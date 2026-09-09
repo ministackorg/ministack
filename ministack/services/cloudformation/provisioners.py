@@ -322,6 +322,23 @@ def _cf_response_headers_policy_delete(physical_id, props):
     _cf._response_headers_policies.pop(physical_id, None)
 
 
+def _cf_oac_record_fields(cfg, name):
+    """The OAC record fields an OriginAccessControlConfig carries.
+
+    The reference marks every field but Description "Required: Yes"; the
+    fallbacks here are MiniStack's own, for a template that leaves one out.
+    They live in one place so that a create and an update of the same template
+    cannot come to disagree about what an absent field means.
+    """
+    return {
+        "Name": name,
+        "Description": cfg.get("Description", ""),
+        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
+        "SigningBehavior": cfg.get("SigningBehavior", "always"),
+        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+    }
+
+
 def _cf_oac_create(logical_id, props, stack_name):
     cfg = dict(props.get("OriginAccessControlConfig") or {})
     name = cfg.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
@@ -331,14 +348,34 @@ def _cf_oac_create(logical_id, props, stack_name):
     oac_id = _cf._dist_id()
     _cf._oacs[oac_id] = {
         "Id": oac_id,
-        "Name": name,
-        "Description": cfg.get("Description", ""),
-        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
-        "SigningBehavior": cfg.get("SigningBehavior", "always"),
-        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+        **_cf_oac_record_fields(cfg, name),
         "ETag": new_uuid(),
     }
     return oac_id, {"Id": oac_id}
+
+
+def _cf_oac_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an origin access control in place.
+
+    The reference marks OriginAccessControlConfig and all five fields under it
+    "Update requires: No interruption" — `Name` included, which UpdateOriginAccessControl
+    also accepts — so the OAC keeps the Id a distribution's origin refers to.
+    The record is rebuilt through the same `_cf_oac_record_fields` the create
+    handler uses, so a property the template drops reverts to its create default.
+    """
+    record = _cf._oacs.get(physical_id)
+    if record is None:
+        # Deleted through the API between updates; converge by creating it again.
+        return _cf_oac_create(logical_id or physical_id, new_props, stack_name)
+    cfg = dict(new_props.get("OriginAccessControlConfig") or {})
+    name = cfg.get("Name") or _physical_name(stack_name, logical_id or physical_id,
+                                             max_len=64)
+    _cf_refuse_taken_name(_cf._oacs, physical_id, name,
+                          "AWS::CloudFront::OriginAccessControl",
+                          lambda existing: existing.get("Name"))
+    record.update(_cf_oac_record_fields(cfg, name))
+    record["ETag"] = new_uuid()
+    return physical_id, {"Id": physical_id}
 
 
 def _cf_oac_delete(physical_id, props):
@@ -8953,7 +8990,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cf_response_headers_policy_delete,
     },
-    "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},
+    "AWS::CloudFront::OriginAccessControl": {
+        "create": _cf_oac_create,
+        "update": _cf_oac_update,
+        "update_with_logical_id": True,
+        "delete": _cf_oac_delete,
+    },
     "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
     "AWS::CloudWatch::Alarm": {
         "create": _cw_metric_alarm_create,

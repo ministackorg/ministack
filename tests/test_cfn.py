@@ -9209,6 +9209,105 @@ def test_cfn_cloudfront_response_headers_policy_updates_in_place(cfn, cloudfront
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _oac_template(name, signing_behavior="always", description=None):
+    config = {"Name": name, "OriginAccessControlOriginType": "s3",
+              "SigningBehavior": signing_behavior, "SigningProtocol": "sigv4"}
+    if description is not None:
+        config["Description"] = description
+    return {
+        "Resources": {"Oac": {"Type": "AWS::CloudFront::OriginAccessControl",
+                              "Properties": {"OriginAccessControlConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Oac", "Id"]}}},
+    }
+
+
+def test_cfn_cloudfront_origin_access_control_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::OriginAccessControl is "No interruption" throughout, so
+    the Id an origin points at survives a changed SigningBehavior, Description
+    or Name. Description is the type's one optional field, so it is the one
+    whose dropping can be tested with a template AWS accepts."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-oac-update-{uid}"
+    name = f"cfn-oac-update-{uid}"
+    renamed = f"cfn-oac-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(name, signing_behavior="never",
+                                          description="first"))
+        oac_id = out["Id"]
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "never"
+        assert cfg["Description"] == "first"
+
+        # In-place: signing behaviour and description change, same Id.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(name, signing_behavior="no-override",
+                                          description="second"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "no-override"
+        assert cfg["Description"] == "second"
+
+        # A rename keeps the same OAC.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(renamed, signing_behavior="no-override",
+                                          description="second"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == renamed
+        summaries = cloudfront.list_origin_access_controls()[
+            "OriginAccessControlList"]["Items"]
+        assert [s["Name"] for s in summaries].count(renamed) == 1
+        assert name not in [s["Name"] for s in summaries]
+
+        # Dropping Description reverts it to the create default.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(renamed, signing_behavior="no-override"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "no-override"
+        assert cfg.get("Description", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_oac_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """An OAC renamed onto a name another OAC holds is refused the way
+    UpdateOriginAccessControl refuses it: the update rolls back and both OACs
+    keep their names."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-oac-taken-{uid}"
+    name = f"cfn-oac-mine-{uid}"
+    taken = f"cfn-oac-taken-{uid}"
+    other = cloudfront.create_origin_access_control(
+        OriginAccessControlConfig=_oac_template(taken)["Resources"]["Oac"][
+            "Properties"]["OriginAccessControlConfig"])["OriginAccessControl"]["Id"]
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _oac_template(name))
+        oac_id = out["Id"]
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_oac_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == name
+        cfg = cloudfront.get_origin_access_control(
+            Id=other)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == taken
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.get_origin_access_control(Id=other)["ETag"]
+        cloudfront.delete_origin_access_control(Id=other, IfMatch=etag)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works
