@@ -57,8 +57,9 @@ Deliberate divergences from AWS, each pinned by a test:
   * A missing source object or destination bucket fails at Start with
     ResourceNotFoundException and records NO job — there is no async
     pipeline that could fail later, so nothing ever lists as `Failed`.
-  * ListSigningJobs serves one page: `maxResults` truncates, no `nextToken`
-    is ever issued and an incoming one is ignored. `status`, `isRevoked`,
+  * ListSigningJobs pages: `maxResults` (1..25) limits the page and a
+    `nextToken` carries the sort position of the last job returned, so a
+    paginator walks the whole list. `status`, `isRevoked`,
     `platformId`, `requestedBy` and `jobInvoker` filter; nothing is ever
     revoked, so `isRevoked=true` is an empty page. `signatureExpiresBefore`
     / `signatureExpiresAfter` are ignored.
@@ -75,6 +76,7 @@ is refused. `ListSigningJobs.maxResults` is 1 to 25, `status` is one of
 of `DAYS | MONTHS | YEARS`.
 """
 
+import base64
 import calendar
 import copy
 import hashlib
@@ -440,14 +442,44 @@ _LISTED_JOB_FIELDS = (
 )
 
 
+def _job_sort_key(job):
+    """Jobs are ordered by creation, with the job id breaking a tie: two jobs
+    started in the same second must still have a total order, or a nextToken
+    pointing at one of them cannot say where the next page starts."""
+    return (job.get("createdAt") or 0, job.get("jobId") or "")
+
+
+def _encode_job_token(job):
+    """A token carries the sort position of the last job on the page, not an
+    offset: an offset would skip a job whenever one was created between two
+    calls."""
+    raw = json.dumps(list(_job_sort_key(job))).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_job_token(token):
+    """The sort key a token carries, or None when the token is not ours."""
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
+        if not isinstance(raw, list) or len(raw) != 2:
+            return None
+        return (float(raw[0]), str(raw[1]))
+    except Exception:
+        return None
+
+
 def _list_signing_jobs(query):
-    """One page, no nextToken: the store is a local dict, so every job fits a
-    single response — maxResults truncates, but no follow-up token is issued
-    and an incoming nextToken is ignored. `status`, `isRevoked`,
-    `platformId`, `requestedBy` and `jobInvoker` filter (nothing is ever
-    revoked, so isRevoked=true is empty); signatureExpiresBefore/-After are
-    ignored. `maxResults` must be 1..25 and `status` one of the documented
-    values; the refusal wording is MiniStack's own."""
+    """`maxResults` (1..25) limits the page; when jobs remain, the response
+    carries a `nextToken` that a following call resumes from, as the API
+    documents ("If additional jobs remain to be listed, AWS Signer returns a
+    nextToken value"). Without `maxResults` the whole list is returned in one
+    page: the service's own default page size is not documented and was not
+    measured. The order (createdAt, then jobId) is MiniStack's own; the
+    reference does not document one. `status`, `isRevoked`, `platformId`,
+    `requestedBy` and `jobInvoker` filter (nothing is ever revoked, so
+    isRevoked=true is empty); signatureExpiresBefore/-After are ignored.
+    `maxResults` must be 1..25 and `status` one of the documented values; the
+    refusal wording is MiniStack's own."""
     status_filter = query.get("status")
     if status_filter is not None and status_filter not in _JOB_STATUSES:
         return _error(400, "ValidationException",
@@ -477,18 +509,35 @@ def _list_signing_jobs(query):
         for field in ("platformId", "requestedBy", "jobInvoker")
         if query.get(field) is not None
     }
-    jobs = []
+    token = query.get("nextToken")
+    cursor = None
+    if token is not None:
+        cursor = _decode_job_token(token)
+        if cursor is None:
+            return _error(400, "ValidationException",
+                          f"Invalid value for nextToken: {token!r}.")
+    matched = []
     for job in _jobs.values():
         if status_filter and job.get("status") != status_filter:
             continue
         if any(job.get(field) != value for field, value in equality.items()):
             continue
+        matched.append(job)
+    matched.sort(key=_job_sort_key)
+    if cursor is not None:
+        matched = [job for job in matched if _job_sort_key(job) > cursor]
+    page, remaining = matched, []
+    if max_results is not None:
+        page, remaining = matched[:max_results], matched[max_results:]
+    jobs = []
+    for job in page:
         summary = _drop_none({k: job.get(k) for k in _LISTED_JOB_FIELDS})
         summary["isRevoked"] = False
         jobs.append(summary)
-    if max_results is not None:
-        jobs = jobs[:max_results]
-    return json_response({"jobs": jobs})
+    result = {"jobs": jobs}
+    if remaining:
+        result["nextToken"] = _encode_job_token(page[-1])
+    return json_response(result)
 
 
 def _put_signing_profile(name, body):

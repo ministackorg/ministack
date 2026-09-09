@@ -546,15 +546,57 @@ def test_signer_list_jobs_requested_by_and_job_invoker_filters(signer, s3, bucke
     assert signer.list_signing_jobs(jobInvoker="999999999999")["jobs"] == []
 
 
-def test_signer_list_jobs_max_results_truncates_without_next_token(signer, s3, buckets, profile):
+def test_signer_list_jobs_max_results_pages_with_a_next_token(signer, s3, buckets, profile):
+    """maxResults limits the page and the response carries a nextToken while
+    jobs remain, so a paginator reaches all of them."""
     src, dst = buckets
     s3.put_object(Bucket=src, Key="t.bin", Body=b"t")
-    for _ in range(2):
-        _start(signer, src, dst, key="t.bin", profile=profile)
+    started = {_start(signer, src, dst, key="t.bin", profile=profile)["jobId"]
+               for _ in range(3)}
 
     page = signer.list_signing_jobs(maxResults=1)
     assert len(page["jobs"]) == 1
+    assert page.get("nextToken")
+
+    # Walk to the end: the suite shares one store, so the three jobs of this
+    # test are somewhere in a longer list.
+    seen = [page["jobs"][0]["jobId"]]
+    token = page["nextToken"]
+    for _ in range(200):
+        page = signer.list_signing_jobs(maxResults=1, nextToken=token)
+        seen.extend(job["jobId"] for job in page["jobs"])
+        token = page.get("nextToken")
+        if not token:
+            break
+    assert not token, "the walk never reached the last page"
+    assert started.issubset(set(seen))
+    assert len(seen) == len(set(seen)), seen
+
+    # The paginator boto3 builds from the model walks the same list.
+    paginated = [job["jobId"] for page in
+                 signer.get_paginator("list_signing_jobs").paginate(
+                     PaginationConfig={"PageSize": 1})
+                 for job in page["jobs"]]
+    assert started.issubset(set(paginated))
+
+
+def test_signer_list_jobs_last_page_has_no_next_token(signer, s3, buckets, profile):
+    """A page that exhausts the list carries no token, which is what stops a
+    paginator."""
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="t.bin", Body=b"t")
+    _start(signer, src, dst, key="t.bin", profile=profile)
+
+    page = signer.list_signing_jobs(maxResults=25)
+    assert page["jobs"]
     assert "nextToken" not in page
+
+
+def test_signer_list_jobs_foreign_next_token_is_refused(signer):
+    """A token MiniStack did not mint is a 400, not a silent full listing."""
+    with pytest.raises(ClientError) as exc:
+        signer.list_signing_jobs(nextToken="not-a-real-token")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
 def test_signer_list_jobs_malformed_max_results_is_validation_error(signer):
