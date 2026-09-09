@@ -39,6 +39,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::ApiGatewayV2::Route` updates in place** — a stack update that changed a route fell through to the create handler: a second route under a new id, `Ref` flipping to it, the old one left on the API with its route key still matching requests. Every property but `ApiId` is *No interruption* on the resource reference, so the route now keeps its id as `UpdateRoute` does; a property the template drops reverts to the create's default (no `AuthorizationScopes`, `AuthorizationType` `NONE`, no `AuthorizerId`), and an `ApiId` change creates the route on the new API before the old one is removed. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::ApiGatewayV2::Stage` updates in place** — a stack update that changed a stage fell through to the create handler, which rebuilt the record under the same name: `CreatedDate` reset to now and the tags map `GetStage` reports was replaced instead of reconciled. Every property but `ApiId` and `StageName` is *No interruption* on the resource reference, so the stage now keeps its record as `UpdateStage` does and refreshes `LastUpdatedDate`; a property the template drops reverts to the create's default (`AutoDeploy` false, no stage variables), `Tags` are reconciled, and a `StageName` or `ApiId` change creates the new stage before the old one is removed. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

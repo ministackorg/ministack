@@ -9005,6 +9005,72 @@ def test_cfn_apigwv2_integration_idempotent_delete(cfn):
     cfn.delete_stack(StackName=stack_name)
 
 
+def _apigwv2_stage_update_template(uid, stage_name="dev", description="first",
+                                   variables=None, auto_deploy=True):
+    props = {
+        "ApiId": {"Ref": "HttpApi"},
+        "StageName": stage_name,
+        "Description": description,
+        "StageVariables": variables or {"tier": "1"},
+        "Tags": {"env": "a"},
+    }
+    if auto_deploy:
+        props["AutoDeploy"] = True
+    return json.dumps({
+        "Resources": {
+            "HttpApi": {"Type": "AWS::ApiGatewayV2::Api",
+                        "Properties": {"Name": f"api-{uid}", "ProtocolType": "HTTP"}},
+            "Stage": {"Type": "AWS::ApiGatewayV2::Stage", "Properties": props},
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}},
+                    "StageRef": {"Value": {"Ref": "Stage"}}},
+    })
+
+
+def test_cfn_apigwv2_stage_updates_in_place(cfn, apigw):
+    """Every property but ApiId and StageName is No interruption on the
+    AWS::ApiGatewayV2::Stage reference: an update keeps the stage (its
+    CreatedDate and Ref) and GetStage reads the new values. The create
+    fallback rebuilt the record under the same name, resetting CreatedDate.
+    A dropped AutoDeploy reverts to the create default (false); a StageName
+    change replaces the stage and removes the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-stage-update-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_apigwv2_stage_update_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        api_id, stage_ref = _output(stack, "ApiId"), _output(stack, "StageRef")
+        before = apigw.get_stage(ApiId=api_id, StageName="dev")
+        assert before["AutoDeploy"] is True
+        time.sleep(1.1)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_stage_update_template(
+            uid, description="second", variables={"tier": "2"}, auto_deploy=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "StageRef") == stage_ref
+        after = apigw.get_stage(ApiId=api_id, StageName="dev")
+        assert after["Description"] == "second"
+        assert after["StageVariables"] == {"tier": "2"}
+        assert after["AutoDeploy"] is False
+        assert after["CreatedDate"] == before["CreatedDate"]
+        assert after["LastUpdatedDate"] > before["LastUpdatedDate"]
+        assert _template_tags(after["Tags"]) == {"env": "a"}
+        assert len(apigw.get_stages(ApiId=api_id)["Items"]) == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_stage_update_template(
+            uid, stage_name="prod", description="second", variables={"tier": "2"},
+            auto_deploy=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "StageRef") != stage_ref
+        assert apigw.get_stage(ApiId=api_id, StageName="prod")["Description"] == "second"
+        assert [s["StageName"] for s in apigw.get_stages(ApiId=api_id)["Items"]] == ["prod"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_full_http_api_stack(cfn, apigw):
     """Full HTTP API stack with Api + Stage + Integration + Route deploys and cleans up."""
     template = {

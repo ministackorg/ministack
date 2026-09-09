@@ -7686,22 +7686,56 @@ def _apigw_v2_api_delete(physical_id, props):
 # ApiGatewayV2 Stage
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_stage_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    stage_name = props.get("StageName", "$default")
-    stage = {
-        "stageName": stage_name,
+def _apigw_v2_stage_props(props):
+    """The mutable part of a stage record from its template properties,
+    with the create's defaults: what the create stores and what an update
+    writes over the existing record."""
+    return {
         "autoDeploy": props.get("AutoDeploy", False),
-        "createdDate": now_iso(),
         "lastUpdatedDate": now_iso(),
         "stageVariables": props.get("StageVariables", {}),
         "description": props.get("Description", ""),
         "defaultRouteSettings": props.get("DefaultRouteSettings", {}),
         "routeSettings": props.get("RouteSettings", {}),
-        "tags": props.get("Tags", {}),
+    }
+
+
+def _apigw_v2_stage_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stage = {
+        "stageName": stage_name,
+        "createdDate": now_iso(),
+        "tags": dict(props.get("Tags") or {}),
+        **_apigw_v2_stage_props(props),
     }
     _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
     physical_id = f"{api_id}/{stage_name}"
+    return physical_id, {"StageName": stage_name}
+
+
+def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a stage in place: every property but ApiId and StageName is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-stage.html),
+    so the record keeps its name and its creation date as UpdateStage does,
+    which also refreshes lastUpdatedDate. The create fallback rebuilt the
+    record under the same name, which reset createdDate and the tags set
+    through the service's own API. A property the template drops reverts to
+    the create's default. ApiId and StageName require replacement: the new
+    stage is created before the old one is removed."""
+    api_id, _, stage_name = physical_id.partition("/")
+    stage = _apigw_v2._stages.get(api_id, {}).get(stage_name)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_props.get("ApiId", ""), new_props.get("StageName", "$default")),
+        (api_id, stage_name) if stage else None,
+        _apigw_v2_stage_create, _apigw_v2_stage_delete,
+    )
+    if replaced is not None:
+        return replaced
+    stage.update(_apigw_v2_stage_props(new_props))
+    _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"StageName": stage_name}
 
 
@@ -9663,7 +9697,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _apigw_v2_api_delete,
     },
-    "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
+    "AWS::ApiGatewayV2::Stage": {
+        "create": _apigw_v2_stage_create,
+        "update": _apigw_v2_stage_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_stage_delete,
+    },
     "AWS::ApiGatewayV2::Integration": {
         "create": _apigw_v2_integration_create,
         "update": _apigw_v2_integration_update,
