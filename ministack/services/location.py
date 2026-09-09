@@ -364,6 +364,26 @@ def _validate_string_map(value, field, max_entries, key_len, value_len, pattern=
     return None
 
 
+def _validate_tracker_name(name):
+    """The model's ResourceName shape: a 1..100 string on ``[-._\\w]+``. Every
+    operation documents it, the path ones included, so a malformed name in the
+    path is a request-validation 400 and never reaches the lookup."""
+    if not isinstance(name, str):
+        return _constraint(name, "trackerName", "Member must be a string")
+    if len(name) > 100:
+        return _constraint(
+            name, "trackerName", "Member must have length less than or equal to 100"
+        )
+    if not _TRACKER_NAME_RE.fullmatch(name):
+        # An unvalidated name with e.g. "/" would be unaddressable through
+        # the path-parameter routes below.
+        return _constraint(
+            name, "trackerName",
+            "Member must satisfy regular expression pattern: [-._\\w]+",
+        )
+    return None
+
+
 def _validate_settings(body):
     """The members CreateTracker and UpdateTracker share. botocore enforces
     only the minimum lengths client-side, so a maximum length, an enum value
@@ -431,17 +451,9 @@ def _create_tracker(body):
     name = body.get("TrackerName", "")
     if not name:
         return _validation("TrackerName is required.")
-    if len(name) > 100:
-        return _constraint(
-            name, "trackerName", "Member must have length less than or equal to 100"
-        )
-    if not _TRACKER_NAME_RE.fullmatch(name):
-        # An unvalidated name with e.g. "/" would be unaddressable through
-        # the path-parameter routes below.
-        return _constraint(
-            name, "trackerName",
-            "Member must satisfy regular expression pattern: [-._\\w]+",
-        )
+    err = _validate_tracker_name(name)
+    if err is not None:
+        return err
     err = _validate_settings(body)
     if err is not None:
         return err
@@ -777,6 +789,10 @@ def _get_position_history(name, device_id, body):
 # Request Router
 # ---------------------------------------------------------------------------
 
+# Every route but CreateTracker and ListTrackers carries {TrackerName} in the
+# path, where it is the same modeled ResourceName as in a request body.
+_PATH_NAME_RE = re.compile(r"^/tracking/v0/trackers/([^/]+)")
+
 _TRACKER_RE = re.compile(r"^/tracking/v0/trackers/([^/]+)$")
 _POSITIONS_RE = re.compile(r"^/tracking/v0/trackers/([^/]+)/positions$")
 _GET_POSITIONS_RE = re.compile(r"^/tracking/v0/trackers/([^/]+)/get-positions$")
@@ -801,6 +817,16 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     # POST /tracking/v0/list-trackers -- ListTrackers
     if path == "/tracking/v0/list-trackers" and method == "POST":
         return _list_trackers(body)
+
+    # The tracker name of every route below comes out of the path, and the
+    # path is not the request-validation layer: a name that is too long or off
+    # the pattern is a ValidationException here, not a lookup that misses and
+    # answers 404.
+    m = _PATH_NAME_RE.match(path)
+    if m:
+        err = _validate_tracker_name(urllib.parse.unquote(m.group(1)))
+        if err is not None:
+            return err
 
     # POST /tracking/v0/trackers/{TrackerName}/positions -- BatchUpdateDevicePosition
     m = _POSITIONS_RE.match(path)

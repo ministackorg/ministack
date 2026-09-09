@@ -152,6 +152,34 @@ def test_location_tracker_name_is_ascii(location):
             location.describe_tracker(TrackerName=name)
 
 
+def test_location_path_tracker_name_validated(location):
+    """The name in the URL is the same modeled ResourceName as the one in a
+    request body — "Length Constraints: Minimum length of 1. Maximum length
+    of 100. Pattern: [-._\\w]+" on every operation page. A name that breaks
+    it is a ValidationException, not the 404 of a lookup that could never
+    have matched."""
+    sample = {"DeviceId": "veh-1", "SampleTime": _ts(0), "Position": [1.0, 1.0]}
+    for name in ("x" * 101, "bad?name"):
+        calls = (
+            lambda n: location.describe_tracker(TrackerName=n),
+            lambda n: location.update_tracker(TrackerName=n, Description="x"),
+            lambda n: location.delete_tracker(TrackerName=n),
+            lambda n: location.batch_update_device_position(
+                TrackerName=n, Updates=[sample]),
+            lambda n: location.batch_get_device_position(
+                TrackerName=n, DeviceIds=["veh-1"]),
+            lambda n: location.get_device_position(TrackerName=n, DeviceId="veh-1"),
+            lambda n: location.get_device_position_history(
+                TrackerName=n, DeviceId="veh-1"),
+        )
+        for call in calls:
+            with pytest.raises(ClientError) as excinfo:
+                call(name)
+            err = excinfo.value.response["Error"]
+            assert err["Code"] == "ValidationException", (name, err)
+            assert "trackerName" in err["Message"]
+
+
 def test_location_duplicate_tracker_conflicts(location):
     name = _uid()
     location.create_tracker(TrackerName=name)
