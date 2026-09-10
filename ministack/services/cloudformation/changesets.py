@@ -17,7 +17,16 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _p,
+    _page,
+    _request_problems,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -77,7 +86,10 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
 
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
-    from ministack.services.cloudformation.handlers import _resolve_stack
+    from ministack.services.cloudformation.handlers import (
+        _check_capabilities,
+        _resolve_stack,
+    )
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
@@ -96,9 +108,15 @@ def _create_change_set(params):
             return _error("AlreadyExistsException",
                           f"ChangeSet [{cs_name}] already exists")
 
+    if cs_type == "CREATE":
+        # The request-level constraints of a new stack, joined as the API does.
+        if request_error := _request_problems(params, stack_name):
+            return request_error
+
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    template_given = bool(template_body)
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
@@ -166,19 +184,28 @@ def _create_change_set(params):
         if not template_body:
             template_body = stack.get("_template_body", "{}")
 
-    def _rejected(message):
+    def _rejected(reason):
         # A rejected CreateChangeSet leaves no stack behind on AWS; drop the
         # REVIEW_IN_PROGRESS placeholder created above for CREATE sets.
+        # ``reason`` is a ValidationError message or a ready error response.
         if cs_type == "CREATE":
             _stacks.pop(stack_name, None)
             _stack_events.pop(stack_id, None)
-        return _error("ValidationError", message)
+        if isinstance(reason, tuple):
+            return reason
+        return _error("ValidationError", reason)
 
     try:
-        template = _parse_template(template_body)
+        template = sent = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _rejected(f"Template format error: {e}")
+
+    # Checked after the transform, as CreateStack and UpdateStack do.
+    # CAPABILITY_AUTO_EXPAND does not apply to a change set
+    # (API_CreateChangeSet), so only the IAM rule runs here.
+    if caps_error := _check_capabilities(sent, template, params, macros=False):
+        return _rejected(caps_error)
 
     try:
         param_values = _resolve_parameters(
@@ -186,9 +213,13 @@ def _create_change_set(params):
     except ValueError as exc:
         return _rejected(str(exc))
 
+    if cs_type == "UPDATE" and not template_given and stack.get("_template"):
+        # As UpdateStack with UsePreviousTemplate: the stored processed
+        # template, so an AWS::Include snippet changed in S3 is not picked up.
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _rejected(str(exc))
 
