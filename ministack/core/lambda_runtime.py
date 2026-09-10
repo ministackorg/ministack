@@ -578,6 +578,7 @@ fs.write = function(fd, ...args) {
     "@aws-sdk/client-servicediscovery":            "Route53AutoNaming_v20170314",
     "@aws-sdk/client-resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
     "@aws-sdk/client-cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+    "@aws-sdk/client-translate":                   "AWSShineFrontendService_20170701",
   };
 
   function _jsonRpcRequest(targetPrefix, opName, params) {

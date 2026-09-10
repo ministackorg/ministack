@@ -733,6 +733,11 @@ def transcribe():
     return make_client("transcribe")
 
 
+@pytest.fixture(scope="session")
+def translate():
+    return make_client("translate")
+
+
 class FakeDockerContainer:
     """Container double for tests that observe lifecycle without a daemon."""
 
