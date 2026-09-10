@@ -448,7 +448,7 @@ def test_ecs_register_task_def_v2(ecs):
 
     resp2 = ecs.register_task_definition(
         family="ecs-td-v2",
-        containerDefinitions=[{"name": "web", "image": "nginx:latest", "cpu": 256, "memory": 512}],
+        containerDefinitions=[{"name": "web", "image": "nginx:alpine", "cpu": 256, "memory": 512}],
     )
     assert resp2["taskDefinition"]["revision"] == 2
 

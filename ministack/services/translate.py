@@ -229,7 +229,7 @@ def _fail_orphaned_jobs():
         if job.get("JobStatus") not in _TERMINAL_STATUSES:
             job["JobStatus"] = "FAILED"
             job["Message"] = "Internal Failure. The job did not survive a MiniStack restart."
-            job["EndTime"] = time.time()
+            job["EndTime"] = int(time.time())
 
 
 try:
@@ -290,8 +290,18 @@ def _output_folder_prefix(job_id, output_prefix):
 
 def _sort_key(job):
     """Submission time with the job id breaking ties, so the ordering is total
-    and stable across calls. Callers reverse it to get newest first."""
-    return (job.get("SubmittedTime") or 0.0, job.get("JobId") or "")
+    and stable across calls. Callers reverse it to get newest first.
+
+    Ordered on the internal high-resolution `_SubmittedAt`, not the wire
+    `SubmittedTime`: the wire member is whole epoch seconds (the shape is a
+    `timestamp` and the json protocol carries it as an integer), so two jobs
+    submitted inside the same second tie there and the job id — a uuid — would
+    decide their order. `_SubmittedAt` keeps the sub-second value the list
+    order needs, and never reaches the wire (leading underscore, see
+    `_JOB_MEMBERS`).
+    """
+    return (job.get("_SubmittedAt") or float(job.get("SubmittedTime") or 0.0),
+            job.get("JobId") or "")
 
 
 def _encode_token(job):
@@ -520,7 +530,7 @@ def _finalize_stop(job_id, run_id):
     if job is None or job.get("JobStatus") != "STOP_REQUESTED":
         return
     job["JobStatus"] = "STOPPED"
-    job["EndTime"] = time.time()
+    job["EndTime"] = int(time.time())
     logger.info("Translate: job %s stopped", job_id)
     _emit_state_change(job_id, "STOPPED")
 
@@ -538,7 +548,7 @@ async def _run_job(job_id, run_id, account_id, region):
             if job is not None and job.get("JobStatus") not in _TERMINAL_STATUSES:
                 job["JobStatus"] = "FAILED"
                 job["Message"] = "Internal Failure. Please try your request again."
-                job["EndTime"] = time.time()
+                job["EndTime"] = int(time.time())
                 _emit_state_change(job_id, "FAILED")
 
 
@@ -570,7 +580,7 @@ def _fail(job_id, run_id, job, message):
         return
     job["JobStatus"] = "FAILED"
     job["Message"] = message
-    job["EndTime"] = time.time()
+    job["EndTime"] = int(time.time())
     logger.info("Translate: job %s failed: %s", job_id, message)
     _emit_state_change(job_id, "FAILED")
 
@@ -720,7 +730,7 @@ def _translate_job(job_id, run_id, job):
         )
     else:
         job["Message"] = "Your job has completed successfully."
-    job["EndTime"] = time.time()
+    job["EndTime"] = int(time.time())
     logger.info(
         "Translate: job %s %s, %d of %d document(s) translated into %s under s3://%s/%s",
         job_id,
@@ -849,7 +859,11 @@ def _start_text_translation_job(data):
     job_output_prefix = _output_folder_prefix(job_id, output_prefix)
 
     run_id = new_uuid()
+    # Stamped once: the wire member is the whole-second truncation of this, and
+    # the sub-second value stays behind under `_SubmittedAt` for the list order.
+    _submitted_at = time.time()
     job = {
+        "_SubmittedAt": _submitted_at,
         "JobId": job_id,
         "JobName": data.get("JobName"),
         "JobStatus": "SUBMITTED",
@@ -857,7 +871,10 @@ def _start_text_translation_job(data):
         "SourceLanguageCode": data["SourceLanguageCode"],
         "TargetLanguageCodes": list(data["TargetLanguageCodes"]),
         "Message": None,
-        "SubmittedTime": time.time(),
+        # translate is the json protocol (jsonVersion 1.1) and SubmittedTime /
+        # EndTime are `timestamp` shapes: whole epoch seconds. time.time()
+        # returns a float, which Java/Go SDK v2 reject on a timestamp member.
+        "SubmittedTime": int(_submitted_at),
         "EndTime": None,
         "InputDataConfig": copy.deepcopy(data["InputDataConfig"]),
         # Reported as the rewritten location from the moment the job exists,

@@ -998,6 +998,16 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
 
+    def test_signer_profile_and_job(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        job_body = b'{"profileName": "fleet", "source": {"s3": {}}}'
+        assert extract_resource_arn("signer", "POST", "/signing-jobs", {}, job_body, {}, "us-east-1", "123") == "arn:aws:signer:us-east-1:123:/signing-profiles/fleet"
+        assert extract_resource_arn("signer", "GET", "/signing-profiles/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:signer:us-east-1:123:/signing-profiles/fleet"
+        assert extract_resource_arn("signer", "GET", "/signing-jobs/9a1f", {}, b"", {}, "us-east-1", "123") == "arn:aws:signer:us-east-1:123:/signing-jobs/9a1f"
+        assert extract_resource_arn("signer", "PUT", "/signing-profiles/fleet", {}, b"{}", {}, "us-east-1", "123") == "*"
+        assert extract_resource_arn("signer", "GET", "/signing-jobs", {}, b"", {"status": "Succeeded"}, "us-east-1", "123") == "*"
+        assert extract_resource_arn("signer", "POST", "/signing-jobs", {}, b"not json", {}, "us-east-1", "123") == "*"
+
     def test_elb_passthrough_arn(self):
         from ministack.core.iam_actions import extract_resource_arn
         lb_arn = "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-lb/abc"
@@ -1023,6 +1033,12 @@ class TestResourceArn:
     def test_pipes(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("pipes", "GET", "/v1/pipes/my-pipe", {}, b"", {}, "us-east-1", "123") == "arn:aws:pipes:us-east-1:123:pipe/my-pipe"
+
+    def test_location_tracker(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("location", "GET", "/tracking/v0/trackers/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:geo:us-east-1:123:tracker/fleet"
+        assert extract_resource_arn("location", "POST", "/tracking/v0/trackers/fleet/positions", {}, b"", {}, "us-east-1", "123") == "arn:aws:geo:us-east-1:123:tracker/fleet"
+        assert extract_resource_arn("location", "POST", "/tracking/v0/list-trackers", {}, b"", {}, "us-east-1", "123") == "*"
 
     def test_mq_broker(self):
         from ministack.core.iam_actions import extract_resource_arn

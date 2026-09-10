@@ -18,8 +18,10 @@ def collect_by_file(mode: str | None = None) -> dict[str, dict[str, int]] | dict
     One pass rather than one per ``-m`` filter: collection dominates the
     shard-planning job, and both counts come out of the same collected set.
     """
-    out_path = REPO_ROOT / ".pytest_collect_plan.json"
-    env = {**os.environ, "MINISTACK_COLLECT_OUT": str(out_path)}
+    from _collect_plan_plugin import COLLECT_PLAN_FILENAME
+
+    out_path = REPO_ROOT / COLLECT_PLAN_FILENAME
+    env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(Path(__file__).resolve().parent), env.get("PYTHONPATH", "")) if p
     )

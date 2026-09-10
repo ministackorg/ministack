@@ -426,6 +426,11 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "ThingGroupName",
         "requires_replacement": lambda old, new: old.get("ParentGroupName") != new.get("ParentGroupName"),
     },
+    # KmsKeyId is "Update requires: Replacement" in the resource reference.
+    "AWS::Location::Tracker": {
+        "name": "TrackerName",
+        "requires_replacement": lambda old, new: old.get("KmsKeyId") != new.get("KmsKeyId"),
+    },
 }
 
 
@@ -624,6 +629,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
+    "AWS::Location::Tracker": ("Tags", "list"),
     "AWS::Logs::LogGroup": ("Tags", "list"),
     "AWS::OpenSearchService::Domain": ("Tags", "list"),
     "AWS::RDS::DBInstance": ("Tags", "list"),
@@ -5772,6 +5778,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
         "VpcId": vpc_id,
         "CidrBlock": cidr,
         "AvailabilityZone": az,
+        "AvailabilityZoneId": _ec2._az_id_for_zone_name(az),
         "State": "available",
         "AvailableIpAddressCount": 251,
         "DefaultForAz": False,
@@ -8523,6 +8530,105 @@ def _scheduler_schedule_update(physical_id, old_props, new_props, stack_name):
             schedule[prop] = new_props[prop]
     return physical_id, {"Arn": _sched._schedule_arn(group, physical_id)}
 
+
+# --- Amazon Location (AWS::Location::Tracker) ---
+
+# The properties the resource reference marks "No interruption", applied
+# through UpdateTracker, with the value a property reverts to when the
+# template drops it: the service's CreateTracker defaults, or None for a
+# member a fresh create leaves absent (it is removed from the record).
+# TrackerName and KmsKeyId require replacement; Tags are reconciled on the
+# tracker record.
+_LOCATION_TRACKER_UPDATABLE = {
+    "Description": "",
+    "PositionFiltering": "TimeBased",
+    "EventBridgeEnabled": False,
+    "KmsKeyEnableGeospatialQueries": None,
+}
+
+
+def _location_tracker_body(name, props):
+    """The CreateTracker request for a template's properties: both sides are
+    PascalCase, only Tags changes shape (CloudFormation's Key/Value list, the
+    API's map)."""
+    body = {"TrackerName": name}
+    for prop in ("Description", "PositionFiltering", "EventBridgeEnabled",
+                 "KmsKeyId", "KmsKeyEnableGeospatialQueries"):
+        if prop in props:
+            body[prop] = props[prop]
+    if "Tags" in props:
+        body["Tags"] = _tag_map(props["Tags"])
+    return body
+
+
+def _location_tracker_attrs(rec):
+    import ministack.services.location as _location
+    return {
+        "Arn": rec["TrackerArn"],
+        "TrackerArn": rec["TrackerArn"],
+        "CreateTime": _location._iso(rec["CreateTime"]),
+        "UpdateTime": _location._iso(rec["UpdateTime"]),
+    }
+
+
+def _location_tracker_create(logical_id, props, stack_name):
+    import ministack.services.location as _location
+    name = props.get("TrackerName") or _physical_name(stack_name, logical_id, max_len=100)
+    resp = _location._create_tracker(_location_tracker_body(name, props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker create failed: {resp[2]!r}")
+    return name, _location_tracker_attrs(_location._trackers[name])
+
+
+def _location_tracker_update(physical_id, old_props, new_props, stack_name,
+                             logical_id=None):
+    """Description, PositionFiltering, EventBridgeEnabled and
+    KmsKeyEnableGeospatialQueries update in place through UpdateTracker and a
+    Tags change is reconciled on the record. TrackerName and KmsKeyId require
+    replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-location-tracker.html):
+    a renamed tracker is created before the old one, with its device
+    positions, is removed; a KmsKeyId change re-creates an auto-named
+    tracker under its deterministic physical name (the name is reused, so
+    the predecessor cannot be retained, as for a DynamoDB table), and with
+    an explicit, unchanged TrackerName it is refused by the
+    _CUSTOM_NAME_REPLACEMENT rule."""
+    import ministack.services.location as _location
+    name = new_props.get("TrackerName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=100
+    )
+    rec = _location._trackers.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, physical_id if rec is not None else None,
+        _location_tracker_create, _location_tracker_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if old_props.get("KmsKeyId") != new_props.get("KmsKeyId"):
+        _location_tracker_delete(physical_id, old_props)
+        return _location_tracker_create(logical_id or physical_id, new_props, stack_name)
+    changes = {}
+    for prop, default in _LOCATION_TRACKER_UPDATABLE.items():
+        if prop in new_props:
+            changes[prop] = new_props[prop]
+        elif prop in old_props:
+            if default is None:
+                rec.pop(prop, None)
+            else:
+                changes[prop] = default
+    resp = _location._update_tracker(name, changes)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker update failed: {resp[2]!r}")
+    _reconcile_tag_map(rec.setdefault("Tags", {}), old_props, new_props)
+    return name, _location_tracker_attrs(rec)
+
+
+def _location_tracker_delete(physical_id, props):
+    import ministack.services.location as _location
+    _location._delete_tracker(physical_id)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -8923,6 +9029,13 @@ _RESOURCE_HANDLERS = {
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "update": _scheduler_schedule_update, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
+    # Amazon Location
+    "AWS::Location::Tracker": {
+        "create": _location_tracker_create,
+        "update": _location_tracker_update,
+        "update_with_logical_id": True,
+        "delete": _location_tracker_delete,
+    },
     # EKS
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
     "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},

@@ -6511,6 +6511,161 @@ def test_cfn_scheduler_schedule(cfn):
     assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
+def test_cfn_location_tracker(cfn, location):
+    """AWS::Location::Tracker provisions through the location service (so it is
+    readable back through the real API) and the stack tags reach its Tags;
+    Description and a tag change update in place; a KmsKeyId change on the
+    custom-named tracker is refused as on AWS; a TrackerName change is a
+    replacement, after which the old tracker is gone."""
+    stack_name = f"cfn-loc-{_uuid_mod.uuid4().hex[:8]}"
+    first, second = f"{stack_name}-a", f"{stack_name}-b"
+
+    def template(name, description, kms_key_id=None):
+        props = {
+            "TrackerName": name,
+            "Description": description,
+            "Tags": [{"Key": "env", "Value": "test"}],
+        }
+        if kms_key_id:
+            props["KmsKeyId"] = kms_key_id
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Tracker": {"Type": "AWS::Location::Tracker", "Properties": props},
+            },
+            "Outputs": {
+                "Name": {"Value": {"Ref": "Tracker"}},
+                "Arn": {"Value": {"Fn::GetAtt": ["Tracker", "Arn"]}},
+                "TrackerArn": {"Value": {"Fn::GetAtt": ["Tracker", "TrackerArn"]}},
+                "UpdateTime": {"Value": {"Fn::GetAtt": ["Tracker", "UpdateTime"]}},
+            },
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(first, "v1"),
+                     Tags=[{"Key": "owner", "Value": "team-a"}])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == first
+        assert _output(stack, "Arn").endswith(f":tracker/{first}")
+        # The resource exposes both Arn and TrackerArn, carrying the same value.
+        assert _output(stack, "TrackerArn") == _output(stack, "Arn")
+        assert _output(stack, "UpdateTime").endswith("Z")
+
+        described = location.describe_tracker(TrackerName=first)
+        assert described["Description"] == "v1"
+        assert described["TrackerArn"] == _output(stack, "Arn")
+        assert described["Tags"] == {
+            "env": "test", "owner": "team-a", **_system_tags(stack, "Tracker"),
+        }
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(first, "v2"),
+                         Tags=[{"Key": "owner", "Value": "team-b"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        resources = cfn.list_stack_resources(StackName=stack_name)["StackResourceSummaries"]
+        assert resources[0]["PhysicalResourceId"] == first
+        described = location.describe_tracker(TrackerName=first)
+        assert described["Description"] == "v2"
+        assert _template_tags(described["Tags"]) == {"env": "test", "owner": "team-b"}
+
+        # KmsKeyId requires replacement, which AWS refuses for a custom-named
+        # resource; the tracker stays as it was.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(first, "v2", kms_key_id="alias/probe"),
+                         Tags=[{"Key": "owner", "Value": "team-b"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+        assert "KmsKeyId" not in location.describe_tracker(TrackerName=first)
+
+        # A rename is a replacement: the new tracker is created, the old one removed.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(second, "v2"),
+                         Tags=[{"Key": "owner", "Value": "team-b"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == second
+        assert location.describe_tracker(TrackerName=second)["Description"] == "v2"
+        with pytest.raises(ClientError):
+            location.describe_tracker(TrackerName=first)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        location.describe_tracker(TrackerName=second)
+
+
+def test_cfn_location_tracker_generated_name(cfn, location):
+    """Without TrackerName the tracker gets the stack-derived physical name;
+    PositionFiltering, EventBridgeEnabled and KmsKeyEnableGeospatialQueries
+    update in place and revert to what a fresh create has (the last one
+    absent) when the template drops them; a KmsKeyId change replaces the
+    auto-named tracker under the same name, so its positions are gone."""
+    stack_name = f"cfn-loc-gen-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(props):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Tracker": {"Type": "AWS::Location::Tracker", "Properties": props},
+            },
+            "Outputs": {"Name": {"Value": {"Ref": "Tracker"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name = _output(stack, "Name")
+        assert name.startswith(f"{stack_name}-Tracker-")
+        described = location.describe_tracker(TrackerName=name)
+        assert described["PositionFiltering"] == "TimeBased"
+        assert described["EventBridgeEnabled"] is False
+        assert "KmsKeyEnableGeospatialQueries" not in described
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({
+            "Description": "in place",
+            "PositionFiltering": "DistanceBased",
+            "EventBridgeEnabled": True,
+            "KmsKeyEnableGeospatialQueries": True,
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == name
+        described = location.describe_tracker(TrackerName=name)
+        assert described["Description"] == "in place"
+        assert described["PositionFiltering"] == "DistanceBased"
+        assert described["EventBridgeEnabled"] is True
+        assert described["KmsKeyEnableGeospatialQueries"] is True
+
+        # Dropping the properties reverts them to what a fresh create has.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        described = location.describe_tracker(TrackerName=name)
+        assert described["Description"] == ""
+        assert described["PositionFiltering"] == "TimeBased"
+        assert described["EventBridgeEnabled"] is False
+        assert "KmsKeyEnableGeospatialQueries" not in described
+
+        location.batch_update_device_position(
+            TrackerName=name,
+            Updates=[{"DeviceId": "veh-1", "Position": [1.0, 1.0],
+                      "SampleTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}],
+        )
+        # KmsKeyId requires replacement: the auto-named tracker is re-created
+        # under the same physical name, without its positions.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template({"KmsKeyId": "alias/probe"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == name
+        assert location.describe_tracker(TrackerName=name)["KmsKeyId"] == "alias/probe"
+        with pytest.raises(ClientError):
+            location.get_device_position(TrackerName=name, DeviceId="veh-1")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_eventbus_basic(cfn, eb):
     """Test basic EventBus create and delete."""
     template = {

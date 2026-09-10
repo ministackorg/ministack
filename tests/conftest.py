@@ -456,6 +456,11 @@ def ses():
 
 
 @pytest.fixture(scope="session")
+def signer():
+    return make_client("signer")
+
+
+@pytest.fixture(scope="session")
 def sfn():
     return make_client("stepfunctions")
 
@@ -571,6 +576,11 @@ def iot_data_client():
 @pytest.fixture(scope="session")
 def iot_jobs_data():
     return make_client("iot-jobs-data")
+
+
+@pytest.fixture(scope="session")
+def iotwireless():
+    return make_client("iotwireless")
 
 
 @pytest.fixture(scope="session")
@@ -746,6 +756,15 @@ def transcribe():
 @pytest.fixture(scope="session")
 def translate():
     return make_client("translate")
+
+
+@pytest.fixture(scope="session")
+def location():
+    # The location model puts `cp.tracking.` / `tracking.` host prefixes in
+    # front of the endpoint; against localhost those subdomains need not
+    # resolve, so disable injection (same as the logs fixture) — routing then
+    # rides on the `geo` credential scope.
+    return make_client("location", additional_config_kwargs={"inject_host_prefix": False})
 
 
 class FakeDockerContainer:
