@@ -2154,6 +2154,7 @@ async def _dispatch_service_request(
     if AUTH:
         from ministack.core.iam_actions import (
             access_denied_response,
+            dynamodb_resource_arns,
             extract_iam_action,
             extract_resource_arn,
         )
@@ -2176,6 +2177,18 @@ async def _dispatch_service_request(
                     denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
                     if denied:
                         iam_action = extra_action
+                        break
+            if service == "dynamodb" and not denied:
+                resources = dynamodb_resource_arns(body, region, get_account_id())
+                for extra_arn in resources[1:]:
+                    denied = enforce(
+                        access_key,
+                        iam_action,
+                        service,
+                        region,
+                        resource_arn=extra_arn,
+                    )
+                    if denied:
                         break
             if denied:
                 if isinstance(denied, AuthError):

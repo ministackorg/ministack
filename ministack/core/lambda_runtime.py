@@ -7,6 +7,7 @@ the handler once (cold start) and then handles subsequent invocations without
 re-importing (warm).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -73,6 +74,42 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
     if not arn:
         raise ArnParseError("arn: missing lambda function arn")
     return _lambda_function_account_region_from_arn(arn)
+
+
+def execution_credentials(config: dict) -> dict[str, str]:
+    """Return account credentials or an AUTH execution-role session."""
+    account_id, _region = _account_region_from_function_config(config)
+    from ministack import app
+
+    if not app.AUTH:
+        return {
+            "AWS_ACCESS_KEY_ID": account_id,
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+            "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+        }
+
+    role_arn = config.get("Role", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    function_arn = config.get("FunctionArn", "")
+    digest = hashlib.sha256(f"{function_arn}:{role_arn}".encode()).hexdigest()
+    access_key = f"ASIA{digest[:16].upper()}"
+    secret_key = hashlib.sha256(f"secret:{digest}".encode()).hexdigest()
+    session_token = hashlib.sha256(f"token:{digest}".encode()).hexdigest()
+    session_name = config.get("FunctionName", "ministack-lambda")[:64]
+
+    from ministack.services import sts as sts_svc
+
+    sts_svc.register_session(access_key, {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}",
+        "UserId": f"{role_name}:{session_name}",
+        "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
+    })
+    return {
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "AWS_SESSION_TOKEN": session_token,
+    }
 
 
 _workers: dict = {}
@@ -1083,9 +1120,7 @@ class Worker:
         account_id, region = _account_region_from_function_config(self.config)
         spawn_env["AWS_REGION"] = region
         spawn_env["AWS_DEFAULT_REGION"] = region
-        spawn_env["AWS_ACCESS_KEY_ID"] = account_id
-        spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
-        spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
+        spawn_env.update(execution_credentials(self.config))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
         # Environment.Variables wins, then host env, then the internal
         # default that points at this MiniStack instance.  Real AWS Lambda

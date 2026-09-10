@@ -799,9 +799,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return f"arn:aws:s3:::{bucket}"
 
     if service == "dynamodb":
-        table = _safe_json_field(body, "TableName")
-        if table:
-            return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+        resources = dynamodb_resource_arns(body, region, account_id)
+        if resources:
+            return resources[0]
         return "*"
 
     if service == "lambda":
@@ -1480,6 +1480,25 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     return "*"
+
+
+def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Return every table ARN addressed by a DynamoDB JSON request."""
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    table = data.get("TableName") if isinstance(data, dict) else None
+    if isinstance(table, str) and table:
+        tables = [table]
+    else:
+        request_items = data.get("RequestItems") if isinstance(data, dict) else None
+        tables = list(request_items) if isinstance(request_items, dict) else []
+    return [
+        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        for name in tables
+        if isinstance(name, str) and name
+    ]
 
 
 def access_denied_response(service: str, action: str, principal_arn: str,
