@@ -2186,9 +2186,11 @@ async def _dispatch_service_request(
                             "Select", "SPECIFIC_ATTRIBUTES"
                         ),
                     }
+            enforce_kwargs = {"resource_arn": resource_arn}
+            if service_context is not None:
+                enforce_kwargs["service_context"] = service_context
             denied = enforce(
-                access_key, iam_action, service, region,
-                resource_arn=resource_arn, service_context=service_context,
+                access_key, iam_action, service, region, **enforce_kwargs
             )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
