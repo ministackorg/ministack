@@ -32,6 +32,11 @@ _LAMBDA_PATH_RE = re.compile(
     r"durable-executions|durable-execution-callbacks)(?:/|$)"
 )
 
+# Lambda Core (botocore `lambda-core`, apiVersion 2026-04-30) network
+# connectors. The request URIs ship under 2026-04-04, not the model's
+# apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
+_LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
+
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
 # url-safe base64, generated per-container in services/ecs.py.
 _ECS_METADATA_PATH_RE = re.compile(r"^/v4/[A-Za-z0-9_-]{8,}(?:/.*)?$")
@@ -67,6 +72,12 @@ SERVICE_PATTERNS = {
     "dynamodb": {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],
+    },
+    # Lambda Core (2026-04-04 URIs) shares Lambda's host and credential scope,
+    # so only the path distinguishes it. Listed before `lambda`; the patterns
+    # are disjoint, and the signed case is handled earlier in detect_service.
+    "lambda-core": {
+        "path_patterns": [r"^/2026-04-04/network-connectors"],
     },
     # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
     # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
@@ -150,6 +161,10 @@ SERVICE_PATTERNS = {
     "transcribe": {
         "target_prefixes": ["Transcribe."],
         "host_patterns": [r"transcribe\."],
+    },
+    "translate": {
+        "target_prefixes": ["AWSShineFrontendService_"],
+        "host_patterns": [r"translate\."],
     },
     "airflow": {
         "host_patterns": [r"airflow\."],
@@ -300,6 +315,19 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
     },
+    # IoT Wireless (endpoint prefix `api.iotwireless.{region}`). The bare
+    # token is anchored at a label boundary, so it matches the `api.` host
+    # too. Kept above the iot family for reading order, but there is no
+    # actual overlap: the host never contains the literal `iot.` segment the
+    # control plane's `iot\.` regex needs (`iot` is followed by `w`) — a
+    # router test pins that anyway. The SDK signs with credential scope
+    # `iotwireless` (botocore signingName), which the scope early-return
+    # resolves via this key.
+    "iotwireless": {
+        "host_patterns": [r"iotwireless\."],
+        "credential_scope": "iotwireless",
+        "path_prefixes": ["/position-estimate"],
+    },
     # IoT Jobs data plane (iot-jobs-data API) MUST come before "iot-data" and
     # "iot": its host also matches the `iot\.` regex, so first-match-wins
     # routing would otherwise swallow it — and on the `iot` control plane
@@ -407,6 +435,19 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"^mediaconnect\."],
         "credential_scope": "mediaconnect",
     },
+    # Amazon Location: the client is named `location` but the endpoint prefix
+    # and credential scope are `geo` (botocore signingName), and the modeled
+    # per-operation host prefixes put `cp.tracking.` / `tracking.` in front of
+    # it — so the host reads `cp.tracking.geo.{region}.{host}`. `geo` starts
+    # its own label there, so the token still matches once
+    # `_anchored_host_pattern` anchors it at a label start; no other service's
+    # host carries a `geo` label, so ordering is not sensitive. Under an
+    # endpoint override the host carries no `geo.` at all and routing relies
+    # on the `"geo"` entry in the credential-scope map below.
+    "location": {
+        "host_patterns": [r"geo\."],
+        "credential_scope": "geo",
+    },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
         "host_patterns": [r"tagging\."],
@@ -443,6 +484,14 @@ SERVICE_PATTERNS = {
     "inspector2": {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
+    },
+    # AWS Signer (REST-JSON, signing name `signer`). No other pattern
+    # contains "signer.", so placement in this dict is not order-sensitive;
+    # SDK requests resolve via the credential-scope early return, unsigned
+    # clients via the /signing-jobs + /signing-profiles path rules.
+    "signer": {
+        "host_patterns": [r"signer\."],
+        "credential_scope": "signer",
     },
     "dsql": {
         "host_patterns": [r"dsql\."],
@@ -575,6 +624,16 @@ def _anchored_host_pattern(pattern: str) -> "re.Pattern":
     return compiled
 
 
+# The closed query-parameter set of ListSigningJobs, and the shape of a signing
+# job id. Both are used to keep the unsigned /signing-jobs path rules off
+# path-style S3 traffic for a bucket of that name.
+_LIST_SIGNING_JOBS_PARAMS = frozenset({
+    "status", "isRevoked", "platformId", "requestedBy", "jobInvoker",
+    "maxResults", "nextToken", "signatureExpiresBefore", "signatureExpiresAfter",
+})
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
     """Detect which AWS service a request is targeting."""
     host = headers.get("host", "")
@@ -664,6 +723,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
+            # Lambda Core signs as `lambda`: its endpointPrefix AND signingName
+            # are both `lambda` (botocore lambda-core/2026-04-30), unlike
+            # lambda-microvms which has its own scope. So the credential scope
+            # cannot tell the two apart and the path has to. This must sit
+            # before the SERVICE_PATTERNS early-return below, or `lambda`
+            # matches there and the request reaches the function router, which
+            # reads `/2026-04-04/network-connectors` as a function name.
+            if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
+                return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
                 return svc_name
             # Map common credential scope names
@@ -718,6 +786,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
                 "eks": "eks",
+                # Amazon Location signs with scope `geo`, not `location`
+                # (botocore signingName). With an endpoint override the host
+                # has no `geo.` in it, so this entry is the primary routing
+                # signal for the location service.
+                "geo": "location",
                 "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
@@ -1099,6 +1172,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "bedrock-runtime"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
+    # IoT Wireless GetPositionEstimate — boto3 signs (scope `iotwireless`)
+    # and the host pattern also matches, but an unsigned caller (curl) must
+    # still resolve by path. POST-only and exact, so an S3 object named
+    # `position-estimate` keeps routing to S3 on GET/PUT.
+    if method == "POST" and path_lower == "/position-estimate":
+        return "iotwireless"
     if path_lower.startswith("/key-value-stores/"):
         return "cloudfront-keyvaluestore"
     if path_lower.startswith("/2020-05-31/"):
@@ -1124,6 +1203,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/domainnames")
     ):
         return "apigateway"
+    # Before the Lambda path check: both live on the Lambda endpoint, and an
+    # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_CORE_PATH_RE.match(path_lower):
+        return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):
         return "lambda"
     if path_lower.startswith(("/oauth2/", "/login", "/logout")):
@@ -1140,6 +1223,29 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # rule below.
     if path_lower.startswith("/oidc/"):
         return "eks"
+    # AWS Signer REST-JSON paths for unsigned clients (SigV4 requests route
+    # via the `signer` credential scope above). Segment-anchored, limited to
+    # the methods the signer surface serves, and further narrowed by the
+    # ListSigningJobs parameter set and the uuid shape of a job id, so
+    # path-style S3 traffic for a bucket like "signing-jobs-archive", and all
+    # but a bare unsigned GET or POST on a bucket named exactly
+    # "signing-jobs", still falls through to S3.
+    if path_lower == "/signing-jobs" and method in ("POST", "GET"):
+        # S3 marks its own listings and multipart/delete POSTs in the query,
+        # and ListSigningJobs has a closed parameter set, so a path-style S3
+        # request for a bucket named "signing-jobs" keeps its verbs.
+        if not (set(query_params) - _LIST_SIGNING_JOBS_PARAMS):
+            return "signer"
+    if method == "GET" and path_lower.startswith("/signing-jobs/"):
+        rest = path_lower[len("/signing-jobs/"):]
+        # A signing job id is a uuid, so an S3 object key that is not one
+        # falls through rather than being read as a DescribeSigningJob.
+        if rest and "/" not in rest and _UUID_RE.fullmatch(rest):
+            return "signer"
+    if method in ("PUT", "GET") and path_lower.startswith("/signing-profiles/"):
+        rest = path_lower[len("/signing-profiles/"):]
+        if rest and "/" not in rest:
+            return "signer"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName

@@ -756,6 +756,145 @@ def test_transcribe_round_trip_fails_a_job_left_mid_flight():
     _round_trip("transcribe", "transcribe", populate, observe)
 
 
+def test_translate_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["1c1838f470806ab9c3e0057f14717bed"] = {
+            "JobId": "1c1838f470806ab9c3e0057f14717bed",
+            "JobName": "nightly-transcript-translation",
+            "JobStatus": "COMPLETED",
+            "JobDetails": {
+                "TranslatedDocumentsCount": 2,
+                "DocumentsWithErrorsCount": 0,
+                "InputDocumentsCount": 2,
+            },
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "EndTime": _time.time(),
+            "InputDataConfig": {
+                "S3Uri": "s3://corpus/input/",
+                "ContentType": "application/x-xliff+xml",
+            },
+            "OutputDataConfig": {
+                "S3Uri": (
+                    "s3://corpus/output/000000000000-TranslateText-"
+                    "1c1838f470806ab9c3e0057f14717bed/"
+                )
+            },
+            "DataAccessRoleArn": "arn:aws:iam::000000000000:role/TranslateBatchRole",
+            "_run_id": "run-1",
+            "_client_token": "token-1",
+            "_output_bucket": "corpus",
+            "_output_prefix": "output/000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/",
+        }
+        mod._client_tokens["token-1"] = "1c1838f470806ab9c3e0057f14717bed"
+
+    def observe(mod):
+        job = mod._jobs.get("1c1838f470806ab9c3e0057f14717bed")
+        assert job is not None
+        assert job["JobStatus"] == "COMPLETED"
+        # The rewritten output location is the only pointer a caller has to the
+        # translated documents; losing it leaves Describe reporting COMPLETED
+        # with nothing to fetch.
+        assert job["OutputDataConfig"]["S3Uri"].endswith(
+            "000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/"
+        )
+        assert job["JobDetails"]["TranslatedDocumentsCount"] == 2
+        # The idempotency map has to survive too, or a client retrying with the
+        # same token after a restart starts a duplicate job.
+        assert mod._client_tokens.get("token-1") == "1c1838f470806ab9c3e0057f14717bed"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_jobs_round_trip_outside_boot_region():
+    """Translate jobs are region-scoped. `AccountRegionScopedDict.__bool__` is
+    scope-relative, so a snapshot holding jobs only in regions other than the
+    one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "JobId": "eu-job",
+                "JobStatus": "COMPLETED",
+                "SourceLanguageCode": "en",
+                "TargetLanguageCodes": ["de"],
+                "SubmittedTime": _time.time(),
+                "EndTime": _time.time(),
+                "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+                "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+                "_output_bucket": "b",
+                "_output_prefix": "out/",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["JobStatus"] == "COMPLETED"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as SUBMITTED,
+    IN_PROGRESS or STOP_REQUESTED would strand every caller polling
+    DescribeTextTranslationJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "JobId": "stuck-job",
+            "JobStatus": "IN_PROGRESS",
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+            "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+            "_output_bucket": "b",
+            "_output_prefix": "out/",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["JobStatus"] == "FAILED"
+        assert job["EndTime"] is not None
+        assert "restart" in job["Message"]
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_location_round_trip():
+    def populate(mod):
+        mod._trackers["trk-test"] = {
+            "TrackerName": "trk-test",
+            "TrackerArn": "arn:aws:geo:us-east-1:000000000000:tracker/trk-test",
+            "CreateTime": 1000.0,
+            "UpdateTime": 1000.0,
+            "positions": {
+                "dev-1": {
+                    "latest": {"DeviceId": "dev-1", "SampleTime": 1000.0,
+                               "ReceivedTime": 1000.5, "Position": [11.0, 48.0]},
+                    "history": [{"DeviceId": "dev-1", "SampleTime": 1000.0,
+                                 "ReceivedTime": 1000.5, "Position": [11.0, 48.0]}],
+                },
+            },
+        }
+
+    def observe(mod):
+        rec = mod._trackers["trk-test"]
+        assert rec["TrackerArn"].endswith(":tracker/trk-test")
+        assert rec["positions"]["dev-1"]["latest"]["Position"] == [11.0, 48.0]
+
+    _round_trip("location", "location", populate, observe)
+
+
 def test_cloudformation_round_trip():
     """CloudFormation stack metadata (stacks, events, exports, change sets)
     survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /
@@ -5518,3 +5657,66 @@ def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_pa
         assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
     finally:
         service.reset()
+
+
+# ── signer._jobs / signer._profiles / signer._tokens ───────────────────
+
+def test_signer_jobs_profiles_and_tokens_survive_warm_boot():
+    """A restored signer job must keep its signedObject reference: a caller
+    whose contract is the signed object at `prefix + jobId` reads that key,
+    and a job record that forgets where its marker lives can no longer
+    answer DescribeSigningJob for it after a restart. The idempotency map
+    must survive too, or a retried Start after a restart would sign twice."""
+    mod = _get_module("signer")
+    mod.reset()
+    job_id = "persisted-signing-job"
+    now = 1700000000
+    try:
+        mod._profiles["persisted_profile"] = {
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "profileVersionArn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile/abc123def4"
+            ),
+            "arn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile"
+            ),
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Active",
+        }
+        mod._jobs[job_id] = {
+            "jobId": job_id,
+            "source": {"s3": {"bucketName": "src-bkt", "key": "fw.bin",
+                              "version": "null"}},
+            "signedObject": {"s3": {"bucketName": "dst-bkt",
+                                    "key": f"signed/{job_id}"}},
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Succeeded",
+            "createdAt": now,
+            "completedAt": now,
+            "requestedBy": "arn:aws:iam::000000000000:root",
+            "jobOwner": "000000000000",
+            "jobInvoker": "000000000000",
+        }
+        mod._tokens["token-1"] = {"jobId": job_id, "jobOwner": "000000000000"}
+
+        _round_trip_dict(mod, "signer")
+
+        job = mod._jobs.get(job_id)
+        assert job is not None, "_jobs lost across save_state -> load_state"
+        assert job["status"] == "Succeeded"
+        assert job["signedObject"]["s3"]["key"] == f"signed/{job_id}"
+        profile = mod._profiles.get("persisted_profile")
+        assert profile is not None, (
+            "_profiles lost across save_state -> load_state"
+        )
+        assert profile["profileVersion"] == "abc123def4"
+        assert mod._tokens.get("token-1") == {
+            "jobId": job_id, "jobOwner": "000000000000",
+        }
+    finally:
+        mod.reset()

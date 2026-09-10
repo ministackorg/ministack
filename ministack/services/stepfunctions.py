@@ -2032,6 +2032,18 @@ def _evaluate_rule(rule, data):
         return _is_num(value) and value <= rule["NumericLessThanEquals"]
     if "NumericGreaterThanEquals" in rule:
         return _is_num(value) and value >= rule["NumericGreaterThanEquals"]
+    if "NumericLessThanPath" in rule:
+        rhs = _resolve_path(rule["NumericLessThanPath"], data)
+        return _is_num(value) and _is_num(rhs) and value < rhs
+    if "NumericGreaterThanPath" in rule:
+        rhs = _resolve_path(rule["NumericGreaterThanPath"], data)
+        return _is_num(value) and _is_num(rhs) and value > rhs
+    if "NumericLessThanEqualsPath" in rule:
+        rhs = _resolve_path(rule["NumericLessThanEqualsPath"], data)
+        return _is_num(value) and _is_num(rhs) and value <= rhs
+    if "NumericGreaterThanEqualsPath" in rule:
+        rhs = _resolve_path(rule["NumericGreaterThanEqualsPath"], data)
+        return _is_num(value) and _is_num(rhs) and value >= rhs
 
     # --- boolean ---
     if "BooleanEquals" in rule:

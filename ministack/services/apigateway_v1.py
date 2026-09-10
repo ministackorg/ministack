@@ -111,7 +111,14 @@ from ministack.core.responses import (
     get_region,
     new_uuid,
 )
-from ministack.services.apigateway import _timeout_from_env, _urlopen_async
+from ministack.services.apigateway import (
+    _b64url_decode,
+    _fetch_jwks,
+    _resolve_jwks_url,
+    _timeout_from_env,
+    _urlopen_async,
+    _verify_rs256_signature,
+)
 
 
 def _now_unix():
@@ -1562,6 +1569,155 @@ def _iam_caller_identity(headers, query_params):
     return identity
 
 
+def _cognito_pool_issuers(authorizer):
+    """The token issuers a COGNITO_USER_POOLS authorizer accepts.
+
+    Each ``providerARNs`` entry is a user-pool ARN
+    (``arn:aws:cognito-idp:{region}:{account}:userpool/{poolId}``) and the
+    issuer Cognito stamps into a token minted by that pool is
+    ``https://cognito-idp.{region}.amazonaws.com/{poolId}``. Unparsable and
+    non-``cognito-idp`` entries are skipped rather than raising: CreateAuthorizer
+    stores the list verbatim, so a malformed ARN only surfaces here and must not
+    take down the request handler.
+    """
+    issuers = []
+    for arn in authorizer.get("providerARNs") or []:
+        try:
+            parsed = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if parsed.service != "cognito-idp" or not parsed.region:
+            continue
+        pool_id = parsed.resource.split("/", 1)[-1] if "/" in parsed.resource else ""
+        if pool_id:
+            issuers.append(f"https://cognito-idp.{parsed.region}.amazonaws.com/{pool_id}")
+    return issuers
+
+
+def _cognito_token_from_request(authorizer, headers, query_params, stage):
+    """The raw JWT named by a Cognito authorizer's ``identitySource``.
+
+    REST identity sources use the ``method.request.header.X`` syntax (not the
+    HTTP API's ``$request.header.X``), and AWS defaults the field to the
+    Authorization header. A ``Bearer `` prefix is tolerated — Cognito authorizers
+    accept the bare token, but clients routinely send the OAuth-style form.
+    """
+    source = authorizer.get("identitySource") or "method.request.header.Authorization"
+    present, values = _request_identity_sources(source, headers, query_params, stage)
+    if not present or not values:
+        return None
+    token = (values[0] or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return token or None
+
+
+def _stringify_claims(claims):
+    """Render JWT claims as the backend receives them.
+
+    API Gateway passes claims through as strings. A list-valued claim —
+    ``cognito:groups`` being the one that matters — arrives space-joined inside
+    square brackets (``"[admins staff]"``), which is why a handler cannot simply
+    index it as an array.
+    """
+    out = {}
+    for key, value in (claims or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif isinstance(value, list):
+            out[key] = "[" + " ".join(str(v) for v in value) + "]"
+        elif isinstance(value, dict):
+            out[key] = json.dumps(value, separators=(",", ":"))
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _token_scopes(claims):
+    """The OAuth scopes carried by an access token (``scope`` or ``scp``)."""
+    scopes = []
+    raw_scope = claims.get("scope")
+    raw_scp = claims.get("scp")
+    if isinstance(raw_scope, str):
+        scopes.extend([s for s in raw_scope.split(" ") if s])
+    if isinstance(raw_scp, list):
+        scopes.extend([str(s) for s in raw_scp])
+    elif isinstance(raw_scp, str):
+        scopes.extend([s for s in raw_scp.split(" ") if s])
+    return sorted(set(scopes))
+
+
+async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_params, stage):
+    """Verify a user-pool token for a COGNITO_USER_POOLS method.
+
+    Returns ``(claims, error_response)``. Unlike the HTTP API's JWT authorizer
+    there is no audience to check: a REST Cognito authorizer is configured with
+    pool ARNs only, so AWS validates the signature, the standard time claims and
+    that ``iss`` names one of those pools — never the app client. Both ID and
+    access tokens are accepted, as on AWS.
+    """
+    issuers = _cognito_pool_issuers(authorizer)
+    if not issuers:
+        # An authorizer with no usable pool cannot authorize anything; AWS
+        # reports this as a configuration error rather than letting it through.
+        return None, _gw_error(500, "Internal server error")
+
+    token = _cognito_token_from_request(authorizer, headers, query_params, stage)
+    if not token:
+        return None, _gw_error(401, "Unauthorized")
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, _gw_error(401, "Unauthorized")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        claims = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, json.JSONDecodeError):
+        return None, _gw_error(401, "Unauthorized")
+    if not isinstance(claims, dict) or not isinstance(header, dict):
+        return None, _gw_error(401, "Unauthorized")
+
+    issuer = claims.get("iss")
+    if issuer not in issuers:
+        return None, _gw_error(401, "Unauthorized")
+
+    kid = header.get("kid")
+    jwks_url = await _resolve_jwks_url({"jwtConfiguration": {"issuer": issuer}})
+    if not kid or not jwks_url:
+        return None, _gw_error(401, "Unauthorized")
+    try:
+        keys = ((await _fetch_jwks(jwks_url)).get("keys") or [])
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, _gw_error(401, "Unauthorized")
+    jwk = next((k for k in keys if k.get("kid") == kid), None)
+    if not jwk or not _verify_rs256_signature(token, jwk):
+        return None, _gw_error(401, "Unauthorized")
+
+    now = int(time.time())
+    try:
+        if "exp" in claims and int(claims["exp"]) <= now:
+            return None, _gw_error(401, "Unauthorized")
+        if "nbf" in claims and int(claims["nbf"]) > now:
+            return None, _gw_error(401, "Unauthorized")
+        if "iat" in claims and int(claims["iat"]) > now:
+            return None, _gw_error(401, "Unauthorized")
+    except (TypeError, ValueError):
+        return None, _gw_error(401, "Unauthorized")
+
+    # authorizationScopes on the method turns the check into an OAuth one: the
+    # token must carry at least one of the listed scopes, and a token without
+    # scopes at all (an ID token) can never satisfy it.
+    required_scopes = method_obj.get("authorizationScopes") or []
+    if required_scopes:
+        granted = _token_scopes(claims)
+        if not any(scope in granted for scope in required_scopes):
+            return None, _gw_error(403, "Forbidden")
+
+    return claims, None
+
+
 async def _authorize_request_v1(
     api_id, stage_name, method_obj, method, request_path, resource,
     headers, body, query_params, path_params, stage,
@@ -1582,8 +1738,19 @@ async def _authorize_request_v1(
         if not _header_ci(headers, "authorization"):
             return _gw_error(403, "Missing Authentication Token"), None
         return None, None
+    if auth_type == "COGNITO_USER_POOLS":
+        authorizer_id = method_obj.get("authorizerId")
+        authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+        if not authorizer:
+            return _gw_error(500, "Internal server error"), None
+        claims, auth_error = await _validate_cognito_authorizer(
+            authorizer, method_obj, headers, query_params, stage
+        )
+        if auth_error:
+            return auth_error, None
+        return None, {"claims": _stringify_claims(claims)}
     if auth_type != "CUSTOM":
-        # COGNITO_USER_POOLS and any future type: not enforced here (pass through).
+        # Any future authorization type: not enforced here (pass through).
         return None, None
 
     authorizer_id = method_obj.get("authorizerId")
@@ -2709,6 +2876,7 @@ def _put_method(api_id, resource_id, http_method, data):
         "httpMethod": http_method,
         "authorizationType": data.get("authorizationType", "NONE"),
         "authorizerId": data.get("authorizerId"),
+        "authorizationScopes": data.get("authorizationScopes", []),
         "apiKeyRequired": data.get("apiKeyRequired", False),
         "operationName": data.get("operationName", ""),
         "requestParameters": data.get("requestParameters", {}),

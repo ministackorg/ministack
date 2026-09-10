@@ -73,11 +73,14 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "iot": "iot",
     "iot-data": "iot",
     "iot-jobs-data": "iot",
+    "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
     "kms": "kms",
     "lambda": "lambda",
+    "lambda-core": "lambda",
     "lambda-microvms": "lambda",
+    "location": "geo",
     "logs": "logs",
     "mediaconnect": "mediaconnect",
     "monitoring": "cloudwatch",
@@ -96,6 +99,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
     "ses": "ses",
+    "signer": "signer",
     "sns": "sns",
     "sqs": "sqs",
     "ssm": "ssm",
@@ -103,6 +107,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "sts": "sts",
     "tagging": "tag",
     "transcribe": "transcribe",
+    "translate": "translate",
     "transfer": "transfer",
     "waf": "waf",
     "waf-regional": "waf-regional",
@@ -439,7 +444,9 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "iot": ["iot"],
     "iot-data": ["iot-data"],
     "iot-jobs-data": ["iot-jobs-data"],
+    "iotwireless": ["iotwireless"],
     "kafka": ["kafka"],
+    "location": ["location"],
     "mediaconnect": ["mediaconnect"],
     "mq": ["mq"],
     "airflow": ["mwaa"],
@@ -450,6 +457,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "signer": ["signer"],
 }
 
 # Compiled route: (http_method, compiled_regex, operation_name, specificity)
@@ -1156,6 +1164,23 @@ def extract_resource_arn(service: str, method: str, path: str,
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
         return "*"
 
+    if service == "signer":
+        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
+        # carry no resource (Service Authorization Reference). The ARNs put a
+        # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+            return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
+        if parts and parts[0] == "signing-jobs":
+            if len(parts) > 1:
+                return f"arn:aws:signer:{region}:{account_id}:/signing-jobs/{parts[1]}"
+            if method == "POST":
+                profile = _safe_json_field(body, "profileName")
+                if profile:
+                    return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{profile}"
+        return "*"
+
     if service == "ssm":
         name = _param(body, query_params, "Name")
         if name:
@@ -1216,6 +1241,15 @@ def extract_resource_arn(service: str, method: str, path: str,
             pi = parts.index("pipes")
             if pi + 1 < len(parts):
                 return f"arn:aws:pipes:{region}:{account_id}:pipe/{parts[pi + 1]}"
+        return "*"
+
+    if service == "location":
+        # /tracking/v0/trackers/{TrackerName}[/...]; the ARN service is geo.
+        parts = [p for p in path.split("/") if p]
+        if "trackers" in parts:
+            ti = parts.index("trackers")
+            if ti + 1 < len(parts):
+                return f"arn:aws:geo:{region}:{account_id}:tracker/{parts[ti + 1]}"
         return "*"
 
     if service == "mq":

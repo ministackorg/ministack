@@ -36,6 +36,7 @@ from .helpers import (
     _extract_string_members,
     _p,
     _page,
+    _request_problems,
     _resolve_template,
     _xml,
 )
@@ -51,6 +52,151 @@ from .stacks import (
 logger = logging.getLogger("cloudformation")
 
 
+# GetTemplateSummary's rule, kept as it was: every ``AWS::IAM::*`` type needs
+# a capability, and these name properties make it CAPABILITY_NAMED_IAM.
+_NAMED_IAM_PROPS = {
+    "AWS::IAM::Role": "RoleName",
+    "AWS::IAM::User": "UserName",
+    "AWS::IAM::Group": "GroupName",
+    "AWS::IAM::Policy": "PolicyName",
+    "AWS::IAM::ManagedPolicy": "ManagedPolicyName",
+    "AWS::IAM::InstanceProfile": "InstanceProfileName",
+}
+
+# The enforcement rule, from the ``Capabilities`` parameter of API_CreateStack:
+# these eight types "require you to specify either the CAPABILITY_IAM or
+# CAPABILITY_NAMED_IAM capability", and "If you have IAM resources with
+# custom names, you must specify CAPABILITY_NAMED_IAM". ``AWS::IAM::Policy``
+# is not in the named map: its ``PolicyName`` is a required property
+# (aws-resource-iam-policy.html), not a custom name.
+_CAPABILITY_IAM_TYPES = frozenset({
+    "AWS::IAM::AccessKey",
+    "AWS::IAM::Group",
+    "AWS::IAM::InstanceProfile",
+    "AWS::IAM::ManagedPolicy",
+    "AWS::IAM::Policy",
+    "AWS::IAM::Role",
+    "AWS::IAM::User",
+    "AWS::IAM::UserToGroupAddition",
+})
+_CAPABILITY_NAMED_PROPS = {
+    rtype: prop for rtype, prop in _NAMED_IAM_PROPS.items()
+    if rtype != "AWS::IAM::Policy"
+}
+
+
+def _uses_embedded_macro(template):
+    """True when a section of the template (other than ``Parameters`` and
+    ``AWSTemplateFormatVersion``) contains an ``Fn::Transform`` node: a macro
+    called on part of the template (intrinsic-function-reference-transform),
+    which API_CreateStack counts like a top-level ``Transform`` for
+    ``CAPABILITY_AUTO_EXPAND`` ("one or more macros")."""
+    stack = [value for section, value in template.items()
+             if section not in ("Parameters", "AWSTemplateFormatVersion", "Transform")]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "Fn::Transform" in node:
+                return True
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
+def _uses_macro(template):
+    """True when the template calls one or more macros: a top-level
+    ``Transform`` or an embedded ``Fn::Transform`` node. Both count for the
+    ``CAPABILITY_AUTO_EXPAND`` rule of API_CreateStack."""
+    return bool(template.get("Transform")) or _uses_embedded_macro(template)
+
+
+def _required_capabilities(template, strict=False):
+    """Return ``(capabilities, reason_types)`` for a parsed template:
+    ``CAPABILITY_NAMED_IAM`` when an IAM resource carries a custom name,
+    ``CAPABILITY_IAM`` for the other IAM resources, ``CAPABILITY_AUTO_EXPAND``
+    when the template declares a ``Transform``. ``reason_types`` are the IAM
+    types behind the IAM entry.
+
+    The default is ``GetTemplateSummary``'s rule (``_NAMED_IAM_PROPS``, every
+    ``AWS::IAM::*`` type, top-level ``Transform`` only); ``strict=True`` is
+    the documented rule the enforcement uses (``_CAPABILITY_IAM_TYPES``,
+    ``_CAPABILITY_NAMED_PROPS``, and an embedded ``Fn::Transform`` counts as a
+    macro too).
+    """
+    resources = template.get("Resources", {}) or {}
+    named_props = _CAPABILITY_NAMED_PROPS if strict else _NAMED_IAM_PROPS
+    named_iam_ids = []
+    unnamed_iam_ids = []
+    for logical_id, res in resources.items():
+        rtype = res.get("Type", "")
+        if strict:
+            if rtype not in _CAPABILITY_IAM_TYPES:
+                continue
+        elif not rtype.startswith("AWS::IAM::"):
+            continue
+        name_prop = named_props.get(rtype)
+        if name_prop and (res.get("Properties") or {}).get(name_prop):
+            named_iam_ids.append(logical_id)
+        else:
+            unnamed_iam_ids.append(logical_id)
+
+    capabilities = []
+    reason_types = []
+    if named_iam_ids:
+        capabilities.append("CAPABILITY_NAMED_IAM")
+        reason_types.extend(
+            sorted(set(resources[lid].get("Type", "") for lid in named_iam_ids))
+        )
+    elif unnamed_iam_ids:
+        capabilities.append("CAPABILITY_IAM")
+        reason_types.extend(
+            sorted(set(resources[lid].get("Type", "") for lid in unnamed_iam_ids))
+        )
+    macro = _uses_macro(template) if strict else bool(template.get("Transform"))
+    if macro:
+        capabilities.append("CAPABILITY_AUTO_EXPAND")
+    return capabilities, reason_types
+
+
+def _check_capabilities(sent, template, params, macros=True):
+    """Refuse a template whose required capabilities the request does not
+    acknowledge, the way CreateStack does: HTTP 400
+    ``InsufficientCapabilitiesException`` with ``Requires capabilities :
+    [CAPABILITY_IAM]`` and no stack created (measured on AWS for the IAM case).
+
+    ``sent`` is the template as the request sent it, ``template`` the same one
+    after the SAM transform. The macro rule reads ``sent``, because the
+    transform drops the ``Transform`` key it looks at; the IAM rule reads
+    ``template``, because a macro may add IAM resources and AWS asks for those
+    to be acknowledged as well (template-macros-overview.html).
+
+    Capabilities are IAM scope, so the check only runs under ``AUTH=true``;
+    without it every template is accepted as before. ``CAPABILITY_IAM`` is
+    satisfied by either IAM capability, ``CAPABILITY_NAMED_IAM`` only by
+    itself. Pass ``macros=False`` for ``CreateChangeSet``: the API reference
+    says ``CAPABILITY_AUTO_EXPAND`` "doesn't apply to creating change sets".
+    Returns an error response or ``None``."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    given = set(_extract_string_members(params, "Capabilities"))
+    required = [cap for cap in _required_capabilities(template, strict=True)[0]
+                if cap != "CAPABILITY_AUTO_EXPAND"]
+    if macros and _uses_macro(sent):
+        required.append("CAPABILITY_AUTO_EXPAND")
+    missing = []
+    for cap in required:
+        if cap == "CAPABILITY_IAM" and "CAPABILITY_NAMED_IAM" in given:
+            continue
+        if cap not in given:
+            missing.append(cap)
+    if not missing:
+        return None
+    return _error("InsufficientCapabilitiesException",
+                  "Requires capabilities : [" + ", ".join(missing) + "]")
+
+
 # --- CreateStack ---
 
 def _create_stack(params):
@@ -60,6 +206,9 @@ def _create_stack(params):
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
+    # The request-level constraints, joined into one message as the API does.
+    if request_error := _request_problems(params, stack_name):
+        return request_error
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
@@ -76,7 +225,7 @@ def _create_stack(params):
                       f"Stack [{stack_name}] already exists")
 
     try:
-        template = _parse_template(template_body)
+        template = sent = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
@@ -89,6 +238,12 @@ def _create_stack(params):
     if tags_error:
         return tags_error
 
+    # The macro rule reads the template as sent (the SAM transform above drops
+    # the Transform key), the IAM rule the transformed one (a macro can add
+    # IAM resources, and AWS asks for those to be acknowledged too).
+    if caps_error := _check_capabilities(sent, template, params):
+        return caps_error
+
     # Resolve parameters
     try:
         param_values = _resolve_parameters(template, provided_params)
@@ -97,7 +252,7 @@ def _create_stack(params):
 
     conditions = _evaluate_conditions(template, param_values)
     try:
-        validate_template_support(template, conditions)
+        validate_template_support(template, conditions, params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -399,7 +554,6 @@ def _resource_metadata_xml(stack, logical_id):
 
 
 def _describe_stack_resource(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     logical_id = _p(params, "LogicalResourceId")
 
@@ -436,7 +590,6 @@ def _describe_stack_resource(params):
 # --- DescribeStackResources ---
 
 def _describe_stack_resources(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     logical_resource_id = _p(params, "LogicalResourceId")
 
@@ -663,7 +816,6 @@ def _stack_has_no_updates(stack, template, param_values, tags,
 
 
 def _update_stack(params):
-    from ministack.services.cloudformation import _stacks
 
     from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
@@ -703,7 +855,7 @@ def _update_stack(params):
             return _error("ValidationError", "TemplateBody or TemplateURL is required")
 
     try:
-        template = _parse_template(template_body)
+        template = sent = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
@@ -720,15 +872,27 @@ def _update_stack(params):
     if tags_error:
         return tags_error
 
+    # The macro rule reads the template as sent (the SAM transform above drops
+    # the Transform key), the IAM rule the transformed one (a macro can add
+    # IAM resources, and AWS asks for those to be acknowledged too).
+    if caps_error := _check_capabilities(sent, template, params):
+        return caps_error
+
     try:
         param_values = _resolve_parameters(
             template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
+    if use_previous_template and stack.get("_template"):
+        # The stored template is the processed one: an AWS::Include snippet
+        # edited or removed in S3 since the deploy is not picked up (the
+        # transform reference: "your stack doesn't automatically pick up
+        # those changes").
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -797,7 +961,9 @@ def _update_stack(params):
 # --- ValidateTemplate ---
 
 def _validate_template(params):
-    template_body = _p(params, "TemplateBody")
+    template_body, resolve_err = _resolve_template(params)
+    if resolve_err:
+        return resolve_err
     if not template_body:
         return _error("ValidationError", "TemplateBody is required")
 
@@ -868,7 +1034,6 @@ def _list_exports(params):
 # --- GetTemplateSummary ---
 
 def _get_template_summary(params):
-    from ministack.services.cloudformation import _stacks
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
@@ -916,40 +1081,7 @@ def _get_template_summary(params):
             "</member>"
         )
 
-    _NAMED_IAM_PROPS = {
-        "AWS::IAM::Role": "RoleName",
-        "AWS::IAM::User": "UserName",
-        "AWS::IAM::Group": "GroupName",
-        "AWS::IAM::Policy": "PolicyName",
-        "AWS::IAM::ManagedPolicy": "ManagedPolicyName",
-        "AWS::IAM::InstanceProfile": "InstanceProfileName",
-    }
-    named_iam_ids = []
-    unnamed_iam_ids = []
-    for logical_id, res in resources.items():
-        rtype = res.get("Type", "")
-        if not rtype.startswith("AWS::IAM::"):
-            continue
-        name_prop = _NAMED_IAM_PROPS.get(rtype)
-        if name_prop and res.get("Properties", {}).get(name_prop):
-            named_iam_ids.append(logical_id)
-        else:
-            unnamed_iam_ids.append(logical_id)
-
-    capabilities = []
-    caps_reason_types = []
-    if named_iam_ids:
-        capabilities.append("CAPABILITY_NAMED_IAM")
-        caps_reason_types.extend(
-            sorted(set(resources[lid].get("Type", "") for lid in named_iam_ids))
-        )
-    elif unnamed_iam_ids:
-        capabilities.append("CAPABILITY_IAM")
-        caps_reason_types.extend(
-            sorted(set(resources[lid].get("Type", "") for lid in unnamed_iam_ids))
-        )
-    if template.get("Transform"):
-        capabilities.append("CAPABILITY_AUTO_EXPAND")
+    capabilities, caps_reason_types = _required_capabilities(template)
 
     caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
     # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return

@@ -2351,6 +2351,28 @@ def test_iceberg_rest_create_commit_load_shares_glue_catalog():
     assert doc["metadata"]["current-snapshot-id"] == 42
 
 
+def test_iceberg_rest_create_table_honours_format_version_property():
+    """A Glue Spark job creating with .tableProperty("format-version", "3")
+    sends it in the createTable request's properties; format-version is a
+    reserved property, so it lands as the top-level metadata field and not in
+    the properties map."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    status, doc = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables",
+        {"name": "orders_v3", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]},
+         "properties": {"format-version": "3", "owner": "bureau"}},
+    )
+    assert status == 200
+    assert doc["metadata"]["format-version"] == 3
+    assert "format-version" not in doc["metadata"].get("properties", {})
+    assert doc["metadata"]["properties"]["owner"] == "bureau"
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders_v3")
+    assert status == 200
+    assert doc["metadata"]["format-version"] == 3
+
+
 def test_iceberg_rest_upgrade_format_version_and_refused_downgrade():
     """The Glue-route Iceberg REST catalog honours ``upgrade-format-version``
     (a Glue Spark job writing with the format-version 3 table property), and a

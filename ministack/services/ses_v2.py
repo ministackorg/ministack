@@ -385,6 +385,68 @@ async def handle_request(method, path, headers, body, query_params):
                     f" | template={template_name}" if template_name else "")
         return json_response({"MessageId": msg_id})
 
+    # POST /v2/email/outbound-bulk-emails  (SendBulkEmail)
+    if sub == "/outbound-bulk-emails" and method == "POST":
+        source = data.get("FromEmailAddress", "")
+        config_set = data.get("ConfigurationSetName", "")
+        tpl = data.get("DefaultContent", {}).get("Template", {})
+        if not tpl:
+            return _json_err("BadRequestException", "DefaultContent.Template is required")
+        stored, template_name, err = _resolve_send_template(tpl)
+        if err:
+            return err
+        default_data = tpl.get("TemplateData", "")
+        entries = data.get("BulkEmailEntries", [])
+        if not entries:
+            return _json_err("BadRequestException", "BulkEmailEntries is required")
+
+        results = []
+        for entry in entries:
+            dest = entry.get("Destination", {})
+            to_addrs = dest.get("ToAddresses", [])
+            cc_addrs = dest.get("CcAddresses", [])
+            bcc_addrs = dest.get("BccAddresses", [])
+            template_data = (
+                entry.get("ReplacementEmailContent", {})
+                     .get("ReplacementTemplate", {})
+                     .get("ReplacementTemplateData", default_data)
+            )
+            rendered = _render_template(stored, template_data)
+            subj = rendered.get("Subject", "")
+            body_text = rendered.get("Text", "")
+            body_html = rendered.get("Html", "")
+            msg_id = f"ministack-{new_uuid()}"
+
+            all_addrs = to_addrs + cc_addrs + bcc_addrs
+            if source and all_addrs:
+                mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                               subj, body_text, body_html, msg_id)
+                _smtp_relay(source, all_addrs, mime_str)
+
+            record = {
+                "MessageId": msg_id,
+                "Source": source,
+                "To": to_addrs,
+                "CC": cc_addrs,
+                "BCC": bcc_addrs,
+                "Subject": subj,
+                "BodyText": body_text,
+                "BodyHtml": body_html,
+                "TemplateData": template_data,
+                "Timestamp": time.time(),
+                "Type": "v2.SendBulkEmail",
+            }
+            if template_name:
+                record["Template"] = template_name
+            if config_set:
+                record["ConfigurationSetName"] = config_set
+            _sent_emails_list().append(record)
+            results.append({"Status": "SUCCESS", "MessageId": msg_id})
+
+        logger.info("SESv2 SendBulkEmail: %s | template=%s | %s entries",
+                    source, template_name or "<inline>", len(entries))
+        return json_response({"BulkEmailEntryResults": results})
+
     # POST /v2/email/identities  (CreateEmailIdentity)
     if sub == "/identities" and method == "POST":
         identity = data.get("EmailIdentity", "")
