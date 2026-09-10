@@ -193,6 +193,16 @@ _SERIAL_TESTS = {
     # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
     # serially; run it in the serial phase.
     "tests/test_ecs.py::test_ecs_service_spawns_tasks",
+    # Cluster task counts use the same Docker-backed service startup and can
+    # remain PENDING behind unrelated container churn. Run serially as well.
+    "tests/test_ecs.py::test_ecs_cluster_task_counts",
+    # SSM Run Command provisions real EC2-agent containers. Keeping these
+    # together avoids Docker API timeouts after the parallel container-heavy
+    # phase.
+    "tests/test_ssm.py::test_ssm_run_command_health_probe",
+    "tests/test_ssm.py::test_ssm_run_command_probe_can_fail",
+    "tests/test_ssm.py::test_ssm_send_command_accepts_a_managed_instance",
+    "tests/test_ssm.py::test_ssm_command_lookup_filters_and_errors",
     # WS/MQTT-broker tests (MQTT-over-WebSocket connect/publish/subscribe,
     # device shadows over MQTT, fleet-index connectivity). They drive the
     # single-event-loop broker over real WebSocket connections with tight
