@@ -5,6 +5,7 @@ CloudFormation helpers — XML response formatting and parameter extraction util
 """
 
 import logging
+import re
 from html import escape as _esc
 from urllib.parse import urlparse
 
@@ -13,6 +14,16 @@ from ministack.core.responses import new_uuid
 logger = logging.getLogger("cloudformation")
 
 CFN_NS = "http://cloudformation.amazonaws.com/doc/2010-05-08/"
+
+# The CloudFormation quotas page: the template body of a request and of an
+# S3 object behind TemplateURL. CreateStack documents the stack name as
+# "only alphanumeric characters (case sensitive) and hyphens", starting with
+# a letter and no longer than 128 characters.
+TEMPLATE_BODY_MAX_BYTES = 51200
+TEMPLATE_URL_MAX_BYTES = 1000000
+STACK_NAME_MAX_CHARS = 128
+STACK_NAME_PATTERN = "[a-zA-Z][-a-zA-Z0-9]*"
+STACK_NAME_RE = re.compile(STACK_NAME_PATTERN)
 
 
 def _p(params, key, default=""):
@@ -88,10 +99,74 @@ def _validate_stack_tags(tags):
 
 
 
+def validation_error_message(problems: list[str]) -> str:
+    """The API's parameter validation joins every request-level violation into
+    one message (quoted: ``2 validation errors detected: Value '' at
+    'stackName' failed to satisfy constraint: ...; Value '' at 'stackName'
+    failed to satisfy constraint: ...``)."""
+    plural = "s" if len(problems) > 1 else ""
+    return f"{len(problems)} validation error{plural} detected: " + "; ".join(problems)
+
+
+def stack_name_problems(stack_name: str) -> list[str]:
+    """The constraints CreateStack documents for ``StackName``: alphanumeric
+    characters and hyphens, a letter first, at most 128 characters. One
+    sentence per violated constraint, in the API's parameter validation
+    wording (quoted for the pattern: ``Value 'x_y' at 'stackName' failed to
+    satisfy constraint: Member must satisfy regular expression pattern:
+    [a-zA-Z][-a-zA-Z0-9]*``; the length sentence follows the shape of other
+    API parameters, unmeasured)."""
+    problems = []
+    if len(stack_name) > STACK_NAME_MAX_CHARS:
+        problems.append(
+            f"Value '{stack_name}' at 'stackName' failed to satisfy constraint: Member "
+            f"must have length less than or equal to {STACK_NAME_MAX_CHARS}")
+    if not STACK_NAME_RE.fullmatch(stack_name):
+        problems.append(
+            f"Value '{stack_name}' at 'stackName' failed to satisfy constraint: Member "
+            f"must satisfy regular expression pattern: {STACK_NAME_PATTERN}")
+    return problems
+
+
+def _template_body_problem(body: str) -> str | None:
+    """The request-level constraint on ``TemplateBody`` (the quota page:
+    "Template body size in a request", 51,200 bytes), as one sentence of the
+    API's parameter validation, which echoes the value (quoted: ``Value
+    '<the template>' at 'templateBody' failed to satisfy constraint: Member
+    must have length less than or equal to 51200``); None when it holds.
+    CreateStack joins it with the stack name problems into one message."""
+    if body and len(body.encode("utf-8")) > TEMPLATE_BODY_MAX_BYTES:
+        return (f"Value '{body}' at 'templateBody' failed to satisfy constraint: Member "
+                f"must have length less than or equal to {TEMPLATE_BODY_MAX_BYTES}")
+    return None
+
+
+def _request_problems(params, stack_name: str = ""):
+    """The request-level constraints of a call that carries a template: the
+    stack name where the call names one, and the size of an inline
+    ``TemplateBody``. The API reports every violation of a request in one
+    message, so both are collected before it answers. Returns the error
+    response, or None when the request passes."""
+    problems = stack_name_problems(stack_name) if stack_name else []
+    body_problem = _template_body_problem(_p(params, "TemplateBody"))
+    if body_problem:
+        problems.append(body_problem)
+    if problems:
+        return _error("ValidationError", validation_error_message(problems))
+    return None
+
+
 def _resolve_template(params):
     """Resolve TemplateBody or TemplateURL to a template string.
     If TemplateURL is provided, fetch the template from S3.
-    Returns (template_body, error_tuple) — error_tuple is None on success."""
+    Returns (template_body, error_tuple) — error_tuple is None on success.
+
+    The request-level constraints are checked here, so every action that reads
+    a template applies them. CreateStack and a CREATE change set check them
+    earlier, together with the stack name, and return before this point."""
+    request_error = _request_problems(params)
+    if request_error:
+        return None, request_error
     return _resolve_document(params, "TemplateBody", "TemplateURL", "Template")
 
 
@@ -121,6 +196,13 @@ def _resolve_document(params, body_key, url_key, label):
             obj_data = _s3._get_object_data(bucket_name, key)
             if obj_data is None:
                 return None, _error("ValidationError", f"{label} not found at {url}")
+            if body_key == "TemplateBody" and len(obj_data) > TEMPLATE_URL_MAX_BYTES:
+                # "Template body size in an Amazon S3 object", 1 MB on the quota
+                # page; the service enforces 1,000,000 bytes and answers with
+                # this sentence (quoted from reports of the error).
+                return None, _error(
+                    "ValidationError",
+                    f"Template may not exceed {TEMPLATE_URL_MAX_BYTES} bytes in size.")
             return obj_data.decode("utf-8"), None
         except Exception as e:
             logger.warning("Failed to fetch %s %s: %s", url_key, url, e)

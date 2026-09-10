@@ -756,6 +756,120 @@ def test_transcribe_round_trip_fails_a_job_left_mid_flight():
     _round_trip("transcribe", "transcribe", populate, observe)
 
 
+def test_translate_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["1c1838f470806ab9c3e0057f14717bed"] = {
+            "JobId": "1c1838f470806ab9c3e0057f14717bed",
+            "JobName": "nightly-transcript-translation",
+            "JobStatus": "COMPLETED",
+            "JobDetails": {
+                "TranslatedDocumentsCount": 2,
+                "DocumentsWithErrorsCount": 0,
+                "InputDocumentsCount": 2,
+            },
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "EndTime": _time.time(),
+            "InputDataConfig": {
+                "S3Uri": "s3://corpus/input/",
+                "ContentType": "application/x-xliff+xml",
+            },
+            "OutputDataConfig": {
+                "S3Uri": (
+                    "s3://corpus/output/000000000000-TranslateText-"
+                    "1c1838f470806ab9c3e0057f14717bed/"
+                )
+            },
+            "DataAccessRoleArn": "arn:aws:iam::000000000000:role/TranslateBatchRole",
+            "_run_id": "run-1",
+            "_client_token": "token-1",
+            "_output_bucket": "corpus",
+            "_output_prefix": "output/000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/",
+        }
+        mod._client_tokens["token-1"] = "1c1838f470806ab9c3e0057f14717bed"
+
+    def observe(mod):
+        job = mod._jobs.get("1c1838f470806ab9c3e0057f14717bed")
+        assert job is not None
+        assert job["JobStatus"] == "COMPLETED"
+        # The rewritten output location is the only pointer a caller has to the
+        # translated documents; losing it leaves Describe reporting COMPLETED
+        # with nothing to fetch.
+        assert job["OutputDataConfig"]["S3Uri"].endswith(
+            "000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/"
+        )
+        assert job["JobDetails"]["TranslatedDocumentsCount"] == 2
+        # The idempotency map has to survive too, or a client retrying with the
+        # same token after a restart starts a duplicate job.
+        assert mod._client_tokens.get("token-1") == "1c1838f470806ab9c3e0057f14717bed"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_jobs_round_trip_outside_boot_region():
+    """Translate jobs are region-scoped. `AccountRegionScopedDict.__bool__` is
+    scope-relative, so a snapshot holding jobs only in regions other than the
+    one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "JobId": "eu-job",
+                "JobStatus": "COMPLETED",
+                "SourceLanguageCode": "en",
+                "TargetLanguageCodes": ["de"],
+                "SubmittedTime": _time.time(),
+                "EndTime": _time.time(),
+                "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+                "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+                "_output_bucket": "b",
+                "_output_prefix": "out/",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["JobStatus"] == "COMPLETED"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as SUBMITTED,
+    IN_PROGRESS or STOP_REQUESTED would strand every caller polling
+    DescribeTextTranslationJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "JobId": "stuck-job",
+            "JobStatus": "IN_PROGRESS",
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+            "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+            "_output_bucket": "b",
+            "_output_prefix": "out/",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["JobStatus"] == "FAILED"
+        assert job["EndTime"] is not None
+        assert "restart" in job["Message"]
+
+    _round_trip("translate", "translate", populate, observe)
+
+
 def test_cloudformation_round_trip():
     """CloudFormation stack metadata (stacks, events, exports, change sets)
     survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /

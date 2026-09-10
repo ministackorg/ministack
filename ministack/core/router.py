@@ -151,6 +151,10 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["Transcribe."],
         "host_patterns": [r"transcribe\."],
     },
+    "translate": {
+        "target_prefixes": ["AWSShineFrontendService_"],
+        "host_patterns": [r"translate\."],
+    },
     "airflow": {
         "host_patterns": [r"airflow\."],
         "path_patterns": [

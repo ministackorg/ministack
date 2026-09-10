@@ -7646,6 +7646,7 @@ const { OrganizationsClient, ListAccountsCommand } = require("@aws-sdk/client-or
 const { CodeBuildClient, ListProjectsCommand } = require("@aws-sdk/client-codebuild");
 const { CloudTrailClient, LookupEventsCommand } = require("@aws-sdk/client-cloudtrail");
 const { ServiceDiscoveryClient, ListServicesCommand } = require("@aws-sdk/client-servicediscovery");
+const { TranslateClient, StartTextTranslationJobCommand } = require("@aws-sdk/client-translate");
 exports.handler = async () => ({
   sqs:   typeof SQSClient === "function" && typeof SendMessageCommand === "function",
   kms:   typeof KMSClient === "function" && typeof EncryptCommand === "function",
@@ -7660,6 +7661,7 @@ exports.handler = async () => ({
   cb:    typeof CodeBuildClient === "function" && typeof ListProjectsCommand === "function",
   ct:    typeof CloudTrailClient === "function" && typeof LookupEventsCommand === "function",
   sd:    typeof ServiceDiscoveryClient === "function" && typeof ListServicesCommand === "function",
+  tr:    typeof TranslateClient === "function" && typeof StartTextTranslationJobCommand === "function",
 });
 """
     result = _run_nodejs_worker(handler_js)
@@ -7667,6 +7669,47 @@ exports.handler = async () => ({
     r = result["result"]
     for svc, ok in r.items():
         assert ok is True, f"Stub not resolved for service key: {svc!r}"
+
+
+def test_nodejs_worker_translate_stub_sends_shine_target():
+    """The Translate stub addresses the service by its real target prefix.
+
+    Translate's awsJson1.1 target prefix is AWSShineFrontendService_20170701,
+    which is what router.py matches on, so a handler that never bundles
+    @aws-sdk/client-translate still reaches the service module.
+    """
+    handler_js = """\
+const http = require("http");
+const srv = http.createServer((req, res) => {
+  const target = req.headers["x-amz-target"];
+  let body = "";
+  req.on("data", (c) => { body += c; });
+  req.on("end", () => {
+    res.writeHead(200, { "Content-Type": "application/x-amz-json-1.1" });
+    res.end(JSON.stringify({ JobId: "abc", JobStatus: "SUBMITTED", _target: target, _body: body }));
+  });
+});
+srv.listen(0, "127.0.0.1", () => {
+  process.env.AWS_ENDPOINT_URL = "http://127.0.0.1:" + srv.address().port;
+  const { TranslateClient, StartTextTranslationJobCommand } = require("@aws-sdk/client-translate");
+  new TranslateClient({})
+    .send(new StartTextTranslationJobCommand({ JobName: "job" }))
+    .then((out) => { srv.close(); exports._result = out; })
+    .catch((e) => { srv.close(); exports._result = { error: String(e) }; });
+});
+exports.handler = () => new Promise((res) => {
+  const wait = () => exports._result ? res(exports._result) : setTimeout(wait, 10);
+  wait();
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r.get("_target") == "AWSShineFrontendService_20170701.StartTextTranslationJob", (
+        f"X-Amz-Target was {r.get('_target')!r}"
+    )
+    assert json.loads(r["_body"]) == {"JobName": "job"}
+    assert r["JobId"] == "abc"
 
 
 def test_nodejs_worker_https_localhost_downgraded_to_http():
