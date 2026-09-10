@@ -2167,7 +2167,29 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+            service_context = None
+            if service == "dynamodb":
+                try:
+                    dynamodb_body = json.loads(body or b"{}")
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                    dynamodb_body = {}
+                projection = dynamodb_body.get("ProjectionExpression")
+                names = dynamodb_body.get("ExpressionAttributeNames") or {}
+                if projection:
+                    attributes = [
+                        names.get(part.strip(), part.strip())
+                        for part in projection.split(",")
+                    ]
+                    service_context = {
+                        "dynamodb:Attributes": attributes,
+                        "dynamodb:Select": dynamodb_body.get(
+                            "Select", "SPECIFIC_ATTRIBUTES"
+                        ),
+                    }
+            denied = enforce(
+                access_key, iam_action, service, region,
+                resource_arn=resource_arn, service_context=service_context,
+            )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
@@ -2187,6 +2209,7 @@ async def _dispatch_service_request(
                         service,
                         region,
                         resource_arn=extra_arn,
+                        service_context=service_context,
                     )
                     if denied:
                         break
