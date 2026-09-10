@@ -371,6 +371,7 @@ SERVICE_REGISTRY = {
     "iot": {"module": "iot"},
     "iot-data": {"module": "iot_data"},
     "iot-jobs-data": {"module": "iot_jobs_data"},
+    "iotwireless": {"module": "iotwireless"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},

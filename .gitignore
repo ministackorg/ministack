@@ -51,3 +51,6 @@ data/
 
 # Logs
 *.log
+
+# Shard-planning scratch output (scripts/select_test_shard.py)
+.pytest_collect_plan.json
