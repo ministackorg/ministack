@@ -12,7 +12,6 @@ DescribeSigningJob.
 import hashlib
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -267,7 +266,6 @@ def test_signer_marker_write_fires_s3_object_created_notification(
 
     job_id = _start(signer, src, dst, key="notify.bin", profile=profile)["jobId"]
 
-    time.sleep(0.5)
     msgs = sqs.receive_message(
         QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2
     )
