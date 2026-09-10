@@ -1148,6 +1148,23 @@ def extract_resource_arn(service: str, method: str, path: str,
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
         return "*"
 
+    if service == "signer":
+        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
+        # carry no resource (Service Authorization Reference). The ARNs put a
+        # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+            return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
+        if parts and parts[0] == "signing-jobs":
+            if len(parts) > 1:
+                return f"arn:aws:signer:{region}:{account_id}:/signing-jobs/{parts[1]}"
+            if method == "POST":
+                profile = _safe_json_field(body, "profileName")
+                if profile:
+                    return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{profile}"
+        return "*"
+
     if service == "ssm":
         name = _param(body, query_params, "Name")
         if name:
