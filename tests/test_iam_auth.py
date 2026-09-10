@@ -907,6 +907,15 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("dynamodb", "POST", "/", {}, b"{}", {}, "us-east-1", "123") == "*"
 
+    def test_dynamodb_index(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps(
+            {"TableName": "users", "IndexName": "email-index"}
+        ).encode()
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/users/index/email-index"
+
     def test_dynamodb_batch_request_uses_first_table(self):
         from ministack.core.iam_actions import extract_resource_arn
         body = json.dumps({"RequestItems": {"events": [], "snapshots": []}}).encode()

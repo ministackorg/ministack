@@ -1490,7 +1490,11 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
         return []
     table = data.get("TableName") if isinstance(data, dict) else None
     if isinstance(table, str) and table:
-        tables = [table]
+        index = data.get("IndexName")
+        suffix = f"/index/{index}" if isinstance(index, str) and index else ""
+        return [
+            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
+        ]
     else:
         request_items = data.get("RequestItems") if isinstance(data, dict) else None
         tables = list(request_items) if isinstance(request_items, dict) else []
