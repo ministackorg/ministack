@@ -73,6 +73,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "iot": "iot",
     "iot-data": "iot",
     "iot-jobs-data": "iot",
+    "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
     "kms": "kms",
@@ -97,6 +98,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
     "ses": "ses",
+    "signer": "signer",
     "sns": "sns",
     "sqs": "sqs",
     "ssm": "ssm",
@@ -441,6 +443,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "iot": ["iot"],
     "iot-data": ["iot-data"],
     "iot-jobs-data": ["iot-jobs-data"],
+    "iotwireless": ["iotwireless"],
     "kafka": ["kafka"],
     "location": ["location"],
     "mediaconnect": ["mediaconnect"],
@@ -453,6 +456,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "signer": ["signer"],
 }
 
 # Compiled route: (http_method, compiled_regex, operation_name, specificity)
@@ -1147,6 +1151,23 @@ def extract_resource_arn(service: str, method: str, path: str,
         identity = _query_param(query_params, "Identity")
         if identity:
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
+        return "*"
+
+    if service == "signer":
+        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
+        # carry no resource (Service Authorization Reference). The ARNs put a
+        # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+            return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
+        if parts and parts[0] == "signing-jobs":
+            if len(parts) > 1:
+                return f"arn:aws:signer:{region}:{account_id}:/signing-jobs/{parts[1]}"
+            if method == "POST":
+                profile = _safe_json_field(body, "profileName")
+                if profile:
+                    return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{profile}"
         return "*"
 
     if service == "ssm":

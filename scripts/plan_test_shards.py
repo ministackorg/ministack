@@ -23,8 +23,11 @@ def main() -> None:
     parallel_shards = int(os.environ.get("PARALLEL_SHARDS", 3))
     serial_shards = int(os.environ.get("SERIAL_SHARDS", 1))
 
-    parallel_files = collect_by_file("parallel")
-    serial_files = collect_by_file("serial")
+    # One collection pass yields both modes; collecting twice doubled the cost
+    # of this job for data the single pass already has.
+    collected = collect_by_file()
+    parallel_files = {f: c["parallel"] for f, c in collected.items() if c["parallel"]}
+    serial_files = {f: c["serial"] for f, c in collected.items() if c["serial"]}
 
     total_parallel = sum(parallel_files.values())
     total_serial = sum(serial_files.values())

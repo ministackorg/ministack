@@ -446,6 +446,11 @@ def ses():
 
 
 @pytest.fixture(scope="session")
+def signer():
+    return make_client("signer")
+
+
+@pytest.fixture(scope="session")
 def sfn():
     return make_client("stepfunctions")
 
@@ -561,6 +566,11 @@ def iot_data_client():
 @pytest.fixture(scope="session")
 def iot_jobs_data():
     return make_client("iot-jobs-data")
+
+
+@pytest.fixture(scope="session")
+def iotwireless():
+    return make_client("iotwireless")
 
 
 @pytest.fixture(scope="session")
