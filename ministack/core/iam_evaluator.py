@@ -26,6 +26,7 @@ logger = logging.getLogger("ministack")
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ParsedStatement:
     sid: str
@@ -70,6 +71,7 @@ class PrincipalInfo:
 @dataclass
 class AuthError:
     """Authentication failure (before policy evaluation)."""
+
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
 
@@ -110,8 +112,8 @@ def fnmatch_iam(value: str, pattern: str) -> bool:
 # Statement matching
 # ---------------------------------------------------------------------------
 
-def _action_matches(request_action: str, actions: list[str],
-                    not_actions: list[str]) -> bool:
+
+def _action_matches(request_action: str, actions: list[str], not_actions: list[str]) -> bool:
     if actions:
         return any(fnmatch_iam(request_action, p) for p in actions)
     if not_actions:
@@ -119,8 +121,7 @@ def _action_matches(request_action: str, actions: list[str],
     return True
 
 
-def _resource_matches(resource_arn: str, resources: list[str],
-                      not_resources: list[str]) -> bool:
+def _resource_matches(resource_arn: str, resources: list[str], not_resources: list[str]) -> bool:
     if resources:
         return any(fnmatch_iam(resource_arn, p) for p in resources)
     if not_resources:
@@ -131,6 +132,7 @@ def _resource_matches(resource_arn: str, resources: list[str],
 # ---------------------------------------------------------------------------
 # Condition evaluation
 # ---------------------------------------------------------------------------
+
 
 def _account_from_arn(arn: str) -> str | None:
     """The account field of an ARN, or None when the ARN carries none: ``*``,
@@ -169,7 +171,7 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     if k == "aws:tagkeys":
         return ctx.tag_keys
     if k.startswith("aws:requesttag/"):
-        tag_key = key[len("aws:RequestTag/"):]
+        tag_key = key[len("aws:RequestTag/") :]
         return ctx.request_tags.get(tag_key)
     if k in ("aws:resourceaccount", "s3:resourceaccount"):
         # The account that owns the resource. The emulator hosts one account
@@ -183,6 +185,7 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
 
 
 # -- Operator implementations --
+
 
 def _op_string_equals(actual: str, expected: str) -> bool:
     return actual == expected
@@ -322,8 +325,7 @@ _CONDITION_OPS: dict[str, Any] = {
 }
 
 
-def _evaluate_single_condition(operator: str, actual: Any,
-                               expected_values: list[str]) -> bool:
+def _evaluate_single_condition(operator: str, actual: Any, expected_values: list[str]) -> bool:
     """One condition key vs its expected values.  Values are OR'd."""
     op_lower = operator.lower()
 
@@ -366,21 +368,13 @@ def _evaluate_single_condition(operator: str, actual: Any,
 
     if for_all:
         # Every actual value must match at least one expected value
-        return all(
-            any(op_func(av, ev) for ev in expected_str)
-            for av in actual_list
-        )
+        return all(any(op_func(av, ev) for ev in expected_str) for av in actual_list)
     if for_any:
         # At least one actual value must match at least one expected value
-        return any(
-            any(op_func(av, ev) for ev in expected_str)
-            for av in actual_list
-        )
+        return any(any(op_func(av, ev) for ev in expected_str) for av in actual_list)
 
     # Standard: any expected value matching any actual value satisfies the condition
-    return any(
-        op_func(str(actual), ev) for ev in expected_str
-    )
+    return any(op_func(str(actual), ev) for ev in expected_str)
 
 
 def _conditions_met(conditions: dict, ctx: EvalContext) -> bool:
@@ -405,6 +399,7 @@ def _conditions_met(conditions: dict, ctx: EvalContext) -> bool:
 # ---------------------------------------------------------------------------
 # Policy parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_policy_document(doc: str | dict) -> list[ParsedStatement]:
     """Parse a JSON policy document into a list of ParsedStatements."""
@@ -439,15 +434,17 @@ def parse_policy_document(doc: str | dict) -> list[ParsedStatement]:
                 return [str(v) for v in val]
             return []
 
-        result.append(ParsedStatement(
-            sid=stmt.get("Sid", ""),
-            effect=effect,
-            actions=_as_list(stmt.get("Action")),
-            not_actions=_as_list(stmt.get("NotAction")),
-            resources=_as_list(stmt.get("Resource")),
-            not_resources=_as_list(stmt.get("NotResource")),
-            conditions=stmt.get("Condition", {}),
-        ))
+        result.append(
+            ParsedStatement(
+                sid=stmt.get("Sid", ""),
+                effect=effect,
+                actions=_as_list(stmt.get("Action")),
+                not_actions=_as_list(stmt.get("NotAction")),
+                resources=_as_list(stmt.get("Resource")),
+                not_resources=_as_list(stmt.get("NotResource")),
+                conditions=stmt.get("Condition", {}),
+            )
+        )
     return result
 
 
@@ -493,8 +490,8 @@ def validate_policy_document(doc: str | dict) -> str | None:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(ctx: EvalContext,
-             policies: list[list[ParsedStatement]]) -> EvalResult:
+
+def evaluate(ctx: EvalContext, policies: list[list[ParsedStatement]]) -> EvalResult:
     """Evaluate all policies against a request context.
 
     ``policies`` is a list of parsed-statement lists (one per policy document).
@@ -530,13 +527,13 @@ def evaluate(ctx: EvalContext,
         return EvalResult("Allow", ctx.principal_arn, stmt.sid, "Explicit allow")
 
     # Step 3: implicit deny
-    return EvalResult("ImplicitDeny", ctx.principal_arn, "",
-                      "No matching Allow statement")
+    return EvalResult("ImplicitDeny", ctx.principal_arn, "", "No matching Allow statement")
 
 
 # ---------------------------------------------------------------------------
 # Principal resolution
 # ---------------------------------------------------------------------------
+
 
 def _role_name_from_assumed_arn(assumed_arn: str) -> str:
     """Extract role name from ``arn:aws:sts::ACCT:assumed-role/RoleName/Session``."""
@@ -551,6 +548,7 @@ def _role_name_from_assumed_arn(assumed_arn: str) -> str:
 
 def _gather_role_policies(role_name: str, account_id: str) -> list[list[ParsedStatement]]:
     from ministack.services import iam as iam_svc
+
     # get_scoped takes (account_id, region, key) — region is ignored for AccountScopedDict
     role = iam_svc._roles.get_scoped(account_id, None, role_name)
     if role is None:
@@ -571,6 +569,7 @@ def _gather_role_policies(role_name: str, account_id: str) -> list[list[ParsedSt
 
 def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedStatement]]:
     from ministack.services import iam as iam_svc
+
     user = iam_svc._users.get_scoped(account_id, None, user_name)
     if user is None:
         return []
@@ -603,8 +602,7 @@ def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedSt
     return policies
 
 
-def _resolve_managed_policy_document(policy_arn: str,
-                                     account_id: str) -> dict | str | None:
+def _resolve_managed_policy_document(policy_arn: str, account_id: str) -> dict | str | None:
     """Resolve a managed policy ARN to its default version's document."""
     from ministack.services import iam as iam_svc
 
@@ -641,8 +639,7 @@ def _is_root_key(access_key_id: str) -> bool:
     return False
 
 
-def resolve_principal(access_key_id: str,
-                      account_id: str) -> PrincipalInfo | AuthError:
+def resolve_principal(access_key_id: str, account_id: str) -> PrincipalInfo | AuthError:
     """Resolve an access key to a principal and their policies.
 
     Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
@@ -674,11 +671,13 @@ def resolve_principal(access_key_id: str,
             )
         assumed_arn = session.get("Arn", "")
         role_name = _role_name_from_assumed_arn(assumed_arn)
-        policies = _gather_role_policies(role_name, account_id)
+        arn_parts = assumed_arn.split(":")
+        session_account = arn_parts[4] if len(arn_parts) >= 6 else account_id
+        policies = _gather_role_policies(role_name, session_account)
         return PrincipalInfo(
             arn=assumed_arn,
             type="AssumedRole",
-            account=account_id,
+            account=session_account,
             policies=policies,
         )
 
@@ -713,11 +712,13 @@ def resolve_principal(access_key_id: str,
 
 # Actions that AWS always allows regardless of IAM policies.
 # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
-_ALWAYS_ALLOWED_ACTIONS = frozenset({
-    "sts:GetCallerIdentity",
-    "sts:GetSessionToken",
-    "sts:GetAccessKeyInfo",
-})
+_ALWAYS_ALLOWED_ACTIONS = frozenset(
+    {
+        "sts:GetCallerIdentity",
+        "sts:GetSessionToken",
+        "sts:GetAccessKeyInfo",
+    }
+)
 
 
 def resolve_caller_identity(access_key_id: str) -> dict | None:
@@ -745,6 +746,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         # caller's own scope.
         try:
             from ministack.services import organizations as org_svc
+
             org = org_svc._orgs.get("self")
             return org.get("Id") if org else None
         except Exception:
@@ -784,8 +786,9 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
     return None
 
 
-def enforce(access_key_id: str, iam_action: str, service: str,
-            region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
+def enforce(
+    access_key_id: str, iam_action: str, service: str, region: str, resource_arn: str = "*"
+) -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.
 
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
@@ -831,6 +834,7 @@ def enforce(access_key_id: str, iam_action: str, service: str,
 # Role ARN existence validation (cross-service)
 # ---------------------------------------------------------------------------
 
+
 def validate_role_arn(role_arn: str) -> str | None:
     """Validate that a role ARN points to an existing IAM role.
 
@@ -838,6 +842,7 @@ def validate_role_arn(role_arn: str) -> str | None:
     Only validates when AUTH=true; returns None (no error) otherwise.
     """
     from ministack.app import AUTH
+
     if not AUTH:
         return None
 
@@ -859,8 +864,7 @@ def validate_role_arn(role_arn: str) -> str | None:
     role_name = role_path_name.rsplit("/", 1)[-1]
 
     if iam_svc._roles.get(role_name) is None:
-        return (f"The role with name {role_name} cannot be found. "
-                f"(Service: IAM, Status Code: 404)")
+        return f"The role with name {role_name} cannot be found. (Service: IAM, Status Code: 404)"
     return None
 
 
@@ -868,8 +872,8 @@ def validate_role_arn(role_arn: str) -> str | None:
 # Trust policy evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_trust_policy(trust_doc: str | dict,
-                          caller_arn: str) -> bool:
+
+def evaluate_trust_policy(trust_doc: str | dict, caller_arn: str) -> bool:
     """Check if a role's trust policy allows the given caller to assume it.
 
     Supports Principal forms:
