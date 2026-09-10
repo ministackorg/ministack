@@ -163,6 +163,27 @@ def _az_id_for_zone_name(zone_name):
     return f"{_az_id_prefix(region)}-az{n}"
 
 
+def _zone_name_for_az_id(az_id):
+    """AZ id -> the zone name it belongs to in this region, or None.
+
+    The inverse of ``_az_id_for_zone_name`` over the zones this region
+    fabricates. CreateSubnet takes ``AvailabilityZoneId`` on its own, and on
+    AWS the two members are one mapping, not two independent inputs: the
+    CreateSubnet reference's own examples always answer a consistent pair
+    (``us-east-2a``/``use2-az1``, ``us-west-2-lax-1a``/``usw2-lax1-az1``).
+    Resolving the name from the id is what keeps the stored subnet a record
+    AWS could actually produce.
+    """
+    if not az_id:
+        return None
+    region = get_region()
+    for letter in "abc":
+        name = f"{region}{letter}"
+        if _az_id_for_zone_name(name) == az_id:
+            return name
+    return None
+
+
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
@@ -2951,8 +2972,16 @@ def _matches_subnet_filters(subnet, filters):
 def _create_subnet(p):
     vpc_id = _p(p, "VpcId") or _DEFAULT_VPC_ID
     cidr = _p(p, "CidrBlock") or "10.0.1.0/24"
-    az = _p(p, "AvailabilityZone") or f"{get_region()}a"
-    az_id = _p(p, "AvailabilityZoneId") or _az_id_for_zone_name(az)
+    # AvailabilityZone and AvailabilityZoneId are one mapping on AWS, never two
+    # independent inputs: every CreateSubnet response pairs a zone name with
+    # that zone's own id. Honouring a supplied id alongside a conflicting name
+    # stored a pair (us-east-1a / use1-az2) that no real account can return, so
+    # the id resolves the name when it is the only one given, and the name wins
+    # the derivation whenever it is present.
+    requested_az = _p(p, "AvailabilityZone")
+    requested_az_id = _p(p, "AvailabilityZoneId")
+    az = requested_az or _zone_name_for_az_id(requested_az_id) or f"{get_region()}a"
+    az_id = _az_id_for_zone_name(az)
     subnet_id = _new_subnet_id()
     _subnets[subnet_id] = {
         "SubnetId": subnet_id,

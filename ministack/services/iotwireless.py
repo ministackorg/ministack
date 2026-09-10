@@ -37,7 +37,10 @@ GeoJSON. The live payload's ``country`` is left out for determinism, as are
 the ``city`` / ``state`` / ``postalCode`` properties the developer guide
 lists for IP lookups (documented divergence).
 
-Refusals mirror the live service verbatim (measured eu-west-1 2026-08-26).
+Two refusals are recorded from the live service (eu-west-1 2026-08-26) and
+are marked as such at their call sites. EVERY OTHER message in this module
+is unverified: no message string is documented for this operation, so the
+wording is this emulator's own and must not be read as AWS's.
 An input with no resolver hint answers ``ValidationException`` ``"1
 validation error detected: Request must have at least 1 valid position
 measurement."``, and an ``IpAddress`` that ``ipaddress.ip_address()``
@@ -72,7 +75,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from ministack.core.responses import error_response_json
+from ministack.core.responses import REST_JSON_CONTENT_TYPE, error_response_json
 
 logger = logging.getLogger("iotwireless")
 
@@ -104,9 +107,7 @@ async def handle_request(
 ) -> tuple:
     if method == "POST" and path == "/position-estimate":
         return _get_position_estimate(body)
-    return error_response_json(
-        "ValidationException", f"No route for {method} {path}", 400
-    )
+    return _validation(f"No route for {method} {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +139,26 @@ _CONFIDENCE_PERCENT_MAX = 99
 _INVALID = object()
 
 
+def _error(code: str, message: str, status: int) -> tuple:
+    """An iotwireless error body.
+
+    The exception shapes of iotwireless/2020-11-22 declare the message member
+    as ``Message`` with no ``locationName``, so ``Message`` is what goes on the
+    wire — not the ``message`` most json-protocol services model. The protocol
+    is ``rest-json``, so the body is ``application/json``.
+
+    ``ResourceNotFoundException`` and ``ConflictException`` also model
+    ``ResourceId`` / ``ResourceType``. Both are optional and nothing here knows
+    what the live service puts in them for this operation, so they are omitted
+    rather than filled with a guess.
+    """
+    return error_response_json(code, message, status,
+                               message_key="Message",
+                               content_type=REST_JSON_CONTENT_TYPE)
+
+
 def _validation(message: str) -> tuple:
-    return error_response_json("ValidationException", message, 400)
+    return _error("ValidationException", message, 400)
 
 
 def _get_position_estimate(body: bytes) -> tuple:
@@ -174,18 +193,15 @@ def _get_position_estimate(body: bytes) -> tuple:
             f"{_CONFIDENCE_PERCENT_MAX}"
         )
     if "Ip" not in payload:
-        # A WLAN/cell/GNSS-only request is well formed, MiniStack simply has
-        # no solver behind it. AWS reserves 400 for malformed input and
-        # documents 404 for exactly this outcome: "no location information
-        # was found or solved ... due to cases such as insufficient data in
-        # the measurement data input", so the scope limit refuses like the
-        # address the resolver cannot place, not like bad JSON.
-        return error_response_json(
-            "ResourceNotFoundException",
-            "MiniStack resolves position from Ip only: provide Ip.IpAddress "
-            "(WiFiAccessPoints/CellTowers/Gnss are accepted but not resolved)",
-            404,
-        )
+        # A WLAN/cell/GNSS-only request is well formed; there is no solver
+        # behind it here, so it takes the same unresolvable-measurement 404 as
+        # an address the IP resolver cannot place. The wording is NOT the live
+        # service's: no message string is documented for this operation
+        # (botocore carries only "Resource does not exist." on the shape), and
+        # the developer-guide sentence this branch was written against could
+        # not be retrieved to verify. Nothing here may name the emulator.
+        return _error("ResourceNotFoundException",
+                      "Cannot find position for the supplied measurements", 404)
     ip_member = payload["Ip"]
     raw = ip_member.get("IpAddress") if isinstance(ip_member, dict) else None
     try:
@@ -201,11 +217,8 @@ def _get_position_estimate(body: bytes) -> tuple:
         # (measured with TEST-NET 203.0.113.7); MiniStack approximates that
         # refusal class deterministically with the global-routability test
         # (multicast groups are global in `ipaddress` but have no place).
-        return error_response_json(
-            "ResourceNotFoundException",
-            f"Cannot find position for the IP address {canonical}",
-            404,
-        )
+        return _error("ResourceNotFoundException",
+                      f"Cannot find position for the IP address {canonical}", 404)
 
     lon, lat = _coordinates_for(canonical)
     properties = {

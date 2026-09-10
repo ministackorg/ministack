@@ -2691,7 +2691,11 @@ def test_ec2_default_subnets_carry_availability_zone_id(ec2):
 
 
 def test_ec2_create_subnet_availability_zone_id(ec2):
-    """AvailabilityZoneId must never be null: it's derived from the AZ, or honored when given."""
+    """AvailabilityZoneId must never be null, and must always name the zone
+    AvailabilityZone names: on AWS the two are one mapping, and every
+    CreateSubnet example in the reference answers a consistent pair
+    (us-east-2a/use2-az1, us-west-2-lax-1a/usw2-lax1-az1). An id supplied on
+    its own resolves the zone name; a conflicting pair cannot be stored."""
     vpc_id = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
 
     derived = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.1.0/24",
@@ -2701,14 +2705,24 @@ def test_ec2_create_subnet_availability_zone_id(ec2):
     desc = ec2.describe_subnets(SubnetIds=[derived["SubnetId"]])["Subnets"][0]
     assert desc["AvailabilityZoneId"] == "use1-az3"
 
-    # AZ says use1-az1, but an explicit AvailabilityZoneId must win.
-    explicit = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.2.0/24",
-                                  AvailabilityZone="us-east-1a",
-                                  AvailabilityZoneId="use1-az2")["Subnet"]
-    assert explicit["AvailabilityZoneId"] == "use1-az2"
+    # AvailabilityZoneId alone resolves the zone name it belongs to, so both
+    # members agree the way a real response does.
+    by_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.2.0/24",
+                              AvailabilityZoneId="use1-az2")["Subnet"]
+    assert by_id["AvailabilityZoneId"] == "use1-az2"
+    assert by_id["AvailabilityZone"] == "us-east-1b"
+
+    # A conflicting pair never lands: the zone name drives the id, so the
+    # record stays one AWS could actually return.
+    conflicting = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.3.0/24",
+                                    AvailabilityZone="us-east-1a",
+                                    AvailabilityZoneId="use1-az2")["Subnet"]
+    assert conflicting["AvailabilityZone"] == "us-east-1a"
+    assert conflicting["AvailabilityZoneId"] == "use1-az1"
 
     ec2.delete_subnet(SubnetId=derived["SubnetId"])
-    ec2.delete_subnet(SubnetId=explicit["SubnetId"])
+    ec2.delete_subnet(SubnetId=by_id["SubnetId"])
+    ec2.delete_subnet(SubnetId=conflicting["SubnetId"])
     ec2.delete_vpc(VpcId=vpc_id)
 
 
@@ -4428,8 +4442,8 @@ def test_ec2_cross_account_ami_sharing():
     assert _consumer_sees() == []
 
     # The consumer never gains modify rights: the image is not in their scope.
-    from botocore.exceptions import ClientError
     import pytest as _pytest
+    from botocore.exceptions import ClientError
     with _pytest.raises(ClientError) as exc:
         consumer.modify_image_attribute(
             ImageId=ami, LaunchPermission={"Add": [{"Group": "all"}]})

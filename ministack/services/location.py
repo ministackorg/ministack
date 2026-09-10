@@ -81,6 +81,7 @@ import urllib.parse
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
     error_response_json,
     get_account_id,
@@ -162,22 +163,56 @@ def _tracker_arn(name):
     return f"arn:aws:geo:{get_region()}:{get_account_id()}:tracker/{name}"
 
 
-def _error(status, code, message):
-    return error_response_json(code, message, status)
+def _error(status, code, message, extra=None):
+    """An Amazon Location error body.
+
+    location/2020-11-19 is ``rest-json``. Its exception shapes declare
+    ``Message`` but carry ``locationName: "message"``, so the wire name is the
+    lowercase ``message`` the helper already emits — the capitalised member
+    name never reaches the wire. ``ValidationException`` additionally models
+    ``reason`` and ``fieldList`` (locationNames of ``Reason`` and
+    ``FieldList``); ``extra`` carries those where the caller knows them.
+    """
+    return error_response_json(code, message, status, extra,
+                               content_type=REST_JSON_CONTENT_TYPE)
 
 
-def _validation(message):
-    return _error(400, "ValidationException", message)
+# ValidationExceptionReason, verbatim from the model's enum. `reason` is a
+# modeled member of ValidationException and the live service populates it, so
+# every refusal below names the one that fits rather than leaving it out.
+_REASON_FIELD = "FieldValidationFailed"
+_REASON_MISSING = "Missing"
+_REASON_CANNOT_PARSE = "CannotParse"
+_REASON_UNKNOWN_OPERATION = "UnknownOperation"
+_REASON_OTHER = "Other"
+
+
+def _validation_reason(message, reason, field=None):
+    """A ValidationException carrying its modeled `reason`, and `fieldList`
+    when the refusal is about one named member.
+
+    ValidationExceptionField models Name/Message with locationNames `name` and
+    `message`, so the entries go on the wire lowercase.
+    """
+    extra = {"reason": reason}
+    if field is not None:
+        extra["fieldList"] = [{"name": field, "message": message}]
+    return _error(400, "ValidationException", message, extra)
 
 
 def _constraint(value, field, constraint):
     """The request-surface ValidationException shape: one violated member
     constraint. The exact wordings are unmeasured on Amazon Location; the
-    shape is the one the AWS SDKs render for every service."""
-    return _validation(
+    shape is the one the AWS SDKs render for every service.
+
+    Carries `reason: FieldValidationFailed` and the one-entry `fieldList` the
+    model declares for exactly this case.
+    """
+    message = (
         f"1 validation error detected: Value '{value}' at '{field}' failed to "
         f"satisfy constraint: {constraint}"
     )
+    return _validation_reason(message, _REASON_FIELD, field)
 
 
 def _not_found(name):
@@ -222,7 +257,8 @@ def _max_results(body):
     if value is None:
         return 100, None
     if not _is_number(value) or int(value) != value:
-        return None, _validation("MaxResults must be an integer")
+        return None, _validation_reason("MaxResults must be an integer",
+                                        _REASON_FIELD, "maxResults")
     value = int(value)
     if value > 100:
         return None, _constraint(
@@ -246,7 +282,8 @@ def _time_bound(body, member, default):
         return default, None
     parsed = _parse_timestamp(value)
     if parsed is None:
-        return None, _validation(f"{member} must be a timestamp")
+        return None, _validation_reason(f"{member} must be a timestamp",
+                                        _REASON_FIELD, member)
     return parsed, None
 
 
@@ -487,9 +524,10 @@ def _validate_settings(body):
         # (CreateTracker reference.) An enum-set message naming one member
         # would be misleading, so the refusal says what happened to the rest.
         # Wording unmeasured.
-        return _validation(
+        return _validation_reason(
             f"PricingPlan '{plan}' is no longer accepted. The only allowed "
-            f"value is RequestBasedUsage."
+            f"value is RequestBasedUsage.",
+            _REASON_FIELD, "pricingPlan",
         )
     return None
 
@@ -531,7 +569,8 @@ def _position_view(pos):
 def _create_tracker(body):
     name = body.get("TrackerName", "")
     if not name:
-        return _validation("TrackerName is required.")
+        return _validation_reason("TrackerName is required.",
+                                  _REASON_MISSING, "trackerName")
     err = _validate_tracker_name(name)
     if err is not None:
         return err
@@ -605,7 +644,7 @@ def _list_trackers(body):
     if token:
         cursor = _decode_token(token, (str,))
         if cursor is None:
-            return _validation(_INVALID_TOKEN)
+            return _validation_reason(_INVALID_TOKEN, _REASON_FIELD, "nextToken")
     # Sorted by name: a total order the token can resume from.
     records = sorted(_trackers.values(), key=lambda r: r["TrackerName"])
     if cursor is not None:
@@ -867,7 +906,7 @@ def _get_position_history(name, device_id, body):
     if token:
         cursor = _decode_token(token, (float, float, int))
         if cursor is None:
-            return _validation(_INVALID_TOKEN)
+            return _validation_reason(_INVALID_TOKEN, _REASON_FIELD, "nextToken")
     # Documented defaults when the members are omitted: the 24 hours up to now.
     start, err = _time_bound(body, "StartTimeInclusive", _now() - 24 * 3600)
     if err is not None:
@@ -915,7 +954,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
-        return _validation("Could not deserialize the request body as JSON.")
+        return _validation_reason("Could not deserialize the request body as JSON.",
+                                  _REASON_CANNOT_PARSE)
 
     # POST /tracking/v0/trackers -- CreateTracker
     if path == "/tracking/v0/trackers" and method == "POST":
@@ -971,4 +1011,5 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "DELETE":
             return _delete_tracker(name)
 
-    return _validation(f"No route for {method} {path}")
+    return _validation_reason(f"No route for {method} {path}",
+                              _REASON_UNKNOWN_OPERATION)

@@ -462,7 +462,15 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     return status, {"Content-Type": "application/xml"}, body
 
 
-def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None) -> tuple:
+# Error-body content types. The json protocol (awsJson1.0/1.1) answers
+# `application/x-amz-json-1.0`; a rest-json service answers `application/json`.
+JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
+REST_JSON_CONTENT_TYPE = "application/json"
+
+
+def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None,
+                        *, message_key: str = "message",
+                        content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
     """AWS-style JSON error response.
 
     Real AWS emits the error type in BOTH the body (`__type`) and the
@@ -472,16 +480,28 @@ def error_response_json(code: str, message: str, status: int = 400, extra: dict 
     `extra` carries the modeled members some exceptions add to the body (for
     example `resourceId` / `resourceArn` on `ResourceAlreadyExistsException`),
     so callers never have to rebuild the envelope themselves.
+
+    `message_key` is the wire name of the message member, which is NOT the same
+    across services: it is whatever the exception shape declares, after any
+    `locationName`. Most json-protocol services model `message`, which is why
+    that is the default, but for example iotwireless models `Message`. boto3
+    finds either; Java/Go SDK v2 unmarshal by the modeled name, so the wrong
+    casing loses the message there. Pull the shape before overriding this.
+
+    `content_type` likewise: `application/x-amz-json-1.0` suits the json
+    protocol, while a rest-json service answers `application/json`. Both SDK
+    and boto3 pick their parser from the service model rather than this header,
+    so it is about matching the wire, not about parsing.
     """
     data = {
         "__type": code,
-        "message": message,
+        message_key: message,
     }
     if extra:
         data.update(extra)
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {
-        "Content-Type": "application/x-amz-json-1.0",
+        "Content-Type": content_type,
         "x-amzn-errortype": code,
     }, body
 

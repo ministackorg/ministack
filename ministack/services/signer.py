@@ -91,6 +91,7 @@ from datetime import datetime, timedelta, timezone
 import ministack.services.s3 as s3_svc
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
     error_response_json,
     get_account_id,
@@ -157,7 +158,11 @@ _IMAGE_FORMATS = ("JSON", "JSONEmbedded", "JSONDetached")
 _ENCRYPTION_ALGORITHMS = ("RSA", "ECDSA")
 _HASH_ALGORITHMS = ("SHA1", "SHA256")
 _MAX_TAGS = 200
-_TAG_KEY_RE = re.compile(r"[a-zA-Z+\-=._:/]+")
+# botocore signer/2017-08-25 TagKey.pattern is `^(?!aws:)[a-zA-Z+-=._:/]+$`.
+# `+-=` there is a RANGE (U+002B..U+003D), so it also admits `,` `-` `.`
+# `/` the digits `0-9` `:` `;` `<` `=`. Escaping the hyphen narrows the
+# class and refused a tag key AWS accepts (`env1`, `2024`).
+_TAG_KEY_RE = re.compile(r"[a-zA-Z+-=._:/]+")
 _ACCOUNT_ID_RE = re.compile(r"[0-9]{12}")
 # PutSigningProfile reference: "If unspecified, the default is 135 months."
 _DEFAULT_VALIDITY = {"type": "MONTHS", "value": 135}
@@ -170,7 +175,19 @@ def _now():
 
 
 def _error(status, code, message):
-    return error_response_json(code, message, status)
+    """A signer error body.
+
+    signer/2017-08-25 is ``rest-json``, so the body is ``application/json``
+    rather than the json-protocol content type. Its exception shapes model the
+    message member as lowercase ``message`` (locationName ``message``), which
+    is already the helper's default, so the casing is left alone here.
+
+    Those shapes also carry an optional ``code`` member. It is not populated:
+    nothing here knows the string the live service puts in it, and a guess
+    would read as if it had been measured.
+    """
+    return error_response_json(code, message, status,
+                               content_type=REST_JSON_CONTENT_TYPE)
 
 
 def _profile_arn(name):
