@@ -79,11 +79,14 @@ def test_iotwireless_position_estimate_is_geojson_point_blob(iotwireless):
 
 
 def test_iotwireless_accuracy_properties_carry_the_measured_values(iotwireless):
-    """The two accuracy properties carry the values of the one live call
-    (eu-west-1, 2026-08-26), which sent no `AdvancedConfiguration`."""
+    """`horizontalAccuracy` is the value of the one live call (eu-west-1,
+    2026-08-26). `horizontalConfidenceLevel` is the documented default: the
+    developer guide gives 0.68 both as the confidence level's default ("The
+    default value is 0.68, which indicates a 68% probability...") and as what
+    `ConfidencePercent` takes when the caller sends none."""
     properties = json.loads(_estimate_bytes(iotwireless, "1.2.3.4"))["properties"]
     assert properties["horizontalAccuracy"] == 1000000
-    assert properties["horizontalConfidenceLevel"] == 0.67
+    assert properties["horizontalConfidenceLevel"] == 0.68
 
 
 @pytest.mark.parametrize("percent,level", [(50, 0.5), (68, 0.68), (99, 0.99)])

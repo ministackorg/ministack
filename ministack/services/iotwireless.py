@@ -20,10 +20,9 @@ form of ``Ip.IpAddress`` is hashed (SHA-256) onto lon [-180, 180) / lat
 [-60, 60), 4 decimals, so the same address always answers the same estimate
 and a consumer test can assert on it.
 
-The blob's ``properties`` carry the two accuracy fields with the values of
-the single live call recorded for this work (eu-west-1, 2026-08-26):
-``horizontalAccuracy`` 1000000 and ``horizontalConfidenceLevel`` 0.67. That
-call asked for nothing, so 0.67 is the default level;
+The blob's ``properties`` carry ``horizontalAccuracy`` 1000000, from the
+single live call recorded for this work (eu-west-1, 2026-08-26), and
+``horizontalConfidenceLevel`` 0.68, the default the developer guide documents;
 ``AdvancedConfiguration.WiFiCellular.ConfidencePercent`` is the caller's own
 say over it and drives the reported level, over 100, within the 50 to 99 the
 model allows. The
@@ -121,13 +120,18 @@ async def handle_request(
 # the value, so an empty `Ip` reaches the address validator below.
 _HINT_MEMBERS = ("WiFiAccessPoints", "CellTowers", "Ip", "Gnss")
 
-# The values of the one live call recorded for this work (eu-west-1,
-# 2026-08-26). Fixed, because the estimate is synthetic: there is no solver
-# behind it whose accuracy could vary per address. That call sent no
-# `AdvancedConfiguration`, so 0.67 is what the service reports when the
-# caller asks for nothing; a caller that does ask drives the level itself.
+# Fixed, because the estimate is synthetic: there is no solver behind it whose
+# accuracy could vary per address. The accuracy is the value of the one live
+# call recorded for this work (eu-west-1, 2026-08-26).
 _HORIZONTAL_ACCURACY = 1000000
-_HORIZONTAL_CONFIDENCE_LEVEL = 0.67
+# AWS IoT Core Device Location documents the default confidence level twice, as
+# 0.68: "The default value is 0.68, which indicates a 68% probability that the
+# actual device location is within the uncertainty radius of the estimated
+# location", and of the CLI example's ConfidencePercent=68, "which is also the
+# default value when this parameter is not specified"
+# (iot/latest/developerguide/device-location-resolve-solvers.html). This was
+# was 0.67, from a single unrecorded call; the documented default is the source.
+_HORIZONTAL_CONFIDENCE_LEVEL = 0.68
 
 # `AdvancedConfiguration.WiFiCellular.ConfidencePercent`, as the model
 # constrains it: an integer, 50 to 99 inclusive.
@@ -292,11 +296,11 @@ def _confidence_level(payload: dict):
     reports, over 100. The model constrains it to an integer from 50 to 99
     inclusive and a value outside that is refused rather than clamped.
 
-    Omitted, the level stays the 0.67 of the one live call, which sent no
-    ``AdvancedConfiguration`` at all. AWS documents the member's own default
-    as 68, and a caller who sends ``ConfidencePercent: 68`` gets 0.68 here;
-    what 0.67 records is what the service answered a request that asked for
-    nothing, which is the thing an emulator has to reproduce.
+    Omitted, the level is the documented default of 0.68 — the developer
+    guide gives that both as the confidence level's own default and as the
+    value ``ConfidencePercent`` takes when the caller sends none — so a
+    request that asks for nothing and one that sends ``ConfidencePercent: 68``
+    answer the same level, as on AWS.
     """
     advanced = payload.get("AdvancedConfiguration")
     if advanced is None:
