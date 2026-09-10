@@ -78,6 +78,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "kinesis": "kinesis",
     "kms": "kms",
     "lambda": "lambda",
+    "lambda-core": "lambda",
     "lambda-microvms": "lambda",
     "location": "geo",
     "logs": "logs",

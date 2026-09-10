@@ -32,6 +32,11 @@ _LAMBDA_PATH_RE = re.compile(
     r"durable-executions|durable-execution-callbacks)(?:/|$)"
 )
 
+# Lambda Core (botocore `lambda-core`, apiVersion 2026-04-30) network
+# connectors. The request URIs ship under 2026-04-04, not the model's
+# apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
+_LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
+
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
 # url-safe base64, generated per-container in services/ecs.py.
 _ECS_METADATA_PATH_RE = re.compile(r"^/v4/[A-Za-z0-9_-]{8,}(?:/.*)?$")
@@ -67,6 +72,12 @@ SERVICE_PATTERNS = {
     "dynamodb": {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],
+    },
+    # Lambda Core (2026-04-04 URIs) shares Lambda's host and credential scope,
+    # so only the path distinguishes it. Listed before `lambda`; the patterns
+    # are disjoint, and the signed case is handled earlier in detect_service.
+    "lambda-core": {
+        "path_patterns": [r"^/2026-04-04/network-connectors"],
     },
     # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
     # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
@@ -712,6 +723,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
+            # Lambda Core signs as `lambda`: its endpointPrefix AND signingName
+            # are both `lambda` (botocore lambda-core/2026-04-30), unlike
+            # lambda-microvms which has its own scope. So the credential scope
+            # cannot tell the two apart and the path has to. This must sit
+            # before the SERVICE_PATTERNS early-return below, or `lambda`
+            # matches there and the request reaches the function router, which
+            # reads `/2026-04-04/network-connectors` as a function name.
+            if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
+                return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
                 return svc_name
             # Map common credential scope names
@@ -1183,6 +1203,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/domainnames")
     ):
         return "apigateway"
+    # Before the Lambda path check: both live on the Lambda endpoint, and an
+    # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_CORE_PATH_RE.match(path_lower):
+        return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):
         return "lambda"
     if path_lower.startswith(("/oauth2/", "/login", "/logout")):

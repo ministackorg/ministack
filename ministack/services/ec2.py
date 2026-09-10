@@ -6965,9 +6965,17 @@ def _create_fleet(p):
         for slot, launched in zip(slots, slot_buckets):
             if not launched:
                 continue
-            if instance_tags:
+            # The slot's launch template contributes its own instance tags; the
+            # request's TagSpecifications (instant fleets only, per the model)
+            # are layered on top. On a duplicate key the request wins — that
+            # precedence is MiniStack's choice, not a measured AWS behaviour.
+            merged = {t["Key"]: t["Value"] for t in slot.get("instance_tags") or []}
+            merged.update({t["Key"]: t["Value"] for t in instance_tags})
+            if merged:
                 for inst in launched:
-                    _tags[inst["InstanceId"]] = instance_tags[:]
+                    _tags[inst["InstanceId"]] = [
+                        {"Key": k, "Value": v} for k, v in merged.items()
+                    ]
             instance_items.append({
                 "InstanceIds": [inst["InstanceId"] for inst in launched],
                 "InstanceType": slot["instance_type"],
@@ -7028,6 +7036,19 @@ def _slot_from_lt_data(spec, lt_data):
         "user_data": (lt_data or {}).get("UserData") or "",
         "sg_ids": (lt_data or {}).get("SecurityGroupIds") or None,
         "iam_profile": iam_profile,
+        # RequestLaunchTemplateData.TagSpecifications is "the tags to apply to
+        # the resources that are created during instance launch", and
+        # CreateFleetRequest.TagSpecifications points at the launch template as
+        # THE way to tag instances of a maintain/request fleet. Only the
+        # `instance` specs belong on the instance; a `volume` spec is for the
+        # volume.
+        "instance_tags": [
+            dict(tag)
+            for spec in ((lt_data or {}).get("TagSpecifications") or [])
+            if spec.get("ResourceType") == "instance"
+            for tag in (spec.get("Tags") or [])
+            if tag.get("Key")
+        ],
     }
 
 

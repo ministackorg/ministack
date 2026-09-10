@@ -3514,6 +3514,94 @@ def test_create_fleet_distributes_across_configs_and_overrides(ec2):
     assert len(total_ids) == 4
 
 
+def test_create_fleet_applies_launch_template_instance_tags(ec2):
+    """A launch template's instance TagSpecifications reach the instances the
+    fleet creates.
+
+    The EC2 model is explicit that this is the mechanism:
+    ``RequestLaunchTemplateData.TagSpecifications`` is "the tags to apply to the
+    resources that are created during instance launch", and
+    ``CreateFleetRequest.TagSpecifications`` says that for a ``maintain`` or
+    ``request`` fleet "you cannot specify a resource type of instance. To tag
+    instances at launch, specify the tags in a launch template."
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"lt-tags-{uid}",
+        LaunchTemplateData={
+            "ImageId": "ami-12345678",
+            "InstanceType": "t3.micro",
+            "TagSpecifications": [
+                {"ResourceType": "instance",
+                 "Tags": [{"Key": "ProbeTag", "Value": "from-launch-template"},
+                          {"Key": "EnvironmentTag", "Value": "probe-environment"}]},
+                # A non-instance spec must not leak onto the instance.
+                {"ResourceType": "volume",
+                 "Tags": [{"Key": "VolumeOnly", "Value": "yes"}]},
+            ],
+        },
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 1,
+            "DefaultTargetCapacityType": "on-demand",
+        },
+        Type="instant",
+    )
+    instance_id = resp["Instances"][0]["InstanceIds"][0]
+    inst = ec2.describe_instances(InstanceIds=[instance_id])[
+        "Reservations"][0]["Instances"][0]
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    assert tags.get("ProbeTag") == "from-launch-template"
+    assert tags.get("EnvironmentTag") == "probe-environment"
+    assert "VolumeOnly" not in tags
+
+
+def test_create_fleet_merges_request_and_launch_template_instance_tags(ec2):
+    """An instant fleet may also carry its own instance TagSpecifications. Both
+    sets reach the instance; on a duplicate key the request wins (the merge
+    precedence is MiniStack's choice, not a measured AWS behaviour)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"lt-merge-{uid}",
+        LaunchTemplateData={
+            "ImageId": "ami-12345678",
+            "InstanceType": "t3.micro",
+            "TagSpecifications": [
+                {"ResourceType": "instance",
+                 "Tags": [{"Key": "FromTemplate", "Value": "yes"},
+                          {"Key": "Shared", "Value": "template"}]},
+            ],
+        },
+    )
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {
+                "LaunchTemplateId": lt["LaunchTemplate"]["LaunchTemplateId"],
+                "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 1,
+            "DefaultTargetCapacityType": "on-demand",
+        },
+        Type="instant",
+        TagSpecifications=[{"ResourceType": "instance",
+                            "Tags": [{"Key": "FromRequest", "Value": "yes"},
+                                     {"Key": "Shared", "Value": "request"}]}],
+    )
+    instance_id = resp["Instances"][0]["InstanceIds"][0]
+    inst = ec2.describe_instances(InstanceIds=[instance_id])[
+        "Reservations"][0]["Instances"][0]
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    assert tags.get("FromTemplate") == "yes"
+    assert tags.get("FromRequest") == "yes"
+    assert tags.get("Shared") == "request"
+
+
 def test_create_fleet_maintain_returns_fleetid_only(ec2):
     """For Type=maintain (and request), AWS does not launch synchronously —
     response carries FleetId only; no Instances / no Errors."""

@@ -439,10 +439,23 @@ def _dict_to_xml(parent: Element, data):
         parent.text = data
 
 
-def json_response(data: dict, status: int = 200) -> tuple:
-    """Build an AWS-style JSON response."""
+# Response/error body content types. The json protocol (awsJson1.0/1.1) answers
+# `application/x-amz-json-1.0`; a rest-json service answers `application/json`.
+JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
+REST_JSON_CONTENT_TYPE = "application/json"
+
+
+def json_response(data: dict, status: int = 200, *,
+                  content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
+    """Build an AWS-style JSON response.
+
+    `content_type` follows the service's protocol: the json protocol answers
+    `application/x-amz-json-1.0` (the default here), while a rest-json service
+    answers `application/json`. SDKs pick their parser from the service model
+    rather than this header, so it is about matching the wire.
+    """
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    return status, {"Content-Type": content_type}, body
 
 
 def error_response_xml(code: str, message: str, status: int, namespace: str = "http://s3.amazonaws.com/doc/2006-03-01/") -> tuple:
@@ -460,12 +473,6 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
 
     body = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
-
-
-# Error-body content types. The json protocol (awsJson1.0/1.1) answers
-# `application/x-amz-json-1.0`; a rest-json service answers `application/json`.
-JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
-REST_JSON_CONTENT_TYPE = "application/json"
 
 
 def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None,
