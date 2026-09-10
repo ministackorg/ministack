@@ -931,6 +931,13 @@ class TestResourceArn:
             "arn:aws:dynamodb:us-east-1:123:table/snapshots",
         ]
 
+    def test_eventbridge_put_events_defaults_to_default_bus(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"Entries": [{"Source": "example"}]}).encode()
+        assert extract_resource_arn(
+            "events", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:events:us-east-1:123:event-bus/default"
+
     def test_lambda_function(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "GET", "/2015-03-31/functions/my-func", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"

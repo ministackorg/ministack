@@ -908,6 +908,16 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Target-based (JSON body) services ---
 
     if service == "events":
+        try:
+            event_data = json.loads(body or b"{}")
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            event_data = {}
+        entries = event_data.get("Entries") if isinstance(event_data, dict) else None
+        if isinstance(entries, list) and entries:
+            event_bus = entries[0].get("EventBusName") or "default"
+            if event_bus.startswith("arn:"):
+                return event_bus
+            return f"arn:aws:events:{region}:{account_id}:event-bus/{event_bus}"
         name = _safe_json_field(body, "Name") or _safe_json_field(body, "RuleName")
         bus = _safe_json_field(body, "EventBusName") or "default"
         if name:
