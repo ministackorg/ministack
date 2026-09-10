@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **S3 — the `s3:TestEvent` no longer reaches Lambda targets** — `PutBucketNotificationConfiguration` fanned the test event out to every destination, Lambda included, but AWS sends it to SQS queues and SNS topics only; a Lambda destination is verified through its function permissions, not by invoking it. The payload carries no `Records` array, so each S3-triggered function raised on it, and because delivery goes through the async path the event was retried to `MaximumRetryAttempts` (default 2) and then routed to the function's DLQ or `OnFailure` destination, where a synthetic event AWS never sends looked like a genuinely dropped message. Any CDK stack with an S3-triggered Lambda hit this through `BucketNotificationsHandler`. Queue and topic destinations still receive the test event, and real object events still invoke the function. Contributed by @ppettitau.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added
