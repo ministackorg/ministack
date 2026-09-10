@@ -3,6 +3,8 @@ import contextlib
 import io
 import json
 import os
+import shutil
+import sys
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
@@ -11328,6 +11330,110 @@ def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
     # A same-named file that came from the user's own zip is left alone.
     (code_dir / "_msctx_shim.js").write_text("// user's own module")
     assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_downgrades_https_to_the_gateway(tmp_path):
+    """The response submitters the CDK bundles into its custom-resource
+    handlers build the ResponseURL PUT from the URL's hostname and path only
+    and hand it to https.request, so it goes out over TLS to port 443
+    whatever the URL says, and in the docker executor a Node custom resource
+    never signalled its stack. The shim the executor injects turns that into a plain
+    HTTP request on the gateway port for the gateway hosts, and only those."""
+    import http.server
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            seen.append((self.command, self.path, self.headers.get("Host")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_GET = do_PUT
+
+        def log_message(self, *args):
+            pass
+
+    # The advertised-host case below dials a second loopback address the shim
+    # does not know by default; Linux answers on all of 127/8, so bind wide
+    # there and stay on 127.0.0.1 elsewhere.
+    on_linux = sys.platform.startswith("linux")
+    server = http.server.HTTPServer(("0.0.0.0" if on_linux else "127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve, reject) => {\n"
+            "  const done = (res) => resolve({status: res.statusCode});\n"
+            "  let req;\n"
+            "  if (event.form === 'string') {\n"
+            "    req = https.request('https://' + event.host + '/_ministack/cfn-response/tok', {method: 'PUT'}, done);\n"
+            "  } else if (event.form === 'get') {\n"
+            "    req = https.get({hostname: event.host, path: '/_ministack/cfn-response/tok'}, done);\n"
+            "  } else {\n"
+            "    const opts = {hostname: event.host, path: '/_ministack/cfn-response/tok', method: 'PUT'};\n"
+            "    if (event.port) opts.port = event.port;\n"
+            "    req = https.request(opts, done);\n"
+            "  }\n"
+            "  req.on('error', reject);\n"
+            "  if (event.form !== 'get') req.end('{}');\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {
+            **os.environ,
+            "LAMBDA_TASK_ROOT": str(code_dir),
+            "_MS_REAL_HANDLER": "index.handler",
+            "AWS_ENDPOINT_URL": f"http://127.0.0.1:{port}",
+            "_MS_GATEWAY_HOSTS": "127.0.0.2",
+        }
+        script = (
+            "const s = require(process.argv[1]);"
+            "const event = {host: process.argv[2], port: process.argv[3] ? Number(process.argv[3]) : undefined,"
+            "  form: process.argv[4] || 'options'};"
+            "s.handler(event, {}).then("
+            "  (r) => process.stdout.write(JSON.stringify(r)),"
+            "  (e) => process.stdout.write(JSON.stringify({error: e.code || String(e)})));"
+        )
+
+        def run(host, hport=None, form="options"):
+            proc = subprocess.run(
+                ["node", "-e", script, str(code_dir / "_msctx_shim.js"), host, str(hport or ""), form],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        # The CDK shape: hostname and path only, https default port. The gateway
+        # host becomes http on the gateway port.
+        assert run("127.0.0.1") == {"status": 200}
+        assert seen[-1] == ("PUT", "/_ministack/cfn-response/tok", f"127.0.0.1:{port}")
+        # An explicit 443 is the same case; so is the advertised gateway host
+        # the container learns through _MS_GATEWAY_HOSTS.
+        assert run("127.0.0.1", 443) == {"status": 200}
+        if on_linux:
+            assert run("127.0.0.2") == {"status": 200}
+            assert seen[-1] == ("PUT", "/_ministack/cfn-response/tok", f"127.0.0.2:{port}")
+        # The string-URL and https.get forms take the same path.
+        assert run("127.0.0.1", form="string") == {"status": 200}
+        assert seen[-1][0] == "PUT"
+        assert run("127.0.0.1", form="get") == {"status": 200}
+        assert seen[-1][0] == "GET"
+        # An explicit other port on a gateway host keeps TLS: the request is
+        # not downgraded and finds no TLS listener there.
+        assert "error" in run("127.0.0.1", port + 1)
+        assert seen[-1][2] != f"127.0.0.1:{port + 1}"
+        # Every other host keeps real TLS on 443 (here: nothing listens).
+        assert "error" in run("localhost.invalid")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
