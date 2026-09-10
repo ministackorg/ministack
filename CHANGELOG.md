@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **SNS — a direct-to-phone `Publish` is recorded and can be read back** — a `Publish` carrying a `PhoneNumber` and no `TopicArn` logged one line and stored nothing, so an SMS was the only thing a suite could send through MiniStack and not observe; SES and SQS both keep what they were sent and serve it at `/_ministack/ses/messages` and `/_ministack/sqs/messages`. SNS now keeps them too, per account and per region, and serves them at `GET /_ministack/sns/sms-messages` grouped by recipient, filterable by `phoneNumber`, `account` and `region`, with `PhoneNumber`, `Message`, `MessageId`, `MessageAttributes`, `Subject`, `MessageStructure`, `TopicArn` and `SubscriptionArn` on each record. The same body is served at LocalStack's `GET /_aws/sns/sms-messages` in LocalStack's `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` shape — the same compatibility `/_localstack/health` already has — so a suite that asserts an SMS was sent runs here unedited. A filtered read names the recipient with an empty list rather than omitting the key, as LocalStack does. The log is cleared by `/_ministack/reset` and survives a persisted restart. Topic publishes are unaffected and are not recorded.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added
