@@ -807,9 +807,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return f"arn:aws:s3:::{bucket}"
 
     if service == "dynamodb":
-        table = _safe_json_field(body, "TableName")
-        if table:
-            return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+        resources = dynamodb_resource_arns(body, region, account_id)
+        if resources:
+            return resources[0]
         return "*"
 
     if service == "lambda":
@@ -916,6 +916,16 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Target-based (JSON body) services ---
 
     if service == "events":
+        try:
+            event_data = json.loads(body or b"{}")
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            event_data = {}
+        entries = event_data.get("Entries") if isinstance(event_data, dict) else None
+        if isinstance(entries, list) and entries:
+            event_bus = entries[0].get("EventBusName") or "default"
+            if event_bus.startswith("arn:"):
+                return event_bus
+            return f"arn:aws:events:{region}:{account_id}:event-bus/{event_bus}"
         name = _safe_json_field(body, "Name") or _safe_json_field(body, "RuleName")
         bus = _safe_json_field(body, "EventBusName") or "default"
         if name:
@@ -1514,6 +1524,29 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     return "*"
+
+
+def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Return every table ARN addressed by a DynamoDB JSON request."""
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    table = data.get("TableName") if isinstance(data, dict) else None
+    if isinstance(table, str) and table:
+        index = data.get("IndexName")
+        suffix = f"/index/{index}" if isinstance(index, str) and index else ""
+        return [
+            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
+        ]
+    else:
+        request_items = data.get("RequestItems") if isinstance(data, dict) else None
+        tables = list(request_items) if isinstance(request_items, dict) else []
+    return [
+        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        for name in tables
+        if isinstance(name, str) and name
+    ]
 
 
 def access_denied_response(service: str, action: str, principal_arn: str,

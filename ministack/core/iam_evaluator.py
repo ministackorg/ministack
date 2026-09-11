@@ -49,6 +49,7 @@ class EvalContext:
     secure_transport: bool = False
     request_tags: dict[str, str] = field(default_factory=dict)
     tag_keys: list[str] = field(default_factory=list)
+    service_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -179,6 +180,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         # role conditions its S3 grant on this key, so leaving it unresolved
         # denied every `cdk deploy` under AUTH=true.
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
+    if k in ctx.service_context:
+        return ctx.service_context[k]
     return None  # key not present
 
 
@@ -674,11 +677,13 @@ def resolve_principal(access_key_id: str,
             )
         assumed_arn = session.get("Arn", "")
         role_name = _role_name_from_assumed_arn(assumed_arn)
-        policies = _gather_role_policies(role_name, account_id)
+        arn_parts = assumed_arn.split(":")
+        session_account = arn_parts[4] if len(arn_parts) >= 6 else account_id
+        policies = _gather_role_policies(role_name, session_account)
         return PrincipalInfo(
             arn=assumed_arn,
             type="AssumedRole",
-            account=account_id,
+            account=session_account,
             policies=policies,
         )
 
@@ -785,7 +790,8 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
 
 
 def enforce(access_key_id: str, iam_action: str, service: str,
-            region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
+            region: str, resource_arn: str = "*",
+            service_context: dict[str, Any] | None = None) -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.
 
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
@@ -815,6 +821,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         action=iam_action,
         resource_arn=resource_arn,
         region=region,
+        service_context={
+            key.lower(): value for key, value in (service_context or {}).items()
+        },
     )
 
     result = evaluate(ctx, principal.policies)
