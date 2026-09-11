@@ -7648,8 +7648,9 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_
     """Update an API in place: every property but ProtocolType is No
     interruption on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-api.html),
-    so the record keeps its apiId, its apiEndpoint and the routes,
-    integrations and stages stored under the id, as UpdateApi does. The
+    so the update goes through the service's own UpdateApi and the record
+    keeps its apiId, its apiEndpoint and the routes, integrations and
+    stages stored under the id. The
     create fallback minted a new id on every change, which re-created every
     child that Refs the API, and with an ms-custom-id tag its second
     _resolve_custom_api_id call refused the pinned id as already in use and
@@ -7665,11 +7666,11 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_
     )
     if replaced is not None:
         return replaced
-    api.update(_apigw_v2_api_props(new_props, stack_name, logical_id or physical_id))
-    if new_props.get("CorsConfiguration"):
-        api["corsConfiguration"] = new_props["CorsConfiguration"]
-    else:
-        api.pop("corsConfiguration", None)
+    payload = _apigw_v2_api_props(new_props, stack_name, logical_id or physical_id)
+    payload["corsConfiguration"] = new_props.get("CorsConfiguration") or {}
+    resp = _apigw_v2._update_api(physical_id, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Api update failed: {resp[2]!r}")
     _reconcile_tag_map(api.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
 
@@ -7718,8 +7719,9 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     """Update a stage in place: every property but ApiId and StageName is No
     interruption on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-stage.html),
-    so the record keeps its name and its creation date as UpdateStage does,
-    which also refreshes lastUpdatedDate. The create fallback rebuilt the
+    so the update goes through the service's own UpdateStage, which keeps
+    the name and the creation date and refreshes lastUpdatedDate. The
+    create fallback rebuilt the
     record under the same name, which reset createdDate and the tags set
     through the service's own API. A property the template drops reverts to
     the create's default. ApiId and StageName require replacement: the new
@@ -7734,7 +7736,9 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     )
     if replaced is not None:
         return replaced
-    stage.update(_apigw_v2_stage_props(new_props))
+    resp = _apigw_v2._update_stage(api_id, stage_name, _apigw_v2_stage_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Stage update failed: {resp[2]!r}")
     _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"StageName": stage_name}
 
@@ -7785,8 +7789,9 @@ def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name, 
     """Update an integration in place: every property but ApiId is No
     interruption on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-integration.html),
-    so the record keeps its integrationId, which every Route's Target
-    names, as UpdateIntegration does. The create fallback minted a new id
+    so the update goes through the service's own UpdateIntegration and the
+    record keeps its integrationId, which every Route's Target names. The
+    create fallback minted a new id
     on every change and left the old integration on the API. A property the
     template drops reverts to the create's default. ApiId requires
     replacement: the integration is created on the new API before the old
@@ -7801,7 +7806,10 @@ def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name, 
     )
     if replaced is not None:
         return replaced
-    integration.update(_apigw_v2_integration_props(new_props))
+    resp = _apigw_v2._update_integration(old_api_id, int_id,
+                                         _apigw_v2_integration_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Integration update failed: {resp[2]!r}")
     return physical_id, {"IntegrationId": int_id, "ApiId": old_api_id}
 
 
@@ -7851,7 +7859,8 @@ def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name, logica
     """Update a route in place: every property but ApiId is No interruption
     on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-route.html),
-    so the record keeps its routeId as UpdateRoute does. The create fallback
+    so the update goes through the service's own UpdateRoute and the record
+    keeps its routeId. The create fallback
     minted a new id on every change and left the old route on the API,
     where its route key kept matching requests. A property the template
     drops reverts to the create's default. ApiId requires replacement: the
@@ -7865,7 +7874,9 @@ def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name, logica
     )
     if replaced is not None:
         return replaced
-    route.update(_apigw_v2_route_props(new_props))
+    resp = _apigw_v2._update_route(api_id, route_id, _apigw_v2_route_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Route update failed: {resp[2]!r}")
     return physical_id, {"RouteId": route_id}
 
 

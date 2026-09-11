@@ -1838,10 +1838,18 @@ def _update_api(api_id, data):
     api = _apis.get(api_id)
     if not api:
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
-    for k in ("name", "corsConfiguration", "routeSelectionExpression",
-              "disableSchemaValidation", "disableExecuteApiEndpoint", "version"):
+    for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
+              "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
+              "description"):
         if k in data:
             api[k] = data[k]
+    # UpdateApi takes the whole CORS configuration, so an empty one removes it
+    # rather than storing a blank block the reader would have to interpret.
+    if "corsConfiguration" in data:
+        if data["corsConfiguration"]:
+            api["corsConfiguration"] = data["corsConfiguration"]
+        else:
+            api.pop("corsConfiguration", None)
     return _apigw_response(api)
 
 
