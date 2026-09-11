@@ -9656,6 +9656,117 @@ def test_cfn_apigateway_rest_api_tracks_stack_region(cfn, apigw_v1):
         _wait_stack(west_cfn, stack_name)
 
 
+def test_cfn_apigateway_method_responses_survive_provisioning(cfn, apigw_v1):
+    """MethodResponses and Integration.IntegrationResponses declared in a template
+    reach the deployed method, so a CDK-style defaultCorsPreflightOptions OPTIONS
+    method actually answers with the Access-Control-Allow-* headers it maps."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-cors-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"cors-cfn-{suffix}"},
+            },
+            "Items": {
+                "Type": "AWS::ApiGateway::Resource",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ParentId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                    "PathPart": "items",
+                },
+            },
+            "OptionsMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResourceId": {"Ref": "Items"},
+                    "HttpMethod": "OPTIONS",
+                    "AuthorizationType": "NONE",
+                    "Integration": {
+                        "Type": "MOCK",
+                        "RequestTemplates": {"application/json": '{ "statusCode": 200 }'},
+                        "IntegrationResponses": [
+                            {
+                                "StatusCode": "204",
+                                "ResponseParameters": {
+                                    "method.response.header.Access-Control-Allow-Origin": "'*'",
+                                    "method.response.header.Access-Control-Allow-Headers": (
+                                        "'Content-Type,Authorization'"
+                                    ),
+                                    "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET'",
+                                },
+                            },
+                        ],
+                    },
+                    "MethodResponses": [
+                        {
+                            "StatusCode": "204",
+                            "ResponseParameters": {
+                                "method.response.header.Access-Control-Allow-Origin": True,
+                                "method.response.header.Access-Control-Allow-Headers": True,
+                                "method.response.header.Access-Control-Allow-Methods": True,
+                            },
+                        },
+                    ],
+                },
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "DependsOn": "OptionsMethod",
+                "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "prod"},
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "Api"}},
+            "ResourceId": {"Value": {"Ref": "Items"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        method = apigw_v1.get_method(
+            restApiId=outputs["ApiId"],
+            resourceId=outputs["ResourceId"],
+            httpMethod="OPTIONS",
+        )
+        assert method["methodResponses"], "MethodResponses were dropped during provisioning"
+        assert "204" in method["methodResponses"]
+        integration_responses = method["methodIntegration"]["integrationResponses"]
+        assert integration_responses, "IntegrationResponses were dropped during provisioning"
+        # Quotes are stripped at request time, not at storage time, so the
+        # stored mapping must keep them verbatim.
+        assert integration_responses["204"]["responseParameters"] == {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,Authorization'",
+            "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET'",
+        }
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/prod/items",
+            method="OPTIONS",
+            headers={
+                "Host": f"{outputs['ApiId']}.execute-api.localhost:{port}",
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 204
+            assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+            assert resp.headers.get("Access-Control-Allow-Methods") == "OPTIONS,GET"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
     """CloudFormation provisions CDK-style regional and edge custom domains."""
     suffix = _uuid_mod.uuid4().hex[:8]

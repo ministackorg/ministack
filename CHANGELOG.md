@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — an `AWS::ApiGateway::Method`'s `MethodResponses` and `IntegrationResponses` are provisioned** — the provisioner read the method and integration properties and discarded both response lists, so every REST API deployed from a template lost its mapped response headers. The visible casualty was the CDK's `defaultCorsPreflightOptions`, whose generated `OPTIONS` method returns the `Access-Control-Allow-*` headers through a MOCK integration's `responseParameters`: the preflight answered without a single CORS header and the browser blocked the request. That became load-bearing once `COGNITO_USER_POOLS` authorizers were enforced in 1.5.10, because the preflight can no longer fall through to a proxy integration and be answered by the application's own CORS middleware. Both lists are now provisioned onto the method, where the existing request-time mapping picks them up, and a stack update reprovisions them from the template. Contributed by @ppettitau.
+
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

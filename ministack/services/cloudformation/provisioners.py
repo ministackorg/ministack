@@ -3541,6 +3541,20 @@ def _apigw_method_create(logical_id, props, stack_name):
     }
     _apigw_v1._put_method(api_id, resource_id, http_method, data)
 
+    # apigateway_v1 stores these in dicts keyed by the status code as a string,
+    # and a template may legitimately carry StatusCode as an integer.
+    for method_response in props.get("MethodResponses", []) or []:
+        _apigw_v1._put_method_response(
+            api_id,
+            resource_id,
+            http_method,
+            str(method_response.get("StatusCode", "200")),
+            {
+                "responseParameters": method_response.get("ResponseParameters", {}),
+                "responseModels": method_response.get("ResponseModels", {}),
+            },
+        )
+
     # Also set Integration if provided
     integration = props.get("Integration")
     if integration:
@@ -3557,6 +3571,20 @@ def _apigw_method_create(logical_id, props, stack_name):
             "cacheKeyParameters": integration.get("CacheKeyParameters", []),
         }
         _apigw_v1._put_integration(api_id, resource_id, http_method, int_data)
+
+        for integration_response in integration.get("IntegrationResponses", []) or []:
+            _apigw_v1._put_integration_response(
+                api_id,
+                resource_id,
+                http_method,
+                str(integration_response.get("StatusCode", "200")),
+                {
+                    "selectionPattern": integration_response.get("SelectionPattern", ""),
+                    "responseParameters": integration_response.get("ResponseParameters", {}),
+                    "responseTemplates": integration_response.get("ResponseTemplates", {}),
+                    "contentHandling": integration_response.get("ContentHandling"),
+                },
+            )
 
     pid = f"{api_id}-{resource_id}-{http_method}"
     return pid, {}
