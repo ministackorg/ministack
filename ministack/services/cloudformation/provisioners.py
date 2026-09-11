@@ -647,18 +647,27 @@ _RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
 
 
 def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_id,
-                        declared_name, current_name, create_fn, delete_fn):
+                        declared_name, current_name, create_fn, delete_fn,
+                        delete_when_id_unchanged=False):
     """Shared prologue for the name-keyed update handlers: when the resource
     record is gone (current_name is None) or its create-only name property
     changed, the update is a replacement — create the new resource first, then
     delete the old one, in CloudFormation's replacement order (unless the
     resource's UpdateReplacePolicy retains it). Returns the create result, or
     None when the update can proceed in place.
+
+    The predecessor is normally left alone when the create returns the same
+    physical id, because then it IS the predecessor. A type whose physical id
+    does not carry its whole identity (a subscription filter keyed by group
+    and name, a resource server keyed by pool and identifier) replaces under
+    an unchanged id and has to delete the old record itself: those pass
+    ``delete_when_id_unchanged``.
     """
     if current_name is not None and declared_name == current_name:
         return None
     created = create_fn(logical_id or physical_id, new_props, stack_name)
-    if current_name is not None and created[0] != physical_id and not _RETAIN_REPLACED.get():
+    replaced = created[0] != physical_id or delete_when_id_unchanged
+    if current_name is not None and replaced and not _RETAIN_REPLACED.get():
         delete_fn(physical_id, old_props)
     return created
 
@@ -1144,10 +1153,8 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
 
 def _s3_bucket_policy_create(logical_id, props, stack_name):
     bucket = props.get("Bucket", "")
-    policy = props.get("PolicyDocument")
-    if bucket and policy:
-        import json
-        _s3._bucket_policies[bucket] = json.dumps(policy) if isinstance(policy, dict) else policy
+    if bucket and props.get("PolicyDocument"):
+        _s3._bucket_policies[bucket] = _policy_document_json(props)
     return f"{bucket}-policy", {}
 
 
@@ -2246,10 +2253,6 @@ def _iam_policy_delete(physical_id, props):
 
 # --- IAM InstanceProfile ---
 
-def _iam_ip_arn(name, path):
-    return f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
-
-
 def _iam_ip_roles(props):
     """The role names of the Roles property that exist, the shape the
     service keeps on the record (its XML resolves them against the role
@@ -2260,27 +2263,19 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = _iam_ip_arn(name, path)
-    if props.get("InstanceProfileName") and name in _iam._instance_profiles:
-        # CreateInstanceProfile answers EntityAlreadyExists for any duplicate
-        # name: a custom-named profile must not write over one that another
-        # stack or the API owns. A generated name is the emulator's
-        # deterministic one, so its replacement lands under the same name
-        # (AWS would mint a new one) and is not refused.
-        raise ValueError(f"AWS::IAM::InstanceProfile: {name} already exists")
-    ip_id = new_uuid().replace("-", "")[:21].upper()
-
-    profile = {
-        "InstanceProfileName": name,
-        "InstanceProfileId": ip_id,
-        "Arn": arn,
-        "Path": path,
-        "Roles": _iam_ip_roles(props),
-        "CreateDate": now_iso(),
-        "Tags": [],
-    }
-    _iam._instance_profiles[name] = profile
-    return arn, {"Arn": arn}
+    # A generated name is the emulator's deterministic one, so a replacement
+    # lands under the same name (AWS would mint a new one) and must not be
+    # refused; a custom name goes through CreateInstanceProfile as it is, and
+    # its EntityAlreadyExists keeps one stack from writing over a profile
+    # another stack or the API owns.
+    if not props.get("InstanceProfileName"):
+        _iam._instance_profiles.pop(name, None)
+    resp = _iam._create_instance_profile({"InstanceProfileName": [name], "Path": [path]})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IAM::InstanceProfile create failed: {resp[2]!r}")
+    profile = _iam._instance_profiles[name]
+    profile["Roles"] = _iam_ip_roles(props)
+    return profile["Arn"], {"Arn": profile["Arn"]}
 
 
 def _iam_ip_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -2300,7 +2295,8 @@ def _iam_ip_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         (ip for ip in _iam._instance_profiles.values() if ip.get("Arn") == physical_id), None)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
-        _iam_ip_arn(name, new_props.get("Path", "/")), profile["Arn"] if profile else None,
+        _iam.instance_profile_arn(name, new_props.get("Path", "/")),
+        profile["Arn"] if profile else None,
         _iam_ip_create, _iam_ip_delete,
     )
     if replaced is not None:
@@ -2718,6 +2714,20 @@ def _cwlogs_resource_policy_delete(physical_id, props):
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
 
+def _cwlogs_subfilter_payload(group, filter_name, props):
+    """The PutSubscriptionFilter request a template's properties describe.
+    PutSubscriptionFilter creates or updates, so the create and the
+    in-place update send the same mapping through the same service call."""
+    return {
+        "logGroupName": group,
+        "filterName": filter_name,
+        "filterPattern": props.get("FilterPattern", ""),
+        "destinationArn": props.get("DestinationArn", ""),
+        "roleArn": props.get("RoleArn", ""),
+        "distribution": props.get("Distribution", "ByLogStream"),
+    }
+
+
 def _cwlogs_subfilter_create(logical_id, props, stack_name):
     group = props.get("LogGroupName")
     if not group:
@@ -2736,15 +2746,9 @@ def _cwlogs_subfilter_create(logical_id, props, stack_name):
             "streams": {},
             "subscriptionFilters": {},
         }
-    grp.setdefault("subscriptionFilters", {})[filter_name] = {
-        "filterName": filter_name,
-        "logGroupName": group,
-        "filterPattern": props.get("FilterPattern", ""),
-        "destinationArn": props.get("DestinationArn", ""),
-        "roleArn": props.get("RoleArn", ""),
-        "distribution": props.get("Distribution", "ByLogStream"),
-        "creationTime": int(time.time() * 1000),
-    }
+    resp = _cw_logs._put_subscription_filter(_cwlogs_subfilter_payload(group, filter_name, props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::SubscriptionFilter create failed: {resp[2]!r}")
     return filter_name, {}
 
 
@@ -2775,20 +2779,17 @@ def _cwlogs_subfilter_update(physical_id, old_props, new_props, stack_name, logi
         stack_name, logical_id or physical_id, max_len=512)
     grp = _cw_logs._log_groups.get(old_group)
     current = grp.get("subscriptionFilters", {}).get(physical_id) if grp else None
-    if current is None or filter_name != physical_id or new_group != old_group:
-        created = _cwlogs_subfilter_create(logical_id or physical_id, new_props, stack_name)
-        if current is not None and not _RETAIN_REPLACED.get():
-            _cwlogs_subfilter_delete(physical_id, old_props)
-        return created
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_group, filter_name), (old_group, physical_id) if current else None,
+        _cwlogs_subfilter_create, _cwlogs_subfilter_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
 
-    resp = _cw_logs._put_subscription_filter({
-        "logGroupName": new_group,
-        "filterName": physical_id,
-        "filterPattern": new_props.get("FilterPattern", ""),
-        "destinationArn": new_props.get("DestinationArn", ""),
-        "roleArn": new_props.get("RoleArn", ""),
-        "distribution": new_props.get("Distribution", "ByLogStream"),
-    })
+    resp = _cw_logs._put_subscription_filter(
+        _cwlogs_subfilter_payload(new_group, physical_id, new_props))
     if resp[0] >= 400:
         raise ValueError(f"AWS::Logs::SubscriptionFilter update failed: {resp[2]!r}")
     return physical_id, {}
@@ -5006,17 +5007,31 @@ def _policy_attachment_update(physical_id, old_props, new_props, members, store)
     return physical_id, {}
 
 
+def _policy_attachment_create(logical_id, props, stack_name, members, store):
+    """Shared create for the two policy-attachment types: the document is
+    written on every member the template names, and the physical id is the
+    generated one CloudFormation mints for a type with no name of its own."""
+    policy_doc = _policy_document_json(props)
+    for member in props.get(members, []):
+        record = store.get(member)
+        if record:
+            record["attributes"]["Policy"] = policy_doc
+    return f"{stack_name}-{logical_id}-{new_uuid()[:8]}", {}
+
+
+def _policy_attachment_delete(props, members, store):
+    """Shared delete for the two policy-attachment types: the member goes
+    back to the service's default, which is no Policy attribute at all."""
+    for member in props.get(members, []):
+        record = store.get(member)
+        if record:
+            record["attributes"].pop("Policy", None)
+
+
 # --- SQS QueuePolicy ---
 
 def _sqs_queue_policy_create(logical_id, props, stack_name):
-    policy_doc = _policy_document_json(props)
-    queues = props.get("Queues", [])
-    for queue_url in queues:
-        queue = _sqs._queues.get(queue_url)
-        if queue:
-            queue["attributes"]["Policy"] = policy_doc
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {}
+    return _policy_attachment_create(logical_id, props, stack_name, "Queues", _sqs._queues)
 
 
 def _sqs_queue_policy_update(physical_id, old_props, new_props, stack_name):
@@ -5024,24 +5039,13 @@ def _sqs_queue_policy_update(physical_id, old_props, new_props, stack_name):
 
 
 def _sqs_queue_policy_delete(physical_id, props):
-    queues = props.get("Queues", [])
-    for queue_url in queues:
-        queue = _sqs._queues.get(queue_url)
-        if queue:
-            queue["attributes"].pop("Policy", None)
+    _policy_attachment_delete(props, "Queues", _sqs._queues)
 
 
 # --- SNS TopicPolicy ---
 
 def _sns_topic_policy_create(logical_id, props, stack_name):
-    policy_doc = _policy_document_json(props)
-    topics = props.get("Topics", [])
-    for topic_arn in topics:
-        topic = _sns._topics.get(topic_arn)
-        if topic:
-            topic["attributes"]["Policy"] = policy_doc
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {}
+    return _policy_attachment_create(logical_id, props, stack_name, "Topics", _sns._topics)
 
 
 def _sns_topic_policy_update(physical_id, old_props, new_props, stack_name):
@@ -5049,12 +5053,7 @@ def _sns_topic_policy_update(physical_id, old_props, new_props, stack_name):
 
 
 def _sns_topic_policy_delete(physical_id, props):
-    topics = props.get("Topics", [])
-    for topic_arn in topics:
-        topic = _sns._topics.get(topic_arn)
-        if topic:
-            # Restore default policy
-            topic["attributes"].pop("Policy", None)
+    _policy_attachment_delete(props, "Topics", _sns._topics)
 
 
 # --- AppSync resource provisioners ---
@@ -5646,13 +5645,11 @@ def _cognito_user_pool_resource_server_update(physical_id, old_props, new_props,
     MiniStack's own fallback. Identifier and UserPoolId require replacement,
     and the new resource server is created before the old one is removed.
 
-    The replacement test is spelled out here rather than going through
-    _rename_replacement because a resource server is keyed by (pool,
-    identifier) while its physical id is the identifier alone: a move to
-    another pool keeps the id, so the helper would see no replacement, the
-    engine's cleanup would not run either, and the resource server would stay
-    behind in the pool the template left. The pool has to be part of the
-    test. Under a declared Identifier the move is refused before we get here
+    A resource server is keyed by (pool, identifier) while its physical id is
+    the identifier alone, so a move to another pool keeps the id and the
+    engine's cleanup never sees the replacement: the handler passes the pair
+    as the identity and asks the shared helper to delete under an unchanged
+    id. Under a declared Identifier the move is refused before we get here
     (_custom_named_replacement_error, the way CloudFormation refuses to
     replace a custom-named resource); this branch carries the case where the
     template leaves the Identifier off. A resource server the template
@@ -5665,13 +5662,15 @@ def _cognito_user_pool_resource_server_update(physical_id, old_props, new_props,
     new_pid = new_props.get("UserPoolId", "")
     pool = _cognito._user_pools.get(old_pid)
     server = _cognito._pool_resource_servers(pool).get(physical_id) if pool else None
-    if server is None or identifier != physical_id or new_pid != old_pid:
-        created = _cognito_user_pool_resource_server_create(
-            logical_id or physical_id, new_props, stack_name
-        )
-        if server is not None and not _RETAIN_REPLACED.get():
-            _cognito_user_pool_resource_server_delete(physical_id, old_props)
-        return created
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_pid, identifier), (old_pid, physical_id) if server else None,
+        _cognito_user_pool_resource_server_create,
+        _cognito_user_pool_resource_server_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
 
     status, _, body = _cognito._update_resource_server({
         "UserPoolId": new_pid,
