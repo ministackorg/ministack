@@ -17,6 +17,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `UpdateReplacePolicy: Retain` holds for every handler-side replacement** — 24 update handlers that replace a resource themselves (a renamed SSM parameter, CloudWatch dashboard, IoT policy or provisioning template, a Cognito user pool group or client moved to another pool, an S3 bucket policy moved to another bucket, the API Gateway REST resources, a Lambda permission, URL, event source mapping or event invoke config, a Firehose delivery stream, an OpenSearch domain) deleted the predecessor inline, so a template that retains it lost the resource, and where the physical id changed the stack still recorded `DELETE_SKIPPED` for it; only the handlers routed through the shared rename helper honoured the policy. Every inline delete now goes through one helper that reads the policy the engine publishes, the three handlers that deleted before creating create first, and the predecessor stays, with its `DELETE_SKIPPED` event where the replacement changes the physical id, as on AWS. Contributed by @iot-rocket.
 
+- **CloudFormation — a resource inside a nested stack reads its own `UpdateReplacePolicy`** — the nested-stack deploy loop never set the contextvar the engine publishes the policy in, so every handler running for a child resource saw whatever the parent's own loop had left there: a retained parent kept every child's predecessor and an unretained parent deleted a retained child's. The loop now resolves each child resource's policy the way the engine does, intrinsics included, and publishes it around that resource's update only. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

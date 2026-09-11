@@ -3286,7 +3286,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
-    from ministack.services.cloudformation.stacks import _add_event
+    from ministack.services.cloudformation.stacks import _add_event, _resource_policy
 
     template_url = props.get("TemplateURL")
     if not template_url:
@@ -3411,10 +3411,20 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                     resource_type, prev.get("Properties", {}),
                     (previous_stack_snapshot or {}).get("Tags") or [],
                     child_name, child_stack_id, child_logical_id)
-                physical_id, attrs = _update_resource(
-                    resource_type, prev.get("PhysicalResourceId", child_logical_id),
-                    old_tagged, new_tagged, child_name, child_logical_id,
-                )
+                # The child's own UpdateReplacePolicy decides whether a
+                # handler-side replacement keeps the predecessor; without
+                # this the parent's policy leaked into the child's handlers.
+                token = _RETAIN_REPLACED.set(_resource_policy(
+                    res_def, "UpdateReplacePolicy", provisioned, param_values,
+                    conditions, mappings, child_name, child_stack_id,
+                ) in _RETAINING_POLICIES)
+                try:
+                    physical_id, attrs = _update_resource(
+                        resource_type, prev.get("PhysicalResourceId", child_logical_id),
+                        old_tagged, new_tagged, child_name, child_logical_id,
+                    )
+                finally:
+                    _RETAIN_REPLACED.reset(token)
             else:
                 physical_id, attrs = _provision_resource(
                     resource_type, child_logical_id, new_tagged, child_name,

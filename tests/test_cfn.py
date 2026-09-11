@@ -18484,6 +18484,76 @@ def test_cfn_update_replace_policy_retain_except_on_create_also_holds(cfn, ssm):
                 pass
 
 
+def test_cfn_nested_stack_child_reads_its_own_update_replace_policy(monkeypatch):
+    """A resource inside a nested stack keeps its predecessor under its own
+    UpdateReplacePolicy Retain and loses it without, whatever the policy on
+    the parent's AWS::CloudFormation::Stack resource: the nested-stack loop
+    ran the child's handlers under the parent's policy before."""
+    from ministack.services import ssm as _ssm
+    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation import helpers as _helpers
+    from ministack.services.cloudformation.provisioners import (
+        _RETAIN_REPLACED,
+        _cfn_nested_stack_deploy,
+    )
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-retain-{uid}"
+    names = [f"/cfn-nested-retain-{uid}/{i}" for i in ("a", "b", "c")]
+    templates = {}
+
+    def child(name, policy):
+        res = {"Type": "AWS::SSM::Parameter",
+               "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return {"Resources": {"Param": res}}
+
+    monkeypatch.setattr(
+        _helpers, "_resolve_template",
+        lambda params: (json.dumps(templates[params["TemplateURL"][0]]), None))
+    _stacks[parent] = {
+        "StackName": parent,
+        "StackId": f"arn:aws:cloudformation:us-east-1:000000000000:stack/{parent}/parent",
+        "StackStatus": "UPDATE_IN_PROGRESS", "_resources": {},
+    }
+
+    def deploy(url, parent_retains, previous=None):
+        props = {"TemplateURL": url}
+        token = _RETAIN_REPLACED.set(parent_retains)
+        try:
+            if previous is None:
+                child_id, _attrs = _cfn_nested_stack_deploy("Child", props, parent)
+            else:
+                child_id, _attrs = _cfn_nested_stack_deploy(
+                    "Child", props, parent, previous_physical_id=previous, previous_props=props)
+        finally:
+            _RETAIN_REPLACED.reset(token)
+        return child_id.split("/")[1]
+
+    def exists(name):
+        return name in _ssm._parameters
+
+    try:
+        # The child retains, the parent resource does not: the predecessor stays.
+        templates["s3://tpl/a"] = child(names[0], "Retain")
+        templates["s3://tpl/b"] = child(names[1], "Retain")
+        stack = deploy("s3://tpl/a", parent_retains=False)
+        deploy("s3://tpl/b", parent_retains=False, previous=stack)
+        assert exists(names[0]) and exists(names[1])
+        # The child does not retain, the parent resource does: it is deleted.
+        templates["s3://tpl/c"] = child(names[2], None)
+        deploy("s3://tpl/c", parent_retains=True, previous=stack)
+        assert not exists(names[1])
+        assert exists(names[2])
+    finally:
+        for name in [n for n in list(_stacks) if n.startswith(parent)]:
+            gone = _stacks.pop(name, None) or {}
+            _stack_events.pop(gone.get("StackId"), None)
+        for name in names:
+            _ssm._parameters.pop(name, None)
+
+
 def test_cfn_apigw_api_key_rename_replaces_it(cfn, apigw_v1):
     """Name is Replacement on AWS::ApiGateway::ApiKey: the renamed key is
     created before the old one is removed, so Ref moves to a new key id and
