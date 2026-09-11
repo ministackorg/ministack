@@ -26,6 +26,7 @@ from .engine import (
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    declared_transforms,
     validate_template_support,
 )
 from .helpers import (
@@ -157,26 +158,6 @@ def _required_capabilities(template, strict=False):
     if macro:
         capabilities.append("CAPABILITY_AUTO_EXPAND")
     return capabilities, reason_types
-
-
-def _declared_transforms(template):
-    """The template's top-level ``Transform``, always as a list of names.
-
-    The section takes a string, a list, or the macro object
-    (``Transform: {Name: ..., Parameters: {...}}``, the documented shape for
-    ``AWS::Include``); a list entry may be either of the last two.
-    """
-    declared = template.get("Transform")
-    if not declared:
-        return []
-    entries = declared if isinstance(declared, list) else [declared]
-    names = []
-    for entry in entries:
-        if isinstance(entry, dict):
-            entry = entry.get("Name")
-        if isinstance(entry, str):
-            names.append(entry)
-    return names
 
 
 def _capabilities_xml(template):
@@ -1070,7 +1051,7 @@ def _validate_template(params):
         )
 
     transforms_xml = "".join(
-        f"<member>{_esc(t)}</member>" for t in _declared_transforms(template))
+        f"<member>{_esc(t)}</member>" for t in declared_transforms(template))
     declared_block = (f"<DeclaredTransforms>{transforms_xml}</DeclaredTransforms>"
                       if transforms_xml else "")
 

@@ -2550,6 +2550,36 @@ def test_cfn_validate_template(cfn):
         cfn.validate_template(TemplateBody=json.dumps(invalid_template))
 
 
+def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
+    """DeclaredTransforms and the deploy path read one function, so a
+    template that ValidateTemplate reports as declaring the SAM transform is
+    a template the stack operation actually transforms. The macro object
+    (Transform: {Name: ...}) is the form that used to be reported and not
+    applied."""
+    from ministack.services.cloudformation.engine import (
+        _apply_sam_transform_if_applicable,
+        declared_transforms,
+    )
+
+    sam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"F": {"Type": "AWS::Serverless::Function", "Properties": {
+            "Runtime": "python3.12", "Handler": "index.handler", "CodeUri": "s3://b/k"}}},
+    }
+    for declared in ("AWS::Serverless-2016-10-31",
+                     {"Name": "AWS::Serverless-2016-10-31"},
+                     ["AWS::Serverless-2016-10-31"]):
+        template = json.loads(json.dumps(dict(sam, Transform=declared)))
+        assert declared_transforms(template) == ["AWS::Serverless-2016-10-31"]
+        out = _apply_sam_transform_if_applicable(template)
+        types = {res.get("Type") for res in out["Resources"].values()}
+        assert "AWS::Serverless::Function" not in types
+        assert "AWS::Lambda::Function" in types
+    # Entries the section cannot name are dropped rather than reported.
+    assert declared_transforms({"Transform": [{"Parameters": {}}, 5]}) == []
+    assert declared_transforms({}) == []
+
+
 def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
     """ValidateTemplate answers Capabilities, CapabilitiesReason and
     DeclaredTransforms, the three response elements the API documents next to

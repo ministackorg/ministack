@@ -1557,6 +1557,25 @@ logging.getLogger("samtranslator.feature_toggle.feature_toggle").setLevel(loggin
 
 _NO_IAM_POLICY_LOADER = SimpleNamespace(load=lambda: {})
 
+def declared_transforms(template: dict) -> list[str]:
+    """The transform names a template declares at the top level, in every
+    form the section takes: a string, the macro object with a ``Name`` (the
+    shape the AWS::Include reference documents at the top level), or a list
+    of either. Anything else is dropped. ValidateTemplate reports this list
+    and the SAM transform is looked up in it, so the two cannot disagree
+    about what a template declares.
+    """
+    declared = template.get("Transform")
+    entries = declared if isinstance(declared, list) else [declared]
+    names = []
+    for entry in entries:
+        if isinstance(entry, str):
+            names.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("Name"), str):
+            names.append(entry["Name"])
+    return names
+
+
 def _apply_sam_transform_if_applicable(template: dict) -> dict:
     """The transforms a stack operation applies before validation: every
     embedded ``AWS::Include`` first, then the SAM transform when the template
@@ -1564,9 +1583,7 @@ def _apply_sam_transform_if_applicable(template: dict) -> dict:
     template = _apply_include_transform(template)
     if isinstance(template, _IncludeFailed):
         return template
-    declared = template.get("Transform")
-    transforms = declared if isinstance(declared, list) else [declared]
-    if _SAM_TRANSFORM not in transforms:
+    if _SAM_TRANSFORM not in declared_transforms(template):
         return template
 
     try:
