@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Transcribe — `StartTranscriptionJob` returns a job already `IN_PROGRESS`** — the start response reported `QUEUED` with no `StartTime`, and the job reached `IN_PROGRESS` only from the background worker, after the response had been sent. A caller that reads the status off the start response and then waits for the terminal `Transcribe Job State Change` event, rather than polling, therefore never saw an in-progress state at all: the job went straight from queued to complete. Jobs now start `IN_PROGRESS` with `StartTime` set, matching the response the AWS CLI walkthrough documents, and `TRANSCRIBE_JOB_RUN_SECONDS` covers the whole run rather than half of it. `QUEUED`, which AWS reaches only for a request that opted into job queueing through `JobExecutionSettings.AllowDeferredExecution` while the account is at its concurrent job limit, stays reachable through the new `TRANSCRIBE_JOB_QUEUE_SECONDS` (default `0`); both knobs are settable at runtime through `/_ministack/config`. Contributed by @ppettitau.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added
