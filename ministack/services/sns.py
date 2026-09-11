@@ -129,6 +129,23 @@ _sub_arn_to_topic = AccountRegionScopedDict()
 _platform_applications = AccountRegionScopedDict()
 _platform_endpoints = AccountRegionScopedDict()
 
+# Direct-to-phone publishes, keyed by recipient phone number. SES and SQS both
+# keep what they were sent so a test can read it back
+# (/_ministack/ses/messages, /_ministack/sqs/messages); SNS was the one
+# messaging service that logged a line and stored nothing, so an SMS was the
+# only thing you could send and not observe. Served by app.py at
+# /_ministack/sns/sms-messages and at LocalStack's /_aws/sns/sms-messages.
+_sms_messages = AccountRegionScopedDict()
+
+
+def _sms_log_for(phone_number: str) -> list:
+    """The record list for one phone number in the current account and region."""
+    records = _sms_messages.get(phone_number)
+    if records is None:
+        records = []
+        _sms_messages[phone_number] = records
+    return records
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -136,6 +153,7 @@ def get_state():
     return {
         "topics": copy.deepcopy(_topics),
         "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
+        "sms_messages": copy.deepcopy(_sms_messages),
         "platform_applications": copy.deepcopy(_platform_applications),
         "platform_endpoints": copy.deepcopy(_platform_endpoints),
     }
@@ -145,6 +163,7 @@ def restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
+        _sms_messages.update(data.get("sms_messages", {}))
         _platform_applications.update(data.get("platform_applications", {}))
         _platform_endpoints.update(data.get("platform_endpoints", {}))
 
@@ -736,7 +755,21 @@ def _publish(params):
 
     if phone_number and not topic_arn:
         msg_id = new_uuid()
-        logger.info("SNS SMS stub to %s: %s", phone_number, message[:80])
+        # There is nowhere for an SMS to go, so record it instead of dropping
+        # it. Field names and nulls match what the endpoint serves, so the
+        # record needs no reshaping on the way out. `_p` defaults an absent
+        # parameter to "", and an absent Subject reads as null, not "".
+        _sms_log_for(phone_number).append({
+            "PhoneNumber": phone_number,
+            "TopicArn": None,
+            "SubscriptionArn": None,
+            "MessageId": msg_id,
+            "Message": message,
+            "MessageAttributes": _parse_message_attributes(params),
+            "MessageStructure": message_structure or None,
+            "Subject": subject or None,
+        })
+        logger.info("SNS SMS to %s: %s", phone_number, message[:80])
         return _xml(200, "PublishResponse",
                     f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
 
@@ -1727,5 +1760,6 @@ def _build_envelope(topic_arn: str, msg_id: str, message: str, subject: str,
 def reset():
     _topics.clear()
     _sub_arn_to_topic.clear()
+    _sms_messages.clear()
     _platform_applications.clear()
     _platform_endpoints.clear()

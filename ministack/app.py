@@ -1097,6 +1097,100 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
 
 
+_SNS_SMS_PATHS = ("/_ministack/sns/sms-messages", "/_aws/sns/sms-messages")
+
+
+async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict, query_params: dict):
+    """Handle the SNS SMS log endpoint.
+
+    A `Publish` that carries a `PhoneNumber` and no `TopicArn` has nowhere to
+    deliver to, so sns.py records it and this serves the recording back. Same
+    read-only introspection as `/_ministack/ses/messages` and
+    `/_ministack/sqs/messages`.
+
+    Also answered at LocalStack's `/_aws/sns/sms-messages`, in LocalStack's
+    `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` shape, for the
+    same reason `/_localstack/health` is answered alongside
+    `/_ministack/health`: a suite that asserts an SMS was sent should not have
+    to be rewritten to run here.
+
+    Filters:
+      ?account=<12-digit-id>   restrict to one account
+      ?region=<aws-region>     restrict to one region
+      ?phoneNumber=<e164>      restrict to one recipient; the key is present
+                               with an empty list when nothing was sent to it
+    """
+    if path not in _SNS_SMS_PATHS or method != "GET":
+        return None
+
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return (
+                400,
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "__type": "InvalidAccountID",
+                        "message": f"Account ID must be 12 digits, got: {account_id}",
+                    }
+                ).encode(),
+            )
+
+    default_region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    region_filter = None
+    if "region" in query_params:
+        raw_region = query_params["region"]
+        region_filter = raw_region[0] if isinstance(raw_region, (list, tuple)) else raw_region
+    phone_filter = None
+    if "phoneNumber" in query_params:
+        raw_phone = query_params["phoneNumber"]
+        phone_filter = raw_phone[0] if isinstance(raw_phone, (list, tuple)) else raw_phone
+
+    try:
+        mod = _get_module("sns")
+        try:
+            all_data = mod._sms_messages.to_dict()
+        except Exception:
+            all_data = {}
+
+        sms_messages: dict[str, list] = {}
+        for scoped_key, records in all_data.items():
+            if len(scoped_key) == 3:
+                acct, region, phone = scoped_key
+            elif len(scoped_key) == 2:
+                acct, phone = scoped_key
+                region = default_region
+            else:
+                continue
+            if account_id is not None and acct != account_id:
+                continue
+            if region_filter is not None and region != region_filter:
+                continue
+            if phone_filter is not None and phone != phone_filter:
+                continue
+            if isinstance(records, list):
+                sms_messages.setdefault(phone, []).extend(records)
+
+        # LocalStack answers a filtered request with the key present and empty
+        # rather than with an absent key, and a poller that reads
+        # `body.sms_messages[phone]` depends on that.
+        if phone_filter is not None:
+            sms_messages.setdefault(phone_filter, [])
+
+        response = {
+            "sms_messages": sms_messages,
+            "region": region_filter or default_region,
+        }
+    except Exception as e:
+        logger.exception("Error retrieving SNS SMS messages: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
+
+
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
@@ -1132,6 +1226,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         return response
 
     response = await _handle_sqs_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
+    response = await _handle_sns_sms_messages_request(method, path, headers, query_params)
     if response is not None:
         return response
 

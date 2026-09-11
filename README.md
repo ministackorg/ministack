@@ -99,6 +99,12 @@ curl http://localhost:4566/_ministack/sqs/messages
 
 # Filter by account and/or a specific queue
 curl "http://localhost:4566/_ministack/sqs/messages?account=000000000000&QueueUrl=http://localhost:4566/000000000000/my-queue"
+
+# Inspect SMS sent via SNS Publish with a PhoneNumber — grouped by recipient
+curl http://localhost:4566/_ministack/sns/sms-messages
+
+# Filter by recipient, account and/or region
+curl "http://localhost:4566/_ministack/sns/sms-messages?phoneNumber=%2B15551234567"
 ```
 
 The reset endpoint is especially useful in CI pipelines and test suites — call it in `setUp`/`beforeEach` to get a clean environment for every test without restarting the container. Add `?init=1` to re-run your init scripts after the reset, restoring any resources they create (VPCs, queues, seed data, etc.).
@@ -124,11 +130,15 @@ docker run -p 4566:4566 \
 
 Or use the multi-tenancy feature — a 12-digit access key automatically becomes the account ID (see [Multi-Tenancy](#multi-tenancy) below).
 
-Also compatible with LocalStack's health endpoint:
+Also compatible with LocalStack's health and SMS-log endpoints:
 
 ```bash
 curl http://localhost:4566/_localstack/health
 curl http://localhost:4566/health
+
+# Same body as /_ministack/sns/sms-messages, in LocalStack's
+# {"sms_messages": {"<phone>": [...]}, "region": "<region>"} shape
+curl http://localhost:4566/_aws/sns/sms-messages
 ```
 
 ---
