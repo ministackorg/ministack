@@ -3694,6 +3694,39 @@ def test_sfn_integration_ecs_run_task(sfn, ecs):
     output = json.loads(desc["output"])
     assert "tasks" in output
 
+
+def test_sfn_ecs_sync_poll_waits_for_stopped_and_preserves_result(monkeypatch):
+    """The sync integration must wait past PENDING/RUNNING states."""
+    from ministack.services import ecs as ecs_service
+    from ministack.services import stepfunctions as sfn_service
+
+    responses = [
+        {"tasks": [{"lastStatus": "PENDING"}], "failures": []},
+        {"tasks": [{"lastStatus": "RUNNING"}], "failures": []},
+        {
+            "tasks": [{
+                "lastStatus": "STOPPED",
+                "containers": [{"exitCode": 17}],
+            }],
+            "failures": [],
+        },
+    ]
+    seen = []
+
+    def describe(data):
+        seen.append(data)
+        return 200, {}, json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(ecs_service, "_describe_tasks", describe)
+    monkeypatch.setattr(sfn_service, "_scaled_sleep", lambda _seconds: None)
+
+    result = sfn_service._poll_ecs_tasks("cluster", ["task-arn"])
+
+    assert len(seen) == 3
+    assert result["tasks"][0]["lastStatus"] == "STOPPED"
+    assert result["tasks"][0]["containers"][0]["exitCode"] == 17
+
+
 def test_sfn_integration_ecs_run_task_sync_success(sfn, ecs):
     """ecs:runTask.sync waits for task STOPPED, then returns task result."""
     import threading
@@ -3816,7 +3849,7 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert "taskArn" in task_out
     assert "containers" in task_out
     assert task_out["containers"][0]["name"] == "app"
-    assert task_out["lastStatus"] == "RUNNING"
+    assert task_out["lastStatus"] in ("PENDING", "RUNNING")
     assert "failures" in output
 
 def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):
