@@ -59,6 +59,7 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_HEADER,
     acquire_worker,
     ensure_spawned,
+    execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -4203,9 +4204,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-        "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -4213,6 +4211,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
     }
+    container_env.update(execution_credentials(config))
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
@@ -5171,8 +5170,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
                 "AWS_DEFAULT_REGION": get_region(),
                 "AWS_REGION": get_region(),
-                "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
                 "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
                 "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
                 "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -5180,6 +5177,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 "LAMBDA_TASK_ROOT": code_dir,
                 "_HANDLER": config.get("Handler", "bootstrap"),
             })
+            proc_env.update(execution_credentials(config))
             proc_env.update(env_vars)
             proc_env.update(_durable_env_overlay())
             # X-Ray active tracing. ``_execute_function_provided`` builds
@@ -5325,9 +5323,6 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                    "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
                     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
                     "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -5340,6 +5335,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     "_LAMBDA_LAYERS_DIRS": os.pathsep.join(layers_dirs),
                 }
             )
+            env.update(execution_credentials(config))
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
