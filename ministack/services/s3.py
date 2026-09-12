@@ -1626,6 +1626,24 @@ _PRESIGN_SIGNING_PARAMS = {
     "x-amz-content-sha256",
 }
 
+# A presigned URL's checksum *value* is signed but never read as a supplied
+# integrity value. Current SDKs (JS since v3.729.0) compute it over the *empty*
+# body at presign time, because whoever holds the URL picks the body later, so
+# the value cannot describe what gets uploaded. Real S3 signs the parameter —
+# rewriting it still yields 403 — and then ignores it, storing the body it was
+# sent. Hoisting it into the headers instead hands it to
+# `_resolve_object_checksums`, which rejects the upload with `BadDigest` for a
+# request AWS answers 200.
+#
+# Only the value parameters are excluded. `x-amz-checksum-algorithm` and
+# `x-amz-sdk-checksum-algorithm` name an algorithm for the server to compute
+# rather than carrying a value, so they cannot disagree with a body and are
+# never the reason a request is refused; CreateMultipartUpload is presigned
+# with either of them to choose the algorithm its parts are digested with.
+_PRESIGN_UNHOISTED_CHECKSUM_PARAMS = frozenset(
+    f"x-amz-checksum-{alg}" for alg in _S3_CHECKSUM_HEADERS
+)
+
 
 def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
     """Fold a presigned URL's hoisted ``x-amz-*`` query params into headers.
@@ -1643,12 +1661,16 @@ def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
     metadata in its query string stored the object without any: the PUT
     succeeded and the metadata was silently dropped.
 
-    An explicitly sent header always wins over its hoisted twin.
+    An explicitly sent header always wins over its hoisted twin. The checksum
+    values in ``_PRESIGN_UNHOISTED_CHECKSUM_PARAMS`` are the exception AWS
+    itself makes and stay out of the headers.
     """
     hoisted = None
     for name, values in query_params.items():
         lname = name.lower()
         if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in _PRESIGN_UNHOISTED_CHECKSUM_PARAMS:
             continue
         if lname in headers:
             continue

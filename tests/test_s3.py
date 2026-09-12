@@ -4090,6 +4090,145 @@ def test_s3_presigned_put_metadata_hoisted_into_query(s3):
     ]
 
 
+def test_s3_presigned_put_query_checksum_is_not_verified(s3):
+    """A presigned URL's `x-amz-checksum-*` query parameter describes the empty
+    body the presigner had, not the body the holder of the URL later uploads,
+    so it cannot be an integrity value. Since v3.729.0 the JS SDK signs one into
+    every presigned PutObject by default, and AWS answers 200 for a body that
+    does not match it. Verifying it rejects a request real S3 accepts."""
+    import urllib.request
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-qs-checksum-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    # `AAAAAA==` is CRC32 of the empty body — the literal value the JS SDK
+    # signs in, and the one AWS's own recorded snapshot carries.
+    signed = AWSRequest(
+        method="PUT",
+        url=f"{ENDPOINT}/{bucket}/{key}"
+            "?x-amz-checksum-crc32=AAAAAA%3D%3D"
+            "&x-amz-sdk-checksum-algorithm=CRC32",
+    )
+    S3SigV4QueryAuth(
+        Credentials("test", "test"), "s3", "us-east-1", expires=300
+    ).add_auth(signed)
+
+    resp = urllib.request.urlopen(
+        urllib.request.Request(signed.url, data=b"123456", method="PUT"))
+    assert resp.status == 200
+
+    # AWS stores the body it was sent, mismatching checksum parameter and all.
+    head = s3.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+    assert head["ContentLength"] == 6
+    assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == b"123456"
+
+    # `x-amz-sdk-checksum-algorithm` names an algorithm to compute rather than
+    # carrying a value, so it keeps hoisting: the stored checksum is CRC32 of
+    # the body that actually arrived, never the empty-body value off the URL.
+    assert head.get("ChecksumCRC32") == "CXLTYQ==", (
+        "the hoisted algorithm selector was not honoured")
+
+
+def test_s3_presigned_put_query_checksum_still_covered_by_signature(s3):
+    """The other half of the AWS contract: the parameter is ignored as an
+    integrity value but still signed, so rewriting it after the fact breaks the
+    signature. Ignoring it must not mean stripping it before verification."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-qs-checksum-sig-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    signed = AWSRequest(
+        method="PUT",
+        url=f"{ENDPOINT}/{bucket}/{key}?x-amz-checksum-crc32=AAAAAA%3D%3D",
+    )
+    S3SigV4QueryAuth(
+        Credentials("test", "test"), "s3", "us-east-1", expires=300
+    ).add_auth(signed)
+
+    tampered = signed.url.replace("AAAAAA%3D%3D", "BBBBBB%3D%3D")
+    assert tampered != signed.url
+    try:
+        status = urllib.request.urlopen(
+            urllib.request.Request(tampered, data=b"123456", method="PUT")).status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 403, f"tampered checksum parameter accepted with {status}"
+
+
+def test_s3_put_header_checksum_is_still_verified(s3):
+    """Excluding the query parameter must not loosen the header case: a
+    `x-amz-checksum-*` sent as a real header is a value the client computed over
+    the body it is sending, and a mismatch is still `BadDigest`."""
+    import urllib.error
+    import urllib.request
+
+    bucket = "presign-hdr-checksum-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    url = s3.generate_presigned_url(
+        "put_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300)
+    try:
+        status = urllib.request.urlopen(urllib.request.Request(
+            url, data=b"123456", method="PUT",
+            headers={"x-amz-checksum-crc32": "AAAAAA=="})).status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 400, f"mismatching checksum header accepted with {status}"
+
+
+def test_s3_presigned_multipart_hoisted_checksum_algorithm_is_honoured(s3):
+    """The exclusion covers checksum *values* only. `x-amz-checksum-algorithm`
+    and `x-amz-sdk-checksum-algorithm` name an algorithm for the server to
+    compute rather than carrying a value, so they cannot disagree with a body;
+    a presigned CreateMultipartUpload hoists one of them to choose the algorithm
+    its parts are digested with, and the completed object must carry it."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-mpu-algo-bkt"
+    s3.create_bucket(Bucket=bucket)
+
+    for param in ("x-amz-checksum-algorithm", "x-amz-sdk-checksum-algorithm"):
+        key = f"multipart/{param}.bin"
+        signed = AWSRequest(
+            method="POST", url=f"{ENDPOINT}/{bucket}/{key}?uploads&{param}=CRC32")
+        S3SigV4QueryAuth(
+            Credentials("test", "test"), "s3", "us-east-1", expires=300
+        ).add_auth(signed)
+
+        body = urllib.request.urlopen(urllib.request.Request(
+            signed.url, data=b"", method="POST")).read()
+        ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+        upload_id = ET.fromstring(body).findtext(f"{ns}UploadId")
+        assert upload_id
+
+        part = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                              PartNumber=1, Body=b"x" * 16)
+        done = s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": [
+                {"ETag": part["ETag"], "PartNumber": 1}]})
+        assert done.get("ChecksumCRC32"), (
+            f"{param} hoisted into the query string was not honoured")
+
+
 def test_s3_presigned_put_metadata_sent_as_signed_headers(s3):
     """The other half of the contract: when the presigner leaves the metadata
     in `X-Amz-SignedHeaders` instead of hoisting it, the uploader sends the
