@@ -3142,6 +3142,38 @@ def _create_cors_api(apigw, *, name: str, cors: dict | None):
     return api_id
 
 
+def test_apigwv2_update_api_replaces_cors_and_delete_removes_it(apigw):
+    """UpdateApi replaces a CORS configuration; it cannot clear one. The API
+    has DeleteCorsConfiguration for that, so an UpdateApi that carries no
+    usable configuration leaves the existing one alone."""
+    import urllib.request
+
+    api_id = _create_cors_api(apigw, name="cors-update", cors={
+        "AllowOrigins": ["https://a.example"], "AllowMethods": ["GET"],
+    })
+    assert apigw.get_api(ApiId=api_id)["CorsConfiguration"]["AllowOrigins"] == [
+        "https://a.example"]
+
+    # A configuration on the call replaces the stored one.
+    apigw.update_api(ApiId=api_id, CorsConfiguration={
+        "AllowOrigins": ["https://b.example"], "AllowMethods": ["GET", "POST"]})
+    cors = apigw.get_api(ApiId=api_id)["CorsConfiguration"]
+    assert cors["AllowOrigins"] == ["https://b.example"]
+
+    # Another property on its own does not disturb it.
+    apigw.update_api(ApiId=api_id, Description="unrelated")
+    assert apigw.get_api(ApiId=api_id)["CorsConfiguration"]["AllowOrigins"] == [
+        "https://b.example"]
+
+    # DeleteCorsConfiguration is what removes it (boto3 models it; the call
+    # goes out as DELETE /v2/apis/{apiId}/cors).
+    req = urllib.request.Request(
+        f"{ENDPOINT}/v2/apis/{api_id}/cors", method="DELETE")
+    with urllib.request.urlopen(req) as r:
+        assert r.status == 204
+    assert "CorsConfiguration" not in apigw.get_api(ApiId=api_id)
+
+
 def test_apigwv2_cors_preflight_echoes_configured_origin(apigw):
     """OPTIONS preflight returns allow_origin from cors_configuration, not wildcard (#406)."""
     import urllib.request

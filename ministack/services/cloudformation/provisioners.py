@@ -7743,10 +7743,17 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_
     if replaced is not None:
         return replaced
     payload = _apigw_v2_api_props(new_props, stack_name, logical_id or physical_id)
-    payload["corsConfiguration"] = new_props.get("CorsConfiguration") or {}
+    if new_props.get("CorsConfiguration"):
+        payload["corsConfiguration"] = new_props["CorsConfiguration"]
     resp = _apigw_v2._update_api(physical_id, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Api update failed: {resp[2]!r}")
+    if not new_props.get("CorsConfiguration"):
+        # A dropped property reverts to the create's default, which for CORS
+        # is no configuration at all. UpdateApi replaces a configuration and
+        # cannot clear one — DeleteCorsConfiguration is the call that removes
+        # it — so the removal happens here rather than inside UpdateApi.
+        _apigw_v2._delete_cors_configuration(physical_id)
     _reconcile_tag_map(api.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
 

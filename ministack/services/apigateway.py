@@ -391,6 +391,10 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_api(api_id, data)
 
+        # /v2/apis/{apiId}/cors
+        if api_id and sub == "cors" and method == "DELETE":
+            return _delete_cors_configuration(api_id)
+
         # /v2/apis/{apiId}/routes[/{routeId}[/routeresponses[/{routeResponseId}]]]
         if api_id and sub == "routes":
             rr_segment = parts[5] if len(parts) > 5 else None
@@ -1843,14 +1847,22 @@ def _update_api(api_id, data):
               "description"):
         if k in data:
             api[k] = data[k]
-    # UpdateApi takes the whole CORS configuration, so an empty one removes it
-    # rather than storing a blank block the reader would have to interpret.
-    if "corsConfiguration" in data:
-        if data["corsConfiguration"]:
-            api["corsConfiguration"] = data["corsConfiguration"]
-        else:
-            api.pop("corsConfiguration", None)
+    # A CORS configuration is replaced wholesale, never removed here: the API
+    # has DeleteCorsConfiguration for that, so an empty one is nothing to
+    # apply. A caller that means to remove it deletes it.
+    if data.get("corsConfiguration"):
+        api["corsConfiguration"] = data["corsConfiguration"]
     return _apigw_response(api)
+
+
+def _delete_cors_configuration(api_id):
+    """DeleteCorsConfiguration: the operation that removes an HTTP API's CORS
+    configuration (UpdateApi replaces it, it cannot clear it)."""
+    api = _apis.get(api_id)
+    if not api:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    api.pop("corsConfiguration", None)
+    return 204, {}, b""
 
 
 # ---- Control plane: Routes ----
