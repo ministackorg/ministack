@@ -840,9 +840,12 @@ function patchAwsSdk() {
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
     // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
-    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+    const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost
+        || (advertised && host === advertised)) {
       options.protocol = "http:";
-      options.port = options.port || msPort;
+      // The https default port means the gateway port here, as in the container shim.
+      options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
