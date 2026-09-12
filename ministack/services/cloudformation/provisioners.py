@@ -220,10 +220,64 @@ def _cf_policy_create(store, parse, label, props, config_key, logical_id, stack_
     return pid, {"Id": pid, "LastModifiedTime": record["LastModifiedTime"]}
 
 
+def _cf_refuse_taken_name(store, physical_id, name, label, name_of):
+    """Refuse a rename onto a name another object of the store already holds.
+
+    The service refuses it (UpdateCachePolicy and its siblings answer
+    CachePolicyAlreadyExists and the like), so the update handler must as well,
+    or the store ends up with two objects under one name.
+    """
+    for existing in store.values():
+        if existing["Id"] != physical_id and name_of(existing) == name:
+            raise ValueError(f"{label}: {name} already exists")
+
+
+def _cf_policy_update(store, parse, label, create_fn, physical_id, new_props,
+                      config_key, logical_id, stack_name):
+    """Update one of the three CloudFront policy families in place.
+
+    Every property of all three types is "Update requires: No interruption" in
+    the resource references, the config's `Name` included, so there is no
+    replacement path here: the policy keeps its Id (which is its physical id,
+    and what `Ref` hands to a distribution) across every change.
+
+    The whole config is re-parsed from the template and swapped in, the way
+    UpdateCachePolicy replaces the config it is sent, so a property the
+    template drops falls back to the parser's create default rather than
+    lingering from the previous version.
+    """
+    record = store.get(physical_id)
+    if record is None:
+        # The policy is gone (deleted through the API between updates); create
+        # it again so the stack converges on what the template asks for.
+        return create_fn(logical_id or physical_id, new_props, stack_name)
+    cfg_props = dict(new_props.get(config_key) or {})
+    cfg_props.setdefault("Name", _physical_name(stack_name, logical_id or physical_id,
+                                                max_len=128))
+    cfg, err = parse(_cf_props_to_element(config_key, cfg_props))
+    if err is not None:
+        raise ValueError(f"{label}: {cfg_props.get('Name')} is not valid")
+    _cf_refuse_taken_name(store, physical_id, cfg["Name"], label,
+                          lambda existing: existing["Config"]["Name"])
+    record["Config"] = cfg
+    record["ETag"] = new_uuid()
+    record["LastModifiedTime"] = now_iso()
+    return physical_id, {"Id": physical_id,
+                         "LastModifiedTime": record["LastModifiedTime"]}
+
+
 def _cf_cache_policy_create(logical_id, props, stack_name):
     return _cf_policy_create(_cf._cache_policies, _cf._parse_cache_policy_config,
                              "AWS::CloudFront::CachePolicy", props,
                              "CachePolicyConfig", logical_id, stack_name)
+
+
+def _cf_cache_policy_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    return _cf_policy_update(_cf._cache_policies, _cf._parse_cache_policy_config,
+                             "AWS::CloudFront::CachePolicy", _cf_cache_policy_create,
+                             physical_id, new_props, "CachePolicyConfig",
+                             logical_id, stack_name)
 
 
 def _cf_cache_policy_delete(physical_id, props):
@@ -236,6 +290,15 @@ def _cf_origin_request_policy_create(logical_id, props, stack_name):
                              "OriginRequestPolicyConfig", logical_id, stack_name)
 
 
+def _cf_origin_request_policy_update(physical_id, old_props, new_props, stack_name,
+                                     logical_id=None):
+    return _cf_policy_update(_cf._origin_request_policies, _cf._ORP_SPEC["parse"],
+                             "AWS::CloudFront::OriginRequestPolicy",
+                             _cf_origin_request_policy_create,
+                             physical_id, new_props, "OriginRequestPolicyConfig",
+                             logical_id, stack_name)
+
+
 def _cf_origin_request_policy_delete(physical_id, props):
     _cf._origin_request_policies.pop(physical_id, None)
 
@@ -246,8 +309,34 @@ def _cf_response_headers_policy_create(logical_id, props, stack_name):
                              "ResponseHeadersPolicyConfig", logical_id, stack_name)
 
 
+def _cf_response_headers_policy_update(physical_id, old_props, new_props, stack_name,
+                                       logical_id=None):
+    return _cf_policy_update(_cf._response_headers_policies, _cf._RHP_SPEC["parse"],
+                             "AWS::CloudFront::ResponseHeadersPolicy",
+                             _cf_response_headers_policy_create,
+                             physical_id, new_props, "ResponseHeadersPolicyConfig",
+                             logical_id, stack_name)
+
+
 def _cf_response_headers_policy_delete(physical_id, props):
     _cf._response_headers_policies.pop(physical_id, None)
+
+
+def _cf_oac_record_fields(cfg, name):
+    """The OAC record fields an OriginAccessControlConfig carries.
+
+    The reference marks every field but Description "Required: Yes"; the
+    fallbacks here are MiniStack's own, for a template that leaves one out.
+    They live in one place so that a create and an update of the same template
+    cannot come to disagree about what an absent field means.
+    """
+    return {
+        "Name": name,
+        "Description": cfg.get("Description", ""),
+        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
+        "SigningBehavior": cfg.get("SigningBehavior", "always"),
+        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+    }
 
 
 def _cf_oac_create(logical_id, props, stack_name):
@@ -259,22 +348,42 @@ def _cf_oac_create(logical_id, props, stack_name):
     oac_id = _cf._dist_id()
     _cf._oacs[oac_id] = {
         "Id": oac_id,
-        "Name": name,
-        "Description": cfg.get("Description", ""),
-        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
-        "SigningBehavior": cfg.get("SigningBehavior", "always"),
-        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+        **_cf_oac_record_fields(cfg, name),
         "ETag": new_uuid(),
     }
     return oac_id, {"Id": oac_id}
+
+
+def _cf_oac_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an origin access control in place.
+
+    The reference marks OriginAccessControlConfig and all five fields under it
+    "Update requires: No interruption" — `Name` included, which UpdateOriginAccessControl
+    also accepts — so the OAC keeps the Id a distribution's origin refers to.
+    The record is rebuilt through the same `_cf_oac_record_fields` the create
+    handler uses, so a property the template drops reverts to its create default.
+    """
+    record = _cf._oacs.get(physical_id)
+    if record is None:
+        # Deleted through the API between updates; converge by creating it again.
+        return _cf_oac_create(logical_id or physical_id, new_props, stack_name)
+    cfg = dict(new_props.get("OriginAccessControlConfig") or {})
+    name = cfg.get("Name") or _physical_name(stack_name, logical_id or physical_id,
+                                             max_len=64)
+    _cf_refuse_taken_name(_cf._oacs, physical_id, name,
+                          "AWS::CloudFront::OriginAccessControl",
+                          lambda existing: existing.get("Name"))
+    record.update(_cf_oac_record_fields(cfg, name))
+    record["ETag"] = new_uuid()
+    return physical_id, {"Id": physical_id}
 
 
 def _cf_oac_delete(physical_id, props):
     _cf._oacs.pop(physical_id, None)
 
 
-def _cf_function_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+def _cf_function_body(name, props):
+    """The FunctionConfig, source and AutoPublish flag a template carries."""
     cfg_el = _cf_props_to_element("FunctionConfig", props.get("FunctionConfig") or {})
     cfg, err = _cf._cf_parse_function_config(cfg_el)
     if err is not None:
@@ -285,14 +394,25 @@ def _cf_function_create(logical_id, props, stack_name):
     if isinstance(code, str):
         code = code.encode("utf-8")
 
-    now = now_iso()
-    dev_etag = new_uuid()
     # "By default, when you create a function, it's in the DEVELOPMENT stage"
     # (AWS::CloudFront::Function reference) — publishing to LIVE happens only
     # when the template sets AutoPublish to true, which CDK emits explicitly.
     auto_publish = props.get("AutoPublish", False)
     if isinstance(auto_publish, str):
         auto_publish = auto_publish.lower() == "true"
+    return cfg, code, auto_publish
+
+
+def _cf_function_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    if name in _cf._functions:
+        # CreateFunction answers FunctionAlreadyExists; a stack must not write
+        # over a function it does not own, on a create or on a rename.
+        raise ValueError(f"AWS::CloudFront::Function: {name} already exists")
+    cfg, code, auto_publish = _cf_function_body(name, props)
+
+    now = now_iso()
+    dev_etag = new_uuid()
 
     _cf._functions[name] = {
         "name": name,
@@ -311,6 +431,48 @@ def _cf_function_create(logical_id, props, stack_name):
     # GetAtt attributes — no Stage.
     arn = _cf._func_arn(name)
     return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
+
+
+def _cf_function_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a CloudFront function in place.
+
+    `Name` is the type's one "Update requires: Replacement" property; AutoPublish,
+    FunctionCode, FunctionConfig, FunctionMetadata and Tags are "No interruption".
+    A renamed function is therefore created under the new name and the old one
+    removed, while everything else keeps the physical id — the function name,
+    which is what its ARN is built from — and its creation time.
+
+    The stage handling follows MiniStack's own UpdateFunction model, which the
+    reference does not describe: the new source lands in DEVELOPMENT and the
+    LIVE stage is dropped, because the record holds one body for both stages
+    and an unpublished change must not be served as published. `AutoPublish:
+    true` republishes right after, which is what the reference means by
+    "updating the AWS::CloudFront::Function resource with the AutoPublish
+    property set to true".
+    """
+    name = new_props.get("Name") or _physical_name(stack_name,
+                                                   logical_id or physical_id, max_len=64)
+    record = _cf._functions.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, record.get("name") if record else None,
+        _cf_function_create, _cf_function_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    cfg, code, auto_publish = _cf_function_body(name, new_props)
+    now = now_iso()
+    record["comment"] = cfg["comment"]
+    record["runtime"] = cfg["runtime"]
+    record["kvs_arns"] = cfg["kvs_arns"]
+    record["code"] = code
+    record["last_modified_dev"] = now
+    record["dev_etag"] = new_uuid()
+    record["last_modified_live"] = now if auto_publish else None
+    record["live_etag"] = new_uuid() if auto_publish else None
+    arn = _cf._func_arn(name)
+    return physical_id, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
 
 
 def _cf_function_delete(physical_id, props):
@@ -3541,6 +3703,20 @@ def _apigw_method_create(logical_id, props, stack_name):
     }
     _apigw_v1._put_method(api_id, resource_id, http_method, data)
 
+    # apigateway_v1 stores these in dicts keyed by the status code as a string,
+    # and a template may legitimately carry StatusCode as an integer.
+    for method_response in props.get("MethodResponses", []) or []:
+        _apigw_v1._put_method_response(
+            api_id,
+            resource_id,
+            http_method,
+            str(method_response.get("StatusCode", "200")),
+            {
+                "responseParameters": method_response.get("ResponseParameters", {}),
+                "responseModels": method_response.get("ResponseModels", {}),
+            },
+        )
+
     # Also set Integration if provided
     integration = props.get("Integration")
     if integration:
@@ -3557,6 +3733,20 @@ def _apigw_method_create(logical_id, props, stack_name):
             "cacheKeyParameters": integration.get("CacheKeyParameters", []),
         }
         _apigw_v1._put_integration(api_id, resource_id, http_method, int_data)
+
+        for integration_response in integration.get("IntegrationResponses", []) or []:
+            _apigw_v1._put_integration_response(
+                api_id,
+                resource_id,
+                http_method,
+                str(integration_response.get("StatusCode", "200")),
+                {
+                    "selectionPattern": integration_response.get("SelectionPattern", ""),
+                    "responseParameters": integration_response.get("ResponseParameters", {}),
+                    "responseTemplates": integration_response.get("ResponseTemplates", {}),
+                    "contentHandling": integration_response.get("ContentHandling"),
+                },
+            )
 
     pid = f"{api_id}-{resource_id}-{http_method}"
     return pid, {}
@@ -8969,11 +9159,36 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
-    "AWS::CloudFront::CachePolicy": {"create": _cf_cache_policy_create, "delete": _cf_cache_policy_delete},
-    "AWS::CloudFront::OriginRequestPolicy": {"create": _cf_origin_request_policy_create, "delete": _cf_origin_request_policy_delete},
-    "AWS::CloudFront::ResponseHeadersPolicy": {"create": _cf_response_headers_policy_create, "delete": _cf_response_headers_policy_delete},
-    "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},
-    "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
+    "AWS::CloudFront::CachePolicy": {
+        "create": _cf_cache_policy_create,
+        "update": _cf_cache_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_cache_policy_delete,
+    },
+    "AWS::CloudFront::OriginRequestPolicy": {
+        "create": _cf_origin_request_policy_create,
+        "update": _cf_origin_request_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_origin_request_policy_delete,
+    },
+    "AWS::CloudFront::ResponseHeadersPolicy": {
+        "create": _cf_response_headers_policy_create,
+        "update": _cf_response_headers_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_response_headers_policy_delete,
+    },
+    "AWS::CloudFront::OriginAccessControl": {
+        "create": _cf_oac_create,
+        "update": _cf_oac_update,
+        "update_with_logical_id": True,
+        "delete": _cf_oac_delete,
+    },
+    "AWS::CloudFront::Function": {
+        "create": _cf_function_create,
+        "update": _cf_function_update,
+        "update_with_logical_id": True,
+        "delete": _cf_function_delete,
+    },
     "AWS::CloudWatch::Alarm": {
         "create": _cw_metric_alarm_create,
         "update": _cw_metric_alarm_update,

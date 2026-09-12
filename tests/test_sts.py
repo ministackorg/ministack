@@ -128,6 +128,210 @@ def test_sts_get_session_token(sts):
     assert "SessionToken" in creds
     assert "Expiration" in creds
 
+
+def test_sts_get_session_token_retains_iam_user_identity(iam):
+    import boto3
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    user_name = "session-token-user"
+    iam.create_user(UserName=user_name)
+    source = iam.create_access_key(UserName=user_name)["AccessKey"]
+    try:
+        source_sts = boto3.client(
+            "sts",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=source["AccessKeyId"],
+            aws_secret_access_key=source["SecretAccessKey"],
+        )
+        session = source_sts.get_session_token(DurationSeconds=900)["Credentials"]
+        session_sts = boto3.client(
+            "sts",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=session["AccessKeyId"],
+            aws_secret_access_key=session["SecretAccessKey"],
+            aws_session_token=session["SessionToken"],
+        )
+
+        identity = session_sts.get_caller_identity()
+
+        assert identity["Arn"] == f"arn:aws:iam::000000000000:user/{user_name}"
+        assert identity["UserId"]
+    finally:
+        iam.delete_access_key(
+            UserName=user_name,
+            AccessKeyId=source["AccessKeyId"],
+        )
+        iam.delete_user(UserName=user_name)
+
+
+def test_sts_get_session_token_rejects_unknown_caller_when_auth_enabled(monkeypatch):
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.services import sts as sts_mod
+
+    issued_key = "test-rejected-session-key"
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    monkeypatch.setattr(sts_mod, "_gen_session_access_key", lambda: issued_key)
+    body = b"Action=GetSessionToken&Version=2011-06-15&DurationSeconds=900"
+    headers = {
+        "authorization": (
+            "AWS4-HMAC-SHA256 "
+            "Credential=unknown-caller/20260908/us-east-1/sts/aws4_request"
+        ),
+        "content-type": "application/x-www-form-urlencoded",
+    }
+
+    status, _headers, payload = asyncio.run(
+        sts_mod.handle_request("POST", "/", headers, body, {})
+    )
+
+    assert status == 403
+    assert b"UnrecognizedClientException" in payload
+    assert issued_key not in sts_mod._sessions
+
+
+def test_sts_get_session_token_resolves_query_signed_iam_caller(monkeypatch):
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.core.responses import get_account_id, set_request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_mod
+
+    account_id = "123456789012"
+    user_name = "query-user"
+    source_key = "test-query-user-key"
+    issued_key = "test-issued-session-key"
+    original_account = get_account_id()
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    monkeypatch.setattr(sts_mod, "_gen_session_access_key", lambda: issued_key)
+    set_request_account_id(account_id)
+    iam_svc._users.set_scoped(account_id, None, user_name, {
+        "UserName": user_name,
+        "UserId": "test-query-user-id",
+        "Arn": f"arn:aws:iam::{account_id}:user/team/{user_name}",
+        "Path": "/team/",
+        "AttachedPolicies": [],
+    })
+    iam_svc._access_keys.set_scoped(account_id, None, source_key, {
+        "AccessKeyId": source_key,
+        "SecretAccessKey": "test-query-user-secret",
+        "Status": "Active",
+        "UserName": user_name,
+    })
+    query = {
+        "Action": ["GetSessionToken"],
+        "DurationSeconds": ["900"],
+        "X-Amz-Credential": [
+            f"{source_key}/20260908/us-east-1/sts/aws4_request"
+        ],
+    }
+    try:
+        status, _headers, _payload = asyncio.run(
+            sts_mod.handle_request("GET", "/", {}, b"", query)
+        )
+
+        assert status == 200
+        assert sts_mod._sessions[issued_key]["Arn"] == (
+            f"arn:aws:iam::{account_id}:user/team/{user_name}"
+        )
+        assert sts_mod._sessions[issued_key]["PrincipalType"] == "User"
+        assert sts_mod._sessions[issued_key]["PrincipalName"] == user_name
+        assert sts_mod._sessions[issued_key]["SourceAccessKeyId"] == source_key
+    finally:
+        sts_mod._sessions.pop(issued_key, None)
+        iam_svc._access_keys.pop_scoped(account_id, None, source_key, None)
+        iam_svc._users.pop_scoped(account_id, None, user_name, None)
+        set_request_account_id(original_account)
+
+
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+def test_sts_get_caller_identity_rejects_expired_session(monkeypatch, auth_enabled):
+    import asyncio
+    import time
+
+    import ministack.app as app_mod
+    from ministack.core.responses import get_account_id
+    from ministack.services import sts as sts_mod
+
+    account_id = get_account_id()
+    access_key = "test-expired-identity-session"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    sts_mod._sessions[access_key] = {
+        "Arn": f"arn:aws:iam::{account_id}:user/expired-user",
+        "UserId": "test-expired-user-id",
+        "SecretAccessKey": "test-expired-secret",
+        "SessionToken": "test-expired-token",
+        "Expiration": time.time() - 1,
+        "AccountId": account_id,
+        "PrincipalType": "User",
+        "PrincipalName": "expired-user",
+    }
+    query = {"Action": ["GetCallerIdentity"]}
+    headers = {
+        "authorization": (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={access_key}/20260908/us-east-1/sts/aws4_request"
+        )
+    }
+    try:
+        status, _headers, payload = asyncio.run(
+            sts_mod.handle_request("GET", "/", headers, b"", query)
+        )
+
+        assert status == 403
+        assert b"<Code>ExpiredToken</Code>" in payload
+    finally:
+        sts_mod._sessions.pop(access_key, None)
+
+
+def test_sts_get_session_token_rejects_temporary_caller_when_auth_enabled(monkeypatch):
+    import asyncio
+    import time
+
+    import ministack.app as app_mod
+    from ministack.core.responses import get_account_id
+    from ministack.services import sts as sts_mod
+
+    account_id = get_account_id()
+    source_key = "test-temporary-source-key"
+    issued_key = "test-renewed-session-key"
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    monkeypatch.setattr(sts_mod, "_gen_session_access_key", lambda: issued_key)
+    sts_mod._sessions[source_key] = {
+        "Arn": f"arn:aws:iam::{account_id}:user/session-user",
+        "UserId": "test-session-user-id",
+        "SecretAccessKey": "test-temporary-secret",
+        "SessionToken": "test-temporary-token",
+        "Expiration": time.time() + 900,
+        "AccountId": account_id,
+        "PrincipalType": "User",
+    }
+    body = b"Action=GetSessionToken&Version=2011-06-15&DurationSeconds=900"
+    headers = {
+        "authorization": (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={source_key}/20260908/us-east-1/sts/aws4_request"
+        ),
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    try:
+        status, _headers, payload = asyncio.run(
+            sts_mod.handle_request("POST", "/", headers, body, {})
+        )
+
+        assert status == 403
+        assert b"AccessDenied" in payload
+        assert issued_key not in sts_mod._sessions
+    finally:
+        sts_mod._sessions.pop(source_key, None)
+
+
 def test_sts_assume_role_with_web_identity(sts, iam):
     iam.create_role(
         RoleName="test-oidc-role",

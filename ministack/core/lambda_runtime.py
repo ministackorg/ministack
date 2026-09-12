@@ -7,10 +7,12 @@ the handler once (cold start) and then handles subsequent invocations without
 re-importing (warm).
 """
 
+import hashlib
 import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -73,6 +75,42 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
     if not arn:
         raise ArnParseError("arn: missing lambda function arn")
     return _lambda_function_account_region_from_arn(arn)
+
+
+def execution_credentials(config: dict) -> dict[str, str]:
+    """Return account credentials or an AUTH execution-role session."""
+    account_id, _region = _account_region_from_function_config(config)
+    from ministack import app
+
+    if not app.AUTH:
+        return {
+            "AWS_ACCESS_KEY_ID": account_id,
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+            "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+        }
+
+    role_arn = config.get("Role", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    function_arn = config.get("FunctionArn", "")
+    digest = hashlib.sha256(f"{function_arn}:{role_arn}".encode()).hexdigest()
+    access_key = f"ASIA{digest[:16].upper()}"
+    secret_key = hashlib.sha256(f"secret:{digest}".encode()).hexdigest()
+    session_token = hashlib.sha256(f"token:{digest}".encode()).hexdigest()
+    session_name = config.get("FunctionName", "ministack-lambda")[:64]
+
+    from ministack.services import sts as sts_svc
+
+    sts_svc.register_session(access_key, {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}",
+        "UserId": f"{role_name}:{session_name}",
+        "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
+    })
+    return {
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "AWS_SESSION_TOKEN": session_token,
+    }
 
 
 _workers: dict = {}
@@ -1084,9 +1122,7 @@ class Worker:
         account_id, region = _account_region_from_function_config(self.config)
         spawn_env["AWS_REGION"] = region
         spawn_env["AWS_DEFAULT_REGION"] = region
-        spawn_env["AWS_ACCESS_KEY_ID"] = account_id
-        spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
-        spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
+        spawn_env.update(execution_credentials(self.config))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
         # Environment.Variables wins, then host env, then the internal
         # default that points at this MiniStack instance.  Real AWS Lambda
@@ -1396,6 +1432,17 @@ def _worker_key(func_name: str, config: dict, qualifier: str) -> str:
     return f"{account}:{region}:{func_name}:{qualifier}"
 
 
+def _worker_class_for(config: dict):
+    """Pick the execution environment implementation for a function's runtime.
+
+    ``provided.*`` speaks the HTTP Lambda Runtime API; python/nodejs speak the
+    JSON-line stdio protocol of the bundled worker scripts.
+    """
+    if str(config.get("Runtime", "")).startswith("provided"):
+        return ProvidedWorker
+    return Worker
+
+
 def acquire_worker(func_name: str, config: dict, code_zip: bytes,
                    qualifier: str = "$LATEST", max_concurrency: int | None = None):
     """Lease a free execution environment for this function.
@@ -1431,7 +1478,7 @@ def acquire_worker(func_name: str, config: dict, code_zip: bytes,
                 return worker, "reused"
         if cap and len(entries) >= cap:
             return None, "func_cap"
-        worker = Worker(func_name, config, code_zip)
+        worker = _worker_class_for(config)(func_name, config, code_zip)
         worker.in_use = True
         worker.last_used = time.time()
         entries.append(worker)
@@ -1563,3 +1610,503 @@ def reset():
         doomed = [w for entries in _workers.values() for w in entries]
         _workers.clear()
     kill_workers(doomed)
+
+
+# ---------------------------------------------------------------------------
+# provided.* (Go / Rust / custom runtime) warm worker
+# ---------------------------------------------------------------------------
+
+# Seconds the bootstrap binary gets to complete its cold start and issue its
+# first GET /runtime/invocation/next before we give up on the environment.
+_PROVIDED_INIT_TIMEOUT = float(os.environ.get("LAMBDA_PROVIDED_INIT_TIMEOUT", "20"))
+
+# How often init/invocation waits check whether the bootstrap is still alive.
+_PROVIDED_POLL = 0.05
+
+# Log lines buffered per environment between drains; the oldest are dropped
+# rather than letting a chatty handler grow the buffer without bound.
+_PROVIDED_LOG_MAX_LINES = 10000
+
+# /2018-06-01/runtime/invocation/<request-id>/{response,error}
+_INVOCATION_RESULT_RE = re.compile(r"/runtime/invocation/([^/]+)/(response|error)/?$")
+
+
+class ProvidedWorker(Worker):
+    """A reusable execution environment for a ``provided.*`` Lambda.
+
+    ``lambda_svc._execute_function_provided`` starts the bootstrap binary,
+    serves exactly one ``/runtime/invocation/next``, and kills the process —
+    so every invocation pays a full cold start. The Lambda Runtime API is
+    already a long-poll loop, which is precisely how real Lambda reuses an
+    environment: hold the HTTP server and the process open and the same binary
+    picks up the next event off ``/next``.
+
+    Reuses ``Worker``'s pool bookkeeping (lease/release, idle reaping,
+    invalidation on code update); only the spawn and invoke mechanics differ,
+    because a custom runtime speaks HTTP rather than the JSON-line stdio
+    protocol the Python/Node worker scripts use.
+
+    Each running environment is a *generation*: ``_spawn`` creates one (server,
+    process, log pump, event queue), ``_teardown`` destroys it. A generation's
+    queues are captured by its own handler threads, and results are accepted
+    only for the current generation's in-flight request ID, so a timed-out or
+    crashed environment cannot feed the invocation that replaces it.
+    """
+
+    def __init__(self, func_name: str, config: dict, code_zip: bytes):
+        super().__init__(func_name, config, code_zip)
+        self._server = None
+        self._server_thread = None
+        self._log_thread = None
+        # One in-flight invocation at a time: the pool leases a worker
+        # exclusively (``in_use``), so a second event can never be queued
+        # behind a first on the same environment — matching AWS, where
+        # concurrent invocations get separate environments.
+        self._pending: queue.Queue = queue.Queue(maxsize=1)
+        self._result: dict = {}
+        self._response_ready = threading.Event()
+        self._init_error = None
+        self._first_poll = threading.Event()
+        # Set by the first /next poll or by an /init/error POST, so the init
+        # wait is not a fixed sleep.
+        self._init_settled = threading.Event()
+        self._stopping = True
+        # Guards state shared with the Runtime API handler threads. Distinct
+        # from ``self._lock``, which is held across a whole invocation.
+        self._state_lock = threading.Lock()
+        self._generation = 0
+        self._current_request_id = None
+
+    # -- State transitions driven by the Runtime API handler threads ------
+
+    def _mark_first_poll(self, generation: int) -> bool:
+        with self._state_lock:
+            if generation != self._generation or self._stopping:
+                return False
+            self._first_poll.set()
+            self._init_settled.set()
+            return True
+
+    def _record_init_error(self, generation: int, payload) -> None:
+        with self._state_lock:
+            if generation != self._generation:
+                return
+            self._init_error = payload
+            self._init_settled.set()
+            if self._current_request_id is not None:
+                # Init can fail on a respawn an invocation is waiting on: fail
+                # it now instead of at the timeout.
+                self._current_request_id = None
+                self._result = {"error": payload}
+                self._response_ready.set()
+
+    def _record_result(self, generation: int, request_id: str, kind: str,
+                       payload) -> bool:
+        """Accept a ``/response`` or ``/error`` POST for the in-flight request.
+
+        False means the ID is not the one we handed out: a duplicate, or a late
+        POST from an environment already torn down, whose result must not reach
+        the invocation that replaced it.
+        """
+        with self._state_lock:
+            if generation != self._generation:
+                return False
+            if not self._current_request_id or request_id != self._current_request_id:
+                return False
+            self._current_request_id = None
+            self._result = ({"error": payload} if kind == "error"
+                            else {"response": payload})
+            self._response_ready.set()
+            return True
+
+    def _build_handler_class(self, generation: int, pending: queue.Queue):
+        worker = self
+
+        import http.server
+
+        class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _read_body(self):
+                encoding = self.headers.get("Transfer-Encoding", "")
+                if "chunked" in encoding.lower():
+                    chunks = []
+                    while True:
+                        size = int(self.rfile.readline().strip(), 16)
+                        if size == 0:
+                            self.rfile.readline()
+                            break
+                        chunks.append(self.rfile.read(size))
+                        self.rfile.readline()
+                    return b"".join(chunks)
+                length = int(self.headers.get("Content-Length", 0))
+                return self.rfile.read(length) if length else b""
+
+            def _respond(self, code: int, body: bytes = b""):
+                self.send_response(code)
+                if body:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def _stopped(self):
+                self._respond(500, b'{"errorMessage":"execution environment stopped"}')
+
+            def do_GET(self):
+                if "/runtime/invocation/next" not in self.path:
+                    self._respond(404)
+                    return
+                # Reaching /next means init finished; the binary long-polls
+                # here between invocations exactly as on AWS.
+                if not worker._mark_first_poll(generation):
+                    self._stopped()
+                    return
+                while True:
+                    if worker._stopping or generation != worker._generation:
+                        # Tell a runtime left over from a dead generation to
+                        # exit rather than serve the live environment's events.
+                        self._stopped()
+                        return
+                    try:
+                        request_id, event, deadline_ms, trace_id = pending.get(
+                            timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+                payload = json.dumps(event).encode()
+                self.send_response(200)
+                self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
+                self.send_header("Lambda-Runtime-Deadline-Ms", str(deadline_ms))
+                self.send_header(
+                    "Lambda-Runtime-Invoked-Function-Arn",
+                    worker.config.get("FunctionArn", ""),
+                )
+                if trace_id:
+                    # The Runtime API header is how AWS hands X-Ray context to
+                    # a custom runtime per invocation. The one-shot executor
+                    # used a spawn-time env var, which a reused environment
+                    # cannot do — this is both warm-safe and closer to AWS.
+                    self.send_header("Lambda-Runtime-Trace-Id", trace_id)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                body = self._read_body()
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = body.decode("utf-8", errors="replace")
+
+                if "/runtime/init/error" in self.path:
+                    worker._record_init_error(generation, parsed)
+                    self._respond(202)
+                    return
+
+                match = _INVOCATION_RESULT_RE.search(self.path)
+                if not match:
+                    self._respond(404)
+                    return
+                request_id, kind = match.group(1), match.group(2)
+                if not worker._record_result(generation, request_id, kind, parsed):
+                    self._respond(400, json.dumps({
+                        "errorMessage": f"Invalid request ID: {request_id}",
+                        "errorType": "InvalidRequestID",
+                    }).encode())
+                    return
+                self._respond(202)
+
+        return RuntimeAPIHandler
+
+    # -- Logs -------------------------------------------------------------
+
+    def _pump_output(self, stream, log_queue: queue.Queue) -> None:
+        """Drain the bootstrap's output into ``log_queue`` for its whole life.
+
+        stdout and stderr are merged into one pipe (a custom runtime logs to
+        either) and read continuously: an undrained pipe fills at ~64KiB and
+        blocks the bootstrap on its next write. The queue belongs to one
+        generation, so a dying environment's tail never mixes into the next.
+        """
+        try:
+            for raw in iter(stream.readline, b""):
+                if not raw:
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                line = raw.rstrip("\r\n")
+                try:
+                    log_queue.put_nowait(line)
+                except queue.Full:
+                    # Drop the oldest, never block: blocking here would stall
+                    # the pipe this thread exists to drain.
+                    try:
+                        log_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        log_queue.put_nowait(line)
+                    except queue.Full:
+                        pass
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    # -- Lifecycle --------------------------------------------------------
+
+    def _spawn(self):
+        import socketserver
+
+        from ministack.services.lambda_svc import (
+            _provided_code_lock,
+            _provided_runtime_code_dir,
+            _provided_worker_env,
+        )
+
+        # A respawn used to abandon the previous generation's HTTP server,
+        # thread and listening socket — one leaked set per bootstrap crash.
+        self._teardown()
+
+        code_dir = _provided_runtime_code_dir(self.code_zip)
+        bootstrap_path = os.path.join(code_dir, "bootstrap")
+        if not os.path.exists(bootstrap_path):
+            raise RuntimeError("no bootstrap binary found")
+
+        pending: queue.Queue = queue.Queue(maxsize=1)
+        log_queue: queue.Queue = queue.Queue(maxsize=_PROVIDED_LOG_MAX_LINES)
+        with self._state_lock:
+            self._generation += 1
+            generation = self._generation
+            self._stopping = False
+            self._first_poll.clear()
+            self._init_settled.clear()
+            self._init_error = None
+            self._result = {}
+            self._response_ready.clear()
+            self._current_request_id = None
+            self._pending = pending
+            self._stderr_queue = log_queue
+
+        class _QuietThreadingServer(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                _, exc, _ = sys.exc_info()
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                                    ConnectionAbortedError)):
+                    return
+                super().handle_error(request, client_address)
+
+        try:
+            # Threading server: /next long-polls, so a single-threaded server
+            # would wedge the response POST behind the next poll.
+            self._server = _QuietThreadingServer(
+                ("127.0.0.1", 0), self._build_handler_class(generation, pending))
+            port = self._server.server_address[1]
+            self._server_thread = threading.Thread(
+                target=self._server.serve_forever, kwargs={"poll_interval": 0.1},
+                daemon=True, name=f"provided-api-{self.func_name}")
+            self._server_thread.start()
+
+            proc_env = _provided_worker_env(self.config, code_dir, port)
+
+            # Spawn under the code lock: no fork may overlap an extraction write
+            # elsewhere, or the child inherits the open write fd and execve fails
+            # with ETXTBSY (#1051).
+            with _provided_code_lock:
+                self._proc = subprocess.Popen(
+                    [bootstrap_path],
+                    cwd=code_dir,
+                    env=proc_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+            self._log_thread = threading.Thread(
+                target=self._pump_output, args=(self._proc.stdout, log_queue),
+                daemon=True, name=f"provided-log-{self.func_name}")
+            self._log_thread.start()
+            self._stderr_thread = self._log_thread
+
+            self._await_init()
+        except BaseException:
+            # Never leave a half-built environment behind.
+            self._teardown()
+            raise
+
+        self._start_time = time.time()
+        logger.info("Lambda provided-runtime environment spawned for %s (cold start)",
+                    self.func_name)
+
+    def _await_init(self) -> None:
+        """Wait for the bootstrap to reach /next, bounded and interruptible.
+
+        Returns as soon as init settles: a first poll, an /init/error POST, or
+        the process exiting. Only a live but silent binary waits out
+        ``_PROVIDED_INIT_TIMEOUT``.
+        """
+        deadline = time.monotonic() + _PROVIDED_INIT_TIMEOUT
+        while not self._init_settled.wait(_PROVIDED_POLL):
+            exit_code = self._proc.poll() if self._proc is not None else -1
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"bootstrap exited during init with code {exit_code}"
+                    f"{self._init_log_suffix()}")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"bootstrap did not reach the Runtime API within "
+                    f"{_PROVIDED_INIT_TIMEOUT:g}s{self._init_log_suffix()}")
+        if self._init_error is not None:
+            raise RuntimeError(f"init error: {self._init_error}")
+
+    def _init_log_suffix(self) -> str:
+        log = self._drain_stderr_bounded(first_line_wait=0.1)
+        return f": {log}" if log else ""
+
+    def invoke(self, event: dict, request_id: str, *, trace_id: str = None) -> dict:
+        """Run one invocation on this environment.
+
+        ``trace_id`` is per-invocation X-Ray context, passed separately rather
+        than through a reserved key in ``event``: the payload belongs to the
+        caller. It leaves as the ``Lambda-Runtime-Trace-Id`` header, where a
+        custom runtime expects it.
+        """
+        with self._lock:
+            cold = False
+            if self._proc is None or self._proc.poll() is not None:
+                self._spawn()
+                cold = True
+                self._cold = False
+
+            timeout = self.config.get("Timeout", 30)
+            generation = self._generation
+
+            with self._state_lock:
+                self._result = {}
+                self._response_ready.clear()
+                self._current_request_id = request_id
+                pending = self._pending
+            deadline_ms = int((time.time() + timeout) * 1000)
+            pending.put((request_id, event, deadline_ms, trace_id))
+
+            deadline = time.monotonic() + timeout
+            failure = None
+            while not self._response_ready.wait(
+                    min(_PROVIDED_POLL, max(0.0, deadline - time.monotonic()))):
+                proc = self._proc
+                if proc is None or proc.poll() is not None:
+                    # The process can exit after sending its response but
+                    # before the HTTP handler thread records it.
+                    if self._response_ready.wait(_PROVIDED_POLL):
+                        break
+                    failure = "Runtime exited before returning a response"
+                    break
+                if time.monotonic() >= deadline:
+                    failure = f"Task timed out after {timeout}.00 seconds"
+                    break
+            if failure is not None:
+                logger.warning("Lambda %s: %s", self.func_name, failure)
+                self._teardown()
+                return {
+                    "status": "error",
+                    "error": failure,
+                    "error_payload": {"errorMessage": failure, "errorType": "Runtime.ExitError"},
+                    "cold_start": cold,
+                    "log": self._drain_stderr(),
+                }
+
+            with self._state_lock:
+                result, self._result = self._result, {}
+                self._current_request_id = None
+                init_failed = self._init_error is not None
+            log = self._drain_stderr_bounded()
+            # An environment whose process is gone cannot serve the next
+            # invocation; drop it now so its server and threads go with it.
+            died = (self._proc is None or self._proc.poll() is not None
+                    or generation != self._generation)
+
+            if "error" in result:
+                # A handler error does not poison the environment on AWS — the
+                # runtime reports it and goes back to polling /next. Only an
+                # init failure (or a dead process) means it is unusable.
+                if init_failed or died:
+                    self._teardown()
+                err = result["error"]
+                return {
+                    "status": "error",
+                    "error": (err.get("errorMessage") if isinstance(err, dict)
+                              else str(err)),
+                    "error_payload": err,
+                    "cold_start": cold,
+                    "log": log,
+                }
+
+            if died:
+                self._teardown()
+
+            return {
+                "status": "ok",
+                "result": result.get("response"),
+                "cold_start": cold,
+                "log": log,
+            }
+
+    def _teardown(self):
+        """Destroy the current generation: process, server, threads.
+
+        Idempotent. Buffered log lines are kept so the invocation that
+        triggered the teardown can still report them.
+        """
+        with self._state_lock:
+            self._stopping = True
+            self._current_request_id = None
+        proc, self._proc = self._proc, None
+        _signal(proc)
+        _collect(proc, time.monotonic() + _REAP_GRACE)
+        self._shutdown_server()
+        self._join_log_thread()
+
+    def _join_log_thread(self) -> None:
+        thread, self._log_thread = self._log_thread, None
+        self._stderr_thread = None
+        # The pipe closes with the process, so the pump ends on its own; the
+        # join only keeps it from outliving the generation.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def _shutdown_server(self):
+        server, self._server = self._server, None
+        thread, self._server_thread = self._server_thread, None
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
+    def _discard_tmpdir(self):
+        # kill_workers() reaps the process and then calls this; piggyback the
+        # server teardown so a reaped worker leaves no listening socket or
+        # thread behind. The code dir is the shared content-addressed cache
+        # from _provided_runtime_code_dir — nothing to remove here.
+        with self._state_lock:
+            self._stopping = True
+        self._shutdown_server()
+        self._join_log_thread()

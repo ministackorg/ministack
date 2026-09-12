@@ -9043,6 +9043,551 @@ def test_cfn_cloudfront_function_without_autopublish_stays_in_development(cfn, c
         _wait_stack(cfn, "cfn-cf-fn-dev")
 
 
+# ---------------------------------------------------------------------------
+# Updating the five CloudFront types. Every property of the three policy
+# families and of the OAC is "Update requires: No interruption" in the resource
+# references, so the object keeps its Id across every change; only
+# AWS::CloudFront::Function has a Replacement property (Name).
+# ---------------------------------------------------------------------------
+
+def _cfn_cf_stack(cfn, stack_name, template, update=False):
+    """Create or update one CloudFront stack and return its outputs."""
+    body = json.dumps(template)
+    if update:
+        cfn.update_stack(StackName=stack_name, TemplateBody=body)
+    else:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body)
+    stack = _wait_stack(cfn, stack_name)
+    expected = "UPDATE_COMPLETE" if update else "CREATE_COMPLETE"
+    assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def _cache_policy_template(name, comment=None, default_ttl=3600):
+    config = {
+        "Name": name,
+        "DefaultTTL": default_ttl, "MaxTTL": 86400, "MinTTL": 1,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True,
+            "HeadersConfig": {"HeaderBehavior": "whitelist", "Headers": ["X-Service"]},
+            "QueryStringsConfig": {"QueryStringBehavior": "none"},
+            "CookiesConfig": {"CookieBehavior": "none"},
+        },
+    }
+    if comment is not None:
+        config["Comment"] = comment
+    return {
+        "Resources": {"CachePolicy": {"Type": "AWS::CloudFront::CachePolicy",
+                                      "Properties": {"CachePolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "CachePolicy"}}},
+    }
+
+
+def test_cfn_cloudfront_cache_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::CachePolicy has no Replacement property — CachePolicyConfig
+    and every field under it are "No interruption" — so an UpdateStack keeps the
+    policy Id that Ref handed to the distribution, a rename included, and a
+    property the template drops falls back to its create default."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-update-{uid}"
+    name = f"cfn-cp-update-{uid}"
+    renamed = f"cfn-cp-renamed-{uid}"
+    policy_id = None
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name, comment="v1"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Comment"] == "v1"
+        assert cfg["DefaultTTL"] == 3600
+
+        # In-place change: same Id, new values.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(name, comment="v2", default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Comment"] == "v2"
+        assert cfg["DefaultTTL"] == 120
+        # The nested whitelist still round-trips after the update.
+        params = cfg["ParametersInCacheKeyAndForwardedToOrigin"]
+        assert params["HeadersConfig"]["Headers"]["Items"] == ["X-Service"]
+
+        # A rename is "No interruption" too: same policy, new name, and the
+        # account holds one policy rather than a replacement pair.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(renamed, comment="v2", default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["CachePolicy"]["CachePolicyConfig"]["Name"]
+                 for p in cloudfront.list_cache_policies()["CachePolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropping Comment reverts it to the create default rather than
+        # leaving the previous value behind.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(renamed, default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg.get("Comment", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    if policy_id:
+        with pytest.raises(ClientError):
+            cloudfront.get_cache_policy(Id=policy_id)
+
+
+def test_cfn_cloudfront_cache_policy_deleted_out_of_band_is_recreated(cfn, cloudfront):
+    """The policy handlers take a different path than the function on an
+    out-of-band delete: no record under the physical id sends the update
+    straight to the create handler, which mints a new policy under the
+    template's name rather than failing the stack. The new Id is what Ref
+    hands out from then on."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-gone-{uid}"
+    name = f"cfn-cp-gone-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name, comment="v1"))
+        old_id = out["Id"]
+        etag = cloudfront.get_cache_policy(Id=old_id)["ETag"]
+        cloudfront.delete_cache_policy(Id=old_id, IfMatch=etag)
+        with pytest.raises(ClientError):
+            cloudfront.get_cache_policy(Id=old_id)
+
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(name, comment="v2"), update=True)
+        cfg = cloudfront.get_cache_policy(Id=out["Id"])["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == name
+        assert cfg["Comment"] == "v2"
+        names = [p["CachePolicy"]["CachePolicyConfig"]["Name"]
+                 for p in cloudfront.list_cache_policies()["CachePolicyList"]["Items"]]
+        assert names.count(name) == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_policy_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """A cache policy renamed onto a name another policy holds is refused the way
+    UpdateCachePolicy refuses it: the update rolls back, the stack's policy keeps
+    its name and its Id, and the other policy is untouched."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-taken-{uid}"
+    name = f"cfn-cp-mine-{uid}"
+    taken = f"cfn-cp-taken-{uid}"
+    # The API shape, not the template's: the wire form carries Quantity/Items.
+    other = cloudfront.create_cache_policy(CachePolicyConfig={
+        "Name": taken, "MinTTL": 1, "DefaultTTL": 60, "MaxTTL": 120,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True,
+            "HeadersConfig": {"HeaderBehavior": "none"},
+            "QueryStringsConfig": {"QueryStringBehavior": "none"},
+            "CookiesConfig": {"CookieBehavior": "none"},
+        },
+    })["CachePolicy"]["Id"]
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name))
+        policy_id = out["Id"]
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_cache_policy_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == name
+        cfg = cloudfront.get_cache_policy(Id=other)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == taken
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.get_cache_policy(Id=other)["ETag"]
+        cloudfront.delete_cache_policy(Id=other, IfMatch=etag)
+
+
+def _origin_request_policy_template(name, comment=None, query_behavior="all",
+                                    headers=("X-Tenant-Key",)):
+    config = {
+        "Name": name,
+        "HeadersConfig": {"HeaderBehavior": "whitelist", "Headers": list(headers)},
+        "QueryStringsConfig": {"QueryStringBehavior": query_behavior},
+        "CookiesConfig": {"CookieBehavior": "none"},
+    }
+    if comment is not None:
+        config["Comment"] = comment
+    return {
+        "Resources": {"Orp": {"Type": "AWS::CloudFront::OriginRequestPolicy",
+                              "Properties": {"OriginRequestPolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Orp"}}},
+    }
+
+
+def test_cfn_cloudfront_origin_request_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::OriginRequestPolicy is "No interruption" throughout, so
+    an UpdateStack keeps the policy Id, the whitelists follow the template, and
+    a dropped Comment goes back to the create default."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-orp-update-{uid}"
+    name = f"cfn-orp-update-{uid}"
+    renamed = f"cfn-orp-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(name, comment="v1"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Comment"] == "v1"
+        assert cfg["QueryStringsConfig"]["QueryStringBehavior"] == "all"
+
+        # In-place: the behaviour flips and the header whitelist grows, same Id.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                name, comment="v2", query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Comment"] == "v2"
+        assert cfg["QueryStringsConfig"]["QueryStringBehavior"] == "none"
+        assert cfg["HeadersConfig"]["Headers"]["Items"] == ["X-Tenant-Key", "X-Service"]
+
+        # A rename keeps the same policy.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                renamed, comment="v2", query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for p in
+                 cloudfront.list_origin_request_policies()[
+                     "OriginRequestPolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropped Comment reverts.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                renamed, query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg.get("Comment", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _response_headers_policy_template(name, max_age=86400, custom_header=None,
+                                      with_cors=True):
+    config = {"Name": name}
+    if with_cors:
+        config["CorsConfig"] = {
+            "AccessControlAllowCredentials": False,
+            "AccessControlAllowHeaders": {"Items": ["Authorization"]},
+            "AccessControlAllowMethods": {"Items": ["GET", "HEAD"]},
+            "AccessControlAllowOrigins": {"Items": ["https://example.test"]},
+            "AccessControlMaxAgeSec": max_age,
+            "OriginOverride": True,
+        }
+    if custom_header is not None:
+        config["CustomHeadersConfig"] = {"Items": [
+            {"Header": "X-Env", "Value": custom_header, "Override": True},
+        ]}
+    return {
+        "Resources": {"Rhp": {"Type": "AWS::CloudFront::ResponseHeadersPolicy",
+                              "Properties": {"ResponseHeadersPolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Rhp"}}},
+    }
+
+
+def test_cfn_cloudfront_response_headers_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::ResponseHeadersPolicy is "No interruption" throughout.
+    The CORS max-age and the custom headers follow the template on an
+    UpdateStack under the same Id, and dropping CorsConfig removes the block
+    rather than leaving the previous one in the policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-rhp-update-{uid}"
+    name = f"cfn-rhp-update-{uid}"
+    renamed = f"cfn-rhp-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(name, custom_header="local"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["CorsConfig"]["AccessControlMaxAgeSec"] == 86400
+        assert cfg["CustomHeadersConfig"]["Items"][0]["Value"] == "local"
+
+        # In-place: max-age and the custom header value change, Id does not.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(
+                                name, max_age=600, custom_header="staging"),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["CorsConfig"]["AccessControlMaxAgeSec"] == 600
+        assert cfg["CustomHeadersConfig"]["Items"][0]["Value"] == "staging"
+
+        # A rename keeps the same policy.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(
+                                renamed, max_age=600, custom_header="staging"),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"]
+                 for p in cloudfront.list_response_headers_policies()[
+                     "ResponseHeadersPolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropping CorsConfig removes the block; dropping CustomHeadersConfig
+        # leaves an empty one, which is what the parser builds for an absent
+        # element.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(renamed, with_cors=False),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert "CorsConfig" not in cfg
+        assert cfg["CustomHeadersConfig"]["Quantity"] == 0
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _oac_template(name, signing_behavior="always", description=None):
+    config = {"Name": name, "OriginAccessControlOriginType": "s3",
+              "SigningBehavior": signing_behavior, "SigningProtocol": "sigv4"}
+    if description is not None:
+        config["Description"] = description
+    return {
+        "Resources": {"Oac": {"Type": "AWS::CloudFront::OriginAccessControl",
+                              "Properties": {"OriginAccessControlConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Oac", "Id"]}}},
+    }
+
+
+def test_cfn_cloudfront_origin_access_control_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::OriginAccessControl is "No interruption" throughout, so
+    the Id an origin points at survives a changed SigningBehavior, Description
+    or Name. Description is the type's one optional field, so it is the one
+    whose dropping can be tested with a template AWS accepts."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-oac-update-{uid}"
+    name = f"cfn-oac-update-{uid}"
+    renamed = f"cfn-oac-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(name, signing_behavior="never",
+                                          description="first"))
+        oac_id = out["Id"]
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "never"
+        assert cfg["Description"] == "first"
+
+        # In-place: signing behaviour and description change, same Id.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(name, signing_behavior="no-override",
+                                          description="second"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "no-override"
+        assert cfg["Description"] == "second"
+
+        # A rename keeps the same OAC.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(renamed, signing_behavior="no-override",
+                                          description="second"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == renamed
+        summaries = cloudfront.list_origin_access_controls()[
+            "OriginAccessControlList"]["Items"]
+        assert [s["Name"] for s in summaries].count(renamed) == 1
+        assert name not in [s["Name"] for s in summaries]
+
+        # Dropping Description reverts it to the create default.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _oac_template(renamed, signing_behavior="no-override"),
+                            update=True)
+        assert out["Id"] == oac_id
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["SigningBehavior"] == "no-override"
+        assert cfg.get("Description", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_oac_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """An OAC renamed onto a name another OAC holds is refused the way
+    UpdateOriginAccessControl refuses it: the update rolls back and both OACs
+    keep their names."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-oac-taken-{uid}"
+    name = f"cfn-oac-mine-{uid}"
+    taken = f"cfn-oac-taken-{uid}"
+    other = cloudfront.create_origin_access_control(
+        OriginAccessControlConfig=_oac_template(taken)["Resources"]["Oac"][
+            "Properties"]["OriginAccessControlConfig"])["OriginAccessControl"]["Id"]
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _oac_template(name))
+        oac_id = out["Id"]
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_oac_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cfg = cloudfront.get_origin_access_control(
+            Id=oac_id)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == name
+        cfg = cloudfront.get_origin_access_control(
+            Id=other)["OriginAccessControl"]["OriginAccessControlConfig"]
+        assert cfg["Name"] == taken
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.get_origin_access_control(Id=other)["ETag"]
+        cloudfront.delete_origin_access_control(Id=other, IfMatch=etag)
+
+
+def _cf_function_template(name, comment="v1", code=_FUNCTION_CODE, auto_publish=True):
+    props = {"Name": name, "FunctionCode": code,
+             "FunctionConfig": {"Comment": comment, "Runtime": "cloudfront-js-2.0"}}
+    if auto_publish is not None:
+        props["AutoPublish"] = auto_publish
+    return {
+        "Resources": {"Fn": {"Type": "AWS::CloudFront::Function", "Properties": props}},
+        "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Fn", "FunctionARN"]}}},
+    }
+
+
+def test_cfn_cloudfront_function_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::Function: FunctionCode, FunctionConfig and AutoPublish are
+    "No interruption", so an UpdateStack edits the function the create made —
+    same name, same CreatedTime — and republishes it when AutoPublish is set."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-update-{uid}"
+    name = f"cfn-fn-update-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(name, comment="v1"))
+        before = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        created = before["FunctionMetadata"]["CreatedTime"]
+        assert before["FunctionConfig"]["Comment"] == "v1"
+
+        new_code = _FUNCTION_CODE.replace("cloudformation", "updated-by-cfn")
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cf_function_template(name, comment="v2", code=new_code),
+                            update=True)
+        assert out["Arn"].endswith(f":function/{name}")
+        after = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        assert after["FunctionConfig"]["Comment"] == "v2"
+        # An in-place update is not a re-create: the function keeps the time it
+        # was created at, which the fall-through to the create handler reset.
+        assert after["FunctionMetadata"]["CreatedTime"] == created
+        body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read()
+        assert b"updated-by-cfn" in body
+
+        # Dropping AutoPublish leaves the new code unpublished, as the service's
+        # own UpdateFunction does.
+        _cfn_cf_stack(cfn, stack_name,
+                      _cf_function_template(name, comment="v3", code=new_code,
+                                            auto_publish=None),
+                      update=True)
+        dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]
+        assert dev["FunctionConfig"]["Comment"] == "v3"
+        assert dev["FunctionMetadata"]["CreatedTime"] == created
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=name, Stage="LIVE")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_function_rename_replaces(cfn, cloudfront):
+    """`Name` is the one "Update requires: Replacement" property of
+    AWS::CloudFront::Function: the renamed function is created and the
+    predecessor removed, so the ARN moves and only one function is left."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-rename-{uid}"
+    before, after = f"cfn-fn-before-{uid}", f"cfn-fn-after-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(before))
+        assert out["Arn"].endswith(f":function/{before}")
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(after), update=True)
+        assert out["Arn"].endswith(f":function/{after}")
+        cloudfront.describe_function(Name=after, Stage="LIVE")
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=before, Stage="DEVELOPMENT")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        cloudfront.describe_function(Name=after, Stage="DEVELOPMENT")
+
+
+def test_cfn_cloudfront_function_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """A function renamed onto a name another function holds is refused the way
+    CreateFunction refuses it with FunctionAlreadyExists: the update rolls back,
+    the stack's function keeps its name and the other function is untouched
+    rather than written over."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-taken-{uid}"
+    name = f"cfn-fn-mine-{uid}"
+    taken = f"cfn-fn-taken-{uid}"
+    cloudfront.create_function(
+        Name=taken, FunctionCode=b"function handler(event) { return event.request; }",
+        FunctionConfig={"Comment": "not the stack's", "Runtime": "cloudfront-js-2.0"})
+    try:
+        _cfn_cf_stack(cfn, stack_name, _cf_function_template(name))
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_cf_function_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cloudfront.describe_function(Name=name, Stage="LIVE")
+        other = cloudfront.describe_function(Name=taken, Stage="DEVELOPMENT")["FunctionSummary"]
+        assert other["FunctionConfig"]["Comment"] == "not the stack's"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.describe_function(Name=taken, Stage="DEVELOPMENT")["ETag"]
+        cloudfront.delete_function(Name=taken, IfMatch=etag)
+
+
+def test_cfn_cloudfront_function_deleted_out_of_band_is_recreated(cfn, cloudfront):
+    """A function removed through the API between two stack updates converges:
+    the update handler finds no record under the physical id, so the shared
+    _rename_replacement prologue treats it as a replacement and creates the
+    function the template asks for rather than failing the stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-gone-{uid}"
+    name = f"cfn-fn-gone-{uid}"
+    try:
+        _cfn_cf_stack(cfn, stack_name, _cf_function_template(name, comment="v1"))
+        etag = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["ETag"]
+        cloudfront.delete_function(Name=name, IfMatch=etag)
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
+
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cf_function_template(name, comment="v2"), update=True)
+        assert out["Arn"].endswith(f":function/{name}")
+        summary = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        assert summary["FunctionConfig"]["Comment"] == "v2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works
@@ -9090,6 +9635,50 @@ def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfro
 
     cfn.delete_stack(StackName="cfn-cf-dist-policies")
     _wait_stack(cfn, "cfn-cf-dist-policies")
+
+
+def test_cfn_cloudfront_distribution_keeps_its_policy_ref_across_a_rename(cfn, cloudfront):
+    """The payoff of updating in place: a distribution that took the cache
+    policy's Ref keeps pointing at the same policy after the policy is renamed
+    through the stack. Only the Ref and the policy itself can be asserted here;
+    GetDistributionConfig on a CloudFormation-provisioned distribution is the
+    separate, pre-existing 500."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-dist-rename-{uid}"
+    template = json.loads(_cloudfront_template(f"ren{uid}"))
+    template["Resources"]["Dist"] = {
+        "Type": "AWS::CloudFront::Distribution",
+        "Properties": {"DistributionConfig": {
+            "Enabled": True,
+            "Comment": "keeps its policy ref",
+            "Origins": [{"Id": "origin1", "DomainName": "example.test",
+                         "CustomOriginConfig": {"OriginProtocolPolicy": "https-only"}}],
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "origin1",
+                "ViewerProtocolPolicy": "allow-all",
+                "CachePolicyId": {"Ref": "CachePolicy"},
+            },
+        }},
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        before = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        renamed = f"cfn-cp-ren{uid}-v2"
+        template["Resources"]["CachePolicy"]["Properties"]["CachePolicyConfig"]["Name"] = renamed
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        after = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert after["CachePolicyRef"] == before["CachePolicyRef"]
+        cfg = cloudfront.get_cache_policy(Id=after["CachePolicyRef"])["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == renamed
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _mrap_template(name, buckets):
     return json.dumps({
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -9654,6 +10243,117 @@ def test_cfn_apigateway_rest_api_tracks_stack_region(cfn, apigw_v1):
     finally:
         west_cfn.delete_stack(StackName=stack_name)
         _wait_stack(west_cfn, stack_name)
+
+
+def test_cfn_apigateway_method_responses_survive_provisioning(cfn, apigw_v1):
+    """MethodResponses and Integration.IntegrationResponses declared in a template
+    reach the deployed method, so a CDK-style defaultCorsPreflightOptions OPTIONS
+    method actually answers with the Access-Control-Allow-* headers it maps."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-cors-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"cors-cfn-{suffix}"},
+            },
+            "Items": {
+                "Type": "AWS::ApiGateway::Resource",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ParentId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                    "PathPart": "items",
+                },
+            },
+            "OptionsMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResourceId": {"Ref": "Items"},
+                    "HttpMethod": "OPTIONS",
+                    "AuthorizationType": "NONE",
+                    "Integration": {
+                        "Type": "MOCK",
+                        "RequestTemplates": {"application/json": '{ "statusCode": 200 }'},
+                        "IntegrationResponses": [
+                            {
+                                "StatusCode": "204",
+                                "ResponseParameters": {
+                                    "method.response.header.Access-Control-Allow-Origin": "'*'",
+                                    "method.response.header.Access-Control-Allow-Headers": (
+                                        "'Content-Type,Authorization'"
+                                    ),
+                                    "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET'",
+                                },
+                            },
+                        ],
+                    },
+                    "MethodResponses": [
+                        {
+                            "StatusCode": "204",
+                            "ResponseParameters": {
+                                "method.response.header.Access-Control-Allow-Origin": True,
+                                "method.response.header.Access-Control-Allow-Headers": True,
+                                "method.response.header.Access-Control-Allow-Methods": True,
+                            },
+                        },
+                    ],
+                },
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "DependsOn": "OptionsMethod",
+                "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "prod"},
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "Api"}},
+            "ResourceId": {"Value": {"Ref": "Items"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        method = apigw_v1.get_method(
+            restApiId=outputs["ApiId"],
+            resourceId=outputs["ResourceId"],
+            httpMethod="OPTIONS",
+        )
+        assert method["methodResponses"], "MethodResponses were dropped during provisioning"
+        assert "204" in method["methodResponses"]
+        integration_responses = method["methodIntegration"]["integrationResponses"]
+        assert integration_responses, "IntegrationResponses were dropped during provisioning"
+        # Quotes are stripped at request time, not at storage time, so the
+        # stored mapping must keep them verbatim.
+        assert integration_responses["204"]["responseParameters"] == {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,Authorization'",
+            "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET'",
+        }
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/prod/items",
+            method="OPTIONS",
+            headers={
+                "Host": f"{outputs['ApiId']}.execute-api.localhost:{port}",
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 204
+            assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+            assert resp.headers.get("Access-Control-Allow-Methods") == "OPTIONS,GET"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
 
 
 def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):

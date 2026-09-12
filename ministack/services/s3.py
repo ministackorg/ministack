@@ -50,6 +50,12 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_credential,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1504,37 +1510,14 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
-def _resolve_presign_secret(access_key_id):
-    """The secret a presigned URL was signed with.
-
-    STS temporary credentials are signed with the unique secret STS issued (not
-    the server's static one), so a presigned URL from an AssumeRole / session
-    token would never recompute against ``AWS_SECRET_ACCESS_KEY``. STS records
-    each issued secret by access key id; resolve it here, falling back to the
-    static server secret for a long-term (non-session) credential.
-    """
-    try:
-        from ministack.services import sts
-
-        session = sts._sessions.get(access_key_id)
-        if session and session.get("SecretAccessKey"):
-            return session["SecretAccessKey"]
-    except Exception:
-        pass
-    return os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
-
-
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
     signed and anonymous requests are handled elsewhere / left lax).
 
-    MiniStack has no IAM secret store, so it verifies against its own secret
-    (``AWS_SECRET_ACCESS_KEY``, default ``test``) — the same credential the
-    server and its Lambda runtimes use. A URL signed with any other secret, or
-    one whose signed headers (content-type, content-length, ...) were tampered
-    with after signing, does not recompute to the same signature and is
-    rejected with 403 SignatureDoesNotMatch, matching real S3.
+    MiniStack resolves root, IAM-user, and STS credentials before recomputing
+    the signature. Temporary credentials must include the exact session token
+    STS issued.
     """
     signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
     if not signature:
@@ -1585,8 +1568,38 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         canonical_request,
     )
 
-    secret = _resolve_presign_secret(_akid)
-    computed = calculate_signature(secret, date_stamp, region, service, string_to_sign)
+    session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
+        query_params, "x-amz-security-token", ""
+    )
+    # S3 presigned requests verify credentials even with AUTH disabled.
+    # Resolve their tenant here, without changing routing for other requests.
+    try:
+        owner = find_iam_access_key_account(_akid)
+    except AmbiguousAccessKeyError:
+        return _error(
+            "InvalidAccessKeyId", "The AWS Access Key Id is ambiguous.", 403, path
+        )
+    if owner:
+        set_request_account_id(owner)
+    credential = resolve_credential(_akid, get_account_id(), session_token)
+    if isinstance(credential, CredentialResolutionError):
+        if credential.code == "ExpiredTokenException":
+            return _error("ExpiredToken", credential.message, 403, path)
+        if credential.code == "InvalidToken":
+            return _error("InvalidToken", credential.message, 403, path)
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    computed = calculate_signature(
+        credential.secret_access_key,
+        date_stamp,
+        region,
+        service,
+        string_to_sign,
+    )
 
     if not signatures_match(computed, signature):
         return _bad_signature()

@@ -21,15 +21,14 @@ from ministack.core.iam_evaluator import (
     EvalContext,
     EvalResult,
     PrincipalInfo,
+    enforce,
     evaluate,
     evaluate_trust_policy,
-    enforce,
     fnmatch_iam,
     parse_policy_document,
     resolve_principal,
     validate_policy_document,
 )
-
 
 # ---------------------------------------------------------------------------
 # Wildcard matching (IAM spec: case-insensitive, * = any, ? = single char)
@@ -907,6 +906,37 @@ class TestResourceArn:
     def test_dynamodb_no_table(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("dynamodb", "POST", "/", {}, b"{}", {}, "us-east-1", "123") == "*"
+
+    def test_dynamodb_index(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps(
+            {"TableName": "users", "IndexName": "email-index"}
+        ).encode()
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/users/index/email-index"
+
+    def test_dynamodb_batch_request_uses_first_table(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"RequestItems": {"events": [], "snapshots": []}}).encode()
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/events"
+
+    def test_dynamodb_batch_request_returns_every_table(self):
+        from ministack.core.iam_actions import dynamodb_resource_arns
+        body = json.dumps({"RequestItems": {"events": [], "snapshots": []}}).encode()
+        assert dynamodb_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:dynamodb:us-east-1:123:table/events",
+            "arn:aws:dynamodb:us-east-1:123:table/snapshots",
+        ]
+
+    def test_eventbridge_put_events_defaults_to_default_bus(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"Entries": [{"Source": "example"}]}).encode()
+        assert extract_resource_arn(
+            "events", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:events:us-east-1:123:event-bus/default"
 
     def test_lambda_function(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1788,3 +1818,143 @@ def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
     })
     assert isinstance(config, dict)
     assert config["FunctionName"] == "f"
+
+
+def test_lambda_execution_credentials_resolve_to_configured_role(monkeypatch):
+    """SDK calls from Lambda are evaluated against its execution role."""
+    import ministack.app as app_mod
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import lambda_svc
+    from ministack.services import sts as sts_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    token = _request_account_id.set("000000000000")
+    role_name = "appointment-mark-canceled"
+    events_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/events"
+    snapshots_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/snapshots"
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {
+            "events": json.dumps({
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["dynamodb:PutItem", "dynamodb:BatchWriteItem"],
+                    "Resource": events_arn,
+                }]
+            })
+        },
+    }
+    try:
+        credentials = lambda_svc.execution_credentials({
+            "FunctionName": "appointment-mark-canceled",
+            "FunctionArn": (
+                "arn:aws:lambda:us-east-1:000000000000:function:"
+                "appointment-mark-canceled"
+            ),
+            "Role": f"arn:aws:iam::000000000000:role/{role_name}",
+        })
+        access_key = credentials["AWS_ACCESS_KEY_ID"]
+        assert access_key.startswith("ASIA")
+        assert credentials["AWS_SESSION_TOKEN"]
+        assert sts_svc._sessions[access_key]["Arn"].startswith(
+            f"arn:aws:sts::000000000000:assumed-role/{role_name}/"
+        )
+        assert enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=events_arn,
+        ) is None
+        denied = enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=snapshots_arn,
+        )
+        assert isinstance(denied, EvalResult)
+        assert denied.decision == "ImplicitDeny"
+    finally:
+        iam_svc._roles.pop(role_name, None)
+        sts_svc._sessions.clear()
+        _request_account_id.reset(token)
+
+
+def test_role_session_uses_account_from_session_arn():
+    from ministack.core.iam_evaluator import resolve_principal
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    role_name = "cross-account-request-context"
+    account_id = "957398953894"
+    token = _request_account_id.set(account_id)
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {"allow": json.dumps({"Statement": [{
+            "Effect": "Allow", "Action": "states:StartExecution", "Resource": "*",
+        }]})},
+    }
+    _request_account_id.reset(token)
+    sts_svc._sessions["ASIASESSIONACCOUNT"] = {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/lambda",
+        "SecretAccessKey": "test-session-secret",
+    }
+    try:
+        principal = resolve_principal("ASIASESSIONACCOUNT", "000000000000")
+        assert principal.account == account_id
+        assert principal.policies
+    finally:
+        token = _request_account_id.set(account_id)
+        iam_svc._roles.pop(role_name, None)
+        _request_account_id.reset(token)
+        sts_svc._sessions.clear()
+
+
+def test_lambda_execution_role_explicit_deny_overrides_allow(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import lambda_svc
+    from ministack.services import sts as sts_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    token = _request_account_id.set("000000000000")
+    role_name = "denied-writer"
+    table_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/events"
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {
+            "allow-and-deny": json.dumps({
+                "Statement": [
+                    {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "dynamodb:BatchWriteItem",
+                        "Resource": table_arn,
+                    },
+                ]
+            })
+        },
+    }
+    try:
+        access_key = lambda_svc.execution_credentials({
+            "FunctionName": "denied-writer",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:denied-writer",
+            "Role": f"arn:aws:iam::000000000000:role/{role_name}",
+        })["AWS_ACCESS_KEY_ID"]
+        denied = enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=table_arn,
+        )
+        assert isinstance(denied, EvalResult)
+        assert denied.decision == "Deny"
+    finally:
+        iam_svc._roles.pop(role_name, None)
+        sts_svc._sessions.clear()
+        _request_account_id.reset(token)

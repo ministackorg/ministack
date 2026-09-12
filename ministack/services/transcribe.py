@@ -10,8 +10,13 @@ Implemented:
   StartTranscriptionJob, GetTranscriptionJob, ListTranscriptionJobs,
   DeleteTranscriptionJob.
 
-Jobs run as a background task that walks QUEUED -> IN_PROGRESS -> COMPLETED
-over ``TRANSCRIBE_JOB_RUN_SECONDS`` (0 completes immediately), reads the media
+StartTranscriptionJob returns the job already IN_PROGRESS with StartTime set,
+as the documented AWS response does. QUEUED is reached on AWS only by a
+request that opted into job queueing while the account is at its concurrent
+job limit; here it is reachable by setting ``TRANSCRIBE_JOB_QUEUE_SECONDS``.
+A background task
+walks the job to COMPLETED or FAILED over ``TRANSCRIBE_JOB_RUN_SECONDS``
+(0 completes immediately), reads the media
 object out of MiniStack's S3 store, and writes a transcript document back to
 S3 in the real Transcribe result format. Entering a terminal state publishes a
 ``Transcribe Job State Change`` event so EventBridge rules downstream of a
@@ -74,10 +79,17 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("transcribe")
 
-# How long a job spends between QUEUED and COMPLETED. Same knob shape as
-# GLUE_CRAWLER_RUN_SECONDS: tests that assert on IN_PROGRESS need a non-zero
-# value, tests that just want a result set it to 0.
+# How long a job spends between IN_PROGRESS and COMPLETED. Same knob shape as
+# GLUE_CRAWLER_RUN_SECONDS: tests that want to observe a job mid-flight need a
+# non-zero value, tests that just want a result set it to 0.
 _JOB_RUN_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_RUN_SECONDS", "2"))
+
+# How long a job sits QUEUED before it starts. On AWS a job is queued only if
+# the request opted into queueing (JobExecutionSettings.AllowDeferredExecution)
+# and the account is at its concurrent job limit, so the default is 0 and the
+# start response reports IN_PROGRESS. Raise it to exercise a caller that
+# handles QUEUED. Also settable at runtime through /_ministack/config.
+_JOB_QUEUE_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_QUEUE_SECONDS", "0"))
 
 # Where transcripts land when the caller supplies no OutputBucketName. Real
 # Transcribe uses a service-managed bucket and hands back a presigned URL; the
@@ -221,7 +233,7 @@ def load_persisted_state(data):
 
 def _fail_orphaned_jobs():
     """A job that was mid-flight when the process stopped has no worker any
-    more. Leaving it QUEUED or IN_PROGRESS strands every caller polling
+    more. Leaving it in a non-terminal state strands every caller polling
     GetTranscriptionJob forever, so it is failed the way AWS fails a job it
     cannot finish."""
     for job in _jobs.all_values():
@@ -609,13 +621,13 @@ def _live_job(job_name, run_id):
     return job
 
 
-async def _run_job(job_name, run_id, account_id, region, netloc):
+async def _run_job(job_name, run_id, account_id, region, netloc, queue_seconds):
     """Walk a job to a terminal state. Runs as a background task, so it pins
     the account and region it was started for rather than inheriting whatever
     request happens to be in flight."""
     with request_scope(account_id, region):
         try:
-            await _run_job_inner(job_name, run_id, netloc)
+            await _run_job_inner(job_name, run_id, netloc, queue_seconds)
         except Exception:
             logger.exception("Transcribe: job %s crashed", job_name)
             job = _live_job(job_name, run_id)
@@ -626,21 +638,23 @@ async def _run_job(job_name, run_id, account_id, region, netloc):
                 _emit_state_change(job_name, "FAILED")
 
 
-async def _run_job_inner(job_name, run_id, netloc):
-    half = _JOB_RUN_SECONDS / 2 if _JOB_RUN_SECONDS > 0 else 0
+async def _run_job_inner(job_name, run_id, netloc, queue_seconds):
+    # queue_seconds is passed in rather than read here: the start handler
+    # decided on it when it chose the job's initial status, and /_ministack/config
+    # can change the module value in between, which would otherwise leave a
+    # QUEUED job with no worker to start it.
+    if queue_seconds > 0:
+        await asyncio.sleep(queue_seconds)
 
-    if half:
-        await asyncio.sleep(half)
+        job = _live_job(job_name, run_id)
+        if job is None:
+            return
 
-    job = _live_job(job_name, run_id)
-    if job is None:
-        return
+        job["TranscriptionJobStatus"] = "IN_PROGRESS"
+        job["StartTime"] = time.time()
 
-    job["TranscriptionJobStatus"] = "IN_PROGRESS"
-    job["StartTime"] = time.time()
-
-    if half:
-        await asyncio.sleep(half)
+    if _JOB_RUN_SECONDS > 0:
+        await asyncio.sleep(_JOB_RUN_SECONDS)
 
     job = _live_job(job_name, run_id)
     if job is None:
@@ -819,16 +833,21 @@ def _start_transcription_job(data):
         location_type = "SERVICE_BUCKET"
 
     run_id = new_uuid()
+    queue_seconds = _JOB_QUEUE_SECONDS
+    queued = queue_seconds > 0
+    # One timestamp for both members: a job that starts immediately has not
+    # started before it was created, and two time.time() calls can skew.
+    created = time.time()
     job = {
         "TranscriptionJobName": name,
-        "TranscriptionJobStatus": "QUEUED",
+        "TranscriptionJobStatus": "QUEUED" if queued else "IN_PROGRESS",
         "LanguageCode": language_code,
         "MediaSampleRateHertz": data.get("MediaSampleRateHertz"),
         "MediaFormat": data.get("MediaFormat"),
         "Media": copy.deepcopy(media),
         "Transcript": None,
-        "StartTime": None,
-        "CreationTime": time.time(),
+        "StartTime": None if queued else created,
+        "CreationTime": created,
         "CompletionTime": None,
         "FailureReason": None,
         "Settings": copy.deepcopy(data.get("Settings")) if data.get("Settings") else None,
@@ -855,7 +874,9 @@ def _start_transcription_job(data):
     _jobs[name] = job
 
     asyncio.create_task(
-        _run_job(name, run_id, get_account_id(), get_region(), _external_netloc())
+        _run_job(
+            name, run_id, get_account_id(), get_region(), _external_netloc(), queue_seconds
+        )
     )
 
     return json_response({"TranscriptionJob": _public_job(job)})
