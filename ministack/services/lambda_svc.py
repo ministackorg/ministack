@@ -4094,6 +4094,14 @@ try {
       .filter(Boolean));
   const origHttpsRequest = https.request;
   https.request = function (input, options, callback) {
+    // Keep the caller's own arguments for the pass-through below: Node's
+    // ClientRequest reads (input, options, cb) positionally and, for a
+    // non-string input, takes cb from the SECOND argument — so replaying a
+    // normalised (input, undefined, callback) would drop the callback and the
+    // handler would never see its response. A copy, not `arguments` itself:
+    // this file is not in strict mode, so `arguments` stays aliased to the
+    // parameters and the normalisation below would rewrite it too.
+    const original = Array.prototype.slice.call(arguments);
     if (typeof options === "function") { callback = options; options = undefined; }
     let opts;
     if (typeof input === "string" || input instanceof URL) {
@@ -4109,7 +4117,7 @@ try {
     // port itself: a handler that dials its own TLS sidecar on another port
     // of localhost keeps TLS.
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
-      return origHttpsRequest.call(https, input, options, callback);
+      return origHttpsRequest.apply(https, original);
     }
     opts.protocol = "http:";
     opts.hostname = host;
@@ -4121,8 +4129,9 @@ try {
     delete opts._defaultAgent;
     return http.request(opts, callback);
   };
-  https.get = function (input, options, callback) {
-    const req = https.request(input, options, callback);
+  https.get = function () {
+    // Same argument shapes as request(), forwarded untouched.
+    const req = https.request.apply(https, arguments);
     req.end();
     return req;
   };
