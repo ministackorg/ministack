@@ -6260,6 +6260,113 @@ def test_route_async_failure_to_sqs_dlq():
         set_request_region(original_region)
 
 
+@pytest.mark.parametrize("payload", [b'[1,2,3]', b'"a string"', b'42', b'{"k":"v"}'])
+def test_warm_worker_context_reaches_every_payload_shape(lam, payload):
+    """On AWS the per-invocation context is the execution environment and the
+    context object, not the event: `_X_AMZN_TRACE_ID` is a reserved variable
+    that "changes with each invocation" (configuration-envvars) and the payload
+    reaches the handler as sent, whatever its JSON type. The pooled worker
+    carries those values beside the payload, so a list or a bare string is
+    served exactly like an object."""
+    fname = f"warm-ctx-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import os\n"
+        "def handler(event, context):\n"
+        "    return {'event': event,\n"
+        "            'trace': os.environ.get('_X_AMZN_TRACE_ID'),\n"
+        "            'req': context.aws_request_id}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+        Timeout=10, TracingConfig={"Mode": "Active"},
+    )
+    try:
+        body = json.loads(lam.invoke(FunctionName=fname, Payload=payload)["Payload"].read())
+        assert body["event"] == json.loads(payload)
+        assert body["trace"], "the trace header did not reach a non-dict payload"
+        assert body["req"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_nodejs_warm_context_object_is_populated(lam):
+    """The properties nodejs-context.html documents, on the warm pool: the
+    bootstrap read them off the event, where nothing ever set them, so every
+    one was empty and getRemainingTimeInMillis() was a constant."""
+    fname = f"warm-jsctx-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async (event, context) => ({\n"
+        "  name: context.functionName, version: context.functionVersion,\n"
+        "  mem: context.memoryLimitInMB, arn: context.invokedFunctionArn,\n"
+        "  req: context.awsRequestId, group: context.logGroupName,\n"
+        "  stream: context.logStreamName, remaining: context.getRemainingTimeInMillis(),\n"
+        "  waits: context.callbackWaitsForEmptyEventLoop});\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip_js(code)},
+        Timeout=7, MemorySize=256,
+    )
+    try:
+        first = json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["name"] == fname
+        assert first["version"] == "$LATEST"
+        assert first["mem"] == "256"
+        assert first["arn"].endswith(f":function:{fname}")
+        assert first["group"] == f"/aws/lambda/{fname}"
+        assert first["stream"]
+        assert first["waits"] is True
+        # Counts down from the configured timeout rather than a constant.
+        assert 0 < first["remaining"] <= 7000
+        # The request id is per invocation; the log stream is per environment.
+        second = json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert second["req"] != first["req"]
+        assert second["stream"] == first["stream"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_warm_invocation_leaves_the_caller_event_untouched(monkeypatch):
+    """The per-invocation values (trace header, invoke depth, durable context)
+    travel beside the payload, so the handler's event is the caller's and
+    nothing ministack-shaped survives the call — the async retry path hands
+    the very same object to `_route_async_failure`, which puts it in the DLQ
+    envelope as `requestPayload`."""
+    seen = {}
+    worker = Mock()
+
+    def _invoke(event, request_id, **ctx):
+        seen["event"] = event
+        seen["ctx"] = ctx
+        return {"status": "ok", "result": {"ok": True}, "log": ""}
+
+    worker.invoke.side_effect = _invoke
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lsvc, "acquire_worker", Mock(return_value=(worker, "reuse")))
+    monkeypatch.setattr(lsvc, "release_worker", Mock())
+    monkeypatch.setattr(lsvc, "_emit_lambda_logs", Mock())
+    config = {
+        "FunctionName": "warm-carrier-copy",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:warm-carrier-copy",
+        "Runtime": "python3.12", "Handler": "index.handler", "Timeout": 3,
+    }
+    event = {"input": "hi"}
+    token = lsvc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
+    try:
+        result = lsvc._execute_function_warm({"config": config, "code_zip": b"zip"}, event)
+    finally:
+        lsvc._durable_ctx.reset(token)
+
+    assert result["body"] == {"ok": True}
+    # The per-invocation values reached the worker beside the payload...
+    assert seen["ctx"]["depth"] is not None
+    assert seen["ctx"]["durable"]["AWS_LAMBDA_DURABLE_EXECUTION_ARN"] == "exec-arn"
+    # ...and the payload is the caller's, untouched.
+    assert seen["event"] == {"input": "hi"}
+    assert event == {"input": "hi"}
+
+
 def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
     """A stale foreign-Region target ARN must not route to a same-named local queue."""
     import ministack.services.sqs as _sqs
@@ -8764,6 +8871,95 @@ def _start_callback(lam):
     cb_id = (op.get("CallbackDetails") or {}).get("CallbackId")
     assert cb_id, f"no CallbackId in {op}"
     return fname, rec["DurableExecutionArn"], cb_id, body["CheckpointToken"]
+
+
+def test_lambda_durable_concurrent_executions_get_their_own_callback(lam):
+    """Two executions of one function reach the same workflow position, so the
+    SDK checkpoints the same operation id for both. The CallbackId is the
+    emulator's to mint and must be unique per execution: completing the first
+    execution's callback must resolve that execution and leave the second one
+    waiting. Reported by @Nhollas."""
+    import base64 as _b64
+    from urllib.parse import quote
+
+    fname = f"durable-cb-iso-{_uuid_mod.uuid4().hex[:8]}"
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    op_id = "cbsharedaaaaaaaaaaaaaaaaaaaaaa"
+
+    def start(payload):
+        """Invoke, then checkpoint a CALLBACK START under the shared op id."""
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2015-03-31/functions/{fname}/invocations",
+            method="POST", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            arn = r.headers.get("X-Amz-Durable-Execution-Arn")
+            token = r.headers.get("X-Amz-Durable-Checkpoint-Token")
+            r.read()
+        code, body = _raw_durable(
+            "POST", f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/checkpoint",
+            body={"CheckpointToken": token, "Updates": [{
+                "Id": op_id, "Type": "CALLBACK", "Action": "START", "Name": "answer",
+                "CallbackOptions": {"TimeoutSeconds": 120},
+            }]})
+        assert code == 200, body
+        op = next(o for o in body["NewExecutionState"]["Operations"] if o["Id"] == op_id)
+        return arn, (op.get("CallbackDetails") or {}).get("CallbackId")
+
+    try:
+        arn_a, cb_a = start(b'{"runId":"A"}')
+        arn_b, cb_b = start(b'{"runId":"B"}')
+        assert arn_a != arn_b
+        assert cb_a and cb_b
+        assert cb_a != cb_b, "two executions were handed the same CallbackId"
+
+        # Completing A's callback resolves A...
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/"
+            f"{quote(cb_a, safe='')}/succeed",
+            method="POST", data=b'{"answer":"A"}',
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+
+        def events(arn):
+            code, hist = _raw_durable(
+                "GET", f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/history")
+            assert code == 200, hist
+            return hist["Events"]
+
+        succeeded_a = [e for e in events(arn_a) if e["EventType"] == "CallbackSucceeded"]
+        assert len(succeeded_a) == 1
+        assert succeeded_a[0]["CallbackSucceededDetails"]["Result"]["Payload"] == (
+            '{"answer":"A"}')
+        # ...and leaves B waiting: no CallbackSucceeded of A's answer on B.
+        assert not [e for e in events(arn_b) if e["EventType"] == "CallbackSucceeded"], (
+            "the second execution received the first execution's answer")
+
+        # B's own id still resolves B.
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/"
+            f"{quote(cb_b, safe='')}/succeed",
+            method="POST", data=b'{"answer":"B"}',
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+        succeeded_b = [e for e in events(arn_b) if e["EventType"] == "CallbackSucceeded"]
+        assert len(succeeded_b) == 1
+        assert succeeded_b[0]["CallbackSucceededDetails"]["Result"]["Payload"] == (
+            '{"answer":"B"}')
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_durable_send_callback_success_then_already_closed(lam):
@@ -12658,6 +12854,68 @@ def test_provided_dispatch_preserves_other_executors(monkeypatch, mode, target):
         assert executor.call_count == (1 if name == target else 0)
     if mode == "local":
         executors[target].assert_called_once_with(func, {}, "request-1")
+
+
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+@pytest.mark.parametrize("durable", [False, True])
+def test_python_and_nodejs_dispatch_to_the_warm_pool_durable_or_not(
+        monkeypatch, runtime, durable):
+    """The sibling of the provided.* routing above: python and nodejs reach
+    _execute_function_warm whether or not the invocation is durable, because
+    their per-call durable context rides in the event rather than in the
+    worker's spawn environment."""
+    monkeypatch.setattr(lambda_svc, "LAMBDA_EXECUTOR", "local")
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    monkeypatch.setattr(lambda_svc, "_proxy_url_for", lambda config: None)
+    monkeypatch.setattr(lambda_svc, "_emit_lambda_logs", Mock())
+    names = ["_execute_function_warm", "_execute_function_local",
+             "_execute_function_provided", "_execute_function_provided_warm",
+             "_execute_function_docker", "_execute_function_proxy"]
+    executors = {name: Mock(return_value={"body": name}) for name in names}
+    for name, executor in executors.items():
+        monkeypatch.setattr(lambda_svc, name, executor)
+    config = _provided_dispatch_config()
+    config["Runtime"] = runtime
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"test": True} if durable else None)
+    try:
+        result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert result == {"body": "_execute_function_warm"}
+    for name, executor in executors.items():
+        assert executor.call_count == (1 if name == "_execute_function_warm" else 0)
+
+
+@pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
+def test_docker_unavailable_fallback_carries_the_durable_context(monkeypatch, unavailable):
+    """Both permissive Docker fallbacks send python and nodejs to the warm
+    pool, so the durable context reaches the handler there too. Before the
+    carrier moved into the event they invoked with the three variables unset."""
+    monkeypatch.setattr(lambda_svc, "_docker_available", unavailable != "sdk")
+    monkeypatch.setattr(lambda_svc, "_get_docker_client",
+                        lambda: None if unavailable == "daemon" else object())
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    warm = Mock(return_value={"body": "warm"})
+    one_shot = Mock(return_value={"body": "one-shot"})
+    monkeypatch.setattr(lambda_svc, "_execute_function_warm", warm)
+    monkeypatch.setattr(lambda_svc, "_execute_function_local", one_shot)
+    config = _provided_dispatch_config()
+    config["Runtime"] = "python3.12"
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
+    try:
+        assert lambda_svc._execute_function_docker(func, {}) == {"body": "warm"}
+        overlay = lambda_svc._durable_env_overlay()
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    warm.assert_called_once_with(func, {})
+    one_shot.assert_not_called()
+    assert overlay == {
+        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "exec-arn",
+        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "tok",
+        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": "exec",
+    }
 
 
 def test_provided_env_keeps_function_vars_and_endpoint_precedence(monkeypatch):

@@ -53,11 +53,9 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
-    DURABLE_CTX_EVENT_KEY,
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
-    INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
     ensure_spawned,
@@ -5011,25 +5009,19 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
         # worker's spawn env.
-        _xray = _xray_trace_id_for_invocation(config)
-        if _xray:
-            event["_x_amzn_trace_id"] = _xray
-        # Same channel for the recursive-loop depth: the worker's env is
-        # fixed at spawn time, so it has to ride in the event. Both worker
-        # bootstraps move it to the environment and drop the key before the
-        # handler runs. Non-dict payloads have nowhere to carry it, and lose
-        # the counter.
-        if isinstance(event, dict):
-            event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
-            # Durable executions ride the same channel: the ARN, the checkpoint
-            # token and the execution name differ per invocation, which is why
-            # they cannot be part of the worker's spawn environment. The
-            # bootstrap clears them again when the key is absent, so a worker
-            # reused for a non-durable call does not see the previous one's.
-            durable = _durable_env_overlay()
-            if durable:
-                event[DURABLE_CTX_EVENT_KEY] = durable
-        result = worker.invoke(event, new_uuid())
+        # The per-invocation values travel beside the payload, never inside
+        # it: on AWS the trace header is a reserved environment variable that
+        # "changes with each invocation", the request id is on the context
+        # object, and the payload the handler receives is the caller's, of
+        # whatever JSON type. A pooled worker's spawn environment is fixed, so
+        # the values ride the envelope and the bootstrap applies them per call.
+        result = worker.invoke(
+            event,
+            new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+            depth=_invoke_depth.get(),
+            durable=_durable_env_overlay(),
+        )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:

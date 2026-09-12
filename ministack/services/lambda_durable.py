@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import copy
+import hashlib as _hashlib
 import json
 import secrets
 import time
@@ -84,6 +85,27 @@ _resume_thread_started = False
 # start.
 _callback_index = AccountScopedDict()
 
+
+def _callback_id(arn: str, op_id: str) -> str:
+    """The CallbackId an execution's CALLBACK operation is handed out under.
+
+    Operation ids come from the client and are deterministic per workflow
+    position, so two executions of the same function reach the same callback
+    with the same operation id. Keying the callback on the operation id alone
+    let the second registration overwrite the first, and the id the first
+    execution had been given then resolved to the second one. The id is ours
+    to mint (the SDK reads it back out of ``CallbackDetails.CallbackId``), so
+    it is derived from the execution ARN as well — unique per execution, and
+    stable across replays and restarts, which a random token would not be.
+
+    The alphabet is the model's (``[A-Za-z0-9+/]+={0,2}``) narrowed to hex:
+    a standard-base64 id can contain ``/``, and ``scope["path"]`` reaches the
+    router already percent-decoded, so such an id would split the URI segment
+    and never resolve.
+    """
+    return _hashlib.sha256(f"{arn}\n{op_id}".encode()).hexdigest()
+
+
 # Function-level DurableConfig is stored on the function config in lambda_svc;
 # we expose helpers here for serialization parity.
 
@@ -141,7 +163,15 @@ def restore_state(data):
             if op.get("Type") == "CALLBACK" and op.get("Status") == "STARTED":
                 op_id = op.get("Id")
                 if op_id:
-                    _callback_index.set_scoped(account_id, region, op_id, (arn, op_id))
+                    _callback_index.set_scoped(
+                        account_id, region, _callback_id(arn, op_id), (arn, op_id))
+                    # A record written before the id became execution-scoped
+                    # carries the old id; keep it resolvable so a callback
+                    # handed out before the upgrade still completes.
+                    stored = (op.get("CallbackDetails") or {}).get("CallbackId")
+                    if stored and stored != _callback_id(arn, op_id):
+                        _callback_index.set_scoped(
+                            account_id, region, stored, (arn, op_id))
         # Re-arm WAIT and CALLBACK timers for executions that were still
         # RUNNING when the process went down. Without this, restored
         # executions stall forever — timers never fire.
@@ -712,7 +742,8 @@ def _apply_update(rec: dict, upd: dict) -> None:
         # resume scheduler can poll them alongside WAIT expiries.
         cb_opts = upd.get("CallbackOptions") or {}
         if action == "START":
-            details["CallbackId"] = op_id  # SDK uses Operation.Id as CallbackId
+            # Unique per (execution, operation): see _callback_id.
+            details["CallbackId"] = _callback_id(rec["DurableExecutionArn"], op_id)
             timeout_s = cb_opts.get("TimeoutSeconds")
             if timeout_s is not None:
                 details["TimeoutDeadline"] = now + float(timeout_s)
@@ -720,11 +751,14 @@ def _apply_update(rec: dict, upd: dict) -> None:
             if hb_s is not None:
                 details["HeartbeatTimeoutSeconds"] = float(hb_s)
                 details["HeartbeatDeadline"] = now + float(hb_s)
-            # Index so Send*Callback handlers can look us up by the bare id.
-            _callback_index[op_id] = (rec["DurableExecutionArn"], op_id)
+            # Index so Send*Callback handlers can look us up by the id.
+            _callback_index[details["CallbackId"]] = (rec["DurableExecutionArn"], op_id)
         elif action in ("SUCCEED", "FAIL", "CANCEL"):
-            # Callback resolved internally — drop from the live index.
-            _callback_index.pop(op_id, None)
+            # Callback resolved internally — drop from the live index. The
+            # stored id is read back rather than recomputed so a record
+            # written before the id became execution-scoped still clears.
+            _callback_index.pop(details.get("CallbackId") or op_id, None)
+            _callback_index.pop(_callback_id(rec["DurableExecutionArn"], op_id), None)
     elif op_type == "CONTEXT":
         details = existing.setdefault("ContextDetails", {})
         if payload is not None and action == "SUCCEED":
@@ -749,7 +783,13 @@ def _apply_update(rec: dict, upd: dict) -> None:
         if rec.get("InputPayload"):
             details["InputPayload"] = rec["InputPayload"]
 
-    # History event mirror.
+    # History event mirror. CallbackStarted reports the id the operation was
+    # handed out under, which is execution-scoped (see _callback_id), not the
+    # client's operation id.
+    callback_id = ""
+    if op_type == "CALLBACK":
+        callback_id = (existing.get("CallbackDetails") or {}).get("CallbackId") or ""
+
     event_type_map = {
         ("STEP", "START"): ("StepStarted", "StepStartedDetails", {}),
         ("STEP", "SUCCEED"): ("StepSucceeded", "StepSucceededDetails",
@@ -763,7 +803,7 @@ def _apply_update(rec: dict, upd: dict) -> None:
         ("WAIT", "CANCEL"): ("WaitCancelled", "WaitCancelledDetails",
                              {"Error": {"Payload": err or {}, "Truncated": False}}),
         ("CALLBACK", "START"): ("CallbackStarted", "CallbackStartedDetails",
-                                {"CallbackId": op_id or ""}),
+                                {"CallbackId": callback_id or ""}),
         ("CALLBACK", "SUCCEED"): ("CallbackSucceeded", "CallbackSucceededDetails",
                                   {"Result": {"Payload": payload or "", "Truncated": False}}),
         ("CALLBACK", "FAIL"): ("CallbackFailed", "CallbackFailedDetails",

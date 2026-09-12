@@ -138,23 +138,20 @@ _LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_WARM_TTL_SECONDS", "300"))
 # because both the worker script and lambda_svc's one-shot wrappers embed it.
 INVOKE_DEPTH_ENV = "_MINISTACK_INVOKE_DEPTH"
 INVOKE_DEPTH_HEADER = "X-Ministack-Invoke-Depth"
-# The warm worker's env is fixed at spawn time, so its depth rides in the
-# event and is popped off before the handler sees it — same trick the X-Ray
-# trace header uses.
-INVOKE_DEPTH_EVENT_KEY = "_ministack_invoke_depth"
+# The warm worker's env is fixed at spawn time, so its depth travels in the
+# invocation envelope beside the payload — same channel as the X-Ray trace
+# header and the durable-execution variables below.
 
 # The durable-execution variables change on every invocation of the same
 # function, so a pooled worker cannot carry them in its spawn environment
-# either. They ride in the event under this key, as a mapping of the three
-# names below, and both worker bootstraps move them into the environment
-# before the handler runs.
+# either. They travel in the envelope as a mapping of the three names below,
+# and both worker bootstraps move them into the environment before the
+# handler runs.
 #
 # One declaration for both readers: lambda_svc builds the overlay from the
 # durable context under these keys, the bootstraps iterate the names to set
 # them and to delete them again. A fourth variable added to only one of the
-# two would be set and never cleared, which is the leak the event carrier
-# exists to avoid.
-DURABLE_CTX_EVENT_KEY = "_ministack_durable_ctx"
+# two would be set and never cleared.
 DURABLE_ENV_VARS = {
     "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "arn",
     "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "token",
@@ -167,8 +164,6 @@ def _sub_runtime_tokens(script: str) -> str:
     return (
         script.replace("__DEPTH_ENV__", INVOKE_DEPTH_ENV)
         .replace("__DEPTH_HEADER__", INVOKE_DEPTH_HEADER)
-        .replace("__DEPTH_EVENT_KEY__", INVOKE_DEPTH_EVENT_KEY)
-        .replace("__DURABLE_EVENT_KEY__", DURABLE_CTX_EVENT_KEY)
         .replace("__DURABLE_ENV_VARS__", json.dumps(list(DURABLE_ENV_VARS)))
     )
 
@@ -274,26 +269,33 @@ def run():
         line = sys.stdin.readline()
         if not line:
             break
-        event = json.loads(line)
-        # X-Ray active tracing: ministack injects the per-invocation trace
-        # header into the event; pop it into os.environ so the AWS X-Ray SDK
-        # can read _X_AMZN_TRACE_ID on import.
-        _xray_tid = event.pop("_x_amzn_trace_id", None)
+        # One invocation, one envelope: {"event": <payload>, "ctx": {...}}.
+        # The payload is the caller's and reaches the handler exactly as it
+        # was sent, whatever its JSON type — on AWS the per-invocation values
+        # below are in the execution environment and the context object, never
+        # in the event.
+        _ms_msg = json.loads(line)
+        event = _ms_msg["event"]
+        _ms_ctx = _ms_msg.get("ctx") or {}
+        # X-Ray active tracing: _X_AMZN_TRACE_ID is a reserved environment
+        # variable that "changes with each invocation", so a pooled worker
+        # sets it per call.
+        _xray_tid = _ms_ctx.get("trace_id")
         if _xray_tid:
             os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
         elif "_X_AMZN_TRACE_ID" in os.environ:
             del os.environ["_X_AMZN_TRACE_ID"]
         # Recursive-loop depth: same per-invocation channel as the trace
         # header, read by the before-call handler when this function calls out.
-        _ms_depth = event.pop("__DEPTH_EVENT_KEY__", None)
+        _ms_depth = _ms_ctx.get("depth")
         if _ms_depth is not None:
             os.environ["__DEPTH_ENV__"] = str(_ms_depth)
         elif "__DEPTH_ENV__" in os.environ:
             del os.environ["__DEPTH_ENV__"]
         # Durable execution: the ARN, the checkpoint token and the execution
-        # name belong to this invocation only, so they arrive with the event
-        # and are dropped again when the next one is not durable.
-        _ms_durable = event.pop("__DURABLE_EVENT_KEY__", None) or {}
+        # name belong to this invocation only, and are dropped again when the
+        # next one is not durable.
+        _ms_durable = _ms_ctx.get("durable") or {}
         for _ms_var in __DURABLE_ENV_VARS__:
             if _ms_var in _ms_durable:
                 os.environ[_ms_var] = str(_ms_durable[_ms_var])
@@ -306,7 +308,7 @@ def run():
             "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
             "memory_limit_in_mb": init.get("memory", 128),
             "invoked_function_arn": init.get("arn", ""),
-            "aws_request_id": event.pop("_request_id", ""),
+            "aws_request_id": _ms_ctx.get("request_id", ""),
             "log_group_name": os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/" + _function_name),
             "log_stream_name": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", ""),
             "identity": None,
@@ -935,37 +937,49 @@ rl.on("line", async (line) => {
       return;
     }
 
-    // Subsequent lines are event invocations
-    const event = msg;
+    // Subsequent lines are one invocation each: {"event": <payload>, "ctx": {...}}.
+    // The payload is the caller's and reaches the handler exactly as it was
+    // sent, whatever its JSON type — on AWS the values below live in the
+    // execution environment and the context object, never in the event.
+    const event = msg.event;
+    const ctx = msg.ctx || {};
+    const _msDeadline = Date.now() + Number(ctx.timeout_ms || 300000);
     const context = {
-      functionName: event._function_name || "",
-      memoryLimitInMB: event._memory || "128",
-      invokedFunctionArn: event._arn || "",
-      awsRequestId: event._request_id || "",
-      getRemainingTimeInMillis: () => 300000,
+      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME || "",
+      functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION || "$LATEST",
+      memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE || "128",
+      invokedFunctionArn: process.env._LAMBDA_FUNCTION_ARN || "",
+      awsRequestId: ctx.request_id || "",
+      logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME
+        || ("/aws/lambda/" + (process.env.AWS_LAMBDA_FUNCTION_NAME || "")),
+      logStreamName: process.env.AWS_LAMBDA_LOG_STREAM_NAME || "",
+      identity: null,
+      clientContext: null,
+      callbackWaitsForEmptyEventLoop: true,
+      getRemainingTimeInMillis: () => Math.max(0, _msDeadline - Date.now()),
       done: () => {},
       succeed: () => {},
       fail: () => {},
     };
-    // X-Ray active tracing: ministack injects the per-invocation trace
-    // header into the event; promote it to process.env so the AWS X-Ray SDK
-    // can read _X_AMZN_TRACE_ID on require().
-    if (event._x_amzn_trace_id) {
-      process.env._X_AMZN_TRACE_ID = event._x_amzn_trace_id;
+    // X-Ray active tracing: _X_AMZN_TRACE_ID is a reserved environment
+    // variable that "changes with each invocation", so a pooled worker sets
+    // it per call and the AWS X-Ray SDK reads it on require().
+    if (ctx.trace_id) {
+      process.env._X_AMZN_TRACE_ID = ctx.trace_id;
     } else if ("_X_AMZN_TRACE_ID" in process.env) {
       delete process.env._X_AMZN_TRACE_ID;
     }
     // Recursive-loop depth rides the same per-invocation channel, and the
     // bundled Lambda stub reads it back off process.env when the handler
     // invokes another function.
-    if (event.__DEPTH_EVENT_KEY__ !== undefined) {
-      process.env.__DEPTH_ENV__ = String(event.__DEPTH_EVENT_KEY__);
+    if (ctx.depth !== undefined && ctx.depth !== null) {
+      process.env.__DEPTH_ENV__ = String(ctx.depth);
     } else if ("__DEPTH_ENV__" in process.env) {
       delete process.env.__DEPTH_ENV__;
     }
-    // Durable execution: per-invocation values, so they ride in the event and
-    // are dropped again when the next invocation is not durable.
-    const _msDurable = event.__DURABLE_EVENT_KEY__ || {};
+    // Durable execution: per-invocation values, dropped again when the next
+    // invocation is not durable.
+    const _msDurable = ctx.durable || {};
     for (const _msVar of __DURABLE_ENV_VARS__) {
       if (_msVar in _msDurable) {
         process.env[_msVar] = String(_msDurable[_msVar]);
@@ -973,13 +987,6 @@ rl.on("line", async (line) => {
         delete process.env[_msVar];
       }
     }
-    delete event.__DURABLE_EVENT_KEY__;
-    delete event.__DEPTH_EVENT_KEY__;
-    delete event._x_amzn_trace_id;
-    delete event._request_id;
-    delete event._function_name;
-    delete event._memory;
-    delete event._arn;
 
     try {
       let settled = false;
@@ -1317,7 +1324,15 @@ class Worker:
                 time.sleep(0.001)
         return "\n".join(lines)
 
-    def invoke(self, event: dict, request_id: str) -> dict:
+    def invoke(self, event, request_id: str, *, trace_id: str | None = None,
+               depth=None, durable: dict | None = None) -> dict:
+        """Run one invocation on this worker.
+
+        The per-invocation values travel beside the payload, not inside it:
+        on AWS they are the execution environment (`_X_AMZN_TRACE_ID` is
+        reserved and "changes with each invocation") and the context object,
+        so the handler's event is the caller's payload of any JSON type.
+        """
         with self._lock:
             cold = self._cold
 
@@ -1329,12 +1344,25 @@ class Worker:
                 cold = False
 
             timeout = self.config.get("Timeout", 30)
-            event["_request_id"] = request_id
+            # Only what genuinely differs per invocation. The function's own
+            # identity (name, version, memory, ARN, log group and stream) is
+            # already in the worker's environment, where AWS puts it, and both
+            # bootstraps build their context object from there.
+            envelope = {
+                "event": event,
+                "ctx": {
+                    "request_id": request_id,
+                    "timeout_ms": int(float(timeout) * 1000),
+                    "trace_id": trace_id,
+                    "depth": depth,
+                    "durable": durable or {},
+                },
+            }
             result_box: list = []
 
             def _read_response():
                 try:
-                    self._proc.stdin.write(json.dumps(event) + "\n")
+                    self._proc.stdin.write(json.dumps(envelope) + "\n")
                     self._proc.stdin.flush()
                     for _ in range(200):
                         response_line = self._proc.stdout.readline()
