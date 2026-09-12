@@ -382,6 +382,31 @@ def _cf_oac_delete(physical_id, props):
     _cf._oacs.pop(physical_id, None)
 
 
+def _cf_function_live_body(cfg, code):
+    """The snapshot PublishFunction freezes for the LIVE stage."""
+    return {
+        "comment": cfg["comment"],
+        "runtime": cfg["runtime"],
+        "kvs_arns": list(cfg["kvs_arns"]),
+        "code": code,
+    }
+
+
+def _cf_function_tags(name, props):
+    """`Tags` on the type is an array of Tag and is "No interruption" on an
+    update, so the template's list replaces whatever the function carried."""
+    tags = [
+        {"Key": str(t.get("Key", "")), "Value": str(t.get("Value", ""))}
+        for t in (props.get("Tags") or [])
+        if isinstance(t, dict) and t.get("Key")
+    ]
+    arn = _cf._func_arn(name)
+    if tags:
+        _cf._tags[arn] = tags
+    else:
+        _cf._tags.pop(arn, None)
+
+
 def _cf_function_body(name, props):
     """The FunctionConfig, source and AutoPublish flag a template carries."""
     cfg_el = _cf_props_to_element("FunctionConfig", props.get("FunctionConfig") or {})
@@ -426,7 +451,9 @@ def _cf_function_create(logical_id, props, stack_name):
         "last_modified_live": now if auto_publish else None,
         "dev_etag": dev_etag,
         "live_etag": new_uuid() if auto_publish else None,
+        "live_body": _cf_function_live_body(cfg, code) if auto_publish else None,
     }
+    _cf_function_tags(name, props)
     # The reference lists only FunctionARN and FunctionMetadata.FunctionARN as
     # GetAtt attributes — no Stage.
     arn = _cf._func_arn(name)
@@ -442,13 +469,12 @@ def _cf_function_update(physical_id, old_props, new_props, stack_name, logical_i
     removed, while everything else keeps the physical id — the function name,
     which is what its ARN is built from — and its creation time.
 
-    The stage handling follows MiniStack's own UpdateFunction model, which the
-    reference does not describe: the new source lands in DEVELOPMENT and the
-    LIVE stage is dropped, because the record holds one body for both stages
-    and an unpublished change must not be served as published. `AutoPublish:
-    true` republishes right after, which is what the reference means by
-    "updating the AWS::CloudFront::Function resource with the AutoPublish
-    property set to true".
+    The new source lands in DEVELOPMENT and the published body keeps serving
+    LIVE, as UpdateFunction does ("The changes are made only to the version of
+    the function that is in the DEVELOPMENT stage"). `AutoPublish: true`
+    republishes right after, which is what the reference means by "updating the
+    AWS::CloudFront::Function resource with the AutoPublish property set to
+    true".
     """
     name = new_props.get("Name") or _physical_name(stack_name,
                                                    logical_id or physical_id, max_len=64)
@@ -469,14 +495,18 @@ def _cf_function_update(physical_id, old_props, new_props, stack_name, logical_i
     record["code"] = code
     record["last_modified_dev"] = now
     record["dev_etag"] = new_uuid()
-    record["last_modified_live"] = now if auto_publish else None
-    record["live_etag"] = new_uuid() if auto_publish else None
+    if auto_publish:
+        record["last_modified_live"] = now
+        record["live_etag"] = new_uuid()
+        record["live_body"] = _cf_function_live_body(cfg, code)
+    _cf_function_tags(name, new_props)
     arn = _cf._func_arn(name)
     return physical_id, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
 
 
 def _cf_function_delete(physical_id, props):
     _cf._functions.pop(physical_id, None)
+    _cf._tags.pop(_cf._func_arn(physical_id), None)
 
 
 # ===========================================================================

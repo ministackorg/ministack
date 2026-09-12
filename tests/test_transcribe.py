@@ -101,38 +101,6 @@ def test_transcribe_start_returns_a_job_already_in_progress(transcribe, media):
     assert started["StartTime"] >= started["CreationTime"]
 
 
-def test_transcribe_queue_seconds_puts_a_job_through_queued_first(transcribe, media):
-    """QUEUED is off by default because AWS reaches it only for a request that
-    opted into job queueing while the account is at its concurrent job limit,
-    but a caller that handles the state still needs a way to exercise it. With
-    TRANSCRIBE_JOB_QUEUE_SECONDS set, the job starts QUEUED with no StartTime
-    and the worker moves it to IN_PROGRESS."""
-    from conftest import _ministack_config
-
-    _, _, media_uri = media
-    job_name = _unique("job")
-
-    _ministack_config({"transcribe._JOB_QUEUE_SECONDS": 3})
-    try:
-        started = transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            LanguageCode="en-US",
-            Media={"MediaFileUri": media_uri},
-        )["TranscriptionJob"]
-
-        assert started["TranscriptionJobStatus"] == "QUEUED"
-        # AWS omits StartTime until the job leaves the queue.
-        assert "StartTime" not in started
-
-        running = _wait_for_status(transcribe, job_name, statuses=("IN_PROGRESS",))
-        assert running["StartTime"] >= running["CreationTime"]
-    finally:
-        _ministack_config({"transcribe._JOB_QUEUE_SECONDS": 0})
-
-    job = _wait_for_status(transcribe, job_name)
-    assert job["TranscriptionJobStatus"] == "COMPLETED"
-
-
 def test_transcribe_transcript_is_deterministic_per_media(transcribe, s3, media):
     """There is no ASR here, so the value of the mock rests entirely on being
     reproducible. The same media must transcribe identically on every run or

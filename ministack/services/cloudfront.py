@@ -552,18 +552,34 @@ def _resolve_taggable_cloudfront_arn(arn: str):
     return arn, None
 
 
+def _function_view(fn: dict, stage: str) -> dict:
+    """The function body a stage serves.
+
+    An update lands in DEVELOPMENT only — "The changes are made only to the
+    version of the function that is in the DEVELOPMENT stage. To copy the
+    updates from the DEVELOPMENT stage to LIVE, you must publish the function"
+    — so LIVE keeps serving the body captured at the last publish. A record
+    from before this snapshot existed falls back to the live body.
+    """
+    if stage == "LIVE":
+        return fn.get("live_body") or fn
+    return fn
+
+
 def _function_summary_builder(fn: dict, stage: str, status: str, last_modified: str):
+    view = _function_view(fn, stage)
+
     def build(root):
         fc = SubElement(root, "FunctionConfig")
-        SubElement(fc, "Comment").text = fn.get("comment", "")
-        kvs_arns = fn.get("kvs_arns", [])
+        SubElement(fc, "Comment").text = view.get("comment", "")
+        kvs_arns = view.get("kvs_arns", [])
         kvs = SubElement(fc, "KeyValueStoreAssociations")
         SubElement(kvs, "Quantity").text = str(len(kvs_arns))
         items_el = SubElement(kvs, "Items")
         for arn in kvs_arns:
             assoc = SubElement(items_el, "KeyValueStoreAssociation")
             SubElement(assoc, "KeyValueStoreARN").text = arn
-        SubElement(fc, "Runtime").text = fn["runtime"]
+        SubElement(fc, "Runtime").text = view.get("runtime", fn["runtime"])
         md = SubElement(root, "FunctionMetadata")
         SubElement(md, "CreatedTime").text = fn["created"]
         SubElement(md, "FunctionARN").text = fn["arn"]
@@ -636,6 +652,8 @@ def _cf_create_function(headers, body):
         "last_modified_live": None,
         "dev_etag": dev_etag,
         "live_etag": None,
+        # The body PublishFunction froze; LIVE serves this, not the working copy.
+        "live_body": None,
     }
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
@@ -706,7 +724,7 @@ def _cf_get_function(name: str, stage: str):
         if not fn["live_etag"]:
             return _error("NoSuchFunctionExists", "The specified function does not exist.", 404)
         etag = fn["live_etag"]
-        code = fn["code"]
+        code = _function_view(fn, "LIVE").get("code", fn["code"])
     elif stage == "DEVELOPMENT":
         etag = fn["dev_etag"]
         code = fn["code"]
@@ -733,6 +751,14 @@ def _cf_publish_function(name: str, headers):
     now = _now_iso()
     fn["live_etag"] = new_uuid()
     fn["last_modified_live"] = now
+    # Publishing copies DEVELOPMENT to LIVE; later updates to the development
+    # body must not reach the stage that is serving traffic.
+    fn["live_body"] = {
+        "comment": fn["comment"],
+        "runtime": fn["runtime"],
+        "kvs_arns": list(fn.get("kvs_arns", [])),
+        "code": fn["code"],
+    }
     logger.info("PublishFunction name=%s", name)
 
     lm = fn["last_modified_live"]
@@ -775,8 +801,8 @@ def _cf_update_function(name: str, headers, body):
     fn["code"] = code
     fn["last_modified_dev"] = now
     fn["dev_etag"] = new_uuid()
-    fn["live_etag"] = None
-    fn["last_modified_live"] = None
+    # LIVE is untouched: an update changes the DEVELOPMENT stage only, and the
+    # published version keeps serving until PublishFunction copies this one.
     logger.info("UpdateFunction name=%s", name)
 
     return _xml_response(

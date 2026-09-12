@@ -931,6 +931,55 @@ class TestResourceArn:
             "arn:aws:dynamodb:us-east-1:123:table/snapshots",
         ]
 
+    def test_eventbridge_put_events_returns_every_bus(self):
+        from ministack.core.iam_actions import eventbridge_resource_arns
+        body = json.dumps({"Entries": [
+            {"EventBusName": "orders"},
+            {"Source": "example"},
+            {"EventBusName": "orders"},
+            {"EventBusName": "arn:aws:events:us-east-1:123:event-bus/audit"},
+        ]}).encode()
+        assert eventbridge_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:events:us-east-1:123:event-bus/orders",
+            "arn:aws:events:us-east-1:123:event-bus/default",
+            "arn:aws:events:us-east-1:123:event-bus/audit",
+        ]
+
+    def test_eventbridge_put_events_survives_a_malformed_entry(self):
+        from ministack.core.iam_actions import eventbridge_resource_arns
+        body = json.dumps({"Entries": ["junk", {"EventBusName": 7}]}).encode()
+        assert eventbridge_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:events:us-east-1:123:event-bus/default",
+        ]
+
+    def test_dynamodb_attributes_are_top_level_only(self):
+        """AWS resolves a ProjectionExpression of "Name, Address.City" to
+        ["Name", "Address"], substituting a placeholder per path segment."""
+        from ministack.core.iam_actions import dynamodb_service_context
+        body = json.dumps({
+            "TableName": "users",
+            "ProjectionExpression": "Name, Address.City, #a.#c, Items[0]",
+            "ExpressionAttributeNames": {"#a": "Addr", "#c": "City"},
+        }).encode()
+        context = dynamodb_service_context(body)
+        assert context["dynamodb:Attributes"] == ["Name", "Address", "Addr", "Items"]
+        assert context["dynamodb:Select"] == "SPECIFIC_ATTRIBUTES"
+
+    def test_dynamodb_select_is_always_resolved(self):
+        """Select always has a value on AWS, so a policy conditioning on it
+        with StringEqualsIfExists must not pass a projection-less request."""
+        from ministack.core.iam_actions import dynamodb_service_context
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users"}).encode()
+        ) == {"dynamodb:Select": "ALL_ATTRIBUTES"}
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users", "Select": "COUNT"}).encode()
+        )["dynamodb:Select"] == "COUNT"
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users", "AttributesToGet": ["a", "b"]}).encode()
+        ) == {"dynamodb:Attributes": ["a", "b"], "dynamodb:Select": "SPECIFIC_ATTRIBUTES"}
+        assert dynamodb_service_context(b"not json") == {}
+
     def test_eventbridge_put_events_defaults_to_default_bus(self):
         from ministack.core.iam_actions import extract_resource_arn
         body = json.dumps({"Entries": [{"Source": "example"}]}).encode()
@@ -1474,7 +1523,8 @@ class TestS3EnforcementSites:
         stmts = parse_policy_document(policy)
         seen = []
 
-        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*"):
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
             seen.append((iam_action, resource_arn))
             result = evaluate(_ctx(action=iam_action, resource=resource_arn), [stmts])
             if result.decision == "Allow":

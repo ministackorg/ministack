@@ -1233,7 +1233,6 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._SFN_WAIT_SCALE",
         "translate._JOB_RUN_SECONDS",
         "transcribe._JOB_RUN_SECONDS",
-        "transcribe._JOB_QUEUE_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "alb.TARGET_CONNECT_TIMEOUT",
@@ -1259,7 +1258,6 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",
                 "transcribe._JOB_RUN_SECONDS",
-                "transcribe._JOB_QUEUE_SECONDS",
             ):
                 try:
                     float_value = float(value)
@@ -2172,6 +2170,8 @@ async def _dispatch_service_request(
         from ministack.core.iam_actions import (
             access_denied_response,
             dynamodb_resource_arns,
+            dynamodb_service_context,
+            eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
         )
@@ -2184,30 +2184,12 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            service_context = None
-            if service == "dynamodb":
-                try:
-                    dynamodb_body = json.loads(body or b"{}")
-                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-                    dynamodb_body = {}
-                projection = dynamodb_body.get("ProjectionExpression")
-                names = dynamodb_body.get("ExpressionAttributeNames") or {}
-                if projection:
-                    attributes = [
-                        names.get(part.strip(), part.strip())
-                        for part in projection.split(",")
-                    ]
-                    service_context = {
-                        "dynamodb:Attributes": attributes,
-                        "dynamodb:Select": dynamodb_body.get(
-                            "Select", "SPECIFIC_ATTRIBUTES"
-                        ),
-                    }
-            enforce_kwargs = {"resource_arn": resource_arn}
-            if service_context is not None:
-                enforce_kwargs["service_context"] = service_context
+            service_context = (
+                dynamodb_service_context(body) if service == "dynamodb" else None
+            )
             denied = enforce(
-                access_key, iam_action, service, region, **enforce_kwargs
+                access_key, iam_action, service, region,
+                resource_arn=resource_arn, service_context=service_context,
             )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
@@ -2229,6 +2211,17 @@ async def _dispatch_service_request(
                         region,
                         resource_arn=extra_arn,
                         service_context=service_context,
+                    )
+                    if denied:
+                        break
+            # PutEvents carries one entry per event, and entries may name
+            # different buses: AWS authorizes each against its own bus.
+            if service == "events" and not denied:
+                for extra_arn in eventbridge_resource_arns(
+                        body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn,
                     )
                     if denied:
                         break

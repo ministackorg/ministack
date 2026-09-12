@@ -9500,8 +9500,9 @@ def test_cfn_cloudfront_function_updates_in_place(cfn, cloudfront):
         body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read()
         assert b"updated-by-cfn" in body
 
-        # Dropping AutoPublish leaves the new code unpublished, as the service's
-        # own UpdateFunction does.
+        # Dropping AutoPublish leaves the new code unpublished: the update
+        # reaches DEVELOPMENT only and LIVE keeps serving what was published,
+        # as UpdateFunction does.
         _cfn_cf_stack(cfn, stack_name,
                       _cf_function_template(name, comment="v3", code=new_code,
                                             auto_publish=None),
@@ -9509,8 +9510,8 @@ def test_cfn_cloudfront_function_updates_in_place(cfn, cloudfront):
         dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]
         assert dev["FunctionConfig"]["Comment"] == "v3"
         assert dev["FunctionMetadata"]["CreatedTime"] == created
-        with pytest.raises(ClientError):
-            cloudfront.describe_function(Name=name, Stage="LIVE")
+        still_live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        assert still_live["FunctionConfig"]["Comment"] == "v2"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 

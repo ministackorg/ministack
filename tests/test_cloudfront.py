@@ -826,6 +826,47 @@ def test_cloudfront_function_create_publish_describe_get_delete(cloudfront):
     assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
 
 
+def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
+    """UpdateFunction changes the DEVELOPMENT stage only: "To copy the updates
+    from the DEVELOPMENT stage to LIVE, you must publish the function". The
+    published version keeps serving until PublishFunction runs again."""
+    name = f"fn-live-{_uuid_mod.uuid4().hex[:8]}"
+    published = b"function handler(event) { return 'published'; }"
+    updated = b"function handler(event) { return 'updated'; }"
+
+    cr = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "v1", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=published,
+    )
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(cr))
+
+    upd = cloudfront.update_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+        FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=updated,
+    )
+
+    live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+    assert live["FunctionConfig"]["Comment"] == "v1"
+    live_body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"]
+    assert (live_body.read() if hasattr(live_body, "read") else live_body) == published
+    dev_body = cloudfront.get_function(Name=name, Stage="DEVELOPMENT")["FunctionCode"]
+    assert (dev_body.read() if hasattr(dev_body, "read") else dev_body) == updated
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
+    live_body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"]
+    assert (live_body.read() if hasattr(live_body, "read") else live_body) == updated
+    live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+    assert live["FunctionConfig"]["Comment"] == "v2"
+
+    cloudfront.delete_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+    )
+
+
 def test_cloudfront_function_duplicate_name(cloudfront):
     name = f"fn-dup-{_uuid_mod.uuid4().hex[:8]}"
     cloudfront.create_function(

@@ -920,12 +920,9 @@ def extract_resource_arn(service: str, method: str, path: str,
             event_data = json.loads(body or b"{}")
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             event_data = {}
-        entries = event_data.get("Entries") if isinstance(event_data, dict) else None
-        if isinstance(entries, list) and entries:
-            event_bus = entries[0].get("EventBusName") or "default"
-            if event_bus.startswith("arn:"):
-                return event_bus
-            return f"arn:aws:events:{region}:{account_id}:event-bus/{event_bus}"
+        buses = eventbridge_resource_arns(body, region, account_id)
+        if buses:
+            return buses[0]
         name = _safe_json_field(body, "Name") or _safe_json_field(body, "RuleName")
         bus = _safe_json_field(body, "EventBusName") or "default"
         if name:
@@ -1526,6 +1523,35 @@ def extract_resource_arn(service: str, method: str, path: str,
     return "*"
 
 
+def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Every event-bus ARN a ``PutEvents`` request addresses, in request order.
+
+    AWS authorizes ``events:PutEvents`` per bus, and one call can carry entries
+    for several, so the caller checks each. Entries that are not objects, and
+    bus names that are not strings, are skipped rather than crashing the
+    enforcement path on a malformed request.
+    """
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    entries = data.get("Entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    arns = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        bus = entry.get("EventBusName")
+        if not isinstance(bus, str) or not bus:
+            bus = "default"
+        arn = bus if bus.startswith("arn:") else (
+            f"arn:aws:events:{region}:{account_id}:event-bus/{bus}")
+        if arn not in arns:
+            arns.append(arn)
+    return arns
+
+
 def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
     """Return every table ARN addressed by a DynamoDB JSON request."""
     try:
@@ -1547,6 +1573,53 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
         for name in tables
         if isinstance(name, str) and name
     ]
+
+
+def dynamodb_service_context(body: bytes) -> dict:
+    """The DynamoDB condition keys a request carries.
+
+    ``dynamodb:Attributes`` is the list of *top-level* attributes the request
+    names: AWS resolves a ``ProjectionExpression`` of ``"Name, Address.City"``
+    to ``["Name", "Address"]``, and a placeholder is substituted per path
+    segment, not on the whole path. The key is omitted when the request names
+    no attributes, which is how AWS evaluates it ("evaluated only on the
+    attributes specified in the request").
+
+    ``dynamodb:Select`` always has a value on AWS for the operations that
+    return attributes (``ALL_ATTRIBUTES`` unless the request says otherwise),
+    so it is set on every request: leaving it unresolved lets a policy that
+    conditions on it with ``StringEqualsIfExists`` pass a request AWS refuses.
+    """
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    names = data.get("ExpressionAttributeNames")
+    names = names if isinstance(names, dict) else {}
+
+    attributes = []
+    projection = data.get("ProjectionExpression")
+    if isinstance(projection, str):
+        for part in projection.split(","):
+            # Top level only: the path's first segment, before any "." or "[".
+            head = re.split(r"[.\[]", part.strip(), maxsplit=1)[0].strip()
+            if head:
+                attributes.append(names.get(head, head))
+    # AttributesToGet is the legacy form of the same projection.
+    legacy = data.get("AttributesToGet")
+    if isinstance(legacy, list):
+        attributes.extend(a for a in legacy if isinstance(a, str) and a)
+
+    context = {}
+    if attributes:
+        context["dynamodb:Attributes"] = attributes
+    select = data.get("Select")
+    if not isinstance(select, str) or not select:
+        select = "SPECIFIC_ATTRIBUTES" if attributes else "ALL_ATTRIBUTES"
+    context["dynamodb:Select"] = select
+    return context
 
 
 def access_denied_response(service: str, action: str, principal_arn: str,

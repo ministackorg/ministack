@@ -12,9 +12,9 @@ Implemented:
 
 StartTranscriptionJob returns the job already IN_PROGRESS with StartTime set,
 as the documented AWS response does. QUEUED is reached on AWS only by a
-request that opted into job queueing while the account is at its concurrent
-job limit; here it is reachable by setting ``TRANSCRIBE_JOB_QUEUE_SECONDS``.
-A background task
+request that opted into job queueing (``JobExecutionSettings.AllowDeferredExecution``)
+while the account is at its concurrent job limit; neither the quota nor the
+opt-in is modelled here, so a job never queues. A background task
 walks the job to COMPLETED or FAILED over ``TRANSCRIBE_JOB_RUN_SECONDS``
 (0 completes immediately), reads the media
 object out of MiniStack's S3 store, and writes a transcript document back to
@@ -83,13 +83,6 @@ logger = logging.getLogger("transcribe")
 # GLUE_CRAWLER_RUN_SECONDS: tests that want to observe a job mid-flight need a
 # non-zero value, tests that just want a result set it to 0.
 _JOB_RUN_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_RUN_SECONDS", "2"))
-
-# How long a job sits QUEUED before it starts. On AWS a job is queued only if
-# the request opted into queueing (JobExecutionSettings.AllowDeferredExecution)
-# and the account is at its concurrent job limit, so the default is 0 and the
-# start response reports IN_PROGRESS. Raise it to exercise a caller that
-# handles QUEUED. Also settable at runtime through /_ministack/config.
-_JOB_QUEUE_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_QUEUE_SECONDS", "0"))
 
 # Where transcripts land when the caller supplies no OutputBucketName. Real
 # Transcribe uses a service-managed bucket and hands back a presigned URL; the
@@ -621,13 +614,13 @@ def _live_job(job_name, run_id):
     return job
 
 
-async def _run_job(job_name, run_id, account_id, region, netloc, queue_seconds):
+async def _run_job(job_name, run_id, account_id, region, netloc):
     """Walk a job to a terminal state. Runs as a background task, so it pins
     the account and region it was started for rather than inheriting whatever
     request happens to be in flight."""
     with request_scope(account_id, region):
         try:
-            await _run_job_inner(job_name, run_id, netloc, queue_seconds)
+            await _run_job_inner(job_name, run_id, netloc)
         except Exception:
             logger.exception("Transcribe: job %s crashed", job_name)
             job = _live_job(job_name, run_id)
@@ -638,21 +631,9 @@ async def _run_job(job_name, run_id, account_id, region, netloc, queue_seconds):
                 _emit_state_change(job_name, "FAILED")
 
 
-async def _run_job_inner(job_name, run_id, netloc, queue_seconds):
-    # queue_seconds is passed in rather than read here: the start handler
-    # decided on it when it chose the job's initial status, and /_ministack/config
-    # can change the module value in between, which would otherwise leave a
-    # QUEUED job with no worker to start it.
-    if queue_seconds > 0:
-        await asyncio.sleep(queue_seconds)
-
-        job = _live_job(job_name, run_id)
-        if job is None:
-            return
-
-        job["TranscriptionJobStatus"] = "IN_PROGRESS"
-        job["StartTime"] = time.time()
-
+async def _run_job_inner(job_name, run_id, netloc):
+    # The job is already IN_PROGRESS with StartTime set: the start handler put
+    # it there, as the AWS response does. There is no queued phase to wait out.
     if _JOB_RUN_SECONDS > 0:
         await asyncio.sleep(_JOB_RUN_SECONDS)
 
@@ -833,20 +814,18 @@ def _start_transcription_job(data):
         location_type = "SERVICE_BUCKET"
 
     run_id = new_uuid()
-    queue_seconds = _JOB_QUEUE_SECONDS
-    queued = queue_seconds > 0
     # One timestamp for both members: a job that starts immediately has not
     # started before it was created, and two time.time() calls can skew.
     created = time.time()
     job = {
         "TranscriptionJobName": name,
-        "TranscriptionJobStatus": "QUEUED" if queued else "IN_PROGRESS",
+        "TranscriptionJobStatus": "IN_PROGRESS",
         "LanguageCode": language_code,
         "MediaSampleRateHertz": data.get("MediaSampleRateHertz"),
         "MediaFormat": data.get("MediaFormat"),
         "Media": copy.deepcopy(media),
         "Transcript": None,
-        "StartTime": None if queued else created,
+        "StartTime": created,
         "CreationTime": created,
         "CompletionTime": None,
         "FailureReason": None,
@@ -874,9 +853,7 @@ def _start_transcription_job(data):
     _jobs[name] = job
 
     asyncio.create_task(
-        _run_job(
-            name, run_id, get_account_id(), get_region(), _external_netloc(), queue_seconds
-        )
+        _run_job(name, run_id, get_account_id(), get_region(), _external_netloc())
     )
 
     return json_response({"TranscriptionJob": _public_job(job)})

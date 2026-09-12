@@ -94,6 +94,13 @@ _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
+# A task that is registered but not stopped, in task-lifecycle order. A
+# PENDING or ACTIVATING task already counts against a service's desired
+# capacity, so reconciliation must not launch a second one while its images
+# are still pulling.
+_PRE_STOP_STATUSES = ("PENDING", "ACTIVATING", "RUNNING")
+
+
 def _live_container_ids():
     """Container ids still owned by a live task.
 
@@ -854,7 +861,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     for arn, t in _tasks.items():
         if (t.get("group") == f"service:{svc_name}"
                 and t.get("clusterArn") == cluster_arn
-                and t.get("lastStatus") in ("PENDING", "RUNNING")):
+                and t.get("lastStatus") in _PRE_STOP_STATUSES):
             if t.get("taskDefinitionArn") == target_td_arn:
                 current_tasks.append((arn, t))
             else:
@@ -1003,7 +1010,7 @@ def _delete_service(data):
         a for a, t in _tasks.items()
         if t.get("group") == f"service:{svc_name}"
         and t.get("clusterArn") == cluster_arn
-        and t.get("lastStatus") in ("PENDING", "RUNNING")
+        and t.get("lastStatus") in _PRE_STOP_STATUSES
     ]:
         _stop_task({"task": task_arn, "cluster": cluster_name, "reason": "Service deleted"})
 
@@ -1453,6 +1460,32 @@ def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
     return True
 
 
+def _mark_task_activating(task_arn, task):
+    """Move a registered task to ACTIVATING, where the image pull happens.
+
+    "ACTIVATING: This is a transition state where Amazon ECS has to perform
+    additional steps after the task is launched but before the task can
+    transition to the RUNNING state. This is the state where Amazon ECS pulls
+    the container images, creates the containers, configures the task
+    networking, registers load balancer target groups" (task-lifecycle). The
+    task sits PENDING only until its worker picks it up.
+    """
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        task["lastStatus"] = "ACTIVATING"
+        task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
+
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name:
+        # pendingTasksCount / pendingCount are "the number of tasks in the
+        # cluster that are in the PENDING state" per the model, so an
+        # ACTIVATING task leaves those counts rather than joining running.
+        _recount_cluster(cluster_name)
+        _refresh_service_state(cluster_name, task.get("group", ""))
+    return True
+
+
 def _mark_task_running(task_arn, task):
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
@@ -1553,11 +1586,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
     cluster_arn = task["clusterArn"]
     launch_type = task.get("launchType", "EC2")
 
-    with resource_lock("ecs-task", task_arn):
-        active = _task_is_active(task_arn, task)
-        if active:
-            task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
-    if not active:
+    if not _mark_task_activating(task_arn, task):
         return
 
     ecs_network = None
@@ -2323,9 +2352,20 @@ def _ecs_single_resource_tail(ref, resource_type):
 
 
 def _sanitize(obj):
-    """Remove internal keys (prefixed with _) from a dict for API responses."""
+    """Project a stored record onto its wire shape.
+
+    Drops internal keys (prefixed with _) and members with no value: AWS omits
+    a member it has nothing for rather than sending an explicit null, and a
+    task holds placeholders for the timestamps it has not reached yet
+    (startedAt and the pull markers while it is PENDING, stoppedAt until it
+    stops). boto3 discards a null member on the way in, so only a client that
+    reads the wire sees the difference.
+    """
     if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items() if not k.startswith("_")}
+        return {
+            k: _sanitize(v) for k, v in obj.items()
+            if not k.startswith("_") and v is not None
+        }
     if isinstance(obj, list):
         return [_sanitize(i) for i in obj]
     return obj

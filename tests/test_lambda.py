@@ -3,12 +3,15 @@ import contextlib
 import io
 import json
 import os
+import socket
+import sys
+import threading
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
 import boto3
@@ -11336,6 +11339,7 @@ def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
     from stored CodeSha256 values (base64), never by re-hashing blobs."""
     import base64 as _b64
     import hashlib as _hashlib
+
     from ministack.core.responses import AccountRegionScopedDict
     _fresh_extract_cache(monkeypatch, tmp_path)
     code_a, code_b = _make_zip("def handler(e,c): return 1"), _make_zip("def handler(e,c): return 2")
@@ -11642,3 +11646,927 @@ def test_lambda_rie_sentinel_arn_resolves_in_caller_scope():
         lsvc._functions.pop_scoped(account_id, "eu-central-1", function_name, None)
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# provided.* (custom runtime) local execution: warm environment and dispatch
+#
+# Every test drives a *real* bootstrap — a stdlib-only Python script that
+# speaks the Lambda Runtime API over ``AWS_LAMBDA_RUNTIME_API`` exactly as a Go
+# or Rust binary would. No Go toolchain, no Docker, no running MiniStack.
+# ---------------------------------------------------------------------------
+
+from ministack.core import lambda_runtime
+from ministack.services import lambda_svc
+
+# ---------------------------------------------------------------------------
+# Bootstrap fixtures (stdlib only, run by the host Python interpreter)
+# ---------------------------------------------------------------------------
+
+_PREAMBLE = '''#!{python}
+import json, os, sys, time, urllib.request, urllib.error
+
+API = os.environ["AWS_LAMBDA_RUNTIME_API"]
+PORT = int(API.rsplit(":", 1)[1])
+
+
+def _call(path, data=None, method=None):
+    url = "http://%s/2018-06-01%s" % (API, path)
+    req = urllib.request.Request(url, data=data, method=method)
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.getcode(), resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def next_invocation():
+    code, headers, body = _call("/runtime/invocation/next")
+    if code != 200:
+        raise SystemExit(0)
+    return headers, json.loads(body or b"null")
+
+
+def post_response(rid, payload):
+    return _call("/runtime/invocation/%s/response" % rid,
+                 data=json.dumps(payload).encode(), method="POST")[0]
+
+
+def post_error(rid, payload):
+    return _call("/runtime/invocation/%s/error" % rid,
+                 data=json.dumps(payload).encode(), method="POST")[0]
+
+
+def post_init_error(payload):
+    return _call("/runtime/init/error",
+                 data=json.dumps(payload).encode(), method="POST")[0]
+'''
+
+
+def _bootstrap(body: str) -> bytes:
+    """Zip a bootstrap script whose body follows the Runtime API preamble."""
+    script = _PREAMBLE.format(python=sys.executable) + "\n" + body
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("bootstrap", script)
+    return buf.getvalue()
+
+
+ECHO_BOOTSTRAP = _bootstrap('''
+n = 0
+while True:
+    headers, event = next_invocation()
+    n += 1
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    post_response(rid, {
+        "pid": os.getpid(),
+        "n": n,
+        "port": PORT,
+        "event": event,
+        "request_id": rid,
+        "trace": headers.get("Lambda-Runtime-Trace-Id"),
+        "arn": headers.get("Lambda-Runtime-Invoked-Function-Arn"),
+        "deadline": headers.get("Lambda-Runtime-Deadline-Ms"),
+    })
+''')
+
+
+def _provided_worker_config(**overrides):
+    config = {
+        "Runtime": "provided.al2023",
+        "Handler": "bootstrap",
+        "FunctionName": "provided-fn",
+        "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:provided-fn",
+        "Timeout": 10,
+        "MemorySize": 128,
+    }
+    config.update(overrides)
+    return config
+
+
+@pytest.fixture
+def isolated_runtime(monkeypatch, tmp_path):
+    """Pool isolation for the provided-runtime tests.
+
+    Requested explicitly rather than autouse: these tests now sit beside the
+    rest of the Lambda suite, which shares the warm pool with the live server.
+    """
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_runtime, "_workers", {})
+    monkeypatch.setattr(lambda_svc, "_PROVIDED_CODE_CACHE", str(tmp_path / "code"))
+    monkeypatch.setattr(lambda_svc, "_provided_code_dirs", {})
+    yield
+    lambda_runtime.reset()
+
+
+@pytest.fixture
+def worker_factory(isolated_runtime):
+    """Build ProvidedWorkers and guarantee they are torn down."""
+    built: list = []
+
+    def _make(code_zip: bytes, **config_overrides) -> lambda_runtime.ProvidedWorker:
+        worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(**config_overrides), code_zip)
+        built.append(worker)
+        return worker
+
+    yield _make
+    lambda_runtime.kill_workers(built)
+    lambda_runtime.reset()
+
+
+def _port_is_closed(port: int) -> bool:
+    for _ in range(50):
+        sock = socket.socket()
+        sock.settimeout(0.5)
+        try:
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return True
+        finally:
+            sock.close()
+        time.sleep(0.05)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reuse + per-invocation trace context
+# ---------------------------------------------------------------------------
+
+
+def test_environment_is_reused_and_trace_is_per_invocation(worker_factory):
+    """Second invocation lands on the same process, with its own trace ID."""
+    worker = worker_factory(ECHO_BOOTSTRAP)
+
+    first = worker.invoke({"k": 1}, "req-1", trace_id="Root=1-aaa;Sampled=1")
+    second = worker.invoke({"k": 2}, "req-2", trace_id="Root=1-bbb;Sampled=1")
+    third = worker.invoke({"k": 3}, "req-3")
+
+    assert first["status"] == "ok" and second["status"] == "ok"
+    assert first["cold_start"] is True
+    assert second["cold_start"] is False and third["cold_start"] is False
+
+    assert first["result"]["pid"] == second["result"]["pid"] == third["result"]["pid"]
+    assert [r["result"]["n"] for r in (first, second, third)] == [1, 2, 3]
+
+    # Request IDs and trace IDs are per invocation, never carried over.
+    assert first["result"]["request_id"] == "req-1"
+    assert second["result"]["request_id"] == "req-2"
+    assert first["result"]["trace"] == "Root=1-aaa;Sampled=1"
+    assert second["result"]["trace"] == "Root=1-bbb;Sampled=1"
+    assert third["result"]["trace"] is None
+    assert first["result"]["arn"] == worker.config["FunctionArn"]
+
+
+def test_trace_id_does_not_touch_the_event_payload(worker_factory):
+    """The event is the caller's; trace context rides the Runtime API header.
+
+    A user event that happens to contain the key the old implementation
+    reserved must reach the handler untouched.
+    """
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    event = {"_x_amzn_trace_id": "user-supplied", "hello": "world"}
+
+    result = worker.invoke(event, "req-1", trace_id="Root=1-ccc")
+
+    assert result["status"] == "ok"
+    # Delivered verbatim ...
+    assert result["result"]["event"] == {
+        "_x_amzn_trace_id": "user-supplied", "hello": "world"}
+    # ... and the header carries the real trace ID.
+    assert result["result"]["trace"] == "Root=1-ccc"
+    # The caller's dict was not mutated.
+    assert event == {"_x_amzn_trace_id": "user-supplied", "hello": "world"}
+
+
+# ---------------------------------------------------------------------------
+# Logs: both pipes drained continuously, buffer bounded
+# ---------------------------------------------------------------------------
+
+
+CHATTY_BOOTSTRAP = _bootstrap('''
+LINE = "x" * 120
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    count = event["lines"]
+    for i in range(count):
+        sys.stdout.write("OUT-%d %s\\n" % (i, LINE))
+        sys.stderr.write("ERR-%d %s\\n" % (i, LINE))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.2)
+    post_response(rid, {"logged": count})
+''')
+
+
+def test_large_log_volume_does_not_wedge_the_bootstrap(worker_factory):
+    """~500KB across both pipes: an undrained pipe would block the child.
+
+    stdout is drained as logs too — a custom runtime writes there — and both
+    streams are merged into one log buffer.
+    """
+    worker = worker_factory(CHATTY_BOOTSTRAP, Timeout=30)
+
+    result = worker.invoke({"lines": 2000}, "req-1")
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"logged": 2000}
+    log = result["log"]
+    assert "OUT-0 " in log and "ERR-0 " in log
+    assert "OUT-1999 " in log and "ERR-1999 " in log
+
+    # And the environment survives it.
+    again = worker.invoke({"lines": 1}, "req-2")
+    assert again["status"] == "ok"
+    assert again["cold_start"] is False
+
+
+def test_log_buffer_is_bounded_and_keeps_the_newest_lines(worker_factory, monkeypatch):
+    monkeypatch.setattr(lambda_runtime, "_PROVIDED_LOG_MAX_LINES", 50)
+    worker = worker_factory(CHATTY_BOOTSTRAP, Timeout=30)
+
+    result = worker.invoke({"lines": 400}, "req-1")
+
+    assert result["status"] == "ok"
+    lines = [line for line in result["log"].splitlines() if line]
+    assert len(lines) <= 50
+    # Oldest dropped, newest kept.
+    assert "OUT-0 " not in result["log"]
+    assert any(line.startswith("ERR-399 ") or line.startswith("OUT-399 ")
+               for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# Crash / restart
+# ---------------------------------------------------------------------------
+
+
+CRASH_BOOTSTRAP = _bootstrap('''
+headers, event = next_invocation()
+rid = headers["Lambda-Runtime-Aws-Request-Id"]
+post_response(rid, {"pid": os.getpid(), "port": PORT})
+sys.stderr.write("bye\\n")
+sys.stderr.flush()
+os._exit(9)
+''')
+
+
+def test_crashed_bootstrap_is_replaced_without_leaking_its_server(worker_factory):
+    worker = worker_factory(CRASH_BOOTSTRAP)
+    threads_before = threading.active_count()
+
+    first = worker.invoke({}, "req-1")
+    assert first["status"] == "ok"
+    first_port = first["result"]["port"]
+    first_pid = first["result"]["pid"]
+
+    # The bootstrap exits right after responding; the next invocation gets a
+    # brand new environment, and the dead one's HTTP server is gone.
+    second = worker.invoke({}, "req-2")
+    assert second["status"] == "ok"
+    assert second["cold_start"] is True
+    assert second["result"]["pid"] != first_pid
+    assert second["result"]["port"] != first_port
+    assert _port_is_closed(first_port), "leaked Runtime API server from dead generation"
+
+    worker.kill()
+    assert _port_is_closed(second["result"]["port"])
+    # Two generations, no accumulated threads.
+    for _ in range(50):
+        if threading.active_count() <= threads_before + 1:
+            break
+        time.sleep(0.1)
+    assert threading.active_count() <= threads_before + 1
+
+
+# ---------------------------------------------------------------------------
+# Init failures are detected promptly
+# ---------------------------------------------------------------------------
+
+
+INIT_ERROR_BOOTSTRAP = _bootstrap('''
+sys.stderr.write("init blew up\\n")
+sys.stderr.flush()
+post_init_error({"errorMessage": "cannot load config", "errorType": "Init.Error"})
+sys.exit(1)
+''')
+
+INSTANT_EXIT_BOOTSTRAP = _bootstrap('''
+sys.stderr.write("missing shared library\\n")
+sys.stderr.flush()
+sys.exit(3)
+''')
+
+
+def test_init_error_fails_fast_and_leaves_nothing_running(worker_factory):
+    worker = worker_factory(INIT_ERROR_BOOTSTRAP)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="init error"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < lambda_runtime._PROVIDED_INIT_TIMEOUT / 2
+    assert worker._proc is None
+    assert worker._server is None
+    assert worker._server_thread is None
+
+
+def test_bootstrap_that_exits_immediately_fails_fast(worker_factory):
+    worker = worker_factory(INSTANT_EXIT_BOOTSTRAP)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="exited during init with code 3"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < lambda_runtime._PROVIDED_INIT_TIMEOUT / 2
+    assert worker._proc is None and worker._server is None
+
+
+def test_init_overrun_reruns_init_under_the_function_timeout(worker_factory, monkeypatch):
+    """AWS does not fail the call when init overruns its budget: "Lambda
+    retries the Init phase at the time of the first function invocation with
+    the configured function timeout". Only the second overrun gives up."""
+    monkeypatch.setattr(lambda_runtime, "_PROVIDED_INIT_TIMEOUT", 0.5)
+    silent = _bootstrap('time.sleep(60)\n')
+    worker = worker_factory(silent, Timeout=2)
+
+    started = time.monotonic()
+    with pytest.raises(lambda_runtime.ProvidedInitTimeout,
+                       match="did not reach the Runtime API"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    # Both budgets were spent: the 0.5s init, then a re-init under Timeout=2.
+    assert 2.5 <= elapsed < 10.0
+    assert worker._proc is None and worker._server is None
+
+
+def test_a_missing_bootstrap_is_runtime_invalid_entrypoint(worker_factory):
+    """"If the bootstrap file doesn't exist or isn't executable, your function
+    returns a Runtime.InvalidEntrypoint error upon invocation"."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("not-bootstrap", "noop")
+    worker = worker_factory(buf.getvalue())
+
+    with pytest.raises(lambda_runtime.ProvidedRuntimeError) as excinfo:
+        worker.invoke({}, "req-1")
+    assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+
+
+# ---------------------------------------------------------------------------
+# Timeout + recovery
+# ---------------------------------------------------------------------------
+
+
+SLOW_ONCE_BOOTSTRAP_TEMPLATE = '''
+MARKER = {marker!r}
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    if not os.path.exists(MARKER):
+        open(MARKER, "w").close()
+        sys.stderr.write("going to sleep\\n")
+        sys.stderr.flush()
+        time.sleep(30)
+    post_response(rid, {{"pid": os.getpid(), "port": PORT}})
+'''
+
+
+def test_timeout_kills_environment_and_next_invocation_recovers(worker_factory, tmp_path):
+    marker = str(tmp_path / "slept")
+    worker = worker_factory(
+        _bootstrap(SLOW_ONCE_BOOTSTRAP_TEMPLATE.format(marker=marker)),
+        Timeout=1,
+    )
+
+    started = time.monotonic()
+    timed_out = worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert timed_out["status"] == "error"
+    assert timed_out["error"] == "Task timed out after 1.00 seconds"
+    assert "going to sleep" in timed_out["log"]
+    assert elapsed < 8.0
+    assert worker._proc is None and worker._server is None
+
+    # A fresh environment serves the next invocation, and the marker makes the
+    # replacement take the fast path.
+    recovered = worker.invoke({}, "req-2")
+    assert recovered["status"] == "ok"
+    assert recovered["cold_start"] is True
+
+
+# ---------------------------------------------------------------------------
+# Request-ID validation and stale-response isolation
+# ---------------------------------------------------------------------------
+
+
+BAD_REQUEST_ID_BOOTSTRAP = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    codes = {
+        "bogus": post_response("not-a-real-request-id", {"stolen": True}),
+        "empty": post_error("", {"errorMessage": "nope"}),
+    }
+    codes["real"] = post_response(rid, {"codes": codes, "request_id": rid})
+    if codes["real"] != 202:
+        post_error(rid, {"errorMessage": "response rejected: %s" % codes})
+''')
+
+
+def test_unknown_request_ids_are_rejected_not_delivered(worker_factory):
+    worker = worker_factory(BAD_REQUEST_ID_BOOTSTRAP)
+
+    result = worker.invoke({}, "req-1")
+
+    assert result["status"] == "ok"
+    # The forged IDs got 400s; only the real one was accepted.
+    assert result["result"]["codes"] == {"bogus": 400, "empty": 404}
+    assert result["result"]["request_id"] == "req-1"
+
+
+DUPLICATE_RESPONSE_BOOTSTRAP = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    first = post_response(rid, {"which": "first"})
+    second = post_response(rid, {"which": "second", "first_code": first})
+    sys.stderr.write("dup-code=%s\\n" % second)
+    sys.stderr.flush()
+''')
+
+
+def test_duplicate_response_for_same_request_id_is_rejected(worker_factory):
+    worker = worker_factory(DUPLICATE_RESPONSE_BOOTSTRAP)
+
+    first = worker.invoke({}, "req-1")
+    assert first["status"] == "ok"
+    assert first["result"] == {"which": "first"}
+
+    # The duplicate got a 400 and, crucially, did not become the *next*
+    # invocation's result.
+    second = worker.invoke({}, "req-2")
+    assert second["status"] == "ok"
+    assert second["result"] == {"which": "first"}
+    assert "dup-code=400" in "\n".join([first["log"], second["log"]])
+
+
+def test_results_from_a_dead_generation_are_ignored(isolated_runtime):
+    """A late POST from a torn-down environment cannot satisfy its successor."""
+    worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(), b"")
+    worker._generation = 7
+    worker._current_request_id = "req-live"
+
+    # Same request ID, previous generation.
+    assert worker._record_result(6, "req-live", "response", {"stale": True}) is False
+    assert worker._response_ready.is_set() is False
+    assert worker._result == {}
+
+    # Wrong request ID, current generation.
+    assert worker._record_result(7, "req-old", "response", {"stale": True}) is False
+    assert worker._response_ready.is_set() is False
+
+    # The live one is accepted exactly once.
+    assert worker._record_result(7, "req-live", "response", {"ok": True}) is True
+    assert worker._result == {"response": {"ok": True}}
+    assert worker._record_result(7, "req-live", "response", {"again": True}) is False
+    assert worker._result == {"response": {"ok": True}}
+
+
+def test_init_error_from_a_dead_generation_is_ignored(isolated_runtime):
+    worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(), b"")
+    worker._generation = 3
+
+    worker._record_init_error(2, {"errorMessage": "stale"})
+    assert worker._init_error is None
+    assert worker._init_settled.is_set() is False
+
+    worker._record_init_error(3, {"errorMessage": "live"})
+    assert worker._init_error == {"errorMessage": "live"}
+    assert worker._init_settled.is_set() is True
+
+
+# ---------------------------------------------------------------------------
+# Cleanup / pool contract
+# ---------------------------------------------------------------------------
+
+
+def test_kill_reaps_process_server_and_threads(worker_factory):
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    threads_before = threading.active_count()
+
+    result = worker.invoke({}, "req-1")
+    port = result["result"]["port"]
+    proc = worker._proc
+    log_thread = worker._log_thread
+    assert proc.poll() is None
+
+    worker.kill()
+
+    assert proc.poll() is not None, "bootstrap process not reaped"
+    assert worker._proc is None
+    assert worker._server is None and worker._server_thread is None
+    assert worker._log_thread is None
+    assert _port_is_closed(port), "Runtime API socket still listening after kill"
+    log_thread.join(timeout=2.0)
+    assert not log_thread.is_alive()
+    for _ in range(50):
+        if threading.active_count() <= threads_before:
+            break
+        time.sleep(0.1)
+    assert threading.active_count() <= threads_before
+
+
+def test_pool_contract_lease_reuse_and_reset(isolated_runtime):
+    """provided.* functions use the same acquire/release pool as the rest."""
+    config = _provided_worker_config()
+    try:
+        worker, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert isinstance(worker, lambda_runtime.ProvidedWorker)
+        assert reason == "spawn"
+        assert worker.in_use is True
+
+        first = worker.invoke({}, "req-1")
+        assert first["status"] == "ok"
+        port = first["result"]["port"]
+
+        # A second lease while the first is held gets a *separate* environment.
+        other, other_reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert other is not worker and other_reason == "spawn"
+        lambda_runtime.release_worker(other)
+
+        lambda_runtime.release_worker(worker)
+        again, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert reason == "reused"
+        assert again is worker
+        assert again.invoke({}, "req-2")["result"]["port"] == port
+        lambda_runtime.release_worker(again)
+    finally:
+        lambda_runtime.reset()
+
+    assert _port_is_closed(port)
+
+
+def test_concurrent_invocations_use_separate_leased_environments(isolated_runtime):
+    """Two leases run at the same time on two processes, results not crossed."""
+    config = _provided_worker_config()
+    barrier = threading.Barrier(2, timeout=30)
+    results: dict = {}
+
+    try:
+        workers = []
+        for _ in range(2):
+            worker, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+            assert reason == "spawn"
+            workers.append(worker)
+
+        def _run(index, worker):
+            barrier.wait()
+            results[index] = worker.invoke({"i": index}, f"req-{index}",
+                                           trace_id=f"Root=1-{index}")
+
+        threads = [threading.Thread(target=_run, args=(i, w))
+                   for i, w in enumerate(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive()
+
+        assert set(results) == {0, 1}
+        assert all(r["status"] == "ok" for r in results.values())
+        assert results[0]["result"]["pid"] != results[1]["result"]["pid"]
+        for index, result in results.items():
+            assert result["result"]["event"] == {"i": index}
+            assert result["result"]["request_id"] == f"req-{index}"
+            assert result["result"]["trace"] == f"Root=1-{index}"
+        for worker in workers:
+            lambda_runtime.release_worker(worker)
+    finally:
+        lambda_runtime.reset()
+
+    for result in results.values():
+        assert _port_is_closed(result["result"]["port"])
+
+
+def test_idle_reaper_and_reset_release_provided_environments(isolated_runtime):
+    config = _provided_worker_config()
+    try:
+        first, _ = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        second, _ = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        ports = [w.invoke({}, "req-1")["result"]["port"] for w in (first, second)]
+        procs = [first._proc, second._proc]
+        lambda_runtime.release_worker(first)
+        lambda_runtime.release_worker(second)
+
+        # ttl=0 reaps every surplus environment; the first per key stays warm.
+        assert lambda_runtime.reap_idle_workers(ttl=0) == 1
+        assert procs[1].poll() is not None
+        assert _port_is_closed(ports[1])
+        assert second._server is None
+        assert procs[0].poll() is None
+
+        lambda_runtime.reset()
+        assert procs[0].poll() is not None
+        assert _port_is_closed(ports[0])
+        assert first._server is None and first._log_thread is None
+    finally:
+        lambda_runtime.reset()
+
+
+def test_invoke_signature_keeps_trace_out_of_the_positional_contract(isolated_runtime):
+    """``trace_id`` is keyword-only, so no caller can pass it as the event."""
+    import inspect
+
+    sig = inspect.signature(lambda_runtime.ProvidedWorker.invoke)
+    assert list(sig.parameters) == ["self", "event", "request_id", "trace_id"]
+    assert sig.parameters["trace_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["trace_id"].default is None
+
+
+def test_json_only_bootstrap_output_is_not_parsed_as_protocol(worker_factory):
+    """stdout is logs, not a protocol channel: JSON there must not confuse us."""
+    noisy = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    sys.stdout.write(json.dumps({"status": "ok", "result": "from-stdout"}) + "\\n")
+    sys.stdout.flush()
+    post_response(rid, {"real": True})
+''')
+    worker = worker_factory(noisy)
+
+    result = worker.invoke({}, "req-1")
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"real": True}
+    assert "from-stdout" in result["log"]
+
+
+def test_handler_error_does_not_poison_warm_environment(worker_factory):
+    code = _bootstrap('''
+n = 0
+while True:
+    headers, event = next_invocation()
+    n += 1
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    if event.get("fail"):
+        post_error(rid, {"errorMessage": "handler failed", "errorType": "Test.Error"})
+    else:
+        post_response(rid, {"n": n})
+''')
+    worker = worker_factory(code)
+    failed = worker.invoke({"fail": True}, "req-1")
+    assert failed["status"] == "error"
+    assert failed["error_payload"]["errorType"] == "Test.Error"
+    recovered = worker.invoke({}, "req-2")
+    assert recovered["status"] == "ok"
+    assert recovered["cold_start"] is False
+    assert recovered["result"] == {"n": 2}
+
+
+def test_exit_during_invocation_fails_without_waiting_for_timeout(worker_factory):
+    worker = worker_factory(_bootstrap('''
+next_invocation()
+sys.stderr.write("crashed during handler\\n")
+sys.stderr.flush()
+sys.exit(9)
+'''), Timeout=30)
+    started = time.monotonic()
+    result = worker.invoke({}, "req-1")
+    assert time.monotonic() - started < 8
+    assert result["status"] == "error"
+    assert result["error_payload"]["errorType"] == "Runtime.ExitError"
+    assert "crashed during handler" in result["log"]
+    assert worker._proc is None and worker._server is None
+
+
+def test_response_recorded_just_after_process_exit_is_preserved(worker_factory, monkeypatch):
+    from unittest.mock import Mock
+
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    proc = Mock()
+    statuses = iter([None, 0])
+    proc.poll.side_effect = lambda: next(statuses, 0)
+    worker._proc = proc
+    ready = Mock()
+    waits = iter([False, True])
+
+    def wait(timeout):
+        settled = next(waits)
+        if settled:
+            worker._result = {"response": {"ok": True}}
+        return settled
+
+    ready.wait.side_effect = wait
+    worker._response_ready = ready
+    monkeypatch.setattr(worker, "_drain_stderr_bounded", lambda: "")
+    result = worker.invoke({}, "req-1")
+    assert result["status"] == "ok"
+    assert result["result"] == {"ok": True}
+    assert ready.wait.call_count == 2
+    assert worker._proc is None
+
+
+def test_spawn_failure_closes_the_already_started_server(worker_factory, monkeypatch):
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    resources = []
+
+    def failed_popen(*args, **kwargs):
+        resources.extend([worker._server, worker._server_thread])
+        raise OSError("cannot execute bootstrap")
+
+    monkeypatch.setattr(lambda_runtime.subprocess, "Popen", failed_popen)
+    # A bootstrap the host cannot exec is Runtime.InvalidEntrypoint on AWS, so
+    # the OSError is re-raised carrying that type rather than as itself.
+    with pytest.raises(lambda_runtime.ProvidedRuntimeError,
+                       match="cannot execute bootstrap") as excinfo:
+        worker.invoke({}, "req-1")
+    assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+    server, thread = resources
+    assert server.fileno() == -1
+    assert not thread.is_alive()
+    assert worker._proc is None and worker._server is None
+
+
+def _provided_dispatch_config(account="111122223333", region="us-east-1", version="$LATEST"):
+    return {
+        "FunctionName": "provided-pool-test",
+        "FunctionArn": f"arn:aws:lambda:{region}:{account}:function:provided-pool-test",
+        "Runtime": "provided.al2023",
+        "Version": version,
+        "Timeout": 2,
+        "Handler": "bootstrap",
+    }
+
+
+@pytest.fixture
+def isolated_pool(monkeypatch):
+    monkeypatch.setattr(lambda_runtime, "_workers", {})
+    monkeypatch.setattr(lambda_svc, "_ensure_reaper_thread", lambda: None)
+    try:
+        yield
+    finally:
+        lambda_runtime.reset()
+
+
+@pytest.mark.parametrize("event", [
+    {"_x_amzn_trace_id": "user data", "value": 1}, [1, 2], "text", None,
+])
+def test_provided_metadata_does_not_mutate_payload(monkeypatch, event):
+    worker = Mock()
+    worker.invoke.return_value = {"status": "ok", "result": event, "log": "handler log"}
+    monkeypatch.setattr(lambda_svc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lambda_svc, "acquire_worker", Mock(return_value=(worker, "spawn")))
+    release = Mock()
+    monkeypatch.setattr(lambda_svc, "release_worker", release)
+    monkeypatch.setattr(lambda_svc, "_xray_trace_id_for_invocation", lambda config: "trace-1")
+    result = lambda_svc._execute_function_provided_warm(
+        {"config": _provided_dispatch_config(), "code_zip": b"zip"}, event, "request-1",
+    )
+    worker.invoke.assert_called_once_with(event, "request-1", trace_id="trace-1")
+    release.assert_called_once_with(worker)
+    assert result == {"body": event, "log": "handler log"}
+    if isinstance(event, dict):
+        assert event["_x_amzn_trace_id"] == "user data"
+
+
+def test_provided_failure_is_scoped_and_not_retried(monkeypatch, isolated_pool):
+    config = _provided_dispatch_config()
+    failed, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    lambda_runtime.release_worker(failed)
+    fail = Mock(side_effect=RuntimeError("bootstrap crashed"))
+    monkeypatch.setattr(failed, "invoke", fail)
+    unrelated = []
+    for account, region, version in [
+        ("999900001111", "us-east-1", "$LATEST"),
+        ("111122223333", "eu-west-1", "$LATEST"),
+        ("111122223333", "us-east-1", "1"),
+    ]:
+        other = _provided_dispatch_config(account, region, version)
+        worker, _ = lambda_runtime.acquire_worker(
+            other["FunctionName"], other, b"zip", qualifier=version,
+        )
+        unrelated.append(worker)
+    fallback = Mock()
+    monkeypatch.setattr(lambda_svc, "_execute_function_provided", fallback)
+    result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {})
+    assert result["error"] is True
+    assert result["body"]["errorMessage"] == "bootstrap crashed"
+    assert fail.call_count == 1
+    fallback.assert_not_called()
+    remaining = [w for entries in lambda_runtime._workers.values() for w in entries]
+    assert remaining == unrelated
+    assert all(w.in_use for w in unrelated)
+
+
+def test_provided_concurrent_leases_and_reuse(isolated_pool):
+    config = _provided_dispatch_config()
+    first, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    second, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    assert isinstance(first, lambda_runtime.ProvidedWorker)
+    assert isinstance(second, lambda_runtime.ProvidedWorker)
+    assert first is not second
+    lambda_runtime.release_worker(first)
+    reused, reason = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    assert reused is first
+    assert reason == "reused"
+    lambda_runtime.release_worker(reused)
+    lambda_runtime.release_worker(second)
+
+
+@pytest.mark.parametrize("mode,target", [
+    ("local", "_execute_function_provided_warm"),
+    ("durable", "_execute_function_provided"),
+    ("docker", "_execute_function_docker"),
+    ("strict", "_execute_function_docker"),
+    ("image", "_execute_function_docker"),
+    ("proxy", "_execute_function_proxy"),
+])
+def test_provided_dispatch_preserves_other_executors(monkeypatch, mode, target):
+    monkeypatch.setattr(lambda_svc, "LAMBDA_EXECUTOR", "docker" if mode == "docker" else "local")
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", mode == "strict")
+    monkeypatch.setattr(lambda_svc, "_proxy_url_for", lambda config: "http://proxy" if mode == "proxy" else None)
+    monkeypatch.setattr(lambda_svc, "_emit_lambda_logs", Mock())
+    names = ["_execute_function_provided_warm", "_execute_function_provided",
+             "_execute_function_docker", "_execute_function_proxy"]
+    executors = {name: Mock(return_value={"body": name}) for name in names}
+    for name, executor in executors.items():
+        monkeypatch.setattr(lambda_svc, name, executor)
+    config = _provided_dispatch_config()
+    if mode == "image":
+        config.update(PackageType="Image", ImageUri="example:latest")
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"test": True} if mode == "durable" else None)
+    try:
+        result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert result == {"body": target}
+    for name, executor in executors.items():
+        assert executor.call_count == (1 if name == target else 0)
+    if mode == "local":
+        executors[target].assert_called_once_with(func, {}, "request-1")
+
+
+def test_provided_env_keeps_function_vars_and_endpoint_precedence(monkeypatch):
+    config = _provided_dispatch_config()
+    config.update(MemorySize=256, Environment={"Variables": {
+        "CUSTOM": "value", "AWS_ENDPOINT_URL": "http://wrong:4566",
+    }})
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://ministack:4566")
+    monkeypatch.setattr(lambda_svc, "get_region", lambda: "us-east-1")
+    token = lambda_svc._durable_ctx.set(None)
+    try:
+        env = lambda_svc._provided_worker_env(config, "/code", 12345)
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert env["AWS_LAMBDA_RUNTIME_API"] == "127.0.0.1:12345"
+    assert env["AWS_LAMBDA_FUNCTION_NAME"] == config["FunctionName"]
+    assert env["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"] == "256"
+    assert env["AWS_ACCESS_KEY_ID"] == "111122223333"
+    assert env["AWS_REGION"] == "us-east-1"
+    assert env["LAMBDA_TASK_ROOT"] == "/code"
+    assert env["CUSTOM"] == "value"
+    assert env["AWS_ENDPOINT_URL"] == "http://ministack:4566"
+
+
+def test_provided_env_uses_execution_role_credentials(monkeypatch):
+    config = _provided_dispatch_config()
+    credentials = {
+        "AWS_ACCESS_KEY_ID": "ASIATESTROLE",
+        "AWS_SECRET_ACCESS_KEY": "role-secret",
+        "AWS_SESSION_TOKEN": "role-session",
+    }
+    resolve = Mock(return_value=credentials)
+    monkeypatch.setattr(lambda_svc, "execution_credentials", resolve)
+    env = lambda_svc._provided_worker_env(config, "/code", 12345)
+    resolve.assert_called_once_with(config)
+    assert {key: env[key] for key in credentials} == credentials
+
+
+@pytest.mark.parametrize("operation", ["code", "configuration", "delete"])
+def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool, operation):
+    config = _provided_dispatch_config()
+    name = config["FunctionName"]
+    monkeypatch.setattr(lambda_svc, "_functions", {name: {"config": config, "code_zip": b"zip"}})
+    monkeypatch.setattr(lambda_svc, "get_account_id", lambda: "111122223333")
+    monkeypatch.setattr(lambda_svc, "get_region", lambda: "us-east-1")
+    monkeypatch.setattr(lambda_svc, "_pool_kill_function", Mock())
+    monkeypatch.setattr(lambda_svc, "_sweep_extract_cache", Mock())
+    monkeypatch.setattr(lambda_svc, "_schedule_state_transition", Mock())
+    worker, _ = lambda_runtime.acquire_worker(name, config, b"zip")
+    lambda_runtime.release_worker(worker)
+    if operation == "code":
+        result = lambda_svc._update_code(name, {})
+    elif operation == "configuration":
+        result = lambda_svc._update_config(name, {"Environment": {"Variables": {"UPDATED": "yes"}}})
+    else:
+        result = lambda_svc._delete_function(name, {})
+    assert result[0] in (200, 204)
+    assert not lambda_runtime._workers

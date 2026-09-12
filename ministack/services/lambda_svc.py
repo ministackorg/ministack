@@ -5139,10 +5139,14 @@ def _execute_function_provided_warm(func: dict, event: dict,
         account, region = _account_region_from_function_config(config)
         invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
         worker = None  # invalidation already removed and reaped the worker
+        # A Python class name is not an AWS error type: a bootstrap that is
+        # missing or cannot be executed is `Runtime.InvalidEntrypoint`, and the
+        # environment failures AWS names Runtime.* carry their own type.
+        error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
         # Do not transparently invoke again: the handler may already have
         # performed side effects before its environment failed.
         return {
-            "body": {"errorMessage": str(e), "errorType": type(e).__name__},
+            "body": {"errorMessage": str(e), "errorType": error_type},
             "error": True,
             "log": "",
         }

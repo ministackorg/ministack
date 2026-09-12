@@ -1482,7 +1482,8 @@ def _fake_docker_recorder(run_impl=None):
 
 
 def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
-    """Registration is visible while a slow Docker start is still blocked."""
+    """Registration is visible while a slow Docker start is still blocked, and
+    the task reports ACTIVATING for the length of the pull."""
     import threading
 
     from ministack.services import ecs as _ecs
@@ -1541,8 +1542,16 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
     task = json.loads(response[2])["tasks"][0]
     assert task["lastStatus"] == "PENDING"
     assert task["containers"][0]["lastStatus"] == "PENDING"
+    # AWS omits a timestamp it has no value for rather than sending a null:
+    # the task has not started, pulled or stopped yet.
+    for member in ("startedAt", "pullStartedAt", "pullStoppedAt",
+                   "stoppingAt", "stoppedAt"):
+        assert member not in task
     assert started.wait(timeout=2)
-    assert _ecs._tasks[task["taskArn"]]["lastStatus"] == "PENDING"
+    # The image pull is the ACTIVATING phase on AWS: "This is the state where
+    # Amazon ECS pulls the container images, creates the containers ...".
+    assert _ecs._tasks[task["taskArn"]]["lastStatus"] == "ACTIVATING"
+    assert _ecs._tasks[task["taskArn"]]["pullStartedAt"]
 
     release.set()
     _wait_until(lambda: _ecs._tasks[task["taskArn"]]["lastStatus"] == "RUNNING")

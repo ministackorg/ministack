@@ -1617,8 +1617,13 @@ def reset():
 # ---------------------------------------------------------------------------
 
 # Seconds the bootstrap binary gets to complete its cold start and issue its
-# first GET /runtime/invocation/next before we give up on the environment.
-_PROVIDED_INIT_TIMEOUT = float(os.environ.get("LAMBDA_PROVIDED_INIT_TIMEOUT", "20"))
+# first GET /runtime/invocation/next. AWS fixes this: "The Init phase is
+# limited to 10 seconds. If all three tasks do not complete within 10 seconds,
+# Lambda retries the Init phase at the time of the first function invocation
+# with the configured function timeout" (lambda-runtime-environment.html), so
+# the number is not ours to tune — and blowing it is not a failed invocation,
+# it re-runs init under the function's own Timeout (see _spawn).
+_PROVIDED_INIT_TIMEOUT = 10.0
 
 # How often init/invocation waits check whether the bootstrap is still alive.
 _PROVIDED_POLL = 0.05
@@ -1629,6 +1634,18 @@ _PROVIDED_LOG_MAX_LINES = 10000
 
 # /2018-06-01/runtime/invocation/<request-id>/{response,error}
 _INVOCATION_RESULT_RE = re.compile(r"/runtime/invocation/([^/]+)/(response|error)/?$")
+
+
+class ProvidedInitTimeout(RuntimeError):
+    """The bootstrap started but did not reach the Runtime API in time."""
+
+
+class ProvidedRuntimeError(RuntimeError):
+    """A provided-runtime failure that carries the error type AWS reports."""
+
+    def __init__(self, message: str, error_type: str):
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class ProvidedWorker(Worker):
@@ -1815,8 +1832,12 @@ class ProvidedWorker(Worker):
                     return
                 request_id, kind = match.group(1), match.group(2)
                 if not worker._record_result(generation, request_id, kind, parsed):
+                    # The shape AWS's own Runtime Interface Emulator renders:
+                    # 400 with {"errorMessage": "Invalid request ID",
+                    # "errorType": "InvalidRequestID"} (RIE
+                    # internal/lambda/rapi/rendering/render_error.go).
                     self._respond(400, json.dumps({
-                        "errorMessage": f"Invalid request ID: {request_id}",
+                        "errorMessage": "Invalid request ID",
                         "errorType": "InvalidRequestID",
                     }).encode())
                     return
@@ -1864,7 +1885,7 @@ class ProvidedWorker(Worker):
 
     # -- Lifecycle --------------------------------------------------------
 
-    def _spawn(self):
+    def _spawn(self, init_timeout: float | None = None):
         import socketserver
 
         from ministack.services.lambda_svc import (
@@ -1879,8 +1900,14 @@ class ProvidedWorker(Worker):
 
         code_dir = _provided_runtime_code_dir(self.code_zip)
         bootstrap_path = os.path.join(code_dir, "bootstrap")
-        if not os.path.exists(bootstrap_path):
-            raise RuntimeError("no bootstrap binary found")
+        if not os.path.exists(bootstrap_path) or not os.access(bootstrap_path, os.X_OK):
+            # "If the bootstrap file doesn't exist or isn't executable, your
+            # function returns a Runtime.InvalidEntrypoint error upon
+            # invocation" (runtimes-custom.html).
+            raise ProvidedRuntimeError(
+                "No bootstrap binary found in the deployment package.",
+                "Runtime.InvalidEntrypoint",
+            )
 
         pending: queue.Queue = queue.Queue(maxsize=1)
         log_queue: queue.Queue = queue.Queue(maxsize=_PROVIDED_LOG_MAX_LINES)
@@ -1925,14 +1952,22 @@ class ProvidedWorker(Worker):
             # elsewhere, or the child inherits the open write fd and execve fails
             # with ETXTBSY (#1051).
             with _provided_code_lock:
-                self._proc = subprocess.Popen(
-                    [bootstrap_path],
-                    cwd=code_dir,
-                    env=proc_env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                )
+                try:
+                    self._proc = subprocess.Popen(
+                        [bootstrap_path],
+                        cwd=code_dir,
+                        env=proc_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                except OSError as exc:
+                    # A bootstrap the host cannot execute is the same class of
+                    # failure as a missing one, and AWS names it the same way.
+                    raise ProvidedRuntimeError(
+                        f"Couldn't execute the bootstrap binary: {exc}",
+                        "Runtime.InvalidEntrypoint",
+                    ) from exc
 
             self._log_thread = threading.Thread(
                 target=self._pump_output, args=(self._proc.stdout, log_queue),
@@ -1940,7 +1975,7 @@ class ProvidedWorker(Worker):
             self._log_thread.start()
             self._stderr_thread = self._log_thread
 
-            self._await_init()
+            self._await_init(init_timeout)
         except BaseException:
             # Never leave a half-built environment behind.
             self._teardown()
@@ -1950,14 +1985,16 @@ class ProvidedWorker(Worker):
         logger.info("Lambda provided-runtime environment spawned for %s (cold start)",
                     self.func_name)
 
-    def _await_init(self) -> None:
+    def _await_init(self, init_timeout: float | None = None) -> None:
         """Wait for the bootstrap to reach /next, bounded and interruptible.
 
         Returns as soon as init settles: a first poll, an /init/error POST, or
-        the process exiting. Only a live but silent binary waits out
-        ``_PROVIDED_INIT_TIMEOUT``.
+        the process exiting. Only a live but silent binary waits out the
+        deadline, and that raises ``ProvidedInitTimeout`` so the caller can do
+        what AWS does — run init again under the function's own timeout.
         """
-        deadline = time.monotonic() + _PROVIDED_INIT_TIMEOUT
+        budget = _PROVIDED_INIT_TIMEOUT if init_timeout is None else init_timeout
+        deadline = time.monotonic() + budget
         while not self._init_settled.wait(_PROVIDED_POLL):
             exit_code = self._proc.poll() if self._proc is not None else -1
             if exit_code is not None:
@@ -1965,9 +2002,9 @@ class ProvidedWorker(Worker):
                     f"bootstrap exited during init with code {exit_code}"
                     f"{self._init_log_suffix()}")
             if time.monotonic() >= deadline:
-                raise RuntimeError(
+                raise ProvidedInitTimeout(
                     f"bootstrap did not reach the Runtime API within "
-                    f"{_PROVIDED_INIT_TIMEOUT:g}s{self._init_log_suffix()}")
+                    f"{budget:g}s{self._init_log_suffix()}")
         if self._init_error is not None:
             raise RuntimeError(f"init error: {self._init_error}")
 
@@ -1985,12 +2022,23 @@ class ProvidedWorker(Worker):
         """
         with self._lock:
             cold = False
+            timeout = self.config.get("Timeout", 30)
             if self._proc is None or self._proc.poll() is not None:
-                self._spawn()
+                try:
+                    self._spawn()
+                except ProvidedInitTimeout:
+                    # AWS: an Init phase that overruns its 10 seconds is not a
+                    # failed invocation — "Lambda retries the Init phase at the
+                    # time of the first function invocation with the configured
+                    # function timeout" (lambda-runtime-environment.html).
+                    logger.info(
+                        "Lambda %s: init exceeded %gs; re-running it under the "
+                        "function timeout (%ss)",
+                        self.func_name, _PROVIDED_INIT_TIMEOUT, timeout)
+                    self._spawn(init_timeout=timeout)
                 cold = True
                 self._cold = False
 
-            timeout = self.config.get("Timeout", 30)
             generation = self._generation
 
             with self._state_lock:
