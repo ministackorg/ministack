@@ -19,6 +19,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ministack.core.aws_credentials import (
+    CredentialResolutionError,
+    is_root_access_key,
+    resolve_credential,
+)
+
 logger = logging.getLogger("ministack")
 
 
@@ -73,10 +79,6 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
-
-
-# Default access keys that are always treated as root (backwards compat)
-_ROOT_ACCESS_KEYS = frozenset({"test", ""})
 
 
 # ---------------------------------------------------------------------------
@@ -636,12 +638,8 @@ def _resolve_managed_policy_document(policy_arn: str,
 
 
 def _is_root_key(access_key_id: str) -> bool:
-    """Keys that are always treated as root: empty, 'test', 12-digit account IDs."""
-    if not access_key_id or access_key_id in _ROOT_ACCESS_KEYS:
-        return True
-    if re.match(r"^\d{12}$", access_key_id):
-        return True
-    return False
+    """Keys treated as root: empty, ``test``, configured, or account IDs."""
+    return is_root_access_key(access_key_id)
 
 
 def resolve_principal(access_key_id: str,
@@ -651,64 +649,30 @@ def resolve_principal(access_key_id: str,
     Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
     authentication fails (unknown key, inactive key, expired session).
     """
-    import time
+    from ministack.core.responses import _account_from_sts_session
 
-    from ministack.services import iam as iam_svc
-    from ministack.services import sts as sts_svc
-
-    # Root / default keys — allow-all, no checks
-    if _is_root_key(access_key_id):
-        return PrincipalInfo(
-            arn=f"arn:aws:iam::{account_id}:root",
-            type="Root",
-            account=account_id,
-            policies=None,
+    account_id = _account_from_sts_session(access_key_id) or account_id
+    credential = resolve_credential(access_key_id, account_id)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    if credential.principal_type == "Root":
+        policies = None
+    elif credential.principal_type == "User":
+        policies = _gather_user_policies(credential.principal_name, account_id)
+    elif credential.principal_type == "AssumedRole":
+        policies = _gather_role_policies(
+            _role_name_from_assumed_arn(credential.principal_arn), account_id
         )
-
-    # Session credentials (AssumeRole) — ASIA prefix
-    if access_key_id in sts_svc._sessions:
-        session = sts_svc._sessions[access_key_id]
-        # Check expiry
-        expiration = session.get("Expiration")
-        if expiration is not None and time.time() > expiration:
-            return AuthError(
-                "ExpiredTokenException",
-                "The security token included in the request is expired",
-            )
-        assumed_arn = session.get("Arn", "")
-        role_name = _role_name_from_assumed_arn(assumed_arn)
-        arn_parts = assumed_arn.split(":")
-        session_account = arn_parts[4] if len(arn_parts) >= 6 else account_id
-        policies = _gather_role_policies(role_name, session_account)
-        return PrincipalInfo(
-            arn=assumed_arn,
-            type="AssumedRole",
-            account=session_account,
-            policies=policies,
+    else:
+        return AuthError(
+            "UnrecognizedClientException",
+            "The security token included in the request is invalid.",
         )
-
-    # IAM user access key — AKIA prefix
-    key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
-    if key_record is not None:
-        # Check key status
-        if key_record.get("Status") == "Inactive":
-            return AuthError(
-                "InvalidClientTokenId",
-                "The security token included in the request is invalid.",
-            )
-        user_name = key_record.get("UserName", "")
-        policies = _gather_user_policies(user_name, account_id)
-        return PrincipalInfo(
-            arn=f"arn:aws:iam::{account_id}:user/{user_name}",
-            type="User",
-            account=account_id,
-            policies=policies,
-        )
-
-    # Unknown access key — reject
-    return AuthError(
-        "UnrecognizedClientException",
-        "The security token included in the request is invalid.",
+    return PrincipalInfo(
+        arn=credential.principal_arn,
+        type=credential.principal_type,
+        account=credential.account_id,
+        policies=policies,
     )
 
 
@@ -781,7 +745,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         return {
             "accessKey": access_key_id,
             "accountId": account_id,
-            "userArn": f"arn:aws:iam::{account_id}:user/{user_name}",
+            "userArn": user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}",
             "userId": user.get("UserId", ""),
             "principalOrgId": _principal_org_id(),
             "session": None,

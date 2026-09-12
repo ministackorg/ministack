@@ -3258,6 +3258,46 @@ def _cfn_noop_delete(physical_id, props):
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
 
+def _check_nested_stack_capabilities(parent_stack_name, template):
+    """Refuse a nested stack's template whose IAM resources the parent did
+    not acknowledge. AWS asks for the capabilities on the parent ("For nested
+    stacks that contain IAM resources, you must acknowledge IAM capabilities",
+    using-cfn-nested-stacks), so the set the parent stored covers the child
+    and, through the child's own record, every level below it. Like the
+    parent's check this runs under AUTH=true only, and it reads the IAM
+    rule alone: whether a child template's own Transform needs
+    CAPABILITY_AUTO_EXPAND on the parent is not modelled here.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return
+    from ministack.services.cloudformation.handlers import (
+        _insufficient_capabilities_message,
+        _missing_capabilities,
+        _required_iam_capabilities,
+    )
+    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)),
+                                    _required_iam_capabilities(template))
+    if missing:
+        raise ValueError(_insufficient_capabilities_message(missing))
+
+
+def _parent_capabilities(parent_stack_name):
+    """The capabilities the parent stack acknowledged on its last operation."""
+    from ministack.services.cloudformation import _stacks
+    return list((_stacks.get(parent_stack_name) or {}).get("Capabilities", []))
+
+
+def _inherited_capabilities(parent_stack_name):
+    """What a child stack's record carries, which is the parent's set under
+    AUTH=true and nothing without it. The set exists to be read by the check
+    on the level below, so recording it where no check runs would only change
+    what DescribeStacks reports on a child.
+    """
+    from ministack.app import AUTH
+    return _parent_capabilities(parent_stack_name) if AUTH else []
+
+
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                              previous_physical_id=None, previous_props=None):
     """Provision an `AWS::CloudFormation::Stack` nested-stack resource.
@@ -3302,6 +3342,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         raise ValueError(f"Nested-stack template empty at {template_url}")
 
     template = _parse_template(template_body)
+    _check_nested_stack_capabilities(parent_stack_name, template)
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
@@ -3357,6 +3398,11 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         "_parent_stack_name": parent_stack_name,
         "RootId": _cr_stack_id(parent_stack_name),
         "ParentId": _cr_stack_id(parent_stack_name),
+        # The parent's acknowledgement covers every level of nesting, so a
+        # child of this child reads the same set. Only the check needs it, so
+        # it is recorded only where the check runs: without AUTH a child's
+        # DescribeStacks reports what it reported before, nothing.
+        "Capabilities": _inherited_capabilities(parent_stack_name),
     }
     _stacks[child_name] = child_stack
     _stack_events.setdefault(child_stack_id, [])

@@ -50,6 +50,12 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_credential,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -1504,37 +1510,14 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
-def _resolve_presign_secret(access_key_id):
-    """The secret a presigned URL was signed with.
-
-    STS temporary credentials are signed with the unique secret STS issued (not
-    the server's static one), so a presigned URL from an AssumeRole / session
-    token would never recompute against ``AWS_SECRET_ACCESS_KEY``. STS records
-    each issued secret by access key id; resolve it here, falling back to the
-    static server secret for a long-term (non-session) credential.
-    """
-    try:
-        from ministack.services import sts
-
-        session = sts._sessions.get(access_key_id)
-        if session and session.get("SecretAccessKey"):
-            return session["SecretAccessKey"]
-    except Exception:
-        pass
-    return os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
-
-
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
     signed and anonymous requests are handled elsewhere / left lax).
 
-    MiniStack has no IAM secret store, so it verifies against its own secret
-    (``AWS_SECRET_ACCESS_KEY``, default ``test``) — the same credential the
-    server and its Lambda runtimes use. A URL signed with any other secret, or
-    one whose signed headers (content-type, content-length, ...) were tampered
-    with after signing, does not recompute to the same signature and is
-    rejected with 403 SignatureDoesNotMatch, matching real S3.
+    MiniStack resolves root, IAM-user, and STS credentials before recomputing
+    the signature. Temporary credentials must include the exact session token
+    STS issued.
     """
     signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
     if not signature:
@@ -1585,8 +1568,38 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         canonical_request,
     )
 
-    secret = _resolve_presign_secret(_akid)
-    computed = calculate_signature(secret, date_stamp, region, service, string_to_sign)
+    session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
+        query_params, "x-amz-security-token", ""
+    )
+    # S3 presigned requests verify credentials even with AUTH disabled.
+    # Resolve their tenant here, without changing routing for other requests.
+    try:
+        owner = find_iam_access_key_account(_akid)
+    except AmbiguousAccessKeyError:
+        return _error(
+            "InvalidAccessKeyId", "The AWS Access Key Id is ambiguous.", 403, path
+        )
+    if owner:
+        set_request_account_id(owner)
+    credential = resolve_credential(_akid, get_account_id(), session_token)
+    if isinstance(credential, CredentialResolutionError):
+        if credential.code == "ExpiredTokenException":
+            return _error("ExpiredToken", credential.message, 403, path)
+        if credential.code == "InvalidToken":
+            return _error("InvalidToken", credential.message, 403, path)
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    computed = calculate_signature(
+        credential.secret_access_key,
+        date_stamp,
+        region,
+        service,
+        string_to_sign,
+    )
 
     if not signatures_match(computed, signature):
         return _bad_signature()
@@ -1606,6 +1619,24 @@ _PRESIGN_SIGNING_PARAMS = {
     "x-amz-content-sha256",
 }
 
+# A presigned URL's checksum *value* is signed but never read as a supplied
+# integrity value. Current SDKs (JS since v3.729.0) compute it over the *empty*
+# body at presign time, because whoever holds the URL picks the body later, so
+# the value cannot describe what gets uploaded. Real S3 signs the parameter —
+# rewriting it still yields 403 — and then ignores it, storing the body it was
+# sent. Hoisting it into the headers instead hands it to
+# `_resolve_object_checksums`, which rejects the upload with `BadDigest` for a
+# request AWS answers 200.
+#
+# Only the value parameters are excluded. `x-amz-checksum-algorithm` and
+# `x-amz-sdk-checksum-algorithm` name an algorithm for the server to compute
+# rather than carrying a value, so they cannot disagree with a body and are
+# never the reason a request is refused; CreateMultipartUpload is presigned
+# with either of them to choose the algorithm its parts are digested with.
+_PRESIGN_UNHOISTED_CHECKSUM_PARAMS = frozenset(
+    f"x-amz-checksum-{alg}" for alg in _S3_CHECKSUM_HEADERS
+)
+
 
 def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
     """Fold a presigned URL's hoisted ``x-amz-*`` query params into headers.
@@ -1623,12 +1654,16 @@ def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
     metadata in its query string stored the object without any: the PUT
     succeeded and the metadata was silently dropped.
 
-    An explicitly sent header always wins over its hoisted twin.
+    An explicitly sent header always wins over its hoisted twin. The checksum
+    values in ``_PRESIGN_UNHOISTED_CHECKSUM_PARAMS`` are the exception AWS
+    itself makes and stay out of the headers.
     """
     hoisted = None
     for name, values in query_params.items():
         lname = name.lower()
         if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in _PRESIGN_UNHOISTED_CHECKSUM_PARAMS:
             continue
         if lname in headers:
             continue
@@ -2619,7 +2654,8 @@ def _put_bucket_notification(name: str, body: bytes):
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
-    # threads, which broke multi-tenant tests).
+    # threads, which broke multi-tenant tests). Queue and topic destinations only;
+    # AWS does not send the test event to Lambda targets.
     _fire_s3_test_event(name)
     return 200, {}, b""
 
@@ -3326,7 +3362,8 @@ def _fire_s3_event_async(
 
 
 def _fire_s3_test_event(bucket_name: str) -> None:
-    """Deliver an s3:TestEvent to every destination in the bucket notification config."""
+    """Deliver an s3:TestEvent to the SQS and SNS destinations in the bucket
+    notification config. AWS does not send it to Lambda targets."""
     try:
         configs = _parse_notification_config(bucket_name)
         if not configs:
@@ -3346,8 +3383,8 @@ def _fire_s3_test_event(bucket_name: str) -> None:
                     _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "sns":
                     _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
-                elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
+                # No lambda branch: AWS verifies Lambda destinations by checking the
+                # function's permissions, not by invoking them.
             except Exception:
                 logger.exception("S3 test-event delivery failed for config %s", cfg.get("id"))
     except Exception:

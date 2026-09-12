@@ -1899,7 +1899,8 @@ def test_role_session_uses_account_from_session_arn():
     }
     _request_account_id.reset(token)
     sts_svc._sessions["ASIASESSIONACCOUNT"] = {
-        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/lambda"
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/lambda",
+        "SecretAccessKey": "test-session-secret",
     }
     try:
         principal = resolve_principal("ASIASESSIONACCOUNT", "000000000000")
