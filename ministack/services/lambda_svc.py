@@ -53,6 +53,8 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
+    DURABLE_CTX_EVENT_KEY,
+    DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_EVENT_KEY,
@@ -1308,11 +1310,7 @@ def _durable_env_overlay() -> dict[str, str]:
     ctx = _durable_ctx.get()
     if not ctx:
         return {}
-    return {
-        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
-        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
-        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
-    }
+    return {var: ctx.get(key, "") for var, key in DURABLE_ENV_VARS.items()}
 
 
 def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
@@ -4836,25 +4834,19 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
-            # Durable invocations need a per-call environment (the
-            # DurableExecutionArn / CheckpointToken change every invoke), and a
-            # reused environment's env is fixed at spawn — so they keep the
-            # one-shot executor, exactly as durable python/nodejs does above.
+            # A durable invocation needs a per-call environment (the
+            # DurableExecutionArn and CheckpointToken change every invoke) and a
+            # pooled worker's env is fixed at spawn, so provided.* durable
+            # invocations keep the one-shot executor. python and nodejs carry
+            # that context in the event instead, which is why they can be pooled.
             if _durable_ctx.get():
                 result = _execute_function_provided(func, event)
             else:
                 result = _execute_function_provided_warm(func, event, request_id)
-        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
-                and not _durable_ctx.get():
-            # Warm pool reuses worker subprocesses whose env was fixed at
-            # spawn time. Durable invocations need per-call env (the
-            # DurableExecutionArn + CheckpointToken change every invoke),
-            # so route them through the per-call local executor.
-            result = _execute_function_warm(func, event)
         elif runtime.startswith(("python", "nodejs")):
-            # Durable python/nodejs falls through to local subprocess (per
-            # the elif above we already filtered durable out of warm).
-            result = _execute_function_local(func, event)
+            # Durable invocations included: their per-call context rides in
+            # the event, so the pooled worker can serve them.
+            result = _execute_function_warm(func, event)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
@@ -5029,6 +5021,14 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # the counter.
         if isinstance(event, dict):
             event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
+            # Durable executions ride the same channel: the ARN, the checkpoint
+            # token and the execution name differ per invocation, which is why
+            # they cannot be part of the worker's spawn environment. The
+            # bootstrap clears them again when the key is absent, so a worker
+            # reused for a non-durable call does not see the previous one's.
+            durable = _durable_env_overlay()
+            if durable:
+                event[DURABLE_CTX_EVENT_KEY] = durable
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
