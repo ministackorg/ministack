@@ -197,10 +197,18 @@ _NON_S3_VHOST_NAMES = frozenset(
 )
 
 from ministack.core import container_reaper
+from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
+    find_iam_access_key_account,
+)
 from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
+from ministack.core.responses import (
+    _12_DIGIT_RE,
+    set_request_account_id,
+    set_request_region,
+)
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -212,6 +220,11 @@ _install_hypercorn_compat()
 # This saves ~20 MB of idle RAM and speeds up boot.
 # ---------------------------------------------------------------------------
 _loaded_modules: dict = {}
+
+
+def _request_account_scope(access_key_id: str) -> str:
+    """Return the tenant selector for an AWS access key."""
+    return find_iam_access_key_account(access_key_id) or access_key_id
 
 # Execution state of ready.d scripts — surfaced via /_ministack/health and /_ministack/ready.
 # status: "pending" (not started) | "running" | "completed" (all scripts finished, errors included)
@@ -1726,6 +1739,12 @@ def _resolve_mrap_host(host: str):
 
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
+    if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
+        # Alias lookup is account-scoped and precedes the S3 handler. Verify
+        # a SigV4 presign first so lookup uses its credential owner's account.
+        error = _get_module("s3")._verify_presigned_sigv4(method, path, headers, query_params)
+        if error:
+            return error
     mrap_bucket = _resolve_mrap_host(host)
     if mrap_bucket:
         # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
@@ -2388,7 +2407,25 @@ async def app(scope, receive, send):
     # If the access key is a 12-digit number, it becomes the account ID.
     _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
-        set_request_account_id(_access_key)
+        try:
+            set_request_account_id(_request_account_scope(_access_key) if AUTH else _access_key)
+        except AmbiguousAccessKeyError:
+            await _send_response(
+                send,
+                403,
+                {
+                    "Content-Type": "application/json",
+                    "x-amzn-requestid": request_id,
+                    "x-amz-request-id": request_id,
+                },
+                json.dumps(
+                    {
+                        "__type": "InvalidClientTokenId",
+                        "message": "The security token included in the request is invalid.",
+                    }
+                ).encode(),
+            )
+            return
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
