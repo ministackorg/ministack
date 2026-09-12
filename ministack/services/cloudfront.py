@@ -417,6 +417,101 @@ def _ensure_distribution_config_sdk_compat(config_el):
         SubElement(og, "Quantity").text = "0"
 
 
+# CloudFormation's DistributionConfig is the API's, in JSON, with a few
+# differences: a {Quantity, Items} block is a plain list (Aliases, Origins,
+# CacheBehaviors, AllowedMethods, ...; OriginGroups and GeoRestriction keep
+# the block), CachedMethods sits next to AllowedMethods instead of inside it,
+# and these member names are spelled differently. Keyed by the API structure
+# the member sits in.
+_CFN_DISTRIBUTION_CONFIG_RENAMES = {
+    ("DistributionConfig", "IPV6Enabled"): "IsIPV6Enabled",
+    ("Origin", "OriginCustomHeaders"): "CustomHeaders",
+    ("CustomOriginConfig", "OriginSSLProtocols"): "OriginSslProtocols",
+    ("ViewerCertificate", "AcmCertificateArn"): "ACMCertificateArn",
+    ("ViewerCertificate", "IamCertificateId"): "IAMCertificateId",
+    ("ViewerCertificate", "SslSupportMethod"): "SSLSupportMethod",
+    ("GeoRestriction", "Locations"): "Items",
+}
+
+_api_model = None
+
+
+def _api_shape(name):
+    """A shape of the CloudFront API model botocore ships, loaded once."""
+    global _api_model
+    if _api_model is None:
+        import botocore.session
+
+        _api_model = botocore.session.get_session().get_service_model("cloudfront")
+    return _api_model.shape_for(name)
+
+
+def _distribution_config_xml(config: dict):
+    """The ``DistributionConfig`` element for a configuration given in
+    CloudFormation's JSON shape: what ``CreateDistribution`` would have
+    stored had the same configuration arrived on the wire, so every read
+    path parses a CloudFormation-provisioned distribution like any other.
+    Walks the API model, so a member the API defines renders and one it
+    does not (the legacy ``CNAMEs``, ``CustomOrigin``, ``S3Origin``) is
+    dropped; an element that would come out empty is omitted, as the API
+    omits ``Items`` at ``Quantity`` 0."""
+    root = Element("DistributionConfig")
+    _render_config_member(root, _api_shape("DistributionConfig"), config)
+    return root
+
+
+def _render_config_member(el, shape, value):
+    if shape.type_name == "structure":
+        if not isinstance(value, dict):
+            return
+        members = shape.members
+        value = {_CFN_DISTRIBUTION_CONFIG_RENAMES.get((shape.name, k), k): v
+                 for k, v in value.items()}
+        if "AllowedMethods" in members and (
+                isinstance(value.get("AllowedMethods"), list) or "CachedMethods" in value):
+            # The API nests CachedMethods inside AllowedMethods, so a
+            # CachedMethods on its own needs one: GET and HEAD, the first of
+            # the three choices the reference lists (it states no default).
+            value["AllowedMethods"] = {"Items": value.get("AllowedMethods") or ["GET", "HEAD"],
+                                       "CachedMethods": value.pop("CachedMethods", None)}
+        if "Quantity" in members and "Items" in members:
+            value.setdefault("Quantity", len(value.get("Items") or []))
+        if "Enabled" in members and "Enabled" not in value:
+            # Six structures carry an Enabled the template may omit:
+            # TrustedSigners and TrustedKeyGroups are on when they list
+            # anything; Logging, OriginShield and GrpcConfig are on when the
+            # block is present; DistributionConfig defaults to on, as
+            # _get_enabled reads it.
+            value["Enabled"] = bool(value.get("Items")) if "Items" in members else True
+        for name, member in members.items():
+            item = value.get(name)
+            if item is None:
+                continue
+            if member.type_name == "structure" and "Items" in member.members and isinstance(item, list):
+                item = {"Items": item}
+            _append_config_member(el, member.serialization.get("name", name), member, item)
+    elif shape.type_name == "list":
+        if not isinstance(value, list):
+            return
+        tag = shape.member.serialization.get("name", "member")
+        for item in value:
+            _append_config_member(el, tag, shape.member, item)
+    elif isinstance(value, bool):
+        el.text = "true" if value else "false"
+    elif not isinstance(value, (dict, list)):
+        el.text = str(value)
+
+
+def _append_config_member(parent, tag, shape, value):
+    """Render ``value`` under ``tag`` and attach it only when something came
+    out: an empty list, or a structure none of whose keys the API knows,
+    leaves no element behind."""
+    child = Element(tag)
+    _render_config_member(child, shape, value)
+    if len(child) or child.text is not None:
+        parent.append(child)
+
+
 def _build_distribution_xml(parent, dist):
     """Append Distribution child elements to parent."""
     SubElement(parent, "Id").text = dist["Id"]
@@ -2102,8 +2197,9 @@ def _get_distribution_config(dist_id):
 def _dist_config_el(dist):
     """Parsed DistributionConfig element for a stored distribution.
 
-    CloudFormation-provisioned records carry an empty ``config_xml``; parse
-    defensively so account-wide scans never fail on them."""
+    A CloudFormation-provisioned record persisted before the provisioner
+    rendered its configuration carries an empty ``config_xml``; parse
+    defensively so account-wide scans never fail on one."""
     xml = dist.get("config_xml")
     if xml:
         try:

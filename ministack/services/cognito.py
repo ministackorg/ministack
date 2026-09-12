@@ -6609,7 +6609,12 @@ def _set_identity_pool_roles(data):
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    # The call sets the whole configuration: RoleMappings is optional on the
+    # API reference and no call removes a mapping on its own, so an omitted
+    # member clears what was there. Reasoned from the API surface, not
+    # measured against a live account.
     pool["_roles"] = data.get("Roles", {})
+    pool["_role_mappings"] = data.get("RoleMappings", {})
     return json_response({})
 
 
@@ -6621,7 +6626,9 @@ def _get_identity_pool_roles(data):
     return json_response({
         "IdentityPoolId": iid,
         "Roles": pool.get("_roles", {}),
-        "RoleMappings": {},
+        # .get, not indexing: pools created before this field existed (and the
+        # ones the CloudFormation provisioner builds itself) carry no entry.
+        "RoleMappings": pool.get("_role_mappings", {}),
     })
 
 

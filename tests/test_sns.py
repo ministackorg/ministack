@@ -378,6 +378,24 @@ def test_sns_subscribe_with_raw_message_delivery(sns):
     attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
     assert attrs["RawMessageDelivery"] == "true"
 
+
+def test_sns_subscribe_with_subscription_role_arn(sns):
+    """SubscriptionRoleArn is a Subscribe and SetSubscriptionAttributes
+    attribute (the role Firehose subscriptions write with); both calls keep it."""
+    arn = sns.create_topic(Name="intg-sns-sub-role")["TopicArn"]
+    sub_arn = sns.subscribe(
+        TopicArn=arn, Protocol="email", Endpoint="role@example.com",
+        Attributes={"SubscriptionRoleArn": "arn:aws:iam::000000000000:role/sub-role-a"},
+    )["SubscriptionArn"]
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["SubscriptionRoleArn"] == "arn:aws:iam::000000000000:role/sub-role-a"
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn, AttributeName="SubscriptionRoleArn",
+        AttributeValue="arn:aws:iam::000000000000:role/sub-role-b")
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["SubscriptionRoleArn"] == "arn:aws:iam::000000000000:role/sub-role-b"
+
+
 def test_sns_subscribe_with_filter_policy(sns):
     arn = sns.create_topic(Name="intg-sns-sub-filter")["TopicArn"]
     filter_policy = json.dumps({"event": ["MyEvent"]})
