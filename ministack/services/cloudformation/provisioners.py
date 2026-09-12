@@ -702,8 +702,11 @@ def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_i
         return None
     created = create_fn(logical_id or physical_id, new_props, stack_name)
     replaced = created[0] != physical_id or delete_when_id_unchanged
-    if current_name is not None and replaced and not _RETAIN_REPLACED.get():
-        delete_fn(physical_id, old_props)
+    if current_name is not None and replaced:
+        # Through the shared helper, so the retaining policy has one reader:
+        # a second copy of the check here is the drift _delete_predecessor
+        # exists to prevent.
+        _delete_predecessor(delete_fn, physical_id, old_props)
     return created
 
 
