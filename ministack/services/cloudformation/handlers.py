@@ -554,7 +554,6 @@ def _resource_metadata_xml(stack, logical_id):
 
 
 def _describe_stack_resource(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     logical_id = _p(params, "LogicalResourceId")
 
@@ -591,7 +590,6 @@ def _describe_stack_resource(params):
 # --- DescribeStackResources ---
 
 def _describe_stack_resources(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     logical_resource_id = _p(params, "LogicalResourceId")
 
@@ -818,7 +816,6 @@ def _stack_has_no_updates(stack, template, param_values, tags,
 
 
 def _update_stack(params):
-    from ministack.services.cloudformation import _stacks
 
     from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
@@ -1037,7 +1034,6 @@ def _list_exports(params):
 # --- GetTemplateSummary ---
 
 def _get_template_summary(params):
-    from ministack.services.cloudformation import _stacks
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err

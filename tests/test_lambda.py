@@ -8229,6 +8229,111 @@ def handler(event, context):
             pass
 
 
+def test_lambda_durable_invocation_reuses_the_warm_worker(lam):
+    """Durable invocations go through the warm pool like every other
+    python/nodejs invocation: the second call reuses the worker (module state
+    survives) and still gets its own execution ARN and checkpoint token."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-warm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    # The counter lives in the module, so it only survives if the same worker
+    # process serves both invocations.
+    code = """
+import os
+_CALLS = 0
+def handler(event, context):
+    global _CALLS
+    _CALLS += 1
+    return {
+        "calls": _CALLS,
+        "arn": os.environ.get("AWS_LAMBDA_DURABLE_EXECUTION_ARN"),
+        "token": os.environ.get("AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN"),
+    }
+"""
+    zip_b64 = _b64.b64encode(_make_zip(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        # A one-shot subprocess pays interpreter start plus the botocore import
+        # inside this budget; a warm worker pays it once, before the invoke.
+        "Timeout": 1,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert second["calls"] == 2, "durable invocation did not reuse the warm worker"
+        assert first["arn"] and second["arn"]
+        assert first["arn"] != second["arn"]
+        assert first["token"] != second["token"]
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
+def test_lambda_durable_context_is_dropped_when_the_next_invocation_is_not_durable(lam):
+    """A worker that served a durable invocation is reused for a non-durable one
+    of the same function, and the bootstrap deletes the three variables the
+    previous invocation set, so the handler cannot read a stale context."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-drop-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    code = """
+import os
+_CALLS = 0
+_NAMES = (
+    "AWS_LAMBDA_DURABLE_EXECUTION_ARN",
+    "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN",
+    "AWS_LAMBDA_DURABLE_EXECUTION_NAME",
+)
+def handler(event, context):
+    global _CALLS
+    _CALLS += 1
+    return {"calls": _CALLS, "env": {n: os.environ.get(n) for n in _NAMES}}
+"""
+    zip_b64 = _b64.b64encode(_make_zip(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "Timeout": 5,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert all(first["env"].values()), first
+        # Switching the function off durable does not respawn its worker: the
+        # counter must keep counting in the same process.
+        code, body = _raw_durable("PUT", f"/2015-03-31/functions/{fname}/configuration",
+                                  body={"DurableConfig": {"Enabled": False}})
+        assert code == 200, body
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert second["calls"] == 2, "the non-durable invocation did not reuse the worker"
+        assert not any(second["env"].values()), second
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
 @pytest.mark.serial
 def test_lambda_durable_chained_invoke_runs_child(lam):
     """A CHAINED_INVOKE checkpoint update with Action=START actually spawns
@@ -8250,7 +8355,6 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Role": _LAMBDA_ROLE,
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(child_code)).decode()},
-        "Timeout": 30,
     })
     parent_code = "def handler(e,c): return {}"
     _raw_durable("POST", "/2015-03-31/functions", body={
@@ -8260,7 +8364,6 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(parent_code)).decode()},
         "DurableConfig": {"Enabled": True},
-        "Timeout": 30,
     })
     try:
         # Invoke parent to spin up its durable execution.
@@ -8540,6 +8643,50 @@ def test_lambda_get_state_prunes_orphan_blobs(lambda_svc_isolated):
     assert not (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
 
 
+def test_lambda_durable_invocation_reuses_the_warm_worker_nodejs(lam):
+    """The nodejs bootstrap takes the same durable context off the event: the
+    second call reuses the worker (module state survives) and still gets its
+    own execution ARN and checkpoint token."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-warm-js-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    code = """
+let calls = 0;
+exports.handler = async () => ({
+  calls: ++calls,
+  arn: process.env.AWS_LAMBDA_DURABLE_EXECUTION_ARN,
+  token: process.env.AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN,
+});
+"""
+    zip_b64 = _b64.b64encode(_make_zip_js(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "nodejs20.x",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "Timeout": 3,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert second["calls"] == 2, "durable nodejs invocation did not reuse the warm worker"
+        assert first["arn"] and second["arn"]
+        assert first["arn"] != second["arn"]
+        assert first["token"] != second["token"]
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
 def test_lambda_durable_event_wrapped_with_sdk_fields(lam):
     """A durable invocation's event payload is wrapped with the fields the
     aws-durable-execution-sdk-python SDK reads from the Lambda event:
@@ -8565,10 +8712,6 @@ def handler(event, context):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(code)).decode()},
         "DurableConfig": {"Enabled": True},
-        # Lambda's default 3s timeout reads a loaded CI runner's slow
-        # subprocess cold start as a function timeout (no SDK fields in the
-        # error body); the budget, not the wrapping, is what varies here.
-        "Timeout": 30,
     })
     try:
         resp = lam.invoke(FunctionName=fname, Payload=b'{"user":"data"}')
@@ -8576,6 +8719,9 @@ def handler(event, context):
         # SDK requires these three top-level keys.
         for key in ("DurableExecutionArn", "CheckpointToken", "InitialExecutionState"):
             assert key in body["keys"], f"missing {key} in {body['keys']}"
+        # The emulator's own carrier keys (durable context, depth, trace) are
+        # popped by the bootstrap before the handler sees the event.
+        assert not any(k.startswith("_ministack") for k in body["keys"]), body["keys"]
         ops = body["event"]["InitialExecutionState"]["Operations"]
         # AWS seeds the synthetic EXECUTION-type op with the input payload.
         assert len(ops) == 1 and ops[0]["Type"] == "EXECUTION"

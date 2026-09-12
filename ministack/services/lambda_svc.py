@@ -53,12 +53,15 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
+    DURABLE_CTX_EVENT_KEY,
+    DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
     ensure_spawned,
+    execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -1307,11 +1310,7 @@ def _durable_env_overlay() -> dict[str, str]:
     ctx = _durable_ctx.get()
     if not ctx:
         return {}
-    return {
-        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
-        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
-        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
-    }
+    return {var: ctx.get(key, "") for var, key in DURABLE_ENV_VARS.items()}
 
 
 def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
@@ -4266,9 +4265,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-        "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -4276,6 +4272,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
     }
+    container_env.update(execution_credentials(config))
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
@@ -4905,18 +4902,19 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
-            result = _execute_function_provided(func, event)
-        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
-                and not _durable_ctx.get():
-            # Warm pool reuses worker subprocesses whose env was fixed at
-            # spawn time. Durable invocations need per-call env (the
-            # DurableExecutionArn + CheckpointToken change every invoke),
-            # so route them through the per-call local executor.
-            result = _execute_function_warm(func, event)
+            # A durable invocation needs a per-call environment (the
+            # DurableExecutionArn and CheckpointToken change every invoke) and a
+            # pooled worker's env is fixed at spawn, so provided.* durable
+            # invocations keep the one-shot executor. python and nodejs carry
+            # that context in the event instead, which is why they can be pooled.
+            if _durable_ctx.get():
+                result = _execute_function_provided(func, event)
+            else:
+                result = _execute_function_provided_warm(func, event, request_id)
         elif runtime.startswith(("python", "nodejs")):
-            # Durable python/nodejs falls through to local subprocess (per
-            # the elif above we already filtered durable out of warm).
-            result = _execute_function_local(func, event)
+            # Durable invocations included: their per-call context rides in
+            # the event, so the pooled worker can serve them.
+            result = _execute_function_warm(func, event)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
@@ -5091,6 +5089,14 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # the counter.
         if isinstance(event, dict):
             event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
+            # Durable executions ride the same channel: the ARN, the checkpoint
+            # token and the execution name differ per invocation, which is why
+            # they cannot be part of the worker's spawn environment. The
+            # bootstrap clears them again when the key is absent, so a worker
+            # reused for a non-durable call does not see the previous one's.
+            durable = _durable_env_overlay()
+            if durable:
+                event[DURABLE_CTX_EVENT_KEY] = durable
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
@@ -5120,6 +5126,98 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         release_worker(worker)
 
 
+def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
+    """Build the process environment for a ``provided.*`` bootstrap binary.
+
+    Shared by the one-shot executor and the warm ``ProvidedWorker`` so the two
+    paths cannot drift. Per-invocation values (X-Ray trace ID) are deliberately
+    absent: a reused environment cannot carry them in env, and the Runtime API
+    has headers for exactly that. The one-shot executor adds its per-call
+    overlays after calling this helper. Custom runtimes have no Python/Node
+    shim to propagate MiniStack's per-call recursion depth; the one-shot path
+    retains its legacy spawn-time depth overlay instead of freezing it here.
+    """
+    env_vars = _runtime_env_vars(config)
+    proc_env = dict(os.environ)
+    proc_env.update({
+        "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+        "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
+        "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
+        "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
+        "LAMBDA_TASK_ROOT": code_dir,
+        "_HANDLER": config.get("Handler", "bootstrap"),
+    })
+    proc_env.update(execution_credentials(config))
+    proc_env.update(env_vars)
+    proc_env.update(_durable_env_overlay())
+    # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
+    # always call back to this MiniStack instance.
+    endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+    if not endpoint:
+        hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
+        if hostname:
+            endpoint = _normalize_endpoint_url(hostname)
+    if endpoint:
+        proc_env["AWS_ENDPOINT_URL"] = endpoint
+    return proc_env
+
+
+def _execute_function_provided_warm(func: dict, event: dict,
+                                    request_id: str | None = None) -> dict:
+    """Execute a ``provided.*`` Lambda on a pooled, reused environment."""
+    config = func.get("config") or func
+    code_zip = func.get("code_zip")
+    if not code_zip:
+        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+
+    func_name = config.get("FunctionName", "unknown")
+    qualifier = config.get("Version", "$LATEST")
+    _ensure_reaper_thread()
+    worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    if worker is None and reason == "func_cap":
+        return _throttle_response(
+            reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: function {func_name} warm-worker ceiling reached",
+        )
+    try:
+        # Invocation metadata belongs in Runtime API headers, not in the user
+        # payload (which need not be a dict and may contain similarly named keys).
+        result = worker.invoke(
+            event, request_id or new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+        )
+        if result.get("status") == "ok":
+            return {"body": result.get("result"), "log": result.get("log", "")}
+        payload = result.get("error_payload")
+        if isinstance(payload, dict):
+            return {"body": payload, "error": True, "log": result.get("log", "")}
+        error_msg = result.get("error", "Unknown error")
+        error_type = ("Runtime.ExitError" if "timed out" in error_msg.lower()
+                      else "Runtime.HandlerError")
+        return {
+            "body": {"errorMessage": error_msg, "errorType": error_type},
+            "error": True,
+            "log": result.get("log", ""),
+        }
+    except Exception as e:
+        logger.error("Warm provided-runtime execution error for %s: %s", func_name, e)
+        account, region = _account_region_from_function_config(config)
+        invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
+        worker = None  # invalidation already removed and reaped the worker
+        # Do not transparently invoke again: the handler may already have
+        # performed side effects before its environment failed.
+        return {
+            "body": {"errorMessage": str(e), "errorType": type(e).__name__},
+            "error": True,
+            "log": "",
+        }
+    finally:
+        release_worker(worker)
+
+
 def _execute_function_provided(func: dict, event: dict) -> dict:
     """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
     config = func.get("config") or func
@@ -5128,7 +5226,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     timeout = config.get("Timeout", 30)
-    env_vars = _runtime_env_vars(config)
 
     try:
         import http.server
@@ -5233,23 +5330,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         server_ready.wait(timeout=5)
 
         try:
-            # Build environment for the Lambda binary
-            proc_env = dict(os.environ)
-            proc_env.update({
-                "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
-                "AWS_DEFAULT_REGION": get_region(),
-                "AWS_REGION": get_region(),
-                "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
-                "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
-                "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
-                "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
-                "LAMBDA_TASK_ROOT": code_dir,
-                "_HANDLER": config.get("Handler", "bootstrap"),
-            })
-            proc_env.update(env_vars)
-            proc_env.update(_durable_env_overlay())
+            proc_env = _provided_worker_env(config, code_dir, port)
             # X-Ray active tracing. ``_execute_function_provided`` builds
             # ``proc_env`` per-invocation, so a per-call trace ID is safe
             # here (unlike the RIE pool). aws-xray-sdk reads this env var
@@ -5258,19 +5339,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             if _xray_trace_id:
                 proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
             proc_env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
-            # Override AWS_ENDPOINT_URL *after* function env vars so
-            # Lambda binaries always call back to this MiniStack
-            # instance.  Function-level env vars may carry the
-            # host-mapped URL which is unreachable from inside the
-            # container.
-            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
-            if not endpoint:
-                hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
-                if hostname:
-                    endpoint = _normalize_endpoint_url(hostname)
-            if endpoint:
-                proc_env["AWS_ENDPOINT_URL"] = endpoint
-
             # Spawn under the code lock: no fork may overlap an extraction
             # write elsewhere, or the child inherits the open write fd and
             # execve fails with ETXTBSY (#1051).
@@ -5393,9 +5461,6 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                    "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
                     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
                     "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -5408,6 +5473,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     "_LAMBDA_LAYERS_DIRS": os.pathsep.join(layers_dirs),
                 }
             )
+            env.update(execution_credentials(config))
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))

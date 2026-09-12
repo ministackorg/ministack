@@ -60,7 +60,7 @@ def test_transcribe_job_completes_and_writes_a_transcript(transcribe, s3, media)
     )["TranscriptionJob"]
 
     assert started["TranscriptionJobName"] == job_name
-    assert started["TranscriptionJobStatus"] == "QUEUED"
+    assert started["TranscriptionJobStatus"] == "IN_PROGRESS"
     assert started["LanguageCode"] == "en-US"
     assert started["Media"] == {"MediaFileUri": media_uri}
     # AWS omits Transcript until the job completes.
@@ -79,6 +79,58 @@ def test_transcribe_job_completes_and_writes_a_transcript(transcribe, s3, media)
     assert text
     assert len(document["results"]["items"]) == len(text.split())
     assert document["results"]["items"][0]["alternatives"][0]["content"] == text.split()[0]
+
+
+def test_transcribe_start_returns_a_job_already_in_progress(transcribe, media):
+    """AWS starts a job IN_PROGRESS with StartTime set; QUEUED is reached only
+    by a request that opted into job queueing while the account is at its
+    concurrent job limit. A caller that reads status off the start response and
+    then waits for the terminal event, rather than polling, sees that one value
+    for the whole life of the job, so returning QUEUED here loses the
+    in-progress state entirely."""
+    _, _, media_uri = media
+    job_name = _unique("job")
+
+    started = transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        LanguageCode="en-US",
+        Media={"MediaFileUri": media_uri},
+    )["TranscriptionJob"]
+
+    assert started["TranscriptionJobStatus"] == "IN_PROGRESS"
+    assert started["StartTime"] >= started["CreationTime"]
+
+
+def test_transcribe_queue_seconds_puts_a_job_through_queued_first(transcribe, media):
+    """QUEUED is off by default because AWS reaches it only for a request that
+    opted into job queueing while the account is at its concurrent job limit,
+    but a caller that handles the state still needs a way to exercise it. With
+    TRANSCRIBE_JOB_QUEUE_SECONDS set, the job starts QUEUED with no StartTime
+    and the worker moves it to IN_PROGRESS."""
+    from conftest import _ministack_config
+
+    _, _, media_uri = media
+    job_name = _unique("job")
+
+    _ministack_config({"transcribe._JOB_QUEUE_SECONDS": 3})
+    try:
+        started = transcribe.start_transcription_job(
+            TranscriptionJobName=job_name,
+            LanguageCode="en-US",
+            Media={"MediaFileUri": media_uri},
+        )["TranscriptionJob"]
+
+        assert started["TranscriptionJobStatus"] == "QUEUED"
+        # AWS omits StartTime until the job leaves the queue.
+        assert "StartTime" not in started
+
+        running = _wait_for_status(transcribe, job_name, statuses=("IN_PROGRESS",))
+        assert running["StartTime"] >= running["CreationTime"]
+    finally:
+        _ministack_config({"transcribe._JOB_QUEUE_SECONDS": 0})
+
+    job = _wait_for_status(transcribe, job_name)
+    assert job["TranscriptionJobStatus"] == "COMPLETED"
 
 
 def test_transcribe_transcript_is_deterministic_per_media(transcribe, s3, media):
@@ -277,7 +329,7 @@ def test_transcribe_identify_language_without_options_falls_back_to_a_default(tr
         IdentifyLanguage=True,
         Media={"MediaFileUri": media_uri},
     )["TranscriptionJob"]
-    assert started["TranscriptionJobStatus"] == "QUEUED"
+    assert started["TranscriptionJobStatus"] == "IN_PROGRESS"
     assert "LanguageCode" not in started
 
     job = _wait_for_status(transcribe, job_name)
@@ -835,7 +887,7 @@ def test_transcribe_recreating_a_deleted_job_name_emits_one_event(
             Media={"MediaFileUri": media_uri},
         )
         transcribe.start_transcription_job(**start)
-        # Delete while still QUEUED, then immediately reuse the name.
+        # Delete while still running, then immediately reuse the name.
         transcribe.delete_transcription_job(TranscriptionJobName=job_name)
         transcribe.start_transcription_job(**start)
 

@@ -197,10 +197,18 @@ _NON_S3_VHOST_NAMES = frozenset(
 )
 
 from ministack.core import container_reaper
+from ministack.core.aws_credentials import (
+    AmbiguousAccessKeyError,
+    find_iam_access_key_account,
+)
 from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
+from ministack.core.responses import (
+    _12_DIGIT_RE,
+    set_request_account_id,
+    set_request_region,
+)
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -212,6 +220,11 @@ _install_hypercorn_compat()
 # This saves ~20 MB of idle RAM and speeds up boot.
 # ---------------------------------------------------------------------------
 _loaded_modules: dict = {}
+
+
+def _request_account_scope(access_key_id: str) -> str:
+    """Return the tenant selector for an AWS access key."""
+    return find_iam_access_key_account(access_key_id) or access_key_id
 
 # Execution state of ready.d scripts — surfaced via /_ministack/health and /_ministack/ready.
 # status: "pending" (not started) | "running" | "completed" (all scripts finished, errors included)
@@ -371,10 +384,13 @@ SERVICE_REGISTRY = {
     "iot": {"module": "iot"},
     "iot-data": {"module": "iot_data"},
     "iot-jobs-data": {"module": "iot_jobs_data"},
+    "iotwireless": {"module": "iotwireless"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
+    "lambda-core": {"module": "lambda_core"},
     "lambda-microvms": {"module": "lambda_microvms"},
+    "location": {"module": "location"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
     "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
@@ -391,6 +407,7 @@ SERVICE_REGISTRY = {
     "secretsmanager": {"module": "secretsmanager"},
     "servicediscovery": {"module": "servicediscovery"},
     "ses": {"module": "ses"},
+    "signer": {"module": "signer"},
     "sns": {"module": "sns"},
     "sqs": {"module": "sqs"},
     "ssm": {"module": "ssm"},
@@ -447,6 +464,7 @@ _state_map = {
     "cloudwatch": "cloudwatch",
     "s3": "s3",
     "lambda": "lambda_svc",
+    "lambda_core": "lambda_core",
     "lambda_microvms": "lambda_microvms",
     "rds": "rds",
     "ecs": "ecs",
@@ -483,8 +501,10 @@ _state_map = {
     "iot": "iot",
     "inspector2": "inspector2",
     "dsql": "dsql",
+    "location": "location",
     "mediaconnect": "mediaconnect",
     "mq": "mq",
+    "signer": "signer",
     "opensearch": "opensearch",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
@@ -1225,6 +1245,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._sfn_mock_config",
         "stepfunctions._SFN_WAIT_SCALE",
         "translate._JOB_RUN_SECONDS",
+        "transcribe._JOB_RUN_SECONDS",
+        "transcribe._JOB_QUEUE_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "alb.TARGET_CONNECT_TIMEOUT",
@@ -1246,7 +1268,12 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
-            if key in ("stepfunctions._SFN_WAIT_SCALE", "translate._JOB_RUN_SECONDS"):
+            if key in (
+                "stepfunctions._SFN_WAIT_SCALE",
+                "translate._JOB_RUN_SECONDS",
+                "transcribe._JOB_RUN_SECONDS",
+                "transcribe._JOB_QUEUE_SECONDS",
+            ):
                 try:
                     float_value = float(value)
                 except (ValueError, TypeError):
@@ -1712,6 +1739,12 @@ def _resolve_mrap_host(host: str):
 
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
+    if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
+        # Alias lookup is account-scoped and precedes the S3 handler. Verify
+        # a SigV4 presign first so lookup uses its credential owner's account.
+        error = _get_module("s3")._verify_presigned_sigv4(method, path, headers, query_params)
+        if error:
+            return error
     mrap_bucket = _resolve_mrap_host(host)
     if mrap_bucket:
         # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
@@ -2157,6 +2190,7 @@ async def _dispatch_service_request(
     if AUTH:
         from ministack.core.iam_actions import (
             access_denied_response,
+            dynamodb_resource_arns,
             extract_iam_action,
             extract_resource_arn,
         )
@@ -2169,7 +2203,31 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+            service_context = None
+            if service == "dynamodb":
+                try:
+                    dynamodb_body = json.loads(body or b"{}")
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                    dynamodb_body = {}
+                projection = dynamodb_body.get("ProjectionExpression")
+                names = dynamodb_body.get("ExpressionAttributeNames") or {}
+                if projection:
+                    attributes = [
+                        names.get(part.strip(), part.strip())
+                        for part in projection.split(",")
+                    ]
+                    service_context = {
+                        "dynamodb:Attributes": attributes,
+                        "dynamodb:Select": dynamodb_body.get(
+                            "Select", "SPECIFIC_ATTRIBUTES"
+                        ),
+                    }
+            enforce_kwargs = {"resource_arn": resource_arn}
+            if service_context is not None:
+                enforce_kwargs["service_context"] = service_context
+            denied = enforce(
+                access_key, iam_action, service, region, **enforce_kwargs
+            )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
@@ -2179,6 +2237,19 @@ async def _dispatch_service_request(
                     denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
                     if denied:
                         iam_action = extra_action
+                        break
+            if service == "dynamodb" and not denied:
+                resources = dynamodb_resource_arns(body, region, get_account_id())
+                for extra_arn in resources[1:]:
+                    denied = enforce(
+                        access_key,
+                        iam_action,
+                        service,
+                        region,
+                        resource_arn=extra_arn,
+                        service_context=service_context,
+                    )
+                    if denied:
                         break
             if denied:
                 if isinstance(denied, AuthError):
@@ -2336,7 +2407,25 @@ async def app(scope, receive, send):
     # If the access key is a 12-digit number, it becomes the account ID.
     _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
-        set_request_account_id(_access_key)
+        try:
+            set_request_account_id(_request_account_scope(_access_key) if AUTH else _access_key)
+        except AmbiguousAccessKeyError:
+            await _send_response(
+                send,
+                403,
+                {
+                    "Content-Type": "application/json",
+                    "x-amzn-requestid": request_id,
+                    "x-amz-request-id": request_id,
+                },
+                json.dumps(
+                    {
+                        "__type": "InvalidClientTokenId",
+                        "message": "The security token included in the request is invalid.",
+                    }
+                ).encode(),
+            )
+            return
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION

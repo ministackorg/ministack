@@ -280,6 +280,50 @@ def test_foreign_hosts_are_not_routed_by_service_token(host):
     assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
 
 
+def test_iotwireless_credential_scope_routes():
+    """boto3 signs GetPositionEstimate with the `iotwireless` scope
+    (botocore signingName); the scope early-return resolves it directly."""
+    assert detect_service(
+        "POST", "/position-estimate", _sigv4_headers("iotwireless"), {}
+    ) == "iotwireless"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The real endpoint prefix: api.iotwireless.{region}.
+        "api.iotwireless.us-east-1.localhost:4566",
+        "iotwireless.us-east-1.localhost:4566",
+    ],
+)
+def test_iotwireless_host_routes(host):
+    assert detect_service(
+        "POST", "/position-estimate", {"host": host}, {}
+    ) == "iotwireless"
+
+
+def test_iotwireless_host_does_not_disturb_iot_family():
+    """`api.iotwireless.` never contains the literal `iot.` segment, so there
+    is no overlap with the iot control-plane regex in either direction — pin
+    that the iot family still resolves as before."""
+    assert detect_service(
+        "GET", "/things", {"host": "iot.us-east-1.localhost:4566"}, {}
+    ) == "iot"
+    assert detect_service(
+        "GET",
+        "/things/t1/jobs/$next",
+        {"host": "a1b2c3.jobs.iot.us-east-1.localhost:4566"},
+        {},
+    ) == "iot-jobs-data"
+
+
+def test_iotwireless_unsigned_path_routes_post_only():
+    """An unsigned POST resolves by path; a GET of the same path stays on the
+    S3 fallback (an object may legitimately be named `position-estimate`)."""
+    assert detect_service("POST", "/position-estimate", _HEADERS, {}) == "iotwireless"
+    assert detect_service("GET", "/position-estimate", _HEADERS, {}) == "s3"
+
+
 @pytest.mark.parametrize(("host", "expected"), [
     ("s3.ministack:4566", "s3"),
     ("iot.localhost:4566", "iot"),
@@ -309,6 +353,80 @@ def test_served_host_prefers_the_multi_label_token():
     ) == "appconfig"
 
 
+def test_signer_credential_scope_routes():
+    """boto3 signs signer requests with credential scope `signer` (botocore
+    signingName) — the scope early-return must resolve it."""
+    assert detect_service(
+        "POST", "/signing-jobs", _sigv4_headers("signer"), {}
+    ) == "signer"
+    assert detect_service(
+        "GET", "/signing-profiles/prof1", _sigv4_headers("signer"), {}
+    ) == "signer"
+
+
+def test_signer_host_routes():
+    headers = {"host": "signer.us-east-1.localhost:4566"}
+    assert detect_service("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f", headers, {}) == "signer"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/signing-jobs"),
+        ("GET", "/signing-jobs"),
+        ("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f"),
+        ("PUT", "/signing-profiles/prof1"),
+        ("GET", "/signing-profiles/prof1"),
+    ],
+)
+def test_signer_unsigned_paths_route_by_prefix(method, path):
+    """Without SigV4 the default is S3 — the /signing-jobs and
+    /signing-profiles path rules must claim signer's REST-JSON surface
+    before that fallback."""
+    assert detect_service(method, path, _HEADERS, {}) == "signer"
+
+
+@pytest.mark.parametrize(("method", "path", "query"), [
+    # A key that is not a job id: DescribeSigningJob takes a uuid.
+    ("GET", "/signing-jobs/report.json", {}),
+    ("GET", "/signing-jobs/2026-09-09", {}),
+    # S3 marks its own listing and its multipart/delete POSTs in the query,
+    # and ListSigningJobs has none of those parameters.
+    ("GET", "/signing-jobs", {"list-type": "2"}),
+    ("GET", "/signing-jobs", {"prefix": "signed/"}),
+    ("POST", "/signing-jobs", {"delete": ""}),
+    ("POST", "/signing-jobs", {"uploads": ""}),
+])
+def test_signer_paths_leave_s3_traffic_alone(method, path, query):
+    """A bucket named exactly "signing-jobs" keeps the requests that carry an
+    S3 marker; only the shapes signer's own surface uses are claimed."""
+    assert detect_service(method, path, _HEADERS, query) == "s3"
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    # Buckets that merely share the prefix.
+    ("GET", "/signing-jobs-archive"),
+    ("GET", "/signing-jobs-archive/report.json"),
+    ("PUT", "/signing-profiles-backup/dump.bin"),
+    # Verbs signer's surface doesn't serve, on the exact-named bucket.
+    ("PUT", "/signing-jobs/new-object"),
+    ("DELETE", "/signing-jobs/old-object"),
+    ("DELETE", "/signing-profiles/prof1"),
+    # Multi-segment object keys inside the exact-named bucket, and the
+    # bare list-bucket GET on "signing-profiles" (ListSigningProfiles is
+    # not implemented, so S3 keeps it).
+    ("GET", "/signing-jobs/path/to/object"),
+    ("GET", "/signing-profiles/nested/key"),
+    ("GET", "/signing-profiles"),
+])
+def test_signer_lookalike_s3_paths_stay_on_s3(method, path):
+    """Regression: `startswith("/signing-jobs")` hijacked unsigned path-style
+    S3 traffic for any bucket whose name starts with that prefix. The rules
+    are segment-anchored and method-limited now, so this traffic falls
+    through to the S3 default."""
+    assert detect_service(method, path, _HEADERS, {}) == "s3"
+
+
 @pytest.mark.parametrize("host", [
     "ministack",
     "ministack-core:4566",
@@ -331,3 +449,28 @@ def test_ministack_host_env_is_a_served_suffix(monkeypatch):
 def test_container_hostname_is_a_served_suffix(monkeypatch):
     monkeypatch.setenv("HOSTNAME", "core-7f3a")
     assert detect_service("GET", "/status", {"host": "sns.core-7f3a:4566"}, {}) == "sns"
+
+
+def test_location_credential_scope_routes():
+    """Amazon Location signs with credential scope `geo`, not `location`
+    (botocore signingName). Under an endpoint override the host carries no
+    `geo.` — the scope map is the only routing signal left."""
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", _sigv4_headers("geo"), {}
+    ) == "location"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The modeled per-operation host prefixes in front of geo.{region}:
+        # `cp.tracking.` on the tracker control plane...
+        "cp.tracking.geo.us-east-1.localhost:4566",
+        # ...and `tracking.` on the device-position data plane.
+        "tracking.geo.us-east-1.localhost:4566",
+    ],
+)
+def test_location_host_routes(host):
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", {"host": host}, {}
+    ) == "location"

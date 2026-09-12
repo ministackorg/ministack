@@ -105,6 +105,8 @@ def _live_container_ids():
     """
     ids = set()
     for _key, task in _tasks.all_items():
+        if task.get("lastStatus") == "STOPPED":
+            continue
         for cid in task.get("_docker_ids") or []:
             if cid:
                 ids.add(cid)
@@ -383,9 +385,9 @@ async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
-        # Docker work (RunTask/StopTask/service updates) blocks for as long as
-        # the daemon takes: a cached nginx start already holds the loop >7s,
-        # measured, during which no service in the process can be served.
+        # ECS mutations such as StopTask and service reconciliation still make
+        # blocking Docker calls. RunTask registers first and hands its startup
+        # work to a task worker, but this dispatcher must remain off the loop.
         #
         # run_reentrant, not the shared pool: every task container is handed
         # AWS_ENDPOINT_URL pointing back here (see _task_env), so a starting
@@ -801,8 +803,33 @@ def _sync_service_targets(cluster_name, svc):
             logger.debug("ECS: %s -> %d target(s) in %s", svc_name, len(targets), tg_arn)
 
 
+def _refresh_service_state(cluster_name, group):
+    if not group or not group.startswith("service:"):
+        return
+    svc_name = group.split(":", 1)[1]
+    svc = _services.get(f"{cluster_name}/{svc_name}")
+    if not svc:
+        return
+    cluster_arn = svc.get("clusterArn", "")
+    running = 0
+    pending = 0
+    for task in _tasks.values():
+        if task.get("group") != group or task.get("clusterArn") != cluster_arn:
+            continue
+        if task.get("lastStatus") == "RUNNING":
+            running += 1
+        elif task.get("lastStatus") == "PENDING":
+            pending += 1
+    svc["runningCount"] = running
+    svc["pendingCount"] = pending
+    if svc.get("deployments"):
+        svc["deployments"][0]["runningCount"] = running
+        svc["deployments"][0]["pendingCount"] = pending
+    _sync_service_targets(cluster_name, svc)
+
+
 def _reconcile_service_tasks(cluster_name, svc_key):
-    """Spawn or stop tasks so running tasks match desiredCount and task definition."""
+    """Spawn or stop active tasks so desiredCount and task definition match."""
     svc = _services.get(svc_key)
     if not svc or svc["status"] != "ACTIVE":
         return
@@ -819,13 +846,15 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     td = _task_defs.get(td_key)
     target_td_arn = td["taskDefinitionArn"] if td else td_arn
 
-    # Partition running service tasks into current-TD and stale-TD
+    # Partition active service tasks into current-TD and stale-TD. A PENDING
+    # task already counts toward desired capacity, so reconciliation does not
+    # launch duplicates while its worker is pulling the image.
     current_tasks = []
     stale_tasks = []
     for arn, t in _tasks.items():
         if (t.get("group") == f"service:{svc_name}"
                 and t.get("clusterArn") == cluster_arn
-                and t.get("lastStatus") == "RUNNING"):
+                and t.get("lastStatus") in ("PENDING", "RUNNING")):
             if t.get("taskDefinitionArn") == target_td_arn:
                 current_tasks.append((arn, t))
             else:
@@ -862,20 +891,8 @@ def _reconcile_service_tasks(cluster_name, svc_key):
             _stop_task({"task": task_arn, "cluster": cluster_name,
                          "reason": "Service scaling down"})
 
-    # Recount actual running tasks
-    running = sum(
-        1 for t in _tasks.values()
-        if t.get("group") == f"service:{svc_name}"
-        and t.get("clusterArn") == cluster_arn
-        and t.get("lastStatus") == "RUNNING"
-    )
-    svc["runningCount"] = running
-    if svc["deployments"]:
-        svc["deployments"][0]["runningCount"] = running
+    _refresh_service_state(cluster_name, f"service:{svc_name}")
     _recount_cluster(cluster_name)
-
-    # Membership of the service's target groups follows its running tasks.
-    _sync_service_targets(cluster_name, svc)
 
 
 def _create_service(data):
@@ -986,7 +1003,7 @@ def _delete_service(data):
         a for a, t in _tasks.items()
         if t.get("group") == f"service:{svc_name}"
         and t.get("clusterArn") == cluster_arn
-        and t.get("lastStatus") == "RUNNING"
+        and t.get("lastStatus") in ("PENDING", "RUNNING")
     ]:
         _stop_task({"task": task_arn, "cluster": cluster_name, "reason": "Service deleted"})
 
@@ -1360,7 +1377,291 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
+def _task_is_active(task_arn, task):
+    return (
+        _tasks.get(task_arn) is task
+        and not task.get("_ecs_resetting")
+        and task.get("lastStatus") != "STOPPED"
+        and task.get("desiredStatus") != "STOPPED"
+    )
+
+
+def _remove_docker_container(docker_client, container_or_id):
+    if not docker_client or container_or_id is None:
+        return
+    container = container_or_id
+    if isinstance(container_or_id, str):
+        try:
+            container = docker_client.containers.get(container_or_id)
+        except Exception:
+            return
+    try:
+        container.stop(timeout=5)
+    except Exception:
+        pass
+    try:
+        container.remove(v=True)
+    except Exception:
+        try:
+            container.remove(v=True, force=True)
+        except Exception:
+            pass
+
+
+def _cleanup_task_resources(task, docker_client, extra_container=None):
+    task_arn = task.get("taskArn", "")
+    with resource_lock("ecs-task", task_arn):
+        docker_ids = list(task.get("_docker_ids") or [])
+        metadata_tokens = list(task.get("_metadata_tokens") or [])
+        task["_docker_ids"] = []
+        task["_metadata_tokens"] = []
+
+    for token in metadata_tokens:
+        ecs_metadata.unregister_token(token)
+
+    seen = set()
+    if extra_container is not None:
+        extra_id = getattr(extra_container, "id", None)
+        if extra_id:
+            seen.add(extra_id)
+        _remove_docker_container(docker_client, extra_container)
+    for docker_id in docker_ids:
+        if docker_id not in seen:
+            _remove_docker_container(docker_client, docker_id)
+
+
+def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        now = _iso()
+        task["lastStatus"] = "STOPPED"
+        task["desiredStatus"] = "STOPPED"
+        task["stoppingAt"] = task.get("stoppingAt") or now
+        task["stoppedAt"] = now
+        task["stoppedReason"] = reason
+        task["stopCode"] = stop_code
+        for container in task.get("containers", []):
+            container["lastStatus"] = "STOPPED"
+            if exit_code is not None:
+                container["exitCode"] = exit_code
+
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name:
+        _recount_cluster(cluster_name)
+        _refresh_service_state(cluster_name, task.get("group", ""))
+    return True
+
+
+def _mark_task_running(task_arn, task):
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        now = _iso()
+        task["lastStatus"] = "RUNNING"
+        task["pullStoppedAt"] = task.get("pullStoppedAt") or now
+        task["startedAt"] = task.get("startedAt") or now
+
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name:
+        _recount_cluster(cluster_name)
+        _refresh_service_state(cluster_name, task.get("group", ""))
+    return True
+
+
+def _attach_started_container(task, container, index, metadata_token, ecs_network):
+    task_arn = task["taskArn"]
+    container_id = container.id
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        task.setdefault("_docker_ids", []).append(container_id)
+        if index < len(task.get("containers", [])):
+            task["containers"][index]["runtimeId"] = container_id[:12]
+            task["containers"][index]["lastStatus"] = "RUNNING"
+
+    ecs_metadata.set_docker_id(metadata_token, container_id)
+    _record_task_ip(task, container, ecs_network)
+    logger.info("ECS: started container %s for task %s", container_id, task_arn[:8])
+    return True
+
+
+def _run_docker_container(docker_client, cdef, run_kwargs):
+    container = None
+    try:
+        try:
+            container = docker_client.containers.run(cdef["image"], **run_kwargs)
+        except Exception as exc:
+            # Best-effort platform pin: a host that cannot run the declared
+            # runtimePlatform can still use the host architecture, as before.
+            pinned = run_kwargs.pop("platform", None)
+            if not pinned:
+                raise
+            logger.warning(
+                "ECS: task definition declares %s but this host cannot "
+                "run it (%s); running %s on the host architecture "
+                "instead. Install a binfmt/qemu handler for real "
+                "cross-architecture execution.",
+                pinned, exc, cdef.get("image"))
+            container = docker_client.containers.run(cdef["image"], **run_kwargs)
+
+        pinned = run_kwargs.get("platform")
+        if pinned:
+            # Without emulation, Docker can create the container successfully
+            # and then fail on its first instruction. Only that failure gets
+            # the architecture fallback; other exits belong to the task.
+            time.sleep(0.25)
+            exec_dead = False
+            try:
+                container.reload()
+                exec_dead = (container.status == "exited"
+                             and b"exec format error"
+                             in (container.logs(tail=5) or b""))
+            except Exception:
+                exec_dead = False
+            if exec_dead:
+                logger.warning(
+                    "ECS: task definition declares %s but this host cannot "
+                    "execute it; running %s on the host architecture "
+                    "instead. Install a binfmt/qemu handler for real "
+                    "cross-architecture execution.",
+                    pinned, cdef.get("image"))
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    _remove_docker_container(docker_client, container)
+                run_kwargs.pop("platform", None)
+                container = docker_client.containers.run(
+                    cdef["image"], **run_kwargs)
+        return container
+    except Exception:
+        if container is not None:
+            _remove_docker_container(docker_client, container)
+        raise
+
+
+def _fail_task_start(task, docker_client, reason):
+    try:
+        _mark_task_stopped(task["taskArn"], task, reason, "TaskFailedToStart")
+    finally:
+        _cleanup_task_resources(task, docker_client)
+
+
+def _start_task_worker(task, td, container_overrides, docker_client):
+    task_arn = task["taskArn"]
+    task_id = task_arn.rsplit("/", 1)[-1]
+    cluster_arn = task["clusterArn"]
+    launch_type = task.get("launchType", "EC2")
+
+    with resource_lock("ecs-task", task_arn):
+        active = _task_is_active(task_arn, task)
+        if active:
+            task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
+    if not active:
+        return
+
+    ecs_network = None
+    ministack_net_ip = None
+    try:
+        self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+        nets = self_container.attrs["NetworkSettings"]["Networks"]
+        if nets:
+            ecs_network = next(iter(nets))
+            ministack_net_ip = nets[ecs_network].get("IPAddress") or None
+            logger.debug(
+                "ECS: detected Ministack network=%s ip=%s",
+                ecs_network, ministack_net_ip,
+            )
+    except Exception:
+        logger.debug("ECS: could not detect Ministack network, using default")
+
+    for i, cdef in enumerate(td.get("containerDefinitions", [])):
+        with resource_lock("ecs-task", task_arn):
+            active = _task_is_active(task_arn, task)
+        if not active:
+            _cleanup_task_resources(task, docker_client)
+            return
+
+        container_override = _container_override_for(
+            container_overrides, cdef["name"]
+        )
+        env_override = {
+            e["name"]: e["value"]
+            for e in container_override.get("environment", [])
+        }
+        env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
+        env.update(_resolve_container_secrets(cdef))
+        env.update(env_override)
+
+        effective_cdef = dict(cdef)
+        if "command" in container_override:
+            effective_cdef["command"] = container_override["command"]
+
+        port_bindings = {}
+        if td.get("networkMode") != "awsvpc":
+            for pm in cdef.get("portMappings", []):
+                host_port = pm.get("hostPort", pm.get("containerPort"))
+                port_bindings[f"{pm['containerPort']}/tcp"] = host_port
+
+        host_mode = td.get("networkMode") == "host"
+        metadata_token = _register_metadata(
+            task_arn, cluster_arn, td, cdef, launch_type, env,
+            host_mode, ministack_net_ip,
+        )
+        with resource_lock("ecs-task", task_arn):
+            active = _task_is_active(task_arn, task)
+            if active:
+                task.setdefault("_metadata_tokens", []).append(metadata_token)
+        if not active:
+            ecs_metadata.unregister_token(metadata_token)
+            _cleanup_task_resources(task, docker_client)
+            return
+
+        run_kwargs = _build_run_kwargs(
+            effective_cdef, td, env, port_bindings, ecs_network,
+            host_mode, task_id, task_arn, ministack_net_ip, cluster_arn,
+        )
+
+        with resource_lock("ecs-task", task_arn):
+            active = _task_is_active(task_arn, task)
+        if not active:
+            _cleanup_task_resources(task, docker_client)
+            return
+
+        container = _run_docker_container(docker_client, effective_cdef, run_kwargs)
+
+        if not _attach_started_container(
+                task, container, i, metadata_token, ecs_network):
+            _cleanup_task_resources(task, docker_client, container)
+            return
+
+    if not _mark_task_running(task_arn, task):
+        _cleanup_task_resources(task, docker_client)
+
+
+def _run_task_worker(task, td, container_overrides, docker_client, account_id, region):
+    with request_scope(account_id, region):
+        try:
+            _start_task_worker(task, td, container_overrides, docker_client)
+        except _SecretResolutionError as exc:
+            _fail_task_start(
+                task, docker_client,
+                "ResourceInitializationError: unable to pull secrets or "
+                "registry auth: execution resource retrieval failed: "
+                + str(exc),
+            )
+        except Exception as exc:
+            logger.warning("ECS: Docker start failed for %s: %s", task["taskArn"], exc)
+            _fail_task_start(
+                task, docker_client,
+                "ResourceInitializationError: unable to pull image or start "
+                "container: " + str(exc),
+            )
+
+
 def _run_task(data):
+    account_id = get_account_id()
+    region = get_region()
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
     if cluster_name is None:
         return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
@@ -1375,33 +1676,49 @@ def _run_task(data):
             f"Unable to find task definition: {td_ref}", 400)
 
     count = data.get("count", 1)
-    container_overrides = data.get("overrides", {}).get("containerOverrides", [])
+    overrides = data.get(
+        "overrides", {"containerOverrides": [], "inferenceAcceleratorOverrides": []}
+    )
+    container_overrides = copy.deepcopy(overrides.get("containerOverrides", []))
     launch_type = data.get("launchType", "EC2")
     group = data.get("group", "")
     started_by = data.get("startedBy", "")
     enable_exec = data.get("enableExecuteCommand", False)
-    network_cfg = data.get("networkConfiguration", {})
     req_tags = data.get("tags", [])
+    docker_client = _get_docker()
+    docker_backed = bool(docker_client)
+    initial_status = "PENDING" if docker_backed else "RUNNING"
 
     tasks = []
     failures = []
+    worker_args = []
+    task_definition = copy.deepcopy(td) if docker_backed else td
+    if docker_backed:
+        _ensure_ecs_reaper_thread()
 
     for _ in range(count):
         task_id = new_uuid()
-        task_arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task/{cluster_name}/{task_id}"
+        task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{task_id}"
         now = _iso()
 
         containers = _build_task_containers(td, container_overrides)
-        for c in containers:
-            c["taskArn"] = task_arn
+        if docker_backed:
+            for container in containers:
+                container["lastStatus"] = "PENDING"
+                container["runtimeId"] = None
+        for container in containers:
+            container["taskArn"] = task_arn
 
         task = {
             "taskArn": task_arn,
             "clusterArn": _clusters[cluster_name]["clusterArn"],
             "taskDefinitionArn": td["taskDefinitionArn"],
-            "containerInstanceArn": f"arn:aws:ecs:{get_region()}:{get_account_id()}:container-instance/{cluster_name}/{new_uuid()}",
-            "overrides": data.get("overrides", {"containerOverrides": [], "inferenceAcceleratorOverrides": []}),
-            "lastStatus": "RUNNING",
+            "containerInstanceArn": (
+                f"arn:aws:ecs:{region}:{account_id}:container-instance/"
+                f"{cluster_name}/{new_uuid()}"
+            ),
+            "overrides": overrides,
+            "lastStatus": initial_status,
             "desiredStatus": "RUNNING",
             "launchType": launch_type,
             "cpu": td.get("cpu", "256"),
@@ -1410,10 +1727,10 @@ def _run_task(data):
             "platformFamily": "",
             "connectivity": "CONNECTED",
             "connectivityAt": now,
-            "pullStartedAt": now,
-            "pullStoppedAt": now,
+            "pullStartedAt": now if not docker_backed else None,
+            "pullStoppedAt": now if not docker_backed else None,
             "createdAt": now,
-            "startedAt": now,
+            "startedAt": now if not docker_backed else None,
             "stoppingAt": None,
             "stoppedAt": None,
             "stoppedReason": "",
@@ -1423,7 +1740,7 @@ def _run_task(data):
             "version": 1,
             "containers": containers,
             "attachments": [],
-            "availabilityZone": f"{get_region()}a",
+            "availabilityZone": f"{region}a",
             "enableExecuteCommand": enable_exec,
             "tags": req_tags,
             "healthStatus": "UNKNOWN",
@@ -1431,152 +1748,33 @@ def _run_task(data):
             "_docker_ids": [],
         }
 
-        docker_client = _get_docker()
-        if docker_client and td:
-            _ensure_ecs_reaper_thread()
-            # Detect the Docker network Ministack is running on,
-            # so ECS containers can reach sibling services (S3, etc.)
-            ecs_network = None
-            ministack_net_ip = None
-            try:
-                self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
-                nets = self_container.attrs["NetworkSettings"]["Networks"]
-                if nets:
-                    ecs_network = next(iter(nets))
-                    # IP that ECS containers should use to reach Ministack.
-                    # Using ministack's own address on the shared network is
-                    # the only thing that works reliably on Linux Docker —
-                    # `host-gateway` magic resolves to 172.17.0.1 (docker0),
-                    # which iptables typically blocks from a sibling bridge.
-                    ministack_net_ip = nets[ecs_network].get("IPAddress") or None
-                    logger.debug(
-                        "ECS: detected Ministack network=%s ip=%s",
-                        ecs_network, ministack_net_ip,
-                    )
-            except Exception:
-                logger.debug("ECS: could not detect Ministack network, using default")
-
-            for i, cdef in enumerate(td.get("containerDefinitions", [])):
-                container_override = _container_override_for(
-                    container_overrides, cdef["name"]
-                )
-                env_override = {}
-                for e in container_override.get("environment", []):
-                    env_override[e["name"]] = e["value"]
-
-                env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
-                try:
-                    env.update(_resolve_container_secrets(cdef))
-                except _SecretResolutionError as exc:
-                    # AWS fails the whole task to start (ResourceInitializationError)
-                    # when a secret can't be retrieved — don't launch any container.
-                    now = _iso()
-                    task["lastStatus"] = "STOPPED"
-                    task["desiredStatus"] = "STOPPED"
-                    task["stoppingAt"] = now
-                    task["stoppedAt"] = now
-                    task["stopCode"] = "TaskFailedToStart"
-                    task["stoppedReason"] = (
-                        "ResourceInitializationError: unable to pull secrets or "
-                        "registry auth: execution resource retrieval failed: "
-                        + str(exc))
-                    for c in task.get("containers", []):
-                        c["lastStatus"] = "STOPPED"
-                    break
-                env.update(env_override)
-                effective_cdef = dict(cdef)
-                if "command" in container_override:
-                    effective_cdef["command"] = container_override["command"]
-
-                # awsvpc tasks get their own network namespace — an ENI in AWS — so
-                # container ports are never published on the host. Publishing them
-                # makes two tasks that share a container port collide on the host,
-                # which cannot happen on Fargate. Only bridge/host mode publishes.
-                port_bindings = {}
-                if td.get("networkMode") != "awsvpc":
-                    for pm in cdef.get("portMappings", []):
-                        host_port = pm.get("hostPort", pm.get("containerPort"))
-                        port_bindings[f"{pm['containerPort']}/tcp"] = host_port
-
-                host_mode = td.get("networkMode") == "host"
-                metadata_token = _register_metadata(
-                    task_arn, _clusters[cluster_name]["clusterArn"],
-                    td, cdef, launch_type, env, host_mode, ministack_net_ip,
-                )
-                run_kwargs = _build_run_kwargs(
-                    effective_cdef, td, env, port_bindings, ecs_network,
-                    host_mode, task_id, task_arn, ministack_net_ip,
-                    _clusters[cluster_name]["clusterArn"],
-                )
-
-                try:
-                    try:
-                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
-                    except Exception as exc:
-                        # Best-effort platform pin: a host that cannot run the
-                        # declared runtimePlatform (no emulation handler, or a
-                        # cached image of the other architecture) logs the
-                        # mismatch and runs on its own architecture, as every
-                        # setup did before the pin existed.
-                        pinned = run_kwargs.pop("platform", None)
-                        if not pinned:
-                            raise
-                        logger.warning(
-                            "ECS: task definition declares %s but this host cannot "
-                            "run it (%s); running %s on the host architecture "
-                            "instead. Install a binfmt/qemu handler for real "
-                            "cross-architecture execution.",
-                            pinned, exc, cdef.get("image"))
-                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
-                    pinned = run_kwargs.get("platform")
-                    if pinned:
-                        # No emulation handler makes the container start cleanly
-                        # and die on its first instruction — docker raises
-                        # nothing. Only an exec-format death triggers the
-                        # fallback: an instant exit for any other reason is the
-                        # task's own business.
-                        time.sleep(0.25)
-                        exec_dead = False
-                        try:
-                            container.reload()
-                            exec_dead = (container.status == "exited"
-                                         and b"exec format error"
-                                         in (container.logs(tail=5) or b""))
-                        except Exception:
-                            # The death-check is best-effort; if it cannot even
-                            # be performed, keep the container that started.
-                            exec_dead = False
-                        if exec_dead:
-                            logger.warning(
-                                "ECS: task definition declares %s but this host "
-                                "cannot execute it; running %s on the host "
-                                "architecture instead. Install a binfmt/qemu "
-                                "handler for real cross-architecture execution.",
-                                pinned, cdef.get("image"))
-                            try:
-                                container.remove(force=True)
-                            except Exception:
-                                pass
-                            run_kwargs.pop("platform", None)
-                            container = docker_client.containers.run(
-                                cdef["image"], **run_kwargs)
-                    task["_docker_ids"].append(container.id)
-                    ecs_metadata.set_docker_id(metadata_token, container.id)
-                    task.setdefault("_metadata_tokens", []).append(metadata_token)
-                    if i < len(task["containers"]):
-                        task["containers"][i]["runtimeId"] = container.id[:12]
-                    _record_task_ip(task, container, ecs_network)
-                    logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
-                except Exception as e:
-                    ecs_metadata.unregister_token(metadata_token)
-                    logger.warning("ECS: Docker run failed for %s: %s", cdef.get('image'), e)
-
         _tasks[task_arn] = task
         if req_tags:
             _tags[task_arn] = list(req_tags)
         tasks.append(_sanitize(task))
+        if docker_backed:
+            worker_args.append((task, task_definition, container_overrides))
 
     _recount_cluster(cluster_name)
+    for task, task_definition, overrides in worker_args:
+        worker = threading.Thread(
+            target=_run_task_worker,
+            args=(
+                task, task_definition, overrides, docker_client,
+                account_id, region,
+            ),
+            daemon=True,
+            name=f"ministack-ecs-task-{task['taskArn'].rsplit('/', 1)[-1][:8]}",
+        )
+        try:
+            worker.start()
+        except RuntimeError as exc:
+            with request_scope(account_id, region):
+                _fail_task_start(
+                    task, docker_client,
+                    "ResourceInitializationError: unable to start task worker: "
+                    + str(exc),
+                )
     return json_response({"tasks": tasks, "failures": failures})
 
 
@@ -1596,32 +1794,10 @@ def _stop_task(data):
         return json_response({"task": _sanitize(task)})
 
     docker_client = _get_docker()
-    if docker_client:
-        for docker_id in task.get("_docker_ids", []):
-            try:
-                c = docker_client.containers.get(docker_id)
-                c.stop(timeout=5)
-                c.remove(v=True)
-            except Exception as e:
-                logger.warning("ECS: failed to stop container %s: %s", docker_id, e)
-
-    for tok in task.get("_metadata_tokens", []):
-        ecs_metadata.unregister_token(tok)
-
-    now = _iso()
-    task["lastStatus"] = "STOPPED"
-    task["desiredStatus"] = "STOPPED"
-    task["stoppingAt"] = now
-    task["stoppedAt"] = now
-    task["stoppedReason"] = reason
-    task["stopCode"] = "UserInitiated"
-    for c in task.get("containers", []):
-        c["lastStatus"] = "STOPPED"
-        c["exitCode"] = 0
-
-    cname = _cluster_name_from_arn(task.get("clusterArn", ""))
-    if cname:
-        _recount_cluster(cname)
+    _mark_task_stopped(
+        task["taskArn"], task, reason, "UserInitiated", exit_code=0
+    )
+    _cleanup_task_resources(task, docker_client)
 
     return json_response({"task": _sanitize(task)})
 
@@ -1638,7 +1814,8 @@ def _describe_tasks(data):
         task = _resolve_task(ref, cluster_name)
         if task:
             _maybe_mark_stopped(task)
-            t = _sanitize(task)
+            with resource_lock("ecs-task", task.get("taskArn", "")):
+                t = _sanitize(task)
             if "TAGS" in include:
                 t["tags"] = _tags.get(task["taskArn"], [])
             result.append(t)
@@ -1651,8 +1828,13 @@ def _describe_tasks(data):
 
 def _maybe_mark_stopped(task):
     """Check Docker containers and transition task to STOPPED if all have exited."""
-    if task.get("lastStatus") != "RUNNING" or not task.get("_docker_ids"):
-        return
+    task_arn = task.get("taskArn", "")
+    with resource_lock("ecs-task", task_arn):
+        if (not _task_is_active(task_arn, task)
+                or task.get("lastStatus") != "RUNNING"
+                or not task.get("_docker_ids")):
+            return
+        docker_ids = list(task["_docker_ids"])
 
     docker_client = _get_docker()
     if not docker_client:
@@ -1660,7 +1842,7 @@ def _maybe_mark_stopped(task):
 
     all_stopped = True
     exit_code = 0
-    for docker_id in task["_docker_ids"]:
+    for docker_id in docker_ids:
         try:
             container = docker_client.containers.get(docker_id)
             # docker SDK caches status; refresh before checking lifecycle
@@ -1680,20 +1862,12 @@ def _maybe_mark_stopped(task):
     if not all_stopped:
         return
 
-    now = _iso()
-    task["lastStatus"] = "STOPPED"
-    task["desiredStatus"] = "STOPPED"
-    task["stoppingAt"] = task.get("stoppingAt") or now
-    task["stoppedAt"] = now
-    task["stoppedReason"] = "Essential container exited"
-    task["stopCode"] = "EssentialContainerExited"
-    for c in task.get("containers", []):
-        c["lastStatus"] = "STOPPED"
-        c["exitCode"] = exit_code
-
-    cname = _cluster_name_from_arn(task.get("clusterArn", ""))
-    if cname:
-        _recount_cluster(cname)
+    stopped = _mark_task_stopped(
+        task_arn, task, "Essential container exited",
+        "EssentialContainerExited", exit_code=exit_code,
+    )
+    if stopped:
+        _cleanup_task_resources(task, None)
 
 
 def _list_tasks(data):
@@ -2398,6 +2572,10 @@ _ACTION_MAP = {
 
 
 def reset():
+    for _key, task in _tasks.all_items():
+        with resource_lock("ecs-task", task.get("taskArn", "")):
+            task["_ecs_resetting"] = True
+
     docker_client = _get_docker()
     if docker_client:
         # Stop + remove every ministack=ecs container (running OR exited).
@@ -2423,3 +2601,4 @@ def reset():
     _account_settings.clear()
     _capacity_providers.clear()
     _attributes.clear()
+    ecs_metadata.reset()

@@ -6536,6 +6536,7 @@ def _get_credentials_for_identity(data):
 
     access_key = f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}"
     secret_key = base64.b64encode(secrets.token_bytes(30)).decode()
+    session_token = base64.b64encode(secrets.token_bytes(64)).decode()
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
 
     # The cognito* identity fields API Gateway reports for IAM-authorized
@@ -6568,7 +6569,10 @@ def _get_credentials_for_identity(data):
                 f"{role_name}/CognitoIdentityCredentials"),
         "UserId": f"{role_id}:CognitoIdentityCredentials",
         "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
         "Expiration": now + 3600,
+        "AccountId": get_account_id(),
+        "PrincipalType": "AssumedRole",
         "_identity_id": identity_id,
         "_identity_pool_id": (pool or {}).get("IdentityPoolId", ""),
         "_logins": logins,
@@ -6582,7 +6586,7 @@ def _get_credentials_for_identity(data):
         "Credentials": {
             "AccessKeyId": access_key,
             "SecretKey": secret_key,
-            "SessionToken": base64.b64encode(secrets.token_bytes(64)).decode(),
+            "SessionToken": session_token,
             "Expiration": now + 3600,
         },
     })

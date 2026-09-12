@@ -2011,6 +2011,31 @@ def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
         "Lambda was not invoked for boto3-shaped notification config"
 
 
+def test_s3_put_notification_no_test_event_to_lambda(s3, lam, logs):
+    """AWS delivers the s3:TestEvent only to SQS and SNS destinations. A Lambda
+    target must not be invoked at configuration time, otherwise every deploy
+    logs failures for handlers that assume the Records array is present.
+    """
+    fname = "s3-no-test-evt-lam"
+    bkt = "s3-no-test-evt-bkt"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_notification_configuration(
+        Bucket=bkt,
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [
+                {"LambdaFunctionArn": arn, "Events": ["s3:ObjectCreated:*"]},
+            ],
+        },
+    )
+    assert not _wait_lambda_invoked(logs, fname, "s3:TestEvent", timeout=3.0), \
+        "s3:TestEvent was delivered to the Lambda target; AWS sends it to SQS and SNS only"
+
+    s3.put_object(Bucket=bkt, Key="real.txt", Body=b"hi")
+    assert _wait_lambda_invoked(logs, fname, "real.txt"), \
+        "Lambda was not invoked for a real object event"
+
+
 def test_s3_event_notification_to_lambda_validates_bucket_region(s3, lam):
     fname = "s3-evt-lam-region"
     _create_event_lambda(lam, fname, marker="east")
@@ -3763,6 +3788,144 @@ def test_s3_presigned_url_signature_is_verified():
     u = good.generate_presigned_url(
         "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
     assert status(urllib.request.Request(u, method="GET")) == 200
+
+
+def test_s3_presigned_url_uses_iam_access_key_secret_and_status():
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    account_id = "123456789012"
+    user_name = f"presign-user-{uuid.uuid4().hex[:8]}"
+    bucket = f"presign-iam-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    tenant_iam = boto3.client(
+        "iam",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+    )
+    tenant_s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    tenant_iam.create_user(UserName=user_name)
+    access_key = tenant_iam.create_access_key(UserName=user_name)["AccessKey"]
+    tenant_s3.create_bucket(Bucket=bucket)
+    tenant_s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=access_key["AccessKeyId"],
+        aws_secret_access_key=access_key["SecretAccessKey"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+    )
+
+    try:
+        assert urllib.request.urlopen(url).status == 200
+        tenant_iam.update_access_key(
+            UserName=user_name,
+            AccessKeyId=access_key["AccessKeyId"],
+            Status="Inactive",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(url)
+        assert exc.value.code == 403
+        assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
+    finally:
+        tenant_iam.delete_access_key(
+            UserName=user_name,
+            AccessKeyId=access_key["AccessKeyId"],
+        )
+        tenant_iam.delete_user(UserName=user_name)
+
+
+def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts):
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    bucket = f"presign-sts-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+    credentials = sts.get_session_token(DurationSeconds=900)["Credentials"]
+    config = Config(signature_version="s3v4", s3={"addressing_style": "path"})
+
+    def presign(session_token=None):
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=session_token,
+            config=config,
+        )
+        return client.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+        )
+
+    assert urllib.request.urlopen(presign(credentials["SessionToken"])).status == 200
+    for bad_token in (None, "wrong-session-token"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(presign(bad_token))
+        assert exc.value.code == 403
+        assert b"<Code>InvalidToken</Code>" in exc.value.read()
+
+
+def test_s3_presigned_url_accepts_lenient_session_origin(s3):
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    bucket = f"presign-lenient-sts-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+    lenient_sts = boto3.client(
+        "sts",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="unknown-lenient-caller",
+        aws_secret_access_key="unknown-lenient-secret",
+    )
+    credentials = lenient_sts.get_session_token(DurationSeconds=900)["Credentials"]
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+    )
+
+    assert urllib.request.urlopen(url).status == 200
 
 
 def test_s3_presigned_url_virtual_hosted_style_is_verified():

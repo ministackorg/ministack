@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.5.9"
+version = "1.5.10"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -53,6 +53,21 @@ full = [
     "asyncssh>=2.14",
     "aws-sam-translator>=1.90",
 ]
+# Exactly what CI installs to run the test suite — kept separate from `dev`
+# (which also carries linters, type stubs and the DB drivers the container-backed
+# RDS tests skip without) so the workflow has one name to install instead of an
+# inline package list that drifts from this file.
+test = [
+    "boto3>=1.34",
+    "pytest>=8.0",
+    "pytest-xdist>=3.6",
+    "duckdb>=0.10.0",
+    "docker>=7.0.0",
+    "cbor2>=5.4.0",
+    "cryptography>=41.0",
+    "aws-sam-translator>=1.90",
+    "websockets>=12.0",
+]
 dev = [
     "boto3>=1.34",
     "pytest>=8.0",
@@ -99,7 +114,6 @@ select = ["E", "F", "I"]
 ignore = [
     "E501",   # line too long — XML templates and service tables make this impractical
     "E402",   # module import not at top — intentional lazy imports in service files
-    "F401",   # unused import — needs manual review; some are re-exports
     "F811",   # redefined while unused — needs manual review
     "F841",   # unused variable — needs manual review
     "E741",   # ambiguous variable name — too noisy for emulator code

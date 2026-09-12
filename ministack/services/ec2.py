@@ -134,6 +134,55 @@ _images = AccountRegionScopedDict()             # ami_id -> registered image rec
 _default_initialized_scopes = set()
 
 
+# ---------------------------------------------------------------------------
+# Availability Zones
+# ---------------------------------------------------------------------------
+
+_AZ_ID_DIRECTIONS = {
+    "north": "n", "south": "s", "east": "e", "west": "w", "central": "c",
+    "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
+}
+
+
+def _az_id_prefix(region):
+    """Region -> the AZ-id prefix AWS codes it with: eu-central-1 -> euc1, ap-southeast-2 -> apse2."""
+
+    parts = region.split("-")
+    if len(parts) < 3:
+        return region.replace("-", "")
+    geo, middles, index = parts[0], parts[1:-1], parts[-1]
+    coded = "".join(_AZ_ID_DIRECTIONS.get(part, part[:1]) for part in middles)
+    return f"{geo}{coded}{index}"
+
+
+def _az_id_for_zone_name(zone_name):
+    """Zone name -> its AZ id, e.g. eu-west-3a -> euw3-az1 (matches DescribeAvailabilityZones)."""
+
+    region, letter = zone_name[:-1], zone_name[-1]
+    n = ord(letter.lower()) - ord("a") + 1
+    return f"{_az_id_prefix(region)}-az{n}"
+
+
+def _zone_name_for_az_id(az_id):
+    """AZ id -> the zone name it belongs to in this region, or None.
+
+    The inverse of ``_az_id_for_zone_name`` over the zones this region
+    fabricates. CreateSubnet takes ``AvailabilityZoneId`` on its own, and on
+    AWS the two members are one mapping, not two independent inputs: the
+    CreateSubnet reference's own examples always answer a consistent pair
+    (``us-east-2a``/``use2-az1``, ``us-west-2-lax-1a``/``usw2-lax1-az1``).
+    Resolving the name from the id is what keeps the stored subnet a record
+    AWS could actually produce.
+    """
+    if not az_id:
+        return None
+    region = get_region()
+    for letter in "abc":
+        name = f"{region}{letter}"
+        if _az_id_for_zone_name(name) == az_id:
+            return name
+    return None
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -296,6 +345,7 @@ def restore_state(data):
     _restore_regional_store(_placement_groups, data.get("placement_groups", {}))
     _restore_regional_store(_vpcs, data.get("vpcs", {}))
     _restore_regional_store(_subnets, data.get("subnets", {}))
+    _backfill_subnet_availability_zone_ids()
     _restore_regional_store(_internet_gateways, data.get("internet_gateways", {}))
     _restore_regional_store(_addresses, data.get("addresses", {}))
     _restore_regional_store(_tags, data.get("tags", {}))
@@ -356,6 +406,13 @@ def _restore_regional_store(store, restored):
         store.set_scoped(get_account_id(), region, key, value)
 
 
+def _backfill_subnet_availability_zone_ids():
+    """State saved before AvailabilityZoneId existed on subnets has none: backfill
+    it so DescribeSubnets doesn't KeyError on a restored pre-upgrade snapshot."""
+    for subnet in _subnets.all_values():
+        subnet.setdefault("AvailabilityZoneId", _az_id_for_zone_name(subnet["AvailabilityZone"]))
+
+
 try:
     _restored = load_state("ec2")
     if _restored:
@@ -409,6 +466,7 @@ def _init_defaults():
                 "VpcId": _DEFAULT_VPC_ID,
                 "CidrBlock": cidr,
                 "AvailabilityZone": az,
+                "AvailabilityZoneId": _az_id_for_zone_name(az),
                 "AvailableIpAddressCount": 4091,
                 "State": "available",
                 "DefaultForAz": True,
@@ -2855,9 +2913,11 @@ def _create_default_vpc(p):
         ("172.31.0.0/20", "a"), ("172.31.16.0/20", "b"), ("172.31.32.0/20", "c"),
     ]):
         subnet_id = _new_subnet_id()
+        az = f"{get_region()}{az_suffix}"
         _subnets[subnet_id] = {
             "SubnetId": subnet_id, "VpcId": vpc_id, "CidrBlock": sub_cidr,
-            "AvailabilityZone": f"{get_region()}{az_suffix}",
+            "AvailabilityZone": az,
+            "AvailabilityZoneId": _az_id_for_zone_name(az),
             "AvailableIpAddressCount": 4091, "State": "available",
             "DefaultForAz": True, "MapPublicIpOnLaunch": True,
             "OwnerId": get_account_id(),
@@ -2912,13 +2972,23 @@ def _matches_subnet_filters(subnet, filters):
 def _create_subnet(p):
     vpc_id = _p(p, "VpcId") or _DEFAULT_VPC_ID
     cidr = _p(p, "CidrBlock") or "10.0.1.0/24"
-    az = _p(p, "AvailabilityZone") or f"{get_region()}a"
+    # AvailabilityZone and AvailabilityZoneId are one mapping on AWS, never two
+    # independent inputs: every CreateSubnet response pairs a zone name with
+    # that zone's own id. Honouring a supplied id alongside a conflicting name
+    # stored a pair (us-east-1a / use1-az2) that no real account can return, so
+    # the id resolves the name when it is the only one given, and the name wins
+    # the derivation whenever it is present.
+    requested_az = _p(p, "AvailabilityZone")
+    requested_az_id = _p(p, "AvailabilityZoneId")
+    az = requested_az or _zone_name_for_az_id(requested_az_id) or f"{get_region()}a"
+    az_id = _az_id_for_zone_name(az)
     subnet_id = _new_subnet_id()
     _subnets[subnet_id] = {
         "SubnetId": subnet_id,
         "VpcId": vpc_id,
         "CidrBlock": cidr,
         "AvailabilityZone": az,
+        "AvailabilityZoneId": az_id,
         "AvailableIpAddressCount": 251,
         "State": "available",
         "DefaultForAz": False,
@@ -3418,35 +3488,13 @@ def _describe_vpc_endpoint_services(p):
     """)
 
 
-# ---------------------------------------------------------------------------
-# Availability Zones
-# ---------------------------------------------------------------------------
-
-_AZ_ID_DIRECTIONS = {
-    "north": "n", "south": "s", "east": "e", "west": "w", "central": "c",
-    "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
-}
-
-
-def _az_id_prefix(region):
-    """Region -> the AZ-id prefix AWS codes it with: eu-central-1 -> euc1, ap-southeast-2 -> apse2."""
-
-    parts = region.split("-")
-    if len(parts) < 3:
-        return region.replace("-", "")
-    geo, middles, index = parts[0], parts[1:-1], parts[-1]
-    coded = "".join(_AZ_ID_DIRECTIONS.get(part, part[:1]) for part in middles)
-    return f"{geo}{coded}{index}"
-
-
 def _describe_availability_zones(p):
     """AZ ids are deliberately unlike the zone names: AWS shuffles names per account, so AZa is different,
     while az1 is the same across accounts. The shuffle on AWS is per-account stable."""
 
     region = get_region()
-    prefix = _az_id_prefix(region)
     # 3 AZs with a=1, b=2, c=3 for ministack
-    zones = [(f"{region}{letter}", f"{prefix}-az{n}") for n, letter in enumerate("abc", start=1)]
+    zones = [(f"{region}{letter}", _az_id_for_zone_name(f"{region}{letter}")) for letter in "abc"]
     # groupName / networkBorderGroup / optInStatus are optional members, so an
     # SDK silently returns a zone with those keys absent rather than erroring —
     # a consumer that reads them (Terraform's aws_availability_zones exposes
@@ -3462,6 +3510,7 @@ def _describe_availability_zones(p):
         <groupName>{group_name}</groupName>
         <networkBorderGroup>{region}</networkBorderGroup>
         <optInStatus>opt-in-not-required</optInStatus>
+        <zoneType>availability-zone</zoneType>
     </item>""" for name, zone_id in zones)
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
@@ -4257,6 +4306,7 @@ def _subnet_fields_xml(subnet, tag="item"):
         <cidrBlock>{subnet['CidrBlock']}</cidrBlock>
         <availableIpAddressCount>{subnet['AvailableIpAddressCount']}</availableIpAddressCount>
         <availabilityZone>{subnet['AvailabilityZone']}</availabilityZone>
+        <availabilityZoneId>{subnet['AvailabilityZoneId']}</availabilityZoneId>
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
@@ -6915,9 +6965,17 @@ def _create_fleet(p):
         for slot, launched in zip(slots, slot_buckets):
             if not launched:
                 continue
-            if instance_tags:
+            # The slot's launch template contributes its own instance tags; the
+            # request's TagSpecifications (instant fleets only, per the model)
+            # are layered on top. On a duplicate key the request wins — that
+            # precedence is MiniStack's choice, not a measured AWS behaviour.
+            merged = {t["Key"]: t["Value"] for t in slot.get("instance_tags") or []}
+            merged.update({t["Key"]: t["Value"] for t in instance_tags})
+            if merged:
                 for inst in launched:
-                    _tags[inst["InstanceId"]] = instance_tags[:]
+                    _tags[inst["InstanceId"]] = [
+                        {"Key": k, "Value": v} for k, v in merged.items()
+                    ]
             instance_items.append({
                 "InstanceIds": [inst["InstanceId"] for inst in launched],
                 "InstanceType": slot["instance_type"],
@@ -6978,6 +7036,19 @@ def _slot_from_lt_data(spec, lt_data):
         "user_data": (lt_data or {}).get("UserData") or "",
         "sg_ids": (lt_data or {}).get("SecurityGroupIds") or None,
         "iam_profile": iam_profile,
+        # RequestLaunchTemplateData.TagSpecifications is "the tags to apply to
+        # the resources that are created during instance launch", and
+        # CreateFleetRequest.TagSpecifications points at the launch template as
+        # THE way to tag instances of a maintain/request fleet. Only the
+        # `instance` specs belong on the instance; a `volume` spec is for the
+        # volume.
+        "instance_tags": [
+            dict(tag)
+            for spec in ((lt_data or {}).get("TagSpecifications") or [])
+            if spec.get("ResourceType") == "instance"
+            for tag in (spec.get("Tags") or [])
+            if tag.get("Key")
+        ],
     }
 
 

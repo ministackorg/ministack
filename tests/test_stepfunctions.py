@@ -3694,6 +3694,39 @@ def test_sfn_integration_ecs_run_task(sfn, ecs):
     output = json.loads(desc["output"])
     assert "tasks" in output
 
+
+def test_sfn_ecs_sync_poll_waits_for_stopped_and_preserves_result(monkeypatch):
+    """The sync integration must wait past PENDING/RUNNING states."""
+    from ministack.services import ecs as ecs_service
+    from ministack.services import stepfunctions as sfn_service
+
+    responses = [
+        {"tasks": [{"lastStatus": "PENDING"}], "failures": []},
+        {"tasks": [{"lastStatus": "RUNNING"}], "failures": []},
+        {
+            "tasks": [{
+                "lastStatus": "STOPPED",
+                "containers": [{"exitCode": 17}],
+            }],
+            "failures": [],
+        },
+    ]
+    seen = []
+
+    def describe(data):
+        seen.append(data)
+        return 200, {}, json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(ecs_service, "_describe_tasks", describe)
+    monkeypatch.setattr(sfn_service, "_scaled_sleep", lambda _seconds: None)
+
+    result = sfn_service._poll_ecs_tasks("cluster", ["task-arn"])
+
+    assert len(seen) == 3
+    assert result["tasks"][0]["lastStatus"] == "STOPPED"
+    assert result["tasks"][0]["containers"][0]["exitCode"] == 17
+
+
 def test_sfn_integration_ecs_run_task_sync_success(sfn, ecs):
     """ecs:runTask.sync waits for task STOPPED, then returns task result."""
     import threading
@@ -3773,7 +3806,11 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
         containerDefinitions=[
             {
                 "name": "app",
-                "image": "nginx:latest",
+                # alpine variant: this one really is launched (ecs:runTask),
+                # so the tag is a ~200MB pull rather than task-definition
+                # metadata. lastStatus RUNNING holds either way — both images
+                # are long-running servers.
+                "image": "nginx:alpine",
                 "memory": 256,
             }
         ],
@@ -3812,7 +3849,7 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert "taskArn" in task_out
     assert "containers" in task_out
     assert task_out["containers"][0]["name"] == "app"
-    assert task_out["lastStatus"] == "RUNNING"
+    assert task_out["lastStatus"] in ("PENDING", "RUNNING")
     assert "failures" in output
 
 def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):
@@ -8068,3 +8105,177 @@ def test_sfn_jsonata_tomillis_still_parses_iso(sfn):
         assert json.loads(desc["output"]) == {"v": 1577836800000}
     finally:
         sfn.delete_state_machine(stateMachineArn=sm)
+
+
+def test_sfn_choice_numeric_path_dynamic_batch_loop(sfn):
+    """A dynamic batch loop guarded by NumericGreaterThanEqualsPath must exit once
+    the cursor reaches the batch size. Before the *Path relational operators were
+    implemented the guard silently evaluated false, the cursor ran past the end of
+    the array and States.ArrayGetItem raised IndexError, failing the execution."""
+    import uuid as _uuid
+    definition = json.dumps(
+        {
+            "StartAt": "CheckIndex",
+            "States": {
+                "CheckIndex": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.index",
+                            "NumericGreaterThanEqualsPath": "$.count",
+                            "Next": "Done",
+                        }
+                    ],
+                    "Default": "Fetch",
+                },
+                "Fetch": {
+                    "Type": "Pass",
+                    "Parameters": {
+                        "items.$": "$.items",
+                        "count.$": "$.count",
+                        "index.$": "States.MathAdd($.index, 1)",
+                        "item.$": "States.ArrayGetItem($.items, $.index)",
+                    },
+                    "Next": "CheckIndex",
+                },
+                "Done": {
+                    "Type": "Pass",
+                    "Parameters": {"last.$": "$.item", "index.$": "$.index"},
+                    "End": True,
+                },
+            },
+        }
+    )
+    name = f"qa-sfn-numeric-path-loop-{_uuid.uuid4().hex[:8]}"
+    arn = sfn.create_state_machine(
+        name=name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    try:
+        items = ["alpha", "beta", "gamma"]
+        exec_arn = sfn.start_execution(
+            stateMachineArn=arn,
+            input=json.dumps({"items": items, "count": len(items), "index": 0}),
+        )["executionArn"]
+        desc = _wait_sfn(sfn, exec_arn)
+        assert desc["status"] == "SUCCEEDED", desc
+        output = json.loads(desc["output"])
+        assert output["last"] == "gamma"
+        assert output["index"] == 3
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+# ---------------------------------------------------------------------------
+# Numeric ``*Path`` Choice operators, exercised against the ASL rule evaluator
+# directly rather than through a running execution. The integration cover is
+# ``test_sfn_choice_numeric_path_dynamic_batch_loop`` above.
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_path_operators_relate_variable_to_resolved_path():
+    """NumericLessThanPath/GreaterThanPath/LessThanEqualsPath/GreaterThanEqualsPath
+    compare the Variable-resolved LHS against the path-resolved RHS."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    data = {"value": 5, "limit": 3, "floor": 5, "ceil": 10}
+    assert _evaluate_rule({"Variable": "$.value", "NumericLessThanPath": "$.ceil"}, data)
+    assert _evaluate_rule({"Variable": "$.value", "NumericGreaterThanPath": "$.limit"}, data)
+    assert _evaluate_rule({"Variable": "$.value", "NumericLessThanEqualsPath": "$.floor"}, data)
+    assert _evaluate_rule({"Variable": "$.value", "NumericGreaterThanEqualsPath": "$.floor"}, data)
+    # Inverse comparisons must not match.
+    assert not _evaluate_rule({"Variable": "$.value", "NumericLessThanPath": "$.limit"}, data)
+    assert not _evaluate_rule({"Variable": "$.value", "NumericGreaterThanPath": "$.ceil"}, data)
+    assert not _evaluate_rule({"Variable": "$.value", "NumericLessThanEqualsPath": "$.limit"}, data)
+    assert not _evaluate_rule({"Variable": "$.value", "NumericGreaterThanEqualsPath": "$.ceil"}, data)
+
+
+def test_numeric_path_operators_reject_bool_operand():
+    """Booleans are not numeric operands: ``_is_num`` excludes ``bool`` even though
+    ``bool`` is an ``int`` subclass in Python."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    data = {"flag": True, "limit": 0}
+    for op in (
+        "NumericEqualsPath",
+        "NumericLessThanPath",
+        "NumericGreaterThanPath",
+        "NumericLessThanEqualsPath",
+        "NumericGreaterThanEqualsPath",
+    ):
+        assert not _evaluate_rule({"Variable": "$.flag", op: "$.limit"}, data), op
+
+
+def test_numeric_path_operators_reject_non_numeric_operand():
+    """Strings and missing values are not numeric operands."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    data = {"text": "5", "limit": 3}
+    for op in (
+        "NumericLessThanPath",
+        "NumericGreaterThanPath",
+        "NumericLessThanEqualsPath",
+        "NumericGreaterThanEqualsPath",
+    ):
+        assert not _evaluate_rule({"Variable": "$.text", op: "$.limit"}, data), op
+        assert not _evaluate_rule({"Variable": "$.missing", op: "$.limit"}, data), op
+
+
+def test_numeric_path_operators_float_operands():
+    """Float LHS and RHS values compare correctly."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    data = {"value": 0.5, "limit": 0.25}
+    assert _evaluate_rule({"Variable": "$.value", "NumericGreaterThanPath": "$.limit"}, data)
+    assert _evaluate_rule({"Variable": "$.value", "NumericGreaterThanEqualsPath": "$.limit"}, data)
+    assert not _evaluate_rule({"Variable": "$.value", "NumericLessThanPath": "$.limit"}, data)
+
+
+def test_numeric_path_operators_reject_non_numeric_rhs():
+    """A non-numeric RHS (missing, string, null, or bool) must make the rule False:
+    no TypeError from comparing a number to a string and no bool coerced to int
+    (e.g. ``1 >= True`` must not match)."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    cases = [
+        ("missing", {}),
+        ("text", {"text": "3"}),
+        ("null", {"null": None}),
+        ("flag", {"flag": True}),
+    ]
+    for op in (
+        "NumericLessThanPath",
+        "NumericGreaterThanPath",
+        "NumericLessThanEqualsPath",
+        "NumericGreaterThanEqualsPath",
+    ):
+        for rhs_key, data in cases:
+            data = {**data, "value": 1}
+            # "1 >= True" is True under raw Python int coercion; the guarded
+            # comparison must return False instead.
+            assert not _evaluate_rule({"Variable": "$.value", op: f"$.{rhs_key}"}, data), (
+                op,
+                rhs_key,
+            )
+
+
+def test_numeric_path_operators_accept_int_float_rhs_mix():
+    """int LHS vs float RHS (and vice versa) still compares numerically."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    assert _evaluate_rule(
+        {"Variable": "$.value", "NumericLessThanPath": "$.limit"}, {"value": 1, "limit": 1.5}
+    )
+    assert _evaluate_rule(
+        {"Variable": "$.value", "NumericGreaterThanEqualsPath": "$.limit"}, {"value": 2.0, "limit": 2}
+    )
+
+
+def test_numeric_equals_path_still_works():
+    """Regression guard for the pre-existing NumericEqualsPath operator."""
+    from ministack.services.stepfunctions import _evaluate_rule
+
+    data = {"value": 7, "expected": 7}
+    assert _evaluate_rule({"Variable": "$.value", "NumericEqualsPath": "$.expected"}, data)
+    assert not _evaluate_rule({"Variable": "$.value", "NumericEqualsPath": "$.other"}, {"value": 7, "other": 8})

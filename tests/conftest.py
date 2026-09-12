@@ -193,6 +193,16 @@ _SERIAL_TESTS = {
     # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
     # serially; run it in the serial phase.
     "tests/test_ecs.py::test_ecs_service_spawns_tasks",
+    # Cluster task counts use the same Docker-backed service startup and can
+    # remain PENDING behind unrelated container churn. Run serially as well.
+    "tests/test_ecs.py::test_ecs_cluster_task_counts",
+    # SSM Run Command provisions real EC2-agent containers. Keeping these
+    # together avoids Docker API timeouts after the parallel container-heavy
+    # phase.
+    "tests/test_ssm.py::test_ssm_run_command_health_probe",
+    "tests/test_ssm.py::test_ssm_run_command_probe_can_fail",
+    "tests/test_ssm.py::test_ssm_send_command_accepts_a_managed_instance",
+    "tests/test_ssm.py::test_ssm_command_lookup_filters_and_errors",
     # WS/MQTT-broker tests (MQTT-over-WebSocket connect/publish/subscribe,
     # device shadows over MQTT, fleet-index connectivity). They drive the
     # single-event-loop broker over real WebSocket connections with tight
@@ -446,6 +456,11 @@ def ses():
 
 
 @pytest.fixture(scope="session")
+def signer():
+    return make_client("signer")
+
+
+@pytest.fixture(scope="session")
 def sfn():
     return make_client("stepfunctions")
 
@@ -561,6 +576,11 @@ def iot_data_client():
 @pytest.fixture(scope="session")
 def iot_jobs_data():
     return make_client("iot-jobs-data")
+
+
+@pytest.fixture(scope="session")
+def iotwireless():
+    return make_client("iotwireless")
 
 
 @pytest.fixture(scope="session")
@@ -736,6 +756,15 @@ def transcribe():
 @pytest.fixture(scope="session")
 def translate():
     return make_client("translate")
+
+
+@pytest.fixture(scope="session")
+def location():
+    # The location model puts `cp.tracking.` / `tracking.` host prefixes in
+    # front of the endpoint; against localhost those subdomains need not
+    # resolve, so disable injection (same as the logs fixture) — routing then
+    # rides on the `geo` credential scope.
+    return make_client("location", additional_config_kwargs={"inject_host_prefix": False})
 
 
 class FakeDockerContainer:
