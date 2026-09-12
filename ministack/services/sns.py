@@ -408,7 +408,7 @@ def _subscribe(params):
     }
 
     allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-                     "RawMessageDelivery", "RedrivePolicy"}
+                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
     i = 1
     while _p(params, f"Attributes.entry.{i}.key"):
         key = _p(params, f"Attributes.entry.{i}.key")
@@ -549,7 +549,7 @@ def _set_subscription_attributes(params):
     attr_val = _p(params, "AttributeValue")
 
     allowed = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-               "RawMessageDelivery", "RedrivePolicy"}
+               "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
     if attr_name not in allowed:
         return _error("InvalidParameterException",
                       f"Invalid attribute name: {attr_name}", 400)

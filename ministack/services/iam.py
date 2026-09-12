@@ -1279,6 +1279,13 @@ def _lookup_instance_profile(name="", arn=""):
     return None
 
 
+def instance_profile_arn(name, path="/"):
+    """The ARN CreateInstanceProfile mints. The path is part of it and
+    already carries its slashes ("/" for the default, "/team/" for a nested
+    one), so it needs no separator of its own."""
+    return f"arn:aws:iam::{get_account_id()}:instance-profile{path or '/'}{name}"
+
+
 def _create_instance_profile(p):
     name = _p(p, "InstanceProfileName")
     if name in _instance_profiles:
@@ -1286,9 +1293,7 @@ def _create_instance_profile(p):
                       f"Instance profile {name} already exists.", ns="iam")
     path = _p(p, "Path") or "/"
     ip_id = _gen_id("AIPA")
-    arn = (f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
-           if path != "/" else
-           f"arn:aws:iam::{get_account_id()}:instance-profile/{name}")
+    arn = instance_profile_arn(name, path)
     _instance_profiles[name] = {
         "InstanceProfileName": name,
         "InstanceProfileId": ip_id,
