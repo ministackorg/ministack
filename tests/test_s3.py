@@ -2011,6 +2011,31 @@ def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
         "Lambda was not invoked for boto3-shaped notification config"
 
 
+def test_s3_put_notification_no_test_event_to_lambda(s3, lam, logs):
+    """AWS delivers the s3:TestEvent only to SQS and SNS destinations. A Lambda
+    target must not be invoked at configuration time, otherwise every deploy
+    logs failures for handlers that assume the Records array is present.
+    """
+    fname = "s3-no-test-evt-lam"
+    bkt = "s3-no-test-evt-bkt"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_notification_configuration(
+        Bucket=bkt,
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [
+                {"LambdaFunctionArn": arn, "Events": ["s3:ObjectCreated:*"]},
+            ],
+        },
+    )
+    assert not _wait_lambda_invoked(logs, fname, "s3:TestEvent", timeout=3.0), \
+        "s3:TestEvent was delivered to the Lambda target; AWS sends it to SQS and SNS only"
+
+    s3.put_object(Bucket=bkt, Key="real.txt", Body=b"hi")
+    assert _wait_lambda_invoked(logs, fname, "real.txt"), \
+        "Lambda was not invoked for a real object event"
+
+
 def test_s3_event_notification_to_lambda_validates_bucket_region(s3, lam):
     fname = "s3-evt-lam-region"
     _create_event_lambda(lam, fname, marker="east")

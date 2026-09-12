@@ -2639,7 +2639,8 @@ def _put_bucket_notification(name: str, body: bytes):
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
-    # threads, which broke multi-tenant tests).
+    # threads, which broke multi-tenant tests). Queue and topic destinations only;
+    # AWS does not send the test event to Lambda targets.
     _fire_s3_test_event(name)
     return 200, {}, b""
 
@@ -3346,7 +3347,8 @@ def _fire_s3_event_async(
 
 
 def _fire_s3_test_event(bucket_name: str) -> None:
-    """Deliver an s3:TestEvent to every destination in the bucket notification config."""
+    """Deliver an s3:TestEvent to the SQS and SNS destinations in the bucket
+    notification config. AWS does not send it to Lambda targets."""
     try:
         configs = _parse_notification_config(bucket_name)
         if not configs:
@@ -3366,8 +3368,8 @@ def _fire_s3_test_event(bucket_name: str) -> None:
                     _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "sns":
                     _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
-                elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
+                # No lambda branch: AWS verifies Lambda destinations by checking the
+                # function's permissions, not by invoking them.
             except Exception:
                 logger.exception("S3 test-event delivery failed for config %s", cfg.get("id"))
     except Exception:

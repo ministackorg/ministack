@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — the `s3:TestEvent` no longer reaches Lambda targets** — `PutBucketNotificationConfiguration` fanned the test event out to every destination, Lambda included, but AWS sends it to SQS queues and SNS topics only; a Lambda destination is verified through its function permissions, not by invoking it. The payload carries no `Records` array, so each S3-triggered function raised on it, and because delivery goes through the async path the event was retried to `MaximumRetryAttempts` (default 2) and then routed to the function's DLQ or `OnFailure` destination, where a synthetic event AWS never sends looked like a genuinely dropped message. Any CDK stack with an S3-triggered Lambda hit this through `BucketNotificationsHandler`. Queue and topic destinations still receive the test event, and real object events still invoke the function. Contributed by @ppettitau.
 ### Changed
 - **Lambda — warm local custom runtimes** — `provided.*` bootstraps now reuse the existing subprocess worker pool instead of restarting on every invocation. Each invocation receives its request metadata through the Lambda Runtime API, concurrent calls use separate workers, and failed environments are cleaned up before reuse. Durable invocations retain their one-shot executor; Docker, image, and proxy execution are unchanged.
 
