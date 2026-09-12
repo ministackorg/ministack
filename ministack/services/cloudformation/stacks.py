@@ -21,6 +21,7 @@ from .engine import (
 )
 from .provisioners import (
     _RETAIN_REPLACED,
+    _RETAINING_POLICIES,
     _delete_resource,
     _provision_resource,
     _update_resource,
@@ -75,10 +76,6 @@ def _is_custom_resource(resource_type: str) -> bool:
 # ===========================================================================
 # Stack Events helper
 # ===========================================================================
-
-# The policies that keep a resource. Snapshot is not among them: the emulator
-# takes no snapshots, so a Snapshot resource is deleted like a Delete one.
-_RETAINING_POLICIES = ("Retain", "RetainExceptOnCreate")
 
 
 def _resource_policy(res_def, attribute, resources, params, conditions, mappings,

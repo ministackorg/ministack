@@ -674,6 +674,11 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
 # replaces the resource must then leave the predecessor in place; the engine
 # records the DELETE_SKIPPED event.
 _RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+# The DeletionPolicy / UpdateReplacePolicy values that keep a resource; the
+# engine reads the same tuple for the cleanup phase and the stack delete.
+# Snapshot is not among them: the emulator takes no snapshots, so a Snapshot
+# resource is deleted like a Delete one.
+_RETAINING_POLICIES = ("Retain", "RetainExceptOnCreate")
 
 
 def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_id,
@@ -700,6 +705,25 @@ def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_i
     if current_name is not None and replaced and not _RETAIN_REPLACED.get():
         delete_fn(physical_id, old_props)
     return created
+
+
+def _delete_predecessor(delete_fn, *args, **kwargs):
+    """Delete the resource a handler-side replacement has just superseded,
+    unless the template retains it (an UpdateReplacePolicy in the engine's
+    retaining set): the engine then records the DELETE_SKIPPED event and the
+    predecessor stays, as on AWS. Every update handler that creates the
+    replacement itself removes the old resource through this, so the policy
+    cannot be forgotten at one site, with three exceptions. Two have a
+    deterministic generated name (the DynamoDB table and the Location
+    tracker): the replacement takes the name back, so there is nothing left
+    to retain. The third is the Lambda permission's degenerate ``Id`` branch,
+    which removes and re-puts one statement under a Sid that cannot change:
+    the physical id is kept, nothing is replaced, and the policy does not
+    apply.
+    """
+    if _RETAIN_REPLACED.get():
+        return
+    delete_fn(*args, **kwargs)
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
@@ -995,7 +1019,7 @@ def _opensearch_domain_update(physical_id, old_props, new_props, stack_name,
             replacement_logical_id, new_props, stack_name
         )
         try:
-            _opensearch.delete_domain_record(physical_id, missing_ok=True)
+            _delete_predecessor(_opensearch.delete_domain_record, physical_id, missing_ok=True)
         except Exception:
             _opensearch.delete_domain_record(new_id, missing_ok=True)
             raise
@@ -1193,7 +1217,7 @@ def _s3_bucket_policy_update(physical_id, old_props, new_props, stack_name):
         # Bucket is create-only on AWS — the policy is replaced onto the new
         # bucket and removed from the old one.
         result = _s3_bucket_policy_create(physical_id, new_props, stack_name)
-        _s3_bucket_policy_delete(physical_id, old_props)
+        _delete_predecessor(_s3_bucket_policy_delete, physical_id, old_props)
         return result
     return _s3_bucket_policy_create(physical_id, new_props, stack_name)
 
@@ -1641,6 +1665,12 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
                 f"resource requires replacing. Rename {name} and update the "
                 "stack again."
             )
+        # Not routed through _delete_predecessor: the emulator's generated
+        # name is deterministic, so the table comes back under the same name
+        # and the old one is lost even under UpdateReplacePolicy Retain (AWS
+        # would mint a new name and keep the old table). AWS::Location::Tracker
+        # is the other type with that shape and is left alone for the same
+        # reason.
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
 
@@ -1992,7 +2022,7 @@ def _lambda_url_update(physical_id, old_props, new_props, stack_name):
         for key in ("TargetFunctionArn", "Qualifier")
     ):
         new_id, attrs = _lambda_url_create(physical_id, new_props, stack_name)
-        _lambda_url_delete(physical_id, old_props)
+        _delete_predecessor(_lambda_url_delete, physical_id, old_props)
         return new_id, attrs
 
     _func, func_name, qualifier = _lambda_url_target(new_props)
@@ -2411,7 +2441,7 @@ def _ssm_update(physical_id, old_props, new_props, stack_name):
             raise ValueError(f"AWS::SSM::Parameter replace failed: {body!r}")
         # Drop the old parameter through the SSM path so its history and tags go
         # with it (a bare store pop orphaned both).
-        _ssm._delete_parameter({"Name": physical_id})
+        _delete_predecessor(_ssm._delete_parameter, {"Name": physical_id})
         return new_name, _ssm_attrs(new_name, data)
     # Every other property is No interruption: overwrite in place through
     # PutParameter, so Version increments and history grows (a bare store write
@@ -3264,22 +3294,30 @@ def _lambda_permission_remove_statement(props, sids):
 def _lambda_permission_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Every AWS::Lambda::Permission property requires replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html),
-    so any change is RemovePermission followed by AddPermission under a fresh
-    physical id — and, as on AWS, a fresh generated Sid, so the engine's
-    predecessor cleanup (which deletes by the OLD resource's Sid) and the
-    rollback of a failed later resource (which deletes by the NEW one) each
-    touch only their own statement.
+    so any change is AddPermission under a fresh physical id followed by
+    RemovePermission of the old statement, the order CloudFormation replaces
+    in, unless the template retains the old one. The fresh generated Sid is
+    what keeps the engine's predecessor cleanup (which deletes by the OLD
+    resource's Sid) and the rollback of a failed later resource (which
+    deletes by the NEW one) on their own statements.
 
-    The one degenerate case is an explicit legacy ``Id`` that both templates
-    share: the Sid then cannot change, so the physical id is kept to suppress
-    the predecessor cleanup that would otherwise strip the statement this
-    update just installed.
+    The one degenerate case is an explicit legacy ``Id`` that names the Sid
+    the old resource wrote: the Sid then cannot change, AddPermission would
+    refuse the duplicate, so the statement is removed and re-put under it and
+    the physical id is kept (not a replacement). That is the FIRST candidate
+    only, the Sid the old resource actually used; the second is the
+    persisted-by-an-earlier-release fallback, and a new ``Id`` naming it is a
+    real Sid change and so a real replacement.
     """
-    _lambda_permission_remove_statement(
-        old_props, _lambda_permission_sids(old_props, logical_id, physical_id))
-    new_pid, attrs = _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
-    if old_props.get("Id") and old_props.get("Id") == new_props.get("Id"):
+    old_sids = _lambda_permission_sids(old_props, logical_id, physical_id)
+    if new_props.get("Id") and old_sids and new_props["Id"] == old_sids[0]:
+        # The Sid cannot change, so the statement is re-put under it and the
+        # physical id is kept: not a replacement.
+        _lambda_permission_remove_statement(old_props, old_sids)
+        _new_pid, attrs = _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
         return physical_id, attrs
+    new_pid, attrs = _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
+    _delete_predecessor(_lambda_permission_remove_statement, old_props, old_sids)
     return new_pid, attrs
 
 
@@ -3491,7 +3529,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
-    from ministack.services.cloudformation.stacks import _add_event
+    from ministack.services.cloudformation.stacks import _add_event, _resource_policy
 
     template_url = props.get("TemplateURL")
     if not template_url:
@@ -3622,10 +3660,20 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                     resource_type, prev.get("Properties", {}),
                     (previous_stack_snapshot or {}).get("Tags") or [],
                     child_name, child_stack_id, child_logical_id)
-                physical_id, attrs = _update_resource(
-                    resource_type, prev.get("PhysicalResourceId", child_logical_id),
-                    old_tagged, new_tagged, child_name, child_logical_id,
-                )
+                # The child's own UpdateReplacePolicy decides whether a
+                # handler-side replacement keeps the predecessor; without
+                # this the parent's policy leaked into the child's handlers.
+                token = _RETAIN_REPLACED.set(_resource_policy(
+                    res_def, "UpdateReplacePolicy", provisioned, param_values,
+                    conditions, mappings, child_name, child_stack_id,
+                ) in _RETAINING_POLICIES)
+                try:
+                    physical_id, attrs = _update_resource(
+                        resource_type, prev.get("PhysicalResourceId", child_logical_id),
+                        old_tagged, new_tagged, child_name, child_logical_id,
+                    )
+                finally:
+                    _RETAIN_REPLACED.reset(token)
             else:
                 physical_id, attrs = _provision_resource(
                     resource_type, child_logical_id, new_tagged, child_name,
@@ -3859,7 +3907,7 @@ def _apigw_rest_api_update(physical_id, old_props, new_props, stack_name, logica
     to the dependent resources as the same update reprocesses them)."""
     if new_props.get("Body") != old_props.get("Body"):
         created = _apigw_rest_api_create(logical_id or physical_id, new_props, stack_name)
-        _apigw_rest_api_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_rest_api_delete, physical_id, old_props)
         return created
 
     patch_ops = []
@@ -3926,7 +3974,7 @@ def _apigw_resource_update(physical_id, old_props, new_props, stack_name):
     # All three properties (RestApiId, ParentId, PathPart) are create-only on
     # AWS — any change is a replacement.
     created = _apigw_resource_create(physical_id, new_props, stack_name)
-    _apigw_resource_delete(physical_id, old_props)
+    _delete_predecessor(_apigw_resource_delete, physical_id, old_props)
     return created
 
 
@@ -4010,7 +4058,7 @@ def _apigw_method_update(physical_id, old_props, new_props, stack_name):
         for key in ("RestApiId", "ResourceId", "HttpMethod")
     ):
         created = _apigw_method_create(physical_id, new_props, stack_name)
-        _apigw_method_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_method_delete, physical_id, old_props)
         return created
     if old_props.get("Integration") and not new_props.get("Integration"):
         _apigw_v1._delete_integration(
@@ -4067,8 +4115,13 @@ def _apigw_model_update(physical_id, old_props, new_props, stack_name):
     # changes. The stack engine delegates that replacement lifecycle here.
     if (old_api_id != new_api_id or physical_id != new_name
             or old_content_type != new_content_type):
-        _apigw_v1._delete_model(old_api_id, physical_id)
-        return _apigw_model_create(physical_id, new_props, stack_name)
+        # The replacement is created first; the emulator's CreateModel path
+        # overwrites a model of the same name on the same API, so the
+        # predecessor is deleted only when its (api, name) key differs.
+        created = _apigw_model_create(physical_id, new_props, stack_name)
+        if (old_api_id, physical_id) != (new_api_id, created[0]):
+            _delete_predecessor(_apigw_v1._delete_model, old_api_id, physical_id)
+        return created
 
     patch_operations = []
     old_description = old_props.get("Description", "")
@@ -4274,7 +4327,7 @@ def _apigw_stage_update(physical_id, old_props, new_props, stack_name):
         for key in ("RestApiId", "StageName")
     ):
         created = _apigw_stage_create(physical_id, new_props, stack_name)
-        _apigw_stage_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_stage_delete, physical_id, old_props)
         return created
     api_id = new_props.get("RestApiId", "")
     stage_name = new_props.get("StageName", "")
@@ -4374,8 +4427,9 @@ def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
     # replaces the key. Everything else updates the existing record in place.
     if (old_props.get("Value") != new_props.get("Value")
             or old_props.get("Name") != new_props.get("Name")):
-        _apigw_v1._delete_api_key(physical_id)
-        return _apigw_api_key_create(physical_id, new_props, stack_name)
+        created = _apigw_api_key_create(physical_id, new_props, stack_name)
+        _delete_predecessor(_apigw_v1._delete_api_key, physical_id)
+        return created
     key = _apigw_v1._api_keys.get(physical_id)
     if key is None:
         return _apigw_api_key_create(physical_id, new_props, stack_name)
@@ -4493,7 +4547,7 @@ def _apigw_base_path_mapping_update(physical_id, old_props, new_props, stack_nam
     # same atomic create-before-delete behavior here.
     new_id, attrs = _apigw_base_path_mapping_create(physical_id, new_props, stack_name)
     if (new_domain, new_base_path) != (old_domain, old_base_path):
-        _apigw_v1._delete_base_path_mapping(old_domain, old_base_path)
+        _delete_predecessor(_apigw_v1._delete_base_path_mapping, old_domain, old_base_path)
     return new_id, attrs
 
 
@@ -4584,7 +4638,7 @@ def _apigw_domain_name_update(physical_id, old_props, new_props, stack_name):
     new_domain_name = new_props.get("DomainName", "")
     new_id, attrs = _apigw_domain_name_create(physical_id, new_props, stack_name)
     if new_domain_name != physical_id:
-        _apigw_domain_name_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_domain_name_delete, physical_id, old_props)
     elif existing_mappings is not None:
         # The native create helper initializes this collection. Preserve
         # dependent mappings while mutable domain properties update in place.
@@ -4626,7 +4680,7 @@ def _apigw_gateway_response_update(physical_id, old_props, new_props, stack_name
     # customization so a failed create cannot destroy the working resource.
     if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "ResponseType")):
         new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
-        _apigw_gateway_response_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_gateway_response_delete, physical_id, old_props)
         return new_id, attrs
 
     _new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
@@ -4679,7 +4733,7 @@ def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_na
     # specification; Properties is mutable in place.
     if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Location")):
         new_id, attrs = _apigw_documentation_part_create(physical_id, new_props, stack_name)
-        _apigw_documentation_part_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_documentation_part_delete, physical_id, old_props)
         return new_id, attrs
 
     if new_props.get("Properties") != old_props.get("Properties"):
@@ -4815,8 +4869,7 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
     for immutable in ("EventSourceArn", "StartingPosition", "StartingPositionTimestamp"):
         if new_props.get(immutable) != old_props.get(immutable):
             new_id, attrs = _lambda_esm_create(physical_id, new_props, stack_name)
-            _lambda_svc._esms.pop(physical_id, None)
-            _lambda_svc._release_esm_poll_state(physical_id)
+            _delete_predecessor(_lambda_esm_delete, physical_id, old_props)
             return new_id, attrs
     for key in (
         "BatchSize",
@@ -4885,7 +4938,10 @@ def _lambda_event_invoke_config_update(physical_id, old_props, new_props, stack_
         physical_id, new_props, stack_name
     )
     if replacement:
-        _lambda_event_invoke_config_delete(physical_id, old_props)
+        # FunctionName written in another form (name vs ARN) resolves to the
+        # same config; deleting the predecessor would delete the new one.
+        if new_id != physical_id:
+            _delete_predecessor(_lambda_event_invoke_config_delete, physical_id, old_props)
         return new_id, attrs
     return physical_id, attrs
 
@@ -5669,7 +5725,7 @@ def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_na
     if (new_props.get("UserPoolId") != old_props.get("UserPoolId")
             or bool(new_props.get("GenerateSecret")) != bool(old_props.get("GenerateSecret"))):
         created = _cognito_user_pool_client_create(logical_id or physical_id, new_props, stack_name)
-        _cognito_user_pool_client_delete(physical_id, old_props)
+        _delete_predecessor(_cognito_user_pool_client_delete, physical_id, old_props)
         return created
     payload = _declared_or_default(
         old_props, new_props, _COGNITO_USER_POOL_CLIENT_UPDATABLE
@@ -5826,7 +5882,7 @@ def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_nam
             logical_id or physical_id, new_props, stack_name
         )
         if group is not None:
-            _cognito_user_pool_group_delete(physical_id, old_props)
+            _delete_predecessor(_cognito_user_pool_group_delete, physical_id, old_props)
         return created
 
     group["Description"] = new_props.get("Description", "")
@@ -7667,7 +7723,7 @@ def _cw_dashboard_update(physical_id, old_props, new_props, stack_name):
         raise ValueError("DashboardName must be between 1 and 255 characters")
     _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(new_props))
     if name != physical_id:
-        _cw.cloudformation_delete_dashboard(physical_id)
+        _delete_predecessor(_cw.cloudformation_delete_dashboard, physical_id)
     return name, {}
 
 
@@ -8762,7 +8818,7 @@ def _firehose_delivery_stream_update(physical_id, old_props, new_props, stack_na
         new_id, attrs = _firehose_delivery_stream_create(
             physical_id, new_props, stack_name
         )
-        _firehose_delivery_stream_delete(physical_id, old_props)
+        _delete_predecessor(_firehose_delivery_stream_delete, physical_id, old_props)
         return new_id, attrs
     stream = _firehose._streams.get(physical_id)
     if stream is None:
@@ -8923,7 +8979,7 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     )
     if name != physical_id:
         created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
-        _iot_policy_delete(physical_id, old_props)
+        _delete_predecessor(_iot_policy_delete, physical_id, old_props)
         return created
     _iot_policy_prune_versions(name)
     resp = _iot._create_policy_version(
@@ -9011,7 +9067,7 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         created = _iot_provisioning_template_create(
             logical_id or physical_id, new_props, stack_name
         )
-        _iot_provisioning_template_delete(physical_id, old_props)
+        _delete_predecessor(_iot_provisioning_template_delete, physical_id, old_props)
         return created
     payload = _iot_provisioning_template_payload(name, new_props)
     payload.pop("templateName", None)
@@ -9238,7 +9294,7 @@ def _cognito_identity_pool_principal_tag_update(physical_id, old_props, new_prop
     # either is a replacement, and the mapping left on the old pair would
     # otherwise keep tagging principals after the template stopped declaring it.
     if (old_props.get("IdentityPoolId"), old_props.get("IdentityProviderName")) != (iid, provider):
-        _cognito_identity_pool_principal_tag_delete(physical_id, old_props)
+        _delete_predecessor(_cognito_identity_pool_principal_tag_delete, physical_id, old_props)
     return f"{iid}|{provider}", {}
 
 
@@ -9443,6 +9499,9 @@ def _location_tracker_update(physical_id, old_props, new_props, stack_name,
     if replaced is not None:
         return replaced
     if old_props.get("KmsKeyId") != new_props.get("KmsKeyId"):
+        # Not routed through _delete_predecessor, like the DynamoDB key-schema
+        # branch: the auto-generated name is deterministic, so the replacement
+        # takes it back and retaining the predecessor is not possible here.
         _location_tracker_delete(physical_id, old_props)
         return _location_tracker_create(logical_id or physical_id, new_props, stack_name)
     changes = {}

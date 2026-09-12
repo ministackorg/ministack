@@ -18907,6 +18907,50 @@ def test_cfn_lambda_permission_id_change_replaces_the_statement(cfn, lam):
         lam.delete_function(FunctionName=fn_name)
 
 
+def test_cfn_lambda_permission_id_adopting_the_generated_sid_keeps_the_statement(cfn, lam):
+    """A template that adds an explicit Id naming the Sid the resource
+    already wrote cannot change that Sid, so the statement is re-put under it
+    and the physical id is kept: not a replacement. A template that names the
+    legacy logical-id fallback instead does change the Sid, so that is a real
+    replacement and the old statement goes."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-adopt-{uid}"
+    fn_name = f"cfn-perm-adopt-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+
+    def template(sid):
+        props = {"FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+                 "Principal": "s3.amazonaws.com"}
+        if sid:
+            props["Id"] = sid
+        return json.dumps({"Resources": {"Perm": {
+            "Type": "AWS::Lambda::Permission", "Properties": props}}})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        generated = {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)}
+        assert len(generated) == 1
+        sid = generated.pop()
+        assert sid != "Perm", "the generated Sid is the physical id, not the logical id"
+
+        # Naming the Sid the resource already wrote: kept, one statement.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(sid))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {sid}
+
+        # Naming something else is a Sid change, so a real replacement.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("Perm"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"Perm"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
 def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_statement(cfn, lam, ddb):
     """When an update that replaced the permission fails later in the run,
     the rollback removes the statement the replacement added, since the
@@ -19809,27 +19853,509 @@ def test_cfn_update_replace_policy_retain_keeps_the_predecessor(cfn, sqs):
             queue["UpdateReplacePolicy"] = policy
         return json.dumps({"Resources": {"Queue": queue}})
 
-    cfn.create_stack(StackName=stack_name, TemplateBody=template(names[0], "Retain"))
     try:
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-
-        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[1], "Retain"))
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _queue_exists(sqs, names[0])
-        assert _queue_exists(sqs, names[1])
-        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Queue")]
-
-        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[2], None))
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert not _queue_exists(sqs, names[1])
-        assert _queue_exists(sqs, names[2])
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Queue", names, lambda name: _queue_exists(sqs, name))
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         for name in names:
             _delete_queue_if_present(sqs, name)
+
+
+def _assert_retain_keeps_handler_side_predecessor(cfn, stack_name, template, logical_id,
+                                                 names, exists):
+    """Rename ``logical_id`` from names[0] to names[1] under UpdateReplacePolicy
+    Retain and assert that both resources exist afterwards with a DELETE_SKIPPED
+    event; then rename to names[2] without the policy and assert the predecessor
+    is gone. ``template(name, policy)`` builds the body, ``exists(name)`` asks
+    the service."""
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(names[0], "Retain"))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template(names[1], "Retain"))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert exists(names[0]), "the retained predecessor was deleted"
+    assert exists(names[1])
+    assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, logical_id)]
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template(names[2], None))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert not exists(names[1])
+    assert exists(names[2])
+
+
+def test_cfn_update_replace_policy_retain_ssm_parameter(cfn, ssm):
+    """A handler that replaces the resource itself (an SSM parameter renamed:
+    Name is Replacement) must leave the predecessor alone under Retain."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-ssm-{uid}"
+    names = [f"/cfn-retain-{uid}/{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        res = {"Type": "AWS::SSM::Parameter",
+               "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Param": res}})
+
+    def exists(name):
+        try:
+            ssm.get_parameter(Name=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ParameterNotFound", exc.response["Error"]
+            return False
+
+    try:
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Param", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                ssm.delete_parameter(Name=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_cloudwatch_dashboard(cfn, cw):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-dash-{uid}"
+    names = [f"cfn-retain-dash-{uid}-{i}" for i in ("a", "b", "c")]
+    body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "x"}}]})
+
+    def template(name, policy):
+        res = {"Type": "AWS::CloudWatch::Dashboard",
+               "Properties": {"DashboardName": name, "DashboardBody": body}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Dash": res}})
+
+    def exists(name):
+        try:
+            cw.get_dashboard(DashboardName=name)
+            return True
+        except ClientError as exc:
+            assert "NotFound" in exc.response["Error"]["Code"], exc.response["Error"]
+            return False
+
+    try:
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Dash", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            cw.delete_dashboards(DashboardNames=names)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_replace_policy_retain_iot_policy(cfn, iot_client):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-iotpol-{uid}"
+    names = [f"cfn-retain-pol-{uid}-{i}" for i in ("a", "b", "c")]
+    document = {"Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": ["iot:Connect"], "Resource": "*"}]}
+
+    def template(name, policy):
+        res = {"Type": "AWS::IoT::Policy",
+               "Properties": {"PolicyName": name, "PolicyDocument": document}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Pol": res}})
+
+    def exists(name):
+        try:
+            iot_client.get_policy(policyName=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ResourceNotFoundException", exc.response["Error"]
+            return False
+
+    try:
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Pol", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                iot_client.delete_policy(policyName=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_cognito_user_pool_group(cfn, cognito_idp):
+    """The group handler replaces inside the pool by (pool, name) and does not
+    go through the shared rename helper; Retain has to hold there as well."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-group-{uid}"
+    pool_id = None
+    names = [f"retain-{uid}-{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        res = {"Type": "AWS::Cognito::UserPoolGroup",
+               "Properties": {"UserPoolId": pool_id, "GroupName": name}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Group": res}})
+
+    def exists(name):
+        groups = cognito_idp.list_groups(UserPoolId=pool_id)["Groups"]
+        return name in [g["GroupName"] for g in groups]
+
+    try:
+        pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-retain-group-{uid}")["UserPool"]["Id"]
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Group", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        if pool_id:
+            try:
+                cognito_idp.delete_user_pool(UserPoolId=pool_id)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_s3_bucket_policy(cfn, s3):
+    """A bucket policy moved to another bucket (Bucket is Replacement) keeps
+    the old bucket's policy under Retain."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-bp-{uid}"
+    names = [f"cfn-retain-bp-{uid}-{i}" for i in ("a", "b", "c")]
+
+    def template(bucket, policy):
+        res = {"Type": "AWS::S3::BucketPolicy", "Properties": {
+            "Bucket": bucket,
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket}/*"}]}}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Policy": res}})
+
+    def exists(bucket):
+        try:
+            s3.get_bucket_policy(Bucket=bucket)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "NoSuchBucketPolicy", exc.response["Error"]
+            return False
+
+    try:
+        for name in names:
+            s3.create_bucket(Bucket=name)
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Policy", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                s3.delete_bucket(Bucket=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_lambda_event_source_mapping(cfn, lam):
+    """EventSourceArn is Replacement and the mapping id is generated: the
+    replaced mapping stays under Retain."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-esm-{uid}"
+    fn = f"cfn-retain-esm-{uid}"
+    names = [f"arn:aws:sqs:us-east-1:000000000000:cfn-retain-esm-{uid}-{i}" for i in ("a", "b", "c")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): return {}")
+
+    def template(source_arn, policy):
+        res = {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+            "FunctionName": fn, "EventSourceArn": source_arn, "BatchSize": 1}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Esm": res}})
+
+    def exists(source_arn):
+        mappings = lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]
+        return source_arn in [m["EventSourceArn"] for m in mappings]
+
+    try:
+        lam.create_function(
+            FunctionName=fn, Runtime="python3.11", Role="arn:aws:iam::000000000000:role/r",
+            Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Esm", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            for m in lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]:
+                lam.delete_event_source_mapping(UUID=m["UUID"])
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_replace_policy_retain_iot_provisioning_template(cfn, iot_client):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-provtpl-{uid}"
+    names = [f"cfn-retain-pt-{uid}-{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        res = {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+            "TemplateName": name, "Enabled": True,
+            "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+            "TemplateBody": _cfn_provisioning_template_body()}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"PT": res}})
+
+    def exists(name):
+        try:
+            iot_client.describe_provisioning_template(templateName=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ResourceNotFoundException", \
+                exc.response["Error"]
+            return False
+
+    try:
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "PT", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                iot_client.delete_provisioning_template(templateName=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_lambda_url(cfn, lam):
+    """A Lambda URL is keyed by its function, so a TargetFunctionArn change
+    replaces it inside the handler and the predecessor URL must survive
+    Retain."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-url-{uid}"
+    names = [f"cfn-retain-url-{uid}-{i}" for i in ("a", "b", "c")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): return {}")
+    for name in names:
+        lam.create_function(
+            FunctionName=name, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/l",
+            Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+
+    def template(name, policy):
+        res = {"Type": "AWS::Lambda::Url", "Properties": {
+            "TargetFunctionArn": name, "AuthType": "NONE"}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Url": res}})
+
+    def exists(name):
+        try:
+            lam.get_function_url_config(FunctionName=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ResourceNotFoundException", \
+                exc.response["Error"]
+            return False
+
+    try:
+        _assert_retain_keeps_handler_side_predecessor(
+            cfn, stack_name, template, "Url", names, exists)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                lam.delete_function(FunctionName=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_update_replace_policy_retain_except_on_create_also_holds(cfn, ssm):
+    """RetainExceptOnCreate is the other half of the retaining set the engine
+    and the handlers now read from one tuple: it keeps a handler-side
+    predecessor exactly as Retain does, since the resource is not newly
+    created by the operation that rolls back."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-exc-{uid}"
+    names = [f"/cfn-retain-exc-{uid}/{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        res = {"Type": "AWS::SSM::Parameter",
+               "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Param": res}})
+
+    def exists(name):
+        try:
+            ssm.get_parameter(Name=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ParameterNotFound", exc.response["Error"]
+            return False
+
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=template(names[0], "RetainExceptOnCreate"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(names[1], "RetainExceptOnCreate"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert exists(names[0]), "the retained predecessor was deleted"
+        assert exists(names[1])
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Param")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            try:
+                ssm.delete_parameter(Name=name)
+            except ClientError:
+                pass
+
+
+def test_cfn_nested_stack_child_reads_its_own_update_replace_policy(monkeypatch):
+    """A resource inside a nested stack keeps its predecessor under its own
+    UpdateReplacePolicy Retain and loses it without, whatever the policy on
+    the parent's AWS::CloudFormation::Stack resource: the nested-stack loop
+    ran the child's handlers under the parent's policy before."""
+    from ministack.services import ssm as _ssm
+    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation import helpers as _helpers
+    from ministack.services.cloudformation.provisioners import (
+        _RETAIN_REPLACED,
+        _cfn_nested_stack_deploy,
+    )
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-retain-{uid}"
+    names = [f"/cfn-nested-retain-{uid}/{i}" for i in ("a", "b", "c")]
+    templates = {}
+
+    def child(name, policy):
+        res = {"Type": "AWS::SSM::Parameter",
+               "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return {"Resources": {"Param": res}}
+
+    monkeypatch.setattr(
+        _helpers, "_resolve_template",
+        lambda params: (json.dumps(templates[params["TemplateURL"][0]]), None))
+    _stacks[parent] = {
+        "StackName": parent,
+        "StackId": f"arn:aws:cloudformation:us-east-1:000000000000:stack/{parent}/parent",
+        "StackStatus": "UPDATE_IN_PROGRESS", "_resources": {},
+    }
+
+    def deploy(url, parent_retains, previous=None):
+        props = {"TemplateURL": url}
+        token = _RETAIN_REPLACED.set(parent_retains)
+        try:
+            if previous is None:
+                child_id, _attrs = _cfn_nested_stack_deploy("Child", props, parent)
+            else:
+                child_id, _attrs = _cfn_nested_stack_deploy(
+                    "Child", props, parent, previous_physical_id=previous, previous_props=props)
+        finally:
+            _RETAIN_REPLACED.reset(token)
+        return child_id.split("/")[1]
+
+    def exists(name):
+        return name in _ssm._parameters
+
+    try:
+        # The child retains, the parent resource does not: the predecessor stays.
+        templates["s3://tpl/a"] = child(names[0], "Retain")
+        templates["s3://tpl/b"] = child(names[1], "Retain")
+        stack = deploy("s3://tpl/a", parent_retains=False)
+        deploy("s3://tpl/b", parent_retains=False, previous=stack)
+        assert exists(names[0]) and exists(names[1])
+        # The child does not retain, the parent resource does: it is deleted.
+        templates["s3://tpl/c"] = child(names[2], None)
+        deploy("s3://tpl/c", parent_retains=True, previous=stack)
+        assert not exists(names[1])
+        assert exists(names[2])
+    finally:
+        for name in [n for n in list(_stacks) if n.startswith(parent)]:
+            gone = _stacks.pop(name, None) or {}
+            _stack_events.pop(gone.get("StackId"), None)
+        for name in names:
+            _ssm._parameters.pop(name, None)
+
+
+def test_cfn_apigw_api_key_rename_replaces_it(cfn, apigw_v1):
+    """Name is Replacement on AWS::ApiGateway::ApiKey: the renamed key is
+    created before the old one is removed, so Ref moves to a new key id and
+    the old id is gone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apikey-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"Key": {"Type": "AWS::ApiGateway::ApiKey",
+                                  "Properties": {"Name": name, "Enabled": True}}},
+            "Outputs": {"KeyId": {"Value": {"Ref": "Key"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(f"{stack_name}-a"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_id = _output(stack, "KeyId")
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"{stack_name}-b"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "KeyId")
+        assert new_id != old_id
+        assert apigw_v1.get_api_key(apiKey=new_id)["name"] == f"{stack_name}-b"
+        with pytest.raises(ClientError):
+            apigw_v1.get_api_key(apiKey=old_id)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_apigw_model_content_type_change_keeps_the_name(cfn, apigw_v1):
+    """ContentType is Replacement on AWS::ApiGateway::Model, but the model is
+    keyed by name on its API: the replacement lands under the same name and
+    the old record is not deleted from under it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-model-ct-{uid}"
+    api_id = None
+    model_name = f"Model{uid}"
+
+    def template(content_type):
+        return json.dumps({
+            "Resources": {"Model": {"Type": "AWS::ApiGateway::Model", "Properties": {
+                "RestApiId": api_id, "Name": model_name, "ContentType": content_type,
+                "Description": content_type, "Schema": {"type": "object"}}}},
+            "Outputs": {"Name": {"Value": {"Ref": "Model"}}},
+        })
+
+    try:
+        api_id = apigw_v1.create_rest_api(name=f"cfn-model-ct-{uid}")["id"]
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("application/json"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("application/xml"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == model_name
+        model = apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+        assert model["contentType"] == "application/xml"
+        assert model["description"] == "application/xml"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        if api_id:
+            try:
+                apigw_v1.delete_rest_api(restApiId=api_id)
+            except ClientError:
+                pass
 
 
 def test_cfn_deletion_policy_retain_on_a_removed_resource(cfn, sqs):
