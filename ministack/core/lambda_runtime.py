@@ -143,13 +143,33 @@ INVOKE_DEPTH_HEADER = "X-Ministack-Invoke-Depth"
 # trace header uses.
 INVOKE_DEPTH_EVENT_KEY = "_ministack_invoke_depth"
 
+# The durable-execution variables change on every invocation of the same
+# function, so a pooled worker cannot carry them in its spawn environment
+# either. They ride in the event under this key, as a mapping of the three
+# names below, and both worker bootstraps move them into the environment
+# before the handler runs.
+#
+# One declaration for both readers: lambda_svc builds the overlay from the
+# durable context under these keys, the bootstraps iterate the names to set
+# them and to delete them again. A fourth variable added to only one of the
+# two would be set and never cleared, which is the leak the event carrier
+# exists to avoid.
+DURABLE_CTX_EVENT_KEY = "_ministack_durable_ctx"
+DURABLE_ENV_VARS = {
+    "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "arn",
+    "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "token",
+    "AWS_LAMBDA_DURABLE_EXECUTION_NAME": "name",
+}
 
-def _sub_depth_tokens(script: str) -> str:
-    """Substitute the invoke-depth carrier names into a bootstrap script."""
+
+def _sub_runtime_tokens(script: str) -> str:
+    """Substitute the per-invocation carrier names into a bootstrap script."""
     return (
         script.replace("__DEPTH_ENV__", INVOKE_DEPTH_ENV)
         .replace("__DEPTH_HEADER__", INVOKE_DEPTH_HEADER)
         .replace("__DEPTH_EVENT_KEY__", INVOKE_DEPTH_EVENT_KEY)
+        .replace("__DURABLE_EVENT_KEY__", DURABLE_CTX_EVENT_KEY)
+        .replace("__DURABLE_ENV_VARS__", json.dumps(list(DURABLE_ENV_VARS)))
     )
 
 
@@ -163,11 +183,12 @@ def _sub_depth_tokens(script: str) -> str:
 # handler alongside it for ministack's depth counter.
 #
 # Importing botocore is what a cold start pays for the counter (~0.15s here),
-# once per worker — or once per invocation on the one-shot executor, which
-# only durable invocations use. A function whose environment has no botocore
-# is not instrumented: it would have to be calling Invoke over raw urllib,
-# which never carried lineage anyway.
-INVOKE_DEPTH_BOOTSTRAP = _sub_depth_tokens('''
+# once per worker. The one-shot executor's wrapper carries the same bootstrap,
+# but nothing reaches it any more: python and nodejs go to the pool, and every
+# other runtime gets a mock answer before the subprocess starts. A function
+# whose environment has no botocore is not instrumented: it would have to be
+# calling Invoke over raw urllib, which never carried lineage anyway.
+INVOKE_DEPTH_BOOTSTRAP = _sub_runtime_tokens('''
 def _ms_install_invoke_depth():
     import os
     try:
@@ -187,7 +208,7 @@ def _ms_install_invoke_depth():
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_PYTHON_WORKER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + _sub_depth_tokens('''
+_PYTHON_WORKER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + _sub_runtime_tokens('''
 import sys, json, importlib, traceback, os, time
 
 def run():
@@ -269,6 +290,15 @@ def run():
             os.environ["__DEPTH_ENV__"] = str(_ms_depth)
         elif "__DEPTH_ENV__" in os.environ:
             del os.environ["__DEPTH_ENV__"]
+        # Durable execution: the ARN, the checkpoint token and the execution
+        # name belong to this invocation only, so they arrive with the event
+        # and are dropped again when the next one is not durable.
+        _ms_durable = event.pop("__DURABLE_EVENT_KEY__", None) or {}
+        for _ms_var in __DURABLE_ENV_VARS__:
+            if _ms_var in _ms_durable:
+                os.environ[_ms_var] = str(_ms_durable[_ms_var])
+            elif _ms_var in os.environ:
+                del os.environ[_ms_var]
         _function_name = init.get("function_name", "")
         _deadline = time.time() + float(os.environ.get("_LAMBDA_TIMEOUT", "3"))
         context = type("Context", (), {
@@ -297,7 +327,7 @@ run()
 # Node.js worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_NODEJS_WORKER_SCRIPT = _sub_depth_tokens(r'''
+_NODEJS_WORKER_SCRIPT = _sub_runtime_tokens(r'''
 const readline = require("readline");
 const path = require("path");
 const http = require("http");
@@ -808,9 +838,12 @@ function patchAwsSdk() {
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
     // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
-    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+    const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost
+        || (advertised && host === advertised)) {
       options.protocol = "http:";
-      options.port = options.port || msPort;
+      // The https default port means the gateway port here, as in the container shim.
+      options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
@@ -933,6 +966,17 @@ rl.on("line", async (line) => {
     } else if ("__DEPTH_ENV__" in process.env) {
       delete process.env.__DEPTH_ENV__;
     }
+    // Durable execution: per-invocation values, so they ride in the event and
+    // are dropped again when the next invocation is not durable.
+    const _msDurable = event.__DURABLE_EVENT_KEY__ || {};
+    for (const _msVar of __DURABLE_ENV_VARS__) {
+      if (_msVar in _msDurable) {
+        process.env[_msVar] = String(_msDurable[_msVar]);
+      } else if (_msVar in process.env) {
+        delete process.env[_msVar];
+      }
+    }
+    delete event.__DURABLE_EVENT_KEY__;
     delete event.__DEPTH_EVENT_KEY__;
     delete event._x_amzn_trace_id;
     delete event._request_id;

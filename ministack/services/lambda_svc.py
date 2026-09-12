@@ -53,6 +53,8 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
+    DURABLE_CTX_EVENT_KEY,
+    DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_EVENT_KEY,
@@ -1308,11 +1310,7 @@ def _durable_env_overlay() -> dict[str, str]:
     ctx = _durable_ctx.get()
     if not ctx:
         return {}
-    return {
-        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
-        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
-        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
-    }
+    return {var: ctx.get(key, "") for var, key in DURABLE_ENV_VARS.items()}
 
 
 def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
@@ -4072,18 +4070,77 @@ def handler(event, context):
 '''
 
 _JS_CTX_ARN_SHIM = '''\
-// MiniStack shim: hand user code the control-plane ARN in its context.
+// MiniStack shim: hand user code the control-plane ARN in its context, and
+// reach the gateway over plain HTTP when a library insists on HTTPS.
 const path = require("path");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const REAL = process.env._MS_REAL_HANDLER || "index.handler";
 const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
+const TASK_ROOT = process.env.LAMBDA_TASK_ROOT || "/var/task";
+// The container talks to MiniStack over http://<gateway host>:<port>, but the
+// response submitters the CDK bundles into its custom-resource handlers
+// (nodejs-entrypoint, the provider framework, AwsCustomResource) build the
+// ResponseURL PUT from the URL's hostname and path only and hand it to
+// https.request, so it goes out over TLS to port 443 whatever the URL says,
+// and a Node custom resource never signalled its stack. Downgrade https to
+// http for the gateway hosts only; the https default 443 becomes the gateway
+// port, any other explicit port is kept.
+try {
+  const EP = new URL(process.env.AWS_ENDPOINT_URL || "http://host.docker.internal:4566");
+  const EP_PORT = EP.port || (EP.protocol === "https:" ? "443" : "80");
+  const PLAIN_HOSTS = new Set(
+    [EP.hostname, "localhost", "127.0.0.1", "host.docker.internal"]
+      .concat((process.env._MS_GATEWAY_HOSTS || "").split(","))
+      .filter(Boolean));
+  const origHttpsRequest = https.request;
+  https.request = function (input, options, callback) {
+    if (typeof options === "function") { callback = options; options = undefined; }
+    let opts;
+    if (typeof input === "string" || input instanceof URL) {
+      const u = new URL(String(input));
+      opts = Object.assign({ hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+                             protocol: u.protocol }, options || {});
+    } else {
+      opts = Object.assign({}, input, options || {});
+    }
+    const host = opts.hostname || String(opts.host || "").split(":")[0];
+    const rawPort = opts.port ? String(opts.port) : "";
+    // Only the gateway hosts, and only the https default port or the gateway
+    // port itself: a handler that dials its own TLS sidecar on another port
+    // of localhost keeps TLS.
+    if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
+      return origHttpsRequest.call(https, input, options, callback);
+    }
+    opts.protocol = "http:";
+    opts.hostname = host;
+    opts.host = host + ":" + EP_PORT;
+    opts.port = EP_PORT;
+    // Node's default http agent (keep-alive with an idle timeout) replaces
+    // whatever https agent the caller set.
+    opts.agent = undefined;
+    delete opts._defaultAgent;
+    return http.request(opts, callback);
+  };
+  https.get = function (input, options, callback) {
+    const req = https.request(input, options, callback);
+    req.end();
+    return req;
+  };
+  // A handler that did `import { request } from "node:https"` holds a live
+  // binding that only refreshes on request; refresh it now.
+  require("module").syncBuiltinESMExports();
+} catch (e) {
+  // A bad AWS_ENDPOINT_URL costs the downgrade, not the function.
+}
 const dot = REAL.lastIndexOf(".");
 const modPart = REAL.slice(0, dot);
 const fnName = REAL.slice(dot + 1);
 let cached = null;
 async function load() {
   if (cached) return cached;
-  const base = path.join("/var/task", modPart);
+  const base = path.join(TASK_ROOT, modPart);
   for (const ext of [".mjs", ".js", ".cjs"]) {
     const p = base + ext;
     if (fs.existsSync(p)) {
@@ -4134,8 +4191,12 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
             pass
         return None
     try:
-        with open(shim_path, "w") as f:
+        # Another container of the same code may already hold the dir as a
+        # read-only mount; a rename lands the file whole rather than truncated.
+        tmp_path = f"{shim_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
             f.write(source)
+        os.replace(tmp_path, shim_path)
     except OSError as exc:
         logger.warning("Lambda context-ARN shim not written (%s); "
                        "container will report the RIE default ARN", exc)
@@ -4263,6 +4324,11 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
+    # The host MiniStack advertises for itself (custom-resource ResponseURLs
+    # carry it); the Node shim downgrades https to http for it.
+    advertised_host = os.environ.get("MINISTACK_HOST", "").split(":")[0]
+    if advertised_host:
+        container_env["_MS_GATEWAY_HOSTS"] = advertised_host
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
     # AWS merges every layer's contents into /opt (so /opt/python, /opt/lib,
@@ -4836,25 +4902,19 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
-            # Durable invocations need a per-call environment (the
-            # DurableExecutionArn / CheckpointToken change every invoke), and a
-            # reused environment's env is fixed at spawn — so they keep the
-            # one-shot executor, exactly as durable python/nodejs does above.
+            # A durable invocation needs a per-call environment (the
+            # DurableExecutionArn and CheckpointToken change every invoke) and a
+            # pooled worker's env is fixed at spawn, so provided.* durable
+            # invocations keep the one-shot executor. python and nodejs carry
+            # that context in the event instead, which is why they can be pooled.
             if _durable_ctx.get():
                 result = _execute_function_provided(func, event)
             else:
                 result = _execute_function_provided_warm(func, event, request_id)
-        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
-                and not _durable_ctx.get():
-            # Warm pool reuses worker subprocesses whose env was fixed at
-            # spawn time. Durable invocations need per-call env (the
-            # DurableExecutionArn + CheckpointToken change every invoke),
-            # so route them through the per-call local executor.
-            result = _execute_function_warm(func, event)
         elif runtime.startswith(("python", "nodejs")):
-            # Durable python/nodejs falls through to local subprocess (per
-            # the elif above we already filtered durable out of warm).
-            result = _execute_function_local(func, event)
+            # Durable invocations included: their per-call context rides in
+            # the event, so the pooled worker can serve them.
+            result = _execute_function_warm(func, event)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
@@ -5029,6 +5089,14 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # the counter.
         if isinstance(event, dict):
             event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
+            # Durable executions ride the same channel: the ARN, the checkpoint
+            # token and the execution name differ per invocation, which is why
+            # they cannot be part of the worker's spawn environment. The
+            # bootstrap clears them again when the key is absent, so a worker
+            # reused for a non-durable call does not see the previous one's.
+            durable = _durable_env_overlay()
+            if durable:
+                event[DURABLE_CTX_EVENT_KEY] = durable
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}

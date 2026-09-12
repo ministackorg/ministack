@@ -2350,6 +2350,117 @@ def test_cfn_change_set_lifecycle(cfn):
     stack = _wait_stack(cfn, "cfn-t08")
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
+def test_cfn_stack_and_change_set_report_their_capabilities(cfn):
+    """DescribeStacks and DescribeChangeSet report the capabilities the
+    operation acknowledged; an update replaces them, and an update that sends
+    none leaves the member empty."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-caps-rep-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{stack_name}-q"}},
+        },
+    }
+    try:
+        cfn.create_change_set(
+            StackName=stack_name,
+            ChangeSetName="cs1",
+            TemplateBody=json.dumps(template),
+            ChangeSetType="CREATE",
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        time.sleep(1)
+        cs = cfn.describe_change_set(StackName=stack_name, ChangeSetName="cs1")
+        assert cs["Capabilities"] == ["CAPABILITY_IAM"]
+
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="cs1")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert stack["Capabilities"] == ["CAPABILITY_IAM"]
+
+        updated = json.loads(json.dumps(template))
+        updated["Resources"]["Q"]["Properties"]["DelaySeconds"] = 5
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(updated),
+            Capabilities=["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack["Capabilities"] == ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+
+        # The member is what the last operation acknowledged: an update that
+        # sends none blanks it.
+        updated["Resources"]["Q"]["Properties"]["DelaySeconds"] = 6
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack.get("Capabilities", []) == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_unknown_capability_is_refused(cfn):
+    """Capabilities is an enum of three values, so a fourth is a parameter
+    validation error rather than something the stack silently keeps, on
+    CreateStack, CreateChangeSet and UpdateStack alike."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-caps-enum-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{stack_name}-q"}},
+        },
+    }
+    bad = ["CAPABILITY_IAM", "CAPABILITY_RESOURCE_POLICY"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template),
+                             Capabilities=bad)
+        message = exc.value.response["Error"]["Message"]
+        assert "1 validation error detected" in message
+        assert "'capabilities'" in message
+        assert "CAPABILITY_AUTO_EXPAND" in message
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=stack_name)
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                                  TemplateBody=json.dumps(template), ChangeSetType="CREATE",
+                                  Capabilities=bad)
+        assert "'capabilities'" in exc.value.response["Error"]["Message"]
+
+        # The capability problem joins the other request-level problems into
+        # one message, which is what _request_problems is for: a stack name
+        # over the length limit and a bad capability arrive together, and the
+        # count is the plural the message builder produces.
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName="c" * 129, TemplateBody=json.dumps(template),
+                             Capabilities=bad)
+        message = exc.value.response["Error"]["Message"]
+        assert "2 validation errors detected" in message
+        assert "'capabilities'" in message
+        assert "'stackName'" in message
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+    try:
+        # The three documented values are accepted.
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template),
+            Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template),
+                             Capabilities=bad)
+        assert "'capabilities'" in exc.value.response["Error"]["Message"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_create_emits_review_event(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -2437,6 +2548,80 @@ def test_cfn_validate_template(cfn):
     invalid_template = {"AWSTemplateFormatVersion": "2010-09-09"}
     with pytest.raises(ClientError):
         cfn.validate_template(TemplateBody=json.dumps(invalid_template))
+
+
+def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
+    """DeclaredTransforms and the deploy path read one function, so a
+    template that ValidateTemplate reports as declaring the SAM transform is
+    a template the stack operation actually transforms. The macro object
+    (Transform: {Name: ...}) is the form that used to be reported and not
+    applied."""
+    from ministack.services.cloudformation.engine import (
+        _apply_sam_transform_if_applicable,
+        declared_transforms,
+    )
+
+    sam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"F": {"Type": "AWS::Serverless::Function", "Properties": {
+            "Runtime": "python3.12", "Handler": "index.handler", "CodeUri": "s3://b/k"}}},
+    }
+    for declared in ("AWS::Serverless-2016-10-31",
+                     {"Name": "AWS::Serverless-2016-10-31"},
+                     ["AWS::Serverless-2016-10-31"]):
+        template = json.loads(json.dumps(dict(sam, Transform=declared)))
+        assert declared_transforms(template) == ["AWS::Serverless-2016-10-31"]
+        out = _apply_sam_transform_if_applicable(template)
+        types = {res.get("Type") for res in out["Resources"].values()}
+        assert "AWS::Serverless::Function" not in types
+        assert "AWS::Lambda::Function" in types
+    # Entries the section cannot name are dropped rather than reported.
+    assert declared_transforms({"Transform": [{"Parameters": {}}, 5]}) == []
+    assert declared_transforms({}) == []
+
+
+def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
+    """ValidateTemplate answers Capabilities, CapabilitiesReason and
+    DeclaredTransforms, the three response elements the API documents next to
+    Description and Parameters."""
+    plain = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"B": {"Type": "AWS::S3::Bucket"}},
+    }
+    result = cfn.validate_template(TemplateBody=json.dumps(plain))
+    assert result.get("Capabilities", []) == []
+    assert result.get("DeclaredTransforms", []) == []
+
+    iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "R": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "vt-caps-role",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            },
+        },
+    }
+    result = cfn.validate_template(TemplateBody=json.dumps(iam))
+    assert result["Capabilities"] == ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+    assert "AWS::IAM::Role" in result["CapabilitiesReason"]
+    assert result["DeclaredTransforms"] == ["AWS::Serverless-2016-10-31"]
+
+    # The list form and the macro object, the shape the AWS::Include reference
+    # documents at the top level, report their names too.
+    listed = dict(plain, Transform=["AWS::LanguageExtensions",
+                                    {"Name": "AWS::Include",
+                                     "Parameters": {"Location": "s3://bucket/snippet.yaml"}}])
+    result = cfn.validate_template(TemplateBody=json.dumps(listed))
+    assert result["DeclaredTransforms"] == ["AWS::LanguageExtensions", "AWS::Include"]
+    macro = dict(plain, Transform={"Name": "AWS::Include",
+                                   "Parameters": {"Location": "s3://bucket/snippet.yaml"}})
+    result = cfn.validate_template(TemplateBody=json.dumps(macro))
+    assert result["DeclaredTransforms"] == ["AWS::Include"]
+
 
 def test_cfn_get_template_summary(cfn):
     # Basic template: parameters and resource types surfaced, no capabilities
@@ -2716,6 +2901,164 @@ def test_cfn_capabilities_check_under_auth(monkeypatch):
     assert check(_CAPS_POLICY_TEMPLATE, "CAPABILITY_IAM") is None
     assert check(_CAPS_SERVICE_LINKED_ROLE_TEMPLATE) is None
     assert check(_CAPS_NULL_PROPS_ROLE_TEMPLATE) == refused
+
+
+def _deploy_nested_child(monkeypatch, parent_name, capabilities, templates, root_url):
+    """Deploy an AWS::CloudFormation::Stack child of ``parent_name`` in
+    process: ``templates`` maps a TemplateURL to its body, ``capabilities`` is
+    what the parent acknowledged. Returns the child stack name."""
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation import helpers as _helpers
+    from ministack.services.cloudformation.provisioners import _cfn_nested_stack_deploy
+
+    monkeypatch.setattr(
+        _helpers, "_resolve_template",
+        lambda params: (json.dumps(templates[params["TemplateURL"][0]]), None))
+    _stacks[parent_name] = {
+        "StackName": parent_name,
+        "StackId": f"arn:aws:cloudformation:us-east-1:000000000000:stack/{parent_name}/parent",
+        "StackStatus": "CREATE_IN_PROGRESS",
+        "Capabilities": list(capabilities),
+        "_resources": {},
+    }
+    child_id, _attrs = _cfn_nested_stack_deploy("Child", {"TemplateURL": root_url}, parent_name)
+    return child_id.split("/")[1]
+
+
+def _forget_nested_test_stacks(prefix):
+    from ministack.services.cloudformation import _stack_events, _stacks
+    for name in [n for n in list(_stacks) if n.startswith(prefix)]:
+        stack = _stacks.pop(name, None) or {}
+        _stack_events.pop(stack.get("StackId"), None)
+
+
+def test_cfn_nested_stack_capabilities_follow_the_parent_under_auth(monkeypatch):
+    """A nested stack's IAM resources are covered by the capabilities the
+    parent acknowledged (using-cfn-nested-stacks: "For nested stacks that
+    contain IAM resources, you must acknowledge IAM capabilities"), so a
+    child with an unnamed role is refused when the parent sent none and
+    provisioned when it sent CAPABILITY_IAM; a custom-named role needs
+    CAPABILITY_NAMED_IAM."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-caps-{uid}"
+    url = "http://localhost:4566/tpl/child.json"
+    templates = {url: _CAPS_ROLE_TEMPLATE}
+    try:
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_IAM\]"):
+            _deploy_nested_child(monkeypatch, parent, [], templates, url)
+        # The check runs before the child record exists, so nothing is left.
+        assert not [n for n in _stacks if n.startswith(f"{parent}-Child")]
+
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], templates, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+        assert _stacks[child]["Capabilities"] == ["CAPABILITY_IAM"]
+
+        named = {url: json.loads(json.dumps(_CAPS_NAMED_ROLE_TEMPLATE))}
+        # A unique name, so a rerun does not meet the role of a previous run.
+        named[url]["Resources"]["Role"]["Properties"]["RoleName"] = f"cfn-nested-caps-{uid}-role"
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_NAMED_IAM\]"):
+            _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], named, url)
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_NAMED_IAM"], named, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _forget_nested_test_stacks(parent)
+
+
+def test_cfn_nested_stack_capabilities_reach_the_second_level_under_auth(monkeypatch):
+    """A child's child reads the root's acknowledgement: the inner stack with
+    an IAM role is refused when the root sent nothing and deploys when it
+    sent CAPABILITY_IAM."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-caps2-{uid}"
+    middle_url = "http://localhost:4566/tpl/middle.json"
+    inner_url = "http://localhost:4566/tpl/inner.json"
+    templates = {
+        inner_url: _CAPS_ROLE_TEMPLATE,
+        middle_url: {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Inner": {"Type": "AWS::CloudFormation::Stack",
+                                    "Properties": {"TemplateURL": inner_url}}},
+        },
+    }
+    try:
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_IAM\]"):
+            _deploy_nested_child(monkeypatch, parent, [], templates, middle_url)
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], templates, middle_url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+        inner = [n for n in _stacks if n.startswith(f"{child}-Inner")]
+        assert [_stacks[n]["StackStatus"] for n in inner] == ["CREATE_COMPLETE"]
+    finally:
+        _forget_nested_test_stacks(parent)
+
+
+def test_cfn_nested_stack_capabilities_not_checked_without_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-noauth-{uid}"
+    url = "http://localhost:4566/tpl/child.json"
+    try:
+        child = _deploy_nested_child(monkeypatch, parent, [], {url: _CAPS_ROLE_TEMPLATE}, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+        # The set exists to be read by the check on the level below, so
+        # without AUTH the child's record carries none and DescribeStacks
+        # reports on it what it reported before: nothing changes.
+        _stacks[parent]["Capabilities"] = ["CAPABILITY_IAM"]
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"],
+                                     {url: _CAPS_ROLE_TEMPLATE}, url)
+        assert _stacks[child].get("Capabilities", []) == []
+    finally:
+        _forget_nested_test_stacks(parent)
+
+
+def test_cfn_nested_stack_capabilities_are_rechecked_on_an_update(monkeypatch):
+    """A parent update that re-deploys the nested resource re-checks the
+    child, so a parent that drops Capabilities fails it: a stack reports what
+    its last operation acknowledged, and the child's own resources follow the
+    same rule the parent's do under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.provisioners import _cfn_nested_stack_deploy
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-caps-upd-{uid}"
+    url = "http://localhost:4566/tpl/child.json"
+    plain = {"AWSTemplateFormatVersion": "2010-09-09",
+             "Resources": {"Q": {"Type": "AWS::SQS::Queue",
+                                 "Properties": {"QueueName": f"{parent}-q"}}}}
+    templates = {url: plain}
+    try:
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], templates, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+
+        # The child gains an IAM role and the parent still acknowledges: fine.
+        templates[url] = _CAPS_ROLE_TEMPLATE
+        _cfn_nested_stack_deploy("Child", {"TemplateURL": url}, parent,
+                                 previous_physical_id=child,
+                                 previous_props={"TemplateURL": url})
+        assert _stacks[child]["StackStatus"] == "UPDATE_COMPLETE"
+
+        # The same update with the acknowledgement dropped is refused: a
+        # stack reports what its last operation acknowledged, so a parent
+        # update that sends no Capabilities covers nothing.
+        _stacks[parent]["Capabilities"] = []
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_IAM\]"):
+            _cfn_nested_stack_deploy("Child", {"TemplateURL": url}, parent,
+                                     previous_physical_id=child,
+                                     previous_props={"TemplateURL": url})
+    finally:
+        _forget_nested_test_stacks(parent)
 
 
 def test_cfn_create_stack_refuses_missing_capabilities_under_auth(monkeypatch):
