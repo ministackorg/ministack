@@ -26,6 +26,7 @@ from .engine import (
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    declared_transforms,
     validate_template_support,
 )
 from .helpers import (
@@ -159,6 +160,24 @@ def _required_capabilities(template, strict=False):
     return capabilities, reason_types
 
 
+def _capabilities_xml(template):
+    """The ``Capabilities`` / ``CapabilitiesReason`` pair that
+    GetTemplateSummary and ValidateTemplate both report, or an empty string
+    when the template needs none (AWS omits both elements then)."""
+    capabilities, reason_types = _required_capabilities(template)
+    if not capabilities:
+        return ""
+    caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
+    # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return
+    # all of the types it should every time. We're doing the best we can here.
+    reason = (
+        "The following resource(s) require capabilities: [" + ", ".join(reason_types) + "]"
+        if reason_types else ""
+    )
+    return (f"<Capabilities>{caps_xml}</Capabilities>"
+            f"<CapabilitiesReason>{_esc(reason)}</CapabilitiesReason>")
+
+
 def _check_capabilities(sent, template, params, macros=True):
     """Refuse a template whose required capabilities the request does not
     acknowledge, the way CreateStack does: HTTP 400
@@ -181,20 +200,39 @@ def _check_capabilities(sent, template, params, macros=True):
     if not AUTH:
         return None
     given = set(_extract_string_members(params, "Capabilities"))
-    required = [cap for cap in _required_capabilities(template, strict=True)[0]
-                if cap != "CAPABILITY_AUTO_EXPAND"]
+    required = _required_iam_capabilities(template)
     if macros and _uses_macro(sent):
         required.append("CAPABILITY_AUTO_EXPAND")
+    missing = _missing_capabilities(given, required)
+    if not missing:
+        return None
+    return _error("InsufficientCapabilitiesException", _insufficient_capabilities_message(missing))
+
+
+def _required_iam_capabilities(template):
+    """The capabilities a template's IAM resources demand, which is the rule
+    both the request-level check and the nested-stack check enforce.
+    CAPABILITY_AUTO_EXPAND is dropped here: a transform is the caller's own
+    declaration, judged per call site, not a property of the IAM resources.
+    """
+    return [cap for cap in _required_capabilities(template, strict=True)[0]
+            if cap != "CAPABILITY_AUTO_EXPAND"]
+
+
+def _missing_capabilities(given, required):
+    """The capabilities of ``required`` that ``given`` does not acknowledge;
+    ``CAPABILITY_IAM`` is satisfied by ``CAPABILITY_NAMED_IAM`` as well."""
     missing = []
     for cap in required:
         if cap == "CAPABILITY_IAM" and "CAPABILITY_NAMED_IAM" in given:
             continue
         if cap not in given:
             missing.append(cap)
-    if not missing:
-        return None
-    return _error("InsufficientCapabilitiesException",
-                  "Requires capabilities : [" + ", ".join(missing) + "]")
+    return missing
+
+
+def _insufficient_capabilities_message(missing):
+    return "Requires capabilities : [" + ", ".join(missing) + "]"
 
 
 # --- CreateStack ---
@@ -285,6 +323,7 @@ def _create_stack(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "Capabilities": _extract_string_members(params, "Capabilities"),
         "Outputs": [],
         "DisableRollback": disable_rollback,
         "EnableTerminationProtection": termination_protection,
@@ -409,6 +448,9 @@ def _describe_stacks(params):
                 "</member>"
             )
 
+        caps_xml = "".join(
+            f"<member>{_esc(c)}</member>" for c in s.get("Capabilities", []))
+
         members += (
             "<member>"
             f"<StackName>{_esc(s['StackName'])}</StackName>"
@@ -422,6 +464,7 @@ def _describe_stacks(params):
             "<EnableTerminationProtection>"
             f"{str(s.get('EnableTerminationProtection', False)).lower()}"
             "</EnableTerminationProtection>"
+            f"<Capabilities>{caps_xml}</Capabilities>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
             f"<Tags>{tags_xml}</Tags>"
@@ -932,6 +975,9 @@ def _update_stack(params):
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
+    # The capabilities a stack reports are the ones its last operation
+    # acknowledged, so an update replaces them rather than adding to them.
+    stack["Capabilities"] = _extract_string_members(params, "Capabilities")
     if tags or tags_given:
         stack["Tags"] = tags
     stack["Parameters"] = [
@@ -1004,10 +1050,17 @@ def _validate_template(params):
             "</member>"
         )
 
+    transforms_xml = "".join(
+        f"<member>{_esc(t)}</member>" for t in declared_transforms(template))
+    declared_block = (f"<DeclaredTransforms>{transforms_xml}</DeclaredTransforms>"
+                      if transforms_xml else "")
+
     return _xml(200, "ValidateTemplateResponse",
                 f"<ValidateTemplateResult>"
                 f"<Description>{_esc(description)}</Description>"
                 f"<Parameters>{params_xml}</Parameters>"
+                f"{_capabilities_xml(template)}"
+                f"{declared_block}"
                 f"</ValidateTemplateResult>")
 
 
@@ -1081,21 +1134,7 @@ def _get_template_summary(params):
             "</member>"
         )
 
-    capabilities, caps_reason_types = _required_capabilities(template)
-
-    caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
-    # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return
-    # all of the types it should every time. We're doing the best we can here.
-    caps_reason = (
-        "The following resource(s) require capabilities: [" + ", ".join(caps_reason_types) + "]"
-        if caps_reason_types else ""
-    )
-
-    caps_block = (
-        f"<Capabilities>{caps_xml}</Capabilities>"
-        f"<CapabilitiesReason>{_esc(caps_reason)}</CapabilitiesReason>"
-        if capabilities else ""
-    )
+    caps_block = _capabilities_xml(template)
 
     return _xml(200, "GetTemplateSummaryResponse",
                 f"<GetTemplateSummaryResult>"

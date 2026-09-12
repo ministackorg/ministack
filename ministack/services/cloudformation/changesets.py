@@ -21,6 +21,7 @@ from .helpers import (
     _error,
     _esc,
     _extract_members,
+    _extract_string_members,
     _p,
     _page,
     _request_problems,
@@ -266,6 +267,7 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "Capabilities": _extract_string_members(params, "Capabilities"),
         "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
@@ -352,6 +354,9 @@ def _describe_change_set(params):
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
         f"<ChangeSetType>{cs.get('ChangeSetType', '')}</ChangeSetType>"
+        "<Capabilities>"
+        + "".join(f"<member>{_esc(c)}</member>" for c in cs.get("Capabilities", []))
+        + "</Capabilities>"
         f"<Parameters>{params_xml}</Parameters>"
         f"<Changes>{changes_xml}</Changes>"
         f"<Tags>{tags_xml}</Tags>"
@@ -427,6 +432,9 @@ def _execute_change_set(params):
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
+    # The stack reports what the operation acknowledged, and for an executed
+    # change set that is what the change set was created with.
+    stack["Capabilities"] = list(cs.get("Capabilities", []))
     if tags or cs.get("_tags_given"):
         stack["Tags"] = tags
     stack["Parameters"] = [
