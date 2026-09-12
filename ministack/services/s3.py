@@ -50,7 +50,7 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.aws_credentials import (
+from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     CredentialResolutionError,
     find_iam_access_key_account,
@@ -1576,17 +1576,24 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     try:
         owner = find_iam_access_key_account(_akid)
     except AmbiguousAccessKeyError:
+        # Two tenants holding one key is an emulator-only state; S3 has no
+        # error for it, so it answers as it does for a key it cannot resolve.
         return _error(
-            "InvalidAccessKeyId", "The AWS Access Key Id is ambiguous.", 403, path
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
         )
     if owner:
         set_request_account_id(owner)
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
+        # S3's own error table: ExpiredToken and InvalidToken are 400, while
+        # InvalidAccessKeyId is 403.
         if credential.code == "ExpiredTokenException":
-            return _error("ExpiredToken", credential.message, 403, path)
+            return _error("ExpiredToken", "The provided token has expired.", 400, path)
         if credential.code == "InvalidToken":
-            return _error("InvalidToken", credential.message, 403, path)
+            return _error("InvalidToken", credential.message, 400, path)
         return _error(
             "InvalidAccessKeyId",
             "The AWS Access Key Id you provided does not exist in our records.",

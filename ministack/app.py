@@ -197,12 +197,12 @@ _NON_S3_VHOST_NAMES = frozenset(
 )
 
 from ministack.core import container_reaper
-from ministack.core.aws_credentials import (
+from ministack.core.concurrency import spawn_background
+from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
+from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
 )
-from ministack.core.concurrency import spawn_background
-from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,

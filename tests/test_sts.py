@@ -332,6 +332,50 @@ def test_sts_get_session_token_rejects_temporary_caller_when_auth_enabled(monkey
         sts_mod._sessions.pop(source_key, None)
 
 
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("action", ["GetSessionToken", "AssumeRole"])
+@pytest.mark.parametrize("credential_kind", ["unknown", "inactive", "expired"])
+def test_sts_credential_rejections_require_auth(monkeypatch, auth_enabled, action, credential_kind):
+    import asyncio
+    import time
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    key = "test-sts-mode-key"
+    account = "000000000000"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    if credential_kind == "inactive":
+        iam_svc._access_keys.set_scoped(account, None, key, {
+            "UserName": "alice", "Status": "Inactive", "SecretAccessKey": "secret",
+        })
+    if credential_kind == "expired":
+        sts_svc._sessions[key] = {
+            "Arn": f"arn:aws:sts::{account}:assumed-role/role/session",
+            "UserId": "role:session", "SecretAccessKey": "secret",
+            "Expiration": time.time() - 60,
+        }
+    previous = set(sts_svc._sessions)
+    try:
+        with request_scope(account, "us-east-1"):
+            status, _, _ = asyncio.run(sts_svc.handle_request(
+                "GET", "/", {
+                    "authorization": f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request",
+                }, b"", {
+                    "Action": [action], "RoleArn": [f"arn:aws:iam::{account}:role/role"],
+                    "RoleSessionName": ["session"],
+                },
+            ))
+        assert status == (403 if auth_enabled else 200)
+    finally:
+        iam_svc._access_keys.pop_scoped(account, None, key, None)
+        for created in set(sts_svc._sessions) - previous:
+            sts_svc._sessions.pop(created, None)
+        sts_svc._sessions.pop(key, None)
+
+
 def test_sts_assume_role_with_web_identity(sts, iam):
     iam.create_role(
         RoleName="test-oidc-role",

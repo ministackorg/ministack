@@ -16,7 +16,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.aws_credentials import CredentialResolutionError, resolve_credential
+from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
 from ministack.core.responses import get_account_id, json_response, new_uuid
 from ministack.core.router import extract_access_key_id
 

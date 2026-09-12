@@ -3863,7 +3863,8 @@ def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts):
     for bad_token in (None, "wrong-session-token"):
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(presign(bad_token))
-        assert exc.value.code == 403
+        # S3's error table: InvalidToken is 400, not 403.
+        assert exc.value.code == 400
         assert b"<Code>InvalidToken</Code>" in exc.value.read()
 
 
@@ -3901,6 +3902,90 @@ def test_s3_presigned_url_accepts_lenient_session_origin(s3):
     )
 
     assert urllib.request.urlopen(url).status == 200
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("bad_token", [False, True])
+def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_token):
+    from urllib.parse import parse_qs, urlsplit
+
+    import boto3
+    from botocore.config import Config
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import s3 as s3_svc
+
+    key = "test-presign-mode-key"
+    owner = "123456789012"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    client = boto3.client(
+        "s3", endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key="secret",
+        aws_session_token="unexpected-token" if bad_token else None,
+        config=Config(signature_version="s3v4"),
+    )
+    url = urlsplit(client.generate_presigned_url(
+        "get_object", Params={"Bucket": "test-bucket", "Key": "object"},
+    ))
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            error = s3_svc._verify_presigned_sigv4(
+                "GET", url.path, {"host": url.netloc}, parse_qs(url.query),
+            )
+            assert get_account_id() == owner
+            if bad_token:
+                assert error[0] == 400
+            else:
+                assert error is None
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+
+
+def test_presigned_mrap_resolves_alias_in_iam_owner_account(monkeypatch):
+    import asyncio
+    from urllib.parse import parse_qs, urlsplit
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import s3 as s3_svc
+
+    key, owner, alias = "test-mrap-owner-key", "123456789012", "testalias.mrap"
+    host = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    request = AWSRequest(method="GET", url=f"http://{host}/object")
+    S3SigV4QueryAuth(Credentials(key, "secret"), "s3", "us-east-1").add_auth(request)
+    url = urlsplit(request.url)
+    routed = []
+
+    async def capture(method, path, headers, body, query_params, **kwargs):
+        routed.append((get_account_id(), path))
+        return 200, {}, b"object"
+
+    monkeypatch.setattr(s3_svc, "handle_request", capture)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    s3_svc._mraps.set_scoped(owner, None, alias, {"Regions": ["member-bucket"]})
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            result = asyncio.run(app_mod._handle_s3_vhost_request(
+                host, url.path, "GET", {"host": host}, b"", parse_qs(url.query),
+            ))
+        assert result[0] == 200
+        assert routed == [(owner, "/member-bucket/object")]
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+        s3_svc._mraps.pop_scoped(owner, None, alias, None)
 
 
 def test_s3_presigned_url_virtual_hosted_style_is_verified():
