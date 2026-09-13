@@ -1247,12 +1247,6 @@ def _frames_by_topic(received):
     return {topic: json.loads(payload) for topic, payload in received}
 
 
-def _assert_epoch_seconds(value):
-    """Stamps must be whole epoch seconds — milliseconds are off by 1000x."""
-    assert isinstance(value, int)
-    assert abs(value - time.time()) < 5 * 60
-
-
 def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client):
     """CreateJob publishes notify (per-status aggregate) + notify-next (full
     execution incl. the jobDocument as an object) to each target thing; a
