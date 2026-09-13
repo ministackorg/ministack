@@ -1282,6 +1282,13 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
+    # Seeded from the record, not from a literal: the endpoint overlays the
+    # live status on every read, so a literal here would only ever be read for
+    # a task that no longer has one, and it would be wrong then too.
+    desired, known, per_container = (
+        metadata_task_status(task_arn) or ("RUNNING", "PENDING", {})
+    )
+    container_known = per_container.get(cdef["name"]) or known
     ecs_metadata.register_container(
         token,
         task_arn,
@@ -1290,8 +1297,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
             "TaskARN": task_arn,
             "Family": td.get("family", ""),
             "Revision": str(td.get("revision", 1)),
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": known,
             "AvailabilityZone": f"{get_region()}a",
             "LaunchType": launch_type,
         },
@@ -1306,8 +1313,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
                 "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
                 "com.amazonaws.ecs.cluster": cluster_arn,
             },
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": container_known,
             "Type": "NORMAL",
         },
     )
@@ -1456,6 +1463,45 @@ def _resolve_container_secrets(cdef):
                     f"{value_from} for environment variable {name}")
         resolved[name] = str(value)
     return resolved
+
+
+def metadata_task_status(task_arn):
+    """Status for the task metadata endpoint, or None when the task is gone.
+
+    Returns ``(desiredStatus, lastStatus, {container name: lastStatus})``. The
+    endpoint reports a task's status, and a task's status changes after the
+    metadata is registered: it is `PENDING` when `RunTask` answers, `ACTIVATING`
+    for the pull and `RUNNING` once the container is up. Serving the record
+    rather than a value captured at registration is what keeps
+    `${ECS_CONTAINER_METADATA_URI_V4}/task` agreeing with `DescribeTasks`.
+
+    A container's own status is carried separately because the two really do
+    differ: a live Fargate task served `"KnownStatus": "NONE"` for the task and
+    `"KnownStatus": "RUNNING"` for the container in the same payload, read by
+    the container itself while it was starting. `DesiredStatus` is the task's
+    on both, which is what flips to STOPPED when the task is being shut down.
+
+    The lookup is scoped by the account and the region in the task ARN, not by
+    the request's: a container reaches this endpoint with a path token and no
+    SigV4, so the request resolves under the default account and region
+    whatever the task was created under.
+    """
+    try:
+        spec = parse_arn(task_arn)
+    except ArnParseError:
+        return None
+    task = _tasks.get_scoped(spec.account_id, spec.region, task_arn)
+    if task is None:
+        return None
+    return (
+        task.get("desiredStatus") or "RUNNING",
+        task.get("lastStatus") or "PENDING",
+        {
+            c["name"]: c.get("lastStatus")
+            for c in task.get("containers", [])
+            if c.get("name")
+        },
+    )
 
 
 def _task_is_active(task_arn, task):

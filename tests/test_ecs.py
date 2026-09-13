@@ -237,6 +237,50 @@ def test_ecs_run_task_metadata_v4(ecs):
     assert success, "Task should transition to STOPPED"
 
 
+def test_ecs_restore_helpers_are_defined_before_the_import_time_restore():
+    """Everything `restore_state` calls must be bound before the module runs it.
+
+    `ecs.py` calls `restore_state(_restored)` at module level, so a helper it
+    reaches that is defined further down the file raises NameError there. The
+    surrounding try/except catches it and ALL ECS state fails to restore, which
+    is only visible under PERSIST_STATE=1 and never in a test that calls
+    `restore_state` after the import. The file already carries `_attributes`
+    at the top for exactly this reason; this keeps the next one honest.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(ecs_service))
+    defined_at = {
+        node.name: node.lineno
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    restore = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "restore_state"
+    )
+    call_line = next(
+        n.lineno for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "restore_state"
+        and n.col_offset == 8  # the module-level try: block, not a nested call
+    )
+
+    late = sorted({
+        node.id
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        and node.id in defined_at and defined_at[node.id] > call_line
+    })
+    assert not late, (
+        f"restore_state reaches {late}, defined after the import-time call at "
+        f"line {call_line}; move them above it or the warm-boot restore dies "
+        f"silently"
+    )
+
+
 def test_ecs_run_task_applies_container_command_overrides(monkeypatch):
     """RunTask containerOverrides.command should reach Docker run kwargs."""
     from ministack.services import ecs as _ecs
@@ -1759,50 +1803,6 @@ def _version_probe_docker(container):
             return container
 
     return SimpleNamespace(containers=FakeContainers())
-
-
-def test_ecs_restore_helpers_are_defined_before_the_import_time_restore():
-    """Everything `restore_state` calls must be bound before the module runs it.
-
-    `ecs.py` calls `restore_state(_restored)` at module level, so a helper it
-    reaches that is defined further down the file raises NameError there. The
-    surrounding try/except catches it and ALL ECS state fails to restore, which
-    is only visible under PERSIST_STATE=1 and never in a test that calls
-    `restore_state` after the import. The file already carries `_attributes`
-    at the top for exactly this reason; this keeps the next one honest.
-    """
-    import ast
-    import inspect
-
-    tree = ast.parse(inspect.getsource(ecs_service))
-    defined_at = {
-        node.name: node.lineno
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    restore = next(
-        n for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "restore_state"
-    )
-    call_line = next(
-        n.lineno for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "restore_state"
-        and n.col_offset == 8  # the module-level try: block, not a nested call
-    )
-
-    late = sorted({
-        node.id
-        for node in ast.walk(restore)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-        and node.id in defined_at and defined_at[node.id] > call_line
-    })
-    assert not late, (
-        f"restore_state reaches {late}, defined after the import-time call at "
-        f"line {call_line}; move them above it or the warm-boot restore dies "
-        f"silently"
-    )
 
 
 def test_ecs_task_version_counts_state_changes(monkeypatch):
