@@ -181,6 +181,8 @@ def get_state():
         t = copy.deepcopy(task)
         t.pop("_docker_ids", None)
         t.pop("_metadata_tokens", None)
+        # The container is gone with the process; its address must not outlive it.
+        t.pop("_container_ip", None)
         tasks._data[scoped_key] = t
     state["tasks"] = tasks
     return state
@@ -253,12 +255,16 @@ def restore_state(data):
         for scoped_key, task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             _tasks._data[scoped_key] = restored_task
     elif isinstance(tasks_data, AccountScopedDict):
         for (account_id, arn), task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(account_id, region, arn, restored_task)
@@ -266,6 +272,8 @@ def restore_state(data):
         for arn, task in tasks_data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(get_account_id(), region, arn, restored_task)
@@ -734,29 +742,78 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
     }
 
 
-def _record_task_ip(task, container, ecs_network):
-    """Store the container's address on the task as an ENI attachment.
+def _requested_subnet(data):
+    """The first subnet of a RunTask/CreateService awsvpcConfiguration, if any.
 
-    Real awsvpc tasks expose it as attachments[].details[privateIPv4Address], which
-    is where an ALB target group and DescribeTasks both look for it.
+    Nothing else read the request's network configuration until now, so this
+    cannot assume the shape the SDK would have sent: a body that names it as
+    anything but the documented object has no subnet to report.
+
+    Both casings are read. A service created through CloudFormation keeps the
+    template's `NetworkConfiguration` verbatim (provisioners.py, the
+    AWS::ECS::Service handler) and replays it here, so the camelCase lookup
+    alone would miss every CFN-defined service.
     """
-    if task.get("attachments"):
-        return
+    network = data.get("networkConfiguration")
+    if not isinstance(network, dict):
+        return None
+    config = network.get("awsvpcConfiguration") or network.get("AwsvpcConfiguration")
+    if not isinstance(config, dict):
+        return None
+    subnets = config.get("subnets") or config.get("Subnets")
+    if not isinstance(subnets, list) or not subnets:
+        return None
+    return subnets[0] if isinstance(subnets[0], str) else None
+
+
+def _container_ip(container, ecs_network):
     try:
         container.reload()
         nets = container.attrs["NetworkSettings"]["Networks"]
-        ip = (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
+        return (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
     except Exception:
-        ip = None
+        return None
+
+
+def _record_task_ip(task, container, ecs_network):
+    """Store the container's address on the task.
+
+    The Task reference calls `attachments` "The Elastic Network Adapter that's
+    associated with the task if the task uses the `awsvpc` network mode", so a
+    bridge or host task has none: its ports are published on the container
+    instance and that is where a consumer reads its address. Only an awsvpc task
+    gets the attachment, and it carries the subnet the request placed it in
+    alongside the address, two of the four members the Attachment reference
+    names for an elastic network interface.
+
+    The address is kept on the task in either mode, under an internal key, for
+    the target-group sync. The first container to report one owns it: a
+    two-container task on AWS reports one attachment and both containers name
+    that one address, so the sync must not follow a sidecar around. Each
+    container calls this from its own thread, so the guard and the write it
+    protects share the task lock; the docker round trip stays outside it.
+    """
+    if task.get("_container_ip") or task.get("attachments"):
+        return
+    ip = _container_ip(container, ecs_network)
     if not ip:
         return
-    task["attachments"] = [{
-        "id": new_uuid(),
-        "type": "ElasticNetworkInterface",
-        "status": "ATTACHED",
-        "details": [{"name": "privateIPv4Address", "value": ip}],
-    }]
-    task["attachmentsStatus"] = "ATTACHED"
+    with resource_lock("ecs-task", task.get("taskArn", "")):
+        if task.get("_container_ip") or task.get("attachments"):
+            return
+        task["_container_ip"] = ip
+        if task.get("_network_mode") != "awsvpc":
+            return
+        details = [{"name": "privateIPv4Address", "value": ip}]
+        subnet = task.get("_subnet")
+        if subnet:
+            details.insert(0, {"name": "subnetId", "value": subnet})
+        task["attachments"] = [{
+            "id": new_uuid(),
+            "type": "ElasticNetworkInterface",
+            "status": "ATTACHED",
+            "details": details,
+        }]
 
 
 def _task_ip(task):
@@ -764,7 +821,7 @@ def _task_ip(task):
         for d in att.get("details") or []:
             if d.get("name") == "privateIPv4Address":
                 return d.get("value")
-    return None
+    return task.get("_container_ip")
 
 
 def _sync_service_targets(cluster_name, svc):
@@ -1737,6 +1794,11 @@ def _run_task(data):
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
     initial_status = "PENDING" if docker_backed else "RUNNING"
+    # The network mode decides whether a task reports an ENI attachment at all,
+    # and the subnet is one of the members that attachment carries. Both are read
+    # when the container comes up, so they ride on the record until then.
+    network_mode = td.get("networkMode")
+    subnet = _requested_subnet(data)
 
     tasks = []
     failures = []
@@ -1787,6 +1849,8 @@ def _run_task(data):
             "group": group,
             "startedBy": started_by,
             "version": 1,
+            "_network_mode": network_mode,
+            "_subnet": subnet,
             "containers": containers,
             "attachments": [],
             "availabilityZone": f"{region}a",

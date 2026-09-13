@@ -2139,6 +2139,219 @@ def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
     assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
 
 
+def _eni_probe_docker(ip):
+    class FakeContainer:
+        id = "container-000000000002"
+        attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            return FakeContainer()
+
+    return SimpleNamespace(containers=FakeContainers())
+
+
+def test_ecs_awsvpc_attachment_carries_the_subnet_it_was_placed_in(monkeypatch):
+    """The attachment names the subnet the request asked for, one of the members
+    the Attachment reference lists for an elastic network interface."""
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.11"))
+    _ecs._register_task_definition({
+        "family": "eni-subnet-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-subnet-c",
+        "taskDefinition": "eni-subnet-td",
+        "networkConfiguration": {"awsvpcConfiguration": {
+            "subnets": ["subnet-0a1b2c3d", "subnet-9f8e7d6c"],
+        }},
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details["subnetId"] == "subnet-0a1b2c3d"
+    assert details["privateIPv4Address"] == "172.30.0.11"
+
+
+def test_ecs_awsvpc_attachment_reads_the_cloudformation_casing(monkeypatch):
+    """A CloudFormation service replays its template's `NetworkConfiguration`.
+
+    The AWS::ECS::Service handler stores the template block verbatim, so it
+    reaches RunTask in PascalCase. Reading only the SDK's casing would leave
+    every CFN-defined service's tasks without a subnet.
+    """
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.41"))
+    _ecs._register_task_definition({
+        "family": "eni-cfncase-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-cfncase-c",
+        "taskDefinition": "eni-cfncase-td",
+        "networkConfiguration": {"AwsvpcConfiguration": {
+            "Subnets": ["subnet-cfn00001"],
+        }},
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details["subnetId"] == "subnet-cfn00001"
+
+
+@pytest.mark.parametrize("network_configuration", [
+    None,
+    {},
+    {"awsvpcConfiguration": {}},
+    {"awsvpcConfiguration": {"subnets": []}},
+])
+def test_ecs_awsvpc_attachment_without_a_usable_subnet(monkeypatch, network_configuration):
+    """A guard: the request's network configuration is not read anywhere else,
+    so a body that leaves it out or leaves it empty must still start the task
+    and report the attachment, just without a subnet."""
+    from ministack.services import ecs as _ecs
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.13"))
+    _ecs._register_task_definition({
+        "family": f"eni-nosubnet-td-{uid}",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    request = {"cluster": "eni-nosubnet-c", "taskDefinition": f"eni-nosubnet-td-{uid}"}
+    if network_configuration is not None:
+        request["networkConfiguration"] = network_configuration
+    task_arn = json.loads(_ecs._run_task(request)[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details == {"privateIPv4Address": "172.30.0.13"}
+
+
+def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
+    """A restart stops every restored task, which is a change to the record:
+    without the bump a consumer's pre-restart copy still compares equal to a
+    task that is no longer running.
+
+    The saved state also drops the address the container had. That key is what
+    the live target-group sync reads, and the container it named is gone with
+    the process. The attachment keeps its own copy, which is right: AWS reports
+    a stopped task's attachment too, with the interface already DELETED.
+    """
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("restore-version-container")
+    container.attrs = {"NetworkSettings": {"Networks": {"n": {"IPAddress": "172.30.0.31"}}}}
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "restore-version-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "restore-version-c",
+        "taskDefinition": "restore-version-td",
+    })[2])["tasks"][0]["taskArn"]
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+    _wait_until(lambda: _ecs._tasks[task_arn].get("_container_ip"))
+    running_version = _ecs._tasks[task_arn]["version"]
+
+    state = _ecs.get_state()
+    saved = [t for t in state["tasks"]._data.values() if t["taskArn"] == task_arn][0]
+    assert _ecs._tasks[task_arn]["_container_ip"] == "172.30.0.31"
+    assert "_container_ip" not in saved
+    _ecs.reset()
+    _ecs.restore_state(state)
+
+    restored = _ecs._tasks[task_arn]
+    assert restored["lastStatus"] == "STOPPED"
+    assert restored["version"] == running_version + 1
+
+    # Restoring an already stopped task is not a transition.
+    state = _ecs.get_state()
+    _ecs.reset()
+    _ecs.restore_state(state)
+    assert _ecs._tasks[task_arn]["version"] == running_version + 1
+
+
+def test_ecs_bridge_task_reports_no_eni_attachment(monkeypatch):
+    """`attachments` is documented as the adapter a task has "if the task uses
+    the awsvpc network mode", so a bridge task reports none. Its address is still
+    known, which is what the target-group sync reads."""
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.12"))
+    _ecs._register_task_definition({
+        "family": "eni-bridge-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-bridge-c",
+        "taskDefinition": "eni-bridge-td",
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._task_ip(_ecs._tasks[task_arn]) == "172.30.0.12")
+    task = _ecs._tasks[task_arn]
+    assert task["attachments"] == []
+    assert "attachmentsStatus" not in task
+    described = json.loads(_ecs._describe_tasks({
+        "cluster": "eni-bridge-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert described["attachments"] == []
+    assert "_container_ip" not in described
+
+
+@pytest.mark.parametrize("mode", ["awsvpc", "bridge"])
+def test_ecs_first_container_to_report_an_address_owns_it(mode):
+    """A task has one address, not one per container.
+
+    A two-container awsvpc task on AWS reports a single attachment, and both
+    containers name that one attachment and that one private address. Each
+    container here calls _record_task_ip from its own thread, so without the
+    guard a sidecar coming up second would move the task's address, and with it
+    the target a load balancer is pointed at.
+    """
+    from ministack.services import ecs as _ecs
+
+    class FakeContainer:
+        def __init__(self, ip):
+            self.attrs = {"NetworkSettings": {"Networks": {"n": {"IPAddress": ip}}}}
+
+        def reload(self):
+            pass
+
+    task = {
+        "taskArn": f"arn:aws:ecs:us-east-1:000000000000:task/c/first-owner-{mode}",
+        "_network_mode": mode,
+        "_subnet": "subnet-0a1b2c3d",
+        "attachments": [],
+    }
+    _ecs._record_task_ip(task, FakeContainer("172.30.0.21"), "n")
+    _ecs._record_task_ip(task, FakeContainer("172.30.0.22"), "n")
+
+    assert _ecs._task_ip(task) == "172.30.0.21"
+    assert len(task["attachments"]) == (1 if mode == "awsvpc" else 0)
+
+
 def test_ecs_sync_service_targets_selects_tasks_by_group(monkeypatch):
     """Target selection must use the same predicate as the service's own recount.
 
