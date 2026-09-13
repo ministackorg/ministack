@@ -5,6 +5,15 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **EKS — Pod Identity associations** — the five operations did not exist, so a controller that reads pod identity to find its role (the AWS Load Balancer Controller among them) could not run against MiniStack at all. `CreatePodIdentityAssociation`, `DescribePodIdentityAssociation`, `ListPodIdentityAssociations` (filtered by `namespace` and `serviceAccount`), `UpdatePodIdentityAssociation` and `DeletePodIdentityAssociation` serve the association records, with one association per namespace and service account, an `externalId` minted for a `targetRoleArn` chain, and the summary shape on the list. Nothing runs inside the cluster: the association is a control-plane record, which is what the API serves. Reported by @josephaw1022
+.
+
+### Fixed
+- **S3 — a notification configuration whose destination does not exist is refused** — `PutBucketNotificationConfiguration` stored the configuration and swallowed the failed test delivery, so a queue or topic that was not there looked like a successful setup and no event ever arrived. AWS verifies an SNS or SQS destination by sending it a test notification, and "if the message fails, the entire PUT action will fail, and Amazon S3 will not add the configuration to your bucket": a missing queue or topic is now `InvalidArgument` (400) with nothing stored. A Lambda destination is still not checked, since AWS verifies that one through the function's permissions. Reported by @ortizgui.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added
