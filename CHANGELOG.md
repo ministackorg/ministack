@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **ECS — a task's `version` counts its state changes** — the counter was minted at `1` and never moved again, so a consumer holding an older `DescribeTasks` copy could not tell it from the current one, which is the comparison the field exists for. It now increments on each transition the record reports: the move to `ACTIVATING`, the move to `RUNNING`, the move to `STOPPED` whether it came from `StopTask`, an essential container exiting or a failed start, and the restore after a restart that stops a task that was running. A real task counts the same way, measured on a Fargate task polled through `DescribeTasks`: `1` at `PROVISIONING`, `2` at `PENDING`, `3` at `RUNNING`, `4` when `StopTask` set `desiredStatus`, `5` at `DEPROVISIONING`, `6` at `STOPPED`. There are no task state change events here, so the counter is what `DescribeTasks`, `RunTask` and `StopTask` report and nothing else. Contributed by @iot-rocket.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added

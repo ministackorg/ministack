@@ -1722,6 +1722,157 @@ def test_ecs_reset_during_pending_start_cleans_late_container(monkeypatch):
     assert task_arn not in _ecs._tasks
 
 
+def _version_probe_container(cid):
+    class FakeContainer:
+        def __init__(self):
+            self.id = cid
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+            self.removed = False
+
+        def reload(self):
+            pass
+
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **kwargs):
+            self.removed = True
+
+    return FakeContainer()
+
+
+def _version_probe_docker(container):
+    class FakeContainers:
+        def get(self, name):
+            if name == container.id:
+                return container
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return [container]
+
+        def run(self, image, **kwargs):
+            return container
+
+    return SimpleNamespace(containers=FakeContainers())
+
+
+def test_ecs_restore_helpers_are_defined_before_the_import_time_restore():
+    """Everything `restore_state` calls must be bound before the module runs it.
+
+    `ecs.py` calls `restore_state(_restored)` at module level, so a helper it
+    reaches that is defined further down the file raises NameError there. The
+    surrounding try/except catches it and ALL ECS state fails to restore, which
+    is only visible under PERSIST_STATE=1 and never in a test that calls
+    `restore_state` after the import. The file already carries `_attributes`
+    at the top for exactly this reason; this keeps the next one honest.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(ecs_service))
+    defined_at = {
+        node.name: node.lineno
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    restore = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "restore_state"
+    )
+    call_line = next(
+        n.lineno for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "restore_state"
+        and n.col_offset == 8  # the module-level try: block, not a nested call
+    )
+
+    late = sorted({
+        node.id
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        and node.id in defined_at and defined_at[node.id] > call_line
+    })
+    assert not late, (
+        f"restore_state reaches {late}, defined after the import-time call at "
+        f"line {call_line}; move them above it or the warm-boot restore dies "
+        f"silently"
+    )
+
+
+def test_ecs_task_version_counts_state_changes(monkeypatch):
+    """The version counter moves on every transition the record reports, so a
+    consumer can tell a stale copy from the current one."""
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("version-counter-container")
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "version-counter-td",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    response = _ecs._run_task({
+        "cluster": "version-counter-c",
+        "taskDefinition": "version-counter-td",
+    })
+    task = json.loads(response[2])["tasks"][0]
+    task_arn = task["taskArn"]
+    assert task["lastStatus"] == "PENDING"
+    assert task["version"] == 1
+
+    # 3, not 2: the task passes through ACTIVATING on its way to RUNNING, and
+    # that is a state this record reports, so it counts like the others.
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+    assert _ecs._tasks[task_arn]["version"] == 3
+
+    stopped = json.loads(_ecs._stop_task({
+        "cluster": "version-counter-c",
+        "task": task_arn,
+        "reason": "done here",
+    })[2])["task"]
+    assert stopped["lastStatus"] == "STOPPED"
+    assert stopped["version"] == 4
+
+
+def test_ecs_task_version_moves_once_for_a_natural_exit(monkeypatch):
+    """The exit is observed by whichever DescribeTasks notices it first; the
+    ones after it describe the same version."""
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("version-exit-container")
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "version-exit-td",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "version-exit-c",
+        "taskDefinition": "version-exit-td",
+    })[2])["tasks"][0]["taskArn"]
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+
+    container.status = "exited"
+    described = json.loads(_ecs._describe_tasks({
+        "cluster": "version-exit-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert described["lastStatus"] == "STOPPED"
+    assert described["version"] == 4
+
+    again = json.loads(_ecs._describe_tasks({
+        "cluster": "version-exit-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert again["version"] == 4
+
+
 def test_ecs_secret_resolution_failure_stops_before_docker_run(monkeypatch):
     from ministack.services import ecs as _ecs
 

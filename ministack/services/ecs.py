@@ -77,6 +77,23 @@ _capacity_providers = AccountRegionScopedDict()
 # try/except swallows it, and ALL ECS state silently fails to restore.
 _attributes = AccountRegionScopedDict()
 
+
+# Up here for the same reason as `_attributes`: the import-time `load_state`
+# block calls `restore_state`, which counts the tasks it stops, so this has to
+# be bound before that runs. Defined further down it raises NameError there,
+# the surrounding try/except swallows it, and ALL ECS state fails to restore.
+def _bump_task_version(task):
+    """Count one observable change on the task.
+
+    The Task reference calls ``version`` the counter a consumer compares against
+    the version an event carries, to tell a stale copy of the record from the
+    current one. A real task counts its whole lifecycle: a Fargate task polled
+    through DescribeTasks reported 1 at PROVISIONING, 2 at PENDING, 3 at
+    RUNNING, 4 when StopTask set desiredStatus, 5 at DEPROVISIONING, 6 at
+    STOPPED. The emulator counts the states it has.
+    """
+    task["version"] = int(task.get("version") or 1) + 1
+
 _docker = None
 
 # ECS exited-container reaper. Every ministack=ecs container we start via
@@ -1442,6 +1459,7 @@ def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        _bump_task_version(task)
         task["lastStatus"] = "STOPPED"
         task["desiredStatus"] = "STOPPED"
         task["stoppingAt"] = task.get("stoppingAt") or now
@@ -1473,6 +1491,7 @@ def _mark_task_activating(task_arn, task):
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
+        _bump_task_version(task)
         task["lastStatus"] = "ACTIVATING"
         task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
 
@@ -1491,6 +1510,7 @@ def _mark_task_running(task_arn, task):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        _bump_task_version(task)
         task["lastStatus"] = "RUNNING"
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
