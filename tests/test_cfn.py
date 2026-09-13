@@ -8417,6 +8417,70 @@ Outputs:
     assert "rgn-test-us-east-2" in buckets
 
 
+def test_cfn_cognito_user_pool_client_getatt_client_secret(cfn, cognito_idp):
+    """The type's Fn::GetAtt attributes are ClientId, ClientSecret and Name.
+    Only ClientId was returned, so a template reading the secret (Serverless
+    Framework emits one) failed with "Requested attribute ClientSecret does
+    not exist in schema" and rolled the whole stack back, on create and on
+    the update that follows it. Reported by @JoshuaSmeda."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-upc-getatt-pool
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Pool
+      ClientName: %s
+      GenerateSecret: true
+  Plain:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Pool
+      ClientName: plain
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ClientId:
+    Value: !GetAtt Client.ClientId
+  ClientSecret:
+    Value: !GetAtt Client.ClientSecret
+  ClientName:
+    Value: !GetAtt Client.Name
+  PlainSecret:
+    Value: !GetAtt Plain.ClientSecret
+"""
+    stack_name = f"cfn-upc-getatt-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template % "getatt-demo")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+        described = cognito_idp.describe_user_pool_client(
+            UserPoolId=outputs["PoolId"], ClientId=outputs["ClientId"],
+        )["UserPoolClient"]
+        assert outputs["ClientSecret"] == described["ClientSecret"]
+        assert outputs["ClientName"] == "getatt-demo"
+        # A client created without GenerateSecret has no secret; the
+        # attribute reads empty rather than failing the template.
+        assert outputs["PlainSecret"] == ""
+
+        # Serverless Framework always follows the create with an update, and
+        # that path resolved the attributes too.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template % "getatt-demo-2")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        assert outputs["ClientSecret"] == described["ClientSecret"]
+        assert outputs["ClientName"] == "getatt-demo-2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cognito_user_pool_client_generate_secret(cfn, cognito_idp):
     """CFN AWS::Cognito::UserPoolClient with GenerateSecret=true creates a
     ClientSecret; GenerateSecret=false/absent leaves it None (#403)."""

@@ -5714,8 +5714,23 @@ def _cognito_user_pool_client_create(logical_id, props, stack_name):
     status, _, body = _cognito._create_user_pool_client(payload)
     if status >= 400:
         raise ValueError(f"AWS::Cognito::UserPoolClient create failed: {body!r}")
-    cid = json.loads(body)["UserPoolClient"]["ClientId"]
-    return cid, {"ClientId": cid}
+    client = json.loads(body)["UserPoolClient"]
+    return client["ClientId"], _cognito_user_pool_client_attributes(client)
+
+
+def _cognito_user_pool_client_attributes(client):
+    """The attributes the type reports: ClientId, ClientSecret and Name.
+    ClientSecret is a documented Fn::GetAtt attribute of the type and a
+    template that reads it (Serverless Framework emits one) failed the stack
+    with "does not exist in schema" while the value was right there on the
+    record. A client created without GenerateSecret has none, and the
+    attribute reads empty rather than failing the template.
+    """
+    return {
+        "ClientId": client.get("ClientId", ""),
+        "ClientSecret": client.get("ClientSecret") or "",
+        "Name": client.get("ClientName", ""),
+    }
 
 
 def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_name,
@@ -5747,7 +5762,9 @@ def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_na
         status, _, body = _cognito._update_user_pool_client(payload)
         if status >= 400:
             raise ValueError(f"AWS::Cognito::UserPoolClient update failed: {body!r}")
-    return physical_id, {"ClientId": physical_id}
+    pool = _cognito._user_pools.get(new_props.get("UserPoolId", "")) or {}
+    client = (pool.get("_clients") or {}).get(physical_id) or {"ClientId": physical_id}
+    return physical_id, _cognito_user_pool_client_attributes(client)
 
 
 def _cognito_user_pool_client_delete(physical_id, props):
