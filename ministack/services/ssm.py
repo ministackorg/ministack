@@ -296,7 +296,12 @@ def _put_parameter(data):
 
     stored_value = value
     if param_type == "SecureString":
-        key_id = data.get("KeyId", "alias/aws/ssm")
+        # "If you don't specify a key ID, the system uses the default key
+        # associated with your Amazon Web Services account" — an AWS managed
+        # key, whose alias has the form aws/<service-name> and which the API
+        # names with the alias/ prefix (KMS concepts: alias/aws/s3 is the S3
+        # one). An empty KeyId on the request is the same as none.
+        key_id = data.get("KeyId") or "alias/aws/ssm"
         stored_value = f"ENCRYPTED:{base64.b64encode(value.encode()).decode()}"
     else:
         key_id = ""
@@ -517,6 +522,13 @@ def _describe_parameters(data):
             "Tier": param.get("Tier", "Standard"),
             "AllowedPattern": param.get("AllowedPattern", ""),
         }
+        # ParameterMetadata.KeyId is "the alias of the KMS key used to encrypt
+        # the parameter. Applies to SecureString parameters only", so it is
+        # reported for those and omitted for the rest. A caller that reads it
+        # back (Terraform's aws_ssm_parameter) plans the same in-place update
+        # on every run while the member is missing.
+        if param.get("KeyId"):
+            desc["KeyId"] = param["KeyId"]
         if param.get("Policies"):
             desc["Policies"] = param["Policies"]
         results.append(desc)
@@ -591,6 +603,9 @@ def _get_parameter_history(data):
             "Labels": entry.get("Labels", []),
             "Policies": entry.get("Policies", []),
         }
+        # ParameterHistory carries the same member as ParameterMetadata.
+        if entry.get("KeyId"):
+            out["KeyId"] = entry["KeyId"]
         if with_decryption or entry["Type"] != "SecureString":
             out["Value"] = entry.get("OriginalValue", entry["Value"])
         else:

@@ -2726,6 +2726,10 @@ def _cwlogs_create(logical_id, props, stack_name):
         "arn": arn,
         "creationTime": int(time.time() * 1000),
         "retentionInDays": int(retention) if retention else None,
+        # DescribeLogGroups reports the class on every group; the API's
+        # default when the template names none is STANDARD.
+        "logGroupClass": props.get("LogGroupClass") or "STANDARD",
+        "kmsKeyId": props.get("KmsKeyId") or None,
         "tags": _tag_map(props.get("Tags")),
         "streams": {},
         "subscriptionFilters": {},
@@ -2748,6 +2752,10 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         return replaced
     retention = new_props.get("RetentionInDays")
     group["retentionInDays"] = int(retention) if retention else None
+    # LogGroupClass and KmsKeyId are Mutable on the resource reference; the
+    # API refuses a class change after creation, so the record keeps the one
+    # it was created with and only the key moves.
+    group["kmsKeyId"] = new_props.get("KmsKeyId") or None
     _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": group["arn"]}
 

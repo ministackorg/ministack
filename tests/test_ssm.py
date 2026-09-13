@@ -254,6 +254,48 @@ def test_ssm_secure_string_not_decrypted_by_default(ssm):
     assert resp2["Parameter"]["Value"] == "mysecret"
 
 
+def test_ssm_describe_parameters_reports_the_key_for_a_secure_string(ssm):
+    """ParameterMetadata.KeyId is "the alias of the AWS KMS key used to
+    encrypt the parameter. Applies to SecureString parameters only", so
+    DescribeParameters reports it for a SecureString and omits it for the
+    rest. Without it Terraform's aws_ssm_parameter records an empty key_id
+    and plans the same in-place update on every run.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    default_key = f"/qa/ssm/keyid/default-{suffix}"
+    custom_key = f"/qa/ssm/keyid/custom-{suffix}"
+    plain = f"/qa/ssm/keyid/plain-{suffix}"
+    custom = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555"
+    ssm.put_parameter(Name=default_key, Value="s", Type="SecureString")
+    ssm.put_parameter(Name=custom_key, Value="s", Type="SecureString", KeyId=custom)
+    ssm.put_parameter(Name=plain, Value="p", Type="String")
+    try:
+        def described(name):
+            found = ssm.describe_parameters(
+                ParameterFilters=[{"Key": "Name", "Values": [name]}])["Parameters"]
+            assert found, name
+            return found[0]
+
+        # No KeyId on the request: the account's default SSM key, an AWS
+        # managed key, whose alias has the form aws/<service-name>.
+        assert described(default_key)["KeyId"] == "alias/aws/ssm"
+        assert described(custom_key)["KeyId"] == custom
+        assert "KeyId" not in described(plain)
+
+        # ParameterHistory carries the same member.
+        history = ssm.get_parameter_history(Name=default_key)["Parameters"]
+        assert history[-1]["KeyId"] == "alias/aws/ssm"
+        assert "KeyId" not in ssm.get_parameter_history(Name=plain)["Parameters"][-1]
+
+        # GetParameter's Parameter shape has no KeyId member.
+        assert "KeyId" not in ssm.get_parameter(Name=default_key)["Parameter"]
+    finally:
+        for name in (default_key, custom_key, plain):
+            ssm.delete_parameter(Name=name)
+
+
 def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
     """GetParametersByPath with Path=/ and Recursive=False should only return top-level params."""
     ssm.put_parameter(Name="/toplevel", Value="top", Type="String", Overwrite=True)

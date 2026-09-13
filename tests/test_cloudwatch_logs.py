@@ -641,6 +641,59 @@ def test_logs_describe_includes_log_group_arn_without_star(logs):
     assert ":*" not in described["logGroupArn"].split("log-group:")[-1]
 
 
+def test_logs_describe_reports_the_log_group_class(logs):
+    """DescribeLogGroups reports logGroupClass on every group: the member is
+    on the LogGroup shape, CreateLogGroup takes it, and "if you omit this
+    parameter, the default of STANDARD is used". A consumer that reads it
+    back (Terraform's aws_cloudwatch_log_group) plans a replacement when the
+    member is missing. Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    default_group = f"/intg/lg-class/{_uuid.uuid4().hex[:8]}"
+    ia_group = f"/intg/lg-class-ia/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=default_group)
+    logs.create_log_group(logGroupName=ia_group, logGroupClass="INFREQUENT_ACCESS")
+    try:
+        described = logs.describe_log_groups(logGroupNamePrefix=default_group)["logGroups"][0]
+        assert described["logGroupClass"] == "STANDARD"
+        described = logs.describe_log_groups(logGroupNamePrefix=ia_group)["logGroups"][0]
+        assert described["logGroupClass"] == "INFREQUENT_ACCESS"
+    finally:
+        logs.delete_log_group(logGroupName=default_group)
+        logs.delete_log_group(logGroupName=ia_group)
+
+
+def test_logs_create_log_group_refuses_an_unknown_class(logs):
+    """logGroupClass is an enum of three values."""
+    import uuid as _uuid
+
+    group = f"/intg/lg-class-bad/{_uuid.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        logs.create_log_group(logGroupName=group, logGroupClass="ARCHIVE")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert "logGroupClass" in exc.value.response["Error"]["Message"]
+
+
+def test_logs_describe_reports_the_kms_key(logs):
+    """kmsKeyId is on the LogGroup shape and CreateLogGroup takes it; it is
+    reported only when the group has one."""
+    import uuid as _uuid
+
+    key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{_uuid.uuid4()}"
+    group = f"/intg/lg-kms/{_uuid.uuid4().hex[:8]}"
+    plain = f"/intg/lg-nokms/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group, kmsKeyId=key_arn)
+    logs.create_log_group(logGroupName=plain)
+    try:
+        described = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]
+        assert described["kmsKeyId"] == key_arn
+        described = logs.describe_log_groups(logGroupNamePrefix=plain)["logGroups"][0]
+        assert "kmsKeyId" not in described
+    finally:
+        logs.delete_log_group(logGroupName=group)
+        logs.delete_log_group(logGroupName=plain)
+
+
 def test_logs_start_live_tail_receives_put_events(logs):
     """StartLiveTail stays open and receives matching PutLogEvents until disconnect."""
     import threading

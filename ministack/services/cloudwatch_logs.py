@@ -343,6 +343,12 @@ async def handle_request(method, path, headers, body, query_params):
 # Log groups
 # ---------------------------------------------------------------------------
 
+# The log classes CreateLogGroup takes; "If you omit this parameter, the
+# default of STANDARD is used" and "The value of logGroupClass can't be
+# changed after a log group is created".
+_LOG_GROUP_CLASSES = ("STANDARD", "INFREQUENT_ACCESS", "DELIVERY")
+
+
 def _create_log_group(data):
     name = data.get("logGroupName")
     if not name:
@@ -352,10 +358,20 @@ def _create_log_group(data):
             "ResourceAlreadyExistsException",
             f"The specified log group already exists: {name}", 400,
         )
+    group_class = data.get("logGroupClass") or "STANDARD"
+    if group_class not in _LOG_GROUP_CLASSES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{group_class}' at 'logGroupClass' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            f"[{', '.join(_LOG_GROUP_CLASSES)}]", 400,
+        )
     _log_groups[name] = {
         "arn": _make_group_arn(name),
         "creationTime": int(time.time() * 1000),
         "retentionInDays": None,
+        "logGroupClass": group_class,
+        "kmsKeyId": data.get("kmsKeyId") or None,
         "tags": dict(data.get("tags", {})),
         "subscriptionFilters": {},
         "streams": {},
@@ -410,9 +426,16 @@ def _describe_log_groups(data):
                 for s in g["streams"].values()
             ),
             "metricFilterCount": sum(1 for k in _metric_filters if k[0] == n),
+            # Always reported: every log group has a class, and a consumer
+            # that reads it back (Terraform's aws_cloudwatch_log_group) plans
+            # a replacement when the member is missing. A group created before
+            # the field was stored reads as the default.
+            "logGroupClass": g.get("logGroupClass") or "STANDARD",
         }
         if g.get("retentionInDays") is not None:
             entry["retentionInDays"] = g["retentionInDays"]
+        if g.get("kmsKeyId"):
+            entry["kmsKeyId"] = g["kmsKeyId"]
         groups.append(entry)
 
     resp: dict = {"logGroups": groups}

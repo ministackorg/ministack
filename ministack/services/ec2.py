@@ -4242,9 +4242,25 @@ def _sg_xml(sg):
 
 
 def _perm_xml(r):
+    def _range_desc(entry):
+        return (f"<description>{_esc(entry['Description'])}</description>"
+                if isinstance(entry, dict) and entry.get("Description") else "")
+
     ranges = "".join(
-        f"<item><cidrIp>{ip['CidrIp']}</cidrIp></item>"
+        f"<item><cidrIp>{ip['CidrIp']}</cidrIp>{_range_desc(ip)}</item>"
         for ip in r.get("IpRanges", [])
+    )
+    # Every family the permission carries is reported: the members are
+    # ipv6Ranges (cidrIpv6) and prefixListIds (prefixListId) on IpPermission,
+    # and a read that omits them makes a configured IPv6 or prefix-list rule
+    # invisible, so Terraform re-applies it on every plan.
+    ranges6 = "".join(
+        f"<item><cidrIpv6>{_esc(ip6['CidrIpv6'])}</cidrIpv6>{_range_desc(ip6)}</item>"
+        for ip6 in r.get("Ipv6Ranges", []) if isinstance(ip6, dict) and ip6.get("CidrIpv6")
+    )
+    prefixes = "".join(
+        f"<item><prefixListId>{_esc(pl['PrefixListId'])}</prefixListId>{_range_desc(pl)}</item>"
+        for pl in r.get("PrefixListIds", []) if isinstance(pl, dict) and pl.get("PrefixListId")
     )
     groups = ""
     for pair in r.get("UserIdGroupPairs", []):
@@ -4264,7 +4280,8 @@ def _perm_xml(r):
         <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
-        <ipv6Ranges/><prefixListIds/><groups>{groups}</groups>
+        <ipv6Ranges>{ranges6}</ipv6Ranges>
+        <prefixListIds>{prefixes}</prefixListIds><groups>{groups}</groups>
     </item>"""
 
 
@@ -6416,6 +6433,23 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     ebs_opt = _p(params, f"{prefix}.EbsOptimized")
     if ebs_opt:
         data["EbsOptimized"] = ebs_opt.lower() == "true"
+    # MetadataOptions — the IMDS settings of
+    # LaunchTemplateInstanceMetadataOptionsRequest. Dropping them made every
+    # refresh report them as newly added.
+    metadata = {}
+    for member in ("HttpTokens", "HttpEndpoint", "HttpProtocolIpv6", "InstanceMetadataTags"):
+        value = _p(params, f"{prefix}.MetadataOptions.{member}")
+        if value:
+            metadata[member] = value
+    hop_limit = _p(params, f"{prefix}.MetadataOptions.HttpPutResponseHopLimit")
+    if hop_limit:
+        metadata["HttpPutResponseHopLimit"] = int(hop_limit)
+    if metadata:
+        data["MetadataOptions"] = metadata
+    # InstanceInitiatedShutdownBehavior (stop | terminate)
+    shutdown = _p(params, f"{prefix}.InstanceInitiatedShutdownBehavior")
+    if shutdown:
+        data["InstanceInitiatedShutdownBehavior"] = shutdown
     return data
 
 
@@ -6499,6 +6533,23 @@ def _lt_data_xml(data):
         xml += f"<tagSpecificationSet>{inner}</tagSpecificationSet>"
     if data.get("Monitoring"):
         xml += f"<monitoring><enabled>{str(data['Monitoring'].get('Enabled', False)).lower()}</enabled></monitoring>"
+    if data.get("MetadataOptions"):
+        mo = data["MetadataOptions"]
+        # The response shape carries a State the request has no member for;
+        # a template's options are in effect as stored, so it reads applied.
+        inner = f"<state>{_esc(mo.get('State', 'applied'))}</state>"
+        for member, tag in (("HttpTokens", "httpTokens"),
+                            ("HttpPutResponseHopLimit", "httpPutResponseHopLimit"),
+                            ("HttpEndpoint", "httpEndpoint"),
+                            ("HttpProtocolIpv6", "httpProtocolIpv6"),
+                            ("InstanceMetadataTags", "instanceMetadataTags")):
+            if mo.get(member) is not None:
+                inner += f"<{tag}>{_esc(str(mo[member]))}</{tag}>"
+        xml += f"<metadataOptions>{inner}</metadataOptions>"
+    if data.get("InstanceInitiatedShutdownBehavior"):
+        xml += ("<instanceInitiatedShutdownBehavior>"
+                f"{_esc(data['InstanceInitiatedShutdownBehavior'])}"
+                "</instanceInitiatedShutdownBehavior>")
     return xml
 
 

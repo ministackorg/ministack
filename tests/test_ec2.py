@@ -673,6 +673,47 @@ def test_ec2_sg_authorize_revoke_ingress(ec2):
     ec2.delete_security_group(GroupId=sg_id)
 
 
+def test_ec2_describe_security_groups_reports_every_range_family(ec2):
+    """DescribeSecurityGroups reports each family the permission carries.
+    IpPermission has ipRanges, ipv6Ranges and prefixListIds, and each range
+    carries its description; the read rendered the last two as empty
+    elements, so a configured IPv6 or prefix-list rule was invisible and
+    Terraform planned the same egress update on every run.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-families-{suffix}", Description="families")["GroupId"]
+    try:
+        # The shape Terraform's egress block sends for a dual-stack allow-all.
+        ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=[
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[{
+            "IpProtocol": "-1",
+            "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "all v4"}],
+            "Ipv6Ranges": [{"CidrIpv6": "::/0", "Description": "all v6"}],
+        }])
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+            "Ipv6Ranges": [{"CidrIpv6": "2001:db8::/32"}],
+        }])
+
+        described = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+
+        egress = described["IpPermissionsEgress"]
+        assert len(egress) == 1, egress
+        assert egress[0]["IpRanges"] == [{"CidrIp": "0.0.0.0/0", "Description": "all v4"}]
+        assert egress[0]["Ipv6Ranges"] == [{"CidrIpv6": "::/0", "Description": "all v6"}]
+
+        ingress = described["IpPermissions"]
+        assert len(ingress) == 1, ingress
+        assert ingress[0]["Ipv6Ranges"] == [{"CidrIpv6": "2001:db8::/32"}]
+        assert ingress[0]["IpRanges"] == []
+    finally:
+        ec2.delete_security_group(GroupId=sg_id)
+
+
 def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
     sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-revoke-egress", Description="egress")["GroupId"]
 
@@ -2652,6 +2693,56 @@ def test_ec2_launch_template_with_block_devices(ec2):
     assert bdm["Ebs"]["VolumeType"] == "gp3"
 
     ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_ec2_launch_template_keeps_metadata_options_and_shutdown_behavior(ec2):
+    """A template's IMDS settings and shutdown behaviour survive the read.
+    RequestLaunchTemplateData carries MetadataOptions and
+    InstanceInitiatedShutdownBehavior, and the response shape reports both
+    (metadataOptions, instanceInitiatedShutdownBehavior); the parser dropped
+    them, so every Terraform refresh reported them as newly added.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    name = f"qa-lt-metadata-{_uuid.uuid4().hex[:8]}"
+    created = ec2.create_launch_template(
+        LaunchTemplateName=name,
+        LaunchTemplateData={
+            "InstanceInitiatedShutdownBehavior": "terminate",
+            "MetadataOptions": {
+                "HttpEndpoint": "enabled",
+                "HttpPutResponseHopLimit": 2,
+                "HttpTokens": "required",
+                "HttpProtocolIpv6": "enabled",
+                "InstanceMetadataTags": "disabled",
+            },
+        },
+    )["LaunchTemplate"]
+    try:
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=created["LaunchTemplateId"])["LaunchTemplateVersions"]
+        data = versions[0]["LaunchTemplateData"]
+        assert data["InstanceInitiatedShutdownBehavior"] == "terminate"
+        options = data["MetadataOptions"]
+        assert options["HttpEndpoint"] == "enabled"
+        assert options["HttpPutResponseHopLimit"] == 2
+        assert options["HttpTokens"] == "required"
+        assert options["HttpProtocolIpv6"] == "enabled"
+        assert options["InstanceMetadataTags"] == "disabled"
+        # The response shape carries a State the request has no member for.
+        assert options["State"] == "applied"
+
+        # A new version keeps its own options, so a refresh of either is stable.
+        ec2.create_launch_template_version(
+            LaunchTemplateId=created["LaunchTemplateId"],
+            LaunchTemplateData={"MetadataOptions": {"HttpTokens": "optional"}})
+        latest = ec2.describe_launch_template_versions(
+            LaunchTemplateId=created["LaunchTemplateId"], Versions=["2"],
+        )["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+        assert latest["MetadataOptions"]["HttpTokens"] == "optional"
+        assert "InstanceInitiatedShutdownBehavior" not in latest
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=created["LaunchTemplateId"])
 
 
 def test_ec2_launch_template_not_found(ec2):
