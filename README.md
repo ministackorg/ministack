@@ -511,7 +511,7 @@ subnet = ec2.create_subnet(
 | `AWS::AppSync::ApiKey` | API key ID | ApiKey, Arn |
 | `AWS::SecretsManager::Secret` | Secret ARN | — |
 | `AWS::Cognito::UserPool` | Pool ID | Arn, ProviderName |
-| `AWS::Cognito::UserPoolClient` | Client ID | — |
+| `AWS::Cognito::UserPoolClient` | Client ID | ClientId, ClientSecret, Name |
 | `AWS::Cognito::UserPoolResourceServer` | Identifier | — |
 | `AWS::Cognito::IdentityPool` | Pool ID | — |
 | `AWS::Cognito::IdentityPoolPrincipalTag` | `<pool ID>\|<provider name>` | — |
