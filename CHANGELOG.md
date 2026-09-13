@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `AWS::IAM::Policy` is provisioned inline, not as a managed policy** — the document was stored as an account-global customer-managed policy and attached to the Roles, Users and Groups the resource named, where CloudFormation embeds it on each of them the way `PutRolePolicy`, `PutUserPolicy` and `PutGroupPolicy` do. The difference is that an inline policy is scoped to its entity, so the same `PolicyName` can exist on many entities at once, and CDK relies on it: it derives `PolicyName` from the construct path, so every stack granting something to a role reached by the same path emits the same name. Twenty of one deployment's twenty-seven policies collapsed onto two records, and each deploy took the grants away from the stacks before it; under `AUTH=true` those roles were then denied the actions their own templates granted. The document now goes onto each entity through the existing inline handlers, so `ListRolePolicies`, `GetRolePolicy` and the `RolePolicyList` of `GetAccountAuthorizationDetails` report it and the IAM evaluator finds it. The physical id is generated rather than being the `PolicyName`, which is what AWS returns: measured against the account, a stack with an explicit `PolicyName` of `ms0049-refprobe-explicit-name` answers `Ref` with `ms0049--Pol-AW24HieEB0iX`, and `list-policies --scope Local` over an estate of forty deployed stacks counts zero. `AWS::IAM::ManagedPolicy` is unchanged. Contributed by @iot-rocket.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added
