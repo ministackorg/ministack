@@ -2135,7 +2135,8 @@ def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
     _wait_until(lambda: _ecs._task_ip(_ecs._tasks.get(task["taskArn"])) == "172.30.0.9")
     task = _ecs._tasks[task["taskArn"]]
     assert _ecs._task_ip(task) == "172.30.0.9"
-    assert task["attachmentsStatus"] == "ATTACHED"
+    # Not a member of the Task shape; the emulator used to invent it.
+    assert "attachmentsStatus" not in task
     assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
 
 
