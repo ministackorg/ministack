@@ -39,6 +39,7 @@ htmlcov/
 *.swo
 .DS_Store
 .kiro/
+.kilo/
 
 # Docker
 data/
