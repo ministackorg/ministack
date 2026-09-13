@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import datetime
 import io
 import json
@@ -5054,6 +5055,7 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
         "global-secondary-before-control-user",
         "repair-required",
         "repair-unfenced",
+        "failover-quarantine",
         "last-member-deleted-during-readiness",
         "last-members-deleted-before-start",
     ],
@@ -5074,7 +5076,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
     rotations = []
     grants = []
     replication_configs = []
-    forced_repair_removals = []
+    repair_compute_containments = []
     remaining_legacy_names = set()
     legacy_owner_by_name = {}
     writer_legacy_container_name = [None]
@@ -5225,21 +5227,22 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
         "_configure_or_defer_mysql_replication",
         _configure_replication,
     )
-    if scenario.startswith("repair-"):
+    if scenario.startswith("repair-") or scenario == "failover-quarantine":
         monkeypatch.setattr(
             m,
             "_mysql_writer_fence_active",
-            lambda _cluster: scenario == "repair-required",
+            lambda _cluster: scenario in (
+                "repair-required", "failover-quarantine",
+            ),
         )
-    if scenario == "repair-unfenced":
-        monkeypatch.setattr(
-            m, "_stop_cluster_shared_container", lambda *_args: False,
-        )
+    if scenario in ("repair-unfenced", "failover-quarantine"):
         monkeypatch.setattr(
             m,
-            "_force_remove_cluster_compute_preserving_volume",
-            lambda cluster_id, _cluster: forced_repair_removals.append(cluster_id)
-            or True,
+            "_remove_cluster_compute_incarnation_preserving_volume",
+            lambda cluster_id, _cluster, container_id: (
+                repair_compute_containments.append((cluster_id, container_id))
+                or True
+            ),
         )
     if scenario.startswith("global-secondary"):
         monkeypatch.setattr(m, "_mysql_replication_secondary", lambda _cluster: True)
@@ -5299,7 +5302,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
         cluster_record["_mysql_gtid_initialized_at_creation"] = True
         if scenario == "global-secondary":
             cluster_record["_mysql_control_user_ready"] = True
-    elif scenario.startswith("repair-"):
+    elif scenario.startswith("repair-") or scenario == "failover-quarantine":
         cluster_record.update({
             "DBClusterArn": (
                 "arn:aws:rds:us-east-1:111111111111:cluster:"
@@ -5343,6 +5346,25 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
                     }],
                     m._MYSQL_GLOBAL_SWITCHOVER_STATE: {
                         "state": "repair_required",
+                    },
+                },
+            }
+        elif scenario == "failover-quarantine":
+            global_clusters = {
+                "repair-global": {
+                    "GlobalClusterIdentifier": "repair-global",
+                    "GlobalClusterMembers": [{
+                        "DBClusterArn": cluster_record["DBClusterArn"],
+                        "IsWriter": False,
+                    }],
+                    m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED: {
+                        cluster_record["DBClusterArn"]: {
+                            "source_arn": cluster_record["DBClusterArn"],
+                            "target_arn": (
+                                "arn:aws:rds:us-west-2:111111111111:cluster:target"
+                            ),
+                            "operation_id": "lossy-operation",
+                        },
                     },
                 },
             }
@@ -5497,7 +5519,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
             assert removed_volumes == []
             return
 
-        if scenario.startswith("repair-"):
+        if scenario.startswith("repair-") or scenario == "failover-quarantine":
             restored_cluster = m._clusters.get(cluster_id)
             assert {"--read-only=ON", "--super-read-only=ON"} <= set(
                 runs[0]["command"],
@@ -5509,8 +5531,10 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
             )
             assert replication_configs == []
             assert removed_volumes == []
-            assert forced_repair_removals == (
-                [cluster_id] if scenario == "repair-unfenced" else []
+            assert repair_compute_containments == (
+                [(cluster_id, "restored-shared-container")]
+                if scenario in ("repair-unfenced", "failover-quarantine")
+                else []
             )
             return
 
@@ -10774,6 +10798,7 @@ def _mysql_switchover_unit_topology(monkeypatch, m):
             "_shared_storage_initialized": True,
             "_shared_container_id": f"container-{index}",
             "_shared_container_epoch": index,
+            "_shared_volume_name": f"volume-{index}",
             "Status": "available",
             "DBClusterMembers": [{"DBInstanceIdentifier": f"instance-{index}"}],
         })
@@ -10806,6 +10831,15 @@ def _mysql_switchover_unit_topology(monkeypatch, m):
     )
     monkeypatch.setattr(m, "_mysql_global_writer_switch_owners", {})
     monkeypatch.setattr(
+        m,
+        "_mysql_global_failover_target_volume_identity",
+        lambda cluster: {
+            "name": cluster["_shared_volume_name"],
+            "created_at": "2026-09-08T00:00:00Z",
+            "mountpoint": f"/volumes/{cluster['_shared_volume_name']}",
+        },
+    )
+    monkeypatch.setattr(
         m, "_wait_for_mysql_replication_healthy", lambda *_a, **_k: True,
     )
     return topology
@@ -10816,6 +10850,126 @@ def _mysql_switchover_params(target="secondary"):
         "GlobalClusterIdentifier": "global-repl",
         "TargetDbClusterIdentifier": target,
     }
+
+
+def _patch_lossy_mysql_failover_success(monkeypatch, m):
+    monkeypatch.setattr(
+        m,
+        "_durably_persist_mysql_global_writer_switch_state",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        m, "_mysql_global_failover_target_credentials_ready", lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(m, "_ensure_mysql_control_user", lambda *_a, **_k: True)
+    monkeypatch.setattr(m, "_mysql_writer_fence_active", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        m, "_contain_mysql_global_failover_source", lambda _cluster: True,
+    )
+    monkeypatch.setattr(
+        m, "_reset_mysql_replication_channel", lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(m, "_set_mysql_cluster_writable", lambda *_a, **_k: True)
+    monkeypatch.setattr(m, "_mysql_control_query", lambda *_a, **_k: ((0, 0),))
+    monkeypatch.setattr(m, "_fence_or_contain_mysql_cluster", lambda _cluster: "fenced")
+
+
+@pytest.mark.parametrize(
+    ("failed_user", "expected", "expected_users"),
+    [
+        (None, True, ["root", "admin"]),
+        ("root", False, ["root"]),
+        ("admin", False, ["root", "admin"]),
+    ],
+)
+def test_rds_lossy_failover_proves_current_password_for_both_admin_users(
+    monkeypatch, failed_user, expected, expected_users,
+):
+    from ministack.services import rds as m
+
+    target = {
+        "DBClusterIdentifier": "secondary",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "current-password",
+    }
+    attempted_users = []
+
+    class Connection:
+        def close(self):
+            pass
+
+    def connect(_cluster, user, password, **_kwargs):
+        attempted_users.append(user)
+        assert password == "current-password"
+        if user == failed_user:
+            raise RuntimeError("access denied")
+        return Connection()
+
+    monkeypatch.setattr(m, "_mysql_cluster_connection", connect)
+
+    assert m._mysql_global_failover_target_credentials_ready(
+        target, deadline=time.monotonic() + 1,
+    ) is expected
+    assert attempted_users == expected_users
+
+
+def test_rds_lossy_failover_restore_containment_removes_only_captured_container(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    removed = []
+    inspected = []
+
+    class NotFound(Exception):
+        status_code = 404
+
+    class Container:
+        def __init__(self, container_id):
+            self.id = container_id
+            self.labels = {
+                "ministack": "rds",
+                "cluster_id": "repair-cluster",
+                "account_id": "111111111111",
+                "region": "us-west-2",
+            }
+
+        def remove(self, **kwargs):
+            removed.append((self.id, kwargs))
+
+    captured = Container("captured-container-id")
+    replacement = Container("replacement-container-id")
+    stable_name = m._rds_cluster_docker_name(
+        "repair-cluster", "111111111111", "us-west-2",
+    )
+
+    class Containers:
+        def get(self, identifier):
+            inspected.append(identifier)
+            if identifier == captured.id and not removed:
+                return captured
+            if identifier == stable_name:
+                return replacement
+            raise NotFound()
+
+    class Docker:
+        containers = Containers()
+
+    cluster = {
+        "DBClusterArn": (
+            "arn:aws:rds:us-west-2:111111111111:cluster:repair-cluster"
+        ),
+        "_shared_container_id": captured.id,
+    }
+    monkeypatch.setattr(m, "_get_docker", lambda: Docker())
+
+    assert m._remove_cluster_compute_incarnation_preserving_volume(
+        "repair-cluster", cluster, captured.id,
+    ) is True
+    assert removed == [(captured.id, {"force": True, "v": False})]
+    assert inspected == [captured.id, captured.id]
+    assert stable_name not in inspected
+    assert cluster["_shared_container_id"] == captured.id
 
 
 def test_rds_mysql_switchover_claim_is_durable_when_persistence_enabled(
@@ -11013,6 +11167,1327 @@ def test_rds_failover_lossless_modes_use_planned_switchover(monkeypatch, mode):
 
     assert status == 200
     assert calls == [params]
+
+
+def test_rds_lossy_failover_orders_containment_before_target_promotion(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    events = []
+    claim_markers = []
+
+    def persist(_gc, marker, **kwargs):
+        if marker is None:
+            events.append("persist-final")
+        elif kwargs.get("expected_topology"):
+            events.append("persist-commit")
+        else:
+            events.append("persist-claim")
+            claim_markers.append(copy.deepcopy(marker))
+        return True
+
+    monkeypatch.setattr(
+        m, "_durably_persist_mysql_global_writer_switch_state", persist,
+    )
+    monkeypatch.setattr(
+        m,
+        "_ensure_mysql_control_user",
+        lambda cluster, **_kwargs: events.append(("control", cluster)) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_global_failover_target_credentials_ready",
+        lambda cluster, **_kwargs: events.append(("credentials", cluster)) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_writer_fence_active",
+        lambda cluster, **_kwargs: events.append(("target-fenced", cluster)) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_contain_mysql_global_failover_source",
+        lambda cluster: events.append(("contain", cluster)) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_reset_mysql_replication_channel",
+        lambda cluster_id, cluster, **kwargs: events.append(
+            ("reset", cluster_id, cluster, kwargs),
+        ) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_set_mysql_cluster_writable",
+        lambda cluster, **_kwargs: events.append(("write-enable", cluster)) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_control_query",
+        lambda cluster, statement, **_kwargs: events.append(
+            ("writable", cluster, statement),
+        ) or ((0, 0),),
+    )
+    monkeypatch.setattr(
+        m,
+        "_wait_for_mysql_gtid",
+        lambda *_args, **_kwargs: pytest.fail("lossy failover waited for GTID"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_wait_for_mysql_writer_quiescence",
+        lambda *_args, **_kwargs: pytest.fail("lossy failover drained source"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_configure_mysql_replica_from_source",
+        lambda *_args, **_kwargs: pytest.fail("lossy failover relinked source"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(
+        _mysql_switchover_params(),
+    )
+
+    assert result["FailoverState"]["IsDataLossAllowed"] is True
+    assert writer_member["IsWriter"] is False
+    assert target_member["IsWriter"] is True
+    assert writer_member["SynchronizationStatus"] == "pending-resync"
+    assert target_member["SynchronizationStatus"] == "connected"
+    assert target.get("_mysql_replication_source_arn") is None
+    quarantine = m._mysql_global_failover_reseed_required(writer)
+    assert quarantine == {
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": quarantine["operation_id"],
+    }
+    assert writer["_shared_container_ready"] is False
+    assert writer["Status"] == "creating"
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+    assert claim_markers[0]["target_volume_identity"] == {
+        "name": "volume-2",
+        "created_at": "2026-09-08T00:00:00Z",
+        "mountpoint": "/volumes/volume-2",
+    }
+    assert claim_markers[0]["target_member_statuses"] == {
+        "instance-2": "available",
+    }
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "persist-claim",
+        "credentials",
+        "control",
+        "target-fenced",
+        "contain",
+        "reset",
+        "credentials",
+        "persist-commit",
+        "contain",
+        "write-enable",
+        "writable",
+        "persist-final",
+    ]
+    reset = next(event for event in events if event[0] == "reset")
+    assert reset[3]["clear_super_read_only"] is False
+    assert reset[3]["allow_missing_channel"] is False
+
+
+def test_rds_lossy_failover_containment_failure_retains_repair(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    monkeypatch.setattr(
+        m, "_contain_mysql_global_failover_source", lambda _cluster: False,
+    )
+    monkeypatch.setattr(
+        m,
+        "_reset_mysql_replication_channel",
+        lambda *_a, **_k: pytest.fail("target reset before source containment"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_set_mysql_cluster_writable",
+        lambda *_a, **_k: pytest.fail("target writes enabled without containment"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    marker = global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE]
+    assert marker["state"] == "repair_required"
+    assert marker["allow_data_loss"] is True
+    assert m._active_mysql_global_writer_switch(global_cluster) is not None
+    assert target["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+    reset_options = []
+    monkeypatch.setattr(
+        m, "_contain_mysql_global_failover_source", lambda _cluster: True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_reset_mysql_replication_channel",
+        lambda *_args, **kwargs: reset_options.append(kwargs) or True,
+    )
+    monkeypatch.setattr(m, "_set_mysql_cluster_writable", lambda *_a, **_k: True)
+    monkeypatch.setattr(m, "_mysql_control_query", lambda *_a, **_k: ((0, 0),))
+
+    retry = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert retry[0] == 400
+    assert b"requires repair" in retry[2]
+    assert reset_options == []
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] is marker
+
+
+def test_rds_lossy_failover_commit_persistence_failure_never_enables_writes(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    persists = iter((True, False, True))
+    monkeypatch.setattr(
+        m,
+        "_durably_persist_mysql_global_writer_switch_state",
+        lambda *_args, **_kwargs: next(persists),
+    )
+    monkeypatch.setattr(
+        m,
+        "_set_mysql_cluster_writable",
+        lambda *_a, **_k: pytest.fail("target writes preceded durable topology"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is False
+    assert target_member["IsWriter"] is True
+    marker = global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE]
+    assert marker["state"] == "repair_required"
+    assert marker["allow_data_loss"] is True
+    assert m._mysql_global_failover_reseed_required(writer)["target_arn"] == (
+        target["DBClusterArn"]
+    )
+
+
+def test_rds_lossy_failover_final_persistence_failure_refences_target(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    persists = iter((True, True, False, True))
+    fenced = []
+    monkeypatch.setattr(
+        m,
+        "_durably_persist_mysql_global_writer_switch_state",
+        lambda *_args, **_kwargs: next(persists),
+    )
+    monkeypatch.setattr(
+        m,
+        "_fence_or_contain_mysql_cluster",
+        lambda cluster: fenced.append(cluster) or "fenced",
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is False
+    assert target_member["IsWriter"] is True
+    assert fenced == [target]
+    marker = global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE]
+    assert marker["state"] == "repair_required"
+    assert marker["allow_data_loss"] is True
+    assert m._mysql_global_failover_reseed_required(writer)["target_arn"] == (
+        target["DBClusterArn"]
+    )
+
+
+def test_rds_lossy_failover_warm_boot_preflight_failure_keeps_repair_compute(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    marker = {
+        "state": "repair_required",
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "warm-boot-operation",
+        "allow_data_loss": True,
+    }
+    global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+    target["_shared_container_ready"] = False
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    monkeypatch.setattr(
+        m, "_mysql_global_failover_target_credentials_ready", lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        m,
+        "_contain_mysql_global_failover_source",
+        lambda *_a, **_k: pytest.fail("warm-boot preflight contained source"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_fence_or_contain_mysql_cluster",
+        lambda *_a, **_k: pytest.fail("warm-boot preflight contained target"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert target["_shared_container_id"] == "container-2"
+    assert target["_shared_container_ready"] is False
+    assert global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE]["state"] == (
+        "repair_required"
+    )
+    assert id(global_cluster) not in m._mysql_global_writer_switch_owners
+
+
+def test_rds_planned_switchover_does_not_consume_lossy_repair(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    marker = {
+        "state": "repair_required",
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "lossy-operation",
+        "allow_data_loss": True,
+    }
+    global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+    monkeypatch.setattr(
+        m,
+        "_ensure_mysql_control_user",
+        lambda *_a, **_k: pytest.fail("planned path consumed lossy repair"),
+    )
+
+    result = m._planned_mysql_global_writer_switch(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] is marker
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+
+
+def test_rds_lossy_failover_persistence_verifies_topology_and_quarantine(
+    monkeypatch,
+    tmp_path,
+):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    m._global_clusters.clear()
+    m._global_clusters["global-repl"] = global_cluster
+    monkeypatch.setattr(m.persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(m.persistence, "STATE_DIR", str(tmp_path))
+    marker = {
+        "state": "in_progress",
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "lossy-operation",
+        "allow_data_loss": True,
+    }
+    quarantine = {
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "lossy-operation",
+    }
+    global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+    m._set_global_cluster_writer(global_cluster, target_member)
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        writer["DBClusterArn"]: quarantine,
+    }
+    topology = m._mysql_global_writer_switch_topology(global_cluster)
+    expected_quarantine = (writer["DBClusterArn"], quarantine)
+    try:
+        assert m._durably_persist_mysql_global_writer_switch_state(
+            global_cluster,
+            marker,
+            expected_topology=topology,
+            expected_quarantine=expected_quarantine,
+        ) is True
+        assert m._durably_persist_mysql_global_writer_switch_state(
+            global_cluster,
+            marker,
+            expected_topology=((writer["DBClusterArn"], True),),
+            expected_quarantine=expected_quarantine,
+        ) is False
+        assert m._durably_persist_mysql_global_writer_switch_state(
+            global_cluster,
+            marker,
+            expected_topology=topology,
+            expected_quarantine=(writer["DBClusterArn"], {"wrong": True}),
+        ) is False
+    finally:
+        m._global_clusters.clear()
+
+
+@pytest.mark.parametrize("transient_failure", ["save", "load"])
+def test_rds_writer_switch_persistence_retries_transient_verification_failure(
+    monkeypatch, transient_failure,
+):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    marker = {
+        "state": "in_progress",
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "retry-persistence",
+        "allow_data_loss": True,
+    }
+    global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+    m._global_clusters.clear()
+    m._global_clusters["global-repl"] = global_cluster
+    calls = {"save": 0, "load": 0}
+
+    def save(*_args):
+        calls["save"] += 1
+        if transient_failure == "save" and calls["save"] == 1:
+            raise OSError("transient save failure")
+
+    def load(*_args):
+        calls["load"] += 1
+        if transient_failure == "load" and calls["load"] == 1:
+            return None
+        return m.get_state()
+
+    monkeypatch.setattr(m.persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(m.persistence, "save_state", save)
+    monkeypatch.setattr(m.persistence, "load_state", load)
+    try:
+        assert m._durably_persist_mysql_global_writer_switch_state(
+            global_cluster, marker,
+        ) is True
+        assert calls["save"] == 2
+        assert calls["load"] == (1 if transient_failure == "save" else 2)
+    finally:
+        m._global_clusters.clear()
+
+
+@pytest.mark.parametrize("binding_changes", [False, True])
+def test_rds_lossy_failover_restore_worker_revalidates_around_containment(
+    monkeypatch, binding_changes,
+):
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+    from ministack.services import rds as m
+
+    account_id = "000000000000"
+    writer_arn = f"arn:aws:rds:us-east-1:{account_id}:cluster:primary"
+    target_arn = f"arn:aws:rds:us-west-2:{account_id}:cluster:secondary"
+    writer = {
+        "DBClusterIdentifier": "primary",
+        "DBClusterArn": writer_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "GlobalClusterIdentifier": "global-repl",
+        "DBClusterMembers": [],
+    }
+    target = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": target_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "GlobalClusterIdentifier": "global-repl",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "password",
+        "DatabaseName": "mydb",
+        "Port": 3306,
+        "Status": "available",
+        "DBClusterMembers": [{
+            "DBInstanceIdentifier": "secondary-instance",
+            "IsClusterWriter": True,
+        }],
+        "_shared_storage_initialized": True,
+        "_shared_volume_name": "secondary-volume",
+        "_shared_container_epoch": 1,
+        "_shared_endpoint": {"Address": "localhost", "Port": 16020},
+        "_mysql_gtid_initialized_at_creation": True,
+        "_mysql_replication_source_arn": writer_arn,
+    }
+    instance = {
+        "DBInstanceIdentifier": "secondary-instance",
+        "DBInstanceArn": (
+            f"arn:aws:rds:us-west-2:{account_id}:db:secondary-instance"
+        ),
+        "DBClusterIdentifier": "secondary",
+        "DBInstanceStatus": "available",
+    }
+    source_member = {"DBClusterArn": writer_arn, "IsWriter": True}
+    target_member = {"DBClusterArn": target_arn, "IsWriter": False}
+    marker = {
+        "state": "repair_required",
+        "source_arn": writer_arn,
+        "target_arn": target_arn,
+        "operation_id": "restore-race-operation",
+        "allow_data_loss": True,
+    }
+    global_cluster = {
+        "GlobalClusterIdentifier": "global-repl",
+        "GlobalClusterMembers": [source_member, target_member],
+        m._MYSQL_GLOBAL_SWITCHOVER_STATE: marker,
+    }
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+    clusters.set_scoped(account_id, "us-west-2", "secondary", target)
+    instances = AccountRegionScopedDict()
+    instances.set_scoped(
+        account_id, "us-west-2", "secondary-instance", instance,
+    )
+    global_clusters = AccountScopedDict()
+    global_clusters.set_scoped(account_id, None, "global-repl", global_cluster)
+
+    class Container:
+        status = "running"
+
+        def reload(self):
+            pass
+
+    class Containers:
+        def get(self, container_id):
+            if container_id != "restored-target-container":
+                raise LookupError(container_id)
+            return Container()
+
+    class Docker:
+        containers = Containers()
+
+    real_thread = threading.Thread
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    def start_cluster(_cluster_id, cluster, remove_stale=False):
+        assert remove_stale is True
+        cluster.update({
+            "_shared_container_id": "restored-target-container",
+            "_shared_internal_address": "172.18.0.9",
+            "_shared_internal_port": 3306,
+            "_shared_container_epoch": 2,
+        })
+        return {
+            "started": True,
+            "failed": False,
+            "readiness_host": "172.18.0.9",
+            "readiness_port": 3306,
+            "container_epoch": 2,
+        }
+
+    def cycle_marker_and_promote(_cluster):
+        if binding_changes:
+            marker["state"] = "in_progress"
+            source_member["IsWriter"] = False
+            target_member["IsWriter"] = True
+            marker["state"] = "repair_required"
+        return False
+
+    contained = []
+
+    def contain(_cluster_id, _cluster, container_id):
+        acquired = []
+
+        def try_lifecycle_lock():
+            locked = m._shared_container_lock.acquire(blocking=False)
+            acquired.append(locked)
+            if locked:
+                m._shared_container_lock.release()
+
+        contender = real_thread(target=try_lifecycle_lock)
+        contender.start()
+        contender.join(timeout=1)
+        assert acquired == [True]
+        contained.append(container_id)
+        return True
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        monkeypatch.setattr(m.threading, "Thread", ImmediateThread)
+        monkeypatch.setattr(m, "_get_docker", lambda: Docker())
+        monkeypatch.setattr(m, "_start_cluster_shared_container", start_cluster)
+        monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+        monkeypatch.setattr(
+            m, "_ensure_mysql_compatibility", lambda *_a, **_k: (True, True),
+        )
+        monkeypatch.setattr(m, "_mysql_writer_fence_active", cycle_marker_and_promote)
+        monkeypatch.setattr(
+            m,
+            "_remove_cluster_compute_incarnation_preserving_volume",
+            contain,
+        )
+
+        m.restore_state({
+            "instances": instances,
+            "clusters": clusters,
+            "global_clusters": global_clusters,
+        })
+
+        restored_target = m._clusters.get_scoped(
+            account_id, "us-west-2", "secondary",
+        )
+        restored_instance = m._instances.get_scoped(
+            account_id, "us-west-2", "secondary-instance",
+        )
+        if binding_changes:
+            assert contained == []
+            assert restored_target["_shared_container_id"] == (
+                "restored-target-container"
+            )
+            assert restored_instance["DBInstanceStatus"] != "failed"
+        else:
+            assert contained == ["restored-target-container"]
+            assert restored_target["_shared_container_id"] is None
+            assert restored_instance["DBInstanceStatus"] == "failed"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_rds_lossy_failover_fails_closed_after_persisted_state_restore(
+    monkeypatch, committed,
+):
+    from ministack.core.responses import get_account_id
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    account_id = get_account_id()
+    writer["DBClusterArn"] = (
+        f"arn:aws:rds:us-east-1:{account_id}:cluster:primary"
+    )
+    target["DBClusterArn"] = (
+        f"arn:aws:rds:us-west-2:{account_id}:cluster:secondary"
+    )
+    writer_member["DBClusterArn"] = writer["DBClusterArn"]
+    target_member["DBClusterArn"] = target["DBClusterArn"]
+    for index, cluster in enumerate((writer, target), start=1):
+        cluster.update({
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password",
+            "DatabaseName": "mydb",
+            "Port": 3306,
+            "Status": "available",
+            "_shared_storage_initialized": True,
+            "_shared_container_id": f"container-{index}",
+            "_shared_container_epoch": index,
+            "_shared_endpoint": {
+                "Address": "localhost",
+                "Port": 16000 + index,
+            },
+            "DBClusterMembers": [{
+                "DBInstanceIdentifier": f"instance-{index}",
+                "IsClusterWriter": True,
+            }],
+        })
+    target["_mysql_replication_source_arn"] = writer["DBClusterArn"]
+    global_cluster.update({
+        "Engine": "aurora-mysql",
+        "EngineVersion": writer["EngineVersion"],
+        "Status": "available",
+    })
+    marker = {
+        "state": "in_progress",
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": f"persisted-{'committed' if committed else 'precommit'}",
+        "allow_data_loss": True,
+    }
+    global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+    if committed:
+        writer_member["IsWriter"] = False
+        target_member["IsWriter"] = True
+        target.pop("_mysql_replication_source_arn")
+        global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+            writer["DBClusterArn"]: {
+                "source_arn": writer["DBClusterArn"],
+                "target_arn": target["DBClusterArn"],
+                "operation_id": marker["operation_id"],
+            },
+        }
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    for index, cluster in enumerate((writer, target), start=1):
+        region = "us-east-1" if cluster is writer else "us-west-2"
+        m._clusters.set_scoped(
+            account_id, region, cluster["DBClusterIdentifier"], cluster,
+        )
+        m._instances.set_scoped(account_id, region, f"instance-{index}", {
+            "DBInstanceIdentifier": f"instance-{index}",
+            "DBInstanceArn": (
+                f"arn:aws:rds:{region}:{account_id}:db:instance-{index}"
+            ),
+            "DBClusterIdentifier": cluster["DBClusterIdentifier"],
+            "DBInstanceStatus": "available",
+        })
+    m._global_clusters["global-repl"] = global_cluster
+    persisted = m.get_state()
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(m.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    m.restore_state(persisted)
+
+    restored_gc = m._resolve_global_cluster("global-repl")
+    restored_writer = m._resolve_cluster(writer["DBClusterArn"])
+    restored_target = m._resolve_cluster(target["DBClusterArn"])
+    restored_marker = restored_gc[m._MYSQL_GLOBAL_SWITCHOVER_STATE]
+    assert restored_marker["state"] == "repair_required"
+    assert restored_marker["allow_data_loss"] is True
+    restored_target["_shared_container_id"] = "restored-target-container"
+    restored_target["_shared_container_ready"] = False
+
+    try:
+        result = m._lossy_mysql_global_writer_failover(
+            _mysql_switchover_params(restored_target["DBClusterArn"]),
+        )
+
+        assert result[0] == 400
+        assert b"requires repair" in result[2]
+        assert restored_gc[m._MYSQL_GLOBAL_SWITCHOVER_STATE] is restored_marker
+        assert restored_marker["state"] == "repair_required"
+        assert writer_member["IsWriter"] is (not committed)
+        assert target_member["IsWriter"] is committed
+    finally:
+        m._mysql_global_writer_switch_owners.clear()
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_lossy_failover_rejects_native_multi_member_topology(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    global_cluster["GlobalClusterMembers"].append({
+        "DBClusterArn": "arn:aws:rds:eu-west-1:111111111111:cluster:third",
+        "IsWriter": False,
+    })
+    monkeypatch.setattr(
+        m,
+        "_ensure_mysql_control_user",
+        lambda *_a, **_k: pytest.fail("unsupported topology reached MySQL"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+    assert target["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+
+def test_rds_lossy_failover_rejects_headless_source_before_claim(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, _target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer["DBClusterMembers"] = []
+    monkeypatch.setattr(
+        m,
+        "_durably_persist_mysql_global_writer_switch_state",
+        lambda *_args, **_kwargs: pytest.fail("headless source was claimed"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert m._MYSQL_GLOBAL_SWITCHOVER_STATE not in global_cluster
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "_planned_mysql_global_writer_switch",
+        "_lossy_mysql_global_writer_failover",
+    ],
+)
+def test_rds_metadata_writer_switch_rejects_quarantined_target(
+    monkeypatch, operation,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    for cluster in (writer, target):
+        cluster["EngineVersion"] = "8.4.mysql_aurora.4.0.0"
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        target["DBClusterArn"]: {
+            "source_arn": target["DBClusterArn"],
+            "target_arn": writer["DBClusterArn"],
+            "operation_id": "previous-lossy-operation",
+        },
+    }
+    monkeypatch.setattr(
+        m,
+        "_switch_global_cluster_writer_locked",
+        lambda *_args, **_kwargs: pytest.fail("quarantine used metadata switch"),
+    )
+
+    result = getattr(m, operation)(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert b"requires reseed or removal" in result[2]
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+
+
+def test_rds_status_refresh_keeps_headless_quarantined_cluster_unavailable(
+    monkeypatch,
+):
+    from ministack.core.responses import request_scope
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    target["DBClusterMembers"] = []
+    target["_shared_container_ready"] = False
+    target["Status"] = "creating"
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        target["DBClusterArn"]: {
+            "source_arn": target["DBClusterArn"],
+            "target_arn": writer["DBClusterArn"],
+            "operation_id": "completed-lossy-operation",
+        },
+    }
+    m._clusters.clear()
+    try:
+        m._clusters.set_scoped(
+            "111111111111", "us-west-2", "secondary", target,
+        )
+        with request_scope("111111111111", "us-west-2"):
+            m._refresh_cluster_status("secondary")
+
+        assert target["Status"] == "creating"
+        assert target["_shared_container_ready"] is False
+    finally:
+        m._clusters.clear()
+
+
+def test_rds_lossy_failover_preserves_control_plane_only_behavior(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    for cluster in (writer, target):
+        cluster["_shared_storage_initialized"] = False
+        cluster["DBClusterMembers"] = []
+        for field in (
+            "_shared_container_id",
+            "_shared_internal_address",
+            "_shared_internal_port",
+            "_shared_endpoint",
+        ):
+            cluster.pop(field, None)
+    calls = []
+    monkeypatch.setattr(
+        m,
+        "_switch_global_cluster_writer_locked",
+        lambda params, **kwargs: calls.append((params, kwargs)) or global_cluster,
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result is global_cluster
+    assert calls == [(_mysql_switchover_params(), {"allow_data_loss": True})]
+
+
+@pytest.mark.parametrize(
+    "failed_preflight",
+    ["credentials", "control-user", "target-fence"],
+)
+def test_rds_lossy_failover_preflight_failure_releases_fresh_claim(
+    monkeypatch, failed_preflight,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    persisted_markers = []
+    monkeypatch.setattr(
+        m,
+        "_durably_persist_mysql_global_writer_switch_state",
+        lambda _gc, marker, **_kwargs: persisted_markers.append(
+            dict(marker) if marker is not None else None,
+        ) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_global_failover_target_credentials_ready",
+        lambda *_a, **_k: failed_preflight != "credentials",
+    )
+    monkeypatch.setattr(
+        m,
+        "_ensure_mysql_control_user",
+        lambda *_a, **_k: failed_preflight != "control-user",
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_writer_fence_active",
+        lambda *_a, **_k: failed_preflight != "target-fence",
+    )
+    monkeypatch.setattr(
+        m,
+        "_contain_mysql_global_failover_source",
+        lambda *_a, **_k: pytest.fail("preflight failure contained source"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_fence_or_contain_mysql_cluster",
+        lambda *_a, **_k: pytest.fail("preflight failure removed target"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert persisted_markers[0]["state"] == "in_progress"
+    assert persisted_markers[-1] is None
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+    assert target["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+
+def test_rds_lossy_failover_claim_blocks_password_rotation_during_credential_proof(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    target["_MasterUserPassword"] = "before-failover"
+    proof_started = threading.Event()
+    release_proof = threading.Event()
+    results = []
+
+    def prove_credentials(*_args, **_kwargs):
+        proof_started.set()
+        return release_proof.wait(timeout=2)
+
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    monkeypatch.setattr(
+        m, "_mysql_global_failover_target_credentials_ready", prove_credentials,
+    )
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            m._lossy_mysql_global_writer_failover(_mysql_switchover_params()),
+        ),
+    )
+    worker.start()
+    assert proof_started.wait(timeout=1)
+    rotation = m._modify_db_cluster({
+        "DBClusterIdentifier": target["DBClusterArn"],
+        "MasterUserPassword": "racing-password",
+    })
+    release_proof.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert rotation[0] == 400
+    assert b"writer switchover is in progress" in rotation[2]
+    assert target["_MasterUserPassword"] == "before-failover"
+    assert results[0]["FailoverState"]["IsDataLossAllowed"] is True
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+
+
+def test_rds_lossy_failover_rejects_compute_backed_uninitialized_topology(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer["_shared_storage_initialized"] = False
+    target["_shared_storage_initialized"] = False
+    monkeypatch.setattr(
+        m,
+        "_switch_global_cluster_writer_locked",
+        lambda *_a, **_k: pytest.fail("compute-backed topology used metadata path"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+
+
+def test_rds_lossy_failover_rejects_mixed_uninitialized_topology(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    target["Engine"] = "aurora-postgresql"
+    for cluster in (writer, target):
+        cluster["_shared_storage_initialized"] = False
+        cluster["DBClusterMembers"] = []
+        for field in (
+            "_shared_container_id",
+            "_shared_internal_address",
+            "_shared_internal_port",
+            "_shared_endpoint",
+        ):
+            cluster.pop(field, None)
+    monkeypatch.setattr(
+        m,
+        "_switch_global_cluster_writer_locked",
+        lambda *_a, **_k: pytest.fail("mixed topology used metadata path"),
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert m._active_mysql_global_writer_switch(global_cluster) is None
+
+
+def test_rds_lossy_failover_write_failure_fences_target_and_retains_repair(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    fenced = []
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+    monkeypatch.setattr(m, "_set_mysql_cluster_writable", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        m,
+        "_fence_or_contain_mysql_cluster",
+        lambda cluster: fenced.append(cluster) or "fenced",
+    )
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result[0] == 400
+    assert writer_member["IsWriter"] is False
+    assert target_member["IsWriter"] is True
+    assert fenced == [target]
+    marker = global_cluster[m._MYSQL_GLOBAL_SWITCHOVER_STATE]
+    assert marker["state"] == "repair_required"
+    assert marker["allow_data_loss"] is True
+    assert m._mysql_global_failover_reseed_required(writer)["target_arn"] == (
+        target["DBClusterArn"]
+    )
+
+
+def test_rds_global_credential_sync_skips_quarantined_volume(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer_member["IsWriter"] = False
+    target_member["IsWriter"] = True
+    writer.update({
+        "MasterUsername": "old-admin",
+        "_MasterUserPassword": "old-password",
+        "DatabaseName": "old-db",
+    })
+    target.update({
+        "MasterUsername": "new-admin",
+        "_MasterUserPassword": "new-password",
+        "DatabaseName": "new-db",
+    })
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        writer["DBClusterArn"]: {
+            "source_arn": writer["DBClusterArn"],
+            "target_arn": target["DBClusterArn"],
+            "operation_id": "completed-lossy-operation",
+        },
+    }
+
+    m._sync_global_mysql_credentials(target, global_cluster)
+
+    assert writer["MasterUsername"] == "old-admin"
+    assert writer["_MasterUserPassword"] == "old-password"
+    assert writer["DatabaseName"] == "old-db"
+
+
+def test_rds_lossy_failover_preserves_nonavailable_target_members(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, _global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    target["DBClusterMembers"].append({
+        "DBInstanceIdentifier": "instance-3",
+        "IsClusterWriter": False,
+    })
+    source_instances = [{
+        "DBInstanceIdentifier": "instance-1",
+        "DBInstanceStatus": "available",
+    }]
+    target_instances = [
+        {
+            "DBInstanceIdentifier": "instance-2",
+            "DBInstanceStatus": "available",
+        },
+        {
+            "DBInstanceIdentifier": "instance-3",
+            "DBInstanceStatus": "stopped",
+        },
+    ]
+    monkeypatch.setattr(
+        m,
+        "_cluster_member_instances",
+        lambda cluster: target_instances if cluster is target else source_instances,
+    )
+    _patch_lossy_mysql_failover_success(monkeypatch, m)
+
+    result = m._lossy_mysql_global_writer_failover(_mysql_switchover_params())
+
+    assert result["FailoverState"]["IsDataLossAllowed"] is True
+    assert [
+        instance["DBInstanceStatus"] for instance in target_instances
+    ] == ["available", "stopped"]
+
+
+def test_rds_remove_quarantined_former_writer_clears_failover_state(monkeypatch):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer_member["IsWriter"] = False
+    target_member["IsWriter"] = True
+    quarantine = {
+        "source_arn": writer["DBClusterArn"],
+        "target_arn": target["DBClusterArn"],
+        "operation_id": "completed-lossy-operation",
+    }
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        writer["DBClusterArn"]: quarantine,
+    }
+    contained = []
+    monkeypatch.setattr(
+        m,
+        "_contain_mysql_global_failover_source",
+        lambda cluster, **_kwargs: contained.append(cluster) or True,
+    )
+
+    status, _headers, _body = m._remove_from_global_cluster({
+        "GlobalClusterIdentifier": "global-repl",
+        "DbClusterIdentifier": writer["DBClusterArn"],
+    })
+
+    assert status == 200
+    assert contained == [writer]
+    assert global_cluster["GlobalClusterMembers"] == [target_member]
+    assert m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED not in global_cluster
+    assert "GlobalClusterIdentifier" not in writer
+    assert writer["Status"] == "stopped"
+    assert writer["_shared_container_ready"] is False
+
+    writer["Port"] = 3306
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    start_status, _headers, _body = m._start_db_cluster({
+        "DBClusterIdentifier": writer["DBClusterArn"],
+    })
+    assert start_status == 200
+    assert writer["Status"] == "available"
+
+
+def test_rds_quarantined_former_writer_rejects_start_reboot_and_create(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer_member["IsWriter"] = False
+    target_member["IsWriter"] = True
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        writer["DBClusterArn"]: {
+            "source_arn": writer["DBClusterArn"],
+            "target_arn": target["DBClusterArn"],
+            "operation_id": "completed-lossy-operation",
+        },
+    }
+    instance = {
+        "DBInstanceIdentifier": "instance-1",
+        "DBInstanceArn": "arn:aws:rds:us-east-1:111111111111:db:instance-1",
+        "DBClusterIdentifier": writer["DBClusterIdentifier"],
+        "DBInstanceClass": "db.r6g.large",
+        "Engine": "aurora-mysql",
+        "EngineVersion": writer["EngineVersion"],
+        "MasterUsername": "admin",
+        "AllocatedStorage": 1,
+        "DBInstanceStatus": "failed",
+    }
+    monkeypatch.setattr(
+        m,
+        "_resolve_instance",
+        lambda identifier: instance if identifier == "instance-1" else None,
+    )
+
+    for action in (m._start_db_instance, m._reboot_db_instance):
+        result = action({"DBInstanceIdentifier": "instance-1"})
+        assert result[0] == 400
+        assert b"requires reseed or removal" in result[2]
+    create = m._create_db_instance({
+        "DBClusterIdentifier": writer["DBClusterArn"],
+        "DBInstanceIdentifier": "new-member",
+    })
+    assert create[0] == 400
+    assert b"requires reseed or removal" in create[2]
+
+    stopped = m._stop_db_instance({"DBInstanceIdentifier": "instance-1"})
+    assert stopped[0] == 200
+    assert instance["DBInstanceStatus"] == "stopped"
+
+
+def test_rds_remove_quarantined_member_does_not_hold_lifecycle_lock(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    writer_member["IsWriter"] = False
+    target_member["IsWriter"] = True
+    global_cluster[m._MYSQL_GLOBAL_FAILOVER_RESEED_REQUIRED] = {
+        writer["DBClusterArn"]: {
+            "source_arn": writer["DBClusterArn"],
+            "target_arn": target["DBClusterArn"],
+            "operation_id": "completed-lossy-operation",
+        },
+    }
+    containment_started = threading.Event()
+    release_containment = threading.Event()
+    results = []
+
+    def contain(_cluster, **_kwargs):
+        containment_started.set()
+        return release_containment.wait(timeout=2)
+
+    monkeypatch.setattr(m, "_contain_mysql_global_failover_source", contain)
+    worker = threading.Thread(
+        target=lambda: results.append(m._remove_from_global_cluster({
+            "GlobalClusterIdentifier": "global-repl",
+            "DbClusterIdentifier": writer["DBClusterArn"],
+        })),
+    )
+    worker.start()
+    assert containment_started.wait(timeout=1)
+    assert m._shared_container_lock.acquire(timeout=0.2)
+    m._shared_container_lock.release()
+    concurrent = m._remove_from_global_cluster({
+        "GlobalClusterIdentifier": "global-repl",
+        "DbClusterIdentifier": writer["DBClusterArn"],
+    })
+    assert concurrent[0] == 400
+    assert b"already being removed" in concurrent[2]
+    release_containment.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert results[0][0] == 200
+    assert global_cluster["GlobalClusterMembers"] == [target_member]
+
+
+def test_rds_failover_target_containment_does_not_hold_lifecycle_lock(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    target = {
+        "DBClusterIdentifier": "target",
+        "_shared_container_epoch": 1,
+        "_shared_container_ready": True,
+        "Status": "available",
+        "DBClusterMembers": [],
+    }
+    containment_started = threading.Event()
+    release_containment = threading.Event()
+    results = []
+
+    def contain(_cluster_id, _cluster):
+        containment_started.set()
+        return release_containment.wait(timeout=2)
+
+    monkeypatch.setattr(m, "_set_mysql_cluster_fenced", lambda *_a, **_k: False)
+    monkeypatch.setattr(m, "_contain_cluster_compute_preserving_volume", contain)
+    worker = threading.Thread(
+        target=lambda: results.append(m._fence_or_contain_mysql_cluster(target)),
+    )
+    worker.start()
+    assert containment_started.wait(timeout=1)
+    assert m._shared_container_lock.acquire(timeout=0.2)
+    m._shared_container_lock.release()
+    release_containment.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert results == ["contained"]
+    assert target["_shared_container_ready"] is False
+    assert target["Status"] == "creating"
 
 
 def test_rds_switchover_orders_lossless_data_plane_before_metadata(monkeypatch):
