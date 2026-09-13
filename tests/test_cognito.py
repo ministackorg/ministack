@@ -2344,6 +2344,73 @@ def test_cognito_saml_presignup_lambda_autoconfirms_invited_user(cognito_idp, la
     assert attrs.get("email_verified") == "true"
 
 
+def test_cognito_saml_presignup_lambda_reentrant_callback_does_not_deadlock(cognito_idp, lam):
+    """A PreSignUp trigger that calls back into ministack's own Cognito Admin
+    API (e.g. to look up the user as part of a federation-linking flow) must
+    run off the event loop thread, so the nested HTTP callback can be served
+    without queuing behind the trigger's own execution and hitting the Lambda
+    timeout.
+    """
+    handler = (
+        "import json, os, urllib.request\n"
+        "def handler(event, ctx):\n"
+        "    req = urllib.request.Request(\n"
+        "        os.environ['AWS_ENDPOINT_URL'],\n"
+        "        data=json.dumps({\n"
+        "            'UserPoolId': event['userPoolId'],\n"
+        "            'Username': 'marker-user',\n"
+        "        }).encode(),\n"
+        "        headers={\n"
+        "            'Content-Type': 'application/x-amz-json-1.1',\n"
+        "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.AdminGetUser',\n"
+        "        },\n"
+        "        method='POST',\n"
+        "    )\n"
+        "    with urllib.request.urlopen(req, timeout=6) as resp:\n"
+        "        json.loads(resp.read())\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-presignup-reentrant-callback"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+        Timeout=8,
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="marker-user", MessageAction="SUPPRESS")
+
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    relay_state = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+    saml_resp = _build_mock_saml_response(name_id="reentrant@example.com")
+    form_data = _urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse", data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"PreSignUp Lambda's own callback deadlocked or timed out: got {e.code}"
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_reentrant@example.com")
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+
+
 # ---------------------------------------------------------------------------
 # OIDC federation (external OIDC IdP — e.g. Keycloak in front of Cognito)
 # ---------------------------------------------------------------------------
@@ -3880,6 +3947,79 @@ def test_oauth2_token_code_reuse():
     assert status2 == 400
     resp2 = json.loads(body2)
     assert resp2['error'] == 'invalid_grant'
+
+
+def test_oauth2_token_concurrent_code_redemption_is_single_use(monkeypatch):
+    """/oauth2/token runs off the event loop (run_reentrant), so two
+    concurrent requests for the same authorization code can race on the
+    check-then-delete of `_authorization_codes` instead of the interpreter
+    serialising them for free. Exactly one may pass the consume gate; the
+    other must get a clean invalid_grant — never a KeyError from an
+    unguarded double-delete.
+
+    Exercised as a direct, in-process unit test (not over HTTP): the actual
+    race window between validating a code and consuming it is a handful of
+    bytecodes, far too narrow to reproduce reliably by racing HTTP clients
+    against the live server. A barrier inserted at `_find_pool_by_client_id`
+    — the call site that immediately precedes the consume line — forces both
+    threads into that window at the same instant instead of hoping.
+    """
+    import threading
+
+    from ministack.services import cognito as _cognito_mod
+
+    code = "race-test-code-" + secrets.token_hex(8)
+    entry = {
+        "client_id": "race-client",
+        "pool_id": "nonexistent-pool",  # never resolves — only the consume gate is under test
+        "redirect_uri": "",
+        "scope": "",
+        "username": "u",
+        "nonce": "",
+        "expires_at": time.time() + 300,
+        "code_challenge": None,
+    }
+    _cognito_mod._authorization_codes[code] = entry
+
+    barrier = threading.Barrier(2)
+    original_lookup = _cognito_mod._find_pool_by_client_id
+
+    def _synced_lookup(client_id):
+        barrier.wait(timeout=5)
+        return original_lookup(client_id)
+
+    monkeypatch.setattr(_cognito_mod, "_find_pool_by_client_id", _synced_lookup)
+
+    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": "", "client_id": "race-client"}
+    raw_body = _urlencode(form).encode()
+    results = [None, None]
+
+    def _redeem(i):
+        try:
+            results[i] = _cognito_mod._oauth2_token({}, {}, raw_body, {})
+        except Exception as e:  # noqa: BLE001 — surfaced by the assertion below, not swallowed
+            results[i] = e
+
+    threads = [threading.Thread(target=_redeem, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not any(isinstance(r, Exception) for r in results), (
+        f"consume gate must reject the loser cleanly, never crash: {results}"
+    )
+    statuses = sorted(status for status, _, _ in results)
+    # One thread's pop() wins and proceeds (past this test's fake pool, so it
+    # surfaces as the pool-not-found path); the other must see the code
+    # already gone and get a clean invalid_grant. Never two winners, never an
+    # unhandled exception propagating as something other than these two.
+    assert statuses == [400, 400], f"expected two clean 400s (winner + loser), got {results}"
+    bodies = [json.loads(body)["error"] for _, _, body in results]
+    assert sorted(bodies) == ["invalid_grant", "server_error"], (
+        f"expected exactly one consumer (server_error past the gate) and one rejected "
+        f"replay (invalid_grant), got {bodies}"
+    )
 
 
 def test_oauth2_token_refresh_token():
