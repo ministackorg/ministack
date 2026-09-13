@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **IAM — one `_account_from_arn`, with the contract the condition evaluator documents** — the module carried two top-level definitions of the helper under the same name, so the later one silently won and the guards the documented one describes (a bare `*`, a value that is not an ARN at all, an AWS-owned `arn:aws:iam::aws:policy/...`) were not the ones in force when `aws:ResourceAccount` resolved a resource's account. They are folded into one definition that keeps both contracts: the field is returned only when it holds an account id, twelve digits, and only from a value that is an ARN. No request the emulator serves changes behaviour, because both callers pass an ARN whose account is twelve digits; the parametrized test gained the two cases that tell the former definitions apart. Contributed by @iot-rocket.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added
