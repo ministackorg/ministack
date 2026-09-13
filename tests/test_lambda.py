@@ -4924,7 +4924,7 @@ def test_lambda_sqs_poller_does_not_tail_match_foreign_region_event_source(monke
         _sqs._queues.clear()
 
         queue_name = "esm-runtime-region-guard"
-        queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+        queue_url = _sqs._queue_url(queue_name)
         _sqs._queues[queue_url] = {
             "name": queue_name,
             "messages": [{
@@ -5180,7 +5180,7 @@ def test_poll_sqs_returns_true_when_batch_processed(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5303,7 +5303,7 @@ def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-failure"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5354,7 +5354,7 @@ def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_sta
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     def make_queue(name):
-        queue_url = f"http://localhost:4566/000000000000/{name}"
+        queue_url = _sqs._queue_url(name)
         _sqs._queues[queue_url] = {
             "name": name,
             "messages": [{
@@ -5452,7 +5452,7 @@ def test_poll_sqs_record_carries_trace_header_and_fifo_attributes(esm_poll_state
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-trace-attrs"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     trace = "Root=1-6893a2b4-aaaabbbbccccddddeeeeffff;Parent=0123456789abcdef;Sampled=1"
     base = {
         "md5_body": "", "sent_at": time.time(), "visible_at": 0,
@@ -5520,7 +5520,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-recovers"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -6234,7 +6234,7 @@ def test_route_async_failure_to_sqs_dlq():
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
     # Create a queue directly in the internal state
-    url = "http://localhost:4566/000000000000/dlq-test"
+    url = _sqs._queue_url("dlq-test")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-test"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},
@@ -6376,7 +6376,7 @@ def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
     original_region = get_region()
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
-    url = "http://localhost:4566/000000000000/dlq-region-guard"
+    url = _sqs._queue_url("dlq-region-guard")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-region-guard"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},

@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 import boto3
 import pytest
 from botocore.exceptions import ClientError
+from conftest import GATEWAY_PORT
 
 _ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 _PORT = urlparse(_ENDPOINT).port or 4566
@@ -211,7 +212,7 @@ async def _invoke_asgi_http(
         "query_string": b"",
         "headers": headers,
         "client": ("127.0.0.1", 55555),
-        "server": ("127.0.0.1", 4566),
+        "server": ("127.0.0.1", int(GATEWAY_PORT)),
     }
     body_sent = False
 
@@ -671,7 +672,7 @@ def test_unsigned_api_key_publish_discovers_event_api_host_region(monkeypatch):
         api_id = created["apiId"]
         custom_pub_host = created["dns"]["HTTP"]
         assert custom_pub_host == (
-            f"{api_id}.appsync-api.internal-edge-1:4566"
+            f"{api_id}.appsync-api.internal-edge-1:{GATEWAY_PORT}"
         )
 
         ns_msgs = await _invoke_asgi_http(
@@ -1133,7 +1134,7 @@ def test_websocket_accepts_region_shaped_configured_custom_host(monkeypatch):
         api_id = created["apiId"]
         custom_host = created["dns"]["REALTIME"]
         assert custom_host == (
-            f"{api_id}.appsync-realtime-api.internal-edge-1:4566"
+            f"{api_id}.appsync-realtime-api.internal-edge-1:{GATEWAY_PORT}"
         )
 
         set_request_region("us-east-1")
