@@ -3,11 +3,10 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
-import shutil
-import sys
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
