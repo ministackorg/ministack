@@ -1523,6 +1523,31 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
+                         headers: dict, query_params: dict):
+    """Authorize an execute-api invoke against its own ARN.
+
+    ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
+    the shape AWS documents. Without it every invoke was authorized against
+    ``*``, so a policy scoped to one API and stage — which is what the CDK's
+    ``grantExecute`` and every hand-written service-to-service grant produce —
+    never matched and the call was denied.
+
+    Built by the same helper the Lambda authorizer's method ARN uses, because
+    a policy has to match both.
+    """
+    from ministack.core.arn import execute_api_arn
+    from ministack.core.responses import get_account_id
+
+    return _enforce_data_plane(
+        "apigateway", "execute-api:Invoke", headers, query_params, "",
+        resource_arn=execute_api_arn(
+            extract_region(headers, query_params), get_account_id(),
+            api_id, stage, method, execute_path,
+        ),
+    )
+
+
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
     """Pick (stage, execute_path) based on the API's configured stages.
 
@@ -1597,23 +1622,35 @@ async def _handle_execute_api_request(
         return None
     api_id, tentative_stage, execute_path = parsed
 
-    denied = _enforce_data_plane("apigateway", "execute-api:Invoke", headers, query_params, "")
+    # WebSocket @connections management API — /{stage}/@connections/{id}.
+    # The @connections prefix is authoritative; skip $default resolution.
+    connections = execute_path.startswith("/@connections/")
+    if connections or stage_from_mapping:
+        # A base-path mapping names its stage; the whole remainder is API path.
+        stage = tentative_stage
+    else:
+        # Resolved before authorizing, so the ARN names the stage the request
+        # actually reaches: a v2 API on $default serves from the root, so the
+        # first path segment is not a stage there and naming it one would
+        # authorize against a resource that does not exist. The call only reads
+        # the API's configured stages, and it answers a caller who is not
+        # authorized yet, so it reports nothing about why it failed.
+        try:
+            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+        except Exception as e:
+            logger.exception("Error resolving the execute-api stage: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()
+
+    denied = _enforce_execute_api(api_id, stage, method, execute_path, headers, query_params)
     if denied:
         return denied
 
     try:
-        # WebSocket @connections management API — /{stage}/@connections/{id}.
-        # The @connections prefix is authoritative; skip $default resolution.
-        if execute_path.startswith("/@connections/"):
+        if connections:
             connection_id = execute_path[len("/@connections/") :].split("/", 1)[0]
             return await _get_module("apigateway").handle_connections_api(
-                method, api_id, tentative_stage, connection_id, body, headers
+                method, api_id, stage, connection_id, body, headers
             )
-        if stage_from_mapping:
-            # A base-path mapping names its stage; the whole remainder is API path.
-            stage = tentative_stage
-        else:
-            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
         apigw_v1 = _get_module("apigateway_v1")
         if apigw_v1.find_api_scope(api_id) is not None:
             return await apigw_v1.handle_execute(api_id, stage, method, execute_path, headers, body, query_params)
@@ -2121,15 +2158,26 @@ def _maybe_record_cloudtrail(
 
 
 def _routing_params(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> dict:
-    """Augment routing params for unsigned form-encoded requests whose Action lives in the body."""
-    routing_params = query_params
-    if not query_params.get("Action") and headers.get("content-type", "").startswith(
+    """Augment routing params with a query-protocol request's form-encoded body.
+
+    The query-protocol services (EC2, CloudFormation, CloudWatch, Auto Scaling,
+    ElastiCache) put every parameter in the body when the SDK POSTs, which
+    botocore does. An unsigned request's ``Action`` lives there, and so does the
+    resource the caller named: this dict is what ``extract_resource_arn``
+    receives, so without the rest of the body it resolves nothing and a
+    resource-scoped policy can never match.
+
+    Merged underneath the query string, which still wins, and only for the one
+    content type that carries it.
+    """
+    if not body or not headers.get("content-type", "").startswith(
         "application/x-www-form-urlencoded"
     ):
-        body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-        if body_params.get("Action"):
-            routing_params = {**query_params, "Action": body_params["Action"]}
-    return routing_params
+        return query_params
+    body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    if not body_params:
+        return query_params
+    return {**body_params, **query_params}
 
 
 def _unknown_query_error(body: bytes, request_id: str):
