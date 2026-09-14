@@ -64,6 +64,10 @@ def get_state() -> dict:
     return copy.deepcopy({"_streams": _streams, "_dest_counter": _dest_counter})
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data: dict):
     global _dest_counter
     _streams.update(data.get("_streams", {}))

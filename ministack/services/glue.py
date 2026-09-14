@@ -153,6 +153,10 @@ def get_state():
     return copy.deepcopy(_ALL_STATE)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     for key, store in _ALL_STATE.items():
         store.clear()

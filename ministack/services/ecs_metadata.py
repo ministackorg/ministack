@@ -100,3 +100,11 @@ async def handle_request(method, path, headers, body, query_params):
     if rest in ("/stats", "/task/stats"):
         return json_response({})
     return json_response({"message": "not found"}, status=404)
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

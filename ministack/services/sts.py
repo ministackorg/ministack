@@ -452,3 +452,11 @@ async def handle_request(method, path, headers, body, query_params):
                     ns="sts")
 
     return _error(400, "InvalidAction", f"Unknown STS action: {action}", ns="sts")
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

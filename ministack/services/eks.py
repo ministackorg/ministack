@@ -195,6 +195,10 @@ def _restore_cluster_child_store(store, restored, cluster_regions, separator):
         store.set_scoped(account_id, region, key, value)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     _clusters.update(data.get("clusters", {}))
     cluster_regions = {

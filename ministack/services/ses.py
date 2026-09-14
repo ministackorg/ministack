@@ -79,6 +79,10 @@ def get_state() -> dict:
     })
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_templates, data.get("_templates", {}))

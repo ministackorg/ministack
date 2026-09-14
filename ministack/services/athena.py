@@ -104,6 +104,10 @@ def get_state():
     )
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     # Scoped dicts are mutated in-place — no module-level reassignment.
     _executions.clear()
