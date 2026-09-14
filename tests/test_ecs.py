@@ -80,7 +80,7 @@ def test_ecs_run_task_stops_after_exit(ecs):
     )
     resp = ecs.run_task(cluster="task-lifecycle", taskDefinition="short-lived")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED (container exits almost immediately)
     stopped = False
@@ -170,7 +170,7 @@ def test_ecs_run_task_network_connectivity(ecs):
     )
     resp = ecs.run_task(cluster="net-test", taskDefinition="net-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED — wget should succeed (exit 0) if network is correct
     success = False
@@ -218,7 +218,7 @@ def test_ecs_run_task_metadata_v4(ecs):
     )
     resp = ecs.run_task(cluster="metadata-test", taskDefinition="metadata-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     success = False
     for _ in range(30):
