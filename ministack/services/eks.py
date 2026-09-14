@@ -839,6 +839,17 @@ def _delete_cluster(name):
         if ng:
             _tags.pop(ng.get("nodegroupArn", ""), None)
 
+    # Access entries and their policy associations belong to the cluster, so
+    # they go with it. Left behind they outlive it, and a cluster recreated
+    # under the same name would inherit the previous one's grants.
+    prefix = f"{name}\x00"
+    for key in [k for k in _access_entries if str(k).startswith(prefix)]:
+        entry = _access_entries.pop(key, None)
+        if entry:
+            _tags.pop(entry.get("accessEntryArn", ""), None)
+    for key in [k for k in _access_policies if str(k).startswith(prefix)]:
+        _access_policies.pop(key, None)
+
     arn = cluster["arn"]
     cluster["status"] = "DELETING"
     result = _sanitize(cluster)

@@ -1633,6 +1633,18 @@ def test_eks_auth_root_does_not_get_other_accounts_bootstrap_access(eks_auth_env
     assert any(g.startswith("ministack:eks:access:") for g in groups)
 
 
+def test_eks_delete_cluster_takes_its_access_entries_with_it(eks_auth_env):
+    """A recreated cluster must not inherit the previous one's grants."""
+    _auth_cluster(creator=f"arn:aws:iam::{_AUTH_ACCOUNT}:root")
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        prefix = f"{_AUTH_CLUSTER}\x00"
+        assert [k for k in eks_service._access_entries if str(k).startswith(prefix)]
+        assert [k for k in eks_service._access_policies if str(k).startswith(prefix)]
+        eks_service._delete_cluster(_AUTH_CLUSTER)
+        assert not [k for k in eks_service._access_entries if str(k).startswith(prefix)]
+        assert not [k for k in eks_service._access_policies if str(k).startswith(prefix)]
+
+
 def test_eks_auth_nondefault_sts_session_and_role_path_access_entry(eks_auth_env):
     _auth_cluster(_AUTH_OTHER_ACCOUNT)
     key = _auth_session(_AUTH_OTHER_ACCOUNT)
