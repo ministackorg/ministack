@@ -53,7 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -850,13 +850,6 @@ def _evaluate_authorizer_policy(policy_doc, route_arn):
     return "Allow" if allow else "NoMatch"
 
 
-def _build_route_arn(region, account_id, api_id, stage, method, path):
-    return (
-        f"arn:aws:execute-api:{region}:{account_id}:"
-        f"{api_id}/{stage}/{method}/{path.lstrip('/')}"
-    )
-
-
 def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
@@ -964,7 +957,7 @@ async def _authorize_request_v2(
     if not authorizer:
         return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
 
-    route_arn = _build_route_arn(owner_region, owner_account_id, api_id, stage, method, path)
+    route_arn = execute_api_arn(owner_region, owner_account_id, api_id, stage, method, path)
     payload_version = str(authorizer.get("authorizerPayloadFormatVersion") or "2.0")
     simple_response = payload_version == "2.0" and bool(authorizer.get("enableSimpleResponses"))
     ttl = _authorizer_ttl(authorizer)

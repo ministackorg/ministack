@@ -102,7 +102,7 @@ import urllib.request
 
 import yaml
 
-from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -1396,13 +1396,6 @@ def _deny_error(explicit):
     )
 
 
-def _build_method_arn(region, account_id, api_id, stage_name, method, request_path):
-    return (
-        f"arn:aws:execute-api:{region}:{account_id}:"
-        f"{api_id}/{stage_name}/{method}/{request_path.lstrip('/')}"
-    )
-
-
 def _arn_matches(pattern, arn):
     """Match an IAM policy Resource against a method ARN, honoring `*`/`?` globs."""
     regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
@@ -1758,7 +1751,7 @@ async def _authorize_request_v1(
     if not authorizer:
         return _gw_error(500, "Internal server error"), None
 
-    method_arn = _build_method_arn(
+    method_arn = execute_api_arn(
         owner_region, owner_account_id, api_id, stage_name, method, request_path
     )
     atype = (authorizer.get("type") or "TOKEN").upper()
