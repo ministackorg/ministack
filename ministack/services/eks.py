@@ -40,7 +40,6 @@ from ministack.core.iam_evaluator import (
     resolve_caller_identity,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
