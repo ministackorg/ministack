@@ -26,7 +26,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_offloop
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     apply_image_prefix,
@@ -106,12 +105,6 @@ def restore_state(data):
         ).start()
 
 
-try:
-    _restored = load_state("mwaa")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def _s3_bucket_from_arn(bucket_arn: str) -> str:

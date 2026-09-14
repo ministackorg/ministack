@@ -17,7 +17,6 @@ import os
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -66,10 +65,7 @@ def _synthetic_pem(domain):
     parser. The requested domain lives in DomainName / SubjectAlternative
     Names metadata, not embedded in the PEM payload.
 
-    Defined above the import-time `restore_state` block (rather than
-    next to its other call site in `_request_certificate`) so the
-    backfill path doesn't NameError when the load_state try block
-    fires at module import."""
+    """
     _ = domain  # represented in cert metadata, not the base64 block
     return (
         "-----BEGIN CERTIFICATE-----\n"
@@ -127,15 +123,6 @@ def restore_state(data):
             cert["_pem_chain"] = ""
 
 
-try:
-    _restored = load_state("acm")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _future_iso(seconds):
@@ -254,10 +241,6 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     return handler(data)
-
-
-# (`_synthetic_pem` is defined near `restore_state` above so the
-# import-time backfill path doesn't NameError.)
 
 
 def _request_certificate(data):

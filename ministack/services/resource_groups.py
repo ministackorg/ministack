@@ -24,7 +24,6 @@ import logging
 import re
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -97,12 +96,6 @@ def _restore_group_child_store(store, restored, legacy_group_regions):
         store.set_scoped(account_id, region, group_name, value)
 
 
-try:
-    _restored = load_state("resource_groups")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def reset():

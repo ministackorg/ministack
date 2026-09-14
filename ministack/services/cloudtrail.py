@@ -24,7 +24,6 @@ import os
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -768,11 +767,3 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         logger.warning("cloudtrail: unknown action %r", action)
         return _err("InvalidParameterException", f"Unknown CloudTrail action: {action!r}")
     return handler(body)
-
-
-try:
-    _restored = load_state("cloudtrail")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted cloudtrail state; continuing fresh")

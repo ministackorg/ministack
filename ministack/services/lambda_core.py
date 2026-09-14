@@ -37,7 +37,6 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
@@ -108,12 +107,6 @@ def restore_state(data):
     _client_tokens.update(data.get("client_tokens", {}))
 
 
-try:
-    _persisted = load_state("lambda_core")
-    if _persisted:
-        restore_state(_persisted)
-except Exception:  # pragma: no cover - best-effort restore
-    logger.exception("Failed to restore persisted lambda_core state; continuing fresh")
 
 
 def reset():

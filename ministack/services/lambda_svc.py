@@ -64,7 +64,7 @@ from ministack.core.lambda_runtime import (
     reap_idle_workers,
     release_worker,
 )
-from ministack.core.persistence import STATE_DIR, load_state
+from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountRegionScopedDict,
@@ -620,7 +620,9 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    restore_state(data)
+    if _esms.has_any():
+        _ensure_poller()
 
 
 def restore_state(data):
@@ -667,8 +669,6 @@ def restore_state(data):
                     and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
                 ):
                     _snapstart_provision_version_async(fn_name, ver_record)
-        if _esms.has_any():
-            _ensure_poller()
 
 
 def _region_from_function_record(func: dict) -> str:
@@ -7963,18 +7963,3 @@ def reset():
     with _docker_extract_lock:
         _docker_extract_dirs.clear()
     shutil.rmtree(_DOCKER_EXTRACT_CACHE, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Persisted-state restore — runs at module import time but deferred to the
-# very bottom of the file so forward references to helpers (e.g.
-# ``_ensure_poller``) resolve at call time (issue #412). A corrupt or
-# incompatible ``lambda.json`` logs and continues instead of breaking the
-# whole service.
-# ---------------------------------------------------------------------------
-try:
-    _restored = load_state("lambda")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted Lambda state; continuing with a fresh store")

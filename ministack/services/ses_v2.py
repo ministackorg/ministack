@@ -22,7 +22,6 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -102,15 +101,6 @@ def _legacy_resource_arn_for_region(resource_arn, account_id, region):
     return f"arn:aws:ses:{region}:{account_id}:{spec.resource}"
 
 
-try:
-    _restored = load_state("ses_v2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _json_err(code, message, status=400):

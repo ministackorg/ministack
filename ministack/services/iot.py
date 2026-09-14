@@ -69,7 +69,6 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -332,12 +331,6 @@ def reset() -> None:
         logger.debug("IoT mTLS: restart after reset failed", exc_info=True)
 
 
-try:
-    _restored = load_state("iot")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted IoT state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

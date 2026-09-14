@@ -38,7 +38,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -97,10 +96,6 @@ def reset():
     _tables.clear()
 
 
-if PERSIST_STATE:
-    _saved = load_state("s3tables")
-    if _saved:
-        restore_state(_saved)
 
 
 # ── Helpers ────────────────────────────────────────────────

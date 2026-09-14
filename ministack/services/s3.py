@@ -56,7 +56,6 @@ from ministack.core.iam_evaluator import (
     find_iam_access_key_account,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -220,14 +219,6 @@ def restore_state(data):
         d.update(data.get(key, {}))
 
 
-try:
-    _restored = load_state("s3")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")

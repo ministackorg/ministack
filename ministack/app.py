@@ -2680,102 +2680,18 @@ def _build_persistence_save_dict():
 
 
 def _load_persisted_state():
-    """Load persisted state for services that support it."""
-    for svc_key in ("apigateway", "apigateway_v1", "servicediscovery"):
-        data = load_state(svc_key)
+    """Restore every saved service through the registry's uniform contract."""
+    for state_key, module_name in _state_map.items():
+        data = load_state(state_key)
         if data:
-            _get_module(svc_key).load_persisted_state(data)
-            logger.info("Loaded persisted state for %s", svc_key)
-
-    # Eagerly import persisted services whose restore path depends on a
-    # module-level `load_state()` side-effect, but which would not otherwise
-    # be imported during startup. Their registry declarations ensure they are
-    # saved and reset; the lazy router still does not pull them in early enough
-    # in these cases:
-    #   - `ses_v2` is reached via the `/v2/email/*` path-prefix shortcut.
-    #   - `pipes` is commonly created via CloudFormation provisioners, without
-    #     a preceding Pipes API request.
-    #   - `appsync_events` is routable (SERVICE_REGISTRY has
-    #     "appsync-events") but real traffic arrives under the
-    #     `appsync` credential scope at `/v2/apis`, so the
-    #     `appsync-events` lazy handler never fires; the module is
-    #     reached only via a sibling import from `appsync.py`, which
-    #     bypasses `_get_module` and leaves it out of
-    #     `_loaded_modules` → shutdown skips persistence (#704).
-    #   - `apigateway_v1` is restored above only when a state file
-    #     already exists; on first-ever boot the conditional skips
-    #     it, the module is reached only via `apigateway.py`'s
-    #     sibling import (line 237), and the first save is silently
-    #     dropped. Same bug class as #704.
-    # Importing here triggers the module-level restore (and, for
-    # `pipes`, also restarts the background poller for any RUNNING
-    # pipe). Keep this list narrow — every entry costs a cold-start
-    # import.
-    for svc_key in ("pipes", "ses_v2", "appsync_events", "apigateway_v1"):
-        _get_module(svc_key)
-
-    # RDS is intentionally NOT in the unconditional list above —
-    # eager-importing it for every user would pull in ~13 MB of module
-    # objects (and, lazily, the docker SDK) even on stacks that don't
-    # use RDS. Instead, only eager-import when a persisted state file
-    # exists: importing the module triggers its bottom-of-file
-    # `load_state("rds")` which spawns the respawn threads for every
-    # persisted instance. Without this, users have to make one client
-    # call after every restart to lazily trigger the import + respawn
-    # (#692 follow-up after doodaz's confirmation).
-    if load_state("rds"):
-        _get_module("rds")
-        logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
-
-    # OpenSearch has a routable management endpoint, but persisted domains must
-    # restore before the first request because restore_state() also recreates
-    # data-plane endpoints/containers. Waiting for the lazy router leaves a
-    # warm-boot window where DescribeDomain/ListDomainNames see empty state and
-    # data-plane traffic has no restored endpoint. Match RDS' conditional shape
-    # so stacks that do not persist OpenSearch pay no cold-start import cost.
-    if load_state("opensearch"):
-        _get_module("opensearch")
-        logger.info("OpenSearch: eager-loaded module to restore persisted domains")
-
-    # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
-    # directly through the lazy router (no SERVICE_REGISTRY entry — it has no
-    # AWS endpoint of its own). Without an eager import at boot, persisted
-    # durable executions silently disappear until something happens to invoke
-    # a durable endpoint. Same conditional-import pattern as RDS — only pay
-    # the cold-start cost when state actually exists.
-    if load_state("lambda_durable"):
-        _get_module("lambda_durable")
-        logger.info("Lambda Durable: eager-loaded module to restore persisted executions")
-
-    # Lambda event source mappings (SQS / Kinesis / DynamoDB Streams) are
-    # polled by a background thread that lambda_svc starts from its
-    # import-time restore (`_ensure_poller`). lambda_svc is otherwise imported
-    # lazily on the first Lambda request — so after a persisted restart a
-    # workload that is pure SQS (just sending to a mapped queue) never imports
-    # the module, the poller never starts, and the restored ESM sits
-    # Enabled-but-unpolled while messages pile up (#889). Eager-import at boot
-    # when persisted ESMs exist so polling resumes exactly like a fresh
-    # CreateEventSourceMapping. Narrow: only pay the cold-start when there are
-    # mappings to poll. The `_data` reach gets all accounts' ESMs (the bool of
-    # an AccountScopedDict is account-scoped and would be 0 with no request
-    # context at boot).
-    _lam = load_state("lambda")
-    if _lam and getattr(_lam.get("esms"), "_data", _lam.get("esms")):
-        _get_module("lambda_svc")  # module file is lambda_svc.py (lambda is a keyword)
-        logger.info("Lambda: eager-loaded module to resume event-source-mapping pollers at boot")
-
-    # ECS services are restored with every task marked STOPPED — their
-    # containers went with the previous process — and the relaunch happens on
-    # the module's import-time restore hook. ECS is otherwise imported lazily on
-    # the first ECS request, so a workload that only talks to the service
-    # through a load balancer never triggers it: the service reports its
-    # persisted runningCount, nothing is running, and every request through the
-    # balancer fails. Same conditional shape as RDS — only pay the cold-start
-    # when there are services to bring back.
-    _ecs_state = load_state("ecs")
-    if _ecs_state and getattr(_ecs_state.get("services"), "_data", _ecs_state.get("services")):
-        _get_module("ecs")
-        logger.info("ECS: eager-loaded module to relaunch persisted services at boot")
+            try:
+                _get_module(module_name).load_persisted_state(data)
+                logger.info("Loaded persisted state for %s", state_key)
+            except Exception:
+                logger.exception(
+                    "Failed to restore persisted state for %s; continuing fresh",
+                    state_key,
+                )
 
 
 async def _wait_for_port(port, timeout=30):

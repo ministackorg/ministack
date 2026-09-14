@@ -39,7 +39,6 @@ from email.mime.text import MIMEText
 from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -105,15 +104,6 @@ def _restore_regional_store(store, restored):
         store[key] = value
 
 
-try:
-    _restored = load_state("ses")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

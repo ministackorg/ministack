@@ -53,7 +53,6 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-from ministack.core.persistence import load_state
 
 _users = AccountScopedDict()
 _roles = AccountScopedDict()
@@ -381,15 +380,6 @@ def restore_state(data):
         _account_aliases.update(data.get("account_aliases", {}))
 
 
-try:
-    _restored = load_state("iam")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ===================================================================== IAM

@@ -35,7 +35,6 @@ logger = logging.getLogger("secretsmanager")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state
 
 _secrets = AccountRegionScopedDict()
 _resource_policies = AccountRegionScopedDict()
@@ -68,15 +67,6 @@ def restore_state(data):
         _resource_policies.update(data.get("resource_policies", {}))
 
 
-try:
-    _restored = load_state("secretsmanager")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

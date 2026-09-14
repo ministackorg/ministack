@@ -89,7 +89,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import ministack.services.s3 as s3_svc
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
@@ -136,12 +135,6 @@ def restore_state(data):
     _tokens.update(data.get("tokens", {}))
 
 
-try:
-    _restored = load_state("signer")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted signer state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

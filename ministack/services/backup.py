@@ -28,7 +28,6 @@ import logging
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -107,12 +106,6 @@ def load_persisted_state(data):
     restore_state(data)
 
 
-try:
-    _restored = load_state("backup")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted backup state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

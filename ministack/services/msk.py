@@ -44,7 +44,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -101,12 +100,6 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("msk")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore msk state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

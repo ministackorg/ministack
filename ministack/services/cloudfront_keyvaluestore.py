@@ -19,7 +19,6 @@ from datetime import datetime
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid
 
 logger = logging.getLogger("cloudfront-keyvaluestore")
@@ -59,12 +58,6 @@ def restore_state(data):
         _stores[k] = v
 
 
-try:
-    _restored = load_state("cloudfront_keyvaluestore")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

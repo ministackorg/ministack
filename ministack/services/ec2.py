@@ -75,7 +75,6 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
 from ministack.core.concurrency import resource_lock, run_offloop
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -417,15 +416,6 @@ def _backfill_subnet_availability_zone_ids():
         subnet.setdefault("AvailabilityZoneId", _az_id_for_zone_name(subnet["AvailabilityZone"]))
 
 
-try:
-    _restored = load_state("ec2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # Default VPC / subnet created at import time so DescribeVpcs always returns something

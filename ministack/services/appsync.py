@@ -30,7 +30,6 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -66,19 +65,6 @@ _caches = AccountRegionScopedDict()           # apiId -> ApiCache record
 _cache_entries: dict = {}
 _cache_entries_lock = threading.Lock()
 _tags = AccountScopedDict()            # resource_arn -> {key: value}
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-def _load_persisted():
-    if not PERSIST_STATE:
-        return
-    data = load_state("appsync")
-    if data:
-        restore_state(data)
-        logger.info("Loaded persisted state for appsync")
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2579,6 +2565,3 @@ def _resolve_lambda(api_id, resolver, data_source, args,
             logger.error("Invalid JSON from Lambda %s", func_name)
             return {"errors": ["Invalid response format"]}
     return {"errors": ["Unexpected response type"]}
-
-# Load persisted state (must be after restore_state is defined)
-_load_persisted()

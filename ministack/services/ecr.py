@@ -15,7 +15,6 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -122,15 +121,6 @@ def _restore_repository_child_store(store, restored, legacy_repo_regions):
         store.set_scoped(account_id, region, name, value)
 
 
-try:
-    _restored = load_state("ecr")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _repo_arn(name):

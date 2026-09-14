@@ -34,7 +34,6 @@ from urllib.parse import parse_qs, urlencode
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
@@ -148,15 +147,6 @@ def restore_state(data):
     _oidc_pending.update(data.get("_oidc_pending", {}))
 
 
-try:
-    _restored = load_state("alb")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 # ---------------------------------------------------------------------------
 # Small helpers

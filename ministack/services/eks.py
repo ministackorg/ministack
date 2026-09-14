@@ -29,7 +29,6 @@ import urllib.parse
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -244,12 +243,6 @@ def restore_state(data):
 
 
 
-try:
-    _restored = load_state("eks")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted eks state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

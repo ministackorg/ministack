@@ -30,7 +30,6 @@ import string
 import time
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -71,12 +70,6 @@ def restore_state(data):
     _endpoints.update(data.get("endpoints", {}))
 
 
-try:
-    _persisted = load_state("bedrock_agentcore")
-    if _persisted:
-        restore_state(_persisted)
-except Exception:  # pragma: no cover - best-effort restore
-    pass
 
 
 def reset():

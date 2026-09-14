@@ -49,7 +49,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -1043,12 +1042,6 @@ def _apply_guardrail(guardrail_id: str, version: str, body) -> tuple:
 _async_invokes = AccountRegionScopedDict()  # invocationArn -> dict
 
 
-try:
-    _restored = load_state("bedrock_runtime")
-    if _restored:
-        _async_invokes.update(_restored.get("async_invokes", {}))
-except Exception:
-    logger.exception("Failed to restore bedrock_runtime state; continuing fresh")
 
 
 def _invocation_arn(invocation_id: str) -> str:

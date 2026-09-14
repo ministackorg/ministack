@@ -43,7 +43,6 @@ import os
 import time
 from typing import Optional
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -103,15 +102,6 @@ def restore_state(data):
     _users.update(data.get("users", {}))
 
 
-try:
-    _restored = load_state("transfer")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

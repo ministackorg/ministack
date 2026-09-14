@@ -28,7 +28,6 @@ import json
 import logging
 import time
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -91,14 +90,6 @@ def restore_state(data):
                 store[k] = v
 
 
-try:
-    _restored = load_state("config")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ── Config Rules ──────────────────────────────────────────────

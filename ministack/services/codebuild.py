@@ -26,7 +26,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -84,15 +83,6 @@ def restore_state(data):
             build.setdefault("endTime", int(time.time()))
 
 
-try:
-    _restored = load_state("codebuild")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

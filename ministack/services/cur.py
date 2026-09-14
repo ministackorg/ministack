@@ -17,7 +17,6 @@ import copy
 import json
 import logging
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -54,12 +53,6 @@ def load_persisted_state(data):
     restore_state(data)
 
 
-try:
-    _restored = load_state("cur")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted CUR state; continuing with fresh store")
 
 
 def _json(status: int, body: dict):

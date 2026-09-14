@@ -39,7 +39,6 @@ from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("sqs")
@@ -239,21 +238,6 @@ def _rebuild_queue_name_index() -> None:
             continue
         account_id, region, name, url = scope
         _queue_name_to_url.set_scoped(account_id, region, name, url)
-
-
-# Import-time state restore. MUST run after restore_state AND every symbol it
-# references (here _rebuild_queue_name_index, defined just above) are bound —
-# otherwise the import-time call NameErrors, the bare except swallows it, and all
-# persisted SQS state is silently dropped on restart (the #492/#494 pattern).
-try:
-    _restored = load_state("sqs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ────────────────────────────────────────────────────────────

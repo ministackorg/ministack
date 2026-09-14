@@ -31,7 +31,6 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, new_uuid
 
 logger = logging.getLogger("route53")
@@ -86,15 +85,6 @@ def restore_state(data):
             _changes.update(data.get("changes", {}))
 
 
-try:
-    _restored = load_state("route53")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def reset():

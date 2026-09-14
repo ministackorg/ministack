@@ -59,7 +59,6 @@ from xml.sax.saxutils import escape as _esc
 from ministack.core import container_reaper, persistence
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -10961,20 +10960,6 @@ def reset():
         _port_counter[0] = BASE_PORT
 
 
-# Load persisted state at module import. Must run AFTER every helper this
-# code path may touch (notably `_get_docker`, `_docker_image_for_engine`,
-# `_get_ministack_network`) is defined — `restore_state` spawns daemon threads
-# that race against the rest of module parsing, and a thread reaching an
-# undefined name raises NameError mid-restore (issue #692 follow-up).
-try:
-    _restored = load_state("rds")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):

@@ -17,7 +17,6 @@ import logging
 import os
 from urllib.parse import parse_qs
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict
 
 logger = logging.getLogger("cloudformation")
@@ -119,11 +118,3 @@ from .handlers import _ACTION_HANDLERS  # noqa: E402
 # Restore persisted stack metadata on first import (a CloudFormation request, or
 # the eager boot import when a state file exists). Failure falls back to a fresh
 # store rather than blocking startup.
-try:
-    _restored = load_state("cloudformation")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception(
-        "Failed to restore persisted CloudFormation state; continuing with a fresh store"
-    )

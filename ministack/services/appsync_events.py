@@ -29,7 +29,6 @@ import re
 import time
 
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -132,12 +131,6 @@ def restore_state(data):
 load_persisted_state = restore_state
 
 
-try:
-    _restored = load_state("appsync_events")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore AppSync Events state")
 
 
 def reset():

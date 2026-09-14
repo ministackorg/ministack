@@ -82,7 +82,6 @@ from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -650,15 +649,6 @@ def _restore_regional_store(store, restored, region_for_item):
         store.set_scoped(account_id, region_for_item(key, value), key, value)
 
 
-try:
-    _restored = load_state("cognito")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

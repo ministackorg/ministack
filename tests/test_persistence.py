@@ -5,8 +5,8 @@ Background
 ----------
 When PERSIST_STATE=1, the registry-derived `_state_map` in
 `ministack/app.py` supplies each loaded service's `get_state()` function
-to `save_all()` at shutdown. State is currently restored either by a
-service's import-time `load_state()` call or by `_load_persisted_state()`.
+to `save_all()` at shutdown. Startup restores saved snapshots centrally
+through each service's `load_persisted_state()` method.
 
 These tests protect persistence round trips and the registry contract.
 """
@@ -539,7 +539,7 @@ def test_save_dict_skips_modules_never_imported(monkeypatch):
 # ── Functional round-trip tests ────────────────────────────────────────
 
 def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
-    """Helper: populate -> save -> reset -> restore -> observe."""
+    """Helper: populate -> save -> reset -> registry-style restore -> observe."""
     mod = _module(mod_name)
     mod.reset()
     populate_fn(mod)
@@ -551,22 +551,14 @@ def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
     # Wipe in-memory state — this simulates a process restart.
     mod.reset()
 
-    # Restore via the same code path the module would use at import.
+    # Restore via the same uniform contract used by the registry loader.
     loaded = persistence.load_state(svc_key)
     assert loaded is not None, (
         f"persistence.load_state({svc_key!r}) returned None — state file "
         "was not written by save_state(). Check `_state_map` membership "
         "and `get_state()` correctness."
     )
-    if hasattr(mod, "restore_state"):
-        mod.restore_state(loaded)
-    elif hasattr(mod, "load_persisted_state"):
-        mod.load_persisted_state(loaded)
-    else:
-        pytest.fail(
-            f"Module {mod_name} has neither restore_state nor "
-            "load_persisted_state — cannot restore."
-        )
+    mod.load_persisted_state(loaded)
 
     # Cleanup state file before observation, so a failure doesn't pollute
     # the next test run.
@@ -1701,7 +1693,7 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     monkeypatch.setattr(mod, "_poller_started", False)
 
     pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/poller-test"
-    mod.restore_state({
+    mod.load_persisted_state({
         "pipes": {
             "poller-test": {
                 "Name": "poller-test",
@@ -1720,66 +1712,31 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     })
 
     assert mod._poller_started, (
-        "restore_state() did not start the pipes poller for a RUNNING pipe — "
+        "load_persisted_state() did not start the pipes poller for a RUNNING pipe — "
         "warm-booted pipes would silently stop forwarding events."
     )
     mod.reset()
 
 
-def test_lambda_esm_eager_loaded_at_boot_when_persisted(monkeypatch):
-    """#889: persisted SQS event source mappings must resume polling after a
-    warm restart even under pure-SQS traffic. The ESM poller starts from
-    lambda_svc's import-time restore (`_ensure_poller`), and lambda_svc is
-    otherwise imported lazily only on a Lambda request — so `_load_persisted_state`
-    must eager-import it at boot when ESMs are persisted, else the restored
-    mapping sits Enabled-but-unpolled and messages pile up. A restore_state-level
-    test does NOT catch this: the bug is the module never being imported."""
-    import ministack.app as app
-    monkeypatch.setattr(app, "load_state",
-                        lambda key: {"esms": {"uuid-1": {"Enabled": True}}} if key == "lambda" else None)
-    requested = []
-    real = app._get_module
-    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
-    app._load_persisted_state()
-    assert "lambda_svc" in requested, (
-        "#889: persisted ESMs present but lambda_svc was not eager-imported at "
-        "boot — the SQS poller never starts under pure-SQS traffic after restart."
-    )
-
-
-def test_lambda_not_eager_loaded_without_persisted_esms(monkeypatch):
-    """Narrow: no persisted ESMs → don't pay the lambda_svc cold-start at boot."""
-    import ministack.app as app
-    monkeypatch.setattr(app, "load_state",
-                        lambda key: {"esms": {}} if key == "lambda" else None)
-    requested = []
-    real = app._get_module
-    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
-    app._load_persisted_state()
-    assert "lambda_svc" not in requested
-
-
-def test_opensearch_eager_loaded_at_boot_when_persisted(monkeypatch):
-    """Persisted domains must be restored before the lazy router sees traffic."""
+def test_registry_loader_dispatches_saved_state_to_the_declared_module(monkeypatch):
+    """The central loader imports only saved modules and calls their contract."""
     import ministack.app as app
 
-    requested = []
+    class Module:
+        def __init__(self):
+            self.loaded = []
 
-    def fake_load_state(key):
-        if key == "opensearch":
-            return {
-                "domains": {
-                    "persisted-domain": {"DomainName": "persisted-domain"}
-                }
-            }
-        return None
+        def load_persisted_state(self, data):
+            self.loaded.append(data)
 
-    monkeypatch.setattr(app, "load_state", fake_load_state)
-    monkeypatch.setattr(app, "_get_module", lambda name: requested.append(name) or object())
+    module = Module()
+    monkeypatch.setattr(app, "_state_map", {"saved": "module", "empty": "other"})
+    monkeypatch.setattr(app, "load_state", lambda key: {"value": key} if key == "saved" else None)
+    monkeypatch.setattr(app, "_get_module", lambda name: module if name == "module" else pytest.fail(name))
 
     app._load_persisted_state()
 
-    assert "opensearch" in requested
+    assert module.loaded == [{"value": "saved"}]
 
 
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
@@ -2800,20 +2757,10 @@ def test_iot_ca_registry_and_registration_code_survive_warm_boot():
         mod.reset()
 
 
-# ── Import-order regression for the ECS NameError trap ───────────────
+# ── ECS restore-contract regression ──────────────────────────────────
 
-def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
-    """Regression for the import-order trap: `restore_state()` runs at
-    module import time (via the `try: load_state("ecs")` block at the
-    bottom of services/ecs.py). If `_attributes` is declared AFTER that
-    block, the restore call NameErrors and the surrounding try/except
-    silently swallows it — wiping all ECS state on warm-boot.
-
-    This test simulates a real warm-boot: write a populated `ecs.json`
-    to STATE_DIR, then `importlib.reload()` the module so the load_state
-    block runs against the file. If `_attributes` (or any other
-    referenced symbol) is declared too late, the restored state will
-    be missing because the entire restore_state body crashed."""
+def test_ecs_load_persisted_state_restores_attributes():
+    """ECS restores every store through the central loader contract."""
     mod = _get_module("ecs")
     mod.reset()
     arn = "arn:aws:ecs:us-east-1:000000000000:cluster/reload-canary"
@@ -2828,17 +2775,14 @@ def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
     # Persist via the same path save_all uses on shutdown.
     persistence.save_state("ecs", mod.get_state())
 
-    # Force a full reload so the module-level try/load_state/restore_state
-    # block at the bottom of ecs.py executes against the on-disk JSON.
-    importlib.reload(mod)
+    mod.reset()
+    mod.load_persisted_state(persistence.load_state("ecs"))
 
     assert arn in mod._clusters, (
-        "Cluster lost after reload — likely NameError in restore_state "
-        "swallowed by the try/except. Check that every referenced state "
-        "dict (_attributes etc.) is declared BEFORE the load_state block."
+        "Cluster lost through the ECS load_persisted_state contract."
     )
     assert "i-canary:reload-attr" in mod._attributes, (
-        "ECS _attributes lost after reload — same root cause."
+        "ECS _attributes lost through the load_persisted_state contract."
     )
     mod.reset()
 
@@ -2858,104 +2802,29 @@ def _persisted_services():
 
 
 @pytest.mark.parametrize("svc_key,mod_name", _persisted_services())
-def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
-    svc_key, mod_name, caplog,
-):
-    """Generic regression for the NameError-at-import pattern that hit
-    `ecs._attributes` (#492) and `acm._synthetic_pem` (#494).
+def test_service_defers_persistence_restore_until_registry_loader(svc_key, mod_name):
+    """Services must not restore from disk merely because they are imported.
 
-    The bug shape: `restore_state(data)` references a module-level
-    symbol declared further down the file. The import-time `try:
-    load_state(...)` block calls `restore_state()` BEFORE Python
-    evaluates the later definition, so the lookup NameErrors. The
-    surrounding try/except logs `Failed to restore persisted state` and
-    swallows the exception, so the module appears to import cleanly
-    while ALL its persisted state silently disappears.
-
-    The test:
-      1. Captures the module's current `get_state()` snapshot (a
-         non-empty dict-of-empty-dicts — important so `restore_state`
-         doesn't early-return on truthy emptiness checks).
-      2. Persists that to disk via the production `save_state` path.
-      3. **Removes the module from `sys.modules` and re-imports it
-         fresh** — `importlib.reload()` would NOT catch the bug
-         because it merges new definitions into the existing
-         namespace, leaving any late-declared symbol bound from the
-         previous import.
-      4. Asserts no WARNING+ log record mentioning "restore" / "failed"
-         / "continuing fresh" was emitted during the cold import.
-
-    Catches: unconditional symbol references in restore_state
-    (ECS-style). Does NOT catch: conditional references inside loops
-    over restored data when the data is empty (ACM-style needs
-    populated state — see the per-service tests above).
+    The registry loader is the sole startup restore path. This keeps module
+    imports lazy and ensures every saved snapshot goes through the uniform
+    ``load_persisted_state(data)`` contract.
     """
-    import sys
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin
+    source = Path(spec.origin).read_text()
+    tree = ast.parse(source)
+    import_time_restores = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Try, ast.If))
+        and "load_state(" in (ast.get_source_segment(source, node) or "")
+    ]
 
-    # Persistence is already enabled and STATE_DIR is already pointed at
-    # a per-test tmp by the autouse `_enable_persistence_dict` fixture.
-
-    # Step 1+2: produce + persist a snapshot using the already-loaded
-    # module (so we get a valid get_state() shape).
-    mod = _get_module(mod_name)
-    if hasattr(mod, "reset"):
-        mod.reset()
-    persistence.save_state(svc_key, mod.get_state())
-
-    # Step 3: cold-import — wipe sys.modules and re-import.
-    # importlib.reload() won't work because it merges into the
-    # existing namespace; the late-declared symbol stays bound from
-    # the prior import.
-    import ministack.services as _services_pkg
-
-    full_name = f"ministack.services.{mod_name}"
-    # The cold-import swaps a brand-new module object into BOTH sys.modules and
-    # the `ministack.services` package attribute. Other already-imported modules
-    # that did `from ministack.services import <mod>` keep a reference to the
-    # ORIGINAL object, so we must restore it afterwards. Otherwise the fresh
-    # module (with empty, reset state) leaks into later tests on the same xdist
-    # worker and desyncs cross-module references — e.g. cold-importing `ecs`
-    # then `secretsmanager` leaves the fresh `ecs` pointing at a stale
-    # `secretsmanager`, so ECS RunTask can no longer resolve Secrets Manager
-    # secrets created via the live module. Both the sys.modules entry and the
-    # package attribute must be restored: `from ministack.services import <mod>`
-    # reads the package attribute, not sys.modules directly.
-    original_mod = sys.modules.get(full_name)
-    sys.modules.pop(full_name, None)
-
-    try:
-        caplog.clear()
-        with caplog.at_level("WARNING"):
-            mod = importlib.import_module(full_name)
-
-        bad = [
-            r for r in caplog.records
-            if r.levelno >= 30  # WARNING+
-            and any(needle in r.getMessage().lower()
-                    for needle in ("failed to restore", "restore failed",
-                                   "continuing fresh", "continuing with fresh"))
-        ]
-        if hasattr(mod, "reset"):
-            mod.reset()
-    finally:
-        # Re-register the original module so references bound before this test
-        # (e.g. `ecs.secretsmanager`) stay valid for subsequent tests.
-        if original_mod is not None:
-            sys.modules[full_name] = original_mod
-            setattr(_services_pkg, mod_name, original_mod)
-
-    assert not bad, (
-        f"Cold import of `{mod_name}` (state-key `{svc_key}`) emitted "
-        f"a restore-failure log:\n  "
-        + "\n  ".join(r.getMessage() for r in bad)
-        + "\n\nThis usually means `restore_state` references a "
-        "module-level symbol that's declared further down the file. "
-        "The import-time `try: load_state()` block runs before the "
-        "later definition, so the symbol lookup NameErrors and the "
-        "surrounding try/except swallows it. Hoist the symbol above "
-        "the import-time `load_state` block (see ECS `_attributes` "
-        "or ACM `_synthetic_pem` for the canonical fix)."
+    assert not import_time_restores, (
+        f"{mod_name} restores state at import time; restore {svc_key!r} "
+        "through ministack.app._load_persisted_state instead."
     )
+    assert "from ministack.core.persistence import load_state" not in source
 
 
 def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_path):
@@ -3523,8 +3392,6 @@ def test_cloudtrail_legacy_state_restores_trails_by_home_region():
 def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
     monkeypatch, tmp_path
 ):
-    import importlib
-
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.core.responses import set_request_account_id, set_request_region
     from ministack.services import cloudtrail
@@ -3572,7 +3439,7 @@ def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
         persistence.save_all({"cloudtrail": save_dict["cloudtrail"]})
 
         cloudtrail.reset()
-        importlib.reload(cloudtrail)
+        cloudtrail.load_persisted_state(persistence.load_state("cloudtrail"))
 
         assert cloudtrail._trails.get_scoped(
             first_account, west_region, "acct-one-west"
@@ -5582,9 +5449,7 @@ def test_glue_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
 
 
 def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
-    """The gateway save map and Batch import-time restore must preserve state
-    outside the ambient boot region across a process-shaped reload."""
-    import importlib
+    """The registry loader preserves state outside the ambient boot region."""
 
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.core.responses import set_request_account_id, set_request_region
@@ -5613,7 +5478,7 @@ def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_pa
         persistence.save_all({"batch": save_dict["batch"]})
 
         service.reset()
-        importlib.reload(service)
+        service.load_persisted_state(persistence.load_state("batch"))
 
         assert service._jobs.get_scoped(
             account_id, resource_region, job_id

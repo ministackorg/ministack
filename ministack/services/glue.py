@@ -29,7 +29,6 @@ from urllib.parse import unquote
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -181,14 +180,6 @@ def _restore_regional_store(store, restored):
         store[key] = value
 
 
-try:
-    _restored = load_state("glue")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def _arn(resource_type, name):

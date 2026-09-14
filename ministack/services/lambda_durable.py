@@ -30,7 +30,6 @@ import time
 import uuid
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     _request_account_id,
@@ -194,13 +193,6 @@ def restore_state(data):
                 _request_region.reset(tok_r)
 
 
-try:
-    _restored = load_state("lambda_durable")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception("Failed to restore lambda_durable state")
 
 
 # ---------------------------------------------------------------------------

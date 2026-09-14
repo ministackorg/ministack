@@ -122,7 +122,6 @@ def _resolve_topic_tag_arn(arn: str):
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
     return arn, topic, None
 
-from ministack.core.persistence import load_state
 
 _topics = AccountRegionScopedDict()
 _sub_arn_to_topic = AccountRegionScopedDict()
@@ -153,15 +152,6 @@ def restore_state(data):
         _platform_endpoints.update(data.get("platform_endpoints", {}))
 
 
-try:
-    _restored = load_state("sns")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:

@@ -36,7 +36,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -70,18 +69,9 @@ _tasks = AccountRegionScopedDict()
 _tags = AccountScopedDict()
 _account_settings = AccountRegionScopedDict()
 _capacity_providers = AccountRegionScopedDict()
-# `_attributes` was originally declared next to its handler block much
-# further down the file. Moved up here so the import-time `load_state`
-# block (which calls `restore_state` and references `_attributes`) sees
-# it defined; otherwise warm-boot fires NameError, the surrounding
-# try/except swallows it, and ALL ECS state silently fails to restore.
 _attributes = AccountRegionScopedDict()
 
 
-# Up here for the same reason as `_attributes`: the import-time `load_state`
-# block calls `restore_state`, which counts the tasks it stops, so this has to
-# be bound before that runs. Defined further down it raises NameError there,
-# the surrounding try/except swallows it, and ALL ECS state fails to restore.
 def _bump_task_version(task):
     """Count one observable change on the task.
 
@@ -240,7 +230,9 @@ def _restore_task_def_latest(latest_data):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    restore_state(data)
+    if _services.has_any():
+        _start_restored_service_reconciler()
 
 
 def restore_state(data):
@@ -331,16 +323,6 @@ def _start_restored_service_reconciler():
     ).start()
 
 
-try:
-    _restored = load_state("ecs")
-    if _restored:
-        restore_state(_restored)
-        _start_restored_service_reconciler()
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _get_docker():

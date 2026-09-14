@@ -32,7 +32,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -598,12 +597,6 @@ def _set_vpc_options(rec: dict, options) -> None:
         rec["Endpoint"] = endpoint
 
 
-try:
-    _restored = load_state("opensearch")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted OpenSearch state; continuing fresh")
 
 
 def _new_domain_record(name, payload):

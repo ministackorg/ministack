@@ -47,7 +47,6 @@ except ImportError:  # the wheel is optional at runtime: JSONata states refuse
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -184,15 +183,6 @@ def restore_state(data):
             exc["cause"] = "Execution was running when service restarted"
 
 
-try:
-    _restored = load_state("stepfunctions")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 _TIMESTAMP_RESPONSE_FIELDS = {

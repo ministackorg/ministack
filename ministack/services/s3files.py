@@ -23,7 +23,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -145,12 +144,6 @@ def _restore_child_store(
         store.set_scoped(account_id, region, key, value)
 
 
-try:
-    _restored = load_state("s3files")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def reset():
