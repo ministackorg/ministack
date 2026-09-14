@@ -913,7 +913,7 @@ def test_iam_aws_managed_attachment_count_persists_through_state_round_trip():
     _iam._aws_managed_attachment_counts.clear()
     assert _iam._aws_managed_attachment_counts.get(arn, 0) == 0
 
-    _iam._restore_state(snapshot)
+    _iam.load_persisted_state(snapshot)
     assert _iam._aws_managed_attachment_counts.get(arn) == 2
 
 

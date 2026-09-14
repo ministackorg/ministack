@@ -1351,7 +1351,7 @@ def test_eks_restore_state_normalizes_endpoint_to_localhost():
         state = eks_mod.get_state()
         eks_mod.reset()
 
-        eks_mod._restore_state(state)
+        eks_mod.load_persisted_state(state)
 
         restored = eks_mod._clusters.get("c-restore")
         assert restored["endpoint"] == "https://localhost:16443"

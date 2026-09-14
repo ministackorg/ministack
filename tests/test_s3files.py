@@ -177,7 +177,7 @@ def test_legacy_child_state_restores_beside_parent_resource():
 
     service.reset()
     try:
-        service._restore_state(payload)
+        service.load_persisted_state(payload)
         assert service._file_systems.get_scoped(
             account_id, resource_region, fs_id
         )["fileSystemId"] == fs_id
@@ -230,7 +230,7 @@ def test_legacy_orphaned_mount_target_restores_to_availability_zone_region():
 
     service.reset()
     try:
-        service._restore_state({"mount_targets": mount_targets})
+        service.load_persisted_state({"mount_targets": mount_targets})
         assert service._mount_targets.get_scoped(
             account_id, resource_region, mt_id
         )["mountTargetId"] == mt_id

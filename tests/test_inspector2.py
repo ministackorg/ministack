@@ -109,7 +109,7 @@ def test_inspector2_legacy_buckets_restore_to_boot_region():
 
     service.reset()
     try:
-        service._restore_state(payload)
+        service.load_persisted_state(payload)
         for state_key in (
             "account_config",
             "findings",
@@ -296,7 +296,7 @@ class TestPersistence:
 
         _inspector2.reset()
         state = _inspector2.get_state()
-        _inspector2._restore_state(state)
+        _inspector2.load_persisted_state(state)
         state2 = _inspector2.get_state()
         assert set(state.keys()) == set(state2.keys())
 

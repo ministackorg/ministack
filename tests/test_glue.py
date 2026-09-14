@@ -1773,7 +1773,7 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
     try:
         set_request_account_id(account)
         set_request_region(region)
-        gluemod._restore_state(state)
+        gluemod.load_persisted_state(state)
 
         assert gluemod._databases.get_scoped(account, region, "legacy-db")["Name"] == "legacy-db"
         assert gluemod._tables.get_scoped(account, region, "legacy-db/legacy-table")["Name"] == "legacy-table"

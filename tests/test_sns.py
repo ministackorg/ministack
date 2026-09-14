@@ -1882,7 +1882,7 @@ def test_sns_restore_legacy_account_scoped_state_adopts_arn_regions():
             "attributes": {"Token": "legacy-token", "Enabled": "true"},
         }
 
-        _sns._restore_state({
+        _sns.load_persisted_state({
             "topics": legacy_topics,
             "sub_arn_to_topic": legacy_subs,
             "platform_applications": legacy_apps,

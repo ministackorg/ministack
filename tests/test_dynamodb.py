@@ -289,7 +289,7 @@ def test_dynamodb_restore_legacy_table_name_metadata_uses_table_arn_region():
     }
 
     try:
-        ddb_service._restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "pitr_settings": pitr_settings,
@@ -359,7 +359,7 @@ def test_dynamodb_restore_ambiguous_legacy_metadata_uses_value_arn_region():
     ]
 
     try:
-        ddb_service._restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "kinesis_destinations": kinesis_destinations,

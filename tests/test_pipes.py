@@ -455,7 +455,7 @@ def test_pipes_restore_legacy_account_scoped_state_uses_pipe_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        _pipes._restore_state({
+        _pipes.load_persisted_state({
             "pipes": legacy_pipes,
             "positions": legacy_positions,
         })

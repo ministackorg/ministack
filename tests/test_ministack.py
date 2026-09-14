@@ -186,7 +186,7 @@ def test_ministack_persist_sqs_roundtrip():
     saved_queues = dict(_sqs._queues)
     _sqs._queues.clear()
     _sqs._queue_name_to_url.clear()
-    _sqs._restore_state(state)
+    _sqs.load_persisted_state(state)
     assert "http://localhost:4566/000000000000/persist-q" in _sqs._queues
     _sqs._queues.update(saved_queues)
 
@@ -196,7 +196,7 @@ def test_ministack_persist_sns_roundtrip():
     state = _sns.get_state()
     assert "topics" in state
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
-    _sns._restore_state(state)
+    _sns.load_persisted_state(state)
     assert "arn:aws:sns:us-east-1:000000000000:persist-topic" in _sns._topics
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
 
@@ -206,7 +206,7 @@ def test_ministack_persist_ssm_roundtrip():
     state = _ssm.get_state()
     assert "parameters" in state
     _ssm._parameters.pop("/persist/key")
-    _ssm._restore_state(state)
+    _ssm.load_persisted_state(state)
     assert "/persist/key" in _ssm._parameters
     _ssm._parameters.pop("/persist/key")
 
@@ -216,7 +216,7 @@ def test_ministack_persist_secretsmanager_roundtrip():
     state = _sm.get_state()
     assert "secrets" in state
     _sm._secrets.pop("persist-secret")
-    _sm._restore_state(state)
+    _sm.load_persisted_state(state)
     assert "persist-secret" in _sm._secrets
     _sm._secrets.pop("persist-secret")
 
@@ -226,7 +226,7 @@ def test_ministack_persist_dynamodb_roundtrip():
     state = _ddb.get_state()
     assert "tables" in state
     _ddb._tables.pop("persist-tbl")
-    _ddb._restore_state(state)
+    _ddb.load_persisted_state(state)
     assert "persist-tbl" in _ddb._tables
     _ddb._tables.pop("persist-tbl")
 
@@ -236,7 +236,7 @@ def test_ministack_persist_eventbridge_roundtrip():
     state = _eb.get_state()
     assert "rules" in state
     _eb._rules.pop("default|persist-rule")
-    _eb._restore_state(state)
+    _eb.load_persisted_state(state)
     assert "default|persist-rule" in _eb._rules
     _eb._rules.pop("default|persist-rule")
 
@@ -246,7 +246,7 @@ def test_ministack_persist_kinesis_roundtrip():
     state = _kin.get_state()
     assert "streams" in state
     _kin._streams.pop("persist-stream")
-    _kin._restore_state(state)
+    _kin.load_persisted_state(state)
     assert "persist-stream" in _kin._streams
     _kin._streams.pop("persist-stream")
 
@@ -257,7 +257,7 @@ def test_ministack_persist_kms_roundtrip():
     state = _kms.get_state()
     assert "keys" in state
     _kms._keys.pop(key_id)
-    _kms._restore_state(state)
+    _kms.load_persisted_state(state)
     assert key_id in _kms._keys
     assert _kms._keys[key_id]["Description"] == "persist-key"
     _kms._keys.pop(key_id)
@@ -268,7 +268,7 @@ def test_ministack_persist_ec2_roundtrip():
     state = _ec2.get_state()
     assert "instances" in state
     _ec2._instances.pop("i-persist01")
-    _ec2._restore_state(state)
+    _ec2.load_persisted_state(state)
     assert "i-persist01" in _ec2._instances
     _ec2._instances.pop("i-persist01")
 
@@ -278,7 +278,7 @@ def test_ministack_persist_route53_roundtrip():
     state = _r53.get_state()
     assert "zones" in state
     _r53._zones.pop("Z00PERSIST")
-    _r53._restore_state(state)
+    _r53.load_persisted_state(state)
     assert "Z00PERSIST" in _r53._zones
     _r53._zones.pop("Z00PERSIST")
 
@@ -288,7 +288,7 @@ def test_ministack_persist_cognito_roundtrip():
     state = _cog.get_state()
     assert "user_pools" in state
     _cog._user_pools.pop("us-east-1_PERSIST")
-    _cog._restore_state(state)
+    _cog.load_persisted_state(state)
     assert "us-east-1_PERSIST" in _cog._user_pools
     _cog._user_pools.pop("us-east-1_PERSIST")
 
@@ -298,7 +298,7 @@ def test_ministack_persist_ecr_roundtrip():
     state = _ecr.get_state()
     assert "repositories" in state
     _ecr._repositories.pop("persist-repo")
-    _ecr._restore_state(state)
+    _ecr.load_persisted_state(state)
     assert "persist-repo" in _ecr._repositories
     _ecr._repositories.pop("persist-repo")
 
@@ -308,7 +308,7 @@ def test_ministack_persist_cloudwatch_roundtrip():
     state = _cw.get_state()
     assert "alarms" in state
     _cw._alarms.pop("persist-alarm")
-    _cw._restore_state(state)
+    _cw.load_persisted_state(state)
     assert "persist-alarm" in _cw._alarms
     _cw._alarms.pop("persist-alarm")
 
@@ -323,7 +323,7 @@ def test_ministack_persist_s3_metadata_roundtrip():
     assert "bucket_versioning" in state
     _s3._buckets.pop("persist-bkt")
     _s3._bucket_versioning.pop("persist-bkt")
-    _s3._restore_state(state)
+    _s3.load_persisted_state(state)
     assert "persist-bkt" in _s3._buckets
     assert _s3._buckets["persist-bkt"]["objects"] == {}  # objects not restored
     assert _s3._bucket_versioning["persist-bkt"] == "Enabled"
@@ -349,7 +349,7 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
     _s3._bucket_logging_config.pop("persist-log-bkt")
     _s3._bucket_accelerate_config.pop("persist-log-bkt")
     _s3._bucket_request_payment_config.pop("persist-log-bkt")
-    _s3._restore_state(state)
+    _s3.load_persisted_state(state)
     assert "TargetBucket>tgt" in _s3._bucket_logging_config["persist-log-bkt"]
     assert "Enabled" in _s3._bucket_accelerate_config["persist-log-bkt"]
     assert "Requester" in _s3._bucket_request_payment_config["persist-log-bkt"]
@@ -378,7 +378,7 @@ def test_ministack_persist_lambda_roundtrip():
         # the bytes themselves live under ${STATE_DIR}/lambda-blobs/{sha}.zip.
         assert state["functions"]["persist-fn"]["code_zip"] == {"code_blob_ref": sha}
         _lam._functions.pop("persist-fn")
-        _lam._restore_state(state)
+        _lam.load_persisted_state(state)
         assert "persist-fn" in _lam._functions
         # code_zip is restored back to bytes.
         assert _lam._functions["persist-fn"]["code_zip"] == code
@@ -402,7 +402,7 @@ def test_ministack_persist_rds_roundtrip():
     assert "instances" in state
     assert "_docker_container_id" not in state["instances"]["persist-db"]
     _rds._instances.pop("persist-db")
-    _rds._restore_state(state)
+    _rds.load_persisted_state(state)
     assert "persist-db" in _rds._instances
     assert _rds._instances["persist-db"]["Engine"] == "postgres"
     _rds._instances.pop("persist-db")
@@ -421,7 +421,7 @@ def test_ministack_persist_ecs_roundtrip():
     assert "_docker_ids" not in state["tasks"]["arn:persist-task"]
     _ecs._clusters.pop("persist-cluster")
     _ecs._tasks.pop("arn:persist-task")
-    _ecs._restore_state(state)
+    _ecs.load_persisted_state(state)
     assert "persist-cluster" in _ecs._clusters
     assert "arn:persist-task" in _ecs._tasks
     assert _ecs._tasks["arn:persist-task"]["lastStatus"] == "STOPPED"
@@ -440,7 +440,7 @@ def test_ministack_persist_elasticache_roundtrip():
     assert "clusters" in state
     assert "_docker_container_id" not in state["clusters"]["persist-cache"]
     _ec._clusters.pop("persist-cache")
-    _ec._restore_state(state)
+    _ec.load_persisted_state(state)
     assert "persist-cache" in _ec._clusters
     assert _ec._clusters["persist-cache"]["Engine"] == "redis"
     _ec._clusters.pop("persist-cache")
@@ -460,7 +460,7 @@ def test_ministack_persist_stepfunctions_roundtrip():
     assert "state_machines" in state
     assert sm_arn in state["state_machines"]
     _sfn._state_machines.pop(sm_arn)
-    _sfn._restore_state(state)
+    _sfn.load_persisted_state(state)
     assert sm_arn in _sfn._state_machines
     assert _sfn._state_machines[sm_arn]["name"] == "persist-sm"
     _sfn._state_machines.pop(sm_arn)
@@ -486,7 +486,7 @@ def test_ministack_persist_stepfunctions_running_marked_failed():
     state = _sfn.get_state()
     _sfn._executions.pop(run_arn)
     _sfn._executions.pop(done_arn)
-    _sfn._restore_state(state)
+    _sfn.load_persisted_state(state)
     # RUNNING execution should be marked FAILED
     restored_run = _sfn._executions[run_arn]
     assert restored_run["status"] == "FAILED"
@@ -601,7 +601,7 @@ def test_lambda_svc_restore_does_not_forward_reference_ensure_poller():
         "function_urls": {},
     }
     # Must not raise NameError
-    lam_mod._restore_state(fake_state)
+    lam_mod.load_persisted_state(fake_state)
     assert "fake-uuid" in [e["UUID"] for e in lam_mod._esms.values()] or True
 
 

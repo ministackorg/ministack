@@ -794,7 +794,7 @@ def test_kms_restore_legacy_account_scoped_state_adopts_key_arn_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms._restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._keys.get_scoped(account_id, "us-east-1", key_id) is None
         assert _kms._keys.get_scoped(account_id, "us-west-2", key_id)["Arn"] == key_arn
@@ -849,7 +849,7 @@ def test_kms_restore_legacy_bare_alias_name_adopts_target_key_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms._restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._aliases.get_scoped(account_id, "us-east-1", alias_arn) is None
         assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
@@ -1920,7 +1920,7 @@ def test_kms_hmac_key_survives_state_roundtrip():
         assert "_hmac_key_b64" in state["keys"][key_id]
         assert "_hmac_key" not in state["keys"][key_id]
         _kms.reset()
-        _kms._restore_state(state)
+        _kms.load_persisted_state(state)
 
         rec = _kms._keys[key_id]
         assert isinstance(rec["_hmac_key"], bytes)

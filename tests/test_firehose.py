@@ -769,7 +769,7 @@ def test_firehose_restore_legacy_account_scoped_state_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        _fh._restore_state({"_streams": legacy_streams})
+        _fh.load_persisted_state({"_streams": legacy_streams})
 
         # The legacy stream lands in the region carried by its ARN, not the
         # active request region.

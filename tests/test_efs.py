@@ -160,7 +160,7 @@ def test_efs_restore_legacy_state_places_children_beside_parent():
 
     service.reset()
     try:
-        service._restore_state(payload)
+        service.load_persisted_state(payload)
         assert service._file_systems.get_scoped(account_id, resource_region, fs_id)["FileSystemId"] == fs_id
         assert service._mount_targets.get_scoped(account_id, resource_region, mt_id)["FileSystemId"] == fs_id
         assert service._access_points.get_scoped(account_id, resource_region, ap_id)["FileSystemId"] == fs_id

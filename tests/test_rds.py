@@ -736,7 +736,7 @@ def test_rds_modify_legacy_subnet_group_adopts_resolved_vpc():
         persisted_groups = rds_service.get_state()["subnet_groups"]
         persisted_groups[group_name]["VpcId"] = "vpc-00000000"
         rds_service._subnet_groups.clear()
-        rds_service._restore_state({"subnet_groups": persisted_groups})
+        rds_service.load_persisted_state({"subnet_groups": persisted_groups})
 
         status, _, _ = rds_service._modify_subnet_group({
             "DBSubnetGroupName": group_name,
@@ -2404,7 +2404,7 @@ def test_rds_restored_initialized_storage_defers_password_rotation(monkeypatch):
         assert persisted_cluster["_shared_storage_initialized"] is True
 
         m._clusters.clear()
-        m._restore_state(persisted)
+        m.load_persisted_state(persisted)
         restored = m._clusters["restored-password-cluster"]
         assert restored["_shared_container_id"] is None
 
@@ -10096,7 +10096,7 @@ def test_rds_restore_syncs_stale_secondary_credentials_from_global_writer(
     m._clusters.clear()
     m._global_clusters.clear()
     try:
-        m._restore_state({
+        m.load_persisted_state({
             "instances": AccountRegionScopedDict(),
             "clusters": clusters,
             "global_clusters": global_clusters,
@@ -10609,7 +10609,7 @@ def test_rds_mysql_writer_switch_state_round_trip_requires_repair():
         persisted = m.get_state()
         m._global_clusters.clear()
 
-        m._restore_state({
+        m.load_persisted_state({
             "instances": {},
             "clusters": {},
             "global_clusters": persisted["global_clusters"],

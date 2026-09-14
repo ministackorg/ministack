@@ -91,7 +91,7 @@ def test_transfer_legacy_state_restores_resources_to_arn_region():
 
     service.reset()
     try:
-        service._restore_state({"servers": servers, "users": users})
+        service.load_persisted_state({"servers": servers, "users": users})
         assert service._servers.get_scoped(
             account_id, resource_region, server_id
         )["ServerId"] == server_id

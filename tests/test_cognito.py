@@ -4978,7 +4978,7 @@ def _cognito_round_trip(mod, svc_key="cognito"):
     mod.reset()
     loaded = persistence.load_state(svc_key)
     assert loaded is not None, "load_state returned None — get_state may be wrong"
-    mod._restore_state(loaded)
+    mod.load_persisted_state(loaded)
 
 
 def test_auth_codes_survive_warm_boot(_enable_persistence):
@@ -5865,7 +5865,7 @@ def test_cognito_legacy_state_self_places_by_pool_ids():
         mod.reset()
         set_request_account_id(account)
         set_request_region("us-east-1")
-        mod._restore_state({
+        mod.load_persisted_state({
             "user_pools": legacy_user_pools,
             "pool_domain_map": legacy_domains,
             "identity_pools": legacy_identity_pools,
@@ -5885,7 +5885,7 @@ def test_cognito_legacy_state_self_places_by_pool_ids():
         v3 = AccountRegionScopedDict()
         v3.set_scoped(account, "eu-central-1", "eu-central-1_v3", {"Name": "v3"})
         mod.reset()
-        mod._restore_state({"user_pools": v3})
+        mod.load_persisted_state({"user_pools": v3})
         assert mod._user_pools.get_scoped(account, "eu-central-1", "eu-central-1_v3") == {
             "Name": "v3"
         }
@@ -6539,7 +6539,7 @@ def test_custom_auth_session_persistence():
     state = cognito_mod.get_state()
     cognito_mod._challenge_sessions.clear()
     assert cognito_mod._challenge_sessions.get(token) is None
-    cognito_mod._restore_state(state)
+    cognito_mod.load_persisted_state(state)
     assert cognito_mod._challenge_sessions.get(token) is not None
 
 
