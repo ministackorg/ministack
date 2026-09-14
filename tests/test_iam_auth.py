@@ -458,6 +458,8 @@ class TestResourceAccountCondition:
         ("arn:aws:sqs:us-east-1:222222222222:q", "222222222222"),
         ("not-an-arn", None),
         ("arn:aws:sqs", None),                            # too short
+        ("arn:aws:sqs:us-east-1:12345:q", None),          # not twelve digits
+        ("a:b:c:d:123456789012:e", None),                 # twelve digits, not an ARN
     ])
     def test_account_from_arn(self, arn, expected):
         from ministack.core.iam_evaluator import _account_from_arn
