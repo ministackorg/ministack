@@ -1174,7 +1174,11 @@ def test_eks_access_entry_list_returns_principal_arns(eks):
         eks.create_access_entry(clusterName=cn, principalArn=p1)
         eks.create_access_entry(clusterName=cn, principalArn=p2)
         listed = eks.list_access_entries(clusterName=cn)["accessEntries"]
-        assert set(listed) == {p1, p2}
+        # The creator's entry is there too: AWS sets the cluster creator as a
+        # cluster admin access entry at creation time, which is what makes it
+        # listable and revocable.
+        assert {p1, p2} <= set(listed)
+        assert "arn:aws:iam::000000000000:root" in listed
     finally:
         try:
             eks.delete_cluster(name=cn)
