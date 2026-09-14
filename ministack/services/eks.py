@@ -12,6 +12,9 @@ Supports:
   Nodegroups: CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup
   IdP configs: AssociateIdentityProviderConfig, DescribeIdentityProviderConfig,
               DisassociateIdentityProviderConfig, ListIdentityProviderConfigs
+  Pod identity: CreatePodIdentityAssociation, DescribePodIdentityAssociation,
+              ListPodIdentityAssociations, UpdatePodIdentityAssociation,
+              DeletePodIdentityAssociation
   Authentication: AWS IAM exec tokens through a k3s TokenReview webhook
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
@@ -91,6 +94,7 @@ _access_entries = AccountRegionScopedDict() # "cluster\x00principalArn" -> acces
 _access_policies = AccountRegionScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
 _idp_configs = AccountRegionScopedDict()     # "cluster\x00idp_name" -> idp record
+_pod_identity_associations = AccountRegionScopedDict()  # "cluster\x00associationId" -> association
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
@@ -179,6 +183,7 @@ def reset():
     _access_policies.clear()
     _tags.clear()
     _idp_configs.clear()
+    _pod_identity_associations.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
 
@@ -200,6 +205,7 @@ def get_state():
         "access_policies": copy.deepcopy(_access_policies),
         "tags": copy.deepcopy(_tags),
         "idp_configs": copy.deepcopy(_idp_configs),
+        "pod_identity_associations": copy.deepcopy(_pod_identity_associations),
         "port_counter": _port_counter[0],
     }
 
@@ -249,6 +255,7 @@ def restore_state(data):
         (_access_entries, "access_entries", "\x00"),
         (_access_policies, "access_policies", "\x00"),
         (_idp_configs, "idp_configs", "\x00"),
+        (_pod_identity_associations, "pod_identity_associations", "\x00"),
     ):
         _restore_cluster_child_store(
             store,
@@ -328,6 +335,18 @@ def _ae_key(cluster_name: str, principal_arn: str) -> str:
 
 def _ap_key(cluster_name: str, principal_arn: str, policy_arn: str) -> str:
     return f"{cluster_name}\x00{principal_arn}\x00{policy_arn}"
+
+
+def _pia_key(cluster_name: str, association_id: str) -> str:
+    return f"{cluster_name}\x00{association_id}"
+
+
+def _pod_identity_association_arn(cluster_name, association_id):
+    # AWS: arn:aws:eks:{region}:{account}:podidentityassociation/{cluster}/{associationId}.
+    return (
+        f"arn:aws:eks:{get_region()}:{get_account_id()}:"
+        f"podidentityassociation/{cluster_name}/{association_id}"
+    )
 
 
 def _now():
@@ -849,6 +868,10 @@ def _delete_cluster(name):
             _tags.pop(entry.get("accessEntryArn", ""), None)
     for key in [k for k in _access_policies if str(k).startswith(prefix)]:
         _access_policies.pop(key, None)
+    for key in [k for k in _pod_identity_associations if str(k).startswith(prefix)]:
+        assoc = _pod_identity_associations.pop(key, None)
+        if assoc:
+            _tags.pop(assoc.get("associationArn", ""), None)
 
     arn = cluster["arn"]
     cluster["status"] = "DELETING"
@@ -1117,6 +1140,140 @@ def _list_access_entries(cluster_name, query):
         arns.append(e["principalArn"])
     max_results = int(query.get("maxResults", 100))
     return _json_resp(200, {"accessEntries": arns[:max_results]})
+
+
+# ---------------------------------------------------------------------------
+# EKS Pod Identity associations
+#
+# A pod identity association binds a Kubernetes service account in a namespace
+# to an IAM role. The EKS Pod Identity Agent and the controllers that read it
+# (the AWS Load Balancer Controller among them) list and describe these
+# records; nothing here runs inside the cluster, so the association is a
+# control-plane record, which is what the API serves.
+# ---------------------------------------------------------------------------
+
+def _pod_identity_summary(assoc):
+    """The PodIdentityAssociationSummary shape ListPodIdentityAssociations
+    returns: six of the full record's members, not the whole association."""
+    return {
+        "clusterName": assoc["clusterName"],
+        "namespace": assoc["namespace"],
+        "serviceAccount": assoc["serviceAccount"],
+        "associationArn": assoc["associationArn"],
+        "associationId": assoc["associationId"],
+        "ownerArn": assoc.get("ownerArn", ""),
+    }
+
+
+def _create_pod_identity_association(cluster_name, body):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = body.get("namespace", "")
+    service_account = body.get("serviceAccount", "")
+    role_arn = body.get("roleArn", "")
+    for name, value in (("namespace", namespace), ("serviceAccount", service_account),
+                        ("roleArn", role_arn)):
+        if not value:
+            return _error(400, "InvalidParameterException", f"{name} is required.")
+    # One association per (namespace, service account): a second one is
+    # ResourceInUseException, which the operation documents.
+    for key, existing in list(_pod_identity_associations.items()):
+        if (key.startswith(f"{cluster_name}\x00")
+                and existing["namespace"] == namespace
+                and existing["serviceAccount"] == service_account):
+            return _error(409, "ResourceInUseException",
+                          f"Association already exists for service account "
+                          f"{service_account} in namespace {namespace}.")
+    association_id = "a-" + new_uuid().replace("-", "")[:16]
+    now = _now()
+    assoc = {
+        "clusterName": cluster_name,
+        "namespace": namespace,
+        "serviceAccount": service_account,
+        "roleArn": role_arn,
+        "associationArn": _pod_identity_association_arn(cluster_name, association_id),
+        "associationId": association_id,
+        "tags": body.get("tags", {}),
+        "createdAt": now,
+        "modifiedAt": now,
+        "ownerArn": "",
+        "disableSessionTags": bool(body.get("disableSessionTags", False)),
+    }
+    if body.get("targetRoleArn"):
+        # A target role makes this a role-chaining association, and AWS mints
+        # the externalId the target role's trust policy matches on.
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc["externalId"] = new_uuid()
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    _pod_identity_associations[_pia_key(cluster_name, association_id)] = assoc
+    if assoc["tags"]:
+        _tags[assoc["associationArn"]] = dict(assoc["tags"])
+    return _json_resp(200, {"association": assoc})
+
+
+def _describe_pod_identity_association(cluster_name, association_id):
+    assoc = _pod_identity_associations.get(_pia_key(cluster_name, association_id))
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    return _json_resp(200, {"association": assoc})
+
+
+def _list_pod_identity_associations(cluster_name, query):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = query.get("namespace")
+    service_account = query.get("serviceAccount")
+    prefix = f"{cluster_name}\x00"
+    summaries = []
+    for key, assoc in _pod_identity_associations.items():
+        if not key.startswith(prefix):
+            continue
+        if namespace is not None and assoc["namespace"] != namespace:
+            continue
+        if service_account is not None and assoc["serviceAccount"] != service_account:
+            continue
+        summaries.append(_pod_identity_summary(assoc))
+    summaries.sort(key=lambda a: a["associationId"])
+    max_results = int(query.get("maxResults", 100))
+    return _json_resp(200, {"associations": summaries[:max_results]})
+
+
+def _update_pod_identity_association(cluster_name, association_id, body):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    # The request carries only the mutable members; namespace and service
+    # account are not among them, so an association keeps the pair it was
+    # created for.
+    if body.get("roleArn"):
+        assoc["roleArn"] = body["roleArn"]
+    if "disableSessionTags" in body:
+        assoc["disableSessionTags"] = bool(body["disableSessionTags"])
+    if body.get("targetRoleArn"):
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc.setdefault("externalId", new_uuid())
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    assoc["modifiedAt"] = _now()
+    return _json_resp(200, {"association": assoc})
+
+
+def _delete_pod_identity_association(cluster_name, association_id):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    _tags.pop(assoc.get("associationArn", ""), None)
+    _pod_identity_associations.pop(key, None)
+    # The deleted association is the response body, as the operation documents.
+    return _json_resp(200, {"association": assoc})
 
 
 def _delete_access_entry(cluster_name, principal_arn):
@@ -2335,6 +2492,26 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
             return _describe_nodegroup(cluster_name, ng_name)
         if method == "DELETE":
             return _delete_nodegroup(cluster_name, ng_name)
+
+    # /clusters/{name}/pod-identity-associations — Create / List
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _create_pod_identity_association(cluster_name, body)
+        if method == "GET":
+            return _list_pod_identity_associations(cluster_name, query)
+
+    # /clusters/{name}/pod-identity-associations/{associationId}
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations/([A-Za-z0-9_-]+)", path)
+    if m:
+        cluster_name, association_id = m.group(1), m.group(2)
+        if method == "GET":
+            return _describe_pod_identity_association(cluster_name, association_id)
+        if method == "POST":
+            return _update_pod_identity_association(cluster_name, association_id, body)
+        if method == "DELETE":
+            return _delete_pod_identity_association(cluster_name, association_id)
 
     # POST /clusters/{name}/encryption-config/associate — AssociateEncryptionConfig
     m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/encryption-config/associate", path)

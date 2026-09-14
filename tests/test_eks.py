@@ -948,6 +948,165 @@ def _create_basic_cluster(eks):
     return cn
 
 
+def test_eks_pod_identity_association_lifecycle(eks):
+    """EKS Pod Identity: the five operations a controller reading pod identity
+    needs. Create returns the full association, List the six-field summary,
+    Describe the record, Update the mutable members, and Delete answers with
+    the association it removed."""
+    cn = _create_basic_cluster(eks)
+    role = f"arn:aws:iam::000000000000:role/lbc-{_uid()}"
+    try:
+        created = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system",
+            serviceAccount="aws-load-balancer-controller",
+            roleArn=role, tags={"team": "platform"},
+        )["association"]
+        assoc_id = created["associationId"]
+        assert created["clusterName"] == cn
+        assert created["namespace"] == "kube-system"
+        assert created["serviceAccount"] == "aws-load-balancer-controller"
+        assert created["roleArn"] == role
+        assert created["tags"] == {"team": "platform"}
+        assert created["associationArn"] == (
+            f"arn:aws:eks:{REGION}:000000000000:podidentityassociation/{cn}/{assoc_id}")
+        assert created["createdAt"] == created["modifiedAt"]
+
+        described = eks.describe_pod_identity_association(
+            clusterName=cn, associationId=assoc_id)["association"]
+        assert described["roleArn"] == role
+
+        # The list shape is the summary, not the whole association.
+        listed = eks.list_pod_identity_associations(clusterName=cn)["associations"]
+        assert len(listed) == 1
+        assert set(listed[0]) == {
+            "clusterName", "namespace", "serviceAccount",
+            "associationArn", "associationId", "ownerArn",
+        }
+
+        updated = eks.update_pod_identity_association(
+            clusterName=cn, associationId=assoc_id, roleArn=role + "-v2")["association"]
+        assert updated["roleArn"] == role + "-v2"
+        # namespace and serviceAccount are not members of the update request.
+        assert updated["namespace"] == "kube-system"
+        assert updated["serviceAccount"] == "aws-load-balancer-controller"
+
+        deleted = eks.delete_pod_identity_association(
+            clusterName=cn, associationId=assoc_id)["association"]
+        assert deleted["associationId"] == assoc_id
+        assert eks.list_pod_identity_associations(clusterName=cn)["associations"] == []
+        with pytest.raises(ClientError) as e:
+            eks.describe_pod_identity_association(clusterName=cn, associationId=assoc_id)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_associations_go_with_the_cluster(eks):
+    """A recreated cluster must not inherit the previous one's associations."""
+    cn = _create_basic_cluster(eks)
+    eks.create_pod_identity_association(
+        clusterName=cn, namespace="default", serviceAccount="app",
+        roleArn=f"arn:aws:iam::000000000000:role/pod-{_uid()}",
+    )
+    assert eks.list_pod_identity_associations(clusterName=cn)["associations"]
+
+    eks.delete_cluster(name=cn)
+    eks.create_cluster(name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+                       resourcesVpcConfig={"subnetIds": ["subnet-1"]})
+    try:
+        assert eks.list_pod_identity_associations(clusterName=cn)["associations"] == []
+    finally:
+        eks.delete_cluster(name=cn)
+
+
+def test_eks_pod_identity_association_list_filters(eks):
+    """ListPodIdentityAssociations filters on namespace and serviceAccount,
+    the two query parameters the operation takes."""
+    cn = _create_basic_cluster(eks)
+    role = "arn:aws:iam::000000000000:role/r"
+    try:
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="lbc", roleArn=role)
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="apps", serviceAccount="web", roleArn=role)
+
+        by_ns = eks.list_pod_identity_associations(
+            clusterName=cn, namespace="apps")["associations"]
+        assert [a["serviceAccount"] for a in by_ns] == ["web"]
+        by_sa = eks.list_pod_identity_associations(
+            clusterName=cn, serviceAccount="lbc")["associations"]
+        assert [a["namespace"] for a in by_sa] == ["kube-system"]
+        assert len(eks.list_pod_identity_associations(clusterName=cn)["associations"]) == 2
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_association_duplicate_and_missing(eks):
+    """One association per namespace and service account, and an unknown
+    cluster or association id is ResourceNotFoundException."""
+    cn = _create_basic_cluster(eks)
+    role = "arn:aws:iam::000000000000:role/r"
+    try:
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="dup", roleArn=role)
+        with pytest.raises(ClientError) as e:
+            eks.create_pod_identity_association(
+                clusterName=cn, namespace="kube-system", serviceAccount="dup", roleArn=role)
+        assert e.value.response["Error"]["Code"] == "ResourceInUseException"
+
+        with pytest.raises(ClientError) as e:
+            eks.describe_pod_identity_association(clusterName=cn, associationId="a-nope")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as e:
+            eks.list_pod_identity_associations(clusterName=f"no-such-{_uid()}")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as e:
+            eks.create_pod_identity_association(
+                clusterName=f"no-such-{_uid()}", namespace="n",
+                serviceAccount="s", roleArn=role)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_association_target_role_gets_an_external_id(eks):
+    """A target role makes the association role-chaining, and AWS mints the
+    externalId its trust policy matches on."""
+    cn = _create_basic_cluster(eks)
+    try:
+        assoc = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="chained",
+            roleArn="arn:aws:iam::000000000000:role/source",
+            targetRoleArn="arn:aws:iam::000000000000:role/target",
+            disableSessionTags=True,
+        )["association"]
+        assert assoc["targetRoleArn"] == "arn:aws:iam::000000000000:role/target"
+        assert assoc["externalId"]
+        assert assoc["disableSessionTags"] is True
+
+        plain = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="plain",
+            roleArn="arn:aws:iam::000000000000:role/source")["association"]
+        assert "externalId" not in plain
+        assert plain["disableSessionTags"] is False
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
 def test_eks_access_entry_create_describe_delete(eks):
     cn = _create_basic_cluster(eks)
     principal = f"arn:aws:iam::000000000000:user/test-{_uid()}"
