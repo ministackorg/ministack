@@ -1139,7 +1139,7 @@ Existing clusters without a recorded creator also need an explicit Access Entry.
 With `AUTH=false`, neither IAM policies nor Access Entries restrict Kubernetes
 access. The CLI still needs credentials to generate its exec token, but MiniStack
 does not check their secret, registration, or permissions. Restart MiniStack to
-change `AUTH`; k3s may retain previous authentication results for up to five minutes.
+change `AUTH`; k3s caches authentication results for two minutes, the kube-apiserver default.
 
 > **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
 

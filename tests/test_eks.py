@@ -1439,21 +1439,42 @@ def _auth_token(key="test", secret="test", session=None, name=_AUTH_CLUSTER, sig
     return "k8s-aws-v1." + base64.urlsafe_b64encode(request.url.encode()).decode().rstrip("=")
 
 
+# The webhook URL's shared secret; only the kubeconfig written into the k3s
+# container carries it, so a caller who merely reaches the gateway cannot use
+# the endpoint to probe whether a token is valid.
+_AUTH_WEBHOOK_SECRET = "test-webhook-secret-000000000000"
+
+
 def _auth_cluster(account=_AUTH_ACCOUNT, creator=None, bootstrap=True):
-    eks_service._clusters.set_scoped(account, _AUTH_REGION, _AUTH_CLUSTER, {
+    cluster = {
         "arn": f"arn:aws:eks:{_AUTH_REGION}:{account}:cluster/{_AUTH_CLUSTER}",
         "roleArn": f"arn:aws:iam::{account}:role/control-plane",
         "_creator_arn": creator,
         "accessConfig": {"bootstrapClusterCreatorAdminPermissions": bootstrap},
-    })
+        "_auth_token": _AUTH_WEBHOOK_SECRET,
+    }
+    eks_service._clusters.set_scoped(account, _AUTH_REGION, _AUTH_CLUSTER, cluster)
+    # CreateCluster mints the creator's access entry; these records are built
+    # straight into the store, so do what that path does.
+    with request_scope(account, _AUTH_REGION):
+        eks_service._bootstrap_creator_access_entry(_AUTH_CLUSTER, cluster, creator)
+
+
+def _auth_token_for(account, region, name):
+    """The cluster's webhook secret, the way k3s reads it from its kubeconfig."""
+    cluster = eks_service._clusters.get_scoped(account, region, name) or {}
+    # A cluster that does not exist has no secret; keep the URL well formed so
+    # the request still reaches the handler and is refused on the lookup.
+    return cluster.get("_auth_token") or _AUTH_WEBHOOK_SECRET
 
 
 def _auth_review(bearer, account=_AUTH_ACCOUNT, name=_AUTH_CLUSTER):
     # Real k3s requests carry no AWS credentials; deliberately use the default
     # request account even when authenticating to a different tenant's cluster.
+    secret = _auth_token_for(account, _AUTH_REGION, name)
     with request_scope(_AUTH_ACCOUNT, "us-east-1"):
         status, _, body = asyncio.run(app._dispatch_service_request(
-            "POST", f"/eks-auth/{account}/{_AUTH_REGION}/{name}", {},
+            "POST", f"/_ministack/eks-auth/{account}/{_AUTH_REGION}/{name}/{secret}", {},
             json.dumps({"apiVersion": "authentication.k8s.io/v1", "spec": {"token": bearer}}).encode(),
             {}, "review-test",
         ))
@@ -1484,16 +1505,21 @@ def test_eks_token_review_authenticates_root_exec_token(eks_mod, monkeypatch):
     import ministack.app as app
     monkeypatch.setattr(app, "AUTH", True)
     name = f"auth-{_uid()}"
-    eks_mod._clusters[name] = {
+    creator = "arn:aws:iam::000000000000:root"
+    cluster = {
         "arn": f"arn:aws:eks:{REGION}:000000000000:cluster/{name}",
         "roleArn": "arn:aws:iam::000000000000:role/eks-role",
-        "_creator_arn": "arn:aws:iam::000000000000:root",
+        "_creator_arn": creator,
+        "_auth_token": _AUTH_WEBHOOK_SECRET,
     }
+    eks_mod._clusters[name] = cluster
+    eks_mod._bootstrap_creator_access_entry(name, cluster, creator)
     token = _eks_exec_token(name)
     status, _headers, response = _eks_direct(
         eks_mod,
         "POST",
-        f"/eks-auth/000000000000/{REGION}/{name}",
+        f"/_ministack/eks-auth/000000000000/{REGION}/{name}/"
+        f"{_auth_token_for('000000000000', REGION, name)}",
         {
             "apiVersion": "authentication.k8s.io/v1",
             "kind": "TokenReview",
@@ -1503,7 +1529,9 @@ def test_eks_token_review_authenticates_root_exec_token(eks_mod, monkeypatch):
     assert status == 200
     assert response["status"]["authenticated"] is True
     assert response["status"]["user"]["username"] == "arn:aws:iam::000000000000:root"
-    assert "system:masters" in response["status"]["user"]["groups"]
+    groups = response["status"]["user"]["groups"]
+    assert "system:masters" not in groups
+    assert any(g.startswith("ministack:eks:access:") for g in groups)
 
 
 def test_eks_token_review_rejects_wrong_cluster_and_tampering(eks_mod, monkeypatch):
@@ -1520,7 +1548,8 @@ def test_eks_token_review_rejects_wrong_cluster_and_tampering(eks_mod, monkeypat
         status, _headers, response = _eks_direct(
             eks_mod,
             "POST",
-            f"/eks-auth/000000000000/{REGION}/{name}",
+            f"/_ministack/eks-auth/000000000000/{REGION}/{name}/"
+        f"{_auth_token_for('000000000000', REGION, name)}",
             {"spec": {"token": candidate}},
         )
         assert status == 200
@@ -1596,9 +1625,12 @@ def test_eks_auth_create_records_actual_caller_and_honors_bootstrap(eks_auth_env
 def test_eks_auth_root_does_not_get_other_accounts_bootstrap_access(eks_auth_env):
     _auth_cluster(_AUTH_OTHER_ACCOUNT, creator=f"arn:aws:iam::{_AUTH_OTHER_ACCOUNT}:root")
     assert _auth_review(_auth_token(), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
-    assert _auth_review(_auth_token(_AUTH_OTHER_ACCOUNT), _AUTH_OTHER_ACCOUNT)["user"]["groups"] == [
-        "system:authenticated", "system:masters",
-    ]
+    # The creator authorizes through its own access entry and the materialized
+    # AmazonEKSClusterAdminPolicy group, not through system:masters.
+    groups = _auth_review(_auth_token(_AUTH_OTHER_ACCOUNT), _AUTH_OTHER_ACCOUNT)["user"]["groups"]
+    assert groups[0] == "system:authenticated"
+    assert "system:masters" not in groups
+    assert any(g.startswith("ministack:eks:access:") for g in groups)
 
 
 def test_eks_auth_nondefault_sts_session_and_role_path_access_entry(eks_auth_env):
@@ -1771,4 +1803,7 @@ def test_eks_auth_background_webhook_preserves_account_and_region(eks_auth_env, 
         status, _, _ = eks_service._create_cluster({"name": _AUTH_CLUSTER, "roleArn": iam._roles["control-plane"]["Arn"]})
     assert status == 200
     assert finished.wait(3)
-    assert f"/eks-auth/{_AUTH_OTHER_ACCOUNT}/{_AUTH_REGION}/{_AUTH_CLUSTER}" in captured["webhook"]
+    assert f"/_ministack/eks-auth/{_AUTH_OTHER_ACCOUNT}/{_AUTH_REGION}/{_AUTH_CLUSTER}/" in captured["webhook"]
+    # The secret is in the URL only k3s receives, and it is not guessable.
+    secret = captured["webhook"].split(f"/{_AUTH_CLUSTER}/", 1)[1].split("\n", 1)[0].strip()
+    assert len(secret) >= 16
