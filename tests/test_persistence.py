@@ -1685,7 +1685,7 @@ def test_pipes_round_trip():
 
 
 def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
-    """When `restore_state` reloads pipes that are RUNNING, the background
+    """When `load_persisted_state` reloads RUNNING pipes, the background
     poller must be (re)started so events keep flowing after warm-boot."""
     mod = _module("pipes")
     mod.reset()
@@ -1716,6 +1716,29 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
         "warm-booted pipes would silently stop forwarding events."
     )
     assert result is None
+    mod.reset()
+
+
+def test_lambda_load_starts_event_source_mapping_poller(monkeypatch):
+    """Warm boot resumes the Lambda poller only through the loader API."""
+    mod = _module("lambda_svc")
+    mod.reset()
+    calls = []
+    monkeypatch.setattr(mod, "_ensure_poller", lambda: calls.append(None))
+
+    mod.load_persisted_state({
+        "esms": {
+            "warm-boot-esm": {
+                "UUID": "warm-boot-esm",
+                "FunctionArn": (
+                    "arn:aws:lambda:us-east-1:000000000000:function:warm-boot"
+                ),
+            },
+        },
+    })
+
+    assert calls == [None]
+    assert mod._esms.has_any()
     mod.reset()
 
 
@@ -5288,7 +5311,7 @@ def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
         set_request_region(original_region)
 
 
-def test_opensearch_restore_recreates_dataplane_in_domain_region(monkeypatch):
+def test_opensearch_load_recreates_dataplane_in_domain_region(monkeypatch):
     from ministack.core.responses import (
         AccountScopedDict,
         get_account_id,
@@ -5347,7 +5370,7 @@ def test_opensearch_restore_recreates_dataplane_in_domain_region(monkeypatch):
         set_request_region(boot_region)
         opensearch.reset()
 
-        opensearch.restore_state({
+        opensearch.load_persisted_state({
             "domains": legacy_store(
                 (
                     account_id,

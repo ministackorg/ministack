@@ -12108,9 +12108,9 @@ def test_snapstart_version_worker_is_reapable():
             lr._workers.pop("000000000000:us-east-1:reap-probe:1", None)
 
 
-def test_snapstart_pending_version_reprovisions_on_restore():
+def test_snapstart_pending_version_reprovisions_on_load():
     """A SnapStart version persisted while Pending (crash mid-publish) must be
-    re-provisioned by restore_state — otherwise it answers 409 forever."""
+    re-provisioned by load_persisted_state — otherwise it answers 409 forever."""
     import copy as _copy
 
     arn = "arn:aws:lambda:us-east-1:000000000000:function:snap-restore-fn"
@@ -12138,7 +12138,7 @@ def test_snapstart_pending_version_reprovisions_on_restore():
     }
     key = ("000000000000", "us-east-1", "snap-restore-fn")
     try:
-        lsvc.restore_state({"functions": {"snap-restore-fn": func}})
+        lsvc.load_persisted_state({"functions": {"snap-restore-fn": func}})
         for _ in range(60):
             state = ver_cfg["State"]
             if state != "Pending":

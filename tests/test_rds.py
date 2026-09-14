@@ -2700,7 +2700,7 @@ def test_rds_restore_keeps_stopped_cluster_compute_stopped(monkeypatch):
         m._instances.clear()
         m._clusters.clear()
         started_calls.clear()
-        m.restore_state(persisted)
+        m.load_persisted_state(persisted)
 
         # restore_state marks every instance ``creating`` before spawning the
         # cluster runner; the runner's stopped branch flips members back to
@@ -5010,7 +5010,7 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -5361,7 +5361,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
 
         monkeypatch.setattr(m.threading, "Thread", TrackedThread)
 
-        m.restore_state({
+        m.load_persisted_state({
             "instances": instances,
             "clusters": clusters,
             "subnet_groups": {},
@@ -5681,7 +5681,7 @@ def test_rds_restored_empty_cluster_cleanup_recovers_container_by_name(
         })
         persisted = m.get_state()
         m._clusters.clear()
-        m.restore_state(persisted)
+        m.load_persisted_state(persisted)
 
         restored = m._clusters.get(cluster_id)
         assert restored["DBClusterMembers"] == []
@@ -6004,7 +6004,7 @@ def test_rds_restore_migrates_legacy_instance_name_before_cluster_claims_it(
     m._instances.clear()
     m._clusters.clear()
     try:
-        m.restore_state({
+        m.load_persisted_state({
             "instances": instances,
             "clusters": clusters,
             "subnet_groups": {},
@@ -6097,7 +6097,7 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted)
+    m.load_persisted_state(persisted)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6168,7 +6168,7 @@ def test_rds_restore_state_preserves_legacy_persistent_volume_name(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted)
+    m.load_persisted_state(persisted)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6242,7 +6242,7 @@ def test_rds_respawn_does_not_bind_engine_port_on_host(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6343,7 +6343,7 @@ def test_rds_respawn_falls_back_when_persisted_host_port_taken(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6424,7 +6424,7 @@ def test_rds_respawn_force_removes_stale_created_container(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and m._instances.get(db_id, {}).get("DBInstanceStatus") not in ("available", "failed"):
@@ -6909,7 +6909,7 @@ def test_rds_legacy_instance_restore_preserves_arn_region(monkeypatch):
 
     try:
         rds.reset()
-        rds.restore_state({"instances": legacy})
+        rds.load_persisted_state({"instances": legacy})
 
         assert rds._instances.get_scoped("000000000000", "us-east-1", instance_id) is None
         restored = rds._instances.get_scoped("000000000000", "us-west-2", instance_id)
@@ -9427,7 +9427,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
         )
         monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configure)
 
-        m.restore_state({
+        m.load_persisted_state({
             "instances": AccountRegionScopedDict(),
             "clusters": clusters,
             "global_clusters": global_clusters,
@@ -13732,7 +13732,7 @@ def test_rds_restore_state_without_docker_demotes_pg_standby(monkeypatch):
             "_pg_standby": True,
             "_docker_container_id": "dead-reader-container",
         }
-        m.restore_state({"clusters": clusters, "instances": instances})
+        m.load_persisted_state({"clusters": clusters, "instances": instances})
 
         reader = m._instances.get("warm-pg-reader")
         assert reader is not None
@@ -13815,7 +13815,7 @@ def test_rds_restore_state_revives_pg_standby(monkeypatch):
             "_docker_container_id": "dead-reader-container",
             "_docker_volume_name": reader_volume,
         }
-        m.restore_state({"clusters": clusters, "instances": instances})
+        m.load_persisted_state({"clusters": clusters, "instances": instances})
 
         reader = m._instances.get("warm-pgr-reader")
         writer = m._instances.get("warm-pgr-writer")

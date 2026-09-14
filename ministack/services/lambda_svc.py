@@ -623,6 +623,7 @@ def load_persisted_state(data) -> None:
     restore_state(data)
     if _esms.has_any():
         _ensure_poller()
+    _resume_pending_snapstart_versions()
 
 
 def restore_state(data):
@@ -655,20 +656,19 @@ def restore_state(data):
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
         _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
-        # A SnapStart version persisted mid-publish restores as State=Pending
-        # with no provisioning thread behind it — and Pending SnapStart
-        # versions answer 409 on Invoke and are skipped by the generic state
-        # flipper, so without re-provisioning here the version would be
-        # uninvokable forever. Re-run the publish-time initialization.
-        for scoped_key, func in list(_functions._data.items()):
-            fn_name = scoped_key[-1]
-            for ver_record in (func.get("versions") or {}).values():
-                cfg = ver_record.get("config") or {}
-                if (
-                    cfg.get("State") == "Pending"
-                    and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
-                ):
-                    _snapstart_provision_version_async(fn_name, ver_record)
+
+
+def _resume_pending_snapstart_versions() -> None:
+    """Resume provisioners that cannot survive a process restart."""
+    for scoped_key, func in list(_functions._data.items()):
+        fn_name = scoped_key[-1]
+        for ver_record in (func.get("versions") or {}).values():
+            cfg = ver_record.get("config") or {}
+            if (
+                cfg.get("State") == "Pending"
+                and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+            ):
+                _snapstart_provision_version_async(fn_name, ver_record)
 
 
 def _region_from_function_record(func: dict) -> str:

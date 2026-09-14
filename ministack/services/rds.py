@@ -364,11 +364,11 @@ def get_state():
     return state
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    restore_state(data, resume_runtime=True)
 
 
-def restore_state(data):
+def restore_state(data, *, resume_runtime=False):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -455,6 +455,9 @@ def restore_state(data):
                 inst["_legacy_docker_container_name"] = _legacy_rds_docker_name(name)
             _instances.set_scoped(get_account_id(), region, name, inst)
             to_respawn.append((None, region, name, inst))
+
+    if not resume_runtime:
+        return
 
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker

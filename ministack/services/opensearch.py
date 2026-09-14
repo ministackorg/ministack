@@ -160,8 +160,9 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    restore_state(data)
+    _restore_domain_dataplanes()
 
 
 def restore_state(data):
@@ -190,7 +191,6 @@ def restore_state(data):
     )
     _restore_package_store(_packages, data.get("packages") or {}, package_regions)
     _tags.update(data.get("tags") or {})
-    _restore_domain_dataplanes()
 
 
 def _legacy_items(restored):
