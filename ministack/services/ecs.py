@@ -1546,10 +1546,10 @@ def _cleanup_task_resources(task, docker_client, extra_container=None):
             _remove_docker_container(docker_client, docker_id)
 
 
-# The downward half of the lifecycle, in order, with the version bumps a real
-# task reports: DescribeTasks reads 4 when StopTask sets desiredStatus while the
-# task is still RUNNING, 5 at DEPROVISIONING and 6 at STOPPED. DEACTIVATING and
-# STOPPING raise no event of their own, the same way ACTIVATING does not going up.
+# The downward half of the lifecycle, and whether each state raises an event.
+# A Fargate task polled through DescribeTasks read 4 with lastStatus still
+# RUNNING and desiredStatus STOPPED, 5 at DEPROVISIONING and 6 at STOPPED, so
+# DEACTIVATING and STOPPING pass through without moving the counter.
 _STOP_SEQUENCE = (("DEACTIVATING", False), ("STOPPING", False),
                   ("DEPROVISIONING", True), ("STOPPED", True))
 
