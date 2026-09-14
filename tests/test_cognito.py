@@ -2981,11 +2981,6 @@ def _post_form(url, data, headers=None, follow_redirects=True):
         return e.code, _lower_headers(e.headers), e.read()
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(newurl, code, msg, headers, fp)
-
-
 # ---------------------------------------------------------------------------
 # Tests — /oauth2/authorize
 # ---------------------------------------------------------------------------
