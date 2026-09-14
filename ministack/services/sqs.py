@@ -70,10 +70,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
         _queue_name_to_url.clear()

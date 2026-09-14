@@ -97,10 +97,10 @@ def _restore_parameter_history(data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))
         _restore_parameter_history(data.get("parameter_history", {}))

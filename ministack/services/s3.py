@@ -157,7 +157,7 @@ _completed_multipart_uploads = AccountScopedDict()
 
 # Module-level registry of per-bucket dicts that round-trip through s3.json.
 # One entry per module global: adding a new _bucket_* dict means one line here,
-# not two separate edits in get_state/restore_state. Must sit below every
+# not two separate edits in get_state/_restore_state. Must sit below every
 # _bucket_* declaration above — the dict literal holds live references.
 # Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
 # per-bucket keys like _ownership_controls / _public_access_block that live
@@ -198,10 +198,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})

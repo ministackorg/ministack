@@ -684,7 +684,7 @@ def test_wafv2_restore_legacy_state_canonicalizes_cloudfront_arns_direct(direct_
         {"Key": "legacy-dialect", "Value": "regional"}
     ]
 
-    waf_service.restore_state({
+    waf_service._restore_state({
         "_web_acls": web_acls,
         "_ip_sets": ip_sets,
         "_rule_groups": rule_groups,

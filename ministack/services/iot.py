@@ -45,7 +45,7 @@ lookups (mTLS).
 
 State is fully isolated per account and region via
 ``AccountRegionScopedDict`` and persisted through
-``get_state``/``restore_state``. The Local CA (used to sign
+``get_state``/``_restore_state``. The Local CA (used to sign
 ``CreateKeysAndCertificate`` certificates) is also persisted so previously
 issued client certificates remain valid across restarts.
 """
@@ -255,10 +255,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict | None) -> None:
+def _restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
     global _mtls_server_cert_pem, _mtls_server_key_pem
     if not data:

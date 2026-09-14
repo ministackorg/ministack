@@ -131,10 +131,10 @@ def _restore_region_scoped(store, restored):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _restore_region_scoped(_lbs, data.get("_lbs", {}))
     _restore_region_scoped(_tgs, data.get("_tgs", {}))
     _restore_region_scoped(_listeners, data.get("_listeners", {}))

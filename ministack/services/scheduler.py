@@ -64,10 +64,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _schedules.update(data.get("schedules", {}))
     _schedule_groups.update(data.get("schedule_groups", {}))
     _tags.update(data.get("tags", {}))

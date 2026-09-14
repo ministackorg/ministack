@@ -57,6 +57,10 @@ def test_registered_service_defines_state_contract(mod_name):
         f"Service module {mod_name} must define get_state(), "
         "load_persisted_state(data), and reset()."
     )
+    assert "restore_state" not in functions, (
+        f"Service module {mod_name} exposes restore_state(); use the public "
+        "load_persisted_state(data) contract instead."
+    )
 
 
 def test_account_region_scoped_dict_isolates_account_and_region():
@@ -323,7 +327,7 @@ def test_appsync_events_legacy_children_follow_parent_api_region():
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        service.restore_state(
+        service._restore_state(
             {
                 "apis": apis,
                 "channel_namespaces": namespaces,
@@ -423,7 +427,7 @@ def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path)
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        service.restore_state(loaded)
+        service._restore_state(loaded)
 
         assert service._apis.get_scoped(account_id, api_region, api_id)[
             "apiArn"
@@ -1011,7 +1015,7 @@ def test_backup_legacy_selection_migration_colocates_with_parent_plan():
             "Resources": [f"arn:aws:dynamodb:{plan_region}:{account_id}:table/WestTable"],
         }
 
-        backup.restore_state(legacy_state)
+        backup._restore_state(legacy_state)
 
         assert backup._vaults.get_scoped(account_id, plan_region, vault_name) is not None
         assert backup._plans.get_scoped(account_id, plan_region, plan_id) is not None
@@ -1126,7 +1130,7 @@ def test_ecr_legacy_state_uses_parent_repository_region(
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod._restore_state(
             {
                 "repositories": repositories,
                 "images": images,
@@ -1346,7 +1350,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod._restore_state(
             {
                 "clusters": legacy_clusters,
                 "nodegroups": legacy_nodegroups,
@@ -1541,7 +1545,7 @@ def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        mod.restore_state(
+        mod._restore_state(
             {"schedule_groups": legacy_groups, "schedules": legacy_schedules}
         )
 
@@ -1621,7 +1625,7 @@ def test_mwaa_restore_preserves_resource_region_outside_boot_scope(
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state({"environments": restored})
+        mod._restore_state({"environments": restored})
 
         assert mod._environments.get_scoped(account_id, boot_region, env_name) is None
         restored_env = mod._environments.get_scoped(
@@ -1819,8 +1823,8 @@ def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path
 ])
 def test_load_state_is_noop_when_persist_state_disabled(monkeypatch, svc_key, tmp_path):
     """When PERSIST_STATE=0, load_state() must return None without touching
-    disk and without invoking restore_state(). Catches a regression where
-    a service module accidentally calls restore_state() unconditionally."""
+    disk and without invoking _restore_state(). Catches a regression where
+    a service module accidentally calls _restore_state() unconditionally."""
     monkeypatch.setattr(persistence, "PERSIST_STATE", False)
     # Pre-write a state file that *would* succeed if persistence were on,
     # so we can assert that it is NOT consumed.
@@ -1876,7 +1880,7 @@ def _round_trip_dict(mod, svc_key):
         f"persistence.load_state({svc_key!r}) returned None — state "
         "file was not written by save_state()."
     )
-    mod.restore_state(loaded)
+    mod._restore_state(loaded)
 
 
 # ── secretsmanager._resource_policies ──────────────────────────────────
@@ -2211,7 +2215,7 @@ def test_ecs_legacy_account_scoped_state_migrates_by_arn(monkeypatch, tmp_path):
 
         loaded = persistence.load_state("ecs")
         assert isinstance(loaded["tasks"], AccountScopedDict)
-        mod.restore_state(loaded)
+        mod._restore_state(loaded)
 
         assert mod._clusters.get_scoped(account_id, resource_region, cluster_name)[
             "clusterArn"
@@ -2303,7 +2307,7 @@ def test_ecs_legacy_task_revision_migration_reconstructs_each_region(monkeypatch
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state({
+        mod._restore_state({
             "task_defs": legacy_task_defs,
             "task_def_latest": legacy_latest,
         })
@@ -2371,7 +2375,7 @@ def test_ecs_plain_dict_tasks_migrate_to_arn_region(monkeypatch):
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod._restore_state(
             {
                 "tasks": {
                     task_arn: {
@@ -2755,7 +2759,7 @@ def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
             }
         ]
 
-        mod.restore_state({"rules": legacy_rules, "targets": legacy_targets})
+        mod._restore_state({"rules": legacy_rules, "targets": legacy_targets})
 
         set_request_region("us-west-2")
         assert mod._rules[rule_key]["Name"] == "legacy-rule"
@@ -2814,7 +2818,7 @@ def test_iot_ca_registry_and_registration_code_survive_warm_boot():
             "persistence.load_state('iot') returned None — state file was not "
             "written by save_state()."
         )
-        mod.restore_state(loaded)
+        mod._restore_state(loaded)
 
         restored = mod._ca_certificates.get(ca_id)
         assert restored is not None, (
@@ -3102,7 +3106,7 @@ def test_mediaconnect_region_scoped_v3_state_round_trips(monkeypatch, tmp_path):
         mediaconnect.reset()
         loaded = persistence.load_state("mediaconnect")
         assert loaded is not None
-        mediaconnect.restore_state(loaded)
+        mediaconnect._restore_state(loaded)
 
         set_request_region(region)
         assert mediaconnect._flows[flow_arn]["name"] == "regional-flow"
@@ -3185,7 +3189,7 @@ def test_iot_legacy_state_migrates_resource_and_retained_regions():
     iot.reset()
     iot.broker_reset()
     try:
-        iot.restore_state(legacy_state)
+        iot._restore_state(legacy_state)
 
         for store in (
             iot._things,
@@ -3418,7 +3422,7 @@ def test_cloudtrail_legacy_state_restores_trails_by_home_region():
         set_request_account_id(account_id)
         set_request_region(boot_region)
         cloudtrail.reset()
-        cloudtrail.restore_state(
+        cloudtrail._restore_state(
             {
                 "trails": {
                     west_name: {
@@ -4404,7 +4408,7 @@ def test_cognito_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
         set_request_account_id(account)
         set_request_region("us-east-1")
         cognito.reset()
-        cognito.restore_state(persistence.load_state("cognito"))
+        cognito._restore_state(persistence.load_state("cognito"))
 
         assert cognito._user_pools.get_scoped(
             account, "us-west-2", pool_id
@@ -4455,7 +4459,7 @@ def test_cognito_restore_rebuilds_schema_attributes_from_legacy_snapshot(monkeyp
         set_request_account_id("000000000000")
         set_request_region("us-west-2")
         cognito.reset()
-        cognito.restore_state({
+        cognito._restore_state({
             "user_pools": {
                 pool_id: {
                     "Id": pool_id,
@@ -4585,7 +4589,7 @@ def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():
             "LogDestination": f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign",
         }
 
-        ec2.restore_state({"vpcs": vpcs, "flow_logs": flow_logs})
+        ec2._restore_state({"vpcs": vpcs, "flow_logs": flow_logs})
 
         assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-legacy")["VpcId"] == "vpc-legacy"
         assert ec2._flow_logs.get_scoped(account_id, boot_region, "fl-legacy")["ResourceId"] == "vpc-legacy"
@@ -4655,7 +4659,7 @@ def test_ec2_legacy_vpc_peering_restores_to_boot_region_graph():
         }
         tags[pcx_id] = [{"Key": "Scope", "Value": "legacy"}]
 
-        ec2.restore_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
+        ec2._restore_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
 
         boot_record = ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)
         peer_record = ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id)
@@ -4722,7 +4726,7 @@ def test_ec2_restore_preserves_deleted_default_resource_scope():
             "default_initialized_scopes"
         ]
 
-        ec2.restore_state(state)
+        ec2._restore_state(state)
         ec2._ensure_defaults_initialized()
 
         assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
@@ -4776,7 +4780,7 @@ def test_ec2_legacy_generated_default_vpc_marks_scope_initialized():
             "MainRouteTableId": "rtb-0abc1234def567890",
         }
 
-        ec2.restore_state({"vpcs": vpcs})
+        ec2._restore_state({"vpcs": vpcs})
         ec2._ensure_defaults_initialized()
 
         assert (
@@ -5179,7 +5183,7 @@ def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
         set_request_region(boot_region)
         opensearch.reset()
 
-        opensearch.restore_state({
+        opensearch._restore_state({
             "domains": legacy_store(
                 (
                     account_id,

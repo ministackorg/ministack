@@ -4950,13 +4950,13 @@ def test_ddb_attribute_value_mapping():
 # ----------------------------------------------------------------------
 
 from ministack.services.iot import (  # noqa: E402
+    _restore_state as _iot_restore_state,
+)
+from ministack.services.iot import (
     _thing_connectivity,
 )
-from ministack.services.iot import (  # noqa: E402
+from ministack.services.iot import (
     get_state as _iot_get_state,
-)
-from ministack.services.iot import (  # noqa: E402
-    restore_state as _iot_restore_state,
 )
 
 _ACCT = "123456789012"

@@ -153,10 +153,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     for key, store in _ALL_STATE.items():
         store.clear()
         restored = data.get(key, {})

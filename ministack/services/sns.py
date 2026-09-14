@@ -141,10 +141,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))

@@ -192,10 +192,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _distributions.update(data.get("distributions", {}))
     _invalidations.update(data.get("invalidations", {}))
     _tags.update(data.get("tags", {}))

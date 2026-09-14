@@ -486,7 +486,7 @@ def _sweep_extract_cache() -> None:
 # files no longer referenced by any function or version (e.g. previous
 # ``UpdateFunctionCode`` generations).
 #
-# Backward compatibility: ``restore_state`` accepts the legacy inline
+# Backward compatibility: ``_restore_state`` accepts the legacy inline
 # base64 shape (``"code_zip": "<b64>"``) so an upgrade in place works
 # without a one-shot migration step.
 
@@ -620,13 +620,13 @@ def get_state():
 
 
 def load_persisted_state(data) -> None:
-    restore_state(data)
+    _restore_state(data)
     if _esms.has_any():
         _ensure_poller()
     _resume_pending_snapstart_versions()
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):

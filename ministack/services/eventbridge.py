@@ -163,10 +163,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _event_buses.update(data.get("buses", {}))
         _rules.update(data.get("rules", {}))

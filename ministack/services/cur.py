@@ -40,7 +40,7 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _report_definitions.clear()
@@ -50,7 +50,7 @@ def restore_state(data):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 

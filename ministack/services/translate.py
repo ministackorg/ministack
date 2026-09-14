@@ -198,7 +198,7 @@ def get_state():
     return copy.deepcopy({"jobs": _jobs, "client_tokens": _client_tokens})
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _jobs.clear()
@@ -216,7 +216,7 @@ def restore_state(data):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 def _fail_orphaned_jobs():

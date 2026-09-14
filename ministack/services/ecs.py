@@ -230,12 +230,12 @@ def _restore_task_def_latest(latest_data):
 
 
 def load_persisted_state(data) -> None:
-    restore_state(data)
+    _restore_state(data)
     if _services.has_any():
         _start_restored_service_reconciler()
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -278,7 +278,7 @@ def restore_state(data):
 def _reconcile_restored_services():
     """Relaunch the tasks of every ACTIVE service after a restore.
 
-    restore_state marks each restored task STOPPED — its container went with the
+    _restore_state marks each restored task STOPPED — its container went with the
     process that ran it. Without this the service still reports its persisted
     runningCount while nothing is running, and any load balancer in front of it
     keeps forwarding to addresses nothing is listening on. Real ECS relaunches:

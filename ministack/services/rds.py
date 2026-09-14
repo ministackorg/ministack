@@ -365,10 +365,10 @@ def get_state():
 
 
 def load_persisted_state(data) -> None:
-    restore_state(data, resume_runtime=True)
+    _restore_state(data, resume_runtime=True)
 
 
-def restore_state(data, *, resume_runtime=False):
+def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -531,7 +531,7 @@ def restore_state(data, *, resume_runtime=False):
         )
         if cluster and members:
             # Publish the restore/migration gate before the daemon starts. A
-            # create arriving immediately after restore_state() must not start
+            # create arriving immediately after _restore_state() must not start
             # fresh cluster storage before the writer volume is adopted.
             cluster["_shared_legacy_migration_in_progress"] = True
             cluster.pop("_shared_legacy_migration_blocked", None)
@@ -7138,7 +7138,7 @@ def _failover_db_cluster_impl(p):
     if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
         "_shared_legacy_migration_blocked",
     ):
-        # restore_state's one-time legacy-storage migration reads
+        # _restore_state's one-time legacy-storage migration reads
         # IsClusterWriter to pick which member's volume becomes the
         # cluster's adopted shared state; flipping the flag mid-migration
         # could make it adopt a reader's volume. Same gate as

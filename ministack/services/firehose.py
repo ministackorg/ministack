@@ -64,10 +64,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict):
+def _restore_state(data: dict):
     global _dest_counter
     _streams.update(data.get("_streams", {}))
     _dest_counter = data.get("_dest_counter", _dest_counter)

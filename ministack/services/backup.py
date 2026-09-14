@@ -68,7 +68,7 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_state(data):
     _vaults.update(data.get("vaults", {}))
     _plans.update(data.get("plans", {}))
     _restore_selections(data.get("selections", {}))
@@ -103,7 +103,7 @@ def _restore_selections(restored):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 

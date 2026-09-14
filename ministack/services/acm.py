@@ -104,10 +104,10 @@ def _restore_certificates(restored):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _restore_certificates(data.get("_certificates", {}))
     # Backwards compat: pre-fix snapshots have certificates without
     # `_pem_body` / `_pem_chain` (the old GetCertificate path returned

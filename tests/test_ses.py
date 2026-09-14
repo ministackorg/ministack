@@ -870,7 +870,7 @@ def test_ses_restore_legacy_state_maps_unregionalized_values_to_boot_region():
 
     service.reset()
     try:
-        service.restore_state(legacy_state)
+        service._restore_state(legacy_state)
         for state_key, (resource_key, value) in values.items():
             store = getattr(service, state_key)
             assert store.get_scoped(account_id, boot_region, resource_key) == value
@@ -915,7 +915,7 @@ def test_ses_v2_restore_legacy_state_maps_unregionalized_values_to_boot_region()
 
     service.reset()
     try:
-        service.restore_state(legacy_state)
+        service._restore_state(legacy_state)
         for state_key, (resource_key, value) in values.items():
             store = getattr(service, state_key)
             expected_key = resource_key

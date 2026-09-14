@@ -332,7 +332,7 @@ def test_ssm_restore_legacy_parameter_history_uses_parameter_arn_region():
     ]
 
     try:
-        ssm_service.restore_state({
+        ssm_service._restore_state({
             "parameters": parameters,
             "parameter_history": parameter_history,
         })
@@ -376,7 +376,7 @@ def test_ssm_restore_legacy_history_prefers_exact_parameter_name_region():
     ]
 
     try:
-        ssm_service.restore_state({
+        ssm_service._restore_state({
             "parameters": parameters,
             "parameter_history": parameter_history,
         })
@@ -410,7 +410,7 @@ def test_ssm_restore_legacy_bare_name_tags_uses_stored_parameter_arn():
     tags[legacy_arn] = {"env": "legacy"}
 
     try:
-        ssm_service.restore_state({
+        ssm_service._restore_state({
             "parameters": parameters,
             "tags": tags,
         })
@@ -472,7 +472,7 @@ def test_ssm_arn_lookup_prefers_exact_stored_arn_match():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service._restore_state({"parameters": parameters})
         set_request_region("us-west-2")
         assert ssm_service.resolve_parameter_value(bare_arn) == "bare"
         assert ssm_service.resolve_parameter_value(path_arn) == "path"
@@ -509,7 +509,7 @@ def test_ssm_exact_legacy_slash_twin_can_be_overwritten():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service._restore_state({"parameters": parameters})
         set_request_region("us-west-2")
         status, _headers, _body = ssm_service._put_parameter({
             "Name": bare_name,
@@ -547,7 +547,7 @@ def test_ssm_legacy_no_slash_arn_does_not_fallback_to_path_parameter():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service._restore_state({"parameters": parameters})
         set_request_region("us-west-2")
         assert ssm_service.resolve_parameter_value(path_arn) == "path"
         assert ssm_service.resolve_parameter_value(stale_legacy_arn) is None
@@ -578,7 +578,7 @@ def test_ssm_malformed_or_foreign_partition_arn_does_not_fallback_to_name():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service._restore_state({"parameters": parameters})
         assert ssm_service.resolve_parameter_value(canonical_arn) == "value"
         assert ssm_service.resolve_parameter_value(missing_region_arn) is None
         assert ssm_service.resolve_parameter_value(foreign_partition_arn) is None
@@ -610,7 +610,7 @@ def test_ssm_restore_legacy_add_tags_key_for_bare_name_parameter():
     tags[legacy_add_tags_arn] = {"env": "legacy-add-tags"}
 
     try:
-        ssm_service.restore_state({
+        ssm_service._restore_state({
             "parameters": parameters,
             "tags": tags,
         })

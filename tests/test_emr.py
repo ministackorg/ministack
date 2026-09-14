@@ -128,7 +128,7 @@ def test_emr_legacy_state_restores_children_beside_parent():
 
     service.reset()
     try:
-        service.restore_state(
+        service._restore_state(
             {
                 "_clusters": clusters,
                 "_steps": steps,

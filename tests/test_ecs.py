@@ -2274,7 +2274,7 @@ def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
     assert _ecs._tasks[task_arn]["_container_ip"] == "172.30.0.31"
     assert "_container_ip" not in saved
     _ecs.reset()
-    _ecs.restore_state(state)
+    _ecs._restore_state(state)
 
     restored = _ecs._tasks[task_arn]
     assert restored["lastStatus"] == "STOPPED"
@@ -2283,7 +2283,7 @@ def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
     # Restoring an already stopped task is not a transition.
     state = _ecs.get_state()
     _ecs.reset()
-    _ecs.restore_state(state)
+    _ecs._restore_state(state)
     assert _ecs._tasks[task_arn]["version"] == running_version + 1
 
 

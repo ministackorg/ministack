@@ -187,10 +187,10 @@ def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
         # Restore items as defaultdict(dict) — JSON deserializes as plain dict

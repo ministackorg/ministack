@@ -444,7 +444,7 @@ def test_batch_restore_legacy_state_uses_resource_arn_region():
 
     service.reset()
     try:
-        service.restore_state(legacy_state)
+        service._restore_state(legacy_state)
         for state_key, (resource_key, value) in stores.items():
             store = getattr(service, f"_{state_key}")
             assert store.get_scoped(account_id, resource_region, resource_key) == value
@@ -480,7 +480,7 @@ def test_batch_restore_current_state_preserves_non_boot_regions():
         assert not snapshot["compute_envs"]
 
         service.reset()
-        service.restore_state(snapshot)
+        service._restore_state(snapshot)
 
         for state_key, (resource_key, value) in resources.items():
             store = getattr(service, f"_{state_key}")

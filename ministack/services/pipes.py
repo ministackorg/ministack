@@ -52,14 +52,14 @@ def get_state():
 
 
 def load_persisted_state(data) -> None:
-    restore_state(data)
+    _restore_state(data)
     # Restored RUNNING pipes need the background poller — register_pipe is the
     # only other place that starts it, and it is not called on warm boot.
     if any(pipe.get("CurrentState") == "RUNNING" for pipe in _pipes.all_values()):
         _ensure_poller()
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _restore_pipe_store(data.get("pipes", {}))
         _restore_position_store(data.get("positions", {}))

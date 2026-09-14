@@ -1526,7 +1526,7 @@ def _round_trip(mod, svc_key="cloudwatch_logs"):
         "file was not written by save_state(). Check get_state() "
         "correctness and that PERSIST_STATE is True."
     )
-    mod.restore_state(loaded)
+    mod._restore_state(loaded)
 
 
 # ── _destinations ──────────────────────────────────────────────────────
@@ -1613,7 +1613,7 @@ def test_legacy_metric_filters_restore_to_log_group_region():
 
     try:
         set_request_region("us-east-1")
-        mod.restore_state({
+        mod._restore_state({
             "log_groups": {
                 group: {
                     "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
@@ -1722,7 +1722,7 @@ def test_legacy_queries_restore_to_log_group_region():
 
     try:
         set_request_region("us-east-1")
-        mod.restore_state({
+        mod._restore_state({
             "log_groups": {
                 group: {
                     "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",

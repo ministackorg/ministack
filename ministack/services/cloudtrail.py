@@ -73,7 +73,7 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_state(data):
     if not isinstance(data, dict):
         return
     trail_regions = _restore_trails(data.get("trails", {}))
@@ -82,7 +82,7 @@ def restore_state(data):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 def _restore_trails(saved) -> dict[tuple[str, str], str]:

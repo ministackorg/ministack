@@ -3702,7 +3702,7 @@ def test_lambda_layer_version_permission_survives_persistence_roundtrip(lambda_s
         status, _headers, _body = svc._get_layer_version_policy(layer_name, 1)
         assert status == 404
 
-        svc.restore_state(state)
+        svc._restore_state(state)
         status, _headers, body = svc._get_layer_version_policy(layer_name, 1)
         assert status == 200
         restored = json.loads(body)
@@ -4826,7 +4826,7 @@ def test_lambda_restore_legacy_plain_functions_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        lsvc.restore_state({"functions": {function_name: legacy_func}})
+        lsvc._restore_state({"functions": {function_name: legacy_func}})
 
         assert lsvc._functions.get_scoped(account_id, "us-west-2", function_name) is legacy_func
         assert lsvc._functions.get_scoped(account_id, "us-east-1", function_name) is None
@@ -5169,10 +5169,10 @@ def esm_poll_state(tmp_path, monkeypatch):
         yield lsvc, _sqs, _kin, _ddb
     finally:
         _clear_all()
-        lsvc.restore_state(lambda_state)
-        _sqs.restore_state(sqs_state)
-        _kin.restore_state(kinesis_state)
-        _ddb.restore_state(dynamodb_state)
+        lsvc._restore_state(lambda_state)
+        _sqs._restore_state(sqs_state)
+        _kin._restore_state(kinesis_state)
+        _ddb._restore_state(dynamodb_state)
         _ddb._stream_records._data.update(stream_records)
         _ddb._stream_trimmed._data.update(trimmed)
 
@@ -8653,14 +8653,14 @@ def test_lambda_durable_persistence_round_trip():
         # Wipe and restore.
         lambda_durable._executions.clear()
         assert not lambda_durable._executions
-        lambda_durable.restore_state(snap)
+        lambda_durable._restore_state(snap)
         assert rec["DurableExecutionArn"] in lambda_durable._executions
         restored = lambda_durable._executions[rec["DurableExecutionArn"]]
         assert restored["Status"] == "RUNNING"
         assert restored["InputPayload"] == '{"k":"v"}'
     finally:
         lambda_durable._executions.clear()
-        lambda_durable.restore_state(original)
+        lambda_durable._restore_state(original)
 
 
 # ---------------------------------------------------------------------------
@@ -8703,7 +8703,7 @@ def lambda_svc_isolated(tmp_path, monkeypatch):
         yield lambda_svc, tmp_path / "lambda-blobs"
     finally:
         lambda_svc._functions._data.clear()
-        lambda_svc.restore_state(original)
+        lambda_svc._restore_state(original)
 
 
 def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
@@ -8714,7 +8714,7 @@ def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
 
     state = svc.get_state()
     svc._functions._data.clear()
-    svc.restore_state(state)
+    svc._restore_state(state)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
     assert restored["code_zip"] == code
@@ -8753,7 +8753,7 @@ def test_lambda_per_version_code_zip_also_externalized(lambda_svc_isolated):
     }
 
     svc._functions._data.clear()
-    svc.restore_state(state)
+    svc._restore_state(state)
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
     assert restored["code_zip"] == v2
     assert restored["versions"]["1"]["code_zip"] == v1
@@ -8798,7 +8798,7 @@ def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated
         "versions": {},
     }
 
-    svc.restore_state(legacy)
+    svc._restore_state(legacy)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "old-fn")]
     assert restored["code_zip"] == code
@@ -8825,7 +8825,7 @@ def test_lambda_missing_blob_degrades_without_aborting_restore(lambda_svc_isolat
         "versions": {},
     }
 
-    svc.restore_state(state)
+    svc._restore_state(state)
 
     assert svc._functions._data[("000000000000", svc.get_region(), "orphan")]["code_zip"] is None
 
@@ -9309,7 +9309,7 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
     }
     with _preserved_lambda_durable_state(_ld):
         # Pretend ministack just booted and read this rec from disk.
-        _ld.restore_state({"executions": {arn: rec}})
+        _ld._restore_state({"executions": {arn: rec}})
         # Index must contain the STARTED callback.
         assert cb_op_id in _ld._callback_index
         assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
@@ -9340,7 +9340,7 @@ def test_lambda_durable_restore_rearms_non_boot_region_from_arn():
     }])
 
     with _preserved_lambda_durable_state(_ld):
-        _ld.restore_state({"executions": {arn: rec}})
+        _ld._restore_state({"executions": {arn: rec}})
         with _ld._resume_lock:
             entries = [e for e in _ld._resume_queue if e[1] == arn]
         assert entries, "no resume entry queued after restore"
@@ -9374,7 +9374,7 @@ def test_lambda_durable_restore_rebuilds_non_default_account_records():
 
     with _preserved_lambda_durable_state(_ld):
         try:
-            _ld.restore_state({"executions": executions})
+            _ld._restore_state({"executions": executions})
             set_request_account_id(account_id)
             set_request_region(region)
             assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
@@ -9425,7 +9425,7 @@ def test_lambda_durable_restore_callback_index_is_account_scoped():
     original_region = get_region()
     with _preserved_lambda_durable_state(_ld):
         try:
-            _ld.restore_state({"executions": executions})
+            _ld._restore_state({"executions": executions})
 
             set_request_account_id(account_a)
             set_request_region(region)
@@ -9465,7 +9465,7 @@ def test_lambda_durable_restore_skips_non_running_executions():
         "InputPayload": "{}",
     }
     with _preserved_lambda_durable_state(_ld):
-        _ld.restore_state({"executions": {arn_done: rec}})
+        _ld._restore_state({"executions": {arn_done: rec}})
         # SUCCEEDED callback must NOT be indexed (only STARTED ones).
         assert cb_op_id not in _ld._callback_index
 
@@ -9488,7 +9488,7 @@ def test_lambda_durable_restore_malformed_arn_falls_back_and_continues(caplog):
     executions = AccountScopedDict.from_dict({(account_id, arn): rec})
 
     with _preserved_lambda_durable_state(_ld), caplog.at_level("WARNING"):
-        _ld.restore_state({"executions": executions})
+        _ld._restore_state({"executions": executions})
         assert "Malformed DurableExecutionArn during restore" in caplog.text
         with _ld._resume_lock:
             entries = [e for e in _ld._resume_queue if e[1] == arn]

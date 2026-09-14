@@ -374,7 +374,7 @@ def test_kinesis_restore_legacy_account_scoped_state_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        _kin.restore_state({
+        _kin._restore_state({
             "streams": legacy_streams,
             "shard_iterators": legacy_iterators,
             "consumers": legacy_consumers,

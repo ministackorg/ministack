@@ -81,10 +81,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _table_buckets.update(data.get("table_buckets", {}))
     _namespaces.update(data.get("namespaces", {}))
     _tables.update(data.get("tables", {}))

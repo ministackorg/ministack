@@ -495,7 +495,7 @@ def test_get_state_strips_private_key_from_persisted_snapshot():
     # Restoring the scrubbed snapshot must not crash and must preserve
     # both tenants' certs (minus the private keys).
     mod._certificates._data.clear()
-    mod.restore_state(snapshot)
+    mod._restore_state(snapshot)
     restored_arns = {cert["CertificateArn"] for cert in mod._certificates._data.values()}
     assert arn_a in restored_arns
     assert arn_b in restored_arns
@@ -568,7 +568,7 @@ def test_restore_state_backfills_pem_body_for_pre_upgrade_snapshots():
             },
         },
     }
-    mod.restore_state(legacy_snapshot)
+    mod._restore_state(legacy_snapshot)
 
     # _get_certificate hits the restored record and reads _pem_body.
     cert = mod._certificates.get(arn)

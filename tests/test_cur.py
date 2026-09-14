@@ -323,7 +323,7 @@ def test_cur_state_round_trips_through_get_and_restore():
     cur.reset()
     assert "r1" not in cur._report_definitions
 
-    cur.restore_state(snapshot)
+    cur._restore_state(snapshot)
     assert cur._report_definitions["r1"]["S3Bucket"] == "billing"
     assert cur._report_tags["r1"] == {"team": "finops"}
 

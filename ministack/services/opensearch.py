@@ -161,11 +161,11 @@ def get_state():
 
 
 def load_persisted_state(data) -> None:
-    restore_state(data)
+    _restore_state(data)
     _restore_domain_dataplanes()
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _domains.update(data.get("domains") or {})

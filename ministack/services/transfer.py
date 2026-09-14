@@ -94,10 +94,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _servers.update(data.get("servers", {}))
     _users.update(data.get("users", {}))
 

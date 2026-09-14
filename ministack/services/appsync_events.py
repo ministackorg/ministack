@@ -114,10 +114,10 @@ def _restore_api_child_store(
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _apis.update(data.get("apis", {}))
@@ -128,7 +128,7 @@ def restore_state(data):
 
 
 # Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = restore_state
+load_persisted_state = _restore_state
 
 
 

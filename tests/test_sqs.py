@@ -1327,7 +1327,7 @@ def test_sqs_restore_rebuilds_legacy_name_index_from_queue_arn():
         }
         legacy_names[queue_name] = queue_url
 
-        _sqs.restore_state({"queues": legacy_queues, "queue_name_to_url": legacy_names})
+        _sqs._restore_state({"queues": legacy_queues, "queue_name_to_url": legacy_names})
 
         assert _sqs._queue_name_to_url.get(queue_name) is None
         set_request_region("us-west-2")

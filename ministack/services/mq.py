@@ -288,10 +288,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict) -> None:
+def _restore_state(data: dict) -> None:
     if not data:
         return
     _brokers.update(data.get("brokers", {}))

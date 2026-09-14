@@ -261,7 +261,7 @@ class _ErrorModule:
         # run persisted, losing every resource the service held.
         return None
 
-    def restore_state(self, data):
+    def _restore_state(self, data):
         pass
 
     def load_persisted_state(self, data):

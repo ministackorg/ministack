@@ -1328,7 +1328,7 @@ def test_mq_legacy_state_follows_parent_broker_region(isolated_mq_module_state):
         "legacy-user": {"username": "legacy-user"}
     })
 
-    service.restore_state({
+    service._restore_state({
         "brokers": brokers,
         "name_index": name_index,
         "tags": tags,
@@ -1352,7 +1352,7 @@ def test_mq_legacy_orphaned_users_are_dropped(isolated_mq_module_state):
         "orphaned-user": {"username": "orphaned-user"}
     })
 
-    service.restore_state({"users": users})
+    service._restore_state({"users": users})
 
     assert not service._users.has_any()
 

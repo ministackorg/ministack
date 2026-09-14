@@ -235,7 +235,7 @@ def test_appsync_legacy_children_restore_beside_parent_api():
 
     service.reset()
     try:
-        service.restore_state(payload)
+        service._restore_state(payload)
         assert service._apis.get_scoped(account_id, api_region, api_id)["arn"] == api_arn
         for store in (
             service._api_keys,
