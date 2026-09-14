@@ -837,6 +837,102 @@ def test_sqs_send_message_batch_limit(sqs):
     assert exc_info.value.response["Error"]["Code"] == "AWS.SimpleQueueService.TooManyEntriesInBatchRequest"
     sqs.delete_queue(QueueUrl=q)
 
+_BATCH_ACTIONS = ("SendMessageBatch", "DeleteMessageBatch", "ChangeMessageVisibilityBatch")
+
+
+def _batch_call(sqs, action, url, entries):
+    if action == "SendMessageBatch":
+        return sqs.send_message_batch(QueueUrl=url, Entries=entries)
+    if action == "DeleteMessageBatch":
+        return sqs.delete_message_batch(QueueUrl=url, Entries=entries)
+    return sqs.change_message_visibility_batch(QueueUrl=url, Entries=entries)
+
+
+def _batch_entry(action, entry_id):
+    """An entry valid enough to reach the request-level checks.
+
+    The receipt handle is deliberately bogus: every assertion below is about a
+    check AWS runs on the request before it looks at an entry, so a batch that
+    passes them lands in the per-entry results instead of raising.
+    """
+    if action == "SendMessageBatch":
+        return {"Id": entry_id, "MessageBody": "m"}
+    entry = {"Id": entry_id, "ReceiptHandle": "not-a-real-receipt-handle"}
+    if action == "ChangeMessageVisibilityBatch":
+        entry["VisibilityTimeout"] = 30
+    return entry
+
+
+@pytest.mark.parametrize("action", _BATCH_ACTIONS)
+def test_sqs_batch_rejects_empty_request(sqs, action):
+    """AWS answers a batch with no entries with EmptyBatchRequest."""
+    url = sqs.create_queue(QueueName=f"batch-empty-{action.lower()}")["QueueUrl"]
+    with pytest.raises(ClientError) as exc:
+        _batch_call(sqs, action, url, [])
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.EmptyBatchRequest"
+    sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.parametrize("action", _BATCH_ACTIONS)
+def test_sqs_batch_rejects_repeated_entry_ids(sqs, action):
+    """Entry ids have to be distinct within one batch, or AWS fails the whole request."""
+    url = sqs.create_queue(QueueName=f"batch-dup-{action.lower()}")["QueueUrl"]
+    entries = [_batch_entry(action, "same"), _batch_entry(action, "same")]
+    with pytest.raises(ClientError) as exc:
+        _batch_call(sqs, action, url, entries)
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.BatchEntryIdsNotDistinct"
+    sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.parametrize("action", _BATCH_ACTIONS)
+@pytest.mark.parametrize("entry_id", ["bad!id", "a" * 81])
+def test_sqs_batch_rejects_malformed_entry_id(sqs, action, entry_id):
+    """An entry id is at most 80 alphanumerics, hyphens and underscores."""
+    url = sqs.create_queue(QueueName=f"batch-badid-{action.lower()}-{len(entry_id)}")["QueueUrl"]
+    with pytest.raises(ClientError) as exc:
+        _batch_call(sqs, action, url, [_batch_entry(action, entry_id)])
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.InvalidBatchEntryId"
+    sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.parametrize("action", ["DeleteMessageBatch", "ChangeMessageVisibilityBatch"])
+def test_sqs_batch_rejects_more_than_ten_entries(sqs, action):
+    """The ten-entry limit is the whole request's, not just SendMessageBatch's."""
+    url = sqs.create_queue(QueueName=f"batch-limit-{action.lower()}")["QueueUrl"]
+    entries = [_batch_entry(action, str(i)) for i in range(11)]
+    with pytest.raises(ClientError) as exc:
+        _batch_call(sqs, action, url, entries)
+    assert exc.value.response["Error"]["Code"] == "AWS.SimpleQueueService.TooManyEntriesInBatchRequest"
+    sqs.delete_queue(QueueUrl=url)
+
+
+def test_sqs_batch_of_ten_distinct_entries_still_succeeds(sqs):
+    """A full, well-formed batch is not caught by any of the checks above."""
+    url = sqs.create_queue(QueueName="batch-ten-valid")["QueueUrl"]
+    sent = sqs.send_message_batch(
+        QueueUrl=url,
+        Entries=[{"Id": f"id_{i}", "MessageBody": f"m{i}"} for i in range(10)],
+    )
+    assert len(sent["Successful"]) == 10
+    assert not sent.get("Failed")
+
+    handles = []
+    while len(handles) < 10:
+        received = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        messages = received.get("Messages", [])
+        if not messages:
+            break
+        handles.extend(m["ReceiptHandle"] for m in messages)
+
+    deleted = sqs.delete_message_batch(
+        QueueUrl=url,
+        Entries=[{"Id": f"id_{i}", "ReceiptHandle": h} for i, h in enumerate(handles[:10])],
+    )
+    assert len(deleted["Successful"]) == 10
+    assert not deleted.get("Failed")
+    sqs.delete_queue(QueueUrl=url)
+
+
 def test_sqs_typed_exception_queue_not_found(sqs):
     """client.exceptions.QueueDoesNotExist must be raised (not generic ClientError)
     when accessing a non-existent queue — requires <Type> in the XML error response."""
