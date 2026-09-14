@@ -4,15 +4,28 @@ Tests cluster CRUD, nodegroup CRUD, tags, and CloudFormation provisioning.
 k3s Docker container tests require Docker socket access.
 """
 import asyncio
+import base64
+import datetime as dt
 import json
 import os
+import threading
 import time
 import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import quote
 
 import boto3
 import pytest
+from botocore.auth import SigV4Auth, SigV4QueryAuth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
+
+import ministack.app as app
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, request_scope
+from ministack.services import eks as eks_service
+from ministack.services import iam, sts
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 REGION = "us-east-1"
@@ -74,6 +87,19 @@ def _eks_direct_create_cluster(eks_service, name):
     )
     assert status == 200
     return body["cluster"]["arn"]
+
+
+def _eks_exec_token(cluster_name, access_key="test", secret_key="test"):
+    request = AWSRequest(
+        method="GET",
+        url="https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        headers={"x-k8s-aws-id": cluster_name},
+    )
+    SigV4QueryAuth(
+        Credentials(access_key, secret_key), "sts", "us-east-1", expires=60
+    ).add_auth(request)
+    encoded = base64.urlsafe_b64encode(request.url.encode()).decode().rstrip("=")
+    return "k8s-aws-v1." + encoded
 
 
 # ---------------------------------------------------------------------------
@@ -1500,3 +1526,390 @@ def test_eks_restore_state_normalizes_endpoint_to_localhost():
         assert restored["status"] == "ACTIVE"  # endpoint stays non-empty for ACTIVE
     finally:
         eks_mod.reset()
+
+
+# ---------------------------------------------------------------------------
+# IAM exec-token authentication and AUTH mode enforcement (no Docker required)
+# ---------------------------------------------------------------------------
+
+_AUTH_ACCOUNT = "000000000000"
+_AUTH_OTHER_ACCOUNT = "111111111111"
+_AUTH_REGION = "eu-central-1"
+_AUTH_CLUSTER = "auth-cluster"
+_AUTH_USER_KEY = "AKIAEKSREVIEW"
+_AUTH_USER_ARN = f"arn:aws:iam::{_AUTH_ACCOUNT}:user/developer"
+_AUTH_ROLE_ARN = f"arn:aws:iam::{_AUTH_ACCOUNT}:role/control-plane"
+_AUTH_POLICY_PREFIX = "arn:aws:eks::aws:cluster-access-policy/"
+_AUTH_ADMIN_POLICY = _AUTH_POLICY_PREFIX + "AmazonEKSClusterAdminPolicy"
+
+
+@pytest.fixture
+def eks_auth_env(monkeypatch):
+    monkeypatch.setattr(app, "AUTH", True)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.setenv("MINISTACK_ACCOUNT_ID", _AUTH_ACCOUNT)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    for name in ("_clusters", "_access_entries", "_access_policies", "_idp_configs", "_tags"):
+        monkeypatch.setattr(eks_service, name, AccountRegionScopedDict())
+    for name in ("_users", "_access_keys", "_roles", "_user_inline_policies"):
+        monkeypatch.setattr(iam, name, AccountScopedDict())
+    monkeypatch.setattr(sts, "_sessions", {})
+    monkeypatch.setattr(eks_service, "_get_docker", lambda: None)
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        iam._users["developer"] = {"Arn": _AUTH_USER_ARN, "UserId": "developer-id"}
+        iam._access_keys[_AUTH_USER_KEY] = {
+            "UserName": "developer", "SecretAccessKey": "test", "Status": "Active",
+        }
+        iam._roles["control-plane"] = {"Arn": _AUTH_ROLE_ARN}
+        yield
+
+
+def _auth_token(key="test", secret="test", session=None, name=_AUTH_CLUSTER, signed_at=None):
+    request = AWSRequest(
+        method="GET",
+        url=f"https://sts.{_AUTH_REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        headers={"x-k8s-aws-id": name},
+    )
+    signer = SigV4QueryAuth(Credentials(key, secret, session), "sts", _AUTH_REGION, expires=60)
+    if signed_at is None:
+        signer.add_auth(request)
+    else:
+        with patch("botocore.auth.get_current_datetime", return_value=signed_at):
+            signer.add_auth(request)
+    return "k8s-aws-v1." + base64.urlsafe_b64encode(request.url.encode()).decode().rstrip("=")
+
+
+def _auth_cluster(account=_AUTH_ACCOUNT, creator=None, bootstrap=True):
+    eks_service._clusters.set_scoped(account, _AUTH_REGION, _AUTH_CLUSTER, {
+        "arn": f"arn:aws:eks:{_AUTH_REGION}:{account}:cluster/{_AUTH_CLUSTER}",
+        "roleArn": f"arn:aws:iam::{account}:role/control-plane",
+        "_creator_arn": creator,
+        "accessConfig": {"bootstrapClusterCreatorAdminPermissions": bootstrap},
+    })
+
+
+def _auth_review(bearer, account=_AUTH_ACCOUNT, name=_AUTH_CLUSTER):
+    # Real k3s requests carry no AWS credentials; deliberately use the default
+    # request account even when authenticating to a different tenant's cluster.
+    with request_scope(_AUTH_ACCOUNT, "us-east-1"):
+        status, _, body = asyncio.run(app._dispatch_service_request(
+            "POST", f"/eks-auth/{account}/{_AUTH_REGION}/{name}", {},
+            json.dumps({"apiVersion": "authentication.k8s.io/v1", "spec": {"token": bearer}}).encode(),
+            {}, "review-test",
+        ))
+    assert status == 200
+    return json.loads(body)["status"]
+
+
+def _auth_api(method, path, body=None, key="test"):
+    payload = json.dumps(body or {}).encode()
+    request = AWSRequest(method=method, url=f"http://localhost:4566{path}", data=payload)
+    SigV4Auth(Credentials(key, "test"), "eks", _AUTH_REGION).add_auth(request)
+    status, _, result = asyncio.run(app._dispatch_service_request(
+        method, path, {k.lower(): v for k, v in request.headers.items()}, payload, {}, "api-test",
+    ))
+    return status, json.loads(result) if result else {}
+
+
+def _auth_session(account=_AUTH_ACCOUNT, role="developer", key="ASIAEKSREVIEW"):
+    sts._sessions[key] = {
+        "Arn": f"arn:aws:sts::{account}:assumed-role/{role}/session",
+        "AccountId": account, "UserId": "role-id:session", "SecretAccessKey": "test",
+        "SessionToken": "local-session", "Expiration": time.time() + 3600,
+    }
+    return key
+
+
+def test_eks_token_review_authenticates_root_exec_token(eks_mod, monkeypatch):
+    import ministack.app as app
+    monkeypatch.setattr(app, "AUTH", True)
+    name = f"auth-{_uid()}"
+    eks_mod._clusters[name] = {
+        "arn": f"arn:aws:eks:{REGION}:000000000000:cluster/{name}",
+        "roleArn": "arn:aws:iam::000000000000:role/eks-role",
+        "_creator_arn": "arn:aws:iam::000000000000:root",
+    }
+    token = _eks_exec_token(name)
+    status, _headers, response = _eks_direct(
+        eks_mod,
+        "POST",
+        f"/eks-auth/000000000000/{REGION}/{name}",
+        {
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenReview",
+            "spec": {"token": token},
+        },
+    )
+    assert status == 200
+    assert response["status"]["authenticated"] is True
+    assert response["status"]["user"]["username"] == "arn:aws:iam::000000000000:root"
+    assert "system:masters" in response["status"]["user"]["groups"]
+
+
+def test_eks_token_review_rejects_wrong_cluster_and_tampering(eks_mod, monkeypatch):
+    import ministack.app as app
+    monkeypatch.setattr(app, "AUTH", True)
+    name = f"auth-{_uid()}"
+    eks_mod._clusters[name] = {
+        "arn": f"arn:aws:eks:{REGION}:000000000000:cluster/{name}",
+        "roleArn": "arn:aws:iam::000000000000:role/eks-role",
+    }
+    token = _eks_exec_token(name)
+    wrong_cluster = _eks_exec_token("another-cluster")
+    for candidate in (wrong_cluster, token[:-1] + ("A" if token[-1] != "A" else "B")):
+        status, _headers, response = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/eks-auth/000000000000/{REGION}/{name}",
+            {"spec": {"token": candidate}},
+        )
+        assert status == 200
+        assert response["status"]["authenticated"] is False
+
+
+@pytest.mark.parametrize("auth", [False, True])
+@pytest.mark.parametrize("credential", ["unknown-key", "wrong-secret", "unmapped-user", "opaque-token"])
+def test_eks_auth_modes_enforce_credentials_and_access_grants(eks_auth_env, monkeypatch, auth, credential):
+    monkeypatch.setattr(app, "AUTH", auth)
+    _auth_cluster()
+    bearer = {
+        "unknown-key": lambda: _auth_token("unknown"),
+        "wrong-secret": lambda: _auth_token(secret="wrong"),
+        "unmapped-user": lambda: _auth_token(_AUTH_USER_KEY),
+        "opaque-token": lambda: "local-bearer-token",
+    }[credential]()
+    result = _auth_review(bearer)
+    assert result["authenticated"] is (not auth)
+    if not auth:
+        assert "system:masters" in result["user"]["groups"]
+
+
+@pytest.mark.parametrize("auth", [False, True])
+def test_eks_auth_empty_tokens_and_missing_clusters_are_rejected(eks_auth_env, monkeypatch, auth):
+    monkeypatch.setattr(app, "AUTH", auth)
+    _auth_cluster()
+    assert _auth_review("")["authenticated"] is False
+    assert _auth_review(_auth_token(), name="missing")["authenticated"] is False
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b"{", b'{"spec": []}'])
+def test_eks_auth_malformed_reviews_fail_closed(eks_auth_env, body):
+    assert json.loads(eks_service._handle_auth_webhook(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION, body)[2])["status"] == {
+        "authenticated": False,
+    }
+
+
+@pytest.mark.parametrize("auth", [False, True])
+def test_eks_auth_iam_enforcement_is_separate_from_kubernetes_access(eks_auth_env, monkeypatch, auth):
+    monkeypatch.setattr(app, "AUTH", auth)
+    _auth_cluster()
+    assert _auth_api("GET", f"/clusters/{_AUTH_CLUSTER}", key=_AUTH_USER_KEY)[0] == (403 if auth else 200)
+    iam._user_inline_policies["developer"] = {
+        "eks": {"Statement": [{"Effect": "Allow", "Action": "eks:*", "Resource": "*"}]},
+    }
+    assert _auth_api("GET", f"/clusters/{_AUTH_CLUSTER}", key=_AUTH_USER_KEY)[0] == 200
+    assert _auth_review(_auth_token(_AUTH_USER_KEY))["authenticated"] is (not auth)
+    eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN, "kubernetesGroups": ["developers"]})
+    assert _auth_review(_auth_token(_AUTH_USER_KEY))["authenticated"] is True
+    if auth:
+        assert _auth_review(_auth_token(_AUTH_USER_KEY))["user"]["groups"] == ["system:authenticated", "developers"]
+
+
+@pytest.mark.parametrize("key,creator", [("test", f"arn:aws:iam::{_AUTH_ACCOUNT}:root"), (_AUTH_USER_KEY, _AUTH_USER_ARN)])
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_eks_auth_create_records_actual_caller_and_honors_bootstrap(eks_auth_env, key, creator, bootstrap):
+    iam._user_inline_policies["developer"] = {
+        "eks": {"Statement": [{"Effect": "Allow", "Action": "eks:*", "Resource": "*"}]},
+    }
+    status, body = _auth_api("POST", "/clusters", {
+        "name": _AUTH_CLUSTER, "roleArn": _AUTH_ROLE_ARN,
+        "accessConfig": {"bootstrapClusterCreatorAdminPermissions": bootstrap},
+    }, key=key)
+    assert status == 200
+    assert "_creator_arn" not in body["cluster"]
+    assert eks_service._clusters[_AUTH_CLUSTER]["_creator_arn"] == creator
+    assert _auth_review(_auth_token(key))["authenticated"] is bootstrap
+    # The service role never inherits the caller's bootstrap privilege.
+    assert _auth_review(_auth_token(_auth_session(role="control-plane"), session="local-session"))["authenticated"] is False
+
+
+def test_eks_auth_root_does_not_get_other_accounts_bootstrap_access(eks_auth_env):
+    _auth_cluster(_AUTH_OTHER_ACCOUNT, creator=f"arn:aws:iam::{_AUTH_OTHER_ACCOUNT}:root")
+    assert _auth_review(_auth_token(), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
+    assert _auth_review(_auth_token(_AUTH_OTHER_ACCOUNT), _AUTH_OTHER_ACCOUNT)["user"]["groups"] == [
+        "system:authenticated", "system:masters",
+    ]
+
+
+def test_eks_auth_nondefault_sts_session_and_role_path_access_entry(eks_auth_env):
+    _auth_cluster(_AUTH_OTHER_ACCOUNT)
+    key = _auth_session(_AUTH_OTHER_ACCOUNT)
+    role_arn = f"arn:aws:iam::{_AUTH_OTHER_ACCOUNT}:role/team/developer"
+    iam._roles.set_scoped(_AUTH_OTHER_ACCOUNT, None, "developer", {"Arn": role_arn})
+    with request_scope(_AUTH_OTHER_ACCOUNT, _AUTH_REGION):
+        eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": role_arn, "kubernetesGroups": ["developers"]})
+    assert _auth_review(_auth_token(key, session="local-session"), _AUTH_OTHER_ACCOUNT)["user"]["groups"] == [
+        "system:authenticated", "developers",
+    ]
+    assert _auth_review(_auth_token(key, session="wrong"), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
+    sts._sessions[key]["Expiration"] = time.time() - 1
+    assert _auth_review(_auth_token(key, session="local-session"), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
+
+
+@pytest.mark.parametrize("scope,policy,supported", [
+    ({"type": "cluster"}, _AUTH_ADMIN_POLICY, True),
+    ({"type": "namespace", "namespaces": ["dev"]}, _AUTH_ADMIN_POLICY, True),
+    ({"type": "cluster"}, _AUTH_POLICY_PREFIX + "AmazonEKSViewPolicy", True),
+    ({"type": "cluster"}, "fake-AmazonEKSClusterAdminPolicy", False),
+])
+def test_eks_auth_access_policies_map_to_internal_rbac_groups(eks_auth_env, monkeypatch, scope, policy, supported):
+    monkeypatch.setattr(eks_service, "_schedule_access_policy_reconcile", lambda *args: None)
+    _auth_cluster()
+    eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
+    eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {"policyArn": policy, "accessScope": scope})
+    result = _auth_review(_auth_token(_AUTH_USER_KEY))
+    assert result["authenticated"] is True
+    group = eks_service._access_policy_group(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    assert (group in result["user"]["groups"]) is supported
+    assert "system:masters" not in result["user"]["groups"]
+
+
+def _policy_allows(policy_name, verb, api_group, resource):
+    for rule in eks_service._ACCESS_POLICY_RULES[policy_name]:
+        groups = rule.get("apiGroups", [])
+        resources = rule.get("resources", [])
+        verbs = rule["verbs"]
+        if (
+            (api_group in groups or "*" in groups)
+            and (resource in resources or "*" in resources)
+            and (verb in verbs or "*" in verbs)
+        ):
+            return True
+    return False
+
+
+@pytest.mark.parametrize("policy,allowed,denied", [
+    ("AmazonEKSClusterAdminPolicy", ("delete", "rbac.authorization.k8s.io", "clusterroles"), ()),
+    ("AmazonEKSAdminPolicy", ("create", "rbac.authorization.k8s.io", "rolebindings"), ("delete", "", "nodes")),
+    ("AmazonEKSEditPolicy", ("create", "", "secrets"), ("create", "rbac.authorization.k8s.io", "roles")),
+    ("AmazonEKSViewPolicy", ("get", "", "pods"), ("get", "", "secrets")),
+    ("AmazonEKSAdminViewPolicy", ("get", "", "secrets"), ("create", "", "secrets")),
+])
+def test_eks_access_policy_rules_allow_and_deny_documented_operations(policy, allowed, denied):
+    assert _policy_allows(policy, *allowed)
+    if denied:
+        assert not _policy_allows(policy, *denied)
+
+
+def test_eks_access_policy_rbac_reconciles_scopes_namespaces_and_revocation(eks_auth_env, monkeypatch):
+    """The materialized k3s RBAC follows association updates and new matches."""
+    monkeypatch.setattr(eks_service, "_schedule_access_policy_reconcile", lambda *args: None)
+    _auth_cluster()
+    eks_service._clusters.get_scoped(_AUTH_ACCOUNT, _AUTH_REGION, _AUTH_CLUSTER)["_docker_id"] = "k3s"
+    policy = _AUTH_POLICY_PREFIX + "AmazonEKSViewPolicy"
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
+        eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+            "policyArn": policy,
+            "accessScope": {"type": "namespace", "namespaces": ["dev-*"]},
+        })
+
+    namespaces = ["default", "dev-api", "prod"]
+    captured = []
+    managed = {"ClusterRoleBinding": [], "RoleBinding": []}
+    deletes = []
+    container = SimpleNamespace()
+    client = SimpleNamespace(containers=SimpleNamespace(get=lambda _id: container))
+
+    def kubectl(_container, command):
+        if command[1:3] == ["get", "namespaces"]:
+            return 0, json.dumps({"items": [{"metadata": {"name": name}} for name in namespaces]})
+        if "delete" in command:
+            deletes.append(command)
+        return 0, ""
+
+    monkeypatch.setattr(eks_service, "_get_docker", lambda: client)
+    monkeypatch.setattr(eks_service, "_k3s_exec", kubectl)
+    monkeypatch.setattr(
+        eks_service, "_apply_access_policy_rbac",
+        lambda _container, objects: captured.append(objects),
+    )
+    monkeypatch.setattr(
+        eks_service, "_managed_access_policy_bindings",
+        lambda _container, kind: managed[kind],
+    )
+
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    bindings = [obj for obj in captured[-1] if obj["kind"] == "RoleBinding"]
+    assert [binding["metadata"]["namespace"] for binding in bindings] == ["dev-api"]
+    assert bindings[0]["roleRef"]["name"] == "ministack-eks-amazoneksviewpolicy"
+    managed["RoleBinding"] = bindings
+
+    namespaces.append("dev-worker")
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    bindings = [obj for obj in captured[-1] if obj["kind"] == "RoleBinding"]
+    assert {binding["metadata"]["namespace"] for binding in bindings} == {"dev-api", "dev-worker"}
+
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+            "policyArn": policy, "accessScope": {"type": "cluster"},
+        })
+    managed["RoleBinding"] = bindings
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    cluster_bindings = [obj for obj in captured[-1] if obj["kind"] == "ClusterRoleBinding"]
+    assert len(cluster_bindings) == 1
+    assert {command[2] for command in deletes} == {"rolebinding"}
+
+    managed["ClusterRoleBinding"] = cluster_bindings
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._disassociate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    assert not [obj for obj in captured[-1] if obj["kind"].endswith("Binding")]
+    assert {command[2] for command in deletes} == {"rolebinding", "clusterrolebinding"}
+
+
+def test_eks_access_policy_changes_schedule_rbac_reconciliation(eks_auth_env, monkeypatch):
+    scheduled = []
+    policy = _AUTH_POLICY_PREFIX + "AmazonEKSEditPolicy"
+    monkeypatch.setattr(
+        eks_service, "_schedule_access_policy_reconcile",
+        lambda cluster_name, *args: scheduled.append(cluster_name),
+    )
+    _auth_cluster()
+    eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
+    eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+        "policyArn": policy, "accessScope": {"type": "cluster"},
+    })
+    eks_service._disassociate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    eks_service._delete_access_entry(_AUTH_CLUSTER, _AUTH_USER_ARN)
+    assert scheduled == [_AUTH_CLUSTER, _AUTH_CLUSTER, _AUTH_CLUSTER]
+
+
+@pytest.mark.parametrize("minutes,accepted", [(2, True), (14, True), (16, False), (-6, False)])
+def test_eks_auth_exec_token_lifetime_matches_kubectl_cache(eks_auth_env, minutes, accepted):
+    _auth_cluster(creator=f"arn:aws:iam::{_AUTH_ACCOUNT}:root")
+    signed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+    assert _auth_review(_auth_token(signed_at=signed_at))["authenticated"] is accepted
+
+
+def test_eks_auth_background_webhook_preserves_account_and_region(eks_auth_env, monkeypatch):
+    finished = threading.Event()
+    captured = {}
+
+    def start(client, kwargs, registries, webhook):
+        captured["webhook"] = webhook.decode()
+        finished.set()
+        return SimpleNamespace(id="fake-container")
+
+    monkeypatch.setattr(eks_service, "_get_docker", lambda: object())
+    monkeypatch.setattr(eks_service, "_get_ministack_network", lambda client: None)
+    monkeypatch.setattr(eks_service, "_k3s_registries_yaml", lambda *args: None)
+    monkeypatch.setattr(eks_service, "_start_k3s_container", start)
+    monkeypatch.setattr(eks_service, "_extract_ca_cert", lambda *args: "fake-ca")
+    with request_scope(_AUTH_OTHER_ACCOUNT, _AUTH_REGION):
+        iam._roles["control-plane"] = {"Arn": f"arn:aws:iam::{_AUTH_OTHER_ACCOUNT}:role/control-plane"}
+        status, _, _ = eks_service._create_cluster({"name": _AUTH_CLUSTER, "roleArn": iam._roles["control-plane"]["Arn"]})
+    assert status == 200
+    assert finished.wait(3)
+    assert f"/eks-auth/{_AUTH_OTHER_ACCOUNT}/{_AUTH_REGION}/{_AUTH_CLUSTER}" in captured["webhook"]
