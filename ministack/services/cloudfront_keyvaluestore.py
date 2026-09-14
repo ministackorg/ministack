@@ -47,6 +47,10 @@ def get_state():
     return copy.deepcopy({"stores": _stores})
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return

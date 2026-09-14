@@ -16,6 +16,7 @@ additionally missing from `_state_map`, so its state is never even saved.
 
 These tests assert the round-trip works for every persisted service.
 """
+import ast
 import importlib
 from pathlib import Path
 
@@ -32,6 +33,41 @@ ALL_PERSISTED_SERVICES = sorted(_state_map.items())
 
 def _module(mod_name):
     return importlib.import_module(f"ministack.services.{mod_name}")
+
+
+def _registered_service_modules():
+    """Return all modules that participate in the service-state contract.
+
+    The optional sub_modules registry field is included before Phase 2 adds
+    it, so adding one automatically extends this contract test.
+    """
+    from ministack.app import SERVICE_REGISTRY
+
+    return sorted(
+        {
+            module
+            for config in SERVICE_REGISTRY.values()
+            for module in (config["module"], *config.get("sub_modules", ()))
+        }
+    )
+
+
+@pytest.mark.parametrize("mod_name", _registered_service_modules())
+def test_registered_service_defines_state_contract(mod_name):
+    """Every registered service exposes the uniform persistence API."""
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin, f"Cannot find service module {mod_name}"
+    module_ast = ast.parse(Path(spec.origin).read_text())
+    functions = {
+        node.name
+        for node in module_ast.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert {"get_state", "load_persisted_state", "reset"} <= functions, (
+        f"Service module {mod_name} must define get_state(), "
+        "load_persisted_state(data), and reset()."
+    )
 
 
 def test_account_region_scoped_dict_isolates_account_and_region():

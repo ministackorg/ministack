@@ -95,6 +95,10 @@ def get_state():
     return copy.deepcopy({"connectors": _connectors, "client_tokens": _client_tokens})
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return

@@ -66,6 +66,10 @@ def get_state():
     })
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     _projects.update(data.get("projects", {}))
     _builds.update(data.get("builds", {}))

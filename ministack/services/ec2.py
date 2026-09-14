@@ -334,6 +334,10 @@ def _restore_vpc_peering_store(restored):
         )
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return

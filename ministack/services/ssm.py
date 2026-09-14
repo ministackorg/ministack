@@ -97,6 +97,10 @@ def _restore_parameter_history(data) -> None:
             _parameter_history.set_scoped(account_id, region, name, history)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))

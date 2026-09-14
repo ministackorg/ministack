@@ -107,6 +107,10 @@ def _restore_certificates(restored):
         _certificates.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, cert)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     _restore_certificates(data.get("_certificates", {}))
     # Backwards compat: pre-fix snapshots have certificates without

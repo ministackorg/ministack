@@ -255,6 +255,10 @@ def get_state() -> dict:
     }
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
     global _mtls_server_cert_pem, _mtls_server_key_pem
