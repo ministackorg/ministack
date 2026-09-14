@@ -465,7 +465,22 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
 _REST_ROUTE_CACHE: dict[str, list[tuple[str, re.Pattern, str, int, dict[str, str]]]] = {}
 
 
-def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
+# A botocore path label is non-greedy ({x}) unless the model marks it greedy
+# ({x+}), and the SDK percent-encodes any "/" the value carries so the label
+# still matches one segment on the wire. We match against the decoded path the
+# ASGI server hands us, where those separators are separators again, so a
+# non-greedy label whose value may contain one never matches and the request
+# resolves no action at all. An MQTT topic is multi-level by definition, which
+# makes iot-data's the case that bites: without this, Publish and
+# GetRetainedMessage are not authorized on any topic below the first level.
+# Keyed by botocore service name, as _BOTOCORE_SERVICE_MAP's values are.
+_GREEDY_URI_LABELS: dict[str, frozenset[str]] = {
+    "iot-data": frozenset({"topic"}),
+}
+
+
+def _compile_uri(uri_pattern: str,
+                 greedy_labels: frozenset[str] = frozenset()) -> tuple[re.Pattern, int, dict[str, str]]:
     """Compile a botocore URI pattern into a regex + specificity score +
     required query params.
 
@@ -474,7 +489,9 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
     (2 literal segments).
 
     Query params from the pattern (e.g., ``?mode=import``) are returned
-    separately for disambiguation.
+    separately for disambiguation. Labels named in ``greedy_labels`` match
+    across ``/`` as if the model had marked them ``{x+}``; see
+    ``_GREEDY_URI_LABELS``.
     """
     required_query: dict[str, str] = {}
     if "?" in uri_pattern:
@@ -501,7 +518,7 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
         if seg.startswith("{") and seg.endswith("+}"):
             regex_parts.append(".+")
         elif seg.startswith("{") and seg.endswith("}"):
-            regex_parts.append("[^/]+")
+            regex_parts.append(".+" if seg[1:-1] in greedy_labels else "[^/]+")
         else:
             regex_parts.append(re.escape(seg))
             specificity += 1
@@ -548,6 +565,7 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
         logger.debug("AUTH: failed to load botocore model for %s", botocore_service)
         return []
 
+    greedy_labels = _GREEDY_URI_LABELS.get(botocore_service, frozenset())
     routes = []
     for op_name, op_def in model.get("operations", {}).items():
         http = op_def.get("http", {})
@@ -555,7 +573,7 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
         uri = http.get("requestUri", "")
         if not method or not uri:
             continue
-        compiled, specificity, required_query = _compile_uri(uri)
+        compiled, specificity, required_query = _compile_uri(uri, greedy_labels)
         # Operations with required query params get a specificity boost
         if required_query:
             specificity += len(required_query)
@@ -787,7 +805,12 @@ def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
                          account_id: str) -> str:
-    """Construct the resource ARN for the request, or '*' if unknown."""
+    """Construct the resource ARN for the request, or '*' if unknown.
+
+    ``query_params`` is the router's params dict, which for a query-protocol
+    POST carries the form-encoded body merged underneath the query string
+    (``app._routing_params``). The branches below read it directly.
+    """
 
     if service == "s3":
         parts = [p for p in path.split("/") if p]
@@ -1397,8 +1420,20 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     # --- IoT (REST path-based, multiple resource types) ---
 
-    if service == "iot":
+    # Both data planes carry iot: actions on iot: ARNs, and their paths are the
+    # ones the map below already names: a publish is /topics/{topic}, a shadow
+    # and a job execution are /things/{thingName}/... . Routed by credential
+    # scope, they arrive here as their own service keys.
+    if service in ("iot", "iot-data", "iot-jobs-data"):
         parts = [p for p in path.split("/") if p]
+        # Publish and the retained-message calls take everything after the
+        # prefix as the topic, and a topic is multi-level: the ARN is
+        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
+        # percent-encoded from the SDK, which is why iot_data._publish unquotes
+        # as well.
+        if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
+            topic = unquote("/".join(parts[1:]))
+            return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1406,15 +1441,14 @@ def extract_resource_arn(service: str, method: str, path: str,
             "policies": "policy",
             "certificates": "cert",
             "rules": "rule",
+            "jobs": "job",
+            "provisioning-templates": "provisioningtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
                 si = parts.index(segment)
                 if si + 1 < len(parts):
-                    name = parts[si + 1]
-                    if rtype == "cert":
-                        return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
-                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{parts[si + 1]}"
         return "*"
 
     # --- API Gateway (REST path-based) ---
