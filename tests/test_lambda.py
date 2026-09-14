@@ -5753,7 +5753,7 @@ def test_esm_batch_completion_wakes_poll_loop(esm_poll_state):
 
 
 def _sqs_esm_fixture(_lsvc, _sqs, name, *, messages=1, esm_extra=None, func_extra=None):
-    queue_url = f"http://localhost:4566/000000000000/{name}"
+    queue_url = _sqs._queue_url(name)
     _sqs._queues[queue_url] = {
         "name": name,
         "messages": [{
@@ -5837,6 +5837,29 @@ def test_poll_sqs_caps_in_flight_batches_per_esm(esm_threaded_dispatch, monkeypa
         _lsvc._poll_sqs()
 
     assert _lsvc._esm_inflight["esm-capped"] == expected
+
+
+def test_poll_sqs_keeps_a_fifo_queue_serial(esm_threaded_dispatch, monkeypatch):
+    """A FIFO queue gets one batch in flight whatever MaximumConcurrency says.
+
+    "Amazon SQS ensures that messages in the same group are delivered to Lambda
+    in order", and a batch here spans groups, so two in flight at once reorder
+    a group. The cap is not MaximumConcurrency for FIFO: on AWS concurrency is
+    bounded by the number of message group IDs, and the poller does not
+    partition batches by MessageGroupId, so serial is the only safe setting.
+    """
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(
+        _lsvc, _sqs, "esm-fifo", messages=20,
+        esm_extra={"ScalingConfig": {"MaximumConcurrency": 8}},
+    )
+    _sqs._queues[_sqs._queue_url("esm-fifo")]["is_fifo"] = True
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: (release.wait(10), {"body": {}})[1])
+
+    for _ in range(20):
+        _lsvc._poll_sqs()
+
+    assert _lsvc._esm_inflight["esm-fifo"] == 1
 
 
 def test_lambda_create_esm_rejects_unresolved_function_arn():

@@ -6986,7 +6986,21 @@ _esm_inflight_lock = threading.Lock()
 _esm_wake = threading.Event()
 
 
-def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict) -> int:
+def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | None = None) -> int:
+    """In-flight batches allowed for one SQS event source mapping.
+
+    A FIFO queue is always 1. "Amazon SQS ensures that messages in the same
+    group are delivered to Lambda in order", and on failure "the function
+    attempts all retries on the affected messages before Lambda receives
+    additional messages from the same group" (Lambda SQS scaling). A batch here
+    is built across message groups — AWS says the same, "each batch might
+    contain messages from more than one message group, but the order of the
+    messages is maintained" — so two batches in flight at once reorder a group.
+    Until the poller partitions batches by MessageGroupId, serial is the only
+    setting that keeps the guarantee.
+    """
+    if (queue or {}).get("is_fifo"):
+        return 1
     limit = (esm.get("ScalingConfig") or {}).get("MaximumConcurrency") or _ESM_SQS_DEFAULT_CONCURRENCY
     reserved = _reserved_concurrency(func_rec, config)
     return min(limit, reserved) if reserved else limit
@@ -7131,7 +7145,7 @@ def _poll_sqs():
             if _esm_backoff_until.get(esm_id, 0) > time.time():
                 continue
             # Only this thread increments, so the count can't rise before dispatch.
-            if _esm_inflight.get(esm_id, 0) >= _sqs_esm_concurrency(esm, func_rec, _cfg):
+            if _esm_inflight.get(esm_id, 0) >= _sqs_esm_concurrency(esm, func_rec, _cfg, queue):
                 continue
 
             batch_size = esm.get("BatchSize", 10)
