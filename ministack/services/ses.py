@@ -1,10 +1,10 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
-SES (Simple Email Service) Emulator — v1 Query API + v2 REST/JSON API.
+SES (Simple Email Service) Emulator — v1 Query API.
 
 v1 Query API (Action=...) via POST form body.
-v2 JSON API detected via path prefix /v2/ or X-Amz-Target containing "sesv2".
+SES v2 requests are delegated to :mod:`ses_v2`.
 
 v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             VerifyEmailIdentity, VerifyEmailAddress, VerifyDomainIdentity,
@@ -15,10 +15,6 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             ListConfigurationSets, CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
             SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled.
-
-v2 REST endpoints under /v2/email/:
-            outbound-emails, outbound-bulk-emails, identities, configuration-sets,
-            templates, account.
 
 All emails stored in-memory for test inspection.
 Send statistics aggregated into 15-minute buckets per AWS spec.
@@ -37,7 +33,7 @@ from email import message_from_bytes
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import default as default_policy
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -125,7 +121,9 @@ async def handle_request(method, path, headers, body, query_params):
     is_v2 = path.startswith("/v2/") or "sesv2" in target.lower()
 
     if is_v2:
-        return _handle_v2(method, path, headers, body)
+        from ministack.services import ses_v2
+
+        return await ses_v2.handle_request(method, path, headers, body, query_params)
 
     params = dict(query_params)
     if method == "POST" and body:
@@ -696,335 +694,6 @@ def _update_template(params):
 
 
 # ---------------------------------------------------------------------------
-# v2 — REST / JSON dispatcher
-# ---------------------------------------------------------------------------
-
-def _handle_v2(method, path, headers, body):
-    try:
-        raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else (body or "")
-        data = json.loads(raw) if raw else {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        data = {}
-
-    route = path.rstrip("/")
-    if route.startswith("/v2/email"):
-        route = route[len("/v2/email"):]
-
-    if method == "POST" and route == "/outbound-emails":
-        return _v2_send_email(data)
-    if method == "POST" and route == "/outbound-bulk-emails":
-        return _v2_send_bulk_email(data)
-    if method == "POST" and route == "/identities":
-        return _v2_create_identity(data)
-    if method == "GET" and route == "/identities":
-        return _v2_list_identities()
-    if method == "POST" and route == "/configuration-sets":
-        return _v2_create_configuration_set(data)
-    if method == "GET" and route == "/configuration-sets":
-        return _v2_list_configuration_sets()
-    if method == "POST" and route == "/templates":
-        return _v2_create_template(data)
-    if method == "GET" and route == "/templates":
-        return _v2_list_templates()
-    if method == "GET" and route == "/account":
-        return _v2_get_account()
-
-    parts = route.split("/")
-
-    if len(parts) == 3 and parts[1] == "identities":
-        identity = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_identity(identity)
-        if method == "DELETE":
-            return _v2_delete_identity(identity)
-
-    if len(parts) == 3 and parts[1] == "configuration-sets":
-        name = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_configuration_set(name)
-        if method == "DELETE":
-            return _v2_delete_configuration_set(name)
-
-    if len(parts) == 3 and parts[1] == "templates":
-        name = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_template(name)
-        if method == "PUT":
-            return _v2_update_template(name, data)
-        if method == "DELETE":
-            return _v2_delete_template(name)
-
-    return _json_error("NotFoundException", f"Route not found: {method} {path}", 404)
-
-
-# ---------------------------------------------------------------------------
-# v2 — Send
-# ---------------------------------------------------------------------------
-
-def _v2_send_email(data):
-    from_addr = data.get("FromEmailAddress", "")
-    dest = data.get("Destination", {})
-    to_addrs = dest.get("ToAddresses", [])
-    cc_addrs = dest.get("CcAddresses", [])
-    bcc_addrs = dest.get("BccAddresses", [])
-    content = data.get("Content", {})
-    config_set = data.get("ConfigurationSetName", "")
-
-    subject = ""
-    body_text = ""
-    body_html = ""
-    template_name = ""
-    template_data = ""
-
-    simple = content.get("Simple", {})
-    if simple:
-        subject = simple.get("Subject", {}).get("Data", "")
-        body_obj = simple.get("Body", {})
-        body_text = body_obj.get("Text", {}).get("Data", "")
-        body_html = body_obj.get("Html", {}).get("Data", "")
-
-    tpl = content.get("Template", {})
-    if tpl:
-        template_name = tpl.get("TemplateName", "")
-        template_data = tpl.get("TemplateData", "")
-
-    raw = content.get("Raw", {})
-    parsed = {}
-    if raw:
-        parsed = _parse_raw_mime(raw.get("Data", ""))
-
-    msg_id = f"{new_uuid()}@email.amazonses.com"
-    record = {
-        "MessageId": msg_id,
-        "Source": from_addr,
-        "To": to_addrs,
-        "CC": cc_addrs,
-        "BCC": bcc_addrs,
-        "Subject": subject,
-        "BodyText": body_text,
-        "BodyHtml": body_html,
-        "Timestamp": time.time(),
-        "Type": "v2.SendEmail",
-    }
-    if template_name:
-        record["Template"] = template_name
-        record["TemplateData"] = template_data
-    if parsed:
-        record["Parsed"] = parsed
-    if config_set:
-        record["ConfigurationSetName"] = config_set
-    _sent_emails_list().append(record)
-    logger.info("SES v2 SendEmail: %s -> %s", from_addr, to_addrs)
-    return _json_response(200, {"MessageId": msg_id})
-
-
-def _v2_send_bulk_email(data):
-    from_addr = data.get("FromEmailAddress", "")
-    default_content = data.get("DefaultContent", {})
-    tpl = default_content.get("Template", {})
-    template_name = tpl.get("TemplateName", "")
-    default_data = tpl.get("TemplateData", "")
-    entries = data.get("BulkEmailEntries", [])
-    config_set = data.get("ConfigurationSetName", "")
-
-    results = []
-    for entry in entries:
-        dest = entry.get("Destination", {})
-        to_addrs = dest.get("ToAddresses", [])
-        replacement = (
-            entry.get("ReplacementEmailContent", {})
-                 .get("ReplacementTemplate", {})
-                 .get("ReplacementTemplateData", default_data)
-        )
-        msg_id = f"{new_uuid()}@email.amazonses.com"
-        record = {
-            "MessageId": msg_id,
-            "Source": from_addr,
-            "To": to_addrs,
-            "Template": template_name,
-            "TemplateData": replacement,
-            "Timestamp": time.time(),
-            "Type": "v2.SendBulkEmail",
-        }
-        if config_set:
-            record["ConfigurationSetName"] = config_set
-        _sent_emails_list().append(record)
-        results.append({"Status": "SUCCESS", "MessageId": msg_id})
-
-    logger.info("SES v2 SendBulkEmail: %s | template=%s | %s entries",
-                from_addr, template_name, len(entries))
-    return _json_response(200, {"BulkEmailEntryResults": results})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Identity
-# ---------------------------------------------------------------------------
-
-def _v2_create_identity(data):
-    identity = data.get("EmailIdentity", "")
-    id_type = "Domain" if ("." in identity and "@" not in identity) else "EmailAddress"
-    _identities[identity] = _make_identity(identity, id_type)
-    return _json_response(200, {
-        "IdentityType": "DOMAIN" if id_type == "Domain" else "EMAIL_ADDRESS",
-        "VerifiedForSendingStatus": True,
-    })
-
-
-def _v2_list_identities():
-    items = []
-    for identity, info in _identities.items():
-        items.append({
-            "IdentityType": "DOMAIN" if info["Type"] == "Domain" else "EMAIL_ADDRESS",
-            "IdentityName": identity,
-            "SendingEnabled": info["VerificationStatus"] == "Success",
-        })
-    return _json_response(200, {"EmailIdentities": items})
-
-
-def _v2_get_identity(identity):
-    info = _identities.get(identity)
-    if not info:
-        return _json_error("NotFoundException",
-                           f"Identity {identity} not found", 404)
-    return _json_response(200, {
-        "IdentityType": "DOMAIN" if info["Type"] == "Domain" else "EMAIL_ADDRESS",
-        "VerifiedForSendingStatus": info["VerificationStatus"] == "Success",
-        "FeedbackForwardingStatus": info.get("FeedbackForwardingEnabled", True),
-        "DkimAttributes": {
-            "SigningEnabled": info.get("DkimEnabled", False),
-            "Status": info.get("DkimVerificationStatus", "NOT_STARTED"),
-            "Tokens": info.get("DkimTokens", []),
-        },
-    })
-
-
-def _v2_delete_identity(identity):
-    _identities.pop(identity, None)
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Configuration sets
-# ---------------------------------------------------------------------------
-
-def _v2_create_configuration_set(data):
-    name = data.get("ConfigurationSetName", "")
-    if not name:
-        return _json_error("BadRequestException",
-                           "ConfigurationSetName is required", 400)
-    if name in _configuration_sets:
-        return _json_error("AlreadyExistsException",
-                           f"Configuration set {name} already exists", 409)
-    _configuration_sets[name] = {"Name": name, "CreatedTimestamp": _iso_now()}
-    return _json_response(200, {})
-
-
-def _v2_list_configuration_sets():
-    items = [{"Name": cs["Name"]} for cs in _configuration_sets.values()]
-    return _json_response(200, {"ConfigurationSets": items})
-
-
-def _v2_get_configuration_set(name):
-    cs = _configuration_sets.get(name)
-    if not cs:
-        return _json_error("NotFoundException",
-                           f"Configuration set {name} not found", 404)
-    return _json_response(200, {"ConfigurationSetName": cs["Name"]})
-
-
-def _v2_delete_configuration_set(name):
-    if name not in _configuration_sets:
-        return _json_error("NotFoundException",
-                           f"Configuration set {name} not found", 404)
-    del _configuration_sets[name]
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Templates
-# ---------------------------------------------------------------------------
-
-def _v2_create_template(data):
-    name = data.get("TemplateName", "")
-    content = data.get("TemplateContent", {})
-    if not name:
-        return _json_error("BadRequestException",
-                           "TemplateName is required", 400)
-    if name in _templates:
-        return _json_error("AlreadyExistsException",
-                           f"Template {name} already exists", 409)
-    _templates[name] = {
-        "TemplateName": name,
-        "SubjectPart": content.get("Subject", ""),
-        "TextPart": content.get("Text", ""),
-        "HtmlPart": content.get("Html", ""),
-        "CreatedTimestamp": _iso_now(),
-    }
-    return _json_response(200, {})
-
-
-def _v2_list_templates():
-    items = [
-        {"TemplateName": t["TemplateName"],
-         "CreatedTimestamp": t["CreatedTimestamp"]}
-        for t in _templates.values()
-    ]
-    return _json_response(200, {"TemplatesMetadata": items})
-
-
-def _v2_get_template(name):
-    tpl = _templates.get(name)
-    if not tpl:
-        return _json_error("NotFoundException",
-                           f"Template {name} not found", 404)
-    return _json_response(200, {
-        "TemplateName": tpl["TemplateName"],
-        "TemplateContent": {
-            "Subject": tpl["SubjectPart"],
-            "Text": tpl["TextPart"],
-            "Html": tpl["HtmlPart"],
-        },
-    })
-
-
-def _v2_update_template(name, data):
-    if name not in _templates:
-        return _json_error("NotFoundException",
-                           f"Template {name} not found", 404)
-    content = data.get("TemplateContent", {})
-    tpl = _templates[name]
-    if "Subject" in content:
-        tpl["SubjectPart"] = content["Subject"]
-    if "Text" in content:
-        tpl["TextPart"] = content["Text"]
-    if "Html" in content:
-        tpl["HtmlPart"] = content["Html"]
-    return _json_response(200, {})
-
-
-def _v2_delete_template(name):
-    _templates.pop(name, None)
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Account
-# ---------------------------------------------------------------------------
-
-def _v2_get_account():
-    cutoff = time.time() - 86400
-    sent_24h = sum(1 for e in _sent_emails_list() if e["Timestamp"] >= cutoff)
-    return _json_response(200, {
-        "SendQuota": {
-            "Max24HourSend": 50000.0,
-            "MaxSendRate": 14.0,
-            "SentLast24Hours": float(sent_24h),
-        },
-        "SendingEnabled": True,
-    })
-
-
-# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
@@ -1212,14 +881,6 @@ def _error(code, message, status):
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
-
-
-def _json_response(status, data):
-    return status, {"Content-Type": "application/json"}, json.dumps(data).encode("utf-8")
-
-
-def _json_error(code, message, status):
-    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "message": message}).encode("utf-8")
 
 
 def reset():
