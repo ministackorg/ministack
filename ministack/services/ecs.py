@@ -229,7 +229,7 @@ def _restore_task_def_latest(latest_data):
             _task_def_latest.set_scoped(account_id, region, family, revision)
 
 
-def load_persisted_state(data):
+def load_persisted_state(data) -> None:
     restore_state(data)
     if _services.has_any():
         _start_restored_service_reconciler()
@@ -305,11 +305,10 @@ def _reconcile_restored_services():
 
 
 def _start_restored_service_reconciler():
-    """Run the reconcile off the import path.
+    """Reconcile restored services on a daemon thread.
 
-    restore_state runs at import; pulling images and starting containers there
-    would block startup behind the Docker daemon, so this happens on a daemon
-    thread once the process is up.
+    Pulling images and starting containers synchronously would block the
+    central persistence loader behind the Docker daemon.
     """
     def _run():
         time.sleep(_ECS_RESTORE_RECONCILE_DELAY)

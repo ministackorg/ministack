@@ -1739,6 +1739,55 @@ def test_registry_loader_dispatches_saved_state_to_the_declared_module(monkeypat
     assert module.loaded == [{"value": "saved"}]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("objects_first", [False, True])
+def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path, legacy, objects_first):
+    """Object loading and central metadata restoration work in either order."""
+    import ministack.app as app
+    from ministack.core.responses import AccountScopedDict, request_scope
+    from ministack.services import s3
+
+    monkeypatch.setattr(s3, "_buckets", AccountScopedDict())
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path / "objects"))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    monkeypatch.setattr(app, "_state_map", {"s3": "s3"})
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    accounts = ["111111111111"] if legacy else ["111111111111", "222222222222"]
+    metadata = {} if legacy else AccountScopedDict()
+    for account in accounts:
+        bucket_meta = {
+            "created": "2020-01-01T00:00:00Z",
+            "region": "eu-west-1",
+            "_ownership_controls": "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            "_public_access_block": "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        }
+        for name in ("bucket", "empty-bucket"):
+            if legacy:
+                metadata[name] = dict(bucket_meta)
+            else:
+                metadata._data[(account, name)] = dict(bucket_meta)
+        object_path = tmp_path / "objects" / account / "bucket" / "key"
+        object_path.parent.mkdir(parents=True)
+        object_path.write_bytes(account.encode())
+    persistence.save_state("s3", {"buckets_meta": metadata})
+
+    with request_scope(accounts[0], "us-east-1"):
+        if objects_first:
+            s3._load_persisted_data()
+        app._load_persisted_state()
+        if not objects_first:
+            s3._load_persisted_data()
+
+    for account in accounts:
+        with request_scope(account, "us-east-1"):
+            for name in ("bucket", "empty-bucket"):
+                bucket = s3._buckets[name]
+                assert {key: value for key, value in bucket.items() if key != "objects"} == bucket_meta
+            obj = s3._buckets["bucket"]["objects"]["key"]
+            assert s3._read_body("bucket", "key", obj) == account.encode()
+            assert s3._buckets["empty-bucket"]["objects"] == {}
+
+
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("svc_key", [

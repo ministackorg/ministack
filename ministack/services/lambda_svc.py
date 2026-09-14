@@ -745,14 +745,6 @@ def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
                 store._data[(account_id, region, key)] = value
 
 
-# NOTE: the persisted-state load used to run here, but ``restore_state`` calls
-# ``_ensure_poller()`` when the restored data contains event source mappings,
-# and that helper is defined much later in this module. Restoring at import
-# time raised ``NameError: _ensure_poller`` on warm starts with a populated
-# ``lambda.json`` (issue #412). The load now lives at the bottom of the file,
-# after ``_ensure_poller`` is defined.
-
-
 # ---------------------------------------------------------------------------
 # Wrapper script executed inside the subprocess.
 # All configuration is passed through env vars; event data arrives on stdin.

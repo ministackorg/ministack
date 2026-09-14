@@ -205,16 +205,16 @@ def restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})
+    # Object persistence may already have created placeholder buckets during
+    # import. Restore metadata onto those records without replacing objects.
     if isinstance(bm, AccountScopedDict):
         # Restore all accounts' buckets directly via _data
         for scoped_key, meta in bm._data.items():
-            if scoped_key not in _buckets._data:
-                _buckets._data[scoped_key] = {**meta, "objects": {}}
+            _buckets._data.setdefault(scoped_key, {"objects": {}}).update(meta)
     else:
         # Legacy plain-dict format (pre-multi-tenancy)
         for name, meta in bm.items():
-            if name not in _buckets:
-                _buckets[name] = {**meta, "objects": {}}
+            _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
 
