@@ -210,6 +210,10 @@ def _restore_clusters(incoming):
         _pending_cluster_respawn.add((account_id, region, name))
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         default_state()

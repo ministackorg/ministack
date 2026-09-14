@@ -348,7 +348,11 @@ SERVICE_REGISTRY = {
     "acm": {"module": "acm"},
     "backup": {"module": "backup"},
     "batch": {"module": "batch"},
-    "apigateway": {"module": "apigateway", "aliases": ("execute-api", "apigatewayv2")},
+    "apigateway": {
+        "module": "apigateway",
+        "aliases": ("execute-api", "apigatewayv2"),
+        "sub_modules": ("apigateway_v1",),
+    },
     "appconfig": {"module": "appconfig"},
     "appconfigdata": {"module": "appconfig"},
     "appsync": {"module": "appsync"},
@@ -387,7 +391,14 @@ SERVICE_REGISTRY = {
     "iotwireless": {"module": "iotwireless"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
-    "lambda": {"module": "lambda_svc"},
+    # ``lambda`` is a Python keyword, so the implementation module is named
+    # ``lambda_svc``. Keep ``lambda`` as the persistence key to preserve the
+    # long-standing ``lambda.json`` state-file contract across warm boots.
+    "lambda": {
+        "module": "lambda_svc",
+        "state_key": "lambda",
+        "sub_modules": ("lambda_durable",),
+    },
     "lambda-core": {"module": "lambda_core"},
     "lambda-microvms": {"module": "lambda_microvms"},
     "location": {"module": "location"},
@@ -406,7 +417,7 @@ SERVICE_REGISTRY = {
     "scheduler": {"module": "scheduler"},
     "secretsmanager": {"module": "secretsmanager"},
     "servicediscovery": {"module": "servicediscovery"},
-    "ses": {"module": "ses"},
+    "ses": {"module": "ses", "sub_modules": ("ses_v2",)},
     "signer": {"module": "signer"},
     "sns": {"module": "sns"},
     "sqs": {"module": "sqs"},
@@ -437,86 +448,33 @@ SERVICE_HANDLERS = {
     service_name: _lazy_handler(service_config["module"]) for service_name, service_config in SERVICE_REGISTRY.items()
 }
 
-# Maps the on-disk persistence key to the service module name. `save_all`
-# (lifespan.shutdown) consumes this. Restore happens at module import time
-# in each service via its own `load_state()` call (see e.g. services/sqs.py);
-# a small allow-list is also restored centrally by `_load_persisted_state`
-# below. Symmetry between save and restore is enforced by
-# tests/test_persistence.py.
-_state_map = {
-    "apigateway": "apigateway",
-    "apigateway_v1": "apigateway_v1",
-    "cloudformation": "cloudformation",
-    "sqs": "sqs",
-    "sns": "sns",
-    "ssm": "ssm",
-    "secretsmanager": "secretsmanager",
-    "iam": "iam",
-    "dynamodb": "dynamodb",
-    "kms": "kms",
-    "eventbridge": "eventbridge",
-    "cloudwatch_logs": "cloudwatch_logs",
-    "kinesis": "kinesis",
-    "ec2": "ec2",
-    "route53": "route53",
-    "cognito": "cognito",
-    "ecr": "ecr",
-    "cloudwatch": "cloudwatch",
-    "s3": "s3",
-    "lambda": "lambda_svc",
-    "lambda_core": "lambda_core",
-    "lambda_microvms": "lambda_microvms",
-    "rds": "rds",
-    "ecs": "ecs",
-    "elasticache": "elasticache",
-    "appsync": "appsync",
-    "appsync_events": "appsync_events",
-    "stepfunctions": "stepfunctions",
-    "alb": "alb",
-    "glue": "glue",
-    "mwaa": "mwaa",
-    "efs": "efs",
-    "waf": "waf",
-    "athena": "athena",
-    "emr": "emr",
-    "cloudfront": "cloudfront",
-    "codebuild": "codebuild",
-    "batch": "batch",
-    "acm": "acm",
-    "firehose": "firehose",
-    "ses": "ses",
-    "ses_v2": "ses_v2",
-    "servicediscovery": "servicediscovery",
-    "s3files": "s3files",
-    "appconfig": "appconfig",
-    "transfer": "transfer",
-    "scheduler": "scheduler",
-    "autoscaling": "autoscaling",
-    "eks": "eks",
-    "backup": "backup",
-    "pipes": "pipes",
-    "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
-    "resource_groups": "resource_groups",
-    "cloudtrail": "cloudtrail",
-    "iot": "iot",
-    "inspector2": "inspector2",
-    "dsql": "dsql",
-    "location": "location",
-    "mediaconnect": "mediaconnect",
-    "mq": "mq",
-    "signer": "signer",
-    "opensearch": "opensearch",
-    "s3tables": "s3tables",
-    "lambda_durable": "lambda_durable",
-    "bedrock": "bedrock",
-    "bedrock_runtime": "bedrock_runtime",
-    "bedrock_agent": "bedrock_agent",
-    "bedrock_agent_runtime": "bedrock_agent_runtime",
-    "bedrock_agentcore": "bedrock_agentcore",
-    "msk": "msk",
-    "transcribe": "transcribe",
-    "translate": "translate",
-}
+def _registry_module_names():
+    """Return every primary and dispatched module declared by the registry."""
+    return {
+        module
+        for config in SERVICE_REGISTRY.values()
+        for module in (config["module"], *config.get("sub_modules", ()))
+    }
+
+
+def _registry_state_map():
+    """Map persistence-file keys to modules declared by ``SERVICE_REGISTRY``.
+
+    A primary module normally uses its module name for the filename. Lambda
+    retains its long-standing ``lambda.json`` filename through ``state_key``;
+    sub-modules always use their own names.
+    """
+    state_map = {}
+    for config in SERVICE_REGISTRY.values():
+        module = config["module"]
+        state_map[config.get("state_key", module)] = module
+        state_map.update({sub_module: sub_module for sub_module in config.get("sub_modules", ())})
+    return state_map
+
+
+# Maps on-disk persistence keys to service modules. The registry is the sole
+# declaration point, including modules reached through a service's dispatcher.
+_state_map = _registry_state_map()
 
 SERVICE_NAME_ALIASES = {
     alias: service_name
@@ -1228,7 +1186,7 @@ async def _handle_cognito_body_request(method: str, path: str, headers: dict, bo
     if path in ("/oauth2/login", "/login") and method == "POST":
         return _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
     if path == "/oauth2/token" and method == "POST":
-        return _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
+        return await _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
     if path in _COGNITO_USERINFO_PATHS and method == "POST":
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, body, query_params)
     return None
@@ -1523,6 +1481,31 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
+                         headers: dict, query_params: dict):
+    """Authorize an execute-api invoke against its own ARN.
+
+    ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
+    the shape AWS documents. Without it every invoke was authorized against
+    ``*``, so a policy scoped to one API and stage — which is what the CDK's
+    ``grantExecute`` and every hand-written service-to-service grant produce —
+    never matched and the call was denied.
+
+    Built by the same helper the Lambda authorizer's method ARN uses, because
+    a policy has to match both.
+    """
+    from ministack.core.arn import execute_api_arn
+    from ministack.core.responses import get_account_id
+
+    return _enforce_data_plane(
+        "apigateway", "execute-api:Invoke", headers, query_params, "",
+        resource_arn=execute_api_arn(
+            extract_region(headers, query_params), get_account_id(),
+            api_id, stage, method, execute_path,
+        ),
+    )
+
+
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
     """Pick (stage, execute_path) based on the API's configured stages.
 
@@ -1597,23 +1580,35 @@ async def _handle_execute_api_request(
         return None
     api_id, tentative_stage, execute_path = parsed
 
-    denied = _enforce_data_plane("apigateway", "execute-api:Invoke", headers, query_params, "")
+    # WebSocket @connections management API — /{stage}/@connections/{id}.
+    # The @connections prefix is authoritative; skip $default resolution.
+    connections = execute_path.startswith("/@connections/")
+    if connections or stage_from_mapping:
+        # A base-path mapping names its stage; the whole remainder is API path.
+        stage = tentative_stage
+    else:
+        # Resolved before authorizing, so the ARN names the stage the request
+        # actually reaches: a v2 API on $default serves from the root, so the
+        # first path segment is not a stage there and naming it one would
+        # authorize against a resource that does not exist. The call only reads
+        # the API's configured stages, and it answers a caller who is not
+        # authorized yet, so it reports nothing about why it failed.
+        try:
+            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+        except Exception as e:
+            logger.exception("Error resolving the execute-api stage: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()
+
+    denied = _enforce_execute_api(api_id, stage, method, execute_path, headers, query_params)
     if denied:
         return denied
 
     try:
-        # WebSocket @connections management API — /{stage}/@connections/{id}.
-        # The @connections prefix is authoritative; skip $default resolution.
-        if execute_path.startswith("/@connections/"):
+        if connections:
             connection_id = execute_path[len("/@connections/") :].split("/", 1)[0]
             return await _get_module("apigateway").handle_connections_api(
-                method, api_id, tentative_stage, connection_id, body, headers
+                method, api_id, stage, connection_id, body, headers
             )
-        if stage_from_mapping:
-            # A base-path mapping names its stage; the whole remainder is API path.
-            stage = tentative_stage
-        else:
-            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
         apigw_v1 = _get_module("apigateway_v1")
         if apigw_v1.find_api_scope(api_id) is not None:
             return await apigw_v1.handle_execute(api_id, stage, method, execute_path, headers, body, query_params)
@@ -2121,15 +2116,26 @@ def _maybe_record_cloudtrail(
 
 
 def _routing_params(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> dict:
-    """Augment routing params for unsigned form-encoded requests whose Action lives in the body."""
-    routing_params = query_params
-    if not query_params.get("Action") and headers.get("content-type", "").startswith(
+    """Augment routing params with a query-protocol request's form-encoded body.
+
+    The query-protocol services (EC2, CloudFormation, CloudWatch, Auto Scaling,
+    ElastiCache) put every parameter in the body when the SDK POSTs, which
+    botocore does. An unsigned request's ``Action`` lives there, and so does the
+    resource the caller named: this dict is what ``extract_resource_arn``
+    receives, so without the rest of the body it resolves nothing and a
+    resource-scoped policy can never match.
+
+    Merged underneath the query string, which still wins, and only for the one
+    content type that carries it.
+    """
+    if not body or not headers.get("content-type", "").startswith(
         "application/x-www-form-urlencoded"
     ):
-        body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-        if body_params.get("Action"):
-            routing_params = {**query_params, "Action": body_params["Action"]}
-    return routing_params
+        return query_params
+    body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    if not body_params:
+        return query_params
+    return {**body_params, **query_params}
 
 
 def _unknown_query_error(body: bytes, request_id: str):
@@ -2681,12 +2687,14 @@ def _load_persisted_state():
             _get_module(svc_key).load_persisted_state(data)
             logger.info("Loaded persisted state for %s", svc_key)
 
-    # Eagerly import persisted services whose restore path depends on
-    # a module-level `load_state()` side-effect, but which would not
-    # otherwise be imported during startup. The lazy router does not
-    # pull them in early enough in any of these cases:
+    # Eagerly import persisted services whose restore path depends on a
+    # module-level `load_state()` side-effect, but which would not otherwise
+    # be imported during startup. Their registry declarations ensure they are
+    # saved and reset; the lazy router still does not pull them in early enough
+    # in these cases:
     #   - `ses_v2` is reached via the `/v2/email/*` path-prefix shortcut.
-    #   - `pipes` is created only via CloudFormation provisioners.
+    #   - `pipes` is commonly created via CloudFormation provisioners, without
+    #     a preceding Pipes API request.
     #   - `appsync_events` is routable (SERVICE_REGISTRY has
     #     "appsync-events") but real traffic arrives under the
     #     `appsync` credential scope at `/v2/apis`, so the
@@ -2913,16 +2921,7 @@ def _reset_all_state():
 
     from ministack.core.persistence import PERSIST_STATE, STATE_DIR
 
-    # Stateful modules that don't have a routing entry in SERVICE_REGISTRY but
-    # still need reset() — REST API v1 (served via the apigateway module),
-    # SES v2 (served via the ses module), and EventBridge Pipes (CFN-only
-    # provisioner with a background poller thread that reset() must stop).
-    # Kept for documentation / safety even though the `sys.modules` fallback
-    # below catches every imported module regardless.
-    _extra_reset_modules = ("apigateway_v1", "ses_v2", "pipes")
-
-    module_names = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
-    module_names.update(_extra_reset_modules)
+    module_names = _registry_module_names()
 
     for mod_name in module_names:
         # Same class fix as the shutdown save loop: a module reached only via

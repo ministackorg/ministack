@@ -191,6 +191,10 @@ def _restore_queries(queries):
                 _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))

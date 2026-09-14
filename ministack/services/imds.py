@@ -235,3 +235,11 @@ async def handle_request(method, path, headers, body, query_params):
             return _text(_META_FLAT[leaf])
 
     return _not_found()
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

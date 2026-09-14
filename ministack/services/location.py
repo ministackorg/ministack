@@ -130,6 +130,10 @@ def get_state():
     }
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     global _sequence
     if not data:

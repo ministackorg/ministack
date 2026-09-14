@@ -479,7 +479,7 @@ subnet = ec2.create_subnet(
 | `AWS::DynamoDB::Table` | Table name | Arn, StreamArn |
 | `AWS::Lambda::Function` | Function name | Arn |
 | `AWS::IAM::Role` | Role name | Arn, RoleId |
-| `AWS::IAM::Policy` | Policy ARN | — |
+| `AWS::IAM::Policy` | Generated id | Id |
 | `AWS::IAM::InstanceProfile` | Profile name | Arn |
 | `AWS::SSM::Parameter` | Parameter name | Type, Value |
 | `AWS::Logs::LogGroup` | Log group name | Arn |

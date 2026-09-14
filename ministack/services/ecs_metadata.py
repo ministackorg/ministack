@@ -80,6 +80,44 @@ def reset() -> None:
         _TOKEN_TO_CONTAINER.clear()
 
 
+def _live_status(task_arn: str) -> tuple[str, str, dict] | None:
+    """``(DesiredStatus, KnownStatus, {container name: status})``, or None.
+
+    Imported lazily: services/ecs.py imports this module, so a module-level
+    import back would be circular.
+    """
+    from ministack.services import ecs
+
+    return ecs.metadata_task_status(task_arn)
+
+
+def _with_status(payload: dict, status, container: bool = False) -> dict:
+    """A copy of ``payload`` carrying the current status.
+
+    `DesiredStatus` is the task's everywhere, which is how a container learns
+    it is being shut down. `KnownStatus` is the task's on the task payload and
+    the container's own on a container payload: on AWS the two differ while a
+    task starts, where the container is already RUNNING and the task is not.
+
+    A copy because this writes the two members, and the dicts it is handed are
+    the live registry entries: the task payload every sibling container's
+    `/task` view is built from, and the container payloads inside it. Writing
+    the overlay into those would drift the registry away from what was
+    registered, and the fallback for a task whose record is gone would then
+    serve a value nobody registered.
+    """
+    out = dict(payload)
+    if status is None:
+        return out
+    desired, known, per_container = status
+    out["DesiredStatus"] = desired
+    if container:
+        out["KnownStatus"] = per_container.get(out.get("Name")) or out.get("KnownStatus") or known
+    else:
+        out["KnownStatus"] = known
+    return out
+
+
 async def handle_request(method, path, headers, body, query_params):
     m = _PATH_RE.match(path)
     if not m:
@@ -91,12 +129,29 @@ async def handle_request(method, path, headers, body, query_params):
             return json_response({"message": "unknown token"}, status=404)
         container = _TOKEN_TO_CONTAINER[token]
         task = _TASKS[arn]
+        containers = list(task.get("Containers", []))
+
+    # Resolved outside _LOCK: the ecs service takes its own per-task locks, and
+    # holding this one across that call would be a lock-order inversion.
+    status = _live_status(arn)
 
     rest = (m.group("rest") or "").rstrip("/")
     if rest == "":
-        return json_response(container)
+        return json_response(_with_status(container, status, container=True))
     if rest == "/task":
+        task = _with_status(task, status)
+        task["Containers"] = [
+            _with_status(c, status, container=True) for c in containers
+        ]
         return json_response(task)
     if rest in ("/stats", "/task/stats"):
         return json_response({})
     return json_response({"message": "not found"}, status=404)
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

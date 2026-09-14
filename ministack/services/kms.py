@@ -131,6 +131,10 @@ def get_state():
     return {"keys": serializable_keys, "aliases": _aliases}
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if data:
         keys_data = data.get("keys", {})

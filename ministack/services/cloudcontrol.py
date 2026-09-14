@@ -52,6 +52,10 @@ def get_state():
     return {"resources": _resources, "requests": _requests}
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return

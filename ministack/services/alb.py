@@ -131,6 +131,10 @@ def _restore_region_scoped(store, restored):
         store.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, rec)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     _restore_region_scoped(_lbs, data.get("_lbs", {}))
     _restore_region_scoped(_tgs, data.get("_tgs", {}))

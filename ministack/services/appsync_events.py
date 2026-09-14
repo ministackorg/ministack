@@ -114,6 +114,10 @@ def _restore_api_child_store(
         store.set_scoped(account_id, region, api_id, value)
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return

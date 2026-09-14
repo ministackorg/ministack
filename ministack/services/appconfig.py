@@ -73,6 +73,10 @@ def get_state():
     })
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     _applications.update(data.get("applications", {}))
     _environments.update(data.get("environments", {}))

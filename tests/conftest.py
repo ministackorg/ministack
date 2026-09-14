@@ -21,6 +21,14 @@ from botocore.config import Config
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 ENDPOINT_HOST = urlparse(ENDPOINT).hostname
+# The port the services advertise themselves on, read the way they read it: an
+# `or` chain, so an empty string falls through exactly as it does in
+# ministack/app.py. A test asserting on a value a service built from this has
+# to use the same source. MINISTACK_ENDPOINT above can be set independently, so
+# deriving the port from it would agree only by coincidence. Note that some
+# services read GATEWAY_PORT alone, without the EDGE_PORT fallback; this
+# constant is for the ones that render an advertised endpoint.
+GATEWAY_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 REGION = "us-east-1"
 
 _default_kwargs = dict(

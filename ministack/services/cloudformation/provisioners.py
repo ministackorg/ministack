@@ -2169,13 +2169,29 @@ def _iam_role_delete(physical_id, props):
 
 
 # --- IAM Policy ---
+#
+# Two resource types share this section. AWS::IAM::ManagedPolicy creates a
+# managed policy and attaches it; AWS::IAM::Policy embeds an *inline* policy on
+# every Role, User and Group it names, exactly as PutRolePolicy,
+# PutUserPolicy and PutGroupPolicy do. The two are easy to confuse, because
+# both carry the same Roles / Users / Groups properties, but they differ in the
+# way that matters here: an inline policy is scoped to its entity, so the same
+# PolicyName can live on many entities at once, each with its own document,
+# while a managed policy is one account-global record that entities point at.
+#
+# CDK depends on that difference. It derives PolicyName from the construct
+# path, so every stack granting something to a role reached by the same path
+# produces the same PolicyName. Provisioned as managed policies they collapse
+# onto one record and the last stack deployed silently takes the grants away
+# from every earlier one; provisioned inline they are independent, as on AWS.
+#
+# The four helpers below serve the managed policy; the inline handlers follow.
 
 def _attach_policy_to_entities(arn, props):
-    """Attach a CFN-created policy to the Roles / Users / Groups it names.
+    """Attach an AWS::IAM::ManagedPolicy to the Roles / Users / Groups it names.
 
-    Both AWS::IAM::Policy and AWS::IAM::ManagedPolicy carry these three
-    properties. Attaching through the IAM module keeps AttachedPolicies a list
-    of bare ARNs and AttachmentCount in step, exactly as AttachRolePolicy does.
+    Attaching through the IAM module keeps AttachedPolicies a list of bare ARNs
+    and AttachmentCount in step, exactly as AttachRolePolicy does.
     """
     for prop, store in (("Roles", _iam._roles),
                         ("Users", _iam._users),
@@ -2186,49 +2202,12 @@ def _attach_policy_to_entities(arn, props):
                 _iam.attach_managed_policy(entity, arn)
 
 
-def _iam_policy_arn(props, name):
-    """The ARN MiniStack keys an AWS::IAM::Policy record by. Derived from the
-    name, so create and rename must agree on it."""
-    return f"arn:aws:iam::{get_account_id()}:policy{props.get('Path', '/')}{name}"
-
-
-def _iam_policy_create(logical_id, props, stack_name):
-    name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=128)
-    path = props.get("Path", "/")
-    arn = _iam_policy_arn(props, name)
-    pol_doc = props.get("PolicyDocument", {})
-    if isinstance(pol_doc, dict):
-        pol_doc = json.dumps(pol_doc)
-
-    record = _iam.store_policy(arn, name, path, pol_doc,
-                               description=props.get("Description", ""))
-    _attach_policy_to_entities(arn, props)
-    # "When the logical ID of this resource is provided to the Ref intrinsic
-    # function, Ref returns the resource name" — so the physical id is the
-    # policy name, not the ARN, and _iam_policy_delete resolves back from it.
-    # AWS::IAM::Policy exposes exactly one attribute, Id; anything else falls
-    # through to the engine's PhysicalResourceId fallback.
-    return name, {"Id": record["PolicyId"]}
-
-
-def _iam_policy_record(physical_id):
-    """Find the record behind an AWS::IAM::Policy physical id. The physical id
-    is the policy name (what Ref returns); older stacks stored the ARN."""
-    record = _iam._policies.get(physical_id)
-    if record is not None:
-        return physical_id, record
-    for arn, policy in _iam._policies.items():
-        if policy.get("PolicyName") == physical_id:
-            return arn, policy
-    return None, None
-
-
 def _iam_policy_set_document(arn, record, document, resource_type):
     """A new PolicyDocument becomes a new default policy version through the
     IAM module's own CreatePolicyVersion (pruning the oldest non-default
     version at the five-version cap first, like the CFN handler), so the
-    policy id, the creation date and the attachments stay. Shared by the
-    inline and the managed policy handlers."""
+    policy id, the creation date and the attachments stay. Managed policies
+    only: an inline policy has no versions."""
     versions = record["Versions"]
     surplus = len(versions) - _IAM_POLICY_VERSION_LIMIT + 1
     if surplus > 0:
@@ -2250,10 +2229,9 @@ def _iam_policy_set_document(arn, record, document, resource_type):
 
 
 def _iam_policy_reconcile_entities(arn, old_props, new_props):
-    """Attach the policy to the Roles / Users / Groups the new template names
-    and detach it from the ones the old template named, through the IAM
-    helpers so AttachmentCount stays in step. Shared by the inline and the
-    managed policy handlers."""
+    """Attach the managed policy to the Roles / Users / Groups the new template
+    names and detach it from the ones the old template named, through the IAM
+    helpers so AttachmentCount stays in step."""
     for prop, store in (("Roles", _iam._roles),
                         ("Users", _iam._users),
                         ("Groups", _iam._groups)):
@@ -2269,49 +2247,127 @@ def _iam_policy_reconcile_entities(arn, old_props, new_props):
                 _iam.attach_managed_policy(entity, arn)
 
 
-def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update an inline policy in place, as PutRolePolicy / PutUserPolicy /
-    PutGroupPolicy do on AWS: every property of AWS::IAM::Policy, PolicyName
-    included, updates with no interruption
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html).
-    A new PolicyDocument becomes the default version under the same policy
-    id, the Roles / Users / Groups lists reconcile through attach/detach,
-    and a new PolicyName re-keys the record (MiniStack keys it by an ARN
-    derived from the name) with its id, versions and attachments intact;
-    Ref follows the new name, as it does on AWS.
-    """
-    name = new_props.get("PolicyName") or _physical_name(
-        stack_name, logical_id or physical_id, max_len=128
-    )
-    arn, record = _iam_policy_record(physical_id)
-    if record is None:
-        return _iam_policy_create(logical_id or physical_id, new_props, stack_name)
-
-    new_arn = _iam_policy_arn(new_props, name)
-    if new_arn != arn or name != record.get("PolicyName"):
-        _iam.rename_policy(arn, new_arn, name)
-        arn = new_arn
-
-    if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
-        _iam_policy_set_document(
-            arn, record, new_props.get("PolicyDocument", {}), "AWS::IAM::Policy"
-        )
-    _iam_policy_reconcile_entities(arn, old_props, new_props)
-    return name, {"Id": record["PolicyId"]}
-
-
 def _iam_policy_remove(arn, props):
-    """Detach the policy from every Role / User / Group the template named,
-    through the IAM helpers so AttachmentCount follows, then drop the
-    record. Shared by the inline and the managed policy delete handlers."""
+    """Detach the managed policy from every Role / User / Group the template
+    named, through the IAM helpers so AttachmentCount follows, then drop the
+    record."""
     _iam_policy_reconcile_entities(arn, props, {})
     _iam._policies.pop(arn, None)
 
 
+# The AWS::IAM::Policy (inline) handlers.
+
+def _iam_inline_policy_targets(props):
+    """The entities an AWS::IAM::Policy names, with the IAM handlers that write
+    and remove an inline policy on each kind.
+
+    Going through the handlers rather than the stores directly matters because
+    the three kinds are stored differently: a role keeps its inline policies on
+    the role record, while users and groups keep theirs in the sidecar
+    _user_inline_policies / _group_inline_policies maps.
+
+    An entity the template names but that does not exist is skipped, which is
+    what attaching did before this became an inline policy.
+    """
+    for prop, param, store, put, remove in (
+        ("Roles", "RoleName", _iam._roles,
+         _iam._put_role_policy, _iam._delete_role_policy),
+        ("Users", "UserName", _iam._users,
+         _iam._put_user_policy, _iam._delete_user_policy),
+        ("Groups", "GroupName", _iam._groups,
+         _iam._put_group_policy, _iam._delete_group_policy),
+    ):
+        for entity_name in props.get(prop, []) or []:
+            if store.get(entity_name) is not None:
+                yield param, entity_name, put, remove
+
+
+def _iam_policy_put(props, name):
+    """Embed the PolicyDocument on every entity the resource names.
+
+    The document is stored as a JSON string, the shape AWS::IAM::Role's own
+    Policies property already writes and the shape
+    GetAccountAuthorizationDetails URL-quotes when it renders these.
+    """
+    document = props.get("PolicyDocument", {})
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    for param, entity_name, put, _remove in _iam_inline_policy_targets(props):
+        resp = put({param: entity_name,
+                    "PolicyName": name,
+                    "PolicyDocument": document})
+        if resp[0] >= 400:
+            raise ValueError(
+                f"AWS::IAM::Policy {name} could not be put on {entity_name}: {resp[2]!r}"
+            )
+
+
+def _iam_policy_drop(props, name):
+    """Remove the named inline policy from every entity the props name.
+
+    A not-found answer is ignored on purpose: the entity may already have been
+    deleted earlier in the same stack teardown, and the policy may already have
+    been removed under this name by a rename earlier in the same update.
+    """
+    for param, entity_name, _put, remove in _iam_inline_policy_targets(props):
+        remove({param: entity_name, "PolicyName": name})
+
+
+def _iam_policy_create(logical_id, props, stack_name):
+    """AWS::IAM::Policy embeds an inline policy on every entity it names; it
+    does not create a managed policy and attach it.
+
+    The physical id is generated rather than being the PolicyName. On AWS the
+    type's primary identifier is its read-only Id attribute (its resource
+    schema declares exactly Groups, Id, PolicyDocument, PolicyName, Roles and
+    Users), and a template that sets an explicit PolicyName still gets an
+    opaque generated id back from CloudFormation. _physical_name hashes the
+    stack and the logical id, so the value is stable across updates the way
+    that generated id is, and two stacks that happen to share a PolicyName
+    still get ids of their own.
+    """
+    physical_id = _physical_name(stack_name, logical_id, max_len=128)
+    _iam_policy_put(props, props.get("PolicyName") or physical_id)
+    return physical_id, {"Id": physical_id}
+
+
+def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update the inline policy in place, as PutRolePolicy / PutUserPolicy /
+    PutGroupPolicy do on AWS: every property of AWS::IAM::Policy, PolicyName
+    included, updates with no interruption
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html).
+
+    The physical id comes back unchanged, which is what "no interruption" means
+    here. The engine reads a changed physical id as a replacement and deletes
+    the predecessor once the update completes, and since an inline policy is
+    keyed by its entity and its name, that cleanup would delete the very policy
+    this update had just written. Returning it unchanged also leaves stacks
+    provisioned by an older MiniStack alone, where the physical id is the
+    policy name.
+    """
+    old_name = old_props.get("PolicyName") or physical_id
+    new_name = new_props.get("PolicyName") or physical_id
+
+    # Whatever the old template left behind has to come off first: everything
+    # under the old name if the name changed, and the entities this template
+    # no longer lists.
+    if new_name != old_name:
+        _iam_policy_drop(old_props, old_name)
+    departed = {
+        prop: [name for name in (old_props.get(prop) or [])
+               if name not in (new_props.get(prop) or [])]
+        for prop in ("Roles", "Users", "Groups")
+    }
+    _iam_policy_drop(departed, new_name)
+
+    _iam_policy_put(new_props, new_name)
+    return physical_id, {"Id": physical_id}
+
+
 def _iam_policy_delete(physical_id, props):
-    arn, _record = _iam_policy_record(physical_id)
-    if arn is not None:
-        _iam_policy_remove(arn, props)
+    """The physical id is not consulted: an inline policy has no record of its
+    own to resolve, it lives on its entities under its PolicyName."""
+    _iam_policy_drop(props, props.get("PolicyName") or physical_id)
 
 
 # --- IAM InstanceProfile ---

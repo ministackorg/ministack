@@ -3,11 +3,10 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
-import shutil
-import sys
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
@@ -4925,7 +4924,7 @@ def test_lambda_sqs_poller_does_not_tail_match_foreign_region_event_source(monke
         _sqs._queues.clear()
 
         queue_name = "esm-runtime-region-guard"
-        queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+        queue_url = _sqs._queue_url(queue_name)
         _sqs._queues[queue_url] = {
             "name": queue_name,
             "messages": [{
@@ -5156,12 +5155,15 @@ def esm_poll_state(tmp_path, monkeypatch):
         lsvc._kinesis_positions._data.clear()
         lsvc._dynamodb_stream_positions._data.clear()
         lsvc._esm_backoff_until._data.clear()
+        lsvc._esm_inflight.clear()
         _sqs._queues._data.clear()
         _kin._streams._data.clear()
         _ddb._tables._data.clear()
         _ddb._stream_records._data.clear()
         _ddb._stream_trimmed._data.clear()
 
+    # Run dispatched SQS batches inline so a poll pass finishes its invokes before returning.
+    monkeypatch.setattr(lsvc, "spawn_background", lambda task, **_: task())
     _clear_all()
     try:
         yield lsvc, _sqs, _kin, _ddb
@@ -5181,7 +5183,7 @@ def test_poll_sqs_returns_true_when_batch_processed(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5297,14 +5299,14 @@ def test_poll_dynamodb_streams_returns_true_when_batch_processed(esm_poll_state,
     assert _lsvc._poll_dynamodb_streams() is True
 
 
-def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
+def test_poll_sqs_backs_off_after_invoke_fails(esm_poll_state, monkeypatch):
     """A failed invoke leaves the message undeleted (just invisible for its
-    visibility timeout) rather than advancing — _poll_loop must not skip its
-    idle sleep for a pass that made no real progress."""
+    visibility timeout) and puts the ESM in backoff, so the next pass finds
+    nothing to take and _poll_loop goes back to waiting instead of spinning."""
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-failure"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5344,8 +5346,9 @@ def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
         lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
     )
 
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(_sqs._queues[queue_url]["messages"]) == 1
+    assert _lsvc._poll_sqs() is False
 
 
 def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_state, monkeypatch):
@@ -5355,7 +5358,7 @@ def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_sta
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     def make_queue(name):
-        queue_url = f"http://localhost:4566/000000000000/{name}"
+        queue_url = _sqs._queue_url(name)
         _sqs._queues[queue_url] = {
             "name": name,
             "messages": [{
@@ -5453,7 +5456,7 @@ def test_poll_sqs_record_carries_trace_header_and_fifo_attributes(esm_poll_state
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-trace-attrs"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     trace = "Root=1-6893a2b4-aaaabbbbccccddddeeeeffff;Parent=0123456789abcdef;Sampled=1"
     base = {
         "md5_body": "", "sent_at": time.time(), "visible_at": 0,
@@ -5521,7 +5524,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-recovers"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5570,7 +5573,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
     fake_now = [1_000_000.0]
     monkeypatch.setattr(_lsvc.time, "time", lambda: fake_now[0])
 
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(invoke_calls) == 1
 
     # Still within the backoff window — skipped before it would even receive.
@@ -5580,7 +5583,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
 
     # Backoff has elapsed — the ESM is retried (and fails again).
     fake_now[0] += _lsvc._ESM_BACKOFF_SECONDS
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(invoke_calls) == 2
 
 
@@ -5709,7 +5712,7 @@ def test_poll_loop_skips_sleep_when_a_poller_processed_work(monkeypatch):
     monkeypatch.setattr(lsvc, "_poll_sqs", fake_poll_sqs)
     monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
-    monkeypatch.setattr(lsvc.time, "sleep", lambda secs: sleep_calls.append(secs))
+    monkeypatch.setattr(lsvc._esm_wake, "wait", lambda secs: sleep_calls.append(secs))
 
     with pytest.raises(_StopPollLoop):
         lsvc._poll_loop()
@@ -5732,12 +5735,108 @@ def test_poll_loop_sleeps_when_no_poller_processed_work(esm_poll_state, monkeypa
     monkeypatch.setattr(lsvc, "_poll_sqs", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
-    monkeypatch.setattr(lsvc.time, "sleep", fake_sleep)
+    monkeypatch.setattr(lsvc._esm_wake, "wait", fake_sleep)
 
     with pytest.raises(_StopPollLoop):
         lsvc._poll_loop()
 
     assert sleep_calls == [5]
+
+
+def test_esm_batch_completion_wakes_poll_loop(esm_poll_state):
+    """A finished batch frees a concurrency slot; the poll loop must refill it
+    right away rather than waiting out its idle cadence."""
+    lsvc._esm_wake.clear()
+    lsvc._dispatch_esm_batch("esm-wake", lambda: None)
+    assert lsvc._esm_wake.is_set()
+    assert "esm-wake" not in lsvc._esm_inflight
+
+
+def _sqs_esm_fixture(_lsvc, _sqs, name, *, messages=1, esm_extra=None, func_extra=None):
+    queue_url = f"http://localhost:4566/000000000000/{name}"
+    _sqs._queues[queue_url] = {
+        "name": name,
+        "messages": [{
+            "id": f"msg-{i}", "body": "payload", "md5_body": "", "receipt_handle": None,
+            "sent_at": time.time(), "visible_at": 0, "receive_count": 0,
+            "first_receive_at": None, "message_attributes": {},
+        } for i in range(messages)],
+        "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{name}"},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions[f"{name}-fn"] = {
+        "config": {
+            "FunctionName": f"{name}-fn",
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}-fn",
+        },
+        "versions": {}, "aliases": {},
+        **(func_extra or {}),
+    }
+    _lsvc._esms[name] = {
+        "UUID": name,
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{name}",
+        "FunctionName": f"{name}-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 1,
+        **(esm_extra or {}),
+    }
+    return queue_url
+
+
+@pytest.fixture
+def esm_threaded_dispatch(esm_poll_state, monkeypatch):
+    """Real worker threads instead of the inline dispatch esm_poll_state installs."""
+    from ministack.core.concurrency import spawn_background
+
+    threads = []
+    monkeypatch.setattr(lsvc, "spawn_background", lambda task, **kw: threads.append(spawn_background(task, **kw)))
+    release = threading.Event()
+    try:
+        yield esm_poll_state, release
+    finally:
+        release.set()
+        for t in threads:
+            t.join(10)
+
+
+def test_poll_sqs_slow_handler_does_not_block_other_esms(esm_threaded_dispatch, monkeypatch):
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-slow")
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-fast")
+    fast_done = threading.Event()
+
+    def fake_execute(func, _event):
+        if func["config"]["FunctionName"] == "esm-slow-fn":
+            release.wait(10)
+        else:
+            fast_done.set()
+        return {"body": {}}
+
+    monkeypatch.setattr(_lsvc, "_execute_function", fake_execute)
+
+    assert _lsvc._poll_sqs() is True
+    assert fast_done.wait(5), "fast ESM waited on the slow ESM's handler"
+
+
+@pytest.mark.parametrize("esm_extra,func_extra,expected", [
+    ({}, {}, 5),
+    ({"ScalingConfig": {"MaximumConcurrency": 3}}, {}, 3),
+    ({"ScalingConfig": {"MaximumConcurrency": 8}}, {"concurrency": 2}, 2),
+])
+def test_poll_sqs_caps_in_flight_batches_per_esm(esm_threaded_dispatch, monkeypatch, esm_extra, func_extra, expected):
+    """MaximumConcurrency (default 5) bounds one ESM's in-flight batches, and a
+    lower ReservedConcurrentExecutions wins so the ESM doesn't throttle itself."""
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-capped", messages=20, esm_extra=esm_extra, func_extra=func_extra)
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: (release.wait(10), {"body": {}})[1])
+
+    for _ in range(20):
+        _lsvc._poll_sqs()
+
+    assert _lsvc._esm_inflight["esm-capped"] == expected
 
 
 def test_lambda_create_esm_rejects_unresolved_function_arn():
@@ -6235,7 +6334,7 @@ def test_route_async_failure_to_sqs_dlq():
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
     # Create a queue directly in the internal state
-    url = "http://localhost:4566/000000000000/dlq-test"
+    url = _sqs._queue_url("dlq-test")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-test"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},
@@ -6377,7 +6476,7 @@ def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
     original_region = get_region()
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
-    url = "http://localhost:4566/000000000000/dlq-region-guard"
+    url = _sqs._queue_url("dlq-region-guard")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-region-guard"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},
