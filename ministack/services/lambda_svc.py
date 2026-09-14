@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
@@ -4798,6 +4798,15 @@ def _inflight_key(config: dict) -> str:
     return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
 
 
+def _reserved_concurrency(func: dict, config: dict) -> int | None:
+    reserved = (func or {}).get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    if reserved is None:
+        reserved = config.get("ReservedConcurrentExecutions")
+    return None if reserved is None else int(reserved)
+
+
 def _acquire_execution_slot(func: dict, config: dict):
     """Reserve one unit of concurrency, or None when a cap is reached.
 
@@ -4810,14 +4819,10 @@ def _acquire_execution_slot(func: dict, config: dict):
     so both are consulted rather than assuming either shape.
     """
     global _inflight_total
-    reserved = (func or {}).get("concurrency")
-    if isinstance(reserved, dict):
-        reserved = reserved.get("ReservedConcurrentExecutions")
-    if reserved is None:
-        reserved = config.get("ReservedConcurrentExecutions")
+    reserved = _reserved_concurrency(func, config)
     key = _inflight_key(config)
     with _inflight_lock:
-        if reserved and _inflight.get(key, 0) >= int(reserved):
+        if reserved and _inflight.get(key, 0) >= reserved:
             return None, "function"
         if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
             return None, "account"
@@ -6971,6 +6976,40 @@ _dynamodb_stream_positions_lock = threading.Lock()
 _esm_backoff_until = AccountRegionScopedDict()
 _ESM_BACKOFF_SECONDS = 1.0
 
+# SQS batches run off the poll thread so a slow handler can't stall other ESMs.
+# Per-ESM limit is ScalingConfig.MaximumConcurrency, else this default.
+_ESM_SQS_DEFAULT_CONCURRENCY = 5
+# esm_uuid -> dispatched batches not yet finished.
+_esm_inflight: dict[str, int] = {}
+_esm_inflight_lock = threading.Lock()
+# Set when a dispatched batch finishes, so _poll_loop refills the slot at once.
+_esm_wake = threading.Event()
+
+
+def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict) -> int:
+    limit = (esm.get("ScalingConfig") or {}).get("MaximumConcurrency") or _ESM_SQS_DEFAULT_CONCURRENCY
+    reserved = _reserved_concurrency(func_rec, config)
+    return min(limit, reserved) if reserved else limit
+
+
+def _dispatch_esm_batch(esm_id: str, fn, *args) -> None:
+    with _esm_inflight_lock:
+        _esm_inflight[esm_id] = _esm_inflight.get(esm_id, 0) + 1
+
+    def _task():
+        try:
+            fn(*args)
+        finally:
+            with _esm_inflight_lock:
+                remaining = _esm_inflight.get(esm_id, 0) - 1
+                if remaining > 0:
+                    _esm_inflight[esm_id] = remaining
+                else:
+                    _esm_inflight.pop(esm_id, None)
+            _esm_wake.set()
+
+    spawn_background(_task, thread_name="ministack-esm")
+
 
 def _init_stream_position(esm_id, source_arn, starting):
     """Anchor a DynamoDB-stream ESM's read position at subscription time so
@@ -7006,6 +7045,7 @@ def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
     while True:
         processed = False
+        _esm_wake.clear()
         try:
             processed = _poll_sqs() or processed
         except Exception as e:
@@ -7022,7 +7062,7 @@ def _poll_loop():
         # immediately rather than waiting out the idle cadence below, so
         # throughput isn't throttled to batch_size-per-tick.
         if not processed:
-            time.sleep(1 if _esms.has_any() else 5)
+            _esm_wake.wait(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():
@@ -7049,8 +7089,8 @@ def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
 
 
 def _poll_sqs():
-    """Returns True if any ESM advanced past a batch this pass (successfully
-    invoked, or filtered out entirely)."""
+    """Returns True if any ESM took a batch this pass (dispatched for invoke,
+    or filtered out entirely)."""
     from ministack.services import sqs as _sqs
 
     processed_any = False
@@ -7089,6 +7129,9 @@ def _poll_sqs():
 
             esm_id = esm["UUID"]
             if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+            # Only this thread increments, so the count can't rise before dispatch.
+            if _esm_inflight.get(esm_id, 0) >= _sqs_esm_concurrency(esm, func_rec, _cfg):
                 continue
 
             batch_size = esm.get("BatchSize", 10)
@@ -7146,65 +7189,75 @@ def _poll_sqs():
                 processed_any = True
                 continue
 
-            event = {"Records": records}
-            result = _execute_function(func_rec, event)
-
-            if result.get("error"):
-                err_body = result.get("body") or {}
-                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                esm["LastProcessingResult"] = "FAILED"
-                logger.warning(
-                    "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                    func_name, queue_name, err_type, err_msg, result.get("log", ""),
-                )
-                # Failed messages stay invisible for their visibility timeout
-                # rather than advancing, so don't report this as processed.
-                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
-            else:
-                processed_any = True
-                _esm_backoff_until.pop(esm_id, None)
-                # Check for ReportBatchItemFailures — partial batch response
-                failed_ids = set()
-                if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
-                    body = result.get("body")
-                    if isinstance(body, dict):
-                        for failure in body.get("batchItemFailures", []):
-                            fid = failure.get("itemIdentifier", "")
-                            if fid:
-                                failed_ids.add(fid)
-                    elif isinstance(body, str):
-                        try:
-                            parsed = json.loads(body)
-                            for failure in parsed.get("batchItemFailures", []):
-                                fid = failure.get("itemIdentifier", "")
-                                if fid:
-                                    failed_ids.add(fid)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-
-                # Delete only the messages that succeeded (not in failed_ids)
-                succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
-                receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
-                if receipt_handles:
-                    _sqs._delete_messages_for_esm(queue_url, receipt_handles)
-
-                n_failed = len(batch) - len(succeeded)
-                if n_failed:
-                    esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                                func_name, len(succeeded), queue_name, n_failed)
-                else:
-                    esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
-                log_output = result.get("log", "")
-                if log_output:
-                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+            _dispatch_esm_batch(
+                esm_id, _run_sqs_batch, esm, func_rec, {"Records": records}, batch, queue_url, queue_name
+            )
+            processed_any = True
         finally:
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
     return processed_any
+
+
+def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
+    from ministack.services import sqs as _sqs
+
+    esm_id = esm["UUID"]
+    func_name = esm["FunctionName"]
+    result = _execute_function(func_rec, event)
+
+    if result.get("error"):
+        err_body = result.get("body") or {}
+        err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+        err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+        esm["LastProcessingResult"] = "FAILED"
+        logger.warning(
+            "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
+            func_name, queue_name, err_type, err_msg, result.get("log", ""),
+        )
+        # Failed messages stay invisible for their visibility timeout; pace
+        # retries so the poll loop doesn't spin on a broken ESM.
+        _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
+        return
+
+    _esm_backoff_until.pop(esm_id, None)
+    # Check for ReportBatchItemFailures — partial batch response
+    failed_ids = set()
+    if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+        body = result.get("body")
+        if isinstance(body, dict):
+            for failure in body.get("batchItemFailures", []):
+                fid = failure.get("itemIdentifier", "")
+                if fid:
+                    failed_ids.add(fid)
+        elif isinstance(body, str):
+            try:
+                parsed = json.loads(body)
+                for failure in parsed.get("batchItemFailures", []):
+                    fid = failure.get("itemIdentifier", "")
+                    if fid:
+                        failed_ids.add(fid)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # Delete only the messages that succeeded (not in failed_ids)
+    succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+    receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+    if receipt_handles:
+        _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+
+    n_failed = len(batch) - len(succeeded)
+    if n_failed:
+        esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                    func_name, len(succeeded), queue_name, n_failed)
+    else:
+        esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
+    log_output = result.get("log", "")
+    if log_output:
+        logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
 def _poll_kinesis():

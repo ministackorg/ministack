@@ -1897,11 +1897,20 @@ def _find_pool_by_client_id(client_id: str):
 
 
 def _cleanup_expired_relay_codes():
-    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL."""
+    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL.
+
+    `/saml2/idpresponse` and `/oauth2/idpresponse` run reentrantly, so this can
+    run on multiple threads at once while another thread concurrently inserts
+    or pops from `_auth_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [k for k, v in _auth_codes.items() if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
+    expired = [k for k, v in list(_auth_codes.items()) if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
     for k in expired:
-        del _auth_codes[k]
+        _auth_codes.pop(k, None)
 
 
 def _authenticate_client(headers: dict, form: dict):
@@ -1927,10 +1936,21 @@ def _generate_auth_code() -> str:
 
 
 def _cleanup_expired_codes():
+    """Remove expired managed-login authorization codes.
+
+    `/oauth2/token` runs reentrantly, so this can run on multiple threads at
+    once while `_issue_auth_code_redirect` (from `/login`, on the event loop)
+    or another `/oauth2/token` call concurrently inserts or pops from
+    `_authorization_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [code for code, entry in _authorization_codes.items() if entry["expires_at"] < now]
+    expired = [code for code, entry in list(_authorization_codes.items()) if entry["expires_at"] < now]
     for code in expired:
-        del _authorization_codes[code]
+        _authorization_codes.pop(code, None)
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
@@ -1959,12 +1979,18 @@ async def handle_request(method, path, headers, body, query_params):
     # Path-based endpoints (form-encoded or no body — must run before JSON parse)
     if path.startswith("/oauth2/authorize"):
         return handle_oauth2_authorize(method, path, headers, query_params)
+    # These three routes can invoke PreSignUp/PreTokenGeneration Lambda triggers,
+    # which may call back into ministack over HTTP — run_reentrant gives that
+    # callback its own thread instead of queuing behind this request's thread.
     if path.startswith("/saml2/idpresponse"):
-        return _saml2_idp_response(body, query_params)
+        return await run_reentrant(_saml2_idp_response, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/idpresponse"):
-        return _oauth2_idp_response(method, body, query_params)
+        return await run_reentrant(_oauth2_idp_response, method, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/token"):
-        return _oauth2_token({}, query_params, body, headers)
+        return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+                                   thread_name="ministack-cognito-trigger")
 
     try:
         data = json.loads(body) if body else {}
@@ -6158,8 +6184,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-            # Consume code (one-time use)
-            del _authorization_codes[code]
+            # Consume code (one-time use). This handler runs off the loop
+            # (run_reentrant), so two concurrent requests for the same code
+            # can both reach this point after passing validation above — pop()
+            # is the atomic single-use gate; the loser must not proceed past it
+            # even though it already "validated" against the (about-to-be-stale)
+            # entry.
+            if _authorization_codes.pop(code, None) is not entry:
+                return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
             pool_id = entry["pool_id"]
             pool = _get_pool_unscoped(pool_id)
@@ -6305,9 +6337,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
     })
 
 
-def handle_oauth2_token(method, path, headers, body, query_params):
+async def handle_oauth2_token(method, path, headers, body, query_params):
     """Public entry point called from app.py for POST /oauth2/token."""
-    return _oauth2_token({}, query_params, body, headers)
+    return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+                               thread_name="ministack-cognito-trigger")
 
 
 # -- /oauth2/userInfo (GET/POST) ---------------------------------------------

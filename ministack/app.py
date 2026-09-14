@@ -1228,7 +1228,7 @@ async def _handle_cognito_body_request(method: str, path: str, headers: dict, bo
     if path in ("/oauth2/login", "/login") and method == "POST":
         return _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
     if path == "/oauth2/token" and method == "POST":
-        return _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
+        return await _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
     if path in _COGNITO_USERINFO_PATHS and method == "POST":
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, body, query_params)
     return None
