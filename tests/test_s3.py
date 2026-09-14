@@ -1778,6 +1778,9 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
         Bucket=bkt,
         CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
     )
+    # The destination has to exist: AWS verifies an SQS or SNS target by sending
+    # it a test notification and fails the whole PUT when that does not arrive.
+    _regional_client("sqs", "us-west-2").create_queue(QueueName="s3-west-region-q")
 
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
