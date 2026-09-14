@@ -2171,7 +2171,14 @@ def _unknown_query_error(body: bytes, request_id: str):
 async def _dispatch_service_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
 ):
-    """Dispatch a request through the generic service router."""
+    """Dispatch AWS service requests and Kubernetes TokenReviews."""
+    if method == "POST" and path.startswith("/eks-auth/"):
+        # TokenReview carries its own credentials; EKS authenticates the token.
+        return await _get_module("eks").handle_request(
+            method, path, headers, body, query_params
+        )
+
+    # Generic AWS service routing and IAM enforcement
     routing_params = _routing_params(method, path, headers, body, query_params)
     service = detect_service(method, path, headers, routing_params)
 

@@ -808,7 +808,7 @@ end-to-end without any client config.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GATEWAY_PORT` | `4566` | Port to listen on. Also accepts `EDGE_PORT` (LocalStack compatibility alias) |
-| `MINISTACK_HOST` | `localhost` | Hostname used in response URLs (SQS queues, SNS subscriptions, API Gateway endpoints, Lambda layers) |
+| `MINISTACK_HOST` | `localhost` | Hostname used in response URLs and EKS cluster endpoints. Set a hostname reachable by your clients, not a wildcard bind address |
 | `MINISTACK_ACCOUNT_ID` | `000000000000` | Default AWS account ID. Overridden per-request when `AWS_ACCESS_KEY_ID` is a 12-digit number (see [Multi-Tenancy](#multi-tenancy)) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
@@ -1067,19 +1067,26 @@ describe can find nothing where AWS would still answer.
 MiniStack's EKS spawns a real [k3s](https://k3s.io) cluster (75 MB image) when you create a cluster. `kubectl`, Helm, and any Kubernetes tooling work out of the box.
 
 ```bash
+# Local credentials for the AWS CLI. With AUTH=false any dummy key/secret
+# works; kubectl's aws eks get-token plugin inherits these variables.
+unset AWS_PROFILE AWS_SESSION_TOKEN
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=eu-central-1
+
 # Create an EKS cluster — k3s starts automatically
 aws --endpoint-url=http://localhost:4566 eks create-cluster \
   --name my-cluster --role-arn arn:aws:iam::000000000000:role/eks \
   --resources-vpc-config subnetIds=subnet-1
 
-# Get the k3s kubeconfig (container name follows
-# ministack-eks-{region}-{name}; this example uses eu-central-1)
-docker exec ministack-eks-eu-central-1-my-cluster cat /etc/rancher/k3s/k3s.yaml \
-  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-eu-central-1-my-cluster 6443/tcp | cut -d: -f2)/" \
-  > /tmp/ministack-kubeconfig.yaml
+# Wait for k3s to finish booting so DescribeCluster includes its CA bundle.
+aws --endpoint-url=http://localhost:4566 eks wait cluster-active --name my-cluster
 
-# Use kubectl against real Kubernetes
-export KUBECONFIG=/tmp/ministack-kubeconfig.yaml
+# Generate a normal AWS EKS kubeconfig. k3s sends the aws eks get-token
+# credential to MiniStack's authentication webhook.
+aws --endpoint-url=http://localhost:4566 eks update-kubeconfig --name my-cluster
+
+# Use kubectl against real Kubernetes (the default ~/.kube/config is updated)
 kubectl get nodes          # Real k3s node, Ready status
 kubectl create deployment nginx --image=nginx:alpine
 kubectl get pods           # Real pod running
@@ -1091,6 +1098,48 @@ helm install my-redis bitnami/redis --set auth.enabled=false
 # Clean up — k3s container is removed automatically
 aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 ```
+
+To enforce IAM, start MiniStack with `AUTH=true` (for example,
+`AUTH=true python -m ministack`, or add `AUTH=true` to the container environment).
+The root key/secret default to `test`/`test`; custom values must match the
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the MiniStack server.
+Under `AUTH=true`, create the IAM role before running the cluster example above:
+
+```bash
+aws --endpoint-url=http://localhost:4566 iam create-role \
+  --role-name eks \
+  --assume-role-policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+```
+
+In strict mode, IAM policies govern EKS API calls such as `DescribeCluster`
+(needed by `update-kubeconfig`). Kubernetes access requires a separate grant:
+the principal that creates the cluster gets bootstrap administrator access unless
+`--access-config bootstrapClusterCreatorAdminPermissions=false` is supplied.
+The cluster's service role does not inherit that access. Other principals need
+an EKS Access Entry with `kubernetesGroups` bound through Kubernetes RBAC, or
+one of these EKS managed access policies:
+
+| Policy | Kubernetes permissions |
+|---|---|
+| `AmazonEKSClusterAdminPolicy` | Full cluster administration |
+| `AmazonEKSAdminPolicy` | Broad administration, including namespace Roles and RoleBindings |
+| `AmazonEKSEditPolicy` | Modify workloads and Secrets, but not RBAC administration |
+| `AmazonEKSViewPolicy` | Read workloads, excluding Secrets |
+| `AmazonEKSAdminViewPolicy` | Read all resources, including Secrets |
+
+Policies can use cluster or namespace scope. Namespace entries accept wildcard
+patterns such as `dev-*`; MiniStack reconciles their RBAC bindings when a
+matching namespace is created, and after association updates or deletions.
+EKS normally evaluates these policies in its control-plane authorizer. k3s has
+only Kubernetes RBAC, so MiniStack materializes equivalent, managed RBAC roles
+and bindings internally. User-supplied `kubernetesGroups` remain additive.
+Existing clusters without a recorded creator also need an explicit Access Entry.
+
+With `AUTH=false`, neither IAM policies nor Access Entries restrict Kubernetes
+access. The CLI still needs credentials to generate its exec token, but MiniStack
+does not check their secret, registration, or permissions. Restart MiniStack to
+change `AUTH`; k3s may retain previous authentication results for up to five minutes.
 
 > **Note:** EKS requires Docker socket access (`-v /var/run/docker.sock:/var/run/docker.sock`) to spawn k3s containers. The k3s image is pulled on first `CreateCluster` call.
 

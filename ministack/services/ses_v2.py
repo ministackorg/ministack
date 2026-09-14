@@ -274,8 +274,12 @@ def _local_ses_v2_resource_arn(arn):
 
 
 async def handle_request(method, path, headers, body, query_params):
-    # Strip /v2/email prefix
-    sub = path[len("/v2/email"):]
+    # The SES dispatcher also accepts unprefixed REST paths when selected by
+    # a SESv2 target header. Preserve those paths and trailing-slash handling
+    # from its former inline v2 implementation.
+    sub = path.rstrip("/")
+    if sub.startswith("/v2/email"):
+        sub = sub[len("/v2/email"):]
 
     try:
         data = json.loads(body) if body else {}
