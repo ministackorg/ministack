@@ -187,6 +187,10 @@ def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
                 store.set_scoped(account_id, region, original_key, copy.deepcopy(value))
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))

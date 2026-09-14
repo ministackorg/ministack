@@ -912,3 +912,11 @@ def reset():
     _stub_databases.clear()
     _stub_users.clear()
     _stub_grants.clear()
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

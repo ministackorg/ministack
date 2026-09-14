@@ -132,19 +132,24 @@ def _resource_matches(resource_arn: str, resources: list[str],
 # Condition evaluation
 # ---------------------------------------------------------------------------
 
+_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+
+
 def _account_from_arn(arn: str) -> str | None:
     """The account field of an ARN, or None when the ARN carries none: ``*``,
     partition-only ARNs such as S3 (``arn:aws:s3:::bucket``), AWS-owned ARNs
-    (``arn:aws:iam::aws:policy/...``) and malformed values."""
+    (``arn:aws:iam::aws:policy/...``) and malformed values.
+
+    An account id is twelve digits, so anything else standing in that field —
+    ``aws`` on an AWS-owned ARN, a service name, an empty segment — reads as
+    "this ARN names no account" rather than as an account called ``aws``.
+    """
     if not arn or arn == "*" or not arn.startswith("arn:"):
         return None
     parts = arn.split(":", 5)
     if len(parts) < 6:
         return None
-    account = parts[4]
-    if not account or account == "aws":
-        return None
-    return account
+    return parts[4] if _ACCOUNT_ID_RE.fullmatch(parts[4]) else None
 
 
 def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
@@ -638,7 +643,6 @@ def _resolve_managed_policy_document(policy_arn: str,
 # Access-key resolution — the credentials and principals MiniStack issued
 # ---------------------------------------------------------------------------
 
-_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 _SESSION_TOKEN_NOT_CHECKED = object()
 
 
@@ -689,13 +693,6 @@ def _invalid_session_token() -> CredentialResolutionError:
         "InvalidToken",
         "The provided token is malformed or otherwise invalid.",
     )
-
-
-def _account_from_arn(arn: str) -> str | None:
-    parts = arn.split(":")
-    if len(parts) > 4 and _ACCOUNT_ID_RE.fullmatch(parts[4]):
-        return parts[4]
-    return None
 
 
 def _principal_type(arn: str, recorded_type: str) -> str:
