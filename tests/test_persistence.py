@@ -1693,7 +1693,7 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     monkeypatch.setattr(mod, "_poller_started", False)
 
     pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/poller-test"
-    mod.load_persisted_state({
+    result = mod.load_persisted_state({
         "pipes": {
             "poller-test": {
                 "Name": "poller-test",
@@ -1715,6 +1715,7 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
         "load_persisted_state() did not start the pipes poller for a RUNNING pipe — "
         "warm-booted pipes would silently stop forwarding events."
     )
+    assert result is None
     mod.reset()
 
 

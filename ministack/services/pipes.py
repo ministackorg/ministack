@@ -51,7 +51,7 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
+def load_persisted_state(data) -> None:
     restore_state(data)
     # Restored RUNNING pipes need the background poller — register_pipe is the
     # only other place that starts it, and it is not called on warm boot.

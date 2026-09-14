@@ -619,7 +619,7 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
+def load_persisted_state(data) -> None:
     restore_state(data)
     if _esms.has_any():
         _ensure_poller()
