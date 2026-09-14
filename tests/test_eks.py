@@ -1004,6 +1004,24 @@ def test_eks_pod_identity_association_lifecycle(eks):
             pass
 
 
+def test_eks_pod_identity_associations_go_with_the_cluster(eks):
+    """A recreated cluster must not inherit the previous one's associations."""
+    cn = _create_basic_cluster(eks)
+    eks.create_pod_identity_association(
+        clusterName=cn, namespace="default", serviceAccount="app",
+        roleArn=f"arn:aws:iam::000000000000:role/pod-{_uid()}",
+    )
+    assert eks.list_pod_identity_associations(clusterName=cn)["associations"]
+
+    eks.delete_cluster(name=cn)
+    eks.create_cluster(name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+                       resourcesVpcConfig={"subnetIds": ["subnet-1"]})
+    try:
+        assert eks.list_pod_identity_associations(clusterName=cn)["associations"] == []
+    finally:
+        eks.delete_cluster(name=cn)
+
+
 def test_eks_pod_identity_association_list_filters(eks):
     """ListPodIdentityAssociations filters on namespace and serviceAccount,
     the two query parameters the operation takes."""

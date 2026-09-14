@@ -817,6 +817,15 @@ def _delete_cluster(name):
         if ng:
             _tags.pop(ng.get("nodegroupArn", ""), None)
 
+    # Pod identity associations belong to the cluster, so they go with it.
+    # Left behind they outlive it, and a cluster recreated under the same name
+    # would inherit the previous one's associations and their role ARNs.
+    prefix = f"{name}\x00"
+    for key in [k for k in _pod_identity_associations if str(k).startswith(prefix)]:
+        assoc = _pod_identity_associations.pop(key, None)
+        if assoc:
+            _tags.pop(assoc.get("associationArn", ""), None)
+
     arn = cluster["arn"]
     cluster["status"] = "DELETING"
     result = _sanitize(cluster)
