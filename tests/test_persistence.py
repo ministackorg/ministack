@@ -3,18 +3,12 @@ Regression tests for the persistence-symmetry architectural bug.
 
 Background
 ----------
-When PERSIST_STATE=1, every service that participates in `_state_map`
-(see `ministack/app.py`) is saved on shutdown via `save_all()`. State is
-restored on startup either by a service's own `load_state()` call at
-module import time, OR by `_load_persisted_state()` which calls a
-`load_persisted_state()` method on the service module.
+When PERSIST_STATE=1, the registry-derived `_state_map` in
+`ministack/app.py` supplies each loaded service's `get_state()` function
+to `save_all()` at shutdown. State is currently restored either by a
+service's import-time `load_state()` call or by `_load_persisted_state()`.
 
-For five services (autoscaling, backup, eks, scheduler, pipes), the
-shutdown path persists the state to disk but no restore path runs at
-startup, so the next boot starts with an empty store. `pipes` is
-additionally missing from `_state_map`, so its state is never even saved.
-
-These tests assert the round-trip works for every persisted service.
+These tests protect persistence round trips and the registry contract.
 """
 import ast
 import importlib
@@ -24,11 +18,6 @@ import pytest
 
 from ministack.app import _state_map  # noqa: E402  (intentional internal import)
 from ministack.core import persistence
-
-# Services that MUST be persistence-round-trippable. Every entry of
-# `_state_map` qualifies. The set is materialised here so an addition to
-# `_state_map` automatically gets coverage.
-ALL_PERSISTED_SERVICES = sorted(_state_map.items())
 
 
 def _module(mod_name):
@@ -452,45 +441,8 @@ def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path)
         set_request_region(original_region)
 
 
-@pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
-def test_service_has_restore_path(svc_key, mod_name):
-    """Every service in `_state_map` must expose a way to restore its own state.
-
-    Either:
-      (a) the module calls `load_state()` itself at import time, OR
-      (b) the module exposes `load_persisted_state(data)` AND is wired into
-          `_load_persisted_state()` in app.py.
-    """
-    mod = _module(mod_name)
-    src = Path(mod.__file__).read_text()
-
-    # (a) self-restore at import: must import load_state AND call it.
-    self_restoring = (
-        "from ministack.core.persistence import" in src
-        and "load_state" in src
-        and "load_state(" in src
-    )
-
-    # (b) centrally restored: must define load_persisted_state and be in
-    # the explicit allow-list in app.py's `_load_persisted_state()`.
-    has_central_method = hasattr(mod, "load_persisted_state")
-    centrally_restored = has_central_method and svc_key in {
-        "apigateway", "apigateway_v1", "servicediscovery",
-    }
-
-    assert self_restoring or centrally_restored, (
-        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and "
-        f"will be saved on shutdown, but has no restore path on startup. "
-        f"Either add `load_state()` at module top, or define "
-        f"`load_persisted_state(data)` and add it to "
-        f"`_load_persisted_state()` in app.py."
-    )
-
-
 def test_pipes_is_in_state_map():
-    """`pipes` defines `get_state()` so it expects to be persisted, but it
-    is missing from `_state_map`. Without this, pipe definitions evaporate
-    on every restart even before considering restore-path coverage."""
+    """The registry-derived map includes the Pipes service contract."""
     pipes = _module("pipes")
     assert hasattr(pipes, "get_state"), "pipes module no longer has get_state — update this test"
     assert "pipes" in _state_map, (
@@ -499,44 +451,19 @@ def test_pipes_is_in_state_map():
     )
 
 
-def test_state_map_services_without_endpoint_are_eagerly_imported():
-    """Services in `_state_map` but NOT in `SERVICE_REGISTRY` have no
-    AWS endpoint, so the lazy router never imports them. Their
-    import-time `load_state()` block therefore never fires unless
-    `_load_persisted_state()` eagerly imports them at startup.
+def test_state_map_is_derived_from_service_registry():
+    """The registry is the only declaration point for persisted modules."""
+    from ministack.app import SERVICE_REGISTRY, _registry_module_names, _registry_state_map
 
-    Without this, persisted RUNNING pipes don't resume their poller
-    after warm-boot until something else happens to import the
-    module (e.g. a new CFN pipe registration) — silently breaking
-    event forwarding for the entire window between restart and the
-    next pipe-related API call."""
-    import inspect
+    expected = {}
+    for config in SERVICE_REGISTRY.values():
+        module = config["module"]
+        expected[config.get("state_key", module)] = module
+        expected.update({sub_module: sub_module for sub_module in config.get("sub_modules", ())})
 
-    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
-
-    # Find services that need eager import.
-    routable_modules = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
-    needs_eager_import = [
-        mod_name for _, mod_name in _state_map.items()
-        if mod_name not in routable_modules
-    ]
-    assert needs_eager_import, (
-        "Test premise broken: every persisted module is now also routable, "
-        "so this test would never catch the bug it's guarding against. "
-        "Update it or delete it."
-    )
-
-    # The eager-import section in _load_persisted_state must reference each
-    # such module by name, otherwise it stays unimported and its restore
-    # never runs.
-    src = inspect.getsource(_load_persisted_state)
-    for mod_name in needs_eager_import:
-        assert f'"{mod_name}"' in src or f"'{mod_name}'" in src, (
-            f"Service `{mod_name}` is in `_state_map` but not in "
-            f"`SERVICE_REGISTRY`, and `_load_persisted_state()` doesn't "
-            f"eagerly import it. With PERSIST_STATE=1, its persisted "
-            f"state will be silently ignored on warm-boot."
-        )
+    assert _state_map == expected
+    assert _registry_state_map() == expected
+    assert _registry_module_names() == set(expected.values())
 
 
 def test_save_dict_includes_sibling_imported_modules():
@@ -584,27 +511,28 @@ def test_save_dict_includes_sibling_imported_modules():
             _loaded_modules["appsync_events"] = saved
 
 
-def test_save_dict_skips_modules_never_imported():
+def test_save_dict_skips_modules_never_imported(monkeypatch):
     """The sys.modules fallback must NOT save state for modules that
     were never imported at all — there's no state to capture and any
     `get_state()` call on a non-imported module would attribute-error.
     Defensive guard: ensure the fallback path's `hasattr` check works."""
 
-    from ministack.app import _build_persistence_save_dict, _state_map
+    import sys
 
-    # Pick any persisted module and ensure it's truly absent from both
-    # `_loaded_modules` and `sys.modules`. `cur` is an obscure one that
-    # most test sessions won't have touched.
-    target = "ecs_metadata"  # not in _state_map → guaranteed absent from save_dict
-    assert target not in {v for v in _state_map.values()}, (
-        "test premise broken — pick a module not in _state_map"
-    )
+    from ministack.app import _build_persistence_save_dict, _loaded_modules, _state_map
 
-    # Even after the fallback path runs, ecs_metadata must not appear.
+    # Every registered module is now represented in `_state_map`, so force a
+    # known entry absent from both sources instead of relying on an exclusion.
+    target = "account"
+    assert target in _state_map.values(), "test premise broken — account must be registry-derived"
+    monkeypatch.delitem(_loaded_modules, target, raising=False)
+    monkeypatch.delitem(sys.modules, f"ministack.services.{target}", raising=False)
+
+    # Even after the fallback path runs, an unloaded module must not appear.
     save_dict = _build_persistence_save_dict()
-    assert "ecs_metadata" not in save_dict, (
-        "save_dict picked up a module that isn't even in _state_map — "
-        "the loop's key-membership check is broken."
+    assert target not in save_dict, (
+        "save_dict picked up a module that was absent from both module caches — "
+        "the fallback's unloaded-module guard is broken."
     )
 
 
