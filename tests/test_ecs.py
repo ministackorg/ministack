@@ -1610,11 +1610,8 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
 
 
 def test_ecs_run_task_awsvpc_starts_provisioning_and_metadata_follows(monkeypatch):
-    """An awsvpc task starts PROVISIONING: "for tasks that use the awsvpc
-    network mode, the elastic network interface needs to be provisioned"
-    (task-lifecycle). The metadata endpoint reports the status the agent knows,
-    so it must not answer RUNNING while the image is still being pulled, and a
-    container's own KnownStatus is reported separately from the task's.
+    """An awsvpc task starts PROVISIONING and the metadata endpoint follows it,
+    reporting the container's own KnownStatus apart from the task's.
     Reported by @iot-rocket."""
     import threading
 
@@ -1678,9 +1675,8 @@ def test_ecs_run_task_awsvpc_starts_provisioning_and_metadata_follows(monkeypatc
 
     assert started.wait(timeout=2)
     assert _ecs._tasks[arn]["lastStatus"] == "ACTIVATING"
-    # The endpoint answers what the agent knows, not a hardcoded RUNNING. The
-    # container is seeded from its own record entry, which is still PENDING
-    # while the task pulls: AWS reports the two separately.
+    # Seeded from the container's own record entry, still PENDING while the
+    # task pulls: AWS reports the two apart.
     assert _md._TASKS[arn]["KnownStatus"] == "ACTIVATING"
     assert _md._TASKS[arn]["DesiredStatus"] == "RUNNING"
     assert all(c["KnownStatus"] == "PENDING" for c in _md._TASKS[arn]["Containers"])
@@ -1690,16 +1686,13 @@ def test_ecs_run_task_awsvpc_starts_provisioning_and_metadata_follows(monkeypatc
     _wait_until(lambda: _md._TASKS[arn]["KnownStatus"] == "RUNNING")
     assert all(c["KnownStatus"] == "RUNNING" for c in _md._TASKS[arn]["Containers"])
 
-    # DesiredStatus is what a container polls to learn it is being shut down,
-    # and it reaches the container payloads; KnownStatus stays per-container.
+    # DesiredStatus reaches the container payloads; KnownStatus stays per-container.
     _ecs._stop_task({"cluster": "awsvpc-test-c", "task": arn})
     assert _ecs._tasks[arn]["lastStatus"] == "STOPPED"
 
 
 def test_ecs_run_task_bridge_mode_starts_pending(monkeypatch):
-    """Only awsvpc has a network interface to provision; every other mode
-    starts PENDING, "a transition state where Amazon ECS is waiting on the
-    container agent to take further action" (task-lifecycle)."""
+    """Only awsvpc has an interface to provision; every other mode starts PENDING."""
     import threading
 
     from ministack.services import ecs as _ecs

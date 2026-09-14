@@ -74,19 +74,12 @@ def set_docker_id(token: str, docker_id: str) -> None:
 
 
 def set_task_status(task_arn: str, known_status=None, desired_status=None) -> None:
-    """Push the task's status onto the payload the V4 endpoint serves.
+    """Task-level status for the V4 endpoint, pushed at each transition.
 
-    The endpoint reports what the agent knows, and a task's status changes
-    after its metadata is registered: it is PROVISIONING or PENDING when
-    RunTask answers, ACTIVATING while the image is pulled, RUNNING once the
-    container is up. Without this the endpoint served the value captured at
-    registration for the life of the task and contradicted DescribeTasks for
-    the length of the pull.
-
-    Task-level only. A container's own KnownStatus is pushed separately,
-    because AWS reports the two independently: a Fargate task served
-    "KnownStatus": "NONE" for the task and "KnownStatus": "RUNNING" for the
-    container in the same payload.
+    KnownStatus is task-level only; a container's own is pushed separately,
+    because AWS reports the two independently (a Fargate task serves
+    "KnownStatus": "NONE" for itself and "RUNNING" for the container in one
+    payload). DesiredStatus is the task's on every payload.
     """
     with _LOCK:
         task = _TASKS.get(task_arn)
@@ -96,9 +89,6 @@ def set_task_status(task_arn: str, known_status=None, desired_status=None) -> No
             task["KnownStatus"] = known_status
         if desired_status is not None:
             task["DesiredStatus"] = desired_status
-            # DesiredStatus is the task's everywhere: it is what a container
-            # polls to learn it is being shut down, so it reaches the container
-            # payloads too. KnownStatus does not.
             for container in task.get("Containers", []):
                 container["DesiredStatus"] = desired_status
 
@@ -111,11 +101,7 @@ def set_container_status(token: str, known_status: str) -> None:
 
 
 def set_all_container_status(task_arn: str, known_status: str) -> None:
-    """Push one KnownStatus onto every container of a task.
-
-    Only the stop path uses this, where the record really does move every
-    container to STOPPED at once.
-    """
+    """One KnownStatus onto every container. Only the stop path moves them together."""
     with _LOCK:
         task = _TASKS.get(task_arn)
         if task is None:

@@ -161,12 +161,7 @@ def test_trailing_slash_on_root_is_tolerated():
 
 
 def test_status_is_pushed_onto_the_payload_as_the_task_moves():
-    """The endpoint reports the task's status instead of always saying RUNNING.
-
-    A container reads ${ECS_CONTAINER_METADATA_URI_V4}/task while it is
-    starting, which since the async start is the whole image pull. Reporting
-    RUNNING there contradicts DescribeTasks for the length of that pull.
-    """
+    """The endpoint reports the task's status instead of always saying RUNNING."""
     arn = "arn:aws:ecs:us-east-1:000000000000:task/c/statusprobe01"
     _register("statusprobetoken01", arn, "probe", KnownStatus="PENDING")
 
@@ -175,9 +170,8 @@ def test_status_is_pushed_onto_the_payload_as_the_task_moves():
         _, body = _call("GET", "/v4/statusprobetoken01/task")
         assert body["KnownStatus"] == status
 
-    # A container's KnownStatus is its own, not the task's: on AWS a starting
-    # task serves "NONE" for itself and "RUNNING" for the container that is
-    # reading the endpoint, in one payload.
+    # On AWS a starting task serves "NONE" for itself and "RUNNING" for the
+    # container reading the endpoint, in one payload.
     ecs_metadata.set_task_status(arn, known_status="ACTIVATING")
     ecs_metadata.set_container_status("statusprobetoken01", "RUNNING")
     _, body = _call("GET", "/v4/statusprobetoken01/task")
@@ -185,8 +179,7 @@ def test_status_is_pushed_onto_the_payload_as_the_task_moves():
     assert body["Containers"][0]["KnownStatus"] == "RUNNING"
     assert _call("GET", "/v4/statusprobetoken01")[1]["KnownStatus"] == "RUNNING"
 
-    # DesiredStatus is the task's on both, which is what a container polls to
-    # find out it is being shut down.
+    # DesiredStatus is the task's on both.
     ecs_metadata.set_task_status(arn, desired_status="STOPPED")
     _, body = _call("GET", "/v4/statusprobetoken01/task")
     assert body["DesiredStatus"] == "STOPPED"
@@ -227,13 +220,7 @@ def test_status_falls_back_to_what_was_registered_when_the_task_is_gone():
 
 
 def test_seeding_finds_a_task_outside_the_default_account_and_region():
-    """The seed is keyed off the task ARN, not off the request.
-
-    A container reaches the metadata endpoint with a path token and no SigV4,
-    so the request resolves under the default account and region. Keying the
-    task store on those would miss every task created anywhere else, and the
-    payload would be seeded RUNNING for a task that is still starting.
-    """
+    """The seed is keyed off the task ARN, not the request, which carries no SigV4."""
     from ministack.services import ecs
 
     account, region = "111122223333", "eu-central-1"

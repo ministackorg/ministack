@@ -1286,10 +1286,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
-    # Seeded from the record, not from a literal: the task is PROVISIONING or
-    # PENDING here, not RUNNING, and a container that reads its own metadata
-    # during startup must not be told otherwise. Every later transition is
-    # pushed by _mark_task_activating / _mark_task_running / _mark_task_stopped.
+    # Seeded from the record, not a literal: the task is not RUNNING yet here.
+    # Later transitions are pushed by _mark_task_activating/_running/_stopped.
     desired, known, per_container = (
         _task_status_snapshot(task_arn) or ("RUNNING", "PENDING", {})
     )
@@ -1473,13 +1471,9 @@ def _resolve_container_secrets(cdef):
 def _task_status_snapshot(task_arn):
     """``(desiredStatus, lastStatus, {container name: lastStatus})``, or None.
 
-    Seeds the metadata payloads at registration; every later change is pushed
-    through ecs_metadata.set_task_status / set_container_status.
-
-    The lookup is scoped by the account and the region in the task ARN, not by
-    the request's: a container reaches the metadata endpoint with a path token
-    and no SigV4, so the request resolves under the default account and region
-    whatever the task was created under.
+    Seeds the metadata payloads at registration. Scoped by the ARN's account and
+    region, not the request's: the endpoint is reached with a path token and no
+    SigV4, so the request resolves under the defaults.
     """
     try:
         spec = parse_arn(task_arn)
@@ -1641,8 +1635,7 @@ def _attach_started_container(task, container, index, metadata_token, ecs_networ
             task["containers"][index]["lastStatus"] = "RUNNING"
 
     ecs_metadata.set_docker_id(metadata_token, container_id)
-    # The container's own KnownStatus, not the task's: AWS reports them
-    # separately, and this container is RUNNING while the task may not be.
+    # The container's own KnownStatus, not the task's: AWS reports them apart.
     ecs_metadata.set_container_status(metadata_token, "RUNNING")
     _record_task_ip(task, container, ecs_network)
     logger.info("ECS: started container %s for task %s", container_id, task_arn[:8])
@@ -1846,16 +1839,11 @@ def _run_task(data):
     req_tags = data.get("tags", [])
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
-    # The network mode decides the starting state, whether a task reports an ENI
-    # attachment at all, and the subnet that attachment carries. The last two are
-    # read when the container comes up, so they ride on the record until then.
+    # Read when the container comes up, so both ride on the record until then.
     network_mode = td.get("networkMode")
     subnet = _requested_subnet(data)
-    # "PROVISIONING: Amazon ECS has to perform additional steps before the task
-    # is launched. For example, for tasks that use the awsvpc network mode, the
-    # elastic network interface needs to be provisioned" (task-lifecycle). Every
-    # other network mode starts PENDING, "a transition state where Amazon ECS is
-    # waiting on the container agent to take further action".
+    # "for tasks that use the awsvpc network mode, the elastic network interface
+    # needs to be provisioned" (task-lifecycle); every other mode starts PENDING.
     if not docker_backed:
         initial_status = "RUNNING"
     elif network_mode == "awsvpc":
