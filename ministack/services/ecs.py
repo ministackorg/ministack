@@ -77,6 +77,23 @@ _capacity_providers = AccountRegionScopedDict()
 # try/except swallows it, and ALL ECS state silently fails to restore.
 _attributes = AccountRegionScopedDict()
 
+
+# Up here for the same reason as `_attributes`: the import-time `load_state`
+# block calls `restore_state`, which counts the tasks it stops, so this has to
+# be bound before that runs. Defined further down it raises NameError there,
+# the surrounding try/except swallows it, and ALL ECS state fails to restore.
+def _bump_task_version(task):
+    """Count one observable change on the task.
+
+    The Task reference calls ``version`` the counter a consumer compares against
+    the version an event carries, to tell a stale copy of the record from the
+    current one. A real task counts its whole lifecycle: a Fargate task polled
+    through DescribeTasks reported 1 at PROVISIONING, 2 at PENDING, 3 at
+    RUNNING, 4 when StopTask set desiredStatus, 5 at DEPROVISIONING, 6 at
+    STOPPED. The emulator counts the states it has.
+    """
+    task["version"] = int(task.get("version") or 1) + 1
+
 _docker = None
 
 # ECS exited-container reaper. Every ministack=ecs container we start via
@@ -164,6 +181,8 @@ def get_state():
         t = copy.deepcopy(task)
         t.pop("_docker_ids", None)
         t.pop("_metadata_tokens", None)
+        # The container is gone with the process; its address must not outlive it.
+        t.pop("_container_ip", None)
         tasks._data[scoped_key] = t
     state["tasks"] = tasks
     return state
@@ -240,12 +259,16 @@ def restore_state(data):
         for scoped_key, task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             _tasks._data[scoped_key] = restored_task
     elif isinstance(tasks_data, AccountScopedDict):
         for (account_id, arn), task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(account_id, region, arn, restored_task)
@@ -253,6 +276,8 @@ def restore_state(data):
         for arn, task in tasks_data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(get_account_id(), region, arn, restored_task)
@@ -721,29 +746,78 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
     }
 
 
-def _record_task_ip(task, container, ecs_network):
-    """Store the container's address on the task as an ENI attachment.
+def _requested_subnet(data):
+    """The first subnet of a RunTask/CreateService awsvpcConfiguration, if any.
 
-    Real awsvpc tasks expose it as attachments[].details[privateIPv4Address], which
-    is where an ALB target group and DescribeTasks both look for it.
+    Nothing else read the request's network configuration until now, so this
+    cannot assume the shape the SDK would have sent: a body that names it as
+    anything but the documented object has no subnet to report.
+
+    Both casings are read. A service created through CloudFormation keeps the
+    template's `NetworkConfiguration` verbatim (provisioners.py, the
+    AWS::ECS::Service handler) and replays it here, so the camelCase lookup
+    alone would miss every CFN-defined service.
     """
-    if task.get("attachments"):
-        return
+    network = data.get("networkConfiguration")
+    if not isinstance(network, dict):
+        return None
+    config = network.get("awsvpcConfiguration") or network.get("AwsvpcConfiguration")
+    if not isinstance(config, dict):
+        return None
+    subnets = config.get("subnets") or config.get("Subnets")
+    if not isinstance(subnets, list) or not subnets:
+        return None
+    return subnets[0] if isinstance(subnets[0], str) else None
+
+
+def _container_ip(container, ecs_network):
     try:
         container.reload()
         nets = container.attrs["NetworkSettings"]["Networks"]
-        ip = (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
+        return (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
     except Exception:
-        ip = None
+        return None
+
+
+def _record_task_ip(task, container, ecs_network):
+    """Store the container's address on the task.
+
+    The Task reference calls `attachments` "The Elastic Network Adapter that's
+    associated with the task if the task uses the `awsvpc` network mode", so a
+    bridge or host task has none: its ports are published on the container
+    instance and that is where a consumer reads its address. Only an awsvpc task
+    gets the attachment, and it carries the subnet the request placed it in
+    alongside the address, two of the four members the Attachment reference
+    names for an elastic network interface.
+
+    The address is kept on the task in either mode, under an internal key, for
+    the target-group sync. The first container to report one owns it: a
+    two-container task on AWS reports one attachment and both containers name
+    that one address, so the sync must not follow a sidecar around. Each
+    container calls this from its own thread, so the guard and the write it
+    protects share the task lock; the docker round trip stays outside it.
+    """
+    if task.get("_container_ip") or task.get("attachments"):
+        return
+    ip = _container_ip(container, ecs_network)
     if not ip:
         return
-    task["attachments"] = [{
-        "id": new_uuid(),
-        "type": "ElasticNetworkInterface",
-        "status": "ATTACHED",
-        "details": [{"name": "privateIPv4Address", "value": ip}],
-    }]
-    task["attachmentsStatus"] = "ATTACHED"
+    with resource_lock("ecs-task", task.get("taskArn", "")):
+        if task.get("_container_ip") or task.get("attachments"):
+            return
+        task["_container_ip"] = ip
+        if task.get("_network_mode") != "awsvpc":
+            return
+        details = [{"name": "privateIPv4Address", "value": ip}]
+        subnet = task.get("_subnet")
+        if subnet:
+            details.insert(0, {"name": "subnetId", "value": subnet})
+        task["attachments"] = [{
+            "id": new_uuid(),
+            "type": "ElasticNetworkInterface",
+            "status": "ATTACHED",
+            "details": details,
+        }]
 
 
 def _task_ip(task):
@@ -751,7 +825,7 @@ def _task_ip(task):
         for d in att.get("details") or []:
             if d.get("name") == "privateIPv4Address":
                 return d.get("value")
-    return None
+    return task.get("_container_ip")
 
 
 def _sync_service_targets(cluster_name, svc):
@@ -1212,6 +1286,13 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
+    # Seeded from the record, not from a literal: the endpoint overlays the
+    # live status on every read, so a literal here would only ever be read for
+    # a task that no longer has one, and it would be wrong then too.
+    desired, known, per_container = (
+        metadata_task_status(task_arn) or ("RUNNING", "PENDING", {})
+    )
+    container_known = per_container.get(cdef["name"]) or known
     ecs_metadata.register_container(
         token,
         task_arn,
@@ -1220,8 +1301,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
             "TaskARN": task_arn,
             "Family": td.get("family", ""),
             "Revision": str(td.get("revision", 1)),
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": known,
             "AvailabilityZone": f"{get_region()}a",
             "LaunchType": launch_type,
         },
@@ -1236,8 +1317,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
                 "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
                 "com.amazonaws.ecs.cluster": cluster_arn,
             },
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": container_known,
             "Type": "NORMAL",
         },
     )
@@ -1388,6 +1469,45 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
+def metadata_task_status(task_arn):
+    """Status for the task metadata endpoint, or None when the task is gone.
+
+    Returns ``(desiredStatus, lastStatus, {container name: lastStatus})``. The
+    endpoint reports a task's status, and a task's status changes after the
+    metadata is registered: it is `PENDING` when `RunTask` answers, `ACTIVATING`
+    for the pull and `RUNNING` once the container is up. Serving the record
+    rather than a value captured at registration is what keeps
+    `${ECS_CONTAINER_METADATA_URI_V4}/task` agreeing with `DescribeTasks`.
+
+    A container's own status is carried separately because the two really do
+    differ: a live Fargate task served `"KnownStatus": "NONE"` for the task and
+    `"KnownStatus": "RUNNING"` for the container in the same payload, read by
+    the container itself while it was starting. `DesiredStatus` is the task's
+    on both, which is what flips to STOPPED when the task is being shut down.
+
+    The lookup is scoped by the account and the region in the task ARN, not by
+    the request's: a container reaches this endpoint with a path token and no
+    SigV4, so the request resolves under the default account and region
+    whatever the task was created under.
+    """
+    try:
+        spec = parse_arn(task_arn)
+    except ArnParseError:
+        return None
+    task = _tasks.get_scoped(spec.account_id, spec.region, task_arn)
+    if task is None:
+        return None
+    return (
+        task.get("desiredStatus") or "RUNNING",
+        task.get("lastStatus") or "PENDING",
+        {
+            c["name"]: c.get("lastStatus")
+            for c in task.get("containers", [])
+            if c.get("name")
+        },
+    )
+
+
 def _task_is_active(task_arn, task):
     return (
         _tasks.get(task_arn) is task
@@ -1446,6 +1566,7 @@ def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        _bump_task_version(task)
         task["lastStatus"] = "STOPPED"
         task["desiredStatus"] = "STOPPED"
         task["stoppingAt"] = task.get("stoppingAt") or now
@@ -1477,6 +1598,7 @@ def _mark_task_activating(task_arn, task):
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
+        _bump_task_version(task)
         task["lastStatus"] = "ACTIVATING"
         task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
 
@@ -1495,6 +1617,7 @@ def _mark_task_running(task_arn, task):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        _bump_task_version(task)
         task["lastStatus"] = "RUNNING"
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
@@ -1721,6 +1844,11 @@ def _run_task(data):
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
     initial_status = "PENDING" if docker_backed else "RUNNING"
+    # The network mode decides whether a task reports an ENI attachment at all,
+    # and the subnet is one of the members that attachment carries. Both are read
+    # when the container comes up, so they ride on the record until then.
+    network_mode = td.get("networkMode")
+    subnet = _requested_subnet(data)
 
     tasks = []
     failures = []
@@ -1771,6 +1899,8 @@ def _run_task(data):
             "group": group,
             "startedBy": started_by,
             "version": 1,
+            "_network_mode": network_mode,
+            "_subnet": subnet,
             "containers": containers,
             "attachments": [],
             "availabilityZone": f"{region}a",

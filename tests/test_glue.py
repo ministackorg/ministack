@@ -9,6 +9,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import GATEWAY_PORT
 
 import ministack.core.responses as _responses
 from ministack.core.router import detect_service
@@ -2525,7 +2526,7 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     _glue._execute_spark_docker(run, {"Timeout": 1}, "envjob", {}, str(script), _FakeDocker())
 
     env = created["environment"]
-    assert env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
+    assert env["AWS_ENDPOINT_URL"] == f"http://host.docker.internal:{GATEWAY_PORT}"
     # The SDK endpoint and the Spark S3A endpoint must agree.
     s3a = [c for c in created["command"] if isinstance(c, str) and c.startswith("spark.hadoop.fs.s3a.endpoint=")]
     assert s3a == [f"spark.hadoop.fs.s3a.endpoint={env['AWS_ENDPOINT_URL']}"]
