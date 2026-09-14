@@ -210,7 +210,9 @@ def test_ses_v2_send_email(sesv2):
             }
         },
     )
-    assert resp["MessageId"].startswith("ministack-")
+    # Same shape the six v1 send paths return; nothing an AWS client sees
+    # should be prefixed with the emulator's name.
+    assert resp["MessageId"].endswith("@email.amazonses.com")
 
 def test_ses_v2_email_identity_crud(sesv2):
     sesv2.create_email_identity(EmailIdentity="test-domain.com")
