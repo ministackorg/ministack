@@ -19248,22 +19248,130 @@ def _cfn_policy_test_roles_cleanup(iam, roles):
     for role in roles:
         for p in iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]:
             iam.detach_role_policy(RoleName=role, PolicyArn=p["PolicyArn"])
+        # DeleteRole refuses a role that still holds an inline policy, which is
+        # the shape an AWS::IAM::Policy leaves behind.
+        for name in iam.list_role_policies(RoleName=role)["PolicyNames"]:
+            iam.delete_role_policy(RoleName=role, PolicyName=name)
         iam.delete_role(RoleName=role)
+
+
+def _inline_role_document(iam, role, policy_name):
+    """The inline policy document on a role, parsed."""
+    doc = iam.get_role_policy(RoleName=role, PolicyName=policy_name)["PolicyDocument"]
+    return json.loads(doc) if isinstance(doc, str) else doc
+
+
+def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
+    """"Adds or updates an inline policy document that is embedded in the
+    specified IAM group, user or role" (aws-resource-iam-policy.html) — the
+    document lands on the role itself, and no managed policy is created for
+    it. Ref and GetAtt Id both return the generated physical id, not the
+    PolicyName: on AWS the type's primary identifier is its read-only Id, and
+    a template that sets an explicit PolicyName still gets an opaque id."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-inl-{uid}"
+    role = f"cfn-pol-inl-role-{uid}"
+    policy_name = f"cfn-pol-inl-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    before = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
+    template = json.dumps({
+        "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": policy_name,
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+            "Roles": [role],
+        }}},
+        "Outputs": {"Ref": {"Value": {"Ref": "Pol"}},
+                    "Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
+        document = _inline_role_document(iam, role, policy_name)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
+
+        # Nothing managed: no attachment on the role and no new Local policy.
+        assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+        after = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
+        assert after == before
+
+        assert _output(stack, "Ref") == _output(stack, "Id")
+        assert _output(stack, "Ref") != policy_name
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_same_name_in_two_stacks_stays_separate(cfn, iam):
+    """An inline policy is scoped to its entity, so the same PolicyName on two
+    roles is two independent policies. CDK reaches this constantly: it derives
+    PolicyName from the construct path, so every stack that grants something
+    to a role at the same path emits the same name. Provisioned as one managed
+    policy these collapse onto a single record and the second stack silently
+    takes the first role's grants away."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    shared_name = f"cfn-pol-shared-{uid}"
+    roles = [f"cfn-pol-sh-role-a-{uid}", f"cfn-pol-sh-role-b-{uid}"]
+    _cfn_policy_test_roles(iam, roles)
+    stacks = [f"cfn-iam-pol-sh-a-{uid}", f"cfn-iam-pol-sh-b-{uid}"]
+
+    def template(role, action):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+                "PolicyName": shared_name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": action, "Resource": "*"}]},
+                "Roles": [role],
+            }}},
+            "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(roles[0], "s3:GetObject"))
+        stack_a = _wait_stack(cfn, stacks[0])
+        assert stack_a["StackStatus"] == "CREATE_COMPLETE", stack_a.get("StackStatusReason")
+        cfn.create_stack(StackName=stacks[1], TemplateBody=template(roles[1], "sqs:SendMessage"))
+        stack_b = _wait_stack(cfn, stacks[1])
+        assert stack_b["StackStatus"] == "CREATE_COMPLETE", stack_b.get("StackStatusReason")
+
+        # Each role kept its own document under the shared name.
+        for role, action in zip(roles, ["s3:GetObject", "sqs:SendMessage"]):
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [shared_name]
+            document = _inline_role_document(iam, role, shared_name)
+            assert document["Statement"][0]["Action"] == action
+
+        # And the two resources are distinct, so neither stack owns the other's.
+        assert _output(stack_a, "Id") != _output(stack_b, "Id")
+
+        # Deleting the second leaves the first alone.
+        cfn.delete_stack(StackName=stacks[1])
+        assert _wait_stack(cfn, stacks[1])["StackStatus"] == "DELETE_COMPLETE"
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == [shared_name]
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == []
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, roles)
 
 
 def test_cfn_iam_policy_update_in_place(cfn, iam):
     """PolicyDocument and Roles update the inline policy in place, as
-    PutRolePolicy does: Ref keeps the policy name, GetAtt Id the same policy
-    id, the document is rewritten and the second role gets the attachment."""
+    PutRolePolicy does: Ref and GetAtt Id keep the same physical id, the
+    document is rewritten and the second role gets its own copy."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-upd-{uid}"
     roles = [f"cfn-pol-role-a-{uid}", f"cfn-pol-role-b-{uid}"]
+    policy_name = f"cfn-pol-upd-{uid}"
     _cfn_policy_test_roles(iam, roles)
 
     def template(actions, role_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-upd-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": actions, "Resource": "*"}]},
                 "Roles": role_names,
@@ -19276,41 +19384,37 @@ def test_cfn_iam_policy_update_in_place(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        attached = iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-upd-{uid}"]
-        policy_arn = attached[0]["PolicyArn"]
+        physical_id = _output(stack, "Id")
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == [policy_name]
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == []
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(
             ["s3:GetObject", "s3:PutObject"], roles))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Name") == f"cfn-pol-upd-{uid}"
-        assert _output(stack, "Id") == policy_id
+        assert _output(stack, "Name") == physical_id
+        assert _output(stack, "Id") == physical_id
 
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 2
-        assert policy["DefaultVersionId"] == "v2"
-        version = iam.get_policy_version(
-            PolicyArn=policy_arn, VersionId=policy["DefaultVersionId"])["PolicyVersion"]
-        document = version["Document"]
-        if isinstance(document, str):
-            document = json.loads(document)
-        assert document["Statement"][0]["Action"] == ["s3:GetObject", "s3:PutObject"]
         for role in roles:
-            attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-            assert [p["PolicyArn"] for p in attached] == [policy_arn]
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
+            document = _inline_role_document(iam, role, policy_name)
+            assert document["Statement"][0]["Action"] == ["s3:GetObject", "s3:PutObject"]
+            assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
 
 
-def test_cfn_iam_policy_rename_keeps_id_versions_and_attachments(cfn, iam):
+def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam):
     """"PolicyName ... Update requires: No interruption", and "GetAtt Id: The
     stable and unique string identifying the policy"
-    (aws-resource-iam-policy.html) — a renamed policy keeps its id, its
-    version history and its attachments; Ref follows the new name."""
+    (aws-resource-iam-policy.html) — a renamed policy keeps its id, the role
+    ends up holding only the new name, and the old one is gone.
+
+    The id staying put is what keeps the rename safe: the engine reads a
+    changed physical id as a replacement and deletes the predecessor once the
+    update completes, and an inline policy is keyed by its entity and its
+    name, so that cleanup would delete the policy the update just wrote."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-ren-{uid}"
     role = f"cfn-pol-ren-role-{uid}"
@@ -19332,57 +19436,47 @@ def test_cfn_iam_policy_rename_keeps_id_versions_and_attachments(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        old_arn = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"][0]["PolicyArn"]
-        created = iam.get_policy(PolicyArn=old_arn)["Policy"]["CreateDate"]
+        physical_id = _output(stack, "Id")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-a-{uid}"]
 
-        # A document change first, so the rename has a version history to keep.
+        # A document change first, so the rename has something to carry over.
         cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-pol-a-{uid}", "s3:PutObject"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert iam.get_policy(PolicyArn=old_arn)["Policy"]["DefaultVersionId"] == "v2"
+        document = _inline_role_document(iam, role, f"cfn-pol-a-{uid}")
+        assert document["Statement"][0]["Action"] == "s3:PutObject"
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-pol-b-{uid}", "s3:PutObject"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Name") == f"cfn-pol-b-{uid}"
-        assert _output(stack, "Id") == policy_id
+        assert _output(stack, "Name") == physical_id
+        assert _output(stack, "Id") == physical_id
 
-        attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-b-{uid}"]
-        new_arn = attached[0]["PolicyArn"]
-        assert new_arn != old_arn
-        policy = iam.get_policy(PolicyArn=new_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["PolicyName"] == f"cfn-pol-b-{uid}"
-        assert policy["AttachmentCount"] == 1
-        assert policy["DefaultVersionId"] == "v2"
-        assert policy["CreateDate"] == created
-        versions = iam.list_policy_versions(PolicyArn=new_arn)["Versions"]
-        assert sorted(v["VersionId"] for v in versions) == ["v1", "v2"]
-        entities = iam.list_entities_for_policy(PolicyArn=new_arn)
-        assert [r["RoleName"] for r in entities["PolicyRoles"]] == [role]
+        # Only the new name survives, carrying the current document.
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-b-{uid}"]
+        document = _inline_role_document(iam, role, f"cfn-pol-b-{uid}")
+        assert document["Statement"][0]["Action"] == "s3:PutObject"
         with pytest.raises(ClientError) as exc_info:
-            iam.get_policy(PolicyArn=old_arn)
+            iam.get_role_policy(RoleName=role, PolicyName=f"cfn-pol-a-{uid}")
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
 
 
-def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
-    """A role dropped from Roles loses the policy, the way the inline policy
-    goes away on AWS, while the document, the policy id and the other
-    role's attachment stay."""
+def test_cfn_iam_policy_role_removed_from_roles_loses_the_policy(cfn, iam):
+    """A role dropped from Roles loses the inline policy, the way it goes away
+    on AWS, while the remaining role keeps its copy and the id stays."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-rm-{uid}"
     roles = [f"cfn-pol-rm-role-a-{uid}", f"cfn-pol-rm-role-b-{uid}"]
+    policy_name = f"cfn-pol-rm-{uid}"
     _cfn_policy_test_roles(iam, roles)
 
     def template(role_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-rm-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
                 "Roles": role_names,
@@ -19394,21 +19488,18 @@ def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"][0]["PolicyArn"]
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 2
+        physical_id = _output(stack, "Id")
+        for role in roles:
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(roles[1:]))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Id") == policy_id
-        assert iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"] == []
-        attached = iam.list_attached_role_policies(RoleName=roles[1])["AttachedPolicies"]
-        assert [p["PolicyArn"] for p in attached] == [policy_arn]
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 1
-        assert policy["DefaultVersionId"] == "v1"
+        assert _output(stack, "Id") == physical_id
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == []
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == [policy_name]
+        document = _inline_role_document(iam, roles[1], policy_name)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
@@ -19417,12 +19508,13 @@ def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
 def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     """"Users ... Update requires: No interruption" and "Groups ... Update
     requires: No interruption" (aws-resource-iam-policy.html) — a user or
-    group dropped from the list is detached, one added is attached, and the
-    policy id survives the update."""
+    group dropped from the list loses the inline policy, one added gets it,
+    and the id survives the update."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-ug-{uid}"
     users = [f"cfn-pol-user-a-{uid}", f"cfn-pol-user-b-{uid}"]
     groups = [f"cfn-pol-group-a-{uid}", f"cfn-pol-group-b-{uid}"]
+    policy_name = f"cfn-pol-ug-{uid}"
     for user in users:
         iam.create_user(UserName=user)
     for group in groups:
@@ -19431,7 +19523,7 @@ def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     def template(user_names, group_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-ug-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
                 "Users": user_names,
@@ -19444,52 +19536,53 @@ def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"][0]["PolicyArn"]
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"]] == [policy_arn]
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 2
+        physical_id = _output(stack, "Id")
+        # Users and groups keep their inline policies in stores of their own,
+        # away from the role store, so both paths are worth asserting.
+        assert iam.list_user_policies(UserName=users[0])["PolicyNames"] == [policy_name]
+        assert iam.list_group_policies(GroupName=groups[0])["PolicyNames"] == [policy_name]
+        assert iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"] == []
+        assert iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"] == []
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(users[1:], groups[1:]))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Id") == policy_id
-        assert iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"] == []
-        assert iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"] == []
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_user_policies(UserName=users[1])["AttachedPolicies"]] == [policy_arn]
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_group_policies(GroupName=groups[1])["AttachedPolicies"]] == [policy_arn]
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 2
-        entities = iam.list_entities_for_policy(PolicyArn=policy_arn)
-        assert [u["UserName"] for u in entities["PolicyUsers"]] == users[1:]
-        assert [g["GroupName"] for g in entities["PolicyGroups"]] == groups[1:]
+        assert _output(stack, "Id") == physical_id
+        assert iam.list_user_policies(UserName=users[0])["PolicyNames"] == []
+        assert iam.list_group_policies(GroupName=groups[0])["PolicyNames"] == []
+        assert iam.list_user_policies(UserName=users[1])["PolicyNames"] == [policy_name]
+        assert iam.list_group_policies(GroupName=groups[1])["PolicyNames"] == [policy_name]
+        document = iam.get_user_policy(
+            UserName=users[1], PolicyName=policy_name)["PolicyDocument"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         for user in users:
-            for p in iam.list_attached_user_policies(UserName=user)["AttachedPolicies"]:
-                iam.detach_user_policy(UserName=user, PolicyArn=p["PolicyArn"])
+            for name in iam.list_user_policies(UserName=user)["PolicyNames"]:
+                iam.delete_user_policy(UserName=user, PolicyName=name)
             iam.delete_user(UserName=user)
         for group in groups:
+            for name in iam.list_group_policies(GroupName=group)["PolicyNames"]:
+                iam.delete_group_policy(GroupName=group, PolicyName=name)
             iam.delete_group(GroupName=group)
 
 
-def test_cfn_iam_policy_delete_detaches_entities(cfn, iam):
+def test_cfn_iam_policy_delete_removes_the_inline_policy(cfn, iam):
     """Deleting the stack takes the inline policy off the role it was
     embedded in ("Adds or updates an inline policy document that is embedded
     in the specified IAM group, user or role", aws-resource-iam-policy.html):
-    the role's attached list is empty and the policy is gone once the stack
-    reports DELETE_COMPLETE — checked before the fixture cleanup, which
-    would otherwise mask a leftover attachment."""
+    the role holds nothing once the stack reports DELETE_COMPLETE — checked
+    before the fixture cleanup, which would otherwise mask a leftover."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-del-{uid}"
     role = f"cfn-pol-del-role-{uid}"
+    policy_name = f"cfn-pol-del-{uid}"
     _cfn_policy_test_roles(iam, [role])
     template = json.dumps({
         "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-            "PolicyName": f"cfn-pol-del-{uid}",
+            "PolicyName": policy_name,
             "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                 {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
             "Roles": [role],
@@ -19500,19 +19593,109 @@ def test_cfn_iam_policy_delete_detaches_entities(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-del-{uid}"]
-        policy_arn = attached[0]["PolicyArn"]
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
 
         cfn.delete_stack(StackName=stack_name)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
-        assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == []
         with pytest.raises(ClientError) as exc_info:
-            iam.get_policy(PolicyArn=policy_arn)
+            iam.get_role_policy(RoleName=role, PolicyName=policy_name)
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_shows_up_in_the_authorization_details(cfn, iam):
+    """GetAccountAuthorizationDetails lists the policy under RolePolicyList
+    rather than AttachedManagedPolicies, which is where the IAM evaluator
+    reads a role's grants from."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-aad-{uid}"
+    role = f"cfn-pol-aad-role-{uid}"
+    policy_name = f"cfn-pol-aad-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    template = json.dumps({
+        "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": policy_name,
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+            "Roles": [role],
+        }}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        details = iam.get_account_authorization_details(Filter=["Role"])
+        entry = next(r for r in details["RoleDetailList"] if r["RoleName"] == role)
+        assert [p["PolicyName"] for p in entry.get("RolePolicyList", [])] == [policy_name]
+        assert entry.get("AttachedManagedPolicies", []) == []
+        document = entry["RolePolicyList"][0]["PolicyDocument"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_grant_survives_a_second_stack_with_the_same_name(cfn, iam):
+    """The grant reaches the evaluator, and a later stack sharing the
+    PolicyName does not take it away.
+
+    SimulatePrincipalPolicy resolves a role through _gather_role_policies, the
+    same function AUTH=true consults when it decides a request, so this is the
+    behaviour the resource exists for rather than another shape assertion.
+    Deploying the second stack is what makes it a real test: one managed
+    policy keyed by name serves both roles, so the second document replaces
+    the first and the first role quietly loses the grant its own template
+    declared."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    shared_name = f"cfn-pol-sim-{uid}"
+    roles = [f"cfn-pol-sim-role-a-{uid}", f"cfn-pol-sim-role-b-{uid}"]
+    stacks = [f"cfn-iam-pol-sim-a-{uid}", f"cfn-iam-pol-sim-b-{uid}"]
+    _cfn_policy_test_roles(iam, roles)
+    arns = [iam.get_role(RoleName=role)["Role"]["Arn"] for role in roles]
+
+    def template(role, action):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+                "PolicyName": shared_name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": action,
+                     "Resource": f"arn:aws:s3:::bucket-{uid}/*"}]},
+                "Roles": [role],
+            }}},
+        })
+
+    def decision(arn, action):
+        results = iam.simulate_principal_policy(
+            PolicySourceArn=arn, ActionNames=[action],
+            ResourceArns=[f"arn:aws:s3:::bucket-{uid}/*"],
+        )["EvaluationResults"]
+        return results[0]["EvalDecision"]
+
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(roles[0], "s3:GetObject"))
+        stack = _wait_stack(cfn, stacks[0])
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert decision(arns[0], "s3:GetObject") == "allowed"
+
+        cfn.create_stack(StackName=stacks[1], TemplateBody=template(roles[1], "s3:PutObject"))
+        stack = _wait_stack(cfn, stacks[1])
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        # Each role is allowed what its own stack granted, and nothing else.
+        assert decision(arns[0], "s3:GetObject") == "allowed"
+        assert decision(arns[0], "s3:PutObject") != "allowed"
+        assert decision(arns[1], "s3:PutObject") == "allowed"
+        assert decision(arns[1], "s3:GetObject") != "allowed"
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, roles)
 
 
 def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
@@ -19671,52 +19854,6 @@ def test_cfn_iam_instance_profile_path_change_under_generated_name_replaces_it(c
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_iam_policy_version_cap_prunes_on_sixth_document(cfn, iam):
-    """Every PolicyDocument change becomes a new default version; at the IAM
-    five-version cap the oldest non-default version is pruned first, so the
-    sixth document lands as v6 with five versions listed and the policy id
-    unchanged throughout."""
-    uid = _uuid_mod.uuid4().hex[:8]
-    stack_name = f"cfn-iam-pol-cap-{uid}"
-    role = f"cfn-pol-cap-role-{uid}"
-    _cfn_policy_test_roles(iam, [role])
-
-    def template(n):
-        return json.dumps({
-            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-cap-{uid}",
-                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
-                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::bucket-{n}/*"}]},
-                "Roles": [role],
-            }}},
-            "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
-        })
-
-    cfn.create_stack(StackName=stack_name, TemplateBody=template(1))
-    try:
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"][0]["PolicyArn"]
-
-        for n in range(2, 7):
-            cfn.update_stack(StackName=stack_name, TemplateBody=template(n))
-            stack = _wait_stack(cfn, stack_name)
-            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-            assert _output(stack, "Id") == policy_id
-            assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["DefaultVersionId"] == f"v{n}"
-
-        versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
-        assert sorted(v["VersionId"] for v in versions) == ["v2", "v3", "v4", "v5", "v6"]
-        assert [v["VersionId"] for v in versions if v["IsDefaultVersion"]] == ["v6"]
-        document = iam.get_policy_version(PolicyArn=policy_arn, VersionId="v6")["PolicyVersion"]["Document"]
-        if isinstance(document, str):
-            document = json.loads(document)
-        assert document["Statement"][0]["Resource"] == "arn:aws:s3:::bucket-6/*"
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 1
-    finally:
-        _delete_cfn_test_stack(cfn, stack_name)
-        _cfn_policy_test_roles_cleanup(iam, [role])
 def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, ddb):
     """A failed update rolls back only what the update created. The queue
     existed before the update and kept its physical id through an in-place
