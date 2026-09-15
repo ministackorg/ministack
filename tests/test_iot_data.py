@@ -195,18 +195,24 @@ def _record_publish(msg, received: list) -> int | None:
     return ptype
 
 
+# The handshake budget for a WS subscriber. Generous on purpose: a single
+# timeout here kills the thread before it can set `ready`, and every caller
+# then reports the same unhelpful "did not become ready" instead of why.
+_WS_HANDSHAKE_TIMEOUT = 15.0
+
+
 async def _ws_subscribe_and_collect(
     ws_url: str, topic: str, ready_event: threading.Event, received: list, stop: threading.Event
 ):
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect("test-client"))
         # Wait for CONNACK
-        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
         # Subscribe
         await ws.send(_make_subscribe(packet_id=1, topic=topic, qos=0))
         # Retained PUBLISH frames may precede SUBACK in the in-process broker.
         while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            msg = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
             if _record_publish(msg, received) == 9:  # SUBACK
                 break
         ready_event.set()
@@ -232,17 +238,17 @@ async def _ws_unsubscribe_one_and_collect(
     """Subscribe to every topic in ``topics``, then UNSUBSCRIBE from ``drop``."""
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect("unsub-client"))
-        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
         for packet_id, topic in enumerate(topics, start=1):
             await ws.send(_make_subscribe(packet_id=packet_id, topic=topic, qos=0))
             while True:
-                msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                msg = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
                 if _record_publish(msg, received) == 9:  # SUBACK
                     break
 
         await ws.send(_make_unsubscribe(packet_id=len(topics) + 1, topics=[drop]))
         while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            msg = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
             if _record_publish(msg, received) == 11:  # UNSUBACK
                 break
         ready_event.set()
@@ -276,7 +282,7 @@ def test_iot_ws_unsubscribe_keeps_the_other_subscriptions(iot_data_client):
         daemon=True,
     )
     t.start()
-    assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+    assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT), "WebSocket subscriber did not become ready"
 
     iot_data_client.publish(topic=dropped, payload=b"should-not-arrive")
     iot_data_client.publish(topic=kept, payload=b"should-arrive")
@@ -314,7 +320,7 @@ def test_iot_lambda_publishes_browser_subscribes_e2e(iot_data_client):
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+    assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT), "WebSocket subscriber did not become ready"
 
     payload = b"telemetry-from-lambda"
     iot_data_client.publish(topic=topic, payload=payload)
@@ -379,8 +385,8 @@ def test_iot_ws_publish_isolated_between_regions():
     )
     east_thread.start()
     west_thread.start()
-    assert east_ready.wait(timeout=5)
-    assert west_ready.wait(timeout=5)
+    assert east_ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
+    assert west_ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
 
     east_client = boto3.client(
         "iot-data",
@@ -442,7 +448,7 @@ def test_iot_ws_credential_region_wildcards_cannot_bypass_isolation(
         daemon=True,
     )
     live_thread.start()
-    assert live_ready.wait(timeout=5)
+    assert live_ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
 
     east_client = boto3.client(
         "iot-data",
@@ -473,7 +479,7 @@ def test_iot_ws_credential_region_wildcards_cannot_bypass_isolation(
         daemon=True,
     )
     retained_thread.start()
-    assert retained_ready.wait(timeout=5)
+    assert retained_ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
     time.sleep(0.6)
     retained_stop.set()
     retained_thread.join(timeout=2)
@@ -509,7 +515,7 @@ def test_iot_ws_topic_isolation_between_accounts(iot_data_client):
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    assert ready.wait(timeout=5)
+    assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
 
     # Publish from account B using a 12-digit access key.
     client_b = boto3.client(
@@ -562,7 +568,7 @@ def test_iot_ws_same_account_publish_delivers(iot_data_client):
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    assert ready.wait(timeout=5)
+    assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT)
 
     # Publish from the SAME account.
     client_a = boto3.client(
@@ -1006,7 +1012,7 @@ def test_iot_rule_republish_where_gated_ws_subscriber(iot_client, iot_data_clien
             daemon=True,
         )
         t.start()
-        assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+        assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT), "WebSocket subscriber did not become ready"
 
         iot_data_client.publish(
             topic=source, payload=json.dumps({"severity": "low", "n": 1}).encode()
@@ -1133,7 +1139,7 @@ async def _mqtt_connect(client_id: str, url: str | None = None):
     """Open an MQTT session and hold it. The caller closes the socket."""
     ws = await websockets.connect(url or _broker_ws_url(), subprotocols=["mqtt"])
     await ws.send(_make_connect(client_id))
-    await asyncio.wait_for(ws.recv(), timeout=2.0)  # CONNACK
+    await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)  # CONNACK
     return ws
 
 
@@ -1638,7 +1644,7 @@ def _collect_shadow_frames(sub_filter, publish_fn, want, timeout=5.0):
             daemon=True,
         )
         t.start()
-        assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+        assert ready.wait(timeout=_WS_HANDSHAKE_TIMEOUT), "WebSocket subscriber did not become ready"
 
         publish_fn()
 
@@ -1740,7 +1746,7 @@ def test_shadow_delete_over_http_emits_delete_accepted_but_get_nothing(iot_data_
         f"{base}/get/+",
         lambda: iot_data_client.get_thing_shadow(thingName=thing),
         want=1,
-        timeout=2.0,
+        timeout=_WS_HANDSHAKE_TIMEOUT,
     )
     assert received == []
 
@@ -1800,7 +1806,7 @@ def test_shadow_update_over_http_rejected_emits_no_frames(iot_data_client):
         assert ei.value.response["Error"]["Code"] == "ConflictException"
 
     received = _collect_shadow_frames(
-        f"{base}/update/+", _stale_update, want=1, timeout=2.0
+        f"{base}/update/+", _stale_update, want=1, timeout=_WS_HANDSHAKE_TIMEOUT
     )
     assert received == []
 
@@ -1817,7 +1823,7 @@ def test_shadow_delete_over_http_missing_emits_no_frames(iot_data_client):
         assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
     received = _collect_shadow_frames(
-        f"{base}/delete/+", _delete_missing, want=1, timeout=2.0
+        f"{base}/delete/+", _delete_missing, want=1, timeout=_WS_HANDSHAKE_TIMEOUT
     )
     assert received == []
 
@@ -1888,10 +1894,10 @@ async def _ws_publish_shadow_and_collect(
 
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect(_unique("shadow-dev")))
-        await asyncio.wait_for(ws.recv(), timeout=2.0)  # CONNACK
+        await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)  # CONNACK
         await ws.send(_make_subscribe(packet_id=1, topic=sub_filter, qos=0))
         while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            msg = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
             if _record(msg) == 9:  # SUBACK
                 break
         await ws.send(_make_publish_frame(pub_topic, pub_payload))
@@ -3370,7 +3376,7 @@ def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):
         broker.client("iot-data", access_key="111111111111").publish(
             topic=topic, payload=b"someone-else"
         )
-        assert peer.next_publish(timeout=2.0) is None, "leaked across accounts"
+        assert peer.next_publish(timeout=_WS_HANDSHAKE_TIMEOUT) is None, "leaked across accounts"
 
         broker.client("iot-data", access_key="000000000000").publish(
             topic=topic, payload=b"default-account"
@@ -3559,7 +3565,7 @@ def test_mtls_account_scoped_delivery(broker, tmp_path):
         broker.client("iot-data", access_key="000000000000").publish(
             topic=topic, payload=b"other-tenant"
         )
-        assert peer.next_publish(timeout=2.0) is None, "leaked across accounts"
+        assert peer.next_publish(timeout=_WS_HANDSHAKE_TIMEOUT) is None, "leaked across accounts"
 
         broker.client("iot-data", access_key="111111111111").publish(
             topic=topic, payload=b"own-tenant"
@@ -3576,7 +3582,7 @@ def test_mtls_garbage_bytes_dropped(broker, tmp_path):
     try:
         junk.send(bytes([0xFF]) * 64)
         junk.send(os.urandom(256))
-        junk.next_packet(timeout=2.0)
+        junk.next_packet(timeout=_WS_HANDSHAKE_TIMEOUT)
     finally:
         junk.close()
 

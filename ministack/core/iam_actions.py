@@ -465,22 +465,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
 _REST_ROUTE_CACHE: dict[str, list[tuple[str, re.Pattern, str, int, dict[str, str]]]] = {}
 
 
-# A botocore path label is non-greedy ({x}) unless the model marks it greedy
-# ({x+}), and the SDK percent-encodes any "/" the value carries so the label
-# still matches one segment on the wire. We match against the decoded path the
-# ASGI server hands us, where those separators are separators again, so a
-# non-greedy label whose value may contain one never matches and the request
-# resolves no action at all. An MQTT topic is multi-level by definition, which
-# makes iot-data's the case that bites: without this, Publish and
-# GetRetainedMessage are not authorized on any topic below the first level.
-# Keyed by botocore service name, as _BOTOCORE_SERVICE_MAP's values are.
-_GREEDY_URI_LABELS: dict[str, frozenset[str]] = {
-    "iot-data": frozenset({"topic"}),
-}
-
-
-def _compile_uri(uri_pattern: str,
-                 greedy_labels: frozenset[str] = frozenset()) -> tuple[re.Pattern, int, dict[str, str]]:
+def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
     """Compile a botocore URI pattern into a regex + specificity score +
     required query params.
 
@@ -489,9 +474,7 @@ def _compile_uri(uri_pattern: str,
     (2 literal segments).
 
     Query params from the pattern (e.g., ``?mode=import``) are returned
-    separately for disambiguation. Labels named in ``greedy_labels`` match
-    across ``/`` as if the model had marked them ``{x+}``; see
-    ``_GREEDY_URI_LABELS``.
+    separately for disambiguation.
     """
     required_query: dict[str, str] = {}
     if "?" in uri_pattern:
@@ -518,7 +501,15 @@ def _compile_uri(uri_pattern: str,
         if seg.startswith("{") and seg.endswith("+}"):
             regex_parts.append(".+")
         elif seg.startswith("{") and seg.endswith("}"):
-            regex_parts.append(".+" if seg[1:-1] in greedy_labels else "[^/]+")
+            # Lazy, not single-segment. A botocore label is non-greedy because
+            # the SDK percent-encodes any "/" the value carries, so it stays one
+            # segment on the wire; we match the decoded path, where those are
+            # separators again. Every ARN-valued label is in this position, as
+            # is an MQTT topic, so "[^/]+" resolves no action at all and the
+            # request authorizes against "*". The pattern is anchored and the
+            # literal segments around a label still bound it, and a route with
+            # more literals outscores one with fewer.
+            regex_parts.append(".+?")
         else:
             regex_parts.append(re.escape(seg))
             specificity += 1
@@ -565,7 +556,6 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
         logger.debug("AUTH: failed to load botocore model for %s", botocore_service)
         return []
 
-    greedy_labels = _GREEDY_URI_LABELS.get(botocore_service, frozenset())
     routes = []
     for op_name, op_def in model.get("operations", {}).items():
         http = op_def.get("http", {})
@@ -573,7 +563,7 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
         uri = http.get("requestUri", "")
         if not method or not uri:
             continue
-        compiled, specificity, required_query = _compile_uri(uri, greedy_labels)
+        compiled, specificity, required_query = _compile_uri(uri)
         # Operations with required query params get a specificity boost
         if required_query:
             specificity += len(required_query)

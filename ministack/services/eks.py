@@ -12,6 +12,9 @@ Supports:
   Nodegroups: CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup
   IdP configs: AssociateIdentityProviderConfig, DescribeIdentityProviderConfig,
               DisassociateIdentityProviderConfig, ListIdentityProviderConfigs
+  Pod identity: CreatePodIdentityAssociation, DescribePodIdentityAssociation,
+              ListPodIdentityAssociations, UpdatePodIdentityAssociation,
+              DeletePodIdentityAssociation
   Authentication: AWS IAM exec tokens through a k3s TokenReview webhook
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
@@ -26,6 +29,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -89,6 +93,7 @@ _access_entries = AccountRegionScopedDict() # "cluster\x00principalArn" -> acces
 _access_policies = AccountRegionScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
 _idp_configs = AccountRegionScopedDict()     # "cluster\x00idp_name" -> idp record
+_pod_identity_associations = AccountRegionScopedDict()  # "cluster\x00associationId" -> association
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
@@ -96,9 +101,9 @@ _oidc_keypair = None                  # (private_key, jwk_dict, kid)
 _rbac_reconcilers_lock = threading.Lock()
 _rbac_reconcilers = {}                 # (account, region, cluster) -> (stop, wake)
 _rbac_reconcile_locks = {}             # (account, region, cluster) -> Lock
-_EKS_RBAC_RECONCILE_INTERVAL = float(
-    os.environ.get("EKS_RBAC_RECONCILE_INTERVAL", "2")
-)
+# Paces only the discovery of a namespace created after a wildcard-scoped
+# policy was associated; every other trigger wakes the loop directly.
+_EKS_RBAC_RECONCILE_INTERVAL = 2.0
 
 
 def _cluster_endpoint(port):
@@ -177,6 +182,7 @@ def reset():
     _access_policies.clear()
     _tags.clear()
     _idp_configs.clear()
+    _pod_identity_associations.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
 
@@ -198,6 +204,7 @@ def get_state():
         "access_policies": copy.deepcopy(_access_policies),
         "tags": copy.deepcopy(_tags),
         "idp_configs": copy.deepcopy(_idp_configs),
+        "pod_identity_associations": copy.deepcopy(_pod_identity_associations),
         "port_counter": _port_counter[0],
     }
 
@@ -247,6 +254,7 @@ def _restore_state(data):
         (_access_entries, "access_entries", "\x00"),
         (_access_policies, "access_policies", "\x00"),
         (_idp_configs, "idp_configs", "\x00"),
+        (_pod_identity_associations, "pod_identity_associations", "\x00"),
     ):
         _restore_cluster_child_store(
             store,
@@ -320,6 +328,18 @@ def _ae_key(cluster_name: str, principal_arn: str) -> str:
 
 def _ap_key(cluster_name: str, principal_arn: str, policy_arn: str) -> str:
     return f"{cluster_name}\x00{principal_arn}\x00{policy_arn}"
+
+
+def _pia_key(cluster_name: str, association_id: str) -> str:
+    return f"{cluster_name}\x00{association_id}"
+
+
+def _pod_identity_association_arn(cluster_name, association_id):
+    # AWS: arn:aws:eks:{region}:{account}:podidentityassociation/{cluster}/{associationId}.
+    return (
+        f"arn:aws:eks:{get_region()}:{get_account_id()}:"
+        f"podidentityassociation/{cluster_name}/{association_id}"
+    )
 
 
 def _now():
@@ -426,7 +446,6 @@ def _k3s_run_kwargs(
         "--tls-san=0.0.0.0",
         "--https-listen-port=6443",
         "--kube-apiserver-arg=authentication-token-webhook-config-file=/etc/rancher/k3s/eks-auth-webhook.yaml",
-        "--kube-apiserver-arg=authentication-token-webhook-cache-ttl=5m",
     ]
     if oidc_args:
         command.extend(oidc_args)
@@ -479,7 +498,8 @@ def _k3s_gateway_host(client, ms_network):
     return "host.docker.internal"
 
 
-def _k3s_auth_webhook_config(client, ms_network, cluster_name, account_id=None, region=None):
+def _k3s_auth_webhook_config(client, ms_network, cluster_name, account_id=None,
+                             region=None, auth_token=""):
     """Build the kubeconfig consumed by the k3s token webhook authenticator.
 
     The webhook endpoint is deliberately addressed through MiniStack's
@@ -493,7 +513,10 @@ def _k3s_auth_webhook_config(client, ms_network, cluster_name, account_id=None, 
     scheme = "https" if _tls.use_ssl_enabled() else "http"
     account_id = account_id or get_account_id()
     region = region or get_region()
-    server = f"{scheme}://{host}:{port}/eks-auth/{account_id}/{region}/{cluster_name}"
+    server = (
+        f"{scheme}://{host}:{port}/_ministack/eks-auth/"
+        f"{account_id}/{region}/{cluster_name}/{auth_token}"
+    )
     return (
         "apiVersion: v1\n"
         "kind: Config\n"
@@ -697,6 +720,12 @@ def _create_cluster(body, creator_arn=None):
         "encryptionConfig": body.get("encryptionConfig", []),
         "accessConfig": body.get("accessConfig", {}),
         "_creator_arn": creator_arn,
+        # The webhook URL's shared secret. The route is unauthenticated by
+        # necessity (the apiserver has no AWS credentials), so without this the
+        # path is guessable and anyone who reaches the gateway can ask whether a
+        # token is valid. Only k3s learns it, from the kubeconfig written into
+        # the container before boot.
+        "_auth_token": secrets.token_urlsafe(32),
         "_docker_id": None,
         "_port": port,
     }
@@ -704,6 +733,7 @@ def _create_cluster(body, creator_arn=None):
     _clusters[name] = cluster
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
+    _bootstrap_creator_access_entry(name, cluster, creator_arn)
 
     account_id, region = get_account_id(), get_region()
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
@@ -729,7 +759,8 @@ def _create_cluster(body, creator_arn=None):
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             auth_webhook_config = _k3s_auth_webhook_config(
-                client, ms_network, name, account_id, region
+                client, ms_network, name, account_id, region,
+                cluster.get("_auth_token", ""),
             )
             container = _start_k3s_container(
                 client, run_kwargs, registries_yaml, auth_webhook_config
@@ -764,6 +795,35 @@ def _list_clusters(query):
     return _json_resp(200, {"clusters": names})
 
 
+
+def _bootstrap_creator_access_entry(cluster_name, cluster, creator_arn):
+    """Give the cluster creator its access entry, as AWS does at creation.
+
+    "Specifies whether or not the cluster creator IAM principal was set as a
+    cluster admin access entry during cluster creation time"
+    (CreateAccessConfigRequest.bootstrapClusterCreatorAdminPermissions). It is
+    an ordinary STANDARD entry with AmazonEKSClusterAdminPolicy at cluster
+    scope, which is why ListAccessEntries returns it and deleting it is the
+    documented way to revoke the creator's admin access.
+    """
+    if not creator_arn:
+        return
+    if not cluster.get("accessConfig", {}).get(
+        "bootstrapClusterCreatorAdminPermissions", True
+    ):
+        return
+    entry = _build_access_entry(cluster_name, creator_arn, {"type": "STANDARD"})
+    _access_entries[_ae_key(cluster_name, creator_arn)] = entry
+    now = _now()
+    policy_arn = f"arn:aws:eks::aws:{_ACCESS_POLICY_ARN_PREFIX}AmazonEKSClusterAdminPolicy"
+    _access_policies[_ap_key(cluster_name, creator_arn, policy_arn)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+        "associatedAt": now,
+        "modifiedAt": now,
+    }
+
+
 def _delete_cluster(name):
     cluster = _clusters.get(name)
     if not cluster:
@@ -790,6 +850,21 @@ def _delete_cluster(name):
         ng = _nodegroups.pop(k, None)
         if ng:
             _tags.pop(ng.get("nodegroupArn", ""), None)
+
+    # Access entries and their policy associations belong to the cluster, so
+    # they go with it. Left behind they outlive it, and a cluster recreated
+    # under the same name would inherit the previous one's grants.
+    prefix = f"{name}\x00"
+    for key in [k for k in _access_entries if str(k).startswith(prefix)]:
+        entry = _access_entries.pop(key, None)
+        if entry:
+            _tags.pop(entry.get("accessEntryArn", ""), None)
+    for key in [k for k in _access_policies if str(k).startswith(prefix)]:
+        _access_policies.pop(key, None)
+    for key in [k for k in _pod_identity_associations if str(k).startswith(prefix)]:
+        assoc = _pod_identity_associations.pop(key, None)
+        if assoc:
+            _tags.pop(assoc.get("associationArn", ""), None)
 
     arn = cluster["arn"]
     cluster["status"] = "DELETING"
@@ -1058,6 +1133,140 @@ def _list_access_entries(cluster_name, query):
         arns.append(e["principalArn"])
     max_results = int(query.get("maxResults", 100))
     return _json_resp(200, {"accessEntries": arns[:max_results]})
+
+
+# ---------------------------------------------------------------------------
+# EKS Pod Identity associations
+#
+# A pod identity association binds a Kubernetes service account in a namespace
+# to an IAM role. The EKS Pod Identity Agent and the controllers that read it
+# (the AWS Load Balancer Controller among them) list and describe these
+# records; nothing here runs inside the cluster, so the association is a
+# control-plane record, which is what the API serves.
+# ---------------------------------------------------------------------------
+
+def _pod_identity_summary(assoc):
+    """The PodIdentityAssociationSummary shape ListPodIdentityAssociations
+    returns: six of the full record's members, not the whole association."""
+    return {
+        "clusterName": assoc["clusterName"],
+        "namespace": assoc["namespace"],
+        "serviceAccount": assoc["serviceAccount"],
+        "associationArn": assoc["associationArn"],
+        "associationId": assoc["associationId"],
+        "ownerArn": assoc.get("ownerArn", ""),
+    }
+
+
+def _create_pod_identity_association(cluster_name, body):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = body.get("namespace", "")
+    service_account = body.get("serviceAccount", "")
+    role_arn = body.get("roleArn", "")
+    for name, value in (("namespace", namespace), ("serviceAccount", service_account),
+                        ("roleArn", role_arn)):
+        if not value:
+            return _error(400, "InvalidParameterException", f"{name} is required.")
+    # One association per (namespace, service account): a second one is
+    # ResourceInUseException, which the operation documents.
+    for key, existing in list(_pod_identity_associations.items()):
+        if (key.startswith(f"{cluster_name}\x00")
+                and existing["namespace"] == namespace
+                and existing["serviceAccount"] == service_account):
+            return _error(409, "ResourceInUseException",
+                          f"Association already exists for service account "
+                          f"{service_account} in namespace {namespace}.")
+    association_id = "a-" + new_uuid().replace("-", "")[:16]
+    now = _now()
+    assoc = {
+        "clusterName": cluster_name,
+        "namespace": namespace,
+        "serviceAccount": service_account,
+        "roleArn": role_arn,
+        "associationArn": _pod_identity_association_arn(cluster_name, association_id),
+        "associationId": association_id,
+        "tags": body.get("tags", {}),
+        "createdAt": now,
+        "modifiedAt": now,
+        "ownerArn": "",
+        "disableSessionTags": bool(body.get("disableSessionTags", False)),
+    }
+    if body.get("targetRoleArn"):
+        # A target role makes this a role-chaining association, and AWS mints
+        # the externalId the target role's trust policy matches on.
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc["externalId"] = new_uuid()
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    _pod_identity_associations[_pia_key(cluster_name, association_id)] = assoc
+    if assoc["tags"]:
+        _tags[assoc["associationArn"]] = dict(assoc["tags"])
+    return _json_resp(200, {"association": assoc})
+
+
+def _describe_pod_identity_association(cluster_name, association_id):
+    assoc = _pod_identity_associations.get(_pia_key(cluster_name, association_id))
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    return _json_resp(200, {"association": assoc})
+
+
+def _list_pod_identity_associations(cluster_name, query):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = query.get("namespace")
+    service_account = query.get("serviceAccount")
+    prefix = f"{cluster_name}\x00"
+    summaries = []
+    for key, assoc in _pod_identity_associations.items():
+        if not key.startswith(prefix):
+            continue
+        if namespace is not None and assoc["namespace"] != namespace:
+            continue
+        if service_account is not None and assoc["serviceAccount"] != service_account:
+            continue
+        summaries.append(_pod_identity_summary(assoc))
+    summaries.sort(key=lambda a: a["associationId"])
+    max_results = int(query.get("maxResults", 100))
+    return _json_resp(200, {"associations": summaries[:max_results]})
+
+
+def _update_pod_identity_association(cluster_name, association_id, body):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    # The request carries only the mutable members; namespace and service
+    # account are not among them, so an association keeps the pair it was
+    # created for.
+    if body.get("roleArn"):
+        assoc["roleArn"] = body["roleArn"]
+    if "disableSessionTags" in body:
+        assoc["disableSessionTags"] = bool(body["disableSessionTags"])
+    if body.get("targetRoleArn"):
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc.setdefault("externalId", new_uuid())
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    assoc["modifiedAt"] = _now()
+    return _json_resp(200, {"association": assoc})
+
+
+def _delete_pod_identity_association(cluster_name, association_id):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    _tags.pop(assoc.get("associationArn", ""), None)
+    _pod_identity_associations.pop(key, None)
+    # The deleted association is the response body, as the operation documents.
+    return _json_resp(200, {"association": assoc})
 
 
 def _delete_access_entry(cluster_name, principal_arn):
@@ -1605,8 +1814,12 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             cluster_spec = parse_arn(cluster.get("arn", ""))
+            # A restart reuses the cluster's token; one minted here would not
+            # match the URL k3s was given, and the restored record carries it.
+            cluster.setdefault("_auth_token", secrets.token_urlsafe(32))
             auth_webhook_config = _k3s_auth_webhook_config(
-                client, ms_network, cluster_name, cluster_spec.account_id, cluster_spec.region
+                client, ms_network, cluster_name, cluster_spec.account_id,
+                cluster_spec.region, cluster["_auth_token"],
             )
             container = _start_k3s_container(
                 client, run_kwargs, registries_yaml, auth_webhook_config
@@ -2119,7 +2332,7 @@ def _access_entry_for_principal(cluster_name, account_id, region, principal_arn)
     return None
 
 
-def _authenticate_token_review(cluster_name, account_id, region, review):
+def _authenticate_token_review(cluster_name, account_id, region, review, auth_token=""):
     from ministack.app import AUTH
 
     spec = review.get("spec")
@@ -2130,6 +2343,13 @@ def _authenticate_token_review(cluster_name, account_id, region, review):
     if not cluster_info:
         return _token_review_response(review)
     account_id, region, cluster = cluster_info
+
+    # The URL's shared secret. Only the kubeconfig written into this cluster's
+    # container carries it, so a caller who merely reached the gateway cannot
+    # use the endpoint to test whether a token is valid.
+    expected_token = cluster.get("_auth_token") or ""
+    if not expected_token or not secrets.compare_digest(auth_token, expected_token):
+        return _token_review_response(review)
 
     # Permissive mode accepts local bearer credentials without requiring an
     # IAM identity, a matching secret, or an access entry, just like the AWS
@@ -2165,15 +2385,11 @@ def _authenticate_token_review(cluster_name, account_id, region, review):
             )
             if principal_arn == entry["principalArn"]
         )
-    elif (
-        credential.account_id == account_id
-        and cluster.get("accessConfig", {}).get("bootstrapClusterCreatorAdminPermissions", True)
-        and cluster.get("_creator_arn") == (
-            _role_arn_from_assumed_role(credential.principal_arn) or credential.principal_arn
-        )
-    ):
-        groups.append("system:masters")
     else:
+        # No entry, no Kubernetes access. The creator has one, minted at
+        # CreateCluster, so it authorizes through the same path as everyone
+        # else rather than through system:masters, which bypasses RBAC and
+        # could never be revoked.
         return _token_review_response(review)
 
     # Deduplicate while preserving the caller's configured order.
@@ -2187,14 +2403,14 @@ def _authenticate_token_review(cluster_name, account_id, region, review):
     )
 
 
-def _handle_auth_webhook(cluster_name, account_id, region, body_bytes):
+def _handle_auth_webhook(cluster_name, account_id, region, body_bytes, auth_token=""):
     try:
         review = json.loads(body_bytes) if body_bytes else {}
     except (TypeError, json.JSONDecodeError):
         review = {}
     if not isinstance(review, dict):
         review = {}
-    return _authenticate_token_review(cluster_name, account_id, region, review)
+    return _authenticate_token_review(cluster_name, account_id, region, review, auth_token)
 
 
 # ---------------------------------------------------------------------------
@@ -2214,7 +2430,8 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
     # webhook, not by an AWS EKS client. Keep it outside the EKS JSON API
     # namespace so the normal AWS action router never sees TokenReview data.
     auth_match = re.fullmatch(
-        r"/eks-auth/(\d{12})/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)", path
+        r"/_ministack/eks-auth/(\d{12})/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_-]{16,})",
+        path,
     )
     if auth_match and method == "POST":
         return _handle_auth_webhook(
@@ -2222,6 +2439,7 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
             auth_match.group(1),
             auth_match.group(2),
             body_bytes,
+            auth_match.group(4),
         )
 
     try:
@@ -2267,6 +2485,26 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
             return _describe_nodegroup(cluster_name, ng_name)
         if method == "DELETE":
             return _delete_nodegroup(cluster_name, ng_name)
+
+    # /clusters/{name}/pod-identity-associations — Create / List
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _create_pod_identity_association(cluster_name, body)
+        if method == "GET":
+            return _list_pod_identity_associations(cluster_name, query)
+
+    # /clusters/{name}/pod-identity-associations/{associationId}
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations/([A-Za-z0-9_-]+)", path)
+    if m:
+        cluster_name, association_id = m.group(1), m.group(2)
+        if method == "GET":
+            return _describe_pod_identity_association(cluster_name, association_id)
+        if method == "POST":
+            return _update_pod_identity_association(cluster_name, association_id, body)
+        if method == "DELETE":
+            return _delete_pod_identity_association(cluster_name, association_id)
 
     # POST /clusters/{name}/encryption-config/associate — AssociateEncryptionConfig
     m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/encryption-config/associate", path)

@@ -3051,11 +3051,44 @@ def _validate_notification_target_arn(target_type: str, arn: str, bucket_region:
     return None
 
 
+def _notification_destination_exists(target_type: str, arn: str, bucket_region: str) -> bool:
+    """Whether the queue or topic an SQS/SNS destination names is there.
+
+    S3 verifies an SNS or SQS destination by sending it a test notification,
+    and "if the message fails, the entire PUT action will fail, and Amazon S3
+    will not add the configuration to your bucket". A Lambda destination is
+    verified through its function permissions instead, which this emulator
+    does not model, so a Lambda target is not checked here.
+    """
+    spec = _parse_delivery_notification_target(target_type, arn, bucket_region)
+    if not spec:
+        return False
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
+    from ministack.services import sns as _sns
+
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topics.get(arn) is not None
+
+
 def _validate_notification_configs(configs: list[dict], bucket_region: str) -> tuple | None:
     for cfg in configs:
         error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
         if error:
             return error
+    # The destination check is second: an ARN that does not parse is reported
+    # as malformed before anything tries to reach what it names.
+    unreachable = [
+        cfg["arn"] for cfg in configs
+        if cfg["type"] in ("sqs", "sns")
+        and not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+    ]
+    if unreachable:
+        return _invalid_notification_config(
+            "Unable to validate the following destination configurations: "
+            + ", ".join(unreachable)
+        )
     return None
 
 

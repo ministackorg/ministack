@@ -80,6 +80,34 @@ def test_tests_restore_state_only_through_the_public_contract():
     )
 
 
+@pytest.mark.parametrize("svc_key,mod_name", sorted(_state_map.items()))
+def test_service_has_restore_path(svc_key, mod_name):
+    """Every service in `_state_map` must expose a way to restore its own state.
+
+    Either the module calls `load_state()` itself at import time, or it exposes
+    `load_persisted_state(data)` and is wired into `_load_persisted_state()`.
+    Without one of the two its state is written on shutdown and dropped on the
+    next boot, silently.
+    """
+    mod = _module(mod_name)
+    if not mod.get_state():
+        pytest.skip(f"{mod_name} holds no state to restore")
+    src = Path(mod.__file__).read_text()
+
+    self_restoring = (
+        "from ministack.core.persistence import" in src
+        and "load_state(" in src
+    )
+    centrally_restored = hasattr(mod, "load_persisted_state") and svc_key in {
+        "apigateway", "apigateway_v1", "servicediscovery",
+    }
+
+    assert self_restoring or centrally_restored, (
+        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and will "
+        f"be saved on shutdown, but has no restore path on startup."
+    )
+
+
 def test_account_region_scoped_dict_isolates_account_and_region():
     """Account+region scoped stores keep same-name resources independent."""
     from ministack.core.responses import (

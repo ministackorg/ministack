@@ -80,7 +80,7 @@ def test_ecs_run_task_stops_after_exit(ecs):
     )
     resp = ecs.run_task(cluster="task-lifecycle", taskDefinition="short-lived")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED (container exits almost immediately)
     stopped = False
@@ -170,7 +170,7 @@ def test_ecs_run_task_network_connectivity(ecs):
     )
     resp = ecs.run_task(cluster="net-test", taskDefinition="net-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED — wget should succeed (exit 0) if network is correct
     success = False
@@ -218,7 +218,7 @@ def test_ecs_run_task_metadata_v4(ecs):
     )
     resp = ecs.run_task(cluster="metadata-test", taskDefinition="metadata-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     success = False
     for _ in range(30):
@@ -1579,7 +1579,7 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
         "taskDefinition": "pending-test-td",
     })
     task = json.loads(response[2])["tasks"][0]
-    assert task["lastStatus"] == "PENDING"
+    assert task["lastStatus"] == "PROVISIONING"
     assert task["containers"][0]["lastStatus"] == "PENDING"
     # AWS omits a timestamp it has no value for rather than sending a null:
     # the task has not started, pulled or stopped yet.
@@ -1602,6 +1602,125 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
     })[2])["tasks"][0]
     assert described["lastStatus"] == "STOPPED"
     assert described["containers"][0]["exitCode"] == 0
+
+
+def test_ecs_run_task_starts_provisioning_and_metadata_follows(monkeypatch):
+    """A task starts PROVISIONING and the metadata endpoint follows it,
+    reporting the container's own KnownStatus apart from the task's.
+    Reported by @iot-rocket."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+    from ministack.services import ecs_metadata as _md
+
+    started = threading.Event()
+    release = threading.Event()
+    containers = {}
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self):
+            pass
+
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **kwargs):
+            pass
+
+    class FakeContainers:
+        def get(self, name):
+            if name in containers:
+                return containers[name]
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return list(containers.values())
+
+        def run(self, image, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            container = FakeContainer("awsvpc-test-container")
+            containers[container.id] = container
+            return container
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "awsvpc-test-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    response = _ecs._run_task({
+        "cluster": "awsvpc-test-c",
+        "taskDefinition": "awsvpc-test-td",
+    })
+    task = json.loads(response[2])["tasks"][0]
+    arn = task["taskArn"]
+    assert task["lastStatus"] == "PROVISIONING"
+
+    assert started.wait(timeout=2)
+    assert _ecs._tasks[arn]["lastStatus"] == "ACTIVATING"
+    # Seeded from the container's own record entry, still PENDING while the
+    # task pulls: AWS reports the two apart.
+    assert _md._TASKS[arn]["KnownStatus"] == "ACTIVATING"
+    assert _md._TASKS[arn]["DesiredStatus"] == "RUNNING"
+    assert all(c["KnownStatus"] == "PENDING" for c in _md._TASKS[arn]["Containers"])
+
+    release.set()
+    _wait_until(lambda: _ecs._tasks[arn]["lastStatus"] == "RUNNING")
+    _wait_until(lambda: _md._TASKS[arn]["KnownStatus"] == "RUNNING")
+    assert all(c["KnownStatus"] == "RUNNING" for c in _md._TASKS[arn]["Containers"])
+
+    # DesiredStatus reaches the container payloads; KnownStatus stays per-container.
+    _ecs._stop_task({"cluster": "awsvpc-test-c", "task": arn})
+    assert _ecs._tasks[arn]["lastStatus"] == "STOPPED"
+
+
+def test_ecs_run_task_bridge_mode_also_starts_provisioning(monkeypatch):
+    """Every network mode starts PROVISIONING, not only awsvpc: the ENI is one
+    example of the "additional steps before the task is launched", not the
+    condition for the state (task-lifecycle)."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+
+    release = threading.Event()
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            assert release.wait(timeout=5)
+            raise RuntimeError("stopped by the test")
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "bridge-test-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+    response = _ecs._run_task({
+        "cluster": "bridge-test-c",
+        "taskDefinition": "bridge-test-td",
+    })
+    assert json.loads(response[2])["tasks"][0]["lastStatus"] == "PROVISIONING"
+    release.set()
 
 
 def test_ecs_run_task_startup_failure_is_a_stopped_task(monkeypatch):
@@ -1818,11 +1937,11 @@ def test_ecs_task_version_counts_state_changes(monkeypatch):
     })
     task = json.loads(response[2])["tasks"][0]
     task_arn = task["taskArn"]
-    assert task["lastStatus"] == "PENDING"
+    assert task["lastStatus"] == "PROVISIONING"
     assert task["version"] == 1
 
-    # 3, not 2: the task passes through ACTIVATING on its way to RUNNING, and
-    # that is a state this record reports, so it counts like the others.
+    # 3, not 4: ACTIVATING raises no state-change event, so the bumps to RUNNING
+    # are PROVISIONING, PENDING and RUNNING, which is what a real task reads.
     _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
     assert _ecs._tasks[task_arn]["version"] == 3
 
@@ -1832,12 +1951,13 @@ def test_ecs_task_version_counts_state_changes(monkeypatch):
         "reason": "done here",
     })[2])["task"]
     assert stopped["lastStatus"] == "STOPPED"
-    assert stopped["version"] == 4
+    assert stopped["version"] == 6
 
 
 def test_ecs_task_version_moves_once_for_a_natural_exit(monkeypatch):
     """The exit is observed by whichever DescribeTasks notices it first; the
-    ones after it describe the same version."""
+    ones after it describe the same version. 6, as on a real task: the
+    desiredStatus flip, DEPROVISIONING and STOPPED each count."""
     from ministack.services import ecs as _ecs
 
     container = _version_probe_container("version-exit-container")
@@ -1859,13 +1979,13 @@ def test_ecs_task_version_moves_once_for_a_natural_exit(monkeypatch):
         "tasks": [task_arn],
     })[2])["tasks"][0]
     assert described["lastStatus"] == "STOPPED"
-    assert described["version"] == 4
+    assert described["version"] == 6
 
     again = json.loads(_ecs._describe_tasks({
         "cluster": "version-exit-c",
         "tasks": [task_arn],
     })[2])["tasks"][0]
-    assert again["version"] == 4
+    assert again["version"] == 6
 
 
 def test_ecs_secret_resolution_failure_stops_before_docker_run(monkeypatch):
@@ -1916,7 +2036,7 @@ def test_ecs_run_task_count_and_multi_container_startup_are_independent(monkeypa
         "count": 2,
     })
     tasks = json.loads(response[2])["tasks"]
-    assert all(task["lastStatus"] == "PENDING" for task in tasks)
+    assert all(task["lastStatus"] == "PROVISIONING" for task in tasks)
     _wait_until(lambda: len(fake_containers.calls) == 4)
     _wait_until(
         lambda: all(

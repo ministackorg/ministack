@@ -73,49 +73,48 @@ def set_docker_id(token: str, docker_id: str) -> None:
             container["DockerId"] = docker_id
 
 
+def set_task_status(task_arn: str, known_status=None, desired_status=None) -> None:
+    """Task-level status for the V4 endpoint, pushed at each transition.
+
+    KnownStatus is task-level only; a container's own is pushed separately,
+    because AWS reports the two independently (a Fargate task serves
+    "KnownStatus": "NONE" for itself and "RUNNING" for the container in one
+    payload). DesiredStatus is the task's on every payload.
+    """
+    with _LOCK:
+        task = _TASKS.get(task_arn)
+        if task is None:
+            return
+        if known_status is not None:
+            task["KnownStatus"] = known_status
+        if desired_status is not None:
+            task["DesiredStatus"] = desired_status
+            for container in task.get("Containers", []):
+                container["DesiredStatus"] = desired_status
+
+
+def set_container_status(token: str, known_status: str) -> None:
+    """Push one container's own KnownStatus onto its payload."""
+    with _LOCK:
+        if container := _TOKEN_TO_CONTAINER.get(token):
+            container["KnownStatus"] = known_status
+
+
+def set_all_container_status(task_arn: str, known_status: str) -> None:
+    """One KnownStatus onto every container. Only the stop path moves them together."""
+    with _LOCK:
+        task = _TASKS.get(task_arn)
+        if task is None:
+            return
+        for container in task.get("Containers", []):
+            container["KnownStatus"] = known_status
+
+
 def reset() -> None:
     with _LOCK:
         _TASKS.clear()
         _TOKEN_TO_TASK.clear()
         _TOKEN_TO_CONTAINER.clear()
-
-
-def _live_status(task_arn: str) -> tuple[str, str, dict] | None:
-    """``(DesiredStatus, KnownStatus, {container name: status})``, or None.
-
-    Imported lazily: services/ecs.py imports this module, so a module-level
-    import back would be circular.
-    """
-    from ministack.services import ecs
-
-    return ecs.metadata_task_status(task_arn)
-
-
-def _with_status(payload: dict, status, container: bool = False) -> dict:
-    """A copy of ``payload`` carrying the current status.
-
-    `DesiredStatus` is the task's everywhere, which is how a container learns
-    it is being shut down. `KnownStatus` is the task's on the task payload and
-    the container's own on a container payload: on AWS the two differ while a
-    task starts, where the container is already RUNNING and the task is not.
-
-    A copy because this writes the two members, and the dicts it is handed are
-    the live registry entries: the task payload every sibling container's
-    `/task` view is built from, and the container payloads inside it. Writing
-    the overlay into those would drift the registry away from what was
-    registered, and the fallback for a task whose record is gone would then
-    serve a value nobody registered.
-    """
-    out = dict(payload)
-    if status is None:
-        return out
-    desired, known, per_container = status
-    out["DesiredStatus"] = desired
-    if container:
-        out["KnownStatus"] = per_container.get(out.get("Name")) or out.get("KnownStatus") or known
-    else:
-        out["KnownStatus"] = known
-    return out
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -129,20 +128,11 @@ async def handle_request(method, path, headers, body, query_params):
             return json_response({"message": "unknown token"}, status=404)
         container = _TOKEN_TO_CONTAINER[token]
         task = _TASKS[arn]
-        containers = list(task.get("Containers", []))
-
-    # Resolved outside _LOCK: the ecs service takes its own per-task locks, and
-    # holding this one across that call would be a lock-order inversion.
-    status = _live_status(arn)
 
     rest = (m.group("rest") or "").rstrip("/")
     if rest == "":
-        return json_response(_with_status(container, status, container=True))
+        return json_response(container)
     if rest == "/task":
-        task = _with_status(task, status)
-        task["Containers"] = [
-            _with_status(c, status, container=True) for c in containers
-        ]
         return json_response(task)
     if rest in ("/stats", "/task/stats"):
         return json_response({})

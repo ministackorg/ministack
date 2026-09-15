@@ -948,6 +948,165 @@ def _create_basic_cluster(eks):
     return cn
 
 
+def test_eks_pod_identity_association_lifecycle(eks):
+    """EKS Pod Identity: the five operations a controller reading pod identity
+    needs. Create returns the full association, List the six-field summary,
+    Describe the record, Update the mutable members, and Delete answers with
+    the association it removed."""
+    cn = _create_basic_cluster(eks)
+    role = f"arn:aws:iam::000000000000:role/lbc-{_uid()}"
+    try:
+        created = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system",
+            serviceAccount="aws-load-balancer-controller",
+            roleArn=role, tags={"team": "platform"},
+        )["association"]
+        assoc_id = created["associationId"]
+        assert created["clusterName"] == cn
+        assert created["namespace"] == "kube-system"
+        assert created["serviceAccount"] == "aws-load-balancer-controller"
+        assert created["roleArn"] == role
+        assert created["tags"] == {"team": "platform"}
+        assert created["associationArn"] == (
+            f"arn:aws:eks:{REGION}:000000000000:podidentityassociation/{cn}/{assoc_id}")
+        assert created["createdAt"] == created["modifiedAt"]
+
+        described = eks.describe_pod_identity_association(
+            clusterName=cn, associationId=assoc_id)["association"]
+        assert described["roleArn"] == role
+
+        # The list shape is the summary, not the whole association.
+        listed = eks.list_pod_identity_associations(clusterName=cn)["associations"]
+        assert len(listed) == 1
+        assert set(listed[0]) == {
+            "clusterName", "namespace", "serviceAccount",
+            "associationArn", "associationId", "ownerArn",
+        }
+
+        updated = eks.update_pod_identity_association(
+            clusterName=cn, associationId=assoc_id, roleArn=role + "-v2")["association"]
+        assert updated["roleArn"] == role + "-v2"
+        # namespace and serviceAccount are not members of the update request.
+        assert updated["namespace"] == "kube-system"
+        assert updated["serviceAccount"] == "aws-load-balancer-controller"
+
+        deleted = eks.delete_pod_identity_association(
+            clusterName=cn, associationId=assoc_id)["association"]
+        assert deleted["associationId"] == assoc_id
+        assert eks.list_pod_identity_associations(clusterName=cn)["associations"] == []
+        with pytest.raises(ClientError) as e:
+            eks.describe_pod_identity_association(clusterName=cn, associationId=assoc_id)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_associations_go_with_the_cluster(eks):
+    """A recreated cluster must not inherit the previous one's associations."""
+    cn = _create_basic_cluster(eks)
+    eks.create_pod_identity_association(
+        clusterName=cn, namespace="default", serviceAccount="app",
+        roleArn=f"arn:aws:iam::000000000000:role/pod-{_uid()}",
+    )
+    assert eks.list_pod_identity_associations(clusterName=cn)["associations"]
+
+    eks.delete_cluster(name=cn)
+    eks.create_cluster(name=cn, roleArn="arn:aws:iam::000000000000:role/eks",
+                       resourcesVpcConfig={"subnetIds": ["subnet-1"]})
+    try:
+        assert eks.list_pod_identity_associations(clusterName=cn)["associations"] == []
+    finally:
+        eks.delete_cluster(name=cn)
+
+
+def test_eks_pod_identity_association_list_filters(eks):
+    """ListPodIdentityAssociations filters on namespace and serviceAccount,
+    the two query parameters the operation takes."""
+    cn = _create_basic_cluster(eks)
+    role = "arn:aws:iam::000000000000:role/r"
+    try:
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="lbc", roleArn=role)
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="apps", serviceAccount="web", roleArn=role)
+
+        by_ns = eks.list_pod_identity_associations(
+            clusterName=cn, namespace="apps")["associations"]
+        assert [a["serviceAccount"] for a in by_ns] == ["web"]
+        by_sa = eks.list_pod_identity_associations(
+            clusterName=cn, serviceAccount="lbc")["associations"]
+        assert [a["namespace"] for a in by_sa] == ["kube-system"]
+        assert len(eks.list_pod_identity_associations(clusterName=cn)["associations"]) == 2
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_association_duplicate_and_missing(eks):
+    """One association per namespace and service account, and an unknown
+    cluster or association id is ResourceNotFoundException."""
+    cn = _create_basic_cluster(eks)
+    role = "arn:aws:iam::000000000000:role/r"
+    try:
+        eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="dup", roleArn=role)
+        with pytest.raises(ClientError) as e:
+            eks.create_pod_identity_association(
+                clusterName=cn, namespace="kube-system", serviceAccount="dup", roleArn=role)
+        assert e.value.response["Error"]["Code"] == "ResourceInUseException"
+
+        with pytest.raises(ClientError) as e:
+            eks.describe_pod_identity_association(clusterName=cn, associationId="a-nope")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as e:
+            eks.list_pod_identity_associations(clusterName=f"no-such-{_uid()}")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as e:
+            eks.create_pod_identity_association(
+                clusterName=f"no-such-{_uid()}", namespace="n",
+                serviceAccount="s", roleArn=role)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
+def test_eks_pod_identity_association_target_role_gets_an_external_id(eks):
+    """A target role makes the association role-chaining, and AWS mints the
+    externalId its trust policy matches on."""
+    cn = _create_basic_cluster(eks)
+    try:
+        assoc = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="chained",
+            roleArn="arn:aws:iam::000000000000:role/source",
+            targetRoleArn="arn:aws:iam::000000000000:role/target",
+            disableSessionTags=True,
+        )["association"]
+        assert assoc["targetRoleArn"] == "arn:aws:iam::000000000000:role/target"
+        assert assoc["externalId"]
+        assert assoc["disableSessionTags"] is True
+
+        plain = eks.create_pod_identity_association(
+            clusterName=cn, namespace="kube-system", serviceAccount="plain",
+            roleArn="arn:aws:iam::000000000000:role/source")["association"]
+        assert "externalId" not in plain
+        assert plain["disableSessionTags"] is False
+    finally:
+        try:
+            eks.delete_cluster(name=cn)
+        except Exception:
+            pass
+
+
 def test_eks_access_entry_create_describe_delete(eks):
     cn = _create_basic_cluster(eks)
     principal = f"arn:aws:iam::000000000000:user/test-{_uid()}"
@@ -1015,7 +1174,11 @@ def test_eks_access_entry_list_returns_principal_arns(eks):
         eks.create_access_entry(clusterName=cn, principalArn=p1)
         eks.create_access_entry(clusterName=cn, principalArn=p2)
         listed = eks.list_access_entries(clusterName=cn)["accessEntries"]
-        assert set(listed) == {p1, p2}
+        # The creator's entry is there too: AWS sets the cluster creator as a
+        # cluster admin access entry at creation time, which is what makes it
+        # listable and revocable.
+        assert {p1, p2} <= set(listed)
+        assert "arn:aws:iam::000000000000:root" in listed
     finally:
         try:
             eks.delete_cluster(name=cn)
@@ -1439,21 +1602,42 @@ def _auth_token(key="test", secret="test", session=None, name=_AUTH_CLUSTER, sig
     return "k8s-aws-v1." + base64.urlsafe_b64encode(request.url.encode()).decode().rstrip("=")
 
 
+# The webhook URL's shared secret; only the kubeconfig written into the k3s
+# container carries it, so a caller who merely reaches the gateway cannot use
+# the endpoint to probe whether a token is valid.
+_AUTH_WEBHOOK_SECRET = "test-webhook-secret-000000000000"
+
+
 def _auth_cluster(account=_AUTH_ACCOUNT, creator=None, bootstrap=True):
-    eks_service._clusters.set_scoped(account, _AUTH_REGION, _AUTH_CLUSTER, {
+    cluster = {
         "arn": f"arn:aws:eks:{_AUTH_REGION}:{account}:cluster/{_AUTH_CLUSTER}",
         "roleArn": f"arn:aws:iam::{account}:role/control-plane",
         "_creator_arn": creator,
         "accessConfig": {"bootstrapClusterCreatorAdminPermissions": bootstrap},
-    })
+        "_auth_token": _AUTH_WEBHOOK_SECRET,
+    }
+    eks_service._clusters.set_scoped(account, _AUTH_REGION, _AUTH_CLUSTER, cluster)
+    # CreateCluster mints the creator's access entry; these records are built
+    # straight into the store, so do what that path does.
+    with request_scope(account, _AUTH_REGION):
+        eks_service._bootstrap_creator_access_entry(_AUTH_CLUSTER, cluster, creator)
+
+
+def _auth_token_for(account, region, name):
+    """The cluster's webhook secret, the way k3s reads it from its kubeconfig."""
+    cluster = eks_service._clusters.get_scoped(account, region, name) or {}
+    # A cluster that does not exist has no secret; keep the URL well formed so
+    # the request still reaches the handler and is refused on the lookup.
+    return cluster.get("_auth_token") or _AUTH_WEBHOOK_SECRET
 
 
 def _auth_review(bearer, account=_AUTH_ACCOUNT, name=_AUTH_CLUSTER):
     # Real k3s requests carry no AWS credentials; deliberately use the default
     # request account even when authenticating to a different tenant's cluster.
+    secret = _auth_token_for(account, _AUTH_REGION, name)
     with request_scope(_AUTH_ACCOUNT, "us-east-1"):
         status, _, body = asyncio.run(app._dispatch_service_request(
-            "POST", f"/eks-auth/{account}/{_AUTH_REGION}/{name}", {},
+            "POST", f"/_ministack/eks-auth/{account}/{_AUTH_REGION}/{name}/{secret}", {},
             json.dumps({"apiVersion": "authentication.k8s.io/v1", "spec": {"token": bearer}}).encode(),
             {}, "review-test",
         ))
@@ -1484,16 +1668,21 @@ def test_eks_token_review_authenticates_root_exec_token(eks_mod, monkeypatch):
     import ministack.app as app
     monkeypatch.setattr(app, "AUTH", True)
     name = f"auth-{_uid()}"
-    eks_mod._clusters[name] = {
+    creator = "arn:aws:iam::000000000000:root"
+    cluster = {
         "arn": f"arn:aws:eks:{REGION}:000000000000:cluster/{name}",
         "roleArn": "arn:aws:iam::000000000000:role/eks-role",
-        "_creator_arn": "arn:aws:iam::000000000000:root",
+        "_creator_arn": creator,
+        "_auth_token": _AUTH_WEBHOOK_SECRET,
     }
+    eks_mod._clusters[name] = cluster
+    eks_mod._bootstrap_creator_access_entry(name, cluster, creator)
     token = _eks_exec_token(name)
     status, _headers, response = _eks_direct(
         eks_mod,
         "POST",
-        f"/eks-auth/000000000000/{REGION}/{name}",
+        f"/_ministack/eks-auth/000000000000/{REGION}/{name}/"
+        f"{_auth_token_for('000000000000', REGION, name)}",
         {
             "apiVersion": "authentication.k8s.io/v1",
             "kind": "TokenReview",
@@ -1503,7 +1692,9 @@ def test_eks_token_review_authenticates_root_exec_token(eks_mod, monkeypatch):
     assert status == 200
     assert response["status"]["authenticated"] is True
     assert response["status"]["user"]["username"] == "arn:aws:iam::000000000000:root"
-    assert "system:masters" in response["status"]["user"]["groups"]
+    groups = response["status"]["user"]["groups"]
+    assert "system:masters" not in groups
+    assert any(g.startswith("ministack:eks:access:") for g in groups)
 
 
 def test_eks_token_review_rejects_wrong_cluster_and_tampering(eks_mod, monkeypatch):
@@ -1520,7 +1711,8 @@ def test_eks_token_review_rejects_wrong_cluster_and_tampering(eks_mod, monkeypat
         status, _headers, response = _eks_direct(
             eks_mod,
             "POST",
-            f"/eks-auth/000000000000/{REGION}/{name}",
+            f"/_ministack/eks-auth/000000000000/{REGION}/{name}/"
+        f"{_auth_token_for('000000000000', REGION, name)}",
             {"spec": {"token": candidate}},
         )
         assert status == 200
@@ -1596,9 +1788,24 @@ def test_eks_auth_create_records_actual_caller_and_honors_bootstrap(eks_auth_env
 def test_eks_auth_root_does_not_get_other_accounts_bootstrap_access(eks_auth_env):
     _auth_cluster(_AUTH_OTHER_ACCOUNT, creator=f"arn:aws:iam::{_AUTH_OTHER_ACCOUNT}:root")
     assert _auth_review(_auth_token(), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
-    assert _auth_review(_auth_token(_AUTH_OTHER_ACCOUNT), _AUTH_OTHER_ACCOUNT)["user"]["groups"] == [
-        "system:authenticated", "system:masters",
-    ]
+    # The creator authorizes through its own access entry and the materialized
+    # AmazonEKSClusterAdminPolicy group, not through system:masters.
+    groups = _auth_review(_auth_token(_AUTH_OTHER_ACCOUNT), _AUTH_OTHER_ACCOUNT)["user"]["groups"]
+    assert groups[0] == "system:authenticated"
+    assert "system:masters" not in groups
+    assert any(g.startswith("ministack:eks:access:") for g in groups)
+
+
+def test_eks_delete_cluster_takes_its_access_entries_with_it(eks_auth_env):
+    """A recreated cluster must not inherit the previous one's grants."""
+    _auth_cluster(creator=f"arn:aws:iam::{_AUTH_ACCOUNT}:root")
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        prefix = f"{_AUTH_CLUSTER}\x00"
+        assert [k for k in eks_service._access_entries if str(k).startswith(prefix)]
+        assert [k for k in eks_service._access_policies if str(k).startswith(prefix)]
+        eks_service._delete_cluster(_AUTH_CLUSTER)
+        assert not [k for k in eks_service._access_entries if str(k).startswith(prefix)]
+        assert not [k for k in eks_service._access_policies if str(k).startswith(prefix)]
 
 
 def test_eks_auth_nondefault_sts_session_and_role_path_access_entry(eks_auth_env):
@@ -1771,4 +1978,7 @@ def test_eks_auth_background_webhook_preserves_account_and_region(eks_auth_env, 
         status, _, _ = eks_service._create_cluster({"name": _AUTH_CLUSTER, "roleArn": iam._roles["control-plane"]["Arn"]})
     assert status == 200
     assert finished.wait(3)
-    assert f"/eks-auth/{_AUTH_OTHER_ACCOUNT}/{_AUTH_REGION}/{_AUTH_CLUSTER}" in captured["webhook"]
+    assert f"/_ministack/eks-auth/{_AUTH_OTHER_ACCOUNT}/{_AUTH_REGION}/{_AUTH_CLUSTER}/" in captured["webhook"]
+    # The secret is in the URL only k3s receives, and it is not guessable.
+    secret = captured["webhook"].split(f"/{_AUTH_CLUSTER}/", 1)[1].split("\n", 1)[0].strip()
+    assert len(secret) >= 16

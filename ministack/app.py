@@ -2172,7 +2172,7 @@ async def _dispatch_service_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
 ):
     """Dispatch AWS service requests and Kubernetes TokenReviews."""
-    if method == "POST" and path.startswith("/eks-auth/"):
+    if method == "POST" and path.startswith("/_ministack/eks-auth/"):
         # TokenReview carries its own credentials; EKS authenticates the token.
         return await _get_module("eks").handle_request(
             method, path, headers, body, query_params

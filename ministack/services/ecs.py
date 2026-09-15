@@ -101,11 +101,11 @@ _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
-# A task that is registered but not stopped, in task-lifecycle order. A
-# PENDING or ACTIVATING task already counts against a service's desired
-# capacity, so reconciliation must not launch a second one while its images
-# are still pulling.
-_PRE_STOP_STATUSES = ("PENDING", "ACTIVATING", "RUNNING")
+# A task that is registered but not stopped, in task-lifecycle order. A task in
+# any starting state already counts against a service's desired capacity, so
+# reconciliation must not launch a second one while its images are still
+# pulling.
+_PRE_STOP_STATUSES = ("PROVISIONING", "PENDING", "ACTIVATING", "RUNNING")
 
 
 def _live_container_ids():
@@ -1267,11 +1267,10 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
-    # Seeded from the record, not from a literal: the endpoint overlays the
-    # live status on every read, so a literal here would only ever be read for
-    # a task that no longer has one, and it would be wrong then too.
+    # Seeded from the record, not a literal: the task is not RUNNING yet here.
+    # Later transitions are pushed by _mark_task_activating/_running/_stopped.
     desired, known, per_container = (
-        metadata_task_status(task_arn) or ("RUNNING", "PENDING", {})
+        _task_status_snapshot(task_arn) or ("RUNNING", "PENDING", {})
     )
     container_known = per_container.get(cdef["name"]) or known
     ecs_metadata.register_container(
@@ -1450,26 +1449,12 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
-def metadata_task_status(task_arn):
-    """Status for the task metadata endpoint, or None when the task is gone.
+def _task_status_snapshot(task_arn):
+    """``(desiredStatus, lastStatus, {container name: lastStatus})``, or None.
 
-    Returns ``(desiredStatus, lastStatus, {container name: lastStatus})``. The
-    endpoint reports a task's status, and a task's status changes after the
-    metadata is registered: it is `PENDING` when `RunTask` answers, `ACTIVATING`
-    for the pull and `RUNNING` once the container is up. Serving the record
-    rather than a value captured at registration is what keeps
-    `${ECS_CONTAINER_METADATA_URI_V4}/task` agreeing with `DescribeTasks`.
-
-    A container's own status is carried separately because the two really do
-    differ: a live Fargate task served `"KnownStatus": "NONE"` for the task and
-    `"KnownStatus": "RUNNING"` for the container in the same payload, read by
-    the container itself while it was starting. `DesiredStatus` is the task's
-    on both, which is what flips to STOPPED when the task is being shut down.
-
-    The lookup is scoped by the account and the region in the task ARN, not by
-    the request's: a container reaches this endpoint with a path token and no
-    SigV4, so the request resolves under the default account and region
-    whatever the task was created under.
+    Seeds the metadata payloads at registration. Scoped by the ARN's account and
+    region, not the request's: the endpoint is reached with a path token and no
+    SigV4, so the request resolves under the defaults.
     """
     try:
         spec = parse_arn(task_arn)
@@ -1542,22 +1527,68 @@ def _cleanup_task_resources(task, docker_client, extra_container=None):
             _remove_docker_container(docker_client, docker_id)
 
 
+# The downward half of the lifecycle, and whether each state raises an event.
+# A Fargate task polled through DescribeTasks read 4 with lastStatus still
+# RUNNING and desiredStatus STOPPED, 5 at DEPROVISIONING and 6 at STOPPED, so
+# DEACTIVATING and STOPPING pass through without moving the counter.
+_STOP_SEQUENCE = (("DEACTIVATING", False), ("STOPPING", False),
+                  ("DEPROVISIONING", True), ("STOPPED", True))
+
+
 def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        # desiredStatus flips first and counts, while lastStatus is still what
+        # it was: that is the change a consumer polls for to learn the task is
+        # being shut down.
         _bump_task_version(task)
-        task["lastStatus"] = "STOPPED"
         task["desiredStatus"] = "STOPPED"
         task["stoppingAt"] = task.get("stoppingAt") or now
+        for state, counts in _STOP_SEQUENCE:
+            if counts:
+                _bump_task_version(task)
+            task["lastStatus"] = state
         task["stoppedAt"] = now
+        # "The Unix timestamp for the time when the task execution stopped" —
+        # the containers stop before the task reaches STOPPED, so it is set here
+        # and never later than stoppedAt.
+        task["executionStoppedAt"] = task.get("executionStoppedAt") or now
         task["stoppedReason"] = reason
         task["stopCode"] = stop_code
         for container in task.get("containers", []):
             container["lastStatus"] = "STOPPED"
             if exit_code is not None:
                 container["exitCode"] = exit_code
+
+    ecs_metadata.set_task_status(
+        task_arn, known_status="STOPPED", desired_status="STOPPED"
+    )
+    ecs_metadata.set_all_container_status(task_arn, "STOPPED")
+
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name:
+        _recount_cluster(cluster_name)
+        _refresh_service_state(cluster_name, task.get("group", ""))
+    return True
+
+
+def _mark_task_pending(task_arn, task):
+    """Move a registered task to PENDING, where it waits on the agent.
+
+    "PENDING: This is a transition state where Amazon ECS is waiting on the
+    container agent to take further action" (task-lifecycle): the state between
+    PROVISIONING, where the task is placed, and ACTIVATING, where its images
+    are pulled.
+    """
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        _bump_task_version(task)
+        task["lastStatus"] = "PENDING"
+
+    ecs_metadata.set_task_status(task_arn, known_status="PENDING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1573,15 +1604,18 @@ def _mark_task_activating(task_arn, task):
     additional steps after the task is launched but before the task can
     transition to the RUNNING state. This is the state where Amazon ECS pulls
     the container images, creates the containers, configures the task
-    networking, registers load balancer target groups" (task-lifecycle). The
-    task sits PENDING only until its worker picks it up.
+    networking, registers load balancer target groups" (task-lifecycle).
     """
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
-        _bump_task_version(task)
+        # No version bump: a real task polled through DescribeTasks reads 1 at
+        # PROVISIONING, 2 at PENDING and 3 at RUNNING, so ACTIVATING raises no
+        # state-change event of its own.
         task["lastStatus"] = "ACTIVATING"
         task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
+
+    ecs_metadata.set_task_status(task_arn, known_status="ACTIVATING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1603,6 +1637,8 @@ def _mark_task_running(task_arn, task):
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
 
+    ecs_metadata.set_task_status(task_arn, known_status="RUNNING")
+
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
         _recount_cluster(cluster_name)
@@ -1622,6 +1658,8 @@ def _attach_started_container(task, container, index, metadata_token, ecs_networ
             task["containers"][index]["lastStatus"] = "RUNNING"
 
     ecs_metadata.set_docker_id(metadata_token, container_id)
+    # The container's own KnownStatus, not the task's: AWS reports them apart.
+    ecs_metadata.set_container_status(metadata_token, "RUNNING")
     _record_task_ip(task, container, ecs_network)
     logger.info("ECS: started container %s for task %s", container_id, task_arn[:8])
     return True
@@ -1694,6 +1732,8 @@ def _start_task_worker(task, td, container_overrides, docker_client):
     cluster_arn = task["clusterArn"]
     launch_type = task.get("launchType", "EC2")
 
+    if not _mark_task_pending(task_arn, task):
+        return
     if not _mark_task_activating(task_arn, task):
         return
 
@@ -1824,12 +1864,12 @@ def _run_task(data):
     req_tags = data.get("tags", [])
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
-    initial_status = "PENDING" if docker_backed else "RUNNING"
-    # The network mode decides whether a task reports an ENI attachment at all,
-    # and the subnet is one of the members that attachment carries. Both are read
-    # when the container comes up, so they ride on the record until then.
+    # Read when the container comes up, so both ride on the record until then.
     network_mode = td.get("networkMode")
     subnet = _requested_subnet(data)
+    # "PROVISIONING: Amazon ECS has to perform additional steps before the task
+    # is launched" (task-lifecycle), for every task, whatever its network mode.
+    initial_status = "PROVISIONING" if docker_backed else "RUNNING"
 
     tasks = []
     failures = []

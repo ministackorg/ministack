@@ -310,7 +310,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # POST /v2/email/outbound-emails  (SendEmail)
     if sub == "/outbound-emails" and method == "POST":
-        msg_id = f"ministack-{new_uuid()}"
+        msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
@@ -413,7 +413,7 @@ async def handle_request(method, path, headers, body, query_params):
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
             body_html = rendered.get("Html", "")
-            msg_id = f"ministack-{new_uuid()}"
+            msg_id = f"{new_uuid()}@email.amazonses.com"
 
             all_addrs = to_addrs + cc_addrs + bcc_addrs
             if source and all_addrs:

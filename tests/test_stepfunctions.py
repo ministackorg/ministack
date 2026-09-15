@@ -3849,7 +3849,7 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert "taskArn" in task_out
     assert "containers" in task_out
     assert task_out["containers"][0]["name"] == "app"
-    assert task_out["lastStatus"] in ("PENDING", "RUNNING")
+    assert task_out["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
     assert "failures" in output
 
 def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):

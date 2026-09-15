@@ -160,57 +160,55 @@ def test_trailing_slash_on_root_is_tolerated():
     assert body["Name"] == "web"
 
 
-def test_status_follows_the_task_record():
-    """The endpoint follows the task record instead of always saying RUNNING.
-
-    A container reads ${ECS_CONTAINER_METADATA_URI_V4}/task while it is
-    starting, which since the async start is the whole image pull. Reporting
-    RUNNING there contradicts DescribeTasks for the length of that pull.
-    """
-    from ministack.services import ecs
-
+def test_status_is_pushed_onto_the_payload_as_the_task_moves():
+    """The endpoint reports the task's status instead of always saying RUNNING."""
     arn = "arn:aws:ecs:us-east-1:000000000000:task/c/statusprobe01"
-    task = {
-        "taskArn": arn,
-        "desiredStatus": "RUNNING",
-        "lastStatus": "PENDING",
-        "containers": [{"name": "probe", "lastStatus": "PENDING"}],
-    }
-    ecs._tasks[arn] = task
     _register("statusprobetoken01", arn, "probe", KnownStatus="PENDING")
-    try:
-        for status in ("PENDING", "ACTIVATING", "RUNNING"):
-            task["lastStatus"] = status
-            _, body = _call("GET", "/v4/statusprobetoken01/task")
-            assert body["KnownStatus"] == status
 
-        # A container's KnownStatus is its own, not the task's: on AWS a
-        # starting task serves "NONE" for itself and "RUNNING" for the
-        # container that is reading the endpoint.
-        task["lastStatus"] = "ACTIVATING"
-        task["containers"][0]["lastStatus"] = "RUNNING"
+    for status in ("PENDING", "ACTIVATING", "RUNNING"):
+        ecs_metadata.set_task_status(arn, known_status=status)
         _, body = _call("GET", "/v4/statusprobetoken01/task")
-        assert body["KnownStatus"] == "ACTIVATING"
-        assert body["Containers"][0]["KnownStatus"] == "RUNNING"
-        assert _call("GET", "/v4/statusprobetoken01")[1]["KnownStatus"] == "RUNNING"
+        assert body["KnownStatus"] == status
 
-        # desiredStatus is the task's on both, which is what a container polls
-        # to find out it is being shut down.
-        task["desiredStatus"] = "STOPPED"
-        _, body = _call("GET", "/v4/statusprobetoken01/task")
-        assert body["DesiredStatus"] == "STOPPED"
-        assert body["Containers"][0]["DesiredStatus"] == "STOPPED"
-        assert _call("GET", "/v4/statusprobetoken01")[1]["DesiredStatus"] == "STOPPED"
+    # On AWS a starting task serves "NONE" for itself and "RUNNING" for the
+    # container reading the endpoint, in one payload.
+    ecs_metadata.set_task_status(arn, known_status="ACTIVATING")
+    ecs_metadata.set_container_status("statusprobetoken01", "RUNNING")
+    _, body = _call("GET", "/v4/statusprobetoken01/task")
+    assert body["KnownStatus"] == "ACTIVATING"
+    assert body["Containers"][0]["KnownStatus"] == "RUNNING"
+    assert _call("GET", "/v4/statusprobetoken01")[1]["KnownStatus"] == "RUNNING"
 
-        # The overlay is applied to a copy. The registry dicts are shared by
-        # every sibling container of a task, so writing the live status into
-        # them would make one read change what the next one serves. Reading the
-        # response back cannot show this, since json.loads already copies:
-        # assert on the registry itself.
-        assert ecs_metadata._TASKS[arn]["KnownStatus"] == "RUNNING"
-        assert ecs_metadata._TOKEN_TO_CONTAINER["statusprobetoken01"]["KnownStatus"] == "PENDING"
-    finally:
-        ecs._tasks.pop(arn, None)
+    # DesiredStatus is the task's on both.
+    ecs_metadata.set_task_status(arn, desired_status="STOPPED")
+    _, body = _call("GET", "/v4/statusprobetoken01/task")
+    assert body["DesiredStatus"] == "STOPPED"
+    assert body["Containers"][0]["DesiredStatus"] == "STOPPED"
+    assert _call("GET", "/v4/statusprobetoken01")[1]["DesiredStatus"] == "STOPPED"
+    # ... and it did not drag the container's KnownStatus with it.
+    assert body["Containers"][0]["KnownStatus"] == "RUNNING"
+
+
+def test_stop_pushes_every_container_to_stopped():
+    """The stop path moves every container of the task at once."""
+    arn = "arn:aws:ecs:us-east-1:000000000000:task/c/stopprobe01"
+    _register("stopprobetoken01", arn, "web")
+    _register("stopprobetoken02", arn, "sidecar")
+
+    ecs_metadata.set_task_status(arn, known_status="STOPPED", desired_status="STOPPED")
+    ecs_metadata.set_all_container_status(arn, "STOPPED")
+
+    _, body = _call("GET", "/v4/stopprobetoken01/task")
+    assert body["KnownStatus"] == "STOPPED"
+    assert [c["KnownStatus"] for c in body["Containers"]] == ["STOPPED", "STOPPED"]
+
+
+def test_a_push_for_an_unregistered_task_is_a_no_op():
+    """A task whose tokens are already unregistered must not resurrect an entry."""
+    ecs_metadata.set_task_status("arn:aws:ecs:us-east-1:000000000000:task/c/none", known_status="STOPPED")
+    ecs_metadata.set_all_container_status("arn:aws:ecs:us-east-1:000000000000:task/c/none", "STOPPED")
+    ecs_metadata.set_container_status("no-such-token", "STOPPED")
+    assert ecs_metadata._TASKS == {}
 
 
 def test_status_falls_back_to_what_was_registered_when_the_task_is_gone():
@@ -221,14 +219,8 @@ def test_status_falls_back_to_what_was_registered_when_the_task_is_gone():
     assert body["Containers"][0]["KnownStatus"] == "ACTIVATING"
 
 
-def test_status_finds_a_task_outside_the_default_account_and_region():
-    """The lookup is keyed off the task ARN, not off the request.
-
-    A container reaches this endpoint with a path token and no SigV4, so the
-    request resolves under the default account and region. Keying the task
-    store on those would miss every task created anywhere else, and the
-    endpoint would silently fall back to what it registered.
-    """
+def test_seeding_finds_a_task_outside_the_default_account_and_region():
+    """The seed is keyed off the task ARN, not the request, which carries no SigV4."""
     from ministack.services import ecs
 
     account, region = "111122223333", "eu-central-1"
@@ -239,10 +231,18 @@ def test_status_finds_a_task_outside_the_default_account_and_region():
         "lastStatus": "ACTIVATING",
         "containers": [{"name": "probe", "lastStatus": "PENDING"}],
     })
-    _register("otherprobetoken01", arn, "probe")
     try:
-        _, body = _call("GET", "/v4/otherprobetoken01/task")
-        assert body["KnownStatus"] == "ACTIVATING"
-        assert body["Containers"][0]["KnownStatus"] == "PENDING"
+        assert ecs._task_status_snapshot(arn) == (
+            "RUNNING", "ACTIVATING", {"probe": "PENDING"},
+        )
     finally:
         ecs._tasks.pop_scoped(account, region, arn, None)
+
+
+def test_seeding_returns_none_for_an_unparseable_or_missing_task():
+    from ministack.services import ecs
+
+    assert ecs._task_status_snapshot("not-an-arn") is None
+    assert ecs._task_status_snapshot(
+        "arn:aws:ecs:us-east-1:000000000000:task/c/absent01"
+    ) is None
