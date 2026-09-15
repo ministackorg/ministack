@@ -52,6 +52,7 @@ def generate_ca(
     org_name: str = "Ministack",
     common_name: str = "Ministack Local CA",
     days_valid: int = 3650,
+    key_type: str = "ec256",
 ) -> tuple[str, str]:
     """Create a fresh self-signed root CA.
 
@@ -59,13 +60,24 @@ def generate_ca(
         org_name: Organization name for the CA subject.
         common_name: Common name for the CA subject.
         days_valid: Validity period in days.
+        key_type: ``"ec256"`` (default) or ``"rsa2048"``. P-256 because this
+            runs on a boot path: RSA-2048 keygen costs ~80 ms and holds the
+            GIL for all of it (the Rust layer does not release it), so it
+            stalls the event loop even from a worker thread. What the CA
+            signs is unaffected — a device certificate is still RSA-2048,
+            which is what AWS issues.
 
     Returns:
         Tuple ``(cert_pem, key_pem)`` as UTF-8 strings.
     """
     _require_crypto()
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    if key_type == "ec256":
+        key = ec.generate_private_key(ec.SECP256R1())
+    elif key_type == "rsa2048":
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    else:
+        raise ValueError(f"Unsupported key_type: {key_type!r}")
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, org_name),
         x509.NameAttribute(NameOID.COMMON_NAME, common_name),

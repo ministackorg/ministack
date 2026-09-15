@@ -30,14 +30,27 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
-_VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
-if _VERSION == "dev":
-    try:
-        from importlib.metadata import version as _pkg_version
+_VERSION = os.environ.get("MINISTACK_VERSION") or ""
 
-        _VERSION = _pkg_version("ministack")
-    except Exception:
-        pass
+
+def _version() -> str:
+    """The reported version, resolved on first ask and cached.
+
+    The published images set MINISTACK_VERSION, so this only reaches for the
+    installed distribution's metadata on a `pip install` — and importing
+    `importlib.metadata` to answer a question nobody may ask costs 4 MiB of
+    heap and ~11 ms of import, on every boot, for one string in
+    /_ministack/health.
+    """
+    global _VERSION
+    if not _VERSION:
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _VERSION = _pkg_version("ministack")
+        except Exception:
+            _VERSION = "dev"
+    return _VERSION
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
@@ -773,7 +786,7 @@ def _handle_health_request(path: str, request_id: str):
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
-                "version": _VERSION,
+                "version": _version(),
                 "ready_scripts": dict(_ready_scripts_state),
             }
         ).encode(),
@@ -1265,10 +1278,14 @@ async def _handle_post_body_shortcuts(
             logging.getLogger("cloudformation").warning("CFN ResponseURL PUT for unknown token %r — ignoring", token)
         return 200, {}, b""
 
-    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS)
-    from ministack.services.cloudformation import wait_conditions as _cfn_wc
+    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS).
+    # The prefix is spelled out rather than read off wait_conditions.SIGNAL_PATH
+    # so that matching it is what imports CloudFormation: an import above the
+    # check pulled the whole package — and, through its provisioners, appsync
+    # and graphql — into the first request to any service.
+    if method == "PUT" and path.startswith("/_ministack/cfn-signal/"):
+        from ministack.services.cloudformation import wait_conditions as _cfn_wc
 
-    if method == "PUT" and path.startswith(_cfn_wc.SIGNAL_PATH):
         token = path[len(_cfn_wc.SIGNAL_PATH) :]
         if not _cfn_wc.has_handle(token):
             logging.getLogger("cloudformation").warning("CFN wait condition signal for unknown token %r", token)
@@ -2474,6 +2491,21 @@ async def app(scope, receive, send):
 # ---------------------------------------------------------------------------
 
 
+# The boot task that imports iot and binds the mTLS MQTT listener. Kept so
+# lifespan.shutdown can join it before closing the listener.
+_iot_mtls_task = None
+
+
+async def _start_iot_mtls():
+    """Import the iot module and bind the mTLS MQTT listener."""
+    try:
+        from ministack.services import iot as _iot_svc
+
+        await _iot_svc.mtls_start()
+    except Exception as e:
+        logger.warning("IoT mTLS listener startup failed: %s", e)
+
+
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events."""
     while True:
@@ -2566,12 +2598,16 @@ async def _handle_lifespan(scope, receive, send):
             if _iot_mtls_env in ("0", "false", "no", "off"):
                 logger.debug("IOT_MTLS_ENABLED=%s — skipping iot module import.", _iot_mtls_env)
             else:
-                try:
-                    from ministack.services import iot as _iot_svc
-
-                    await _iot_svc.mtls_start()
-                except Exception as e:
-                    logger.warning("IoT mTLS listener startup failed: %s", e)
+                # Off the critical path: importing iot pulls cryptography.x509,
+                # and binding mints the broker certificate (and, on a fresh
+                # boot, the Local CA), which is RSA keygen. Measured together
+                # at ~180 ms of a ~190 ms startup with warm bytecode, and far
+                # more without. The listener comes up a moment after the HTTP
+                # port instead of before it; shutdown joins the task below
+                # before stopping the listener, so a boot that is torn down
+                # mid-bind still closes what it bound.
+                global _iot_mtls_task
+                _iot_mtls_task = asyncio.create_task(_start_iot_mtls())
             # Start DSQL wire proxies for clusters restored from persistence.
             # Guarded on the module already being loaded (i.e. it had state
             # or was used this boot) so we never import dsql just for this.
@@ -2615,6 +2651,11 @@ async def _handle_lifespan(scope, receive, send):
                 await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
+            if _iot_mtls_task is not None:
+                try:
+                    await _iot_mtls_task
+                except Exception as e:
+                    logger.debug("IoT mTLS startup error: %s", e)
             _iot_mod = sys.modules.get("ministack.services.iot")
             if _iot_mod is not None:
                 try:

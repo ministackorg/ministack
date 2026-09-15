@@ -7397,6 +7397,11 @@ def _mtls_ensure_server_cert() -> tuple[str, str]:
         common_name="Ministack IoT Broker",
         san_dns=dns_names,
         san_ips=ip_addresses,
+        # P-256, unlike the RSA-2048 device certificates AWS issues: this one
+        # is the listener's own TLS identity, not something a client reads
+        # back over an API, and minting it is on the boot path. See
+        # generate_ca for why keygen there is not free.
+        key_type="ec256",
     )
     set_mtls_server_cert(cert_pem, key_pem)
     _mtls_logger.info(

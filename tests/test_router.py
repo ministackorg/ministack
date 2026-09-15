@@ -4,6 +4,11 @@ Pure routing-layer tests — no boto3, no live server. Covers the path-based
 fallback (i.e. when neither X-Amz-Target nor a SigV4 credential scope is
 available to disambiguate the service).
 """
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from ministack.core.router import detect_service
@@ -474,3 +479,58 @@ def test_location_host_routes(host):
     assert detect_service(
         "POST", "/tracking/v0/trackers", {"host": host}, {}
     ) == "location"
+
+
+# ---------------------------------------------------------------------------
+# What a request pulls in
+# ---------------------------------------------------------------------------
+
+
+def test_first_request_does_not_import_cloudformation():
+    """A request to any service must not load the CloudFormation package.
+
+    The body-shortcut handler used to import `cloudformation.wait_conditions`
+    above the path check, so the first request to any service imported the
+    whole package — and, through its provisioners, appsync and graphql. A
+    subprocess, because the rest of the suite has imported everything already.
+    """
+    src = textwrap.dedent(
+        """
+        import asyncio, sys
+        from ministack.app import app
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            pass
+
+        for method in ("GET", "PUT", "POST"):
+            asyncio.run(app(
+                {"type": "http", "method": method, "path": "/",
+                 "query_string": b"", "headers": []},
+                receive, send,
+            ))
+        print(",".join(
+            m for m in ("ministack.services.cloudformation", "ministack.services.appsync", "graphql")
+            if m in sys.modules
+        ))
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", src],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={**os.environ, "IOT_MTLS_ENABLED": "0"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"request imported {proc.stdout.strip()}"
+
+
+def test_cfn_signal_prefix_matches_wait_conditions():
+    """The handler spells the prefix out to keep the import behind the check;
+    this is the guard against the literal drifting from the module."""
+    from ministack.services.cloudformation import wait_conditions
+
+    assert wait_conditions.SIGNAL_PATH == "/_ministack/cfn-signal/"
