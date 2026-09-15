@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **IAM — three calls are authorized against the action and resource AWS uses** — a Lambda Function URL invoke is checked against its function ARN, alias qualifier included, and supplies `lambda:FunctionUrlAuthType`, so the policy `grantInvokeUrl` writes matches. The WebSocket `@connections` API asks for `execute-api:ManageConnections` instead of `execute-api:Invoke`. `iot-jobs-data` operations are authorized under `iotjobsdata:`, except `StartCommandExecution`, which stays on `iot:`. A policy written for the old action names stops matching, as on AWS. Contributed by @iot-rocket.
+
 ## [1.5.12] — 2026-09-15
 
 ### Added

@@ -72,7 +72,11 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "inspector2": "inspector2",
     "iot": "iot",
     "iot-data": "iot",
-    "iot-jobs-data": "iot",
+    # The jobs data plane has its own IAM namespace. AWS authorizes the four
+    # HTTP job-execution operations as iotjobsdata:..., and a grant of the
+    # same operation name under iot: does not carry them. The
+    # fifth operation in that model is the exception below.
+    "iot-jobs-data": "iotjobsdata",
     "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
@@ -112,6 +116,18 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "waf": "waf",
     "waf-regional": "waf-regional",
     "wafv2": "wafv2",
+}
+
+
+# The map above is keyed by service, so it moves every operation the service's
+# botocore model declares. Where AWS does not, the pair belongs here.
+# StartCommandExecution rides the jobs data-plane endpoint and model, but its
+# own API reference derives the permission from iot:StartCommandExecution, and
+# the Service Authorization Reference lists only the four job-execution
+# operations under iotjobsdata. Read by the generic REST route matcher only,
+# the tier every rest-json operation resolves through.
+_IAM_NAMESPACE_BY_OPERATION: dict[tuple[str, str], str] = {
+    ("iot-jobs-data", "StartCommandExecution"): "iot",
 }
 
 
@@ -668,7 +684,7 @@ def extract_iam_action(service: str, method: str, path: str,
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
-        return f"{namespace}:{action_name}"
+        return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)

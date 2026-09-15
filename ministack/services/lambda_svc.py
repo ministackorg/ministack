@@ -7856,10 +7856,17 @@ def _build_function_url_event(
 
 
 async def handle_function_url_request(
-    url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict
+    url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict,
+    resolved: tuple | None = None,
 ) -> tuple:
-    """Serve a Lambda Function URL data-plane request."""
-    resolved = resolve_function_url(url_id)
+    """Serve a Lambda Function URL data-plane request.
+
+    ``resolved`` is the tuple the IAM check in ``app.py`` already looked up
+    for ``url_id``, which spares a second scan over the Function URL config.
+    ``None`` falls back to resolving here.
+    """
+    if resolved is None:
+        resolved = resolve_function_url(url_id)
     if resolved is None:
         return error_response_json("ResourceNotFoundException", "Not Found", 404)
     account_id, region, func_name, qualifier, cfg = resolved

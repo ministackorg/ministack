@@ -909,13 +909,19 @@ def _sigv4_headers(credential_scope: str, host: str) -> dict:
 
 
 def _capture_enforced_arn(monkeypatch) -> dict:
-    """Record the resource ARN the data-plane check was handed, and allow."""
+    """Record the action and resource ARN the data-plane check was handed.
+
+    Always allows, so the call carries on into dispatch.
+    """
     import ministack.app as app
 
     seen: dict[str, str] = {}
 
-    def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*"):
+    def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
+                 service_context=None):
+        seen["action"] = iam_action
         seen["arn"] = resource_arn
+        seen["context"] = service_context
         return None
 
     monkeypatch.setattr(app, "_enforce_data_plane", _capture)
@@ -929,6 +935,63 @@ class _NoApiModule:
     @staticmethod
     def find_api_scope(api_id):
         return None
+
+    @staticmethod
+    async def handle_connections_api(method, api_id, stage, connection_id, body, headers):
+        return 200, {}, b""
+
+
+_NOTIFY_ARN = "arn:aws:lambda:eu-central-1:000000000000:function:notify"
+
+
+def _grant_invoke_url_statements():
+    """The two statements ``grantInvokeUrl`` writes, as aws-cdk-lib 2.260.0 does."""
+    return parse_policy_document({"Statement": [
+        {
+            "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl",
+            "Resource": _NOTIFY_ARN,
+            "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}},
+        },
+        {
+            "Effect": "Allow", "Action": "lambda:InvokeFunction",
+            "Resource": _NOTIFY_ARN,
+            "Condition": {"Bool": {"lambda:InvokedViaFunctionUrl": "true"}},
+        },
+    ]})
+
+
+def _function_url_eval_context(service_context: dict) -> EvalContext:
+    """A Function URL invoke as the evaluator sees it, keys lowered the way
+    ``enforce`` lowers what a handler passes."""
+    return EvalContext(
+        principal_arn="arn:aws:sts::000000000000:assumed-role/caller/session",
+        principal_type="AssumedRole", principal_account="000000000000",
+        action="lambda:InvokeFunctionUrl", resource_arn=_NOTIFY_ARN,
+        region="eu-central-1",
+        service_context={k.lower(): v for k, v in service_context.items()},
+    )
+
+
+def _function_url_module(resolved):
+    """Stands in for lambda_svc with one Function URL resolution. ``handled``
+    records what the handler was passed."""
+
+    class _Module:
+        handled: dict = {}
+
+        @staticmethod
+        def resolve_function_url(url_id):
+            return resolved
+
+        @staticmethod
+        async def handle_function_url_request(*args, **kwargs):
+            _Module.handled.update(kwargs)
+            return 200, {}, b""
+
+    return _Module
+
+
+_FUNCTION_URL_HOST = "3f2a1c4d-0b6e-4a58-9c71-8d5e2f0a1b93.lambda-url.eu-central-1.on.aws"
 
 
 class TestResourceArn:
@@ -1494,6 +1557,187 @@ class TestResourceArn:
             "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/$default/POST/commands/delete"
         )
 
+    # --- The WebSocket @connections API is its own action ---
+    @pytest.mark.parametrize("via_mapping", [False, True])
+    def test_connections_api_asks_for_manage_connections(self, monkeypatch, via_mapping):
+        """AWS authorizes @connections under execute-api:ManageConnections. It
+        asked for execute-api:Invoke, so a grantManageConnections policy, which
+        names only that action, could not match. Also through a base-path
+        mapping that names the stage."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        target = ("d9506af4", "dev", "/@connections/cid-1")
+        if via_mapping:
+            monkeypatch.setattr(app, "_parse_execute_api_url", lambda host, path: None)
+            monkeypatch.setattr(app, "_resolve_custom_domain_request", lambda host, path: target)
+        else:
+            monkeypatch.setattr(app, "_parse_execute_api_url", lambda host, path: target)
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+
+        asyncio.run(app._handle_execute_api_request(
+            "d9506af4.execute-api.eu-central-1.amazonaws.com",
+            "/dev/@connections/cid-1", "POST", {}, b"", {},
+        ))
+        assert seen["action"] == "execute-api:ManageConnections"
+        assert seen["arn"] == (
+            "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/dev/POST/@connections/cid-1"
+        )
+
+    @pytest.mark.parametrize("granted,status", [
+        ("execute-api:ManageConnections", 200),
+        ("execute-api:Invoke", 403),
+    ])
+    def test_a_manage_connections_grant_is_enforced_end_to_end(self, monkeypatch, granted, status):
+        """The grant grantManageConnections writes, through the real
+        _enforce_data_plane and enforce: it allows @connections, and an Invoke
+        grant on the same resource does not."""
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+
+        fake_key = "AKIATESTMANAGECONN1"
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "conn-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["conn-user"] = {
+            "UserName": "conn-user",
+            "Arn": "arn:aws:iam::000000000000:user/conn-user",
+            "UserId": "AIDACONN1", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["conn-user"] = {"p": json.dumps({"Statement": [{
+            "Effect": "Allow", "Action": granted,
+            "Resource": "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/*/*/@connections/*",
+        }]})}
+        monkeypatch.setattr(app, "AUTH", True)
+        monkeypatch.setattr(app, "_parse_execute_api_url",
+                            lambda host, path: ("d9506af4", "dev", "/@connections/cid-1"))
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+        headers = {"authorization": (
+            f"AWS4-HMAC-SHA256 Credential={fake_key}/20260101/eu-central-1/execute-api"
+            "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+        )}
+        try:
+            response = asyncio.run(app._handle_execute_api_request(
+                "d9506af4.execute-api.eu-central-1.amazonaws.com",
+                "/dev/@connections/cid-1", "POST", headers, b"", {},
+            ))
+        finally:
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("conn-user", None)
+            iam_svc._user_inline_policies.pop("conn-user", None)
+        assert response[0] == status
+
+    def test_a_plain_invoke_still_asks_for_invoke(self, monkeypatch):
+        """Nothing but @connections moves off execute-api:Invoke. Through the
+        handler, because that is where the branch is."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        monkeypatch.setattr(app, "_parse_execute_api_url",
+                            lambda host, path: ("d9506af4", "dev", "/commands/delete"))
+        monkeypatch.setattr(app, "_resolve_stage_and_path",
+                            lambda api_id, tentative, path: (tentative, path))
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+
+        asyncio.run(app._handle_execute_api_request(
+            "d9506af4.execute-api.eu-central-1.amazonaws.com",
+            "/dev/commands/delete", "POST", {}, b"", {},
+        ))
+        assert seen["action"] == "execute-api:Invoke"
+
+    # --- Lambda Function URLs ---
+    @pytest.mark.parametrize("resolved,arn,context", [
+        (("000000000000", "eu-central-1", "notify", None, {"AuthType": "AWS_IAM"}),
+         _NOTIFY_ARN, {"lambda:FunctionUrlAuthType": "AWS_IAM"}),
+        (("000000000000", "eu-central-1", "notify", "prod", {"AuthType": "NONE"}),
+         f"{_NOTIFY_ARN}:prod", {"lambda:FunctionUrlAuthType": "NONE"}),
+        (None, "*", {}),
+    ], ids=["function", "alias", "unknown"])
+    def test_function_url_is_authorized_against_its_function(self, monkeypatch, resolved, arn, context):
+        """lambda:InvokeFunctionUrl ran against "*", so a grant naming the
+        function, which is what grantInvokeUrl writes, never matched. A URL on
+        an alias carries the qualifier. The URL's AuthType is supplied as
+        lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl is not. An
+        id that resolves to nothing keeps "*" and no keys, so the lookup,
+        which runs before the caller is authorized, reports nothing about which
+        URLs exist. The handler reuses the resolution."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        module = _function_url_module(resolved)
+        monkeypatch.setattr(app, "_get_module", lambda name: module)
+
+        asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert seen["action"] == "lambda:InvokeFunctionUrl"
+        assert seen["arn"] == arn
+        assert seen["context"] == context
+        assert module.handled["resolved"] == resolved
+
+    def test_the_resolved_resource_and_key_reach_the_evaluator(self, monkeypatch):
+        """The tests above stub _enforce_data_plane, so they pin what the handler
+        resolved. _enforce_data_plane has to hand both on to enforce. With AUTH
+        off nothing reaches enforce and the URL is still served."""
+        import ministack.app as app
+        from ministack.core import iam_evaluator
+
+        seen: dict = {}
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
+            seen.update(action=iam_action, arn=resource_arn, context=service_context)
+            return None
+
+        monkeypatch.setattr(app, "AUTH", True)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        monkeypatch.setattr(app, "_get_module", lambda name: _function_url_module(
+            ("000000000000", "eu-central-1", "notify", None, {"AuthType": "NONE"})))
+
+        asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert seen == {"action": "lambda:InvokeFunctionUrl", "arn": _NOTIFY_ARN,
+                        "context": {"lambda:FunctionUrlAuthType": "NONE"}}
+
+        seen.clear()
+        monkeypatch.setattr(app, "AUTH", False)
+        response = asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert response[0] == 200
+        assert seen == {}
+
+    def test_the_function_url_handler_does_not_resolve_a_passed_resolution_again(self, monkeypatch):
+        from ministack.services import lambda_svc
+
+        def fail(url_id):
+            raise AssertionError("resolve_function_url must not run when resolved= is passed")
+
+        monkeypatch.setattr(lambda_svc, "resolve_function_url", fail)
+        status, _, body = asyncio.run(lambda_svc.handle_function_url_request(
+            "url-id", "GET", "/", {}, b"", {},
+            resolved=("000000000000", "eu-central-1", "no-such-fn", None, {"AuthType": "NONE"}),
+        ))
+        assert status == 404
+        assert b"no-such-fn" in body
+
+    def test_a_grant_invoke_url_policy_matches_an_aws_iam_url(self):
+        """End of the chain: the resource and the condition key together are
+        what make the policy the CDK writes match."""
+        ctx = _function_url_eval_context({"lambda:FunctionUrlAuthType": "AWS_IAM"})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "Allow"
+
+    def test_a_grant_invoke_url_policy_does_not_match_a_none_url(self):
+        """The negative case. A URL whose AuthType is NONE supplies NONE, the
+        StringEquals fails, and the statement does not match, which is what AWS
+        answers for the same pair."""
+        ctx = _function_url_eval_context({"lambda:FunctionUrlAuthType": "NONE"})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "ImplicitDeny"
+
+    def test_the_same_policy_without_the_key_still_does_not_match(self):
+        """What the behaviour was before, and what it still is for a key this
+        does not supply: an unresolved key makes the condition false. The
+        evaluator's fallback is unchanged; only the key became resolvable."""
+        ctx = _function_url_eval_context({})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "ImplicitDeny"
+
     # --- API Gateway ---
     def test_apigateway_v2(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1577,6 +1821,74 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("unknown_svc", "GET", "/", {}, b"", {}) is None
 
+    def test_the_jobs_data_plane_is_the_iotjobsdata_namespace(self):
+        """The four job-execution operations are iotjobsdata: actions on AWS.
+        They were mapped to iot:, which a grant of the documented action cannot
+        match. StartCommandExecution is the fifth operation the same botocore
+        model declares, and AWS keeps that one on iot:."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        def act(method, path):
+            return extract_iam_action("iot-jobs-data", method, path, {}, b"", {})
+
+        assert act("GET", "/things/dev-01/jobs") == "iotjobsdata:GetPendingJobExecutions"
+        assert act("PUT", "/things/dev-01/jobs/$next") == "iotjobsdata:StartNextPendingJobExecution"
+        assert act("GET", "/things/dev-01/jobs/j1") == "iotjobsdata:DescribeJobExecution"
+        assert act("POST", "/things/dev-01/jobs/j1/") == "iotjobsdata:UpdateJobExecution"
+        assert act("POST", "/command-executions") == "iot:StartCommandExecution"
+
+    def test_the_jobs_data_plane_resolves_through_the_router(self):
+        """The branch above is reached only if the router agrees. The AWS IoT
+        Jobs SDK signs with credential scope iot-jobs-data and hits the
+        data.jobs.iot... host family; a test calling extract_iam_action with
+        the literal string "iot-jobs-data" cannot see whether the router
+        actually routes a real signed request there, the way
+        test_publish_resolves_through_the_router does for the message plane."""
+        from ministack.core.iam_actions import extract_iam_action
+        from ministack.core.router import detect_service
+
+        headers = _sigv4_headers("iot-jobs-data", "data.jobs.iot.eu-central-1.localhost")
+
+        path = "/things/dev-01/jobs"
+        service = detect_service("GET", path, headers, {})
+        assert service == "iot-jobs-data"
+        assert extract_iam_action(service, "GET", path, headers, b"", {}) == "iotjobsdata:GetPendingJobExecutions"
+
+        service = detect_service("POST", "/command-executions", headers, {})
+        assert service == "iot-jobs-data"
+        assert extract_iam_action(
+            service, "POST", "/command-executions", headers, b"", {}
+        ) == "iot:StartCommandExecution"
+
+    def test_the_iot_control_plane_and_message_plane_keep_the_iot_namespace(self):
+        """Only the jobs data plane moves. iot: is still the namespace for the
+        control plane and for publish."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        assert extract_iam_action("iot", "PUT", "/jobs/rollout-2024", {}, b"", {}) == "iot:CreateJob"
+        assert extract_iam_action("iot-data", "POST", "/topics/a/b/c", {}, b"", {}) == "iot:Publish"
+
+    @pytest.mark.parametrize("granted,decision", [
+        ("iot:*", "ImplicitDeny"),
+        ("iotjobsdata:UpdateJobExecution", "Allow"),
+    ])
+    def test_a_jobs_data_plane_grant_needs_the_iotjobsdata_name(self, granted, decision):
+        """A policy written for the old iot: name stops matching, as on AWS, and
+        the name the documentation tells a device policy to grant matches."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        action = extract_iam_action("iot-jobs-data", "POST", "/things/dev-01/jobs/j1/", {}, b"", {})
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": granted,
+            "Resource": "arn:aws:iot:eu-central-1:000000000000:thing/dev-01",
+        }]})
+        ctx = EvalContext(
+            principal_arn="arn:aws:sts::000000000000:assumed-role/device/session",
+            principal_type="AssumedRole", principal_account="000000000000",
+            action=action, resource_arn="arn:aws:iot:eu-central-1:000000000000:thing/dev-01",
+            region="eu-central-1",
+        )
+        assert evaluate(ctx, [stmts]).decision == decision
 
 
 class TestS3ActionMapping:

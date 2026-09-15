@@ -1482,8 +1482,9 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
 
 
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
-                         headers: dict, query_params: dict):
-    """Authorize an execute-api invoke against its own ARN.
+                         headers: dict, query_params: dict,
+                         iam_action: str = "execute-api:Invoke"):
+    """Authorize an execute-api call against its own ARN.
 
     ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
     the shape AWS documents. Without it every invoke was authorized against
@@ -1493,12 +1494,16 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
 
     Built by the same helper the Lambda authorizer's method ARN uses, because
     a policy has to match both.
+
+    ``iam_action`` is ``execute-api:Invoke`` for a normal request and
+    ``execute-api:ManageConnections`` for the WebSocket ``@connections`` API,
+    which AWS authorizes under that separate action.
     """
     from ministack.core.arn import execute_api_arn
     from ministack.core.responses import get_account_id
 
     return _enforce_data_plane(
-        "apigateway", "execute-api:Invoke", headers, query_params, "",
+        "apigateway", iam_action, headers, query_params, "",
         resource_arn=execute_api_arn(
             extract_region(headers, query_params), get_account_id(),
             api_id, stage, method, execute_path,
@@ -1599,7 +1604,12 @@ async def _handle_execute_api_request(
             logger.exception("Error resolving the execute-api stage: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()
 
-    denied = _enforce_execute_api(api_id, stage, method, execute_path, headers, query_params)
+    # AWS authorizes the @connections API under execute-api:ManageConnections,
+    # a separate action that execute-api:Invoke does not carry.
+    denied = _enforce_execute_api(
+        api_id, stage, method, execute_path, headers, query_params,
+        iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+    )
     if denied:
         return denied
 
@@ -1654,6 +1664,39 @@ def _parse_lambda_url(host: str, path: str) -> tuple[str, str] | None:
     return None
 
 
+def _function_url_auth_target(url_id: str) -> tuple[str, dict, tuple | None]:
+    """Resolve a Function URL id to what its invoke is authorized against.
+
+    Returns the resource ARN, the request's condition keys, and the raw
+    resolution (``None`` if the id did not resolve), which the handler reuses
+    to serve the request.
+
+    AWS evaluates ``lambda:InvokeFunctionUrl`` on the function ARN, qualifier
+    included, which is the resource the CDK's ``grantInvokeUrl`` names. Without
+    this the invoke was checked against ``*`` and no scoped grant could match.
+
+    ``lambda:FunctionUrlAuthType`` is the URL's own ``AuthType``, and the same
+    method conditions its grant on it, so the resource alone is not enough: an
+    unresolved key makes a condition false and the statement still would not
+    match. ``lambda:InvokedViaFunctionUrl`` is deliberately not supplied. It
+    restricts ``lambda:InvokeFunction`` only, and AWS denies an
+    ``InvokeFunctionUrl`` grant conditioned on it even when the invoke did come
+    through a Function URL.
+
+    An id that resolves to nothing keeps ``*`` and no keys. The lookup runs
+    before the caller is authorized, so it must report nothing about which URLs
+    exist.
+    """
+    resolved = _get_module("lambda_svc").resolve_function_url(url_id)
+    if resolved is None:
+        return "*", {}, None
+    account_id, region, func_name, qualifier, cfg = resolved
+    function_arn = f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+    if qualifier:
+        function_arn = f"{function_arn}:{qualifier}"
+    return function_arn, {"lambda:FunctionUrlAuthType": cfg.get("AuthType", "AWS_IAM")}, resolved
+
+
 async def _handle_lambda_url_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle Lambda Function URL data plane requests (Host-based + path-based)."""
     parsed = _parse_lambda_url(host, path)
@@ -1661,13 +1704,18 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
         return None
     url_id, function_path = parsed
 
-    denied = _enforce_data_plane("lambda", "lambda:InvokeFunctionUrl", headers, query_params, "")
+    resource_arn, service_context, resolved = _function_url_auth_target(url_id)
+    denied = _enforce_data_plane(
+        "lambda", "lambda:InvokeFunctionUrl", headers, query_params, "",
+        resource_arn=resource_arn, service_context=service_context,
+    )
     if denied:
         return denied
 
     try:
+        # The handler reuses the lookup above; None makes it resolve again.
         return await _get_module("lambda_svc").handle_function_url_request(
-            url_id, method, function_path, headers, body, query_params
+            url_id, method, function_path, headers, body, query_params, resolved=resolved,
         )
     except Exception as e:
         logger.exception("Error in Lambda Function URL dispatch: %s", e)
@@ -1839,16 +1887,23 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
 
 
 def _enforce_data_plane(
-    service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*"
+    service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
+    service_context: dict | None = None,
 ):
-    """Enforce IAM auth on a data-plane path. Returns error tuple or None."""
+    """Enforce IAM auth on a data-plane path. Returns error tuple or None.
+
+    ``service_context`` carries the request's own condition keys, for a path
+    that has them. The generic router resolves those itself; a data-plane
+    handler has to pass them, because it knows the resource the router does not.
+    """
     if not AUTH:
         return None
     from ministack.core.iam_actions import access_denied_response
     from ministack.core.iam_evaluator import AuthError, enforce
 
     access_key = extract_access_key_id(headers, query_params)
-    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params), resource_arn=resource_arn)
+    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params),
+                     resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
             return access_denied_response(
