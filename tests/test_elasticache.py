@@ -15,14 +15,10 @@ from ministack.services.elasticache import _engine_image_and_port
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
-# Most ElastiCache tests need a live Docker network because CreateCacheCluster
-# spawns a real Redis container. Mark them with @requires_docker so they skip
-# cleanly in CI without docker, while unit-style tests (e.g. the #853 respawn
-# tests at the bottom of this file) still run.
-requires_docker = pytest.mark.skipif(
-    not os.environ.get("DOCKER_NETWORK"),
-    reason="DOCKER_NETWORK not set - skipping network connectivity test",
-)
+# Kept as a marker on the historical container-backed tests. The collection
+# hook decides which tests still require real Docker; the rest get the
+# request-local no-Docker path instead.
+requires_docker = pytest.mark.elasticache_docker
 
 
 def _ec_client(region):
@@ -1731,6 +1727,17 @@ def test_valkey_no_docker_fallback_uses_redis_port(monkeypatch):
     )
     assert (host, port) == (elasticache.REDIS_DEFAULT_HOST, elasticache.REDIS_DEFAULT_PORT)
     assert cid is None
+
+
+def test_elasticache_no_docker_mode_is_request_scoped(monkeypatch):
+    docker_client = object()
+    monkeypatch.setattr(elasticache, "_docker", docker_client)
+    token = elasticache._set_request_no_docker()
+    try:
+        assert elasticache._get_docker() is None
+    finally:
+        elasticache._reset_request_no_docker(token)
+    assert elasticache._get_docker() is docker_client
 
 
 # ---------------------------------------------------------------------------

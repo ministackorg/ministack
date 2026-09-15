@@ -107,6 +107,9 @@ def _events_list() -> list:
 _port_counter = [BASE_PORT]
 
 _docker = None
+_request_no_docker = contextvars.ContextVar(
+    "elasticache_request_no_docker", default=False
+)
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -425,6 +428,8 @@ _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
 def _get_docker():
     global _docker
+    if _request_no_docker.get():
+        return None
     if _docker is None:
         try:
             import docker
@@ -432,6 +437,16 @@ def _get_docker():
         except Exception:
             pass
     return _docker
+
+
+def _set_request_no_docker(enabled=True):
+    """Set the no-Docker mode for the current request context."""
+    return _request_no_docker.set(enabled)
+
+
+def _reset_request_no_docker(token):
+    """Restore the no-Docker mode that preceded a request context."""
+    _request_no_docker.reset(token)
 
 
 

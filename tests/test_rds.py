@@ -4921,6 +4921,19 @@ def test_docker_image_for_engine_unknown_engine_returns_nones():
     assert result == (None, None, None, None)
 
 
+def test_rds_disable_docker_skips_daemon_connection(monkeypatch):
+    from ministack.services import rds as m
+
+    docker_client = object()
+    monkeypatch.setattr(m, "_docker", docker_client)
+    token = m._set_request_no_docker()
+    try:
+        assert m._get_docker() is None
+    finally:
+        m._reset_request_no_docker(token)
+    assert m._get_docker() is docker_client
+
+
 def test_rds_describe_postgres_18_engine_version(rds):
     """DescribeDBEngineVersions exposes the Postgres 18 entry so Terraform's
     validation (and callers that list supported versions) sees it."""

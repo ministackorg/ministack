@@ -120,6 +120,7 @@ _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
 
 _docker = None
+_request_no_docker = contextvars.ContextVar("rds_request_no_docker", default=False)
 _ministack_network = None
 _shared_container_lock = threading.RLock()
 _mysql_global_writer_switch_lock = threading.RLock()
@@ -2357,6 +2358,8 @@ def _start_rds_container_for_instance(db_id, instance):
 
 
 def _get_docker():
+    if _request_no_docker.get():
+        return None
     global _docker
     if _docker is None:
         try:
@@ -2365,6 +2368,16 @@ def _get_docker():
         except Exception:
             pass
     return _docker
+
+
+def _set_request_no_docker(enabled=True):
+    """Set the no-Docker mode for the current request context."""
+    return _request_no_docker.set(enabled)
+
+
+def _reset_request_no_docker(token):
+    """Restore the no-Docker mode that preceded a request context."""
+    _request_no_docker.reset(token)
 
 
 def _get_ministack_network(docker_client):
