@@ -2020,6 +2020,54 @@ def test_put_role_policy_rejects_malformed_document(iam):
         iam.delete_role(RoleName="validation-test-role-2")
 
 
+def test_put_group_policy_rejects_malformed_document(iam):
+    """PutGroupPolicy validates its document like PutRolePolicy and
+    PutUserPolicy. Measured: a real account answers MalformedPolicyDocument for
+    a document that is not JSON, one without a Statement, one whose Effect is
+    neither Allow nor Deny, and one whose statement has no Resource."""
+    iam.create_group(GroupName="validation-test-group")
+    try:
+        for document in ("not json",
+                         json.dumps({"Version": "2012-10-17"}),
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]}),
+                         json.dumps({"Statement": [{"Effect": "Allow",
+                                                    "Action": "s3:GetObject"}]})):
+            with pytest.raises(ClientError) as exc:
+                iam.put_group_policy(GroupName="validation-test-group",
+                                     PolicyName="bad", PolicyDocument=document)
+            assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+        assert iam.list_group_policies(
+            GroupName="validation-test-group")["PolicyNames"] == []
+    finally:
+        iam.delete_group(GroupName="validation-test-group")
+
+
+def test_put_inline_policy_reports_the_missing_entity_before_the_document(iam):
+    """A call that is wrong in both ways at once is answered NoSuchEntity, not
+    MalformedPolicyDocument.
+
+    Measured per kind on a real account, with a document whose Effect is
+    neither Allow nor Deny on a group, a role and a user, and again, on a role
+    and a user, with one that is not JSON: the missing entity is reported
+    before the document is read."""
+    for call, kind, kwargs in (
+        (iam.put_group_policy, "group", {"GroupName": "validation-absent-group"}),
+        (iam.put_role_policy, "role", {"RoleName": "validation-absent-role"}),
+        (iam.put_user_policy, "user", {"UserName": "validation-absent-user"}),
+    ):
+        for document in ("not json",
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]})):
+            with pytest.raises(ClientError) as exc:
+                call(PolicyName="bad", PolicyDocument=document, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+            assert exc.value.response["Error"]["Message"] == \
+                f"The {kind} with name validation-absent-{kind} cannot be found."
+
+
 # ---------------------------------------------------------------------------
 # Resource ARN extraction (#1504, #1505)
 #

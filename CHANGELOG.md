@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **IAM — a group policy document is validated, and an `AWS::IAM::Policy` naming a missing entity fails** — `PutGroupPolicy` stored a malformed document; all three inline handlers now answer `NoSuchEntity` before `MalformedPolicyDocument`, the order measured on AWS. An `AWS::IAM::Policy` skipped a Role, User or Group that was not there and reported `CREATE_COMPLETE`; the resource now fails with `The role with name <name> cannot be found.`, and an update checks names and document before it takes the old policy off. Contributed by @iot-rocket.
+
 ## [1.5.12] — 2026-09-15
 
 ### Added

@@ -2267,6 +2267,39 @@ def _iam_inline_policy_targets(props):
                 yield param, entity_name, put, remove
 
 
+def _iam_policy_require_entities(props):
+    """Raise the sentence IAM answers for the first entity the props name that
+    does not exist.
+
+    Measured: a stack whose AWS::IAM::Policy names a role, user or group that
+    is not there reports CREATE_FAILED for the resource, with "The <kind> with
+    name <name> cannot be found." from IAM as the reason. Called before the
+    first document is written, so a failed resource leaves no half written
+    policy behind.
+    """
+    for prop, kind, store in (("Roles", "role", _iam._roles),
+                              ("Users", "user", _iam._users),
+                              ("Groups", "group", _iam._groups)):
+        for entity_name in props.get(prop, []) or []:
+            if store.get(entity_name) is None:
+                raise ValueError(f"The {kind} with name {entity_name} cannot be found.")
+
+
+def _iam_policy_require_valid_document(props):
+    """Raise the MalformedPolicyDocument sentence for a PolicyDocument that
+    does not validate.
+
+    _iam_policy_put only sees a malformed document at the first entity's put,
+    which on an update runs after the old policies came off. Called ahead of
+    create and update, after the entities are resolved, so a malformed
+    document never reaches the drops or the writes.
+    """
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(props.get("PolicyDocument", {}))
+    if validation_err:
+        raise ValueError(validation_err)
+
+
 def _iam_policy_put(props, name):
     """Embed the PolicyDocument on every entity the resource names.
 
@@ -2307,6 +2340,8 @@ def _iam_policy_create(logical_id, props, stack_name):
     a PolicyName still get ids of their own.
     """
     physical_id = _physical_name(stack_name, logical_id, max_len=128)
+    _iam_policy_require_entities(props)
+    _iam_policy_require_valid_document(props)
     _iam_policy_put(props, props.get("PolicyName") or physical_id)
     return physical_id, {"Id": physical_id}
 
@@ -2323,6 +2358,14 @@ def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     """
     old_name = old_props.get("PolicyName") or physical_id
     new_name = new_props.get("PolicyName") or physical_id
+
+    # Every name the new template lists is resolved before anything comes off,
+    # and the new document is validated here too: an in place change is not
+    # undone by the rollback of an update, so a put that failed after the
+    # drops below (on a missing entity or a malformed document alike) would
+    # leave the entity holding nothing.
+    _iam_policy_require_entities(new_props)
+    _iam_policy_require_valid_document(new_props)
 
     # Whatever the old template left behind has to come off first: everything
     # under the old name if the name changed, and the entities this template
