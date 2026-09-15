@@ -64,7 +64,7 @@ from ministack.core.lambda_runtime import (
     reap_idle_workers,
     release_worker,
 )
-from ministack.core.persistence import STATE_DIR, load_state
+from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountRegionScopedDict,
@@ -486,7 +486,7 @@ def _sweep_extract_cache() -> None:
 # files no longer referenced by any function or version (e.g. previous
 # ``UpdateFunctionCode`` generations).
 #
-# Backward compatibility: ``restore_state`` accepts the legacy inline
+# Backward compatibility: ``_restore_state`` accepts the legacy inline
 # base64 shape (``"code_zip": "<b64>"``) so an upgrade in place works
 # without a one-shot migration step.
 
@@ -619,11 +619,14 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    if _esms.has_any():
+        _ensure_poller()
+    _resume_pending_snapstart_versions()
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):
@@ -653,22 +656,19 @@ def restore_state(data):
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
         _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
-        # A SnapStart version persisted mid-publish restores as State=Pending
-        # with no provisioning thread behind it — and Pending SnapStart
-        # versions answer 409 on Invoke and are skipped by the generic state
-        # flipper, so without re-provisioning here the version would be
-        # uninvokable forever. Re-run the publish-time initialization.
-        for scoped_key, func in list(_functions._data.items()):
-            fn_name = scoped_key[-1]
-            for ver_record in (func.get("versions") or {}).values():
-                cfg = ver_record.get("config") or {}
-                if (
-                    cfg.get("State") == "Pending"
-                    and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
-                ):
-                    _snapstart_provision_version_async(fn_name, ver_record)
-        if _esms.has_any():
-            _ensure_poller()
+
+
+def _resume_pending_snapstart_versions() -> None:
+    """Resume provisioners that cannot survive a process restart."""
+    for scoped_key, func in list(_functions._data.items()):
+        fn_name = scoped_key[-1]
+        for ver_record in (func.get("versions") or {}).values():
+            cfg = ver_record.get("config") or {}
+            if (
+                cfg.get("State") == "Pending"
+                and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+            ):
+                _snapstart_provision_version_async(fn_name, ver_record)
 
 
 def _region_from_function_record(func: dict) -> str:
@@ -743,14 +743,6 @@ def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
                 account_id = get_account_id()
                 region = esm_scopes.get((account_id, key), get_region())
                 store._data[(account_id, region, key)] = value
-
-
-# NOTE: the persisted-state load used to run here, but ``restore_state`` calls
-# ``_ensure_poller()`` when the restored data contains event source mappings,
-# and that helper is defined much later in this module. Restoring at import
-# time raised ``NameError: _ensure_poller`` on warm starts with a populated
-# ``lambda.json`` (issue #412). The load now lives at the bottom of the file,
-# after ``_ensure_poller`` is defined.
 
 
 # ---------------------------------------------------------------------------
@@ -7972,18 +7964,3 @@ def reset():
     with _docker_extract_lock:
         _docker_extract_dirs.clear()
     shutil.rmtree(_DOCKER_EXTRACT_CACHE, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Persisted-state restore — runs at module import time but deferred to the
-# very bottom of the file so forward references to helpers (e.g.
-# ``_ensure_poller``) resolve at call time (issue #412). A corrupt or
-# incompatible ``lambda.json`` logs and continues instead of breaking the
-# whole service.
-# ---------------------------------------------------------------------------
-try:
-    _restored = load_state("lambda")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted Lambda state; continuing with a fresh store")

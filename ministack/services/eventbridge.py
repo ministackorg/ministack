@@ -99,7 +99,6 @@ def _coerce_timestamp(value):
     return value
 
 
-from ministack.core.persistence import load_state
 
 # Per-account and per-region registries. The "default" bus is lazily created
 # per account/region on first access so every tenant has its own default bus
@@ -164,10 +163,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _event_buses.update(data.get("buses", {}))
         _rules.update(data.get("rules", {}))
@@ -262,15 +261,6 @@ def _restore_targets_store(data) -> None:
             _targets.set_scoped(account_id, region, rule_key, copy.deepcopy(targets))
 
 
-try:
-    _restored = load_state("eventbridge")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):

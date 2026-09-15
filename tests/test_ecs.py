@@ -237,48 +237,43 @@ def test_ecs_run_task_metadata_v4(ecs):
     assert success, "Task should transition to STOPPED"
 
 
-def test_ecs_restore_helpers_are_defined_before_the_import_time_restore():
-    """Everything `restore_state` calls must be bound before the module runs it.
+@pytest.mark.parametrize("has_services", [False, True])
+def test_ecs_central_restore_reconciles_after_loading_state(monkeypatch, tmp_path, has_services):
+    """Boot restores tasks and attributes before scheduling service relaunch."""
+    import ministack.app as app
+    from ministack.core import persistence
+    from ministack.core.responses import AccountRegionScopedDict
 
-    `ecs.py` calls `restore_state(_restored)` at module level, so a helper it
-    reaches that is defined further down the file raises NameError there. The
-    surrounding try/except catches it and ALL ECS state fails to restore, which
-    is only visible under PERSIST_STATE=1 and never in a test that calls
-    `restore_state` after the import. The file already carries `_attributes`
-    at the top for exactly this reason; this keeps the next one honest.
-    """
-    import ast
-    import inspect
+    account, region = "222222222222", "eu-west-1"
+    services = AccountRegionScopedDict()
+    tasks = AccountRegionScopedDict()
+    attributes = AccountRegionScopedDict()
+    if has_services:
+        services.set_scoped(account, region, "cluster/service", {"status": "ACTIVE"})
+    tasks.set_scoped(account, region, "task", {"lastStatus": "RUNNING", "version": 1})
+    attributes.set_scoped(account, region, "instance:attr", {"name": "attr", "value": "v"})
+    for name in ("_services", "_tasks", "_attributes"):
+        monkeypatch.setattr(ecs_service, name, AccountRegionScopedDict())
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_state_map", {"ecs": "ecs"})
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    persistence.save_state("ecs", {"services": services, "tasks": tasks, "attributes": attributes})
 
-    tree = ast.parse(inspect.getsource(ecs_service))
-    defined_at = {
-        node.name: node.lineno
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    restore = next(
-        n for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "restore_state"
-    )
-    call_line = next(
-        n.lineno for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "restore_state"
-        and n.col_offset == 8  # the module-level try: block, not a nested call
-    )
+    scheduled = []
 
-    late = sorted({
-        node.id
-        for node in ast.walk(restore)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-        and node.id in defined_at and defined_at[node.id] > call_line
-    })
-    assert not late, (
-        f"restore_state reaches {late}, defined after the import-time call at "
-        f"line {call_line}; move them above it or the warm-boot restore dies "
-        f"silently"
-    )
+    def schedule():
+        # Capture what the worker would see at the moment it is scheduled.
+        scheduled.append(copy.deepcopy(ecs_service._tasks.get_scoped(account, region, "task")))
+
+    monkeypatch.setattr(ecs_service, "_start_restored_service_reconciler", schedule)
+    app._load_persisted_state()
+
+    task = ecs_service._tasks.get_scoped(account, region, "task")
+    assert task["lastStatus"] == "STOPPED"
+    assert task["version"] == 2
+    assert ecs_service._attributes.get_scoped(account, region, "instance:attr")["value"] == "v"
+    assert scheduled == ([task] if has_services else [])
 
 
 def test_ecs_run_task_applies_container_command_overrides(monkeypatch):
@@ -2399,7 +2394,7 @@ def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
     assert _ecs._tasks[task_arn]["_container_ip"] == "172.30.0.31"
     assert "_container_ip" not in saved
     _ecs.reset()
-    _ecs.restore_state(state)
+    _ecs.load_persisted_state(state)
 
     restored = _ecs._tasks[task_arn]
     assert restored["lastStatus"] == "STOPPED"
@@ -2408,7 +2403,7 @@ def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
     # Restoring an already stopped task is not a transition.
     state = _ecs.get_state()
     _ecs.reset()
-    _ecs.restore_state(state)
+    _ecs.load_persisted_state(state)
     assert _ecs._tasks[task_arn]["version"] == running_version + 1
 
 

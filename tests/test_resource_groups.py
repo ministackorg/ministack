@@ -466,7 +466,7 @@ def test_restore_legacy_child_state_uses_parent_group_region():
 
     service.reset()
     try:
-        service.restore_state({"groups": groups, "group_queries": queries})
+        service.load_persisted_state({"groups": groups, "group_queries": queries})
         assert service._groups.get_scoped(
             account_id, resource_region, group_name
         )["Name"] == group_name

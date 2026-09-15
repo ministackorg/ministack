@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("cloudwatch")
@@ -119,10 +118,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _metrics.update(data.get("metrics", {}))
         _alarms.update(data.get("alarms", {}))
@@ -132,15 +131,6 @@ def restore_state(data):
         _resource_tags.update(data.get("resource_tags", {}))
 
 
-try:
-    _restored = load_state("cloudwatch")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

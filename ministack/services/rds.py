@@ -59,7 +59,6 @@ from xml.sax.saxutils import escape as _esc
 from ministack.core import container_reaper, persistence
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -365,11 +364,11 @@ def get_state():
     return state
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data, resume_runtime=True)
 
 
-def restore_state(data):
+def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -457,6 +456,9 @@ def restore_state(data):
             _instances.set_scoped(get_account_id(), region, name, inst)
             to_respawn.append((None, region, name, inst))
 
+    if not resume_runtime:
+        return
+
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
     # container itself is killed by the host restart, so the restore path has
@@ -529,7 +531,7 @@ def restore_state(data):
         )
         if cluster and members:
             # Publish the restore/migration gate before the daemon starts. A
-            # create arriving immediately after restore_state() must not start
+            # create arriving immediately after _restore_state() must not start
             # fresh cluster storage before the writer volume is adopted.
             cluster["_shared_legacy_migration_in_progress"] = True
             cluster.pop("_shared_legacy_migration_blocked", None)
@@ -7136,7 +7138,7 @@ def _failover_db_cluster_impl(p):
     if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
         "_shared_legacy_migration_blocked",
     ):
-        # restore_state's one-time legacy-storage migration reads
+        # _restore_state's one-time legacy-storage migration reads
         # IsClusterWriter to pick which member's volume becomes the
         # cluster's adopted shared state; flipping the flag mid-migration
         # could make it adopt a reader's volume. Same gate as
@@ -10961,20 +10963,6 @@ def reset():
         _port_counter[0] = BASE_PORT
 
 
-# Load persisted state at module import. Must run AFTER every helper this
-# code path may touch (notably `_get_docker`, `_docker_image_for_engine`,
-# `_get_ministack_network`) is defined — `restore_state` spawns daemon threads
-# that race against the rest of module parsing, and a thread reaching an
-# undefined name raises NameError mid-restore (issue #692 follow-up).
-try:
-    _restored = load_state("rds")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):

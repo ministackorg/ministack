@@ -19,7 +19,6 @@ import json
 import logging
 import time
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -58,10 +57,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     for store, key in (
@@ -71,16 +70,6 @@ def restore_state(data):
         store.clear()
         for k, v in (data.get(key) or {}).items():
             store[k] = v
-
-
-try:
-    _restored = load_state("organizations")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _json(status, body):

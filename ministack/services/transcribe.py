@@ -65,7 +65,6 @@ import re
 import time
 from urllib.parse import urlparse
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -207,7 +206,7 @@ def get_state():
     return copy.deepcopy({"jobs": _jobs})
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _jobs.clear()
@@ -221,7 +220,7 @@ def restore_state(data):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 def _fail_orphaned_jobs():
@@ -235,12 +234,6 @@ def _fail_orphaned_jobs():
             job["FailureReason"] = "Internal Failure. The job did not survive a MiniStack restart."
             job["CompletionTime"] = time.time()
 
-try:
-    _restored = load_state("transcribe")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted Transcribe state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------
