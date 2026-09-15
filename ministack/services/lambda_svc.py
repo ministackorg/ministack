@@ -78,6 +78,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
 )
+from ministack.core.router import extract_access_key_id
 
 logger = logging.getLogger("lambda")
 
@@ -175,6 +176,13 @@ _INVOKE_DEPTH_HEADER = INVOKE_DEPTH_HEADER.lower()
 # is where the executors read it back to seed the child environment.
 _invoke_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "ministack_invoke_depth", default=0
+)
+
+
+# The caller's access key, set per request so a layer-policy denial can name
+# the calling identity the way AWS does.
+_request_access_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ministack_lambda_request_access_key", default=""
 )
 
 
@@ -445,21 +453,34 @@ def _b64_sha_to_hex(b64_sha: str) -> str | None:
 
 def _sweep_extract_cache() -> None:
     """Drop cached extraction trees whose blob no longer backs any function,
-    function version, or layer version — the same reference-based policy the
-    lambda-blob persistence sweep uses. Called when references disappear
-    (function delete, code update, layer-version delete); reset() still
-    clears everything wholesale. Runs on stored CodeSha256 values only, so a
-    sweep never hashes a byte."""
+    function version, or layer version, and reap deleted layer versions once
+    no function references them. Called when references disappear (function
+    delete, code update, layer detach, layer-version delete, CloudFormation
+    deletes) and after a state restore; reset() still clears everything
+    wholesale. Runs on stored CodeSha256 values only, so a sweep never hashes
+    a byte."""
     live_code: set[str] = set()
     live_layer: set[str] = set()
+    attached_layers: set[str] = set()
     for func in _functions._data.values():
         for cfg in [func.get("config") or {}] + [
                 (v or {}).get("config") or {} for v in (func.get("versions") or {}).values()]:
             sha = _b64_sha_to_hex(cfg.get("CodeSha256", ""))
             if sha:
                 live_code.add(sha)
+            for ref in cfg.get("Layers") or []:
+                if isinstance(ref, dict) and ref.get("CodeSize") == 0:
+                    continue
+                attached_layers.add(ref if isinstance(ref, str) else ref.get("Arn", ""))
     for layer in _layers._data.values():
-        for ver in layer.get("versions", []):
+        versions = layer.get("versions") or []
+        # A deleted version survives only while an attached function still
+        # needs its bytes. Removed in place, one atomic list.remove at a time,
+        # so a version a concurrent publish appends is never lost.
+        for ver in [v for v in versions if v.get("_deleted")
+                    and v.get("LayerVersionArn") not in attached_layers]:
+            versions.remove(ver)
+        for ver in versions:
             sha = _b64_sha_to_hex((ver.get("Content") or {}).get("CodeSha256", ""))
             if sha:
                 live_layer.add(sha)
@@ -649,6 +670,9 @@ def restore_state(data):
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
+        # A snapshot may carry a deleted layer version whose last reference
+        # did not survive the restore.
+        _sweep_extract_cache()
         _restore_esms(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
@@ -1264,15 +1288,12 @@ def _validate_unzipped_size(zip_data: bytes | None):
     return None
 
 
-def _layer_unzipped_size(layer_arn: str) -> int:
+def _layer_unzipped_size(attachment: str | dict) -> int:
     """Unzipped size of an attached layer version's content. A layer we don't
     hold the bytes for (an external ARN, or content that failed to fetch)
     contributes 0 — it can't be measured, so it isn't counted rather than
     guessed at (never over-rejecting a function that AWS would accept)."""
-    version_config, err = _resolve_layer_version_for_attachment(layer_arn)
-    if err or not version_config:
-        return 0
-    return _unzipped_size(version_config.get("_zip_data"))
+    return _unzipped_size(_resolve_layer_zip(attachment))
 
 
 def _validate_total_unzipped_size(code_zip: bytes | None, layers):
@@ -1282,9 +1303,8 @@ def _validate_total_unzipped_size(code_zip: bytes | None, layers):
     layers and custom runtimes" (unzipped)."""
     total = _unzipped_size(code_zip)
     for layer in layers or []:
-        arn = layer.get("Arn") if isinstance(layer, dict) else layer
-        if arn:
-            total += _layer_unzipped_size(arn)
+        if layer:
+            total += _layer_unzipped_size(layer)
     if total > _UNZIPPED_LIMIT_BYTES:
         return error_response_json(
             "InvalidParameterValueException",
@@ -1655,6 +1675,38 @@ def _invalid_layer_version_arn(layer_arn: str):
     )
 
 
+def _layer_access_denied(layer_arn: str):
+    """The denial AWS returns for a foreign layer, naming the calling identity."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+
+    identity = resolve_caller_identity(_request_access_key.get()) or {}
+    caller = identity.get("userArn") or f"arn:aws:iam::{get_account_id()}:root"
+    return None, error_response_json(
+        "AccessDeniedException",
+        f"User: {caller} is not authorized to perform: lambda:GetLayerVersion on "
+        f"resource: {layer_arn} because no resource-based policy allows the "
+        "lambda:GetLayerVersion action",
+        403,
+    )
+
+
+def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version, *, allow_opaque=False):
+    """Check stored grants; allow opaque references only for unknown layer names."""
+    if spec.region != get_region():
+        return _layer_access_denied(layer_arn)
+    layer_name, version = name_and_version
+    vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+    if vc is not None:
+        if _layer_policy_allows(vc, get_account_id()):
+            return vc, None
+        return _layer_access_denied(layer_arn)
+    if not allow_opaque or _layers.contains_scoped(spec.account_id, spec.region, layer_name):
+        # A known layer's missing/deleted version cannot become an opaque grant.
+        return _layer_access_denied(layer_arn)
+    logger.debug("Attaching unknown external layer %s without content", layer_arn)
+    return {"Version": version, "Content": {"CodeSize": 0}}, None
+
+
 def _resolve_layer_version_for_attachment(layer_arn: str):
     try:
         spec = parse_arn(layer_arn)
@@ -1666,30 +1718,19 @@ def _resolve_layer_version_for_attachment(layer_arn: str):
         return None, _invalid_layer_version_arn(layer_arn)
 
     if spec.account_id != get_account_id():
-        return None, error_response_json(
-            "AccessDeniedException",
-            "User is not authorized to access this resource.",
-            403,
-        )
+        return _resolve_cross_account_layer(layer_arn, spec, layer_ref, allow_opaque=True)
     if spec.region != get_region():
         return None, error_response_json(
             "InvalidParameterValueException",
-            f"Layer version ARN {layer_arn} is in region {spec.region}; "
-            f"function region is {get_region()}",
+            "Layers are not in the same region as the function. "
+            f"Layers are expected to be in region {get_region()}.",
             400,
         )
 
     layer_name, version = layer_ref
-    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
-    if not layer:
-        return None, error_response_json(
-            "InvalidParameterValueException",
-            f"Layer version {layer_arn} does not exist.",
-            400,
-        )
-    for version_config in layer["versions"]:
-        if version_config["Version"] == version:
-            return version_config, None
+    version_config, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+    if version_config is not None:
+        return version_config, None
     return None, error_response_json(
         "InvalidParameterValueException",
         f"Layer version {layer_arn} does not exist.",
@@ -1929,6 +1970,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
     path = unquote(path)
     parts = path.rstrip("/").split("/")
+    _request_access_key.set(extract_access_key_id(headers, query_params))
 
     # --- Durable Execution surface (preview, API version 2025-12-01) ---
     # Routed first because some paths embed the function ARN as a path segment
@@ -2228,10 +2270,6 @@ def _create_function(data: dict):
             version_id=code_data.get("S3ObjectVersion"),
         )
 
-    err = _validate_total_unzipped_size(code_zip, data.get("Layers"))
-    if err is not None:
-        return err
-
     if image_uri:
         data.setdefault("PackageType", "Image")
 
@@ -2247,6 +2285,9 @@ def _create_function(data: dict):
     if err:
         return err
     layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
+    if err:
+        return err
+    err = _validate_total_unzipped_size(code_zip, layers_cfg)
     if err:
         return err
     if data.get("Layers") is not None:
@@ -2763,6 +2804,9 @@ def _update_config(name: str, data: dict):
         layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
         if err:
             return err
+        err = _validate_total_unzipped_size(_functions[name].get("code_zip"), layers_cfg)
+        if err:
+            return err
         data = dict(data)
         data["Layers"] = layers_cfg
     config = _functions[name]["config"]
@@ -2855,6 +2899,8 @@ def _update_config(name: str, data: dict):
         # in-process warm worker recycle solved for Python/Node.
         _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
+    if "Layers" in data:
+        _sweep_extract_cache()
     return json_response(config)
 
 
@@ -4266,8 +4312,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             raise ValueError("Zip PackageType requires code_zip bytes")
         code_dir = _docker_extracted_dir(code_zip, "code")
         for layer_ref in layers_list:
-            layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
-            layer_zip = _resolve_layer_zip(layer_arn_str)
+            layer_zip = _resolve_layer_zip(layer_ref)
             if not layer_zip:
                 continue
             layers_dirs.append(_docker_extracted_dir(layer_zip, "layer"))
@@ -5425,8 +5470,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
 
             layers_dirs: list[str] = []
             for layer_ref in config.get("Layers", []):
-                layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
-                layer_zip = _resolve_layer_zip(layer_arn_str)
+                layer_zip = _resolve_layer_zip(layer_ref)
                 if layer_zip:
                     layer_dir = os.path.join(tmpdir, f"layer_{len(layers_dirs)}")
                     os.makedirs(layer_dir)
@@ -5574,33 +5618,26 @@ def _execute_function_local(func: dict, event: dict) -> dict:
         }
 
 
-def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
-    """Given a layer version ARN return the stored zip bytes, or None."""
+def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
+    """Return attached content, including versions deleted since attachment."""
+    if isinstance(attachment, dict):
+        # An opaque attachment must not acquire content from a layer published
+        # later without a grant. Every stored ZIP has a nonzero compressed size.
+        if attachment.get("CodeSize") == 0:
+            return None
+        attachment = attachment.get("Arn", "")
     try:
-        spec = parse_arn(layer_arn_str)
+        spec = parse_arn(attachment)
     except ArnParseError:
         return None
-    if spec.service != "lambda":
+    ref = _lambda_layer_version_name_and_number_from_arn_spec(spec)
+    if ref is None or spec.region != get_region():
         return None
-    if spec.account_id != get_account_id():
-        return None
-    if spec.region != get_region():
-        return None
-    parts = spec.resource.split(":", 2)
-    if len(parts) != 3 or parts[0] != "layer":
-        return None
-    layer_name = parts[1]
-    try:
-        version = int(parts[2])
-    except ValueError:
-        return None
-    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
-    if not layer:
-        return None
-    for v in layer["versions"]:
-        if v["Version"] == version:
-            return v.get("_zip_data")
-    return None
+    # Attachment checks permission. Cold starts must still work after revocation.
+    vc, _ = _find_layer_version(
+        *ref, spec.account_id, spec.region, include_deleted=True
+    )
+    return vc.get("_zip_data") if vc else None
 
 
 def _layer_codesize_for_arn(layer_arn_str: str) -> int:
@@ -6151,7 +6188,7 @@ def _list_layer_versions(layer_name: str, query_params: dict):
     all_versions = [
         {k: v for k, v in vc.items() if not k.startswith("_")}
         for vc in layer["versions"]
-        if _match_layer_version(vc, runtime, arch)
+        if not vc.get("_deleted") and _match_layer_version(vc, runtime, arch)
     ]
     all_versions.sort(key=lambda v: v["Version"], reverse=True)
 
@@ -6178,6 +6215,8 @@ def _get_layer_version(layer_name: str, version: int):
             "Layer Version Cannot be less than 1.",
             400,
         )
+    if layer_name.startswith("arn:"):
+        return _get_layer_version_by_arn(f"{layer_name}:{version}")
     layer = _layers.get(layer_name)
     if not layer:
         return error_response_json(
@@ -6186,7 +6225,7 @@ def _get_layer_version(layer_name: str, version: int):
             404,
         )
     for vc in layer["versions"]:
-        if vc["Version"] == version:
+        if vc["Version"] == version and not vc.get("_deleted"):
             out = {k: v for k, v in vc.items() if not k.startswith("_")}
             return json_response(out)
     return error_response_json(
@@ -6213,20 +6252,19 @@ def _get_layer_version_by_arn(arn: str):
             "arn:(aws[a-zA-Z-]*)?:lambda:[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{{1}}:\\d{{12}}:layer:[a-zA-Z0-9-_]+:[0-9]+",
             400,
         )
+    layer_name = parts[1]
+    version = int(parts[2])
     if spec.account_id != get_account_id():
-        return error_response_json(
-            "AccessDeniedException",
-            "User is not authorized to access this resource.",
-            403,
-        )
+        vc, err = _resolve_cross_account_layer(arn, spec, (layer_name, version))
+        if err:
+            return err
+        return json_response({k: v for k, v in vc.items() if not k.startswith("_")})
     if spec.region != get_region():
         return error_response_json(
             "ResourceNotFoundException",
             "The resource you requested does not exist.",
             404,
         )
-    layer_name = parts[1]
-    version = int(parts[2])
     return _get_layer_version(layer_name, version)
 
 
@@ -6240,7 +6278,9 @@ def _delete_layer_version(layer_name: str, version: int):
     layer = _layers.get(layer_name)
     if not layer:
         return 204, {}, b""
-    layer["versions"] = [vc for vc in layer["versions"] if vc["Version"] != version]
+    for vc in layer["versions"]:
+        if vc["Version"] == version:
+            vc["_deleted"] = True
     # The removed version may have been the last reference to its extracted
     # layer tree in the docker executor cache.
     _sweep_extract_cache()
@@ -6253,7 +6293,8 @@ def _list_layers(query_params: dict):
 
     result = []
     for name, layer in _layers.items():
-        matching = [vc for vc in layer["versions"] if _match_layer_version(vc, runtime, arch)]
+        matching = [vc for vc in layer["versions"]
+                    if not vc.get("_deleted") and _match_layer_version(vc, runtime, arch)]
         if matching:
             latest = matching[-1]
             result.append(
@@ -6290,6 +6331,8 @@ def _find_layer_version(
     version: int,
     account_id: str | None = None,
     region: str | None = None,
+    *,
+    include_deleted: bool = False,
 ):
     """Return (layer_version_config, error_response) — one will be None."""
     if account_id and region:
@@ -6304,7 +6347,7 @@ def _find_layer_version(
             404,
         )
     for vc in layer["versions"]:
-        if vc["Version"] == version:
+        if vc["Version"] == version and (include_deleted or not vc.get("_deleted")):
             return vc, None
     return None, error_response_json(
         "ResourceNotFoundException",
@@ -6354,6 +6397,25 @@ def _layer_statement_principal(principal: str):
     if principal.isdigit():
         return {"AWS": f"arn:aws:iam::{principal}:root"}
     return {"AWS": principal}
+
+
+def _layer_policy_allows(version_config: dict, account_id: str) -> bool:
+    """Whether the layer version's resource policy grants the calling account
+    lambda:GetLayerVersion. The caller is the account root, the way an
+    AddLayerVersionPermission grant names it; aws:PrincipalOrgID and every
+    other condition key resolve inside the evaluator."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iam::{account_id}:root",
+        principal_type="Root",
+        principal_account=account_id,
+        action="lambda:GetLayerVersion",
+        resource_arn=version_config["LayerVersionArn"],
+        region=get_region(),
+    )
+    result = evaluate_resource_policy(version_config.get("_policy"), ctx)
+    return result.decision == "Allow"
 
 
 def _add_layer_version_permission(
