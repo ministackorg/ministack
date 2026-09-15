@@ -3789,6 +3789,131 @@ def test_dynamodb_describe_import_not_found(ddb):
     assert e.value.response["Error"]["Code"] == "ImportNotFoundException"
 
 
+def _wait_for_dynamodb_import(ddb, import_arn, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        desc = ddb.describe_import(ImportArn=import_arn)["ImportTableDescription"]
+        if desc["ImportStatus"] in ("COMPLETED", "FAILED"):
+            return desc
+        time.sleep(0.05)
+    raise AssertionError(f"DynamoDB import {import_arn} did not finish within {timeout}s")
+
+
+def test_dynamodb_import_table_csv_from_s3_issue_1741(ddb, s3):
+    bucket = f"ddb-import-{_uuid_mod.uuid4().hex[:8]}"
+    key = "incoming/users.csv"
+    table = f"csv-import-{_uuid_mod.uuid4().hex[:8]}"
+    csv_body = b"ID,name\n1,Alice\n2,Bob\n"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=csv_body)
+
+    try:
+        response = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": key},
+            InputFormat="CSV",
+            InputCompressionType="NONE",
+            TableCreationParameters={
+                "TableName": table,
+                "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "ID", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )
+        submitted = response["ImportTableDescription"]
+        assert submitted["ImportStatus"] == "IN_PROGRESS"
+        assert submitted["InputFormat"] == "CSV"
+        assert submitted["InputCompressionType"] == "NONE"
+
+        completed = _wait_for_dynamodb_import(ddb, submitted["ImportArn"])
+        assert completed["ImportStatus"] == "COMPLETED"
+        assert completed["ProcessedSizeBytes"] == len(csv_body)
+        assert completed["ProcessedItemCount"] == 2
+        assert completed["ImportedItemCount"] == 2
+        assert completed["ErrorCount"] == 0
+
+        table_description = ddb.describe_table(TableName=table)["Table"]
+        assert table_description["TableStatus"] == "ACTIVE"
+        items = sorted(ddb.scan(TableName=table)["Items"], key=lambda item: item["ID"]["S"])
+        assert items == [
+            {"ID": {"S": "1"}, "name": {"S": "Alice"}},
+            {"ID": {"S": "2"}, "name": {"S": "Bob"}},
+        ]
+    finally:
+        try:
+            ddb.delete_table(TableName=table)
+        except ClientError:
+            pass
+        s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_dynamodb_import_table_csv_reports_malformed_csv(ddb, s3):
+    bucket = f"ddb-import-bad-{_uuid_mod.uuid4().hex[:8]}"
+    key = "incoming/bad.csv"
+    table = f"csv-import-bad-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=b'pk,name\n"unterminated,Alice\n')
+
+    try:
+        response = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": key},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": table,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )
+        failed = _wait_for_dynamodb_import(
+            ddb, response["ImportTableDescription"]["ImportArn"]
+        )
+        assert failed["ImportStatus"] == "FAILED"
+        assert failed["FailureCode"] == "ItemValidationError"
+        assert failed["ErrorCount"] == 1
+        assert ddb.scan(TableName=table)["Count"] == 0
+    finally:
+        try:
+            ddb.delete_table(TableName=table)
+        except ClientError:
+            pass
+        s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_dynamodb_import_table_csv_reports_missing_s3_key(ddb, s3):
+    bucket = f"ddb-import-missing-{_uuid_mod.uuid4().hex[:8]}"
+    table = f"csv-import-missing-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+
+    try:
+        response = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": "does-not-exist.csv"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": table,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )
+        failed = _wait_for_dynamodb_import(
+            ddb, response["ImportTableDescription"]["ImportArn"]
+        )
+        assert failed["ImportStatus"] == "FAILED"
+        assert failed["FailureCode"] == "S3NoSuchKey"
+        assert failed["ProcessedItemCount"] == 0
+        with pytest.raises(ClientError) as exc:
+            ddb.describe_table(TableName=table)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            ddb.delete_table(TableName=table)
+        except ClientError:
+            pass
+        s3.delete_bucket(Bucket=bucket)
+
+
 # ---------------------------------------------------------------------------
 # Limits — AWS-spec enforcement (item size, batch caps, number precision,
 # empty sets/strings). Verified against AWS DynamoDB Developer Guide

@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.5.12] — 2026-09-15
 
 ### Added
+- **DynamoDB - CSV table imports from local S3** - `ImportTable` now creates the requested table and asynchronously imports uncompressed CSV objects under the supplied S3 key prefix. `DescribeImport` reports `COMPLETED` or AWS-shaped `FAILED` details, including missing S3 sources and item/CSV validation errors; imported key columns honor `AttributeDefinitions`, non-key columns are strings, and empty columns are omitted.
 - **EKS — Pod Identity associations** — the five operations did not exist, so a controller that reads pod identity to find its role, the AWS Load Balancer Controller among them, could not run against MiniStack. Create, Describe, List, Update and Delete serve the records, one per namespace and service account. Deleting a cluster removes them with it. Reported by @josephaw1022.
 - **EKS — `aws eks update-kubeconfig` works against MiniStack** — k3s could not authenticate the IAM exec token `aws eks get-token` produces, so the only way in was to copy the admin kubeconfig out of the container. MiniStack now answers a TokenReview webhook: `AUTH=false` accepts local bearer tokens, `AUTH=true` verifies the presigned token and then requires a creator or Access Entry grant. The five general-purpose access policies grant their published Kubernetes permissions at cluster or namespace scope. Contributed by @jgrumboe. Reported by @StraggleCraft.
 

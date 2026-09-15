@@ -10,15 +10,19 @@ Supports: CreateTable, DeleteTable, DescribeTable, ListTables, UpdateTable,
           TagResource, UntagResource, ListTagsOfResource,
           EnableKinesisStreamingDestination, DisableKinesisStreamingDestination,
           DescribeKinesisStreamingDestination, UpdateKinesisStreamingDestination,
+          ImportTable, DescribeImport, ListImports,
           ExecuteStatement (PartiQL: SELECT, INSERT, UPDATE, DELETE).
 Legacy conditional parameters: Expected (PutItem/UpdateItem/DeleteItem),
           KeyConditions (Query), ScanFilter/QueryFilter (Scan/Query).
 Uses X-Amz-Target header for action routing (JSON API).
 """
 
+import asyncio
 import base64
 import binascii
 import copy
+import csv
+import io
 import json
 import logging
 import os
@@ -38,6 +42,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
@@ -5008,19 +5013,16 @@ def _delete_resource_policy(data):
 
 # ---------------------------------------------------------------------------
 # Export / Import — local emulation. Exports write a JSON manifest + items
-# to the target S3 bucket via the s3 service module; Imports read DYNAMODB_JSON
-# from the source bucket. Implements the management-plane shape AWS returns.
+# to the target S3 bucket via the s3 service module; CSV imports read objects
+# from the local S3 store. Implements the management-plane shape AWS returns.
 # ---------------------------------------------------------------------------
 
 def _export_arn(table_arn: str) -> str:
     return f"{table_arn}/export/{int(time.time() * 1000)}-{new_uuid()[:8]}"
 
 
-def _import_arn() -> str:
-    return (
-        f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:import/"
-        f"{int(time.time() * 1000)}-{new_uuid()[:8]}"
-    )
+def _import_arn(table_arn: str) -> str:
+    return f"{table_arn}/import/{int(time.time() * 1000)}-{new_uuid()[:8]}"
 
 
 def _export_table_to_point_in_time(data):
@@ -5118,6 +5120,205 @@ def _list_exports(data):
     return json_response(resp)
 
 
+def _validate_csv_import_options(data):
+    options = data.get("InputFormatOptions")
+    if options is None:
+        return None
+    if not isinstance(options, dict):
+        return error_response_json("ValidationException", "InputFormatOptions must be an object", 400)
+    csv_options = options.get("Csv")
+    if csv_options is None:
+        return None
+    if not isinstance(csv_options, dict):
+        return error_response_json("ValidationException", "InputFormatOptions.Csv must be an object", 400)
+    delimiter = csv_options.get("Delimiter", ",")
+    if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in ('"', "\r", "\n"):
+        return error_response_json("ValidationException",
+            "InputFormatOptions.Csv.Delimiter must be a single character other than a quote or newline", 400)
+    headers = csv_options.get("HeaderList")
+    if headers is not None:
+        if (not isinstance(headers, list) or not headers
+                or any(not isinstance(header, str) or not header for header in headers)):
+            return error_response_json("ValidationException",
+                "InputFormatOptions.Csv.HeaderList must contain non-empty attribute names", 400)
+        if len(set(headers)) != len(headers):
+            return error_response_json("ValidationException",
+                "InputFormatOptions.Csv.HeaderList must not contain duplicate attribute names", 400)
+    return None
+
+
+def _remove_failed_import_table(desc):
+    """Remove a table when S3 configuration failed before any item was read."""
+    table_name = (desc.get("TableCreationParameters") or {}).get("TableName")
+    table = _tables.pop(table_name, None)
+    if not table:
+        return
+    _tags.pop(table.get("TableArn", ""), None)
+    _ttl_settings.pop(table_name, None)
+    _pitr_settings.pop(table_name, None)
+    _kinesis_destinations.pop(table_name, None)
+    drop_stream_records(table_name)
+
+
+def _finish_import(desc, status, *, failure_code=None, failure_message=None):
+    desc["ImportStatus"] = status
+    desc["EndTime"] = time.time()
+    if failure_code:
+        desc["FailureCode"] = failure_code
+    if failure_message:
+        desc["FailureMessage"] = failure_message
+
+
+def _csv_import_headers(reader, csv_options):
+    configured = csv_options.get("HeaderList")
+    if configured is not None:
+        return list(configured)
+    try:
+        return next(reader)
+    except StopIteration:
+        return []
+
+
+def _csv_row_to_item(headers, row, attribute_types):
+    if len(row) != len(headers):
+        raise ValueError(
+            f"CSV row has {len(row)} columns but the header has {len(headers)} columns"
+        )
+    item = {}
+    for attribute_name, value in zip(headers, row):
+        # Empty CSV columns are omitted by DynamoDB's importer.
+        if value == "":
+            continue
+        item[attribute_name] = {attribute_types.get(attribute_name, "S"): value}
+    return item
+
+
+def _import_csv_object(desc, key, body):
+    table_params = desc["TableCreationParameters"]
+    table_name = table_params["TableName"]
+    csv_options = (desc.get("InputFormatOptions") or {}).get("Csv") or {}
+    attribute_types = {
+        definition["AttributeName"]: definition["AttributeType"]
+        for definition in table_params.get("AttributeDefinitions", [])
+    }
+
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        logger.info("DynamoDB import %s: %s is not UTF-8", desc["ImportArn"], key)
+        desc["ErrorCount"] += 1
+        return
+
+    reader = csv.reader(
+        io.StringIO(text, newline=""),
+        delimiter=csv_options.get("Delimiter", ","),
+        strict=True,
+    )
+    try:
+        headers = _csv_import_headers(reader, csv_options)
+        if not headers or any(not header for header in headers) or len(set(headers)) != len(headers):
+            desc["ErrorCount"] += 1
+            return
+
+        for row in reader:
+            if not row:
+                continue
+            desc["ProcessedItemCount"] += 1
+            try:
+                item = _csv_row_to_item(headers, row, attribute_types)
+            except ValueError:
+                desc["ErrorCount"] += 1
+                continue
+            status, _, _ = _put_item({"TableName": table_name, "Item": item})
+            if status != 200:
+                desc["ErrorCount"] += 1
+    except csv.Error as exc:
+        logger.info("DynamoDB import %s: malformed CSV in %s: %s", desc["ImportArn"], key, exc)
+        desc["ErrorCount"] += 1
+
+
+async def _run_import(import_arn, account_id, region):
+    """Execute one import without inheriting a later request's account/region."""
+    if _IMPORT_COMPLETE_AFTER_SEC > 0:
+        await asyncio.sleep(_IMPORT_COMPLETE_AFTER_SEC)
+    with request_scope(account_id, region):
+        desc = _imports.get(import_arn)
+        if not desc or desc.get("ImportStatus") != "IN_PROGRESS":
+            return
+        try:
+            _run_import_inner(desc)
+        except Exception:
+            logger.exception("DynamoDB import %s crashed", import_arn)
+            _finish_import(
+                desc,
+                "FAILED",
+                failure_code="InternalServerError",
+                failure_message="Internal Failure. Please try your request again.",
+            )
+
+
+def _run_import_inner(desc):
+    # CSV is the only data format implemented by this import worker. Keep the
+    # existing management-plane behavior for the two pre-existing placeholders.
+    if desc.get("InputFormat") != "CSV":
+        _finish_import(desc, "COMPLETED")
+        return
+
+    from ministack.services import s3 as s3_svc
+
+    source = desc["S3BucketSource"]
+    bucket_name = source["S3Bucket"]
+    prefix = source.get("S3KeyPrefix", "")
+    bucket = s3_svc._ensure_bucket(bucket_name)
+    if bucket is None:
+        _remove_failed_import_table(desc)
+        _finish_import(
+            desc,
+            "FAILED",
+            failure_code="S3NoSuchBucket",
+            failure_message="The specified bucket does not exist",
+        )
+        return
+
+    keys = [
+        key for key in sorted(bucket.get("objects", {}))
+        if key.startswith(prefix) and not key.endswith("/")
+    ]
+    if not keys:
+        _remove_failed_import_table(desc)
+        _finish_import(
+            desc,
+            "FAILED",
+            failure_code="S3NoSuchKey",
+            failure_message="No import source objects were found for the specified S3 key prefix",
+        )
+        return
+
+    for key in keys:
+        body = s3_svc._get_object_data(bucket_name, key)
+        if body is None:
+            desc["ErrorCount"] += 1
+            continue
+        desc["ProcessedSizeBytes"] += len(body)
+        _import_csv_object(desc, key, body)
+
+    table_name = desc["TableCreationParameters"]["TableName"]
+    table = _tables.get(table_name)
+    desc["ImportedItemCount"] = table.get("ItemCount", 0) if table else 0
+    if desc["ErrorCount"]:
+        _finish_import(
+            desc,
+            "FAILED",
+            failure_code="ItemValidationError",
+            failure_message=(
+                "Some of the items failed validation checks and were not imported. "
+                "Please check CloudWatch error logs for more details."
+            ),
+        )
+        return
+    _finish_import(desc, "COMPLETED")
+
+
 def _import_table(data):
     s3_source = data.get("S3BucketSource")
     fmt = data.get("InputFormat")
@@ -5131,6 +5332,17 @@ def _import_table(data):
     if fmt not in ("CSV", "DYNAMODB_JSON", "ION"):
         return error_response_json("ValidationException",
             f"Invalid InputFormat: {fmt}. Valid values: CSV, DYNAMODB_JSON, ION", 400)
+    compression = data.get("InputCompressionType") or "NONE"
+    if compression not in ("NONE", "GZIP", "ZSTD"):
+        return error_response_json("ValidationException",
+            f"Invalid InputCompressionType: {compression}. Valid values: GZIP, ZSTD, NONE", 400)
+    if compression != "NONE":
+        return error_response_json("ValidationException",
+            "Only uncompressed (NONE) DynamoDB imports are supported", 400)
+    if fmt == "CSV":
+        options_err = _validate_csv_import_options(data)
+        if options_err:
+            return options_err
     if not table_params:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableCreationParameters' failed to satisfy constraint: Member must not be null", 400)
@@ -5138,14 +5350,17 @@ def _import_table(data):
     if not table_name:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableCreationParameters.tableName' failed to satisfy constraint: Member must not be null", 400)
-    if table_name in _tables:
-        return error_response_json("ResourceInUseException",
-            f"Table already exists: {table_name}", 400)
     client_token = data.get("ClientToken")
     if client_token:
         for desc in _imports.values():
             if desc.get("ClientToken") == client_token:
                 return json_response({"ImportTableDescription": desc})
+    if table_name in _tables:
+        return error_response_json("ResourceInUseException",
+            f"Table already exists: {table_name}", 400)
+    if not isinstance(s3_source, dict) or not s3_source.get("S3Bucket"):
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 's3BucketSource.s3Bucket' failed to satisfy constraint: Member must not be null", 400)
     # Create the destination table from TableCreationParameters.
     create_req = dict(table_params)
     status, _, body = _create_table(create_req)
@@ -5153,7 +5368,7 @@ def _import_table(data):
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     table_arn = _tables[table_name]["TableArn"]
     table_id = _tables[table_name].get("TableId")
-    arn = _import_arn()
+    arn = _import_arn(table_arn)
     now = time.time()
     desc = {
         "ImportArn": arn,
@@ -5162,11 +5377,16 @@ def _import_table(data):
         "TableId": table_id,
         "S3BucketSource": s3_source,
         "InputFormat": fmt,
+        "InputCompressionType": compression,
         "StartTime": now,
         "ProcessedSizeBytes": 0,
         "ProcessedItemCount": 0,
         "ImportedItemCount": 0,
         "ErrorCount": 0,
+        "CloudWatchLogGroupArn": (
+            f"arn:aws:logs:{get_region()}:{get_account_id()}:"
+            "log-group:/aws-dynamodb/imports:*"
+        ),
         "TableCreationParameters": table_params,
     }
     if data.get("InputFormatOptions"):
@@ -5176,6 +5396,7 @@ def _import_table(data):
     if client_token:
         desc["ClientToken"] = client_token
     _imports[arn] = desc
+    asyncio.create_task(_run_import(arn, get_account_id(), get_region()))
     return json_response({"ImportTableDescription": desc})
 
 
@@ -5188,9 +5409,6 @@ def _describe_import(data):
     if not desc:
         return error_response_json("ImportNotFoundException",
             f"Import not found: {arn}", 400)
-    if desc.get("ImportStatus") == "IN_PROGRESS" and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC:
-        desc["ImportStatus"] = "COMPLETED"
-        desc["EndTime"] = time.time()
     return json_response({"ImportTableDescription": desc})
 
 
