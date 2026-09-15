@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFormation: the `AWS::LanguageExtensions` transform**: a template declaring it was provisioned unexpanded, so an `Fn::ForEach` left the stack in `CREATE_IN_PROGRESS` for good and an `Fn::ToJsonString` reached SSM as a Python dict. The transform now runs between `AWS::Include` and SAM: `Fn::ForEach` over literal, `CommaDelimitedList` and intrinsic collections, nested and inside `Properties`, plus `Fn::Length` and `Fn::ToJsonString`. Where the identifier is substituted, the error sentences and the unexpanded `GetTemplateSummary` follow measurements on a real account. Contributed by @iot-rocket.
+
 ## [1.5.12] — 2026-09-15
 
 ### Added

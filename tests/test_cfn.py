@@ -2557,7 +2557,7 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
     (Transform: {Name: ...}) is the form that used to be reported and not
     applied."""
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
         declared_transforms,
     )
 
@@ -2571,13 +2571,38 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
                      ["AWS::Serverless-2016-10-31"]):
         template = json.loads(json.dumps(dict(sam, Transform=declared)))
         assert declared_transforms(template) == ["AWS::Serverless-2016-10-31"]
-        out = _apply_sam_transform_if_applicable(template)
+        out = _apply_transforms(template)
         types = {res.get("Type") for res in out["Resources"].values()}
         assert "AWS::Serverless::Function" not in types
         assert "AWS::Lambda::Function" in types
     # Entries the section cannot name are dropped rather than reported.
     assert declared_transforms({"Transform": [{"Parameters": {}}, 5]}) == []
     assert declared_transforms({}) == []
+
+
+def test_cfn_language_extensions_runs_before_the_sam_transform():
+    """"If you're using both the AWS::LanguageExtensions and AWS::Serverless
+    transforms, the AWS::LanguageExtensions transform must come before the
+    AWS::Serverless transform in the list" (transform-aws-languageextensions).
+    A loop over AWS::Serverless::Function resources therefore reaches SAM
+    expanded: in the other order SAM is handed an Fn::ForEach key it does not
+    know, and the copies the loop produces are never translated."""
+    from ministack.services.cloudformation.engine import _apply_transforms
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": ["AWS::LanguageExtensions", "AWS::Serverless-2016-10-31"],
+        "Resources": {"Fn::ForEach::Functions": ["Id", ["A", "B"], {
+            "Fn${Id}": {"Type": "AWS::Serverless::Function", "Properties": {
+                "Runtime": "python3.12", "Handler": "index.handler",
+                "CodeUri": "s3://b/k"}}}]},
+    }
+    out = _apply_transforms(json.loads(json.dumps(template)))
+    types = {name: res.get("Type") for name, res in out["Resources"].items()}
+    assert types["FnA"] == "AWS::Lambda::Function"
+    assert types["FnB"] == "AWS::Lambda::Function"
+    # Both transforms are spent, so the processed template declares neither.
+    assert "Transform" not in out
 
 
 def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
@@ -13249,7 +13274,7 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     import sys
 
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
     )
 
     # Simulate the package being absent: a None entry makes `from ... import`
@@ -13267,14 +13292,14 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
         },
     }
     with pytest.raises(ValueError) as exc:
-        _apply_sam_transform_if_applicable(template)
+        _apply_transforms(template)
     msg = str(exc.value)
     assert "AWS::Serverless-2016-10-31" in msg
     assert "docs/iac#sam" in msg
 
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
-    assert _apply_sam_transform_if_applicable(plain) is plain
+    assert _apply_transforms(plain) is plain
 
 
 # AWS::OpenSearchService::Domain
@@ -22057,3 +22082,436 @@ def _include_transform(cfn, s3, ssm, uid, bucket, name):
         == "second"
     assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
         == "edited"
+
+
+
+# ---------------------------------------------------------------------------
+# AWS::LanguageExtensions transform
+# ---------------------------------------------------------------------------
+
+_LANGEXT_ERROR = "Transform AWS::LanguageExtensions failed with: "
+
+# An Fn::ForEach in a template that declares no transform, from CreateStack and
+# ValidateTemplate alike (measured).
+_LANGEXT_UNDECLARED_LOOP = ("Template format error: [/Resources/Fn::ForEach::Loop] "
+                            "resource definition is malformed")
+
+
+def test_cfn_language_extensions_transform(cfn, ssm):
+    """Fn::ForEach over a literal list, a CommaDelimitedList parameter, nested
+    and inside Properties; the identifier in a fragment key, an Fn::Sub and a
+    Ref to it, literal everywhere else; Fn::Length, Fn::ToJsonString (one
+    member left to the stack), FindInMap deciding a Condition, a Conditions
+    loop, a DeletionPolicy from Fn::If. Then a change set, a failed update that
+    rolls back, the update, UsePreviousTemplate (no re-expansion, measured) and
+    the delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-{uid}"
+    prefix = f"/cfn-langext/{uid}"
+    try:
+        _language_extensions(cfn, ssm, prefix, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        for suffix in ("/kept-x", "/address-10.3"):
+            try:
+                ssm.delete_parameter(Name=prefix + suffix)
+            except ClientError:
+                pass
+
+
+def _langext_template(prefix):
+    def parameter(suffix, value, tags=None, **extra):
+        properties = {"Name": {"Fn::Sub": prefix + suffix}, "Type": "String", "Value": value}
+        if tags:
+            properties["Tags"] = tags
+        return dict({"Type": "AWS::SSM::Parameter", "Properties": properties}, **extra)
+
+    return {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {
+            "Addresses": {"Type": "CommaDelimitedList", "Default": "10.1,10.2"},
+            "Stage": {"Type": "String", "Default": "dev"},
+        },
+        "Mappings": {"Gate": {"Condition": {"A": "Never"}},
+                     "Values": {"Only": {"A": "from-map"}}},
+        "Conditions": {
+            "Always": {"Fn::Equals": [{"Ref": "Stage"}, "dev"]},
+            "Never": {"Fn::Equals": [{"Ref": "Stage"}, "prod"]},
+            "Fn::ForEach::Tiers": ["Tier", ["dev", "prod"], {
+                "Is${Tier}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Tier"}]},
+            }],
+        },
+        "Resources": {
+            # GatedA's condition is false; GatedB's default is AWS::NoValue.
+            "Fn::ForEach::Gated": ["Id", ["A", "B"], {
+                "Gated${Id}": parameter(
+                    "/gated-${Id}",
+                    {"Fn::FindInMap": ["Values", "Only", {"Ref": "Id"},
+                                       {"DefaultValue": "default"}]},
+                    Condition={"Fn::FindInMap": ["Gate", "Condition", {"Ref": "Id"},
+                                                 {"DefaultValue": {"Ref": "AWS::NoValue"}}]}),
+            }],
+            "Fn::ForEach::Addresses": ["Address", {"Ref": "Addresses"}, {
+                "Address&{Address}": parameter("/address-${Address}", {"Ref": "Address"}),
+            }],
+            "Fn::ForEach::Outer": ["Outer", ["x", "y"], {
+                "Pair${Outer}": parameter("/pair-${Outer}", "pair"),
+                "Fn::ForEach::Inner": ["Inner", ["1", "2"], {
+                    "Pair${Outer}${Inner}": parameter(
+                        "/pair-${Outer}-${Inner}",
+                        {"Fn::GetAtt": [{"Fn::Sub": "Pair${Outer}"}, "Value"]}),
+                }],
+            }],
+            "Counted": parameter("/counted", {"Fn::Sub": [
+                "${Count}", {"Count": {"Fn::Length": {"Ref": "Addresses"}}}]}),
+            "TierDev": parameter("/tier-dev", "dev", Condition="Isdev"),
+            "TierProd": parameter("/tier-prod", "prod", Condition="Isprod"),
+            # A plain value, &{Id} in an Fn::Sub and a nested key stay literal
+            # (measured); a loop inside Properties produces its keys, which
+            # need not be alphanumeric (measured).
+            "Fn::ForEach::Literal": ["Id", ["x"], {
+                "Literal${Id}": parameter("/literal-${Id}", "${Id}", tags={
+                    "Fn::ForEach::Tags": ["Tag", ["a", "b"], {"VAR_${Tag}": {"Ref": "Tag"}}]}),
+                "Sub${Id}": parameter("/sub-${Id}", {"Fn::Sub": "&{Id}|${Id}"}),
+                "Nested${Id}": parameter("/nested-${Id}", {"Fn::ToJsonString": {
+                    "k${Id}": {"Ref": "Id"}}}),
+            }],
+            "Json": parameter("/json", {"Fn::ToJsonString": {"config": {
+                "stage": {"Ref": "Stage"}, "addresses": {"Ref": "Addresses"},
+                "region": {"Ref": "AWS::Region"}}}}),
+            "Fn::ForEach::Kept": ["Id", ["x"], {
+                "Kept${Id}": parameter("/kept-${Id}", "kept",
+                                       DeletionPolicy={"Fn::If": ["Always", "Retain", "Delete"]}),
+            }],
+        },
+        "Outputs": {"Fn::ForEach::Names": ["Id", ["x"], {
+            "Pair${Id}Name": {"Value": {"Ref": {"Fn::Sub": "Pair${Id}"}}},
+            "Pair${Id}Literal": {"Value": {"Fn::Join": ["", ["&{Id}", "-", "${Id}"]]}},
+        }]},
+    }
+
+
+def _language_extensions(cfn, ssm, prefix, name):
+    template = json.dumps(_langext_template(prefix))
+
+    def value(suffix):
+        return ssm.get_parameter(Name=prefix + suffix)["Parameter"]["Value"]
+
+    def logical_ids():
+        return sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"])
+
+    def update(expected, addresses, **kwargs):
+        cfn.update_stack(StackName=name, **kwargs, Parameters=[
+            {"ParameterKey": "Addresses", "ParameterValue": addresses}])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    created = ["Address101", "Address102", "Counted", "GatedB", "Json", "Keptx", "Literalx",
+               "Nestedx", "Pairx", "Pairx1", "Pairx2", "Pairy", "Pairy1", "Pairy2", "Subx",
+               "TierDev"]
+    assert logical_ids() == created
+    assert value("/gated-B") == "default"
+    assert value("/tier-dev") == "dev"
+    for missing in ("/gated-A", "/tier-prod"):
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + missing)
+    assert value("/address-10.2") == "10.2"
+    assert value("/literal-x") == "${Id}"
+    assert value("/sub-x") == "&{Id}|x"
+    assert value("/nested-x") == '{"k${Id}":"x"}'
+    tags = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=prefix + "/literal-x")
+    assert {t["Key"]: t["Value"] for t in tags["TagList"]
+            if not t["Key"].startswith("aws:")} == {"VAR_a": "a", "VAR_b": "b"}
+    assert value("/pair-y-2") == "pair"
+    assert value("/counted") == "2"
+    assert value("/json") == ('{"config":{"stage":"dev","addresses":["10.1","10.2"],'
+                              f'"region":"{cfn.meta.region_name}"}}}}')
+    assert _output(stack, "PairxName") == prefix + "/pair-x"
+    assert _output(stack, "PairxLiteral") == "&{Id}-${Id}"
+
+    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    assert "Fn::ForEach::Addresses" in stored["Resources"]
+
+    parameters = [{"ParameterKey": "Addresses", "ParameterValue": "10.1,10.2,10.3"}]
+    cfn.create_change_set(StackName=name, ChangeSetName="third",
+                          TemplateBody=template, Parameters=parameters)
+    for _ in range(40):
+        described = cfn.describe_change_set(StackName=name, ChangeSetName="third")
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(0.25)
+    assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]
+            if c["ResourceChange"]["Action"] == "Add"] == ["Address103"]
+    cfn.delete_change_set(StackName=name, ChangeSetName="third")
+
+    # The third copy collides with a parameter outside the stack: the update
+    # rolls back to the two-address expansion.
+    ssm.put_parameter(Name=prefix + "/address-10.3", Value="outside", Type="String")
+    update("UPDATE_ROLLBACK_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert logical_ids() == created
+    assert value("/counted") == "2"
+    ssm.delete_parameter(Name=prefix + "/address-10.3")
+
+    update("UPDATE_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert value("/address-10.3") == "10.3"
+    assert value("/counted") == "3"
+
+    # UsePreviousTemplate reuses the processed template: a new list value does
+    # not expand the loop again (measured).
+    update("UPDATE_COMPLETE", "10.1", UsePreviousTemplate=True)
+    assert "Address103" in logical_ids()
+    assert value("/counted") == "3"
+
+    cfn.delete_stack(StackName=name)
+    assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+    assert value("/kept-x") == "kept"
+    with pytest.raises(ClientError):
+        ssm.get_parameter(Name=prefix + "/counted")
+
+
+def test_cfn_language_extensions_refusals(cfn):
+    """Every refusal answers before a stack exists; an account rolls back a
+    created stack instead. Sentences marked measured are the account's."""
+    name = f"cfn-langext-refused-{_uuid_mod.uuid4().hex[:8]}"
+    topic = {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": {"Fn::Sub": "t-${Id}"}}}
+
+    def loop(spec, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions",
+                     "Resources": {"Fn::ForEach::Loop": spec}}, **sections)
+
+    def declared(resources, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions", "Resources": resources},
+                    **sections)
+
+    def undeclared_function(function, argument):
+        return {"Resources": {"T": {"Type": "AWS::SNS::Topic", "Properties": {
+            "DisplayName": {function: argument}}}}}
+
+    cases = [
+        ({"Resources": {"Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}},
+         _LANGEXT_UNDECLARED_LOOP),  # measured
+        (undeclared_function("Fn::Length", ["a", "b"]),
+         _LANGEXT_ERROR + "Fn::Length requires the AWS::LanguageExtensions transform, "
+         "which the template does not declare."),
+        (undeclared_function("Fn::ToJsonString", {"a": "b"}),
+         _LANGEXT_ERROR + "Fn::ToJsonString requires the AWS::LanguageExtensions "
+         "transform, which the template does not declare."),
+        (declared({"T": topic}, Mappings={"M": {"Fn::ForEach::Loop": ["Id", ["a"], {"${Id}": {}}]}}),
+         _LANGEXT_ERROR + "Fn::ForEach is not supported in the Mappings section. The "
+         "functions of AWS::LanguageExtensions are supported in the Resources, "
+         "Conditions and Outputs sections."),
+        (loop(["Id", ["a"]]),
+         _LANGEXT_ERROR + "Fn::ForEach::Loop takes an identifier, a collection and a "
+         "fragment."),
+        (loop(["Id", ["a"], {"Topic": topic}]),
+         _LANGEXT_ERROR + "The key Topic of Fn::ForEach::Loop does not contain ${Id} "
+         "or &{Id}. Every key a loop produces has to carry its identifier, or the "
+         "iterations would collide."),
+        (loop(["Id", "a,b,c", {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::ForEach layout is incorrect"),  # measured
+        (loop(["Id", {"Ref": "Plain"}, {"T${Id}": topic}],
+              Parameters={"Plain": {"Type": "String", "Default": "a,b"}}),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),  # measured
+        (loop(["Id", {"Fn::GetAtt": ["T", "TopicName"]}, {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),
+        (loop(["Id", {"Fn::Split": [",", {"Fn::Select": ["-1", ["z", "a,b"]]}]},
+               {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::Select cannot select nonexistent value at index -1"),  # measured
+        (loop(["Id", ["10.1"], {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "LogicalId 'T10.1' should be alphanumeric"),
+        (declared({"T": topic}, Outputs={"Fn::ForEach::Loop": ["Id", ["1-x"], {
+            "Param${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "OutputKey 'Param1-x' should be alphanumeric"),  # measured
+        (declared({"Loop": {"Type": "AWS::SNS::Topic"},
+                   "Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}),
+         _LANGEXT_ERROR + "The loop name Loop is the logical id of a resource. A loop "
+         "name cannot conflict with a logical id in the Resources section."),
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Loop": ["Id", ["a"], {"O${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "The loop name Loop is used more than once. A loop name must be "
+         "unique within the template."),
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Fn::Length": {"Fn::GetAtt": ["T", "TopicName"]}}})}),
+         _LANGEXT_ERROR + "The Fn::Length value could not be resolved for properties"),  # measured
+        # An account resolves this one (measured); not implemented here.
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Ref": {"Fn::Join": ["", ["a", "b"]]}}})}),
+         _LANGEXT_ERROR + "Ref takes the name of a parameter or a resource here. An "
+         "intrinsic function inside Ref is supported by the transform, but not by this "
+         "implementation, unless a loop resolves it to a name."),
+        (loop(["Id", ["a"], {"T${Id}": dict(topic, Condition="Is${Id}")}],
+              Conditions={"Isa": {"Fn::Equals": [{"Ref": "AWS::Region"}, "nowhere"]}}),
+         _LANGEXT_ERROR + "Key Is${Id} is missing in the map."),  # measured
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Names": ["Id", ["a"], {
+                  "O${Id}": {"Value": {"Fn::Sub": "${T${Id}}"}}}]}),
+         "Template error: variable names in Fn::Sub syntax must contain only alphanumeric "
+         "characters, underscores, periods, and colons"),  # measured
+        ({"Resources": {"T": {"Type": "AWS::SNS::Topic",
+                              "Fn::Transform": {"Name": "AWS::LanguageExtensions"}}}},
+         _LANGEXT_ERROR + "the transform is declared at the top level of a template only."),
+        # "the quotas ... apply to the resultant template".
+        (loop(["Id", [str(i) for i in range(501)], {"T${Id}": topic}]),
+         "Template format error: Number of resources, 501, is greater than maximum "
+         "allowed, 500"),
+    ]
+    try:
+        for template, expected in cases:
+            with pytest.raises(ClientError) as exc:
+                cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == expected
+            with pytest.raises(ClientError):
+                cfn.describe_stacks(StackName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_validate_template_and_summary(cfn):
+    """ValidateTemplate refuses an undeclared loop with CreateStack's sentence;
+    neither it nor GetTemplateSummary expands a declaring template. The
+    summary then carries no ResourceTypes and no Capabilities (measured)."""
+    undeclared = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Fn::ForEach::Loop": ["Id", ["a", "b"], {
+            "T${Id}": {"Type": "AWS::SNS::Topic"}}]},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=json.dumps(undeclared))
+    assert exc.value.response["Error"]["Message"] == _LANGEXT_UNDECLARED_LOOP
+
+    declared = dict(undeclared, Transform="AWS::LanguageExtensions",
+                    Parameters={"Topics": {"Type": "CommaDelimitedList", "Default": "a,b"}})
+    declared["Resources"] = dict(declared["Resources"], Bucket={"Type": "AWS::S3::Bucket"})
+    result = cfn.validate_template(TemplateBody=json.dumps(declared))
+    assert [p["ParameterKey"] for p in result["Parameters"]] == ["Topics"]
+    assert result["Capabilities"] == ["CAPABILITY_AUTO_EXPAND"]
+
+    summary = cfn.get_template_summary(TemplateBody=json.dumps(declared))
+    assert "ResourceTypes" not in summary
+    assert "Capabilities" not in summary
+    assert summary["DeclaredTransforms"] == ["AWS::LanguageExtensions"]
+    assert [p["ParameterKey"] for p in summary["Parameters"]] == ["Topics"]
+
+
+def test_cfn_language_extensions_collections(cfn, ssm):
+    """Collections an intrinsic answers, all measured: Fn::Sub members with a
+    variable map, Fn::Split over Fn::Select, Fn::FindInMap answering a list."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-coll-{uid}"
+    prefix = f"/cfn-langext-coll/{uid}"
+
+    def copies(loop, identifier, collection):
+        return {f"Fn::ForEach::{loop}": [identifier, collection, {
+            f"{loop}${{{identifier}}}": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": {"Fn::Sub": f"{prefix}/{loop}-${{{identifier}}}"},
+                "Type": "String", "Value": {"Ref": identifier}}}}]}
+
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {"Stage": {"Type": "String", "Default": "dev"}},
+        "Mappings": {"M": {"k": {"list": ["m1", "m2"]}}},
+        "Resources": dict(
+            copies("Sub", "Item", [{"Fn::Sub": ["${Stage}one", {"Stage": {"Ref": "Stage"}}]},
+                                   {"Fn::Sub": ["${Stage}two", {"Stage": {"Ref": "Stage"}}]}]),
+            **copies("Split", "Part", {"Fn::Split": [",", {"Fn::Select": [1, ["z", "s1,s2"]]}]}),
+            **copies("Map", "Entry", {"Fn::FindInMap": ["M", "k", "list"]})),
+        # Only a variable nested in a name is refused; any other name is the engine's.
+        "Outputs": {"Odd": {"Value": {"Fn::Sub": "${Not-Alnum}"}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Mapm1", "Mapm2", "Splits1", "Splits2", "Subdevone", "Subdevtwo"]
+        assert ssm.get_parameter(Name=prefix + "/Sub-devtwo")["Parameter"]["Value"] == "devtwo"
+        assert _output(stack, "Odd") == "Not-Alnum"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_reference_to_a_plain_string_target(cfn, ssm):
+    """A Ref, Fn::GetAtt or DependsOn naming the plain string ``Param${Item}``
+    names nothing. An account fails the stack over each (measured); this
+    engine resolves an unknown Ref to its name, an unknown Fn::GetAtt to ""
+    and ignores an unknown DependsOn for every template. Pinned here."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-plain-{uid}"
+    prefix = f"/cfn-langext-plain/{uid}"
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Resources": {"Fn::ForEach::Items": ["Item", ["alpha"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+            "Dep${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Param${Item}",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/dep-${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+        "Outputs": {"Fn::ForEach::Names": ["Item", ["alpha"], {
+            "Good${Item}": {"Value": {"Ref": {"Fn::Sub": "Param${Item}"}}},
+            "Bad${Item}": {"Value": {"Ref": "Param${Item}"}},
+            "BadAtt${Item}": {"Value": {"Fn::GetAtt": ["Param${Item}", "Value"]}},
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Goodalpha") == prefix + "/alpha"
+        assert _output(stack, "Badalpha") == "Param${Item}"
+        assert _output(stack, "BadAttalpha") == ""
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Depalpha", "Paramalpha"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_condition_from_an_intrinsic(cfn, ssm):
+    """An Fn::Sub in the Condition of a copy resolves to the condition name,
+    so only the copy whose condition is true is created (measured). The
+    transform is declared in the {"Name": ...} form (measured)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-cond-{uid}"
+    prefix = f"/cfn-langext-cond/{uid}"
+    template = {
+        "Transform": {"Name": "AWS::LanguageExtensions"},
+        "Parameters": {"Stage": {"Type": "String", "Default": "alpha"}},
+        "Conditions": {"Fn::ForEach::Flags": ["Item", ["alpha", "beta"], {
+            "Is${Item}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Item"}]},
+        }]},
+        "Resources": {"Fn::ForEach::Params": ["Item", ["alpha", "beta"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Condition": {"Fn::Sub": "Is${Item}"},
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=name)["StackResources"]] \
+            == ["Paramalpha"]
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + "/beta")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
