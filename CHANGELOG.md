@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **IAM — a Secrets Manager request is authorized against the stored secret ARN** — the resource was built from the name in the request, `secret:<name>`, while AWS evaluates the stored ARN with the six random characters minted at `CreateSecret`. The grant shape the CDK writes for a secret looked up by name, `secret:<name>-??????` or `secret:<name>-*`, matched nothing under `AUTH=true`. The resource now comes from the store through the handlers' own lookup; a secret that does not exist keeps the name-derived ARN. Contributed by @iot-rocket.
+
 ## [1.5.12] — 2026-09-15
 
 ### Added
