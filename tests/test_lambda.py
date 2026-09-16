@@ -2992,14 +2992,13 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
         east.delete_function(FunctionName=update_name)
 
 
-def test_lambda_wrong_account_layer_arn_does_not_resolve_to_the_local_layer(lam):
-    """A foreign-account ARN is opaque, never the local layer of the same name.
+def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
+    """A foreign-account ARN with no grant behind it is refused.
 
     The layer store is keyed by account and region, so rewriting the account
     field of an ARN this account published must not hand back that layer's
-    content. Since an unregistered cross-account layer is accepted as an opaque
-    reference, the visible proof is the code size: the real layer has one, the
-    opaque reference reports zero.
+    content — and with no AddLayerVersionPermission statement naming the
+    caller, the attachment is denied on create and on update alike.
     """
     suffix = _uuid_mod.uuid4().hex[:8]
 
@@ -3017,17 +3016,16 @@ def test_lambda_wrong_account_layer_arn_does_not_resolve_to_the_local_layer(lam)
     create_name = f"wrong-account-layer-create-{suffix}"
     update_name = f"wrong-account-layer-update-{suffix}"
     try:
-        lam.create_function(
-            FunctionName=create_name,
-            Runtime="python3.12",
-            Role=_LAMBDA_ROLE,
-            Handler="index.handler",
-            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
-            Layers=[wrong_account_arn],
-        )
-        assert lam.get_function_configuration(FunctionName=create_name)["Layers"] == [
-            {"Arn": wrong_account_arn, "CodeSize": 0}
-        ]
+        with pytest.raises(ClientError) as create_exc:
+            lam.create_function(
+                FunctionName=create_name,
+                Runtime="python3.12",
+                Role=_LAMBDA_ROLE,
+                Handler="index.handler",
+                Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+                Layers=[wrong_account_arn],
+            )
+        assert create_exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
         lam.create_function(
             FunctionName=update_name,
@@ -3036,10 +3034,9 @@ def test_lambda_wrong_account_layer_arn_does_not_resolve_to_the_local_layer(lam)
             Handler="index.handler",
             Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
         )
-        lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
-        assert lam.get_function_configuration(FunctionName=update_name)["Layers"] == [
-            {"Arn": wrong_account_arn, "CodeSize": 0}
-        ]
+        with pytest.raises(ClientError) as update_exc:
+            lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
+        assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
         # The layer this account really published still resolves to its bytes.
         lam.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
@@ -4785,15 +4782,16 @@ _DENIED = "AccessDeniedException"
     pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
     pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
                  id="missing-version-of-known-layer"),
-    pytest.param(None, None, _AWS_MANAGED_LAYER, None, _DENIED, id="unknown-layer-is-opaque"),
+    pytest.param(None, None, _AWS_MANAGED_LAYER, _DENIED, _DENIED, id="unknown-foreign-layer"),
     pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
     pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
                  "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
 ])
 def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
-    """A grant makes stored foreign content attachable and readable. An unknown
-    foreign layer name attaches as metadata only; a missing layer of this
-    account never does. The resolver does not read AUTH (see the next test)."""
+    """A grant makes stored foreign content attachable and readable. Without
+    one — no statement, a statement naming another account, or no layer of that
+    name at all — the attachment and the read are denied. The resolver does not
+    read AUTH (see the next test)."""
     arn = arn or _foreign_arn(layer_name)
     with _foreign_layer(layer_name, granted_to=granted_to):
         version_config, attach, payload, read = _layer_verdicts(arn)
@@ -4956,33 +4954,6 @@ def test_lambda_shared_layer_organization_condition(monkeypatch, membership, all
     assert len(orgs._data) == (0 if membership == "absent" else 1)
 
 
-def test_lambda_opaque_layer_does_not_load_later_private_content(shared_layer):
-    """A metadata-only attachment must not pick up content the owner publishes
-    afterwards at the same ARN, at a cold start or on reattachment."""
-    owner, caller, published, role = shared_layer
-    name = published["LayerArn"].split(":")[-1] + "-later"
-    arn = published["LayerVersionArn"].replace(published["LayerArn"].split(":")[-1], name)
-    fname = f"opaque-{_uuid_mod.uuid4().hex[:8]}"
-    later = None
-    try:
-        caller.create_function(FunctionName=fname, Runtime="python3.13", Handler="index.handler", Role=role,
-                               Code={"ZipFile": _import_handler("private_layer_module")}, Layers=[arn])
-        later = owner.publish_layer_version(
-            LayerName=name, Content={"ZipFile": _make_zip_js("SECRET = 123\n", "python/private_layer_module.py")})
-        assert later["LayerVersionArn"] == arn
-        # No invocation before publication, so this is a cold start.
-        assert _invoke_lambda_payload(caller, fname)[1] == {"value": None}
-        assert caller.get_function_configuration(FunctionName=fname)["Layers"] == [{"Arn": arn, "CodeSize": 0}]
-        with pytest.raises(ClientError) as denied:
-            caller.update_function_configuration(FunctionName=fname, Layers=[arn])
-        assert denied.value.response["Error"]["Code"] == _DENIED
-    finally:
-        with contextlib.suppress(ClientError):
-            caller.delete_function(FunctionName=fname)
-        if later is not None:
-            owner.delete_layer_version(LayerName=name, VersionNumber=later["Version"])
-
-
 @pytest.fixture
 def isolated_layers(lambda_svc_isolated, monkeypatch):
     """lambda_svc with an empty layer store and extraction cache."""
@@ -5039,7 +5010,7 @@ def test_lambda_deleted_shared_layer_retention_and_restore(isolated_layers):
     assert not [vc for layer in svc.get_state()["layers"]._data.values() for vc in layer["versions"]]
 
 
-def _seed_attached_layer(svc, name, attached_code_size, deleted):
+def _seed_attached_layer(svc, name, attached, deleted):
     from ministack.core.responses import request_scope
 
     arn = _foreign_arn(name, 1)
@@ -5047,20 +5018,21 @@ def _seed_attached_layer(svc, name, attached_code_size, deleted):
         svc._layers[name] = {"versions": [{"Version": 1, "LayerVersionArn": arn, "Content": {"CodeSize": 4096},
                                            "_zip_data": _make_zip("x"), "_deleted": deleted}], "next_version": 2}
     with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
-        svc._functions["attached"] = {"config": {"FunctionName": "attached",
-                                                 "Layers": [{"Arn": arn, "CodeSize": attached_code_size}]}}
+        svc._functions["attached"] = {"config": {
+            "FunctionName": "attached",
+            "Layers": [{"Arn": arn, "CodeSize": 4096}] if attached else []}}
     return arn
 
 
-@pytest.mark.parametrize(("attached_code_size", "reaped"), [
-    pytest.param(4096, False, id="attached-with-content-retained"),
-    pytest.param(0, True, id="opaque-attachment-does-not-retain"),
+@pytest.mark.parametrize(("attached", "reaped"), [
+    pytest.param(True, False, id="attached-version-retained"),
+    pytest.param(False, True, id="unreferenced-version-reaped"),
 ])
-def test_lambda_deleted_layer_version_reaping(isolated_layers, attached_code_size, reaped):
-    """Only an attachment that carries the bytes keeps a deleted version alive."""
+def test_lambda_deleted_layer_version_reaping(isolated_layers, attached, reaped):
+    """A deleted version lives on exactly while a function still references it."""
     from ministack.core.responses import request_scope
 
-    _seed_attached_layer(isolated_layers, "reaped-layer", attached_code_size, deleted=True)
+    _seed_attached_layer(isolated_layers, "reaped-layer", attached, deleted=True)
     isolated_layers._sweep_extract_cache()
     with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
         assert (isolated_layers._layers["reaped-layer"]["versions"] == []) is reaped
@@ -5073,7 +5045,7 @@ def test_lambda_cfn_deletes_and_restore_reap_unreferenced_layer_versions(isolate
     from ministack.services.cloudformation import provisioners
 
     svc = isolated_layers
-    arn = _seed_attached_layer(svc, "cfn-layer", 4096, deleted=False)
+    arn = _seed_attached_layer(svc, "cfn-layer", True, deleted=False)
     with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
         provisioners._lambda_layer_delete(arn, {})
         assert svc._layers["cfn-layer"]["versions"][0]["_deleted"]

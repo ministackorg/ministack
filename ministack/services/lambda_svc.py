@@ -469,8 +469,6 @@ def _sweep_extract_cache() -> None:
             if sha:
                 live_code.add(sha)
             for ref in cfg.get("Layers") or []:
-                if isinstance(ref, dict) and ref.get("CodeSize") == 0:
-                    continue
                 attached_layers.add(ref if isinstance(ref, str) else ref.get("Arn", ""))
     for layer in _layers._data.values():
         versions = layer.get("versions") or []
@@ -1690,21 +1688,15 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
-def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version, *, allow_opaque=False):
-    """Check stored grants; allow opaque references only for unknown layer names."""
+def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
+    """Resolve another account's layer version through its stored grant."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
-    if vc is not None:
-        if _layer_policy_allows(vc, get_account_id()):
-            return vc, None
-        return _layer_access_denied(layer_arn)
-    if not allow_opaque or _layers.contains_scoped(spec.account_id, spec.region, layer_name):
-        # A known layer's missing/deleted version cannot become an opaque grant.
-        return _layer_access_denied(layer_arn)
-    logger.debug("Attaching unknown external layer %s without content", layer_arn)
-    return {"Version": version, "Content": {"CodeSize": 0}}, None
+    if vc is not None and _layer_policy_allows(vc, get_account_id()):
+        return vc, None
+    return _layer_access_denied(layer_arn)
 
 
 def _resolve_layer_version_for_attachment(layer_arn: str):
@@ -1718,7 +1710,7 @@ def _resolve_layer_version_for_attachment(layer_arn: str):
         return None, _invalid_layer_version_arn(layer_arn)
 
     if spec.account_id != get_account_id():
-        return _resolve_cross_account_layer(layer_arn, spec, layer_ref, allow_opaque=True)
+        return _resolve_cross_account_layer(layer_arn, spec, layer_ref)
     if spec.region != get_region():
         return None, error_response_json(
             "InvalidParameterValueException",
@@ -5621,10 +5613,6 @@ def _execute_function_local(func: dict, event: dict) -> dict:
 def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
     """Return attached content, including versions deleted since attachment."""
     if isinstance(attachment, dict):
-        # An opaque attachment must not acquire content from a layer published
-        # later without a grant. Every stored ZIP has a nonzero compressed size.
-        if attachment.get("CodeSize") == 0:
-            return None
         attachment = attachment.get("Arn", "")
     try:
         spec = parse_arn(attachment)
