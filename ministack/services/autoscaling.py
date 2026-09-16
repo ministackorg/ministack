@@ -22,7 +22,6 @@ import copy
 import logging
 import os
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -64,10 +63,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
 
@@ -109,12 +108,6 @@ def _restore_asg_child_store(store, restored, asg_regions):
         store.set_scoped(account_id, region, key, value)
 
 
-try:
-    _restored = load_state("autoscaling")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted autoscaling state; continuing fresh")
 
 
 def reset():

@@ -27,7 +27,6 @@ import string
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -414,10 +413,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _clear_state()
@@ -459,15 +458,6 @@ def _restore_file_system_child_store(store, restored, fs_regions):
         store.set_scoped(account_id, region, fs_id, value)
 
 
-try:
-    _restored = load_state("efs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _put_lifecycle_configuration(fs_id, body):

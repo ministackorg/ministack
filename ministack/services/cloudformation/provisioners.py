@@ -1810,7 +1810,11 @@ def _lambda_create(logical_id, props, stack_name):
     memory = int(props.get("MemorySize", 128))
     env_vars = props.get("Environment", {}).get("Variables", {})
     description = props.get("Description", "")
-    layers = props.get("Layers", [])
+    # The Lambda API's own resolution, so a template cannot attach a foreign
+    # layer the API would refuse.
+    layers, err = _lambda_svc._normalize_layer_attachments(props.get("Layers"))
+    if err:
+        raise ValueError(f"AWS::Lambda::Function layer attachment failed: {err[2]!r}")
 
     # Resolve the actual code bytes:
     #  - inline ZipFile is wrapped to a real zip archive
@@ -1847,7 +1851,7 @@ def _lambda_create(logical_id, props, stack_name):
             "CodeSha256": code_sha,
             "Version": "$LATEST",
             "Environment": {"Variables": env_vars},
-            "Layers": [{"Arn": l} if isinstance(l, str) else l for l in layers],
+            "Layers": layers,
             "State": "Active",
             "LastUpdateStatus": "Successful",
             "PackageType": "Image" if is_image else "Zip",
@@ -1879,12 +1883,15 @@ def _lambda_create(logical_id, props, stack_name):
         func["config"]["ImageUri"] = image_uri
         if props.get("ImageConfig"):
             func["config"]["ImageConfigResponse"] = {"ImageConfig": props["ImageConfig"]}
+    replaced = name in _lambda_svc._functions
     _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
     # warm worker + docker pool so the new code/config load on the next invoke
     # (#897). No-op on first create (no worker spawned yet).
     _lambda_svc.invalidate_worker(name)
     _lambda_svc._pool_kill_function(get_account_id(), name)
+    if replaced:
+        _lambda_svc._sweep_extract_cache()
     return name, {"Arn": arn}
 
 
@@ -1978,6 +1985,8 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
 
 def _lambda_delete(physical_id, props):
     _lambda_svc._functions.pop(physical_id, None)
+    # The function may have held the last reference to a deleted layer version.
+    _lambda_svc._sweep_extract_cache()
 
 
 def _lambda_url_target(props):
@@ -7087,7 +7096,12 @@ def _lambda_layer_delete(physical_id, props):
         layer_name = parts[-2].split("layer:")[-1] if "layer:" in physical_id else ""
         layer = _lambda_svc._layers.get(layer_name)
         if layer:
-            layer["versions"] = [v for v in layer["versions"] if v["LayerVersionArn"] != physical_id]
+            # Tombstoned like DeleteLayerVersion: attached functions keep the
+            # content until the sweep finds no reference left.
+            for v in layer["versions"]:
+                if v["LayerVersionArn"] == physical_id:
+                    v["_deleted"] = True
+            _lambda_svc._sweep_extract_cache()
 
 
 # ---------------------------------------------------------------------------

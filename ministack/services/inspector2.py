@@ -12,7 +12,6 @@ import time
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -1225,10 +1224,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     reset()
@@ -1281,11 +1280,3 @@ def reset():
     _scan_history.clear()
     _tags.clear()
     _filters.clear()
-
-
-try:
-    _restored = load_state("inspector2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")

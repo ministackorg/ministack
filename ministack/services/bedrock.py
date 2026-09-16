@@ -38,7 +38,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -273,9 +272,6 @@ _marketplace_endpoints = AccountRegionScopedDict()
 _prompt_routers = AccountRegionScopedDict()
 _invocation_logging_config = AccountRegionScopedDict()  # 'config' -> dict (singleton)
 _tags = AccountRegionScopedDict()                  # arn -> {key: value}
-# Defined here (with the other state containers) so it exists before the
-# import-time restore_state() below — see the "Use Case for Model Access"
-# section further down for its accessors.
 _USE_CASE = AccountRegionScopedDict()              # 'usecase' -> dict (model-access use case)
 
 
@@ -312,10 +308,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _guardrails.update(data.get("guardrails", {}))
@@ -336,12 +332,6 @@ def restore_state(data):
     _USE_CASE.update(data.get("use_case", {}))
 
 
-try:
-    _restored = load_state("bedrock")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore bedrock state; continuing fresh")
 
 
 # ===========================================================================
@@ -1332,10 +1322,6 @@ def _delete_logging_config() -> tuple:
 # ===========================================================================
 # Use Case for Model Access
 # ===========================================================================
-# (_USE_CASE is defined up top with the other state containers so it exists
-#  before the import-time restore_state().)
-
-
 def _get_use_case_for_model_access() -> tuple:
     rec = _USE_CASE.get("usecase")
     if rec is None:

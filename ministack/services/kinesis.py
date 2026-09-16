@@ -40,7 +40,6 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 MAX_HASH_KEY = (2**128) - 1
 ITERATOR_EXPIRY_SECONDS = 300
 
-from ministack.core.persistence import load_state
 
 _streams = AccountRegionScopedDict()
 _shard_iterators = AccountRegionScopedDict()
@@ -60,10 +59,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _restore_stream_store(data.get("streams", {}))
         _restore_shard_iterator_store(data.get("shard_iterators", {}))
@@ -171,15 +170,6 @@ def _restore_consumer_store(data) -> None:
             _consumers.set_scoped(account_id, region, consumer_arn, copy.deepcopy(consumer))
 
 
-try:
-    _restored = load_state("kinesis")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _next_sequence_number():

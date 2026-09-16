@@ -22,7 +22,6 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -61,10 +60,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict):
+def _restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_config_sets, data.get("_config_sets", {}))
     _restore_tag_store(data.get("_ses_tags", {}))
@@ -102,15 +101,6 @@ def _legacy_resource_arn_for_region(resource_arn, account_id, region):
     return f"arn:aws:ses:{region}:{account_id}:{spec.resource}"
 
 
-try:
-    _restored = load_state("ses_v2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _json_err(code, message, status=400):

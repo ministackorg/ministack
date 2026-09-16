@@ -36,7 +36,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -70,18 +69,9 @@ _tasks = AccountRegionScopedDict()
 _tags = AccountScopedDict()
 _account_settings = AccountRegionScopedDict()
 _capacity_providers = AccountRegionScopedDict()
-# `_attributes` was originally declared next to its handler block much
-# further down the file. Moved up here so the import-time `load_state`
-# block (which calls `restore_state` and references `_attributes`) sees
-# it defined; otherwise warm-boot fires NameError, the surrounding
-# try/except swallows it, and ALL ECS state silently fails to restore.
 _attributes = AccountRegionScopedDict()
 
 
-# Up here for the same reason as `_attributes`: the import-time `load_state`
-# block calls `restore_state`, which counts the tasks it stops, so this has to
-# be bound before that runs. Defined further down it raises NameError there,
-# the surrounding try/except swallows it, and ALL ECS state fails to restore.
 def _bump_task_version(task):
     """Count one observable change on the task.
 
@@ -239,11 +229,13 @@ def _restore_task_def_latest(latest_data):
             _task_def_latest.set_scoped(account_id, region, family, revision)
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    if _services.has_any():
+        _start_restored_service_reconciler()
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -286,7 +278,7 @@ def restore_state(data):
 def _reconcile_restored_services():
     """Relaunch the tasks of every ACTIVE service after a restore.
 
-    restore_state marks each restored task STOPPED — its container went with the
+    _restore_state marks each restored task STOPPED — its container went with the
     process that ran it. Without this the service still reports its persisted
     runningCount while nothing is running, and any load balancer in front of it
     keeps forwarding to addresses nothing is listening on. Real ECS relaunches:
@@ -313,11 +305,10 @@ def _reconcile_restored_services():
 
 
 def _start_restored_service_reconciler():
-    """Run the reconcile off the import path.
+    """Reconcile restored services on a daemon thread.
 
-    restore_state runs at import; pulling images and starting containers there
-    would block startup behind the Docker daemon, so this happens on a daemon
-    thread once the process is up.
+    Pulling images and starting containers synchronously would block the
+    central persistence loader behind the Docker daemon.
     """
     def _run():
         time.sleep(_ECS_RESTORE_RECONCILE_DELAY)
@@ -331,16 +322,6 @@ def _start_restored_service_reconciler():
     ).start()
 
 
-try:
-    _restored = load_state("ecs")
-    if _restored:
-        restore_state(_restored)
-        _start_restored_service_reconciler()
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _get_docker():

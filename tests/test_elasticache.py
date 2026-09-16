@@ -812,7 +812,7 @@ def test_elasticache_restore_legacy_account_scoped_state_adopts_record_arn_regio
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _ec.restore_state({
+        _ec.load_persisted_state({
             "clusters": legacy_clusters,
             "replication_groups": legacy_rgs,
             "subnet_groups": legacy_subnets,
@@ -1535,7 +1535,7 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
 
     monkeypatch.setattr(_ec, "_spawn_redis_container", fake_spawn)
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": {
             "clustertest": {
                 "CacheClusterId": "clustertest",
@@ -1573,7 +1573,7 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     monkeypatch.setattr(_ec, "_spawn_redis_container",
                           lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "replication_groups": {
             "rg-1": {
                 "ReplicationGroupId": "rg-1",
@@ -1625,7 +1625,7 @@ def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
             "_docker_container_ids": [f"dead-rg-{region}"],
         })
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": clusters,
         "replication_groups": replication_groups,
     })
@@ -1677,7 +1677,7 @@ def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monke
 
     monkeypatch.setattr(_ec, "_spawn_redis_container", boom)
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": {
             "c1": {
                 "CacheClusterId": "c1", "Engine": "redis", "EngineVersion": "7.1",

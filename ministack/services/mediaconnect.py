@@ -32,7 +32,6 @@ import time
 import urllib.parse
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -66,10 +65,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _restore_flows(data.get("flows", {}))
@@ -105,12 +104,6 @@ def _restore_flows(restored):
         _flows.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, flow)
 
 
-try:
-    _restored = load_state("mediaconnect")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted mediaconnect state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

@@ -1109,7 +1109,7 @@ class Worker:
             if not layer_arn:
                 continue
             try:
-                layer_data = _resolve_layer_zip(layer_arn)
+                layer_data = _resolve_layer_zip(layer_ref)
                 if layer_data:
                     layer_dir = os.path.join(self._tmpdir, f"layer_{len(layers_dirs)}")
                     os.makedirs(layer_dir)
