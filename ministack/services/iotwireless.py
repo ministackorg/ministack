@@ -89,10 +89,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict | None) -> None:
+def _restore_state(data: dict | None) -> None:
     return None
 
 

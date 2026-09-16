@@ -35,7 +35,6 @@ logger = logging.getLogger("ssm")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_PAGE_SIZE = 10
 
-from ministack.core.persistence import load_state
 
 _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()
@@ -98,10 +97,10 @@ def _restore_parameter_history(data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))
         _restore_parameter_history(data.get("parameter_history", {}))
@@ -210,15 +209,6 @@ def _parameter_tag_arn(resource_type: str, resource_id: str) -> str | None:
     return _param_arn(resource_id)
 
 
-try:
-    _restored = load_state("ssm")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _encode_next_token(index: int) -> str:

@@ -4949,14 +4949,14 @@ def test_ddb_attribute_value_mapping():
 # Fleet-index connectivity (white-box: transitions and persistence)
 # ----------------------------------------------------------------------
 
-from ministack.services.iot import (  # noqa: E402
+from ministack.services.iot import (
     _thing_connectivity,
 )
-from ministack.services.iot import (  # noqa: E402
+from ministack.services.iot import (
     get_state as _iot_get_state,
 )
 from ministack.services.iot import (  # noqa: E402
-    restore_state as _iot_restore_state,
+    load_persisted_state as _iot_load_persisted_state,
 )
 
 _ACCT = "123456789012"
@@ -5107,7 +5107,7 @@ def test_connectivity_is_not_persisted_and_cannot_restore_as_connected():
         # Restart: state comes back, sessions do not.
         await session.cleanup()
         reset()
-        _iot_restore_state(snapshot)
+        _iot_load_persisted_state(snapshot)
         doc = _connectivity_of("dev-snap")
         assert doc["connected"] is False
         # And nothing was invented to fill the gap.

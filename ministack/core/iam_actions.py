@@ -899,6 +899,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         if not secret_id:
             secret_id = _safe_json_field(body, "Name")
         if secret_id:
+            # AWS evaluates against the stored ARN, whose six random characters
+            # the request need not carry. The handlers' own lookup reads them;
+            # a miss keeps the name-derived ARN.
+            from ministack.services import secretsmanager as secretsmanager_svc
+
+            _, secret = secretsmanager_svc._resolve(secret_id)
+            if secret:
+                return secret["ARN"]
             if secret_id.startswith("arn:"):
                 return secret_id
             return f"arn:aws:secretsmanager:{region}:{account_id}:secret:{secret_id}"

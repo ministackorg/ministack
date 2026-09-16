@@ -36,7 +36,6 @@ import time
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
 
 logger = logging.getLogger("appconfig")
@@ -74,10 +73,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _applications.update(data.get("applications", {}))
     _environments.update(data.get("environments", {}))
     _config_profiles.update(data.get("config_profiles", {}))
@@ -87,15 +86,6 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("appconfig")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 # ---------------------------------------------------------------------------
 # Helpers

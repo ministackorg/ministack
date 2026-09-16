@@ -56,7 +56,6 @@ from ministack.core.iam_evaluator import (
     find_iam_access_key_account,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -158,7 +157,7 @@ _completed_multipart_uploads = AccountScopedDict()
 
 # Module-level registry of per-bucket dicts that round-trip through s3.json.
 # One entry per module global: adding a new _bucket_* dict means one line here,
-# not two separate edits in get_state/restore_state. Must sit below every
+# not two separate edits in get_state/_restore_state. Must sit below every
 # _bucket_* declaration above — the dict literal holds live references.
 # Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
 # per-bucket keys like _ownership_controls / _public_access_block that live
@@ -199,35 +198,27 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})
+    # Object persistence may already have created placeholder buckets during
+    # import. Restore metadata onto those records without replacing objects.
     if isinstance(bm, AccountScopedDict):
         # Restore all accounts' buckets directly via _data
         for scoped_key, meta in bm._data.items():
-            if scoped_key not in _buckets._data:
-                _buckets._data[scoped_key] = {**meta, "objects": {}}
+            _buckets._data.setdefault(scoped_key, {"objects": {}}).update(meta)
     else:
         # Legacy plain-dict format (pre-multi-tenancy)
         for name, meta in bm.items():
-            if name not in _buckets:
-                _buckets[name] = {**meta, "objects": {}}
+            _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
 
 
-try:
-    _restored = load_state("s3")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")

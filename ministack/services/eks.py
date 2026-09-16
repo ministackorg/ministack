@@ -44,7 +44,6 @@ from ministack.core.iam_evaluator import (
     resolve_caller_identity,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -240,10 +239,10 @@ def _restore_cluster_child_store(store, restored, cluster_regions, separator):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _clusters.update(data.get("clusters", {}))
     cluster_regions = {
         (account_id, cluster_name): region
@@ -289,12 +288,6 @@ def restore_state(data):
 
 
 
-try:
-    _restored = load_state("eks")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted eks state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

@@ -1810,7 +1810,11 @@ def _lambda_create(logical_id, props, stack_name):
     memory = int(props.get("MemorySize", 128))
     env_vars = props.get("Environment", {}).get("Variables", {})
     description = props.get("Description", "")
-    layers = props.get("Layers", [])
+    # The Lambda API's own resolution, so a template cannot attach a foreign
+    # layer the API would refuse.
+    layers, err = _lambda_svc._normalize_layer_attachments(props.get("Layers"))
+    if err:
+        raise ValueError(f"AWS::Lambda::Function layer attachment failed: {err[2]!r}")
 
     # Resolve the actual code bytes:
     #  - inline ZipFile is wrapped to a real zip archive
@@ -1847,7 +1851,7 @@ def _lambda_create(logical_id, props, stack_name):
             "CodeSha256": code_sha,
             "Version": "$LATEST",
             "Environment": {"Variables": env_vars},
-            "Layers": [{"Arn": l} if isinstance(l, str) else l for l in layers],
+            "Layers": layers,
             "State": "Active",
             "LastUpdateStatus": "Successful",
             "PackageType": "Image" if is_image else "Zip",
@@ -1879,12 +1883,15 @@ def _lambda_create(logical_id, props, stack_name):
         func["config"]["ImageUri"] = image_uri
         if props.get("ImageConfig"):
             func["config"]["ImageConfigResponse"] = {"ImageConfig": props["ImageConfig"]}
+    replaced = name in _lambda_svc._functions
     _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
     # warm worker + docker pool so the new code/config load on the next invoke
     # (#897). No-op on first create (no worker spawned yet).
     _lambda_svc.invalidate_worker(name)
     _lambda_svc._pool_kill_function(get_account_id(), name)
+    if replaced:
+        _lambda_svc._sweep_extract_cache()
     return name, {"Arn": arn}
 
 
@@ -1978,6 +1985,8 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
 
 def _lambda_delete(physical_id, props):
     _lambda_svc._functions.pop(physical_id, None)
+    # The function may have held the last reference to a deleted layer version.
+    _lambda_svc._sweep_extract_cache()
 
 
 def _lambda_url_target(props):
@@ -2267,6 +2276,39 @@ def _iam_inline_policy_targets(props):
                 yield param, entity_name, put, remove
 
 
+def _iam_policy_require_entities(props):
+    """Raise the sentence IAM answers for the first entity the props name that
+    does not exist.
+
+    Measured: a stack whose AWS::IAM::Policy names a role, user or group that
+    is not there reports CREATE_FAILED for the resource, with "The <kind> with
+    name <name> cannot be found." from IAM as the reason. Called before the
+    first document is written, so a failed resource leaves no half written
+    policy behind.
+    """
+    for prop, kind, store in (("Roles", "role", _iam._roles),
+                              ("Users", "user", _iam._users),
+                              ("Groups", "group", _iam._groups)):
+        for entity_name in props.get(prop, []) or []:
+            if store.get(entity_name) is None:
+                raise ValueError(f"The {kind} with name {entity_name} cannot be found.")
+
+
+def _iam_policy_require_valid_document(props):
+    """Raise the MalformedPolicyDocument sentence for a PolicyDocument that
+    does not validate.
+
+    _iam_policy_put only sees a malformed document at the first entity's put,
+    which on an update runs after the old policies came off. Called ahead of
+    create and update, after the entities are resolved, so a malformed
+    document never reaches the drops or the writes.
+    """
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(props.get("PolicyDocument", {}))
+    if validation_err:
+        raise ValueError(validation_err)
+
+
 def _iam_policy_put(props, name):
     """Embed the PolicyDocument on every entity the resource names.
 
@@ -2307,6 +2349,8 @@ def _iam_policy_create(logical_id, props, stack_name):
     a PolicyName still get ids of their own.
     """
     physical_id = _physical_name(stack_name, logical_id, max_len=128)
+    _iam_policy_require_entities(props)
+    _iam_policy_require_valid_document(props)
     _iam_policy_put(props, props.get("PolicyName") or physical_id)
     return physical_id, {"Id": physical_id}
 
@@ -2323,6 +2367,14 @@ def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     """
     old_name = old_props.get("PolicyName") or physical_id
     new_name = new_props.get("PolicyName") or physical_id
+
+    # Every name the new template lists is resolved before anything comes off,
+    # and the new document is validated here too: an in place change is not
+    # undone by the rollback of an update, so a put that failed after the
+    # drops below (on a missing entity or a malformed document alike) would
+    # leave the entity holding nothing.
+    _iam_policy_require_entities(new_props)
+    _iam_policy_require_valid_document(new_props)
 
     # Whatever the old template left behind has to come off first: everything
     # under the old name if the name changed, and the entities this template
@@ -7044,7 +7096,12 @@ def _lambda_layer_delete(physical_id, props):
         layer_name = parts[-2].split("layer:")[-1] if "layer:" in physical_id else ""
         layer = _lambda_svc._layers.get(layer_name)
         if layer:
-            layer["versions"] = [v for v in layer["versions"] if v["LayerVersionArn"] != physical_id]
+            # Tombstoned like DeleteLayerVersion: attached functions keep the
+            # content until the sweep finds no reference left.
+            for v in layer["versions"]:
+                if v["LayerVersionArn"] == physical_id:
+                    v["_deleted"] = True
+            _lambda_svc._sweep_extract_cache()
 
 
 # ---------------------------------------------------------------------------

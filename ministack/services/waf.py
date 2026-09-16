@@ -17,7 +17,6 @@ import logging
 import os
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -60,10 +59,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not isinstance(data, dict):
         return
     arn_rewrites = {}
@@ -252,15 +251,6 @@ def _values_for_scope(store, scope):
     return store.values_scoped(get_account_id(), _scope_home_region(scope))
 
 
-try:
-    _restored = load_state("waf")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _waf_err(code, message):

@@ -49,7 +49,6 @@ except ImportError:
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state
 
 _keys = AccountRegionScopedDict()
 # key_id -> {
@@ -132,10 +131,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         keys_data = data.get("keys", {})
 
@@ -207,15 +206,6 @@ def restore_state(data):
                 _store_alias(get_account_id(), alias_key, target_id)
 
 
-try:
-    _restored = load_state("kms")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _arn(key_id):

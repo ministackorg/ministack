@@ -12952,6 +12952,63 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         cfn.delete_stack(StackName=stack_name)
 
 
+@pytest.mark.parametrize("granted", [False, True], ids=["ungranted", "granted"])
+def test_cfn_lambda_function_foreign_layer_follows_the_layer_policy(granted):
+    """A template resolves its layers the way CreateFunction does, so a stack
+    cannot attach, and later load, another account's layer without a grant."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    consumer_id = str(int(owner_id) + 400000000000)
+
+    def client(service, account):
+        return boto3.client(
+            service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1", aws_access_key_id=account, aws_secret_access_key="test",
+        )
+
+    owner, lam, cfn = client("lambda", owner_id), client("lambda", consumer_id), client(
+        "cloudformation", consumer_id)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/foreign.py", "VALUE = 1\n")
+    published = owner.publish_layer_version(LayerName="foreign", Content={"ZipFile": buf.getvalue()})
+    arn = published["LayerVersionArn"]
+    if granted:
+        owner.add_layer_version_permission(
+            LayerName="foreign", VersionNumber=published["Version"], StatementId="shared",
+            Action="lambda:GetLayerVersion", Principal=consumer_id,
+        )
+    stack_name = "cfn-foreign-layer"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+            "FunctionName": "foreign-layer-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": f"arn:aws:iam::{consumer_id}:role/cfn-role",
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"},
+            "Layers": [arn],
+        },
+    }}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        if granted:
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+            assert lam.get_function_configuration(FunctionName="foreign-layer-fn")["Layers"] == [
+                {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+        else:
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(
+                StackName=stack_name)["StackEvents"] if e["ResourceStatus"] == "CREATE_FAILED"]
+            assert any(
+                f"User: arn:aws:iam::{consumer_id}:root is not authorized to perform: "
+                f"lambda:GetLayerVersion on resource: {arn} because no resource-based "
+                "policy allows the lambda:GetLayerVersion action" in reason
+                for reason in reasons
+            ), reasons
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        owner.delete_layer_version(LayerName="foreign", VersionNumber=published["Version"])
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with
@@ -19286,6 +19343,16 @@ def _inline_role_document(iam, role, policy_name):
     return json.loads(doc) if isinstance(doc, str) else doc
 
 
+def _cfn_inline_policy_template(policy_name, document=None, **entities):
+    """One AWS::IAM::Policy on the Roles / Users / Groups passed as keywords."""
+    return json.dumps({"Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+        "PolicyName": policy_name,
+        "PolicyDocument": document or {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+        **entities,
+    }}}})
+
+
 def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
     """"Adds or updates an inline policy document that is embedded in the
     specified IAM group, user or role" (aws-resource-iam-policy.html) — the
@@ -19434,7 +19501,8 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
     """"PolicyName ... Update requires: No interruption", and "GetAtt Id: The
     stable and unique string identifying the policy"
     (aws-resource-iam-policy.html) — a renamed policy keeps its id, the role
-    ends up holding only the new name, and the old one is gone.
+    ends up holding only the new name, and the old one is gone. A rename that
+    cannot finish takes nothing off.
 
     The id staying put is what keeps the rename safe: the engine reads a
     changed physical id as a replacement and deletes the predecessor once the
@@ -19445,13 +19513,13 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
     role = f"cfn-pol-ren-role-{uid}"
     _cfn_policy_test_roles(iam, [role])
 
-    def template(name, action):
+    def template(name, action, role_names=None):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
                 "PolicyName": name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": action, "Resource": "*"}]},
-                "Roles": [role],
+                "Roles": role_names or [role],
             }}},
             "Outputs": {"Name": {"Value": {"Ref": "Pol"}},
                         "Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
@@ -19484,6 +19552,48 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
         with pytest.raises(ClientError) as exc_info:
             iam.get_role_policy(RoleName=role, PolicyName=f"cfn-pol-a-{uid}")
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
+
+        # A rename that names a role which is not there takes nothing off. The
+        # rollback of an update leaves a resource that kept its physical id
+        # alone, so the drop has to wait until every name resolves.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(f"cfn-pol-c-{uid}", "s3:PutObject",
+                                               [role, f"cfn-pol-ren-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-b-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_malformed_update_rolls_back_before_touching_the_role(cfn, iam):
+    """An update whose new PolicyDocument does not validate rolls back, and
+    the role keeps its last good document. Measured on a real account with a
+    statement that has no Resource."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-bad-doc-{uid}"
+    role = f"cfn-pol-bad-doc-role-{uid}"
+    policy_name = f"cfn-pol-bad-doc-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+
+    good_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    bad_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject"}]}  # no Resource
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, good_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, bad_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        assert _inline_role_document(iam, role, policy_name) == good_document
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
@@ -19721,6 +19831,101 @@ def test_cfn_iam_policy_grant_survives_a_second_stack_with_the_same_name(cfn, ia
         for stack_name in stacks:
             _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
+
+
+def test_cfn_iam_policy_missing_entity_fails_the_resource(cfn):
+    """An AWS::IAM::Policy that names a role, user or group which does not
+    exist fails the resource instead of skipping it.
+
+    Measured on a real account with one stack per kind, rollback disabled so
+    the events survive: each reports CREATE_FAILED for the resource, with the
+    IAM sentence "The <kind> with name <name> cannot be found." in the reason,
+    and then CREATE_FAILED for the stack. Rollback is on here, so the stack
+    ends in ROLLBACK_COMPLETE and the reason is read off the events."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    for prop, kind in (("Roles", "role"), ("Users", "user"), ("Groups", "group")):
+        stack_name = f"cfn-iam-pol-miss-{kind}-{uid}"
+        missing = f"cfn-pol-miss-{kind}-{uid}"
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-miss-{uid}", **{prop: [missing]}))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert f"The {kind} with name {missing} cannot be found." in \
+                _stack_event_reasons(cfn, stack_name)
+        finally:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_policy_missing_entity_writes_nothing_at_all(cfn, iam):
+    """A resource that names one role that exists and one that does not writes
+    the policy on neither: the names are resolved before the first document is
+    embedded, so the failed resource leaves nothing behind for the rollback to
+    miss."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-part-{uid}"
+    role = f"cfn-pol-part-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            f"cfn-pol-part-{uid}", Roles=[role, f"cfn-pol-part-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+@pytest.mark.parametrize("prop,kind", [("Users", "user"), ("Groups", "group")])
+def test_cfn_iam_policy_update_adding_a_missing_entity_keeps_the_policy(cfn, iam, prop, kind):
+    """An update that adds a user or group which does not exist rolls back, and
+    the entity that held the policy still holds it. The rename test covers the
+    same case for a role."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-add-{kind}-{uid}"
+    entity = {"UserName" if kind == "user" else "GroupName": f"cfn-pol-add-{kind}-{uid}"}
+    policy_name = f"cfn-pol-add-{uid}"
+    missing = f"cfn-pol-add-gone-{uid}"
+    getattr(iam, f"create_{kind}")(**entity)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: list(entity.values())}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: [*entity.values(), missing]}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert f"The {kind} with name {missing} cannot be found." in \
+            _stack_event_reasons(cfn, stack_name)
+        assert getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"] == [policy_name]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"]:
+            getattr(iam, f"delete_{kind}_policy")(PolicyName=name, **entity)
+        getattr(iam, f"delete_{kind}")(**entity)
+
+
+def test_cfn_iam_policy_delete_tolerates_an_entity_that_is_already_gone(cfn, iam):
+    """A role deleted out from under a live stack does not fail the stack
+    delete: an entity is routinely torn down before the policy on it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-gone-{uid}"
+    role = f"cfn-pol-gone-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-gone-{uid}", Roles=[role]))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        finally:
+            _cfn_policy_test_roles_cleanup(iam, [role])
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
