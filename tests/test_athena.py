@@ -229,7 +229,7 @@ def test_athena_legacy_state_migrates_to_configured_boot_region(monkeypatch):
 
     service.reset()
     try:
-        service.restore_state(payload)
+        service.load_persisted_state(payload)
         for store_name, (key, value) in stores.items():
             restored = getattr(service, store_name).get_scoped(
                 account_id, boot_region, key
@@ -314,7 +314,7 @@ def test_athena_legacy_children_follow_workgroup_region(monkeypatch):
     service.reset()
     try:
         assert service.REGION != first_request_region
-        service.restore_state(payload)
+        service.load_persisted_state(payload)
 
         assert service._workgroups.get_scoped(
             account_id, workgroup_region, workgroup_name

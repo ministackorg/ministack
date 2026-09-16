@@ -12927,6 +12927,63 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         cfn.delete_stack(StackName=stack_name)
 
 
+@pytest.mark.parametrize("granted", [False, True], ids=["ungranted", "granted"])
+def test_cfn_lambda_function_foreign_layer_follows_the_layer_policy(granted):
+    """A template resolves its layers the way CreateFunction does, so a stack
+    cannot attach, and later load, another account's layer without a grant."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    consumer_id = str(int(owner_id) + 400000000000)
+
+    def client(service, account):
+        return boto3.client(
+            service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1", aws_access_key_id=account, aws_secret_access_key="test",
+        )
+
+    owner, lam, cfn = client("lambda", owner_id), client("lambda", consumer_id), client(
+        "cloudformation", consumer_id)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/foreign.py", "VALUE = 1\n")
+    published = owner.publish_layer_version(LayerName="foreign", Content={"ZipFile": buf.getvalue()})
+    arn = published["LayerVersionArn"]
+    if granted:
+        owner.add_layer_version_permission(
+            LayerName="foreign", VersionNumber=published["Version"], StatementId="shared",
+            Action="lambda:GetLayerVersion", Principal=consumer_id,
+        )
+    stack_name = "cfn-foreign-layer"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+            "FunctionName": "foreign-layer-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": f"arn:aws:iam::{consumer_id}:role/cfn-role",
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"},
+            "Layers": [arn],
+        },
+    }}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        if granted:
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+            assert lam.get_function_configuration(FunctionName="foreign-layer-fn")["Layers"] == [
+                {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+        else:
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(
+                StackName=stack_name)["StackEvents"] if e["ResourceStatus"] == "CREATE_FAILED"]
+            assert any(
+                f"User: arn:aws:iam::{consumer_id}:root is not authorized to perform: "
+                f"lambda:GetLayerVersion on resource: {arn} because no resource-based "
+                "policy allows the lambda:GetLayerVersion action" in reason
+                for reason in reasons
+            ), reasons
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        owner.delete_layer_version(LayerName="foreign", VersionNumber=published["Version"])
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with

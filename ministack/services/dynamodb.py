@@ -71,7 +71,6 @@ _DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
 _EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
 _IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
 
-from ministack.core.persistence import load_state
 
 # Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
 # keying made name lookups find cross-region tables while ARN ops (which
@@ -188,10 +187,10 @@ def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
         # Restore items as defaultdict(dict) — JSON deserializes as plain dict
@@ -214,15 +213,6 @@ def restore_state(data):
         _imports.update(data.get("imports", {}))
 
 
-try:
-    _restored = load_state("dynamodb")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

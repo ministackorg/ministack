@@ -21,7 +21,6 @@ import secrets
 import time
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -52,10 +51,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _microvms.clear()
@@ -64,12 +63,6 @@ def restore_state(data):
     _images.update(data.get("images", {}))
 
 
-try:
-    _persisted = load_state("lambda_microvms")
-    if _persisted:
-        restore_state(_persisted)
-except Exception:  # pragma: no cover - best-effort restore
-    pass
 
 
 def reset():

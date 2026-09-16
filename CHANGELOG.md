@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **IAM — a Secrets Manager request is authorized against the stored secret ARN** — the resource was built from the name in the request, `secret:<name>`, while AWS evaluates the stored ARN with the six random characters minted at `CreateSecret`. The grant shape the CDK writes for a secret looked up by name, `secret:<name>-??????` or `secret:<name>-*`, matched nothing under `AUTH=true`. The resource now comes from the store through the handlers' own lookup; a secret that does not exist keeps the name-derived ARN. Contributed by @iot-rocket.
+- **Lambda — a layer shared through `AddLayerVersionPermission` attaches** — every layer ARN from another account was refused before the stored policy was read. Attachment, from the API and from a CloudFormation function, and `GetLayerVersionByArn` now evaluate it for account, root, public and organization grants, and an attached function keeps the content after the grant is revoked or the version is deleted. Contributed by @iot-rocket.
 
 ## [1.5.12] — 2026-09-15
 

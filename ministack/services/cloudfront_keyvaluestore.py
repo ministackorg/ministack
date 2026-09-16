@@ -19,7 +19,6 @@ from datetime import datetime
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid
 
 logger = logging.getLogger("cloudfront-keyvaluestore")
@@ -48,23 +47,20 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _stores.clear()
-    for k, v in (data.get("stores") or {}).items():
-        _stores[k] = v
+    # update() carries every account's entries; iterating a scoped dict yields
+    # only the caller's, and `or {}` discards it entirely, since both its
+    # truthiness and its iteration are account-scoped and the loader runs at
+    # boot with no request scope.
+    _stores.update(data.get("stores", {}))
 
 
-try:
-    _restored = load_state("cloudfront_keyvaluestore")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

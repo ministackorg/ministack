@@ -32,7 +32,6 @@ from urllib.parse import parse_qs
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -141,7 +140,7 @@ def get_state():
 # Issue #853: after restart the persisted Docker container ids reference
 # containers that no longer exist. Metadata says "available" but no Redis
 # is running, so Terraform / SDKs see a healthy cluster they can't connect
-# to. We can't respawn at restore_state time because that runs during
+# to. We can't respawn at _restore_state time because that runs during
 # module-import (before _spawn_redis_container is defined). Instead, mark
 # resources as pending and respawn lazily on the first dispatcher call —
 # Terraform's typical flow is DescribeCacheClusters → connect, so the
@@ -211,12 +210,11 @@ def _restore_clusters(incoming):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
-        default_state()
         return
     _restore_replication_groups(data.get("replication_groups", {}))
     _subnet_groups.update(data.get("subnet_groups", {}))
@@ -1788,14 +1786,11 @@ def _default_params_for_family(family):
     }
 
 
-try:
-    _restored = load_state("elasticache")
-    restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+# The default parameter groups exist on a fresh AWS account, so they are seeded
+# at import rather than from the restore path — the central loader only calls
+# load_persisted_state when a state file exists, and a boot without one still
+# has to answer DescribeCacheParameterGroups.
+default_state()
 
 
 # ---- Engine Versions ----

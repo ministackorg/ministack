@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -65,21 +64,15 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _schedules.update(data.get("schedules", {}))
     _schedule_groups.update(data.get("schedule_groups", {}))
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("scheduler")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted scheduler state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

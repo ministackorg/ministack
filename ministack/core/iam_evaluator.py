@@ -152,6 +152,20 @@ def _account_from_arn(arn: str) -> str | None:
     return parts[4] if _ACCOUNT_ID_RE.fullmatch(parts[4]) else None
 
 
+def _principal_org_id(account_id: str) -> str | None:
+    """aws:PrincipalOrgID, the Organization the calling account belongs to.
+    In this emulator every account is the master of its own org the moment it
+    calls Organizations and member accounts are not modelled, so the id
+    resolves from that account's own scope, and an account that never called
+    Organizations has none."""
+    try:
+        from ministack.services import organizations as org_svc
+        org = org_svc._orgs.get_scoped(account_id, None, "self")
+    except Exception:
+        return None
+    return org.get("Id") if isinstance(org, dict) else None
+
+
 def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     """Resolve a global condition context key to its value."""
     k = key.lower()
@@ -186,6 +200,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
     if k in ctx.service_context:
         return ctx.service_context[k]
+    if k == "aws:principalorgid":
+        return _principal_org_id(ctx.principal_account)
     return None  # key not present
 
 
@@ -539,6 +555,35 @@ def evaluate(ctx: EvalContext,
     # Step 3: implicit deny
     return EvalResult("ImplicitDeny", ctx.principal_arn, "",
                       "No matching Allow statement")
+
+
+def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext) -> EvalResult:
+    """Evaluate a Lambda layer-version policy for the account principal in *ctx*.
+
+    Such a document names the principals it applies to, so a statement counts
+    only when its ``AWS`` principal (or ``*``) matches the caller; action,
+    resource, conditions and deny-before-allow are then the ordinary
+    evaluation. ``Service`` principals are ignored, since the trust-policy
+    matcher lets them match any account root. A statement carrying only
+    ``NotPrincipal`` never matches, leaving that unsupported form closed."""
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(doc)
+        except (json.JSONDecodeError, TypeError):
+            doc = None
+    statements = doc.get("Statement", []) if isinstance(doc, dict) else []
+    if isinstance(statements, dict):
+        statements = [statements]
+    applicable = []
+    for stmt in statements if isinstance(statements, list) else []:
+        if not isinstance(stmt, dict):
+            continue
+        principal = stmt.get("Principal", {})
+        if isinstance(principal, dict):
+            principal = {"AWS": principal.get("AWS", [])}
+        if _principal_matches(principal, ctx.principal_arn):
+            applicable.append(stmt)
+    return evaluate(ctx, [parse_policy_document({"Statement": applicable})])
 
 
 # ---------------------------------------------------------------------------
@@ -937,25 +982,13 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         return None
     account_id = get_account_id()
 
-    def _principal_org_id():
-        # aws:PrincipalOrgID — the caller account's Organization, when it has
-        # one. In this emulator's model every account is the master of its own
-        # org the moment it calls Organizations, so the id resolves from the
-        # caller's own scope.
-        try:
-            from ministack.services import organizations as org_svc
-            org = org_svc._orgs.get("self")
-            return org.get("Id") if org else None
-        except Exception:
-            return None
-
     if _is_root_key(access_key_id):
         return {
             "accessKey": access_key_id,
             "accountId": account_id,
             "userArn": f"arn:aws:iam::{account_id}:root",
             "userId": account_id,
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": None,
         }
     session = sts_svc._sessions.get(access_key_id)
@@ -965,7 +998,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
             "accountId": account_id,
             "userArn": session.get("Arn", ""),
             "userId": session.get("UserId", ""),
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": session,
         }
     key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
@@ -977,7 +1010,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
             "accountId": account_id,
             "userArn": user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}",
             "userId": user.get("UserId", ""),
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": None,
         }
     return None
