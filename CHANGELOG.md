@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SNS — a direct-to-phone `Publish` is recorded and can be read back** — a `Publish` carrying a `PhoneNumber` and no `TopicArn` logged one line and stored nothing, so an SMS was the only thing a suite could send through MiniStack and not observe; SES and SQS both keep what they were sent and serve it at `/_ministack/ses/messages` and `/_ministack/sqs/messages`. SNS now keeps them too, per account and per region, and serves them at `GET /_ministack/sns/sms-messages` grouped by recipient, filterable by `phoneNumber`, `account` and `region`, with `PhoneNumber`, `Message`, `MessageId`, `MessageAttributes`, `Subject`, `MessageStructure`, `TopicArn` and `SubscriptionArn` on each record. The body keeps LocalStack's `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` shape, so a suite that asserts an SMS was sent changes the URL and nothing else. A filtered read names the recipient with an empty list rather than omitting the key, as LocalStack does. The log is cleared by `/_ministack/reset` and survives a persisted restart. Topic publishes are unaffected and are not recorded.
+
 ### Fixed
 - **IAM — three calls are authorized against the action and resource AWS uses** — a Lambda Function URL invoke is checked against its function ARN, alias qualifier included, and supplies `lambda:FunctionUrlAuthType`, so the policy `grantInvokeUrl` writes matches. The WebSocket `@connections` API asks for `execute-api:ManageConnections` instead of `execute-api:Invoke`. `iot-jobs-data` operations are authorized under `iotjobsdata:`, except `StartCommandExecution`, which stays on `iot:`. A policy written for the old action names stops matching, as on AWS. Contributed by @iot-rocket.
 ### Added
