@@ -215,7 +215,6 @@ def load_persisted_state(data):
 
 def _restore_state(data):
     if not data:
-        default_state()
         return
     _restore_replication_groups(data.get("replication_groups", {}))
     _subnet_groups.update(data.get("subnet_groups", {}))
@@ -1787,6 +1786,11 @@ def _default_params_for_family(family):
     }
 
 
+# The default parameter groups exist on a fresh AWS account, so they are seeded
+# at import rather than from the restore path — the central loader only calls
+# load_persisted_state when a state file exists, and a boot without one still
+# has to answer DescribeCacheParameterGroups.
+default_state()
 
 
 # ---- Engine Versions ----

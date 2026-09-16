@@ -67,9 +67,15 @@ def _restore_state(data):
         (_orgs, "orgs"), (_accounts, "accounts"),
         (_ous, "ous"), (_roots, "roots"), (_tags, "tags")
     ):
+        # update() copies every account's entries; iterating an
+        # AccountScopedDict yields only the caller's, and the loader runs at
+        # boot with no request scope, so a per-key loop would drop every
+        # account but the default one. `or {}` is wrong here for the same
+        # reason: the truthiness of a scoped dict is account-scoped too.
+        restored = data.get(key)
         store.clear()
-        for k, v in (data.get(key) or {}).items():
-            store[k] = v
+        if restored is not None:
+            store.update(restored)
 
 
 def _json(status, body):

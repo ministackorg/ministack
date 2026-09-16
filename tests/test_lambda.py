@@ -4997,7 +4997,7 @@ def test_lambda_deleted_shared_layer_retention_and_restore(isolated_layers):
     state = svc.get_state()
     svc._layers.clear()
     svc._functions.clear()
-    svc.restore_state(state)
+    svc.load_persisted_state(state)
     with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
         assert svc._resolve_layer_zip(arn) == layer_zip
         assert svc._layer_unzipped_size(arn) == len("retained bytes")
@@ -5056,7 +5056,7 @@ def test_lambda_cfn_deletes_and_restore_reap_unreferenced_layer_versions(isolate
     with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
         assert svc._layers["cfn-layer"]["versions"] == []
         svc._layers.clear()
-        svc.restore_state(state)
+        svc.load_persisted_state(state)
         assert svc._layers["cfn-layer"]["versions"] == []
 
 
