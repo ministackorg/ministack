@@ -17,7 +17,6 @@ import logging
 import os
 from urllib.parse import parse_qs
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict
 
 logger = logging.getLogger("cloudformation")
@@ -94,10 +93,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     for store, key in _PERSISTED_STORES:
@@ -105,7 +104,7 @@ def restore_state(data):
         target = store()
         if isinstance(restored, AccountRegionScopedDict):
             # Merge the (account, region, key)-scoped entries directly. Restore
-            # runs at import time with no request scope, so re-scoping through
+            # runs at startup with no request scope, so re-scoping through
             # the public dict interface would misattribute every entry.
             target._data.update(restored._data)
         elif isinstance(restored, dict):
@@ -115,15 +114,3 @@ def restore_state(data):
 
 # Must be last — handlers imports from this module
 from .handlers import _ACTION_HANDLERS  # noqa: E402
-
-# Restore persisted stack metadata on first import (a CloudFormation request, or
-# the eager boot import when a state file exists). Failure falls back to a fresh
-# store rather than blocking startup.
-try:
-    _restored = load_state("cloudformation")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception(
-        "Failed to restore persisted CloudFormation state; continuing with a fresh store"
-    )

@@ -30,7 +30,6 @@ import time
 import uuid
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     _request_account_id,
@@ -79,9 +78,9 @@ _resume_thread_started = False
 
 # Maps CallbackId → (DurableExecutionArn, OperationId), scoped by account, so
 # external SendCallback{Success,Failure,Heartbeat} can find their target
-# without scanning every execution. Defined HERE (above restore_state) because
-# restore_state rebuilds this index from persisted executions at module import
-# time — if the name were defined later, restore_state would NameError on cold
+# without scanning every execution. Defined HERE (above _restore_state) because
+# _restore_state rebuilds this index from persisted executions at module import
+# time — if the name were defined later, _restore_state would NameError on cold
 # start.
 _callback_index = AccountScopedDict()
 
@@ -141,10 +140,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _executions.update(data.get("executions", {}))
@@ -194,13 +193,6 @@ def restore_state(data):
                 _request_region.reset(tok_r)
 
 
-try:
-    _restored = load_state("lambda_durable")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception("Failed to restore lambda_durable state")
 
 
 # ---------------------------------------------------------------------------

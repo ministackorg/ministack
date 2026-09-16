@@ -2557,7 +2557,7 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
     (Transform: {Name: ...}) is the form that used to be reported and not
     applied."""
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
         declared_transforms,
     )
 
@@ -2571,13 +2571,38 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
                      ["AWS::Serverless-2016-10-31"]):
         template = json.loads(json.dumps(dict(sam, Transform=declared)))
         assert declared_transforms(template) == ["AWS::Serverless-2016-10-31"]
-        out = _apply_sam_transform_if_applicable(template)
+        out = _apply_transforms(template)
         types = {res.get("Type") for res in out["Resources"].values()}
         assert "AWS::Serverless::Function" not in types
         assert "AWS::Lambda::Function" in types
     # Entries the section cannot name are dropped rather than reported.
     assert declared_transforms({"Transform": [{"Parameters": {}}, 5]}) == []
     assert declared_transforms({}) == []
+
+
+def test_cfn_language_extensions_runs_before_the_sam_transform():
+    """"If you're using both the AWS::LanguageExtensions and AWS::Serverless
+    transforms, the AWS::LanguageExtensions transform must come before the
+    AWS::Serverless transform in the list" (transform-aws-languageextensions).
+    A loop over AWS::Serverless::Function resources therefore reaches SAM
+    expanded: in the other order SAM is handed an Fn::ForEach key it does not
+    know, and the copies the loop produces are never translated."""
+    from ministack.services.cloudformation.engine import _apply_transforms
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": ["AWS::LanguageExtensions", "AWS::Serverless-2016-10-31"],
+        "Resources": {"Fn::ForEach::Functions": ["Id", ["A", "B"], {
+            "Fn${Id}": {"Type": "AWS::Serverless::Function", "Properties": {
+                "Runtime": "python3.12", "Handler": "index.handler",
+                "CodeUri": "s3://b/k"}}}]},
+    }
+    out = _apply_transforms(json.loads(json.dumps(template)))
+    types = {name: res.get("Type") for name, res in out["Resources"].items()}
+    assert types["FnA"] == "AWS::Lambda::Function"
+    assert types["FnB"] == "AWS::Lambda::Function"
+    # Both transforms are spent, so the processed template declares neither.
+    assert "Transform" not in out
 
 
 def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
@@ -12927,6 +12952,63 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         cfn.delete_stack(StackName=stack_name)
 
 
+@pytest.mark.parametrize("granted", [False, True], ids=["ungranted", "granted"])
+def test_cfn_lambda_function_foreign_layer_follows_the_layer_policy(granted):
+    """A template resolves its layers the way CreateFunction does, so a stack
+    cannot attach, and later load, another account's layer without a grant."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    consumer_id = str(int(owner_id) + 400000000000)
+
+    def client(service, account):
+        return boto3.client(
+            service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1", aws_access_key_id=account, aws_secret_access_key="test",
+        )
+
+    owner, lam, cfn = client("lambda", owner_id), client("lambda", consumer_id), client(
+        "cloudformation", consumer_id)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/foreign.py", "VALUE = 1\n")
+    published = owner.publish_layer_version(LayerName="foreign", Content={"ZipFile": buf.getvalue()})
+    arn = published["LayerVersionArn"]
+    if granted:
+        owner.add_layer_version_permission(
+            LayerName="foreign", VersionNumber=published["Version"], StatementId="shared",
+            Action="lambda:GetLayerVersion", Principal=consumer_id,
+        )
+    stack_name = "cfn-foreign-layer"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+            "FunctionName": "foreign-layer-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": f"arn:aws:iam::{consumer_id}:role/cfn-role",
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"},
+            "Layers": [arn],
+        },
+    }}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        if granted:
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+            assert lam.get_function_configuration(FunctionName="foreign-layer-fn")["Layers"] == [
+                {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+        else:
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(
+                StackName=stack_name)["StackEvents"] if e["ResourceStatus"] == "CREATE_FAILED"]
+            assert any(
+                f"User: arn:aws:iam::{consumer_id}:root is not authorized to perform: "
+                f"lambda:GetLayerVersion on resource: {arn} because no resource-based "
+                "policy allows the lambda:GetLayerVersion action" in reason
+                for reason in reasons
+            ), reasons
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        owner.delete_layer_version(LayerName="foreign", VersionNumber=published["Version"])
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with
@@ -13249,7 +13331,7 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     import sys
 
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
     )
 
     # Simulate the package being absent: a None entry makes `from ... import`
@@ -13267,14 +13349,14 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
         },
     }
     with pytest.raises(ValueError) as exc:
-        _apply_sam_transform_if_applicable(template)
+        _apply_transforms(template)
     msg = str(exc.value)
     assert "AWS::Serverless-2016-10-31" in msg
     assert "docs/iac#sam" in msg
 
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
-    assert _apply_sam_transform_if_applicable(plain) is plain
+    assert _apply_transforms(plain) is plain
 
 
 # AWS::OpenSearchService::Domain
@@ -19261,6 +19343,16 @@ def _inline_role_document(iam, role, policy_name):
     return json.loads(doc) if isinstance(doc, str) else doc
 
 
+def _cfn_inline_policy_template(policy_name, document=None, **entities):
+    """One AWS::IAM::Policy on the Roles / Users / Groups passed as keywords."""
+    return json.dumps({"Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+        "PolicyName": policy_name,
+        "PolicyDocument": document or {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+        **entities,
+    }}}})
+
+
 def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
     """"Adds or updates an inline policy document that is embedded in the
     specified IAM group, user or role" (aws-resource-iam-policy.html) — the
@@ -19409,7 +19501,8 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
     """"PolicyName ... Update requires: No interruption", and "GetAtt Id: The
     stable and unique string identifying the policy"
     (aws-resource-iam-policy.html) — a renamed policy keeps its id, the role
-    ends up holding only the new name, and the old one is gone.
+    ends up holding only the new name, and the old one is gone. A rename that
+    cannot finish takes nothing off.
 
     The id staying put is what keeps the rename safe: the engine reads a
     changed physical id as a replacement and deletes the predecessor once the
@@ -19420,13 +19513,13 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
     role = f"cfn-pol-ren-role-{uid}"
     _cfn_policy_test_roles(iam, [role])
 
-    def template(name, action):
+    def template(name, action, role_names=None):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
                 "PolicyName": name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": action, "Resource": "*"}]},
-                "Roles": [role],
+                "Roles": role_names or [role],
             }}},
             "Outputs": {"Name": {"Value": {"Ref": "Pol"}},
                         "Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
@@ -19459,6 +19552,48 @@ def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam)
         with pytest.raises(ClientError) as exc_info:
             iam.get_role_policy(RoleName=role, PolicyName=f"cfn-pol-a-{uid}")
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
+
+        # A rename that names a role which is not there takes nothing off. The
+        # rollback of an update leaves a resource that kept its physical id
+        # alone, so the drop has to wait until every name resolves.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(f"cfn-pol-c-{uid}", "s3:PutObject",
+                                               [role, f"cfn-pol-ren-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-b-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_malformed_update_rolls_back_before_touching_the_role(cfn, iam):
+    """An update whose new PolicyDocument does not validate rolls back, and
+    the role keeps its last good document. Measured on a real account with a
+    statement that has no Resource."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-bad-doc-{uid}"
+    role = f"cfn-pol-bad-doc-role-{uid}"
+    policy_name = f"cfn-pol-bad-doc-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+
+    good_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    bad_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject"}]}  # no Resource
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, good_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, bad_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        assert _inline_role_document(iam, role, policy_name) == good_document
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
@@ -19696,6 +19831,101 @@ def test_cfn_iam_policy_grant_survives_a_second_stack_with_the_same_name(cfn, ia
         for stack_name in stacks:
             _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
+
+
+def test_cfn_iam_policy_missing_entity_fails_the_resource(cfn):
+    """An AWS::IAM::Policy that names a role, user or group which does not
+    exist fails the resource instead of skipping it.
+
+    Measured on a real account with one stack per kind, rollback disabled so
+    the events survive: each reports CREATE_FAILED for the resource, with the
+    IAM sentence "The <kind> with name <name> cannot be found." in the reason,
+    and then CREATE_FAILED for the stack. Rollback is on here, so the stack
+    ends in ROLLBACK_COMPLETE and the reason is read off the events."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    for prop, kind in (("Roles", "role"), ("Users", "user"), ("Groups", "group")):
+        stack_name = f"cfn-iam-pol-miss-{kind}-{uid}"
+        missing = f"cfn-pol-miss-{kind}-{uid}"
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-miss-{uid}", **{prop: [missing]}))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert f"The {kind} with name {missing} cannot be found." in \
+                _stack_event_reasons(cfn, stack_name)
+        finally:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_policy_missing_entity_writes_nothing_at_all(cfn, iam):
+    """A resource that names one role that exists and one that does not writes
+    the policy on neither: the names are resolved before the first document is
+    embedded, so the failed resource leaves nothing behind for the rollback to
+    miss."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-part-{uid}"
+    role = f"cfn-pol-part-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            f"cfn-pol-part-{uid}", Roles=[role, f"cfn-pol-part-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+@pytest.mark.parametrize("prop,kind", [("Users", "user"), ("Groups", "group")])
+def test_cfn_iam_policy_update_adding_a_missing_entity_keeps_the_policy(cfn, iam, prop, kind):
+    """An update that adds a user or group which does not exist rolls back, and
+    the entity that held the policy still holds it. The rename test covers the
+    same case for a role."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-add-{kind}-{uid}"
+    entity = {"UserName" if kind == "user" else "GroupName": f"cfn-pol-add-{kind}-{uid}"}
+    policy_name = f"cfn-pol-add-{uid}"
+    missing = f"cfn-pol-add-gone-{uid}"
+    getattr(iam, f"create_{kind}")(**entity)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: list(entity.values())}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: [*entity.values(), missing]}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert f"The {kind} with name {missing} cannot be found." in \
+            _stack_event_reasons(cfn, stack_name)
+        assert getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"] == [policy_name]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"]:
+            getattr(iam, f"delete_{kind}_policy")(PolicyName=name, **entity)
+        getattr(iam, f"delete_{kind}")(**entity)
+
+
+def test_cfn_iam_policy_delete_tolerates_an_entity_that_is_already_gone(cfn, iam):
+    """A role deleted out from under a live stack does not fail the stack
+    delete: an entity is routinely torn down before the policy on it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-gone-{uid}"
+    role = f"cfn-pol-gone-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-gone-{uid}", Roles=[role]))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        finally:
+            _cfn_policy_test_roles_cleanup(iam, [role])
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
@@ -22057,3 +22287,436 @@ def _include_transform(cfn, s3, ssm, uid, bucket, name):
         == "second"
     assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
         == "edited"
+
+
+
+# ---------------------------------------------------------------------------
+# AWS::LanguageExtensions transform
+# ---------------------------------------------------------------------------
+
+_LANGEXT_ERROR = "Transform AWS::LanguageExtensions failed with: "
+
+# An Fn::ForEach in a template that declares no transform, from CreateStack and
+# ValidateTemplate alike (measured).
+_LANGEXT_UNDECLARED_LOOP = ("Template format error: [/Resources/Fn::ForEach::Loop] "
+                            "resource definition is malformed")
+
+
+def test_cfn_language_extensions_transform(cfn, ssm):
+    """Fn::ForEach over a literal list, a CommaDelimitedList parameter, nested
+    and inside Properties; the identifier in a fragment key, an Fn::Sub and a
+    Ref to it, literal everywhere else; Fn::Length, Fn::ToJsonString (one
+    member left to the stack), FindInMap deciding a Condition, a Conditions
+    loop, a DeletionPolicy from Fn::If. Then a change set, a failed update that
+    rolls back, the update, UsePreviousTemplate (no re-expansion, measured) and
+    the delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-{uid}"
+    prefix = f"/cfn-langext/{uid}"
+    try:
+        _language_extensions(cfn, ssm, prefix, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        for suffix in ("/kept-x", "/address-10.3"):
+            try:
+                ssm.delete_parameter(Name=prefix + suffix)
+            except ClientError:
+                pass
+
+
+def _langext_template(prefix):
+    def parameter(suffix, value, tags=None, **extra):
+        properties = {"Name": {"Fn::Sub": prefix + suffix}, "Type": "String", "Value": value}
+        if tags:
+            properties["Tags"] = tags
+        return dict({"Type": "AWS::SSM::Parameter", "Properties": properties}, **extra)
+
+    return {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {
+            "Addresses": {"Type": "CommaDelimitedList", "Default": "10.1,10.2"},
+            "Stage": {"Type": "String", "Default": "dev"},
+        },
+        "Mappings": {"Gate": {"Condition": {"A": "Never"}},
+                     "Values": {"Only": {"A": "from-map"}}},
+        "Conditions": {
+            "Always": {"Fn::Equals": [{"Ref": "Stage"}, "dev"]},
+            "Never": {"Fn::Equals": [{"Ref": "Stage"}, "prod"]},
+            "Fn::ForEach::Tiers": ["Tier", ["dev", "prod"], {
+                "Is${Tier}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Tier"}]},
+            }],
+        },
+        "Resources": {
+            # GatedA's condition is false; GatedB's default is AWS::NoValue.
+            "Fn::ForEach::Gated": ["Id", ["A", "B"], {
+                "Gated${Id}": parameter(
+                    "/gated-${Id}",
+                    {"Fn::FindInMap": ["Values", "Only", {"Ref": "Id"},
+                                       {"DefaultValue": "default"}]},
+                    Condition={"Fn::FindInMap": ["Gate", "Condition", {"Ref": "Id"},
+                                                 {"DefaultValue": {"Ref": "AWS::NoValue"}}]}),
+            }],
+            "Fn::ForEach::Addresses": ["Address", {"Ref": "Addresses"}, {
+                "Address&{Address}": parameter("/address-${Address}", {"Ref": "Address"}),
+            }],
+            "Fn::ForEach::Outer": ["Outer", ["x", "y"], {
+                "Pair${Outer}": parameter("/pair-${Outer}", "pair"),
+                "Fn::ForEach::Inner": ["Inner", ["1", "2"], {
+                    "Pair${Outer}${Inner}": parameter(
+                        "/pair-${Outer}-${Inner}",
+                        {"Fn::GetAtt": [{"Fn::Sub": "Pair${Outer}"}, "Value"]}),
+                }],
+            }],
+            "Counted": parameter("/counted", {"Fn::Sub": [
+                "${Count}", {"Count": {"Fn::Length": {"Ref": "Addresses"}}}]}),
+            "TierDev": parameter("/tier-dev", "dev", Condition="Isdev"),
+            "TierProd": parameter("/tier-prod", "prod", Condition="Isprod"),
+            # A plain value, &{Id} in an Fn::Sub and a nested key stay literal
+            # (measured); a loop inside Properties produces its keys, which
+            # need not be alphanumeric (measured).
+            "Fn::ForEach::Literal": ["Id", ["x"], {
+                "Literal${Id}": parameter("/literal-${Id}", "${Id}", tags={
+                    "Fn::ForEach::Tags": ["Tag", ["a", "b"], {"VAR_${Tag}": {"Ref": "Tag"}}]}),
+                "Sub${Id}": parameter("/sub-${Id}", {"Fn::Sub": "&{Id}|${Id}"}),
+                "Nested${Id}": parameter("/nested-${Id}", {"Fn::ToJsonString": {
+                    "k${Id}": {"Ref": "Id"}}}),
+            }],
+            "Json": parameter("/json", {"Fn::ToJsonString": {"config": {
+                "stage": {"Ref": "Stage"}, "addresses": {"Ref": "Addresses"},
+                "region": {"Ref": "AWS::Region"}}}}),
+            "Fn::ForEach::Kept": ["Id", ["x"], {
+                "Kept${Id}": parameter("/kept-${Id}", "kept",
+                                       DeletionPolicy={"Fn::If": ["Always", "Retain", "Delete"]}),
+            }],
+        },
+        "Outputs": {"Fn::ForEach::Names": ["Id", ["x"], {
+            "Pair${Id}Name": {"Value": {"Ref": {"Fn::Sub": "Pair${Id}"}}},
+            "Pair${Id}Literal": {"Value": {"Fn::Join": ["", ["&{Id}", "-", "${Id}"]]}},
+        }]},
+    }
+
+
+def _language_extensions(cfn, ssm, prefix, name):
+    template = json.dumps(_langext_template(prefix))
+
+    def value(suffix):
+        return ssm.get_parameter(Name=prefix + suffix)["Parameter"]["Value"]
+
+    def logical_ids():
+        return sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"])
+
+    def update(expected, addresses, **kwargs):
+        cfn.update_stack(StackName=name, **kwargs, Parameters=[
+            {"ParameterKey": "Addresses", "ParameterValue": addresses}])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    created = ["Address101", "Address102", "Counted", "GatedB", "Json", "Keptx", "Literalx",
+               "Nestedx", "Pairx", "Pairx1", "Pairx2", "Pairy", "Pairy1", "Pairy2", "Subx",
+               "TierDev"]
+    assert logical_ids() == created
+    assert value("/gated-B") == "default"
+    assert value("/tier-dev") == "dev"
+    for missing in ("/gated-A", "/tier-prod"):
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + missing)
+    assert value("/address-10.2") == "10.2"
+    assert value("/literal-x") == "${Id}"
+    assert value("/sub-x") == "&{Id}|x"
+    assert value("/nested-x") == '{"k${Id}":"x"}'
+    tags = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=prefix + "/literal-x")
+    assert {t["Key"]: t["Value"] for t in tags["TagList"]
+            if not t["Key"].startswith("aws:")} == {"VAR_a": "a", "VAR_b": "b"}
+    assert value("/pair-y-2") == "pair"
+    assert value("/counted") == "2"
+    assert value("/json") == ('{"config":{"stage":"dev","addresses":["10.1","10.2"],'
+                              f'"region":"{cfn.meta.region_name}"}}}}')
+    assert _output(stack, "PairxName") == prefix + "/pair-x"
+    assert _output(stack, "PairxLiteral") == "&{Id}-${Id}"
+
+    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    assert "Fn::ForEach::Addresses" in stored["Resources"]
+
+    parameters = [{"ParameterKey": "Addresses", "ParameterValue": "10.1,10.2,10.3"}]
+    cfn.create_change_set(StackName=name, ChangeSetName="third",
+                          TemplateBody=template, Parameters=parameters)
+    for _ in range(40):
+        described = cfn.describe_change_set(StackName=name, ChangeSetName="third")
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(0.25)
+    assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]
+            if c["ResourceChange"]["Action"] == "Add"] == ["Address103"]
+    cfn.delete_change_set(StackName=name, ChangeSetName="third")
+
+    # The third copy collides with a parameter outside the stack: the update
+    # rolls back to the two-address expansion.
+    ssm.put_parameter(Name=prefix + "/address-10.3", Value="outside", Type="String")
+    update("UPDATE_ROLLBACK_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert logical_ids() == created
+    assert value("/counted") == "2"
+    ssm.delete_parameter(Name=prefix + "/address-10.3")
+
+    update("UPDATE_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert value("/address-10.3") == "10.3"
+    assert value("/counted") == "3"
+
+    # UsePreviousTemplate reuses the processed template: a new list value does
+    # not expand the loop again (measured).
+    update("UPDATE_COMPLETE", "10.1", UsePreviousTemplate=True)
+    assert "Address103" in logical_ids()
+    assert value("/counted") == "3"
+
+    cfn.delete_stack(StackName=name)
+    assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+    assert value("/kept-x") == "kept"
+    with pytest.raises(ClientError):
+        ssm.get_parameter(Name=prefix + "/counted")
+
+
+def test_cfn_language_extensions_refusals(cfn):
+    """Every refusal answers before a stack exists; an account rolls back a
+    created stack instead. Sentences marked measured are the account's."""
+    name = f"cfn-langext-refused-{_uuid_mod.uuid4().hex[:8]}"
+    topic = {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": {"Fn::Sub": "t-${Id}"}}}
+
+    def loop(spec, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions",
+                     "Resources": {"Fn::ForEach::Loop": spec}}, **sections)
+
+    def declared(resources, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions", "Resources": resources},
+                    **sections)
+
+    def undeclared_function(function, argument):
+        return {"Resources": {"T": {"Type": "AWS::SNS::Topic", "Properties": {
+            "DisplayName": {function: argument}}}}}
+
+    cases = [
+        ({"Resources": {"Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}},
+         _LANGEXT_UNDECLARED_LOOP),  # measured
+        (undeclared_function("Fn::Length", ["a", "b"]),
+         _LANGEXT_ERROR + "Fn::Length requires the AWS::LanguageExtensions transform, "
+         "which the template does not declare."),
+        (undeclared_function("Fn::ToJsonString", {"a": "b"}),
+         _LANGEXT_ERROR + "Fn::ToJsonString requires the AWS::LanguageExtensions "
+         "transform, which the template does not declare."),
+        (declared({"T": topic}, Mappings={"M": {"Fn::ForEach::Loop": ["Id", ["a"], {"${Id}": {}}]}}),
+         _LANGEXT_ERROR + "Fn::ForEach is not supported in the Mappings section. The "
+         "functions of AWS::LanguageExtensions are supported in the Resources, "
+         "Conditions and Outputs sections."),
+        (loop(["Id", ["a"]]),
+         _LANGEXT_ERROR + "Fn::ForEach::Loop takes an identifier, a collection and a "
+         "fragment."),
+        (loop(["Id", ["a"], {"Topic": topic}]),
+         _LANGEXT_ERROR + "The key Topic of Fn::ForEach::Loop does not contain ${Id} "
+         "or &{Id}. Every key a loop produces has to carry its identifier, or the "
+         "iterations would collide."),
+        (loop(["Id", "a,b,c", {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::ForEach layout is incorrect"),  # measured
+        (loop(["Id", {"Ref": "Plain"}, {"T${Id}": topic}],
+              Parameters={"Plain": {"Type": "String", "Default": "a,b"}}),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),  # measured
+        (loop(["Id", {"Fn::GetAtt": ["T", "TopicName"]}, {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),
+        (loop(["Id", {"Fn::Split": [",", {"Fn::Select": ["-1", ["z", "a,b"]]}]},
+               {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::Select cannot select nonexistent value at index -1"),  # measured
+        (loop(["Id", ["10.1"], {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "LogicalId 'T10.1' should be alphanumeric"),
+        (declared({"T": topic}, Outputs={"Fn::ForEach::Loop": ["Id", ["1-x"], {
+            "Param${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "OutputKey 'Param1-x' should be alphanumeric"),  # measured
+        (declared({"Loop": {"Type": "AWS::SNS::Topic"},
+                   "Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}),
+         _LANGEXT_ERROR + "The loop name Loop is the logical id of a resource. A loop "
+         "name cannot conflict with a logical id in the Resources section."),
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Loop": ["Id", ["a"], {"O${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "The loop name Loop is used more than once. A loop name must be "
+         "unique within the template."),
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Fn::Length": {"Fn::GetAtt": ["T", "TopicName"]}}})}),
+         _LANGEXT_ERROR + "The Fn::Length value could not be resolved for properties"),  # measured
+        # An account resolves this one (measured); not implemented here.
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Ref": {"Fn::Join": ["", ["a", "b"]]}}})}),
+         _LANGEXT_ERROR + "Ref takes the name of a parameter or a resource here. An "
+         "intrinsic function inside Ref is supported by the transform, but not by this "
+         "implementation, unless a loop resolves it to a name."),
+        (loop(["Id", ["a"], {"T${Id}": dict(topic, Condition="Is${Id}")}],
+              Conditions={"Isa": {"Fn::Equals": [{"Ref": "AWS::Region"}, "nowhere"]}}),
+         _LANGEXT_ERROR + "Key Is${Id} is missing in the map."),  # measured
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Names": ["Id", ["a"], {
+                  "O${Id}": {"Value": {"Fn::Sub": "${T${Id}}"}}}]}),
+         "Template error: variable names in Fn::Sub syntax must contain only alphanumeric "
+         "characters, underscores, periods, and colons"),  # measured
+        ({"Resources": {"T": {"Type": "AWS::SNS::Topic",
+                              "Fn::Transform": {"Name": "AWS::LanguageExtensions"}}}},
+         _LANGEXT_ERROR + "the transform is declared at the top level of a template only."),
+        # "the quotas ... apply to the resultant template".
+        (loop(["Id", [str(i) for i in range(501)], {"T${Id}": topic}]),
+         "Template format error: Number of resources, 501, is greater than maximum "
+         "allowed, 500"),
+    ]
+    try:
+        for template, expected in cases:
+            with pytest.raises(ClientError) as exc:
+                cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == expected
+            with pytest.raises(ClientError):
+                cfn.describe_stacks(StackName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_validate_template_and_summary(cfn):
+    """ValidateTemplate refuses an undeclared loop with CreateStack's sentence;
+    neither it nor GetTemplateSummary expands a declaring template. The
+    summary then carries no ResourceTypes and no Capabilities (measured)."""
+    undeclared = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Fn::ForEach::Loop": ["Id", ["a", "b"], {
+            "T${Id}": {"Type": "AWS::SNS::Topic"}}]},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=json.dumps(undeclared))
+    assert exc.value.response["Error"]["Message"] == _LANGEXT_UNDECLARED_LOOP
+
+    declared = dict(undeclared, Transform="AWS::LanguageExtensions",
+                    Parameters={"Topics": {"Type": "CommaDelimitedList", "Default": "a,b"}})
+    declared["Resources"] = dict(declared["Resources"], Bucket={"Type": "AWS::S3::Bucket"})
+    result = cfn.validate_template(TemplateBody=json.dumps(declared))
+    assert [p["ParameterKey"] for p in result["Parameters"]] == ["Topics"]
+    assert result["Capabilities"] == ["CAPABILITY_AUTO_EXPAND"]
+
+    summary = cfn.get_template_summary(TemplateBody=json.dumps(declared))
+    assert "ResourceTypes" not in summary
+    assert "Capabilities" not in summary
+    assert summary["DeclaredTransforms"] == ["AWS::LanguageExtensions"]
+    assert [p["ParameterKey"] for p in summary["Parameters"]] == ["Topics"]
+
+
+def test_cfn_language_extensions_collections(cfn, ssm):
+    """Collections an intrinsic answers, all measured: Fn::Sub members with a
+    variable map, Fn::Split over Fn::Select, Fn::FindInMap answering a list."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-coll-{uid}"
+    prefix = f"/cfn-langext-coll/{uid}"
+
+    def copies(loop, identifier, collection):
+        return {f"Fn::ForEach::{loop}": [identifier, collection, {
+            f"{loop}${{{identifier}}}": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": {"Fn::Sub": f"{prefix}/{loop}-${{{identifier}}}"},
+                "Type": "String", "Value": {"Ref": identifier}}}}]}
+
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {"Stage": {"Type": "String", "Default": "dev"}},
+        "Mappings": {"M": {"k": {"list": ["m1", "m2"]}}},
+        "Resources": dict(
+            copies("Sub", "Item", [{"Fn::Sub": ["${Stage}one", {"Stage": {"Ref": "Stage"}}]},
+                                   {"Fn::Sub": ["${Stage}two", {"Stage": {"Ref": "Stage"}}]}]),
+            **copies("Split", "Part", {"Fn::Split": [",", {"Fn::Select": [1, ["z", "s1,s2"]]}]}),
+            **copies("Map", "Entry", {"Fn::FindInMap": ["M", "k", "list"]})),
+        # Only a variable nested in a name is refused; any other name is the engine's.
+        "Outputs": {"Odd": {"Value": {"Fn::Sub": "${Not-Alnum}"}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Mapm1", "Mapm2", "Splits1", "Splits2", "Subdevone", "Subdevtwo"]
+        assert ssm.get_parameter(Name=prefix + "/Sub-devtwo")["Parameter"]["Value"] == "devtwo"
+        assert _output(stack, "Odd") == "Not-Alnum"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_reference_to_a_plain_string_target(cfn, ssm):
+    """A Ref, Fn::GetAtt or DependsOn naming the plain string ``Param${Item}``
+    names nothing. An account fails the stack over each (measured); this
+    engine resolves an unknown Ref to its name, an unknown Fn::GetAtt to ""
+    and ignores an unknown DependsOn for every template. Pinned here."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-plain-{uid}"
+    prefix = f"/cfn-langext-plain/{uid}"
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Resources": {"Fn::ForEach::Items": ["Item", ["alpha"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+            "Dep${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Param${Item}",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/dep-${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+        "Outputs": {"Fn::ForEach::Names": ["Item", ["alpha"], {
+            "Good${Item}": {"Value": {"Ref": {"Fn::Sub": "Param${Item}"}}},
+            "Bad${Item}": {"Value": {"Ref": "Param${Item}"}},
+            "BadAtt${Item}": {"Value": {"Fn::GetAtt": ["Param${Item}", "Value"]}},
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Goodalpha") == prefix + "/alpha"
+        assert _output(stack, "Badalpha") == "Param${Item}"
+        assert _output(stack, "BadAttalpha") == ""
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Depalpha", "Paramalpha"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_condition_from_an_intrinsic(cfn, ssm):
+    """An Fn::Sub in the Condition of a copy resolves to the condition name,
+    so only the copy whose condition is true is created (measured). The
+    transform is declared in the {"Name": ...} form (measured)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-cond-{uid}"
+    prefix = f"/cfn-langext-cond/{uid}"
+    template = {
+        "Transform": {"Name": "AWS::LanguageExtensions"},
+        "Parameters": {"Stage": {"Type": "String", "Default": "alpha"}},
+        "Conditions": {"Fn::ForEach::Flags": ["Item", ["alpha", "beta"], {
+            "Is${Item}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Item"}]},
+        }]},
+        "Resources": {"Fn::ForEach::Params": ["Item", ["alpha", "beta"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Condition": {"Fn::Sub": "Is${Item}"},
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=name)["StackResources"]] \
+            == ["Paramalpha"]
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + "/beta")
+    finally:
+        _delete_cfn_test_stack(cfn, name)

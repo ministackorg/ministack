@@ -53,7 +53,6 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-from ministack.core.persistence import load_state
 
 _users = AccountScopedDict()
 _roles = AccountScopedDict()
@@ -356,10 +355,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _users.update(data.get("users", {}))
         _roles.update(data.get("roles", {}))
@@ -381,15 +380,6 @@ def restore_state(data):
         _account_aliases.update(data.get("account_aliases", {}))
 
 
-try:
-    _restored = load_state("iam")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ===================================================================== IAM
@@ -1009,17 +999,20 @@ def _list_attached_role_policies(p):
 # -------------------- Inline role policies --------------------
 
 def _put_role_policy(p):
+    """The role is resolved before the document is read. Measured: a call
+    naming a role that does not exist with a malformed document is answered
+    NoSuchEntity. PutUserPolicy and PutGroupPolicy use the same order."""
     role_name = _p(p, "RoleName")
     policy_name = _p(p, "PolicyName")
     policy_doc = _p(p, "PolicyDocument")
+    role = _roles.get(role_name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"The role with name {role_name} cannot be found.", ns="iam")
     from ministack.core.iam_evaluator import validate_policy_document
     validation_err = validate_policy_document(policy_doc)
     if validation_err:
         return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
-    role = _roles.get(role_name)
-    if not role:
-        return _error(404, "NoSuchEntity",
-                      f"Role {role_name} not found.", ns="iam")
     role["InlinePolicies"][policy_name] = policy_doc
     return _xml(200, "PutRolePolicyResponse", "", ns="iam")
 
@@ -1787,6 +1780,10 @@ def _put_group_policy(p):
     if group_name not in _groups:
         return _error(404, "NoSuchEntity",
                       f"The group with name {group_name} cannot be found.", ns="iam")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     group_policies = _group_inline_policies.get(group_name)
     if group_policies is None:
         group_policies = {}
@@ -1856,13 +1853,13 @@ def _put_user_policy(p):
     user_name = _p(p, "UserName")
     policy_name = _p(p, "PolicyName")
     policy_doc = _p(p, "PolicyDocument")
+    if user_name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {user_name} cannot be found.", ns="iam")
     from ministack.core.iam_evaluator import validate_policy_document
     validation_err = validate_policy_document(policy_doc)
     if validation_err:
         return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
-    if user_name not in _users:
-        return _error(404, "NoSuchEntity",
-                      f"The user with name {user_name} cannot be found.", ns="iam")
     user_policies = _user_inline_policies.get(user_name)
     if user_policies is None:
         user_policies = {}

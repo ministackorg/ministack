@@ -19,7 +19,6 @@ import json
 import logging
 import time
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -58,29 +57,25 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     for store, key in (
         (_orgs, "orgs"), (_accounts, "accounts"),
         (_ous, "ous"), (_roots, "roots"), (_tags, "tags")
     ):
+        # update() copies every account's entries; iterating an
+        # AccountScopedDict yields only the caller's, and the loader runs at
+        # boot with no request scope, so a per-key loop would drop every
+        # account but the default one. `or {}` is wrong here for the same
+        # reason: the truthiness of a scoped dict is account-scoped too.
+        restored = data.get(key)
         store.clear()
-        for k, v in (data.get(key) or {}).items():
-            store[k] = v
-
-
-try:
-    _restored = load_state("organizations")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+        if restored is not None:
+            store.update(restored)
 
 
 def _json(status, body):

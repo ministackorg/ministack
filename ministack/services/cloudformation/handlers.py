@@ -20,13 +20,14 @@ from .changesets import (
 )
 from .engine import (
     _NO_VALUE,
-    _apply_sam_transform_if_applicable,
+    _apply_transforms,
     _evaluate_conditions,
     _has_dynamic_references,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
     declared_transforms,
+    refuse_undeclared_language_extensions,
     validate_template_support,
 )
 from .helpers import (
@@ -130,6 +131,11 @@ def _required_capabilities(template, strict=False):
     named_iam_ids = []
     unnamed_iam_ids = []
     for logical_id, res in resources.items():
+        # A member of Resources that is not a resource definition: the
+        # Fn::ForEach key of an unexpanded AWS::LanguageExtensions template,
+        # which ValidateTemplate and GetTemplateSummary read as it was sent.
+        if not isinstance(res, dict):
+            continue
         rtype = res.get("Type", "")
         if strict:
             if rtype not in _CAPABILITY_IAM_TYPES:
@@ -262,12 +268,12 @@ def _create_stack(params):
         return _error("AlreadyExistsException",
                       f"Stack [{stack_name}] already exists")
 
+    provided_params = _extract_members(params, "Parameters")
     try:
         template = sent = _parse_template(template_body)
-        template = _apply_sam_transform_if_applicable(template)
+        template = _apply_transforms(template, provided_params)
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
-    provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
@@ -897,12 +903,13 @@ def _update_stack(params):
         else:
             return _error("ValidationError", "TemplateBody or TemplateURL is required")
 
+    provided_params = _extract_members(params, "Parameters")
     try:
         template = sent = _parse_template(template_body)
-        template = _apply_sam_transform_if_applicable(template)
+        template = _apply_transforms(template, provided_params,
+                                     stack.get("_resolved_params", {}))
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
-    provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
@@ -931,7 +938,8 @@ def _update_stack(params):
         # The stored template is the processed one: an AWS::Include snippet
         # edited or removed in S3 since the deploy is not picked up (the
         # transform reference: "your stack doesn't automatically pick up
-        # those changes").
+        # those changes"), and an Fn::ForEach is not expanded again for a new
+        # parameter value (measured).
         template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
@@ -1020,6 +1028,12 @@ def _validate_template(params):
     if "Resources" not in template:
         return _error("ValidationError",
                       "Template format error: At least one Resources member must be defined.")
+    # An Fn::ForEach in a template that declares no transform is refused as
+    # CreateStack refuses it; a declaring template is not expanded (measured).
+    try:
+        refuse_undeclared_language_extensions(template)
+    except ValueError as exc:
+        return _error("ValidationError", str(exc))
     try:
         conditions = _evaluate_conditions(
             template, _resolve_parameters(template, []))
@@ -1111,11 +1125,16 @@ def _get_template_summary(params):
     resources = template.get("Resources", {})
     param_defs = template.get("Parameters", {})
 
+    # A template declaring AWS::LanguageExtensions is not expanded here, and an
+    # account answers no ResourceTypes and no Capabilities for one (measured).
+    unexpanded = "AWS::LanguageExtensions" in declared_transforms(template)
+
     # Resource types
-    resource_types = sorted(set(
+    resource_types = [] if unexpanded else sorted(set(
         r.get("Type", "") for r in resources.values()
     ))
     types_xml = "".join(f"<member>{_esc(t)}</member>" for t in resource_types)
+    types_block = "" if unexpanded else f"<ResourceTypes>{types_xml}</ResourceTypes>"
 
     # Parameters
     params_xml = ""
@@ -1134,14 +1153,19 @@ def _get_template_summary(params):
             "</member>"
         )
 
-    caps_block = _capabilities_xml(template)
+    caps_block = "" if unexpanded else _capabilities_xml(template)
+    transforms_xml = "".join(
+        f"<member>{_esc(t)}</member>" for t in declared_transforms(template))
+    declared_block = (f"<DeclaredTransforms>{transforms_xml}</DeclaredTransforms>"
+                      if transforms_xml else "")
 
     return _xml(200, "GetTemplateSummaryResponse",
                 f"<GetTemplateSummaryResult>"
                 f"<Description>{_esc(description)}</Description>"
-                f"<ResourceTypes>{types_xml}</ResourceTypes>"
+                f"{types_block}"
                 f"<Parameters>{params_xml}</Parameters>"
                 f"{caps_block}"
+                f"{declared_block}"
                 f"</GetTemplateSummaryResult>")
 
 

@@ -55,7 +55,6 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
 
 logger = logging.getLogger("cloudfront")
@@ -193,10 +192,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _distributions.update(data.get("distributions", {}))
     _invalidations.update(data.get("invalidations", {}))
     _tags.update(data.get("tags", {}))
@@ -211,14 +210,6 @@ def restore_state(data):
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
-try:
-    _restored = load_state("cloudfront")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

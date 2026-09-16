@@ -23,7 +23,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -52,20 +51,18 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    # Restored RUNNING pipes need the background poller — register_pipe is the
+    # only other place that starts it, and it is not called on warm boot.
+    if any(pipe.get("CurrentState") == "RUNNING" for pipe in _pipes.all_values()):
+        _ensure_poller()
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _restore_pipe_store(data.get("pipes", {}))
         _restore_position_store(data.get("positions", {}))
-        # Restored RUNNING pipes need the background poller — register_pipe
-        # is the only other place that starts it, and it isn't called on
-        # warm-boot. Without this, persisted pipes would silently stop
-        # forwarding events until a new pipe is registered.
-        if any(p.get("CurrentState") == "RUNNING" for p in _pipes.all_values()):
-            _ensure_poller()
 
 
 def _pipe_arn_scope(pipe_arn: str, default_account_id: str | None = None) -> tuple[str, str]:
@@ -132,12 +129,6 @@ def _iter_all_pipes():
         yield account_id, region, pipe
 
 
-try:
-    _restored = load_state("pipes")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted pipes state; continuing fresh")
 
 
 def reset():

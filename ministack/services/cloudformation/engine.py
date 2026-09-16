@@ -20,6 +20,8 @@ import yaml
 
 from ministack.core.responses import get_account_id, get_region
 
+from . import language_extensions
+
 logger = logging.getLogger("cloudformation")
 
 # Sentinel for AWS::NoValue
@@ -267,7 +269,7 @@ def validate_template_support(template: dict, conditions: dict,
     """
     from .provisioners import _RESOURCE_HANDLERS
 
-    if isinstance(template, _IncludeFailed):
+    if isinstance(template, _TransformFailed):
         raise ValueError(template.error)
     _validate_template_limits(template)
     unrecognized: set[str] = set()
@@ -1018,6 +1020,21 @@ def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
     return f"Requested attribute {attr} does not exist in schema for {rtype}"
 
 
+def find_in_map(args, mappings, resolve):
+    """``Fn::FindInMap`` over ``mappings``, every argument read through
+    ``resolve``. The optional fourth argument is {"DefaultValue": ...}; without
+    it a missing key is a template error, as on AWS (measured: "Template error:
+    Unable to get mapping for M::x::y")."""
+    map_name, key1, key2 = resolve(args[0]), resolve(args[1]), resolve(args[2])
+    top = mappings.get(str(map_name), {})
+    if str(key1) in top and str(key2) in top[str(key1)]:
+        return top[str(key1)][str(key2)]
+    if len(args) > 3 and isinstance(args[3], dict) and "DefaultValue" in args[3]:
+        return resolve(args[3]["DefaultValue"])
+    raise ValueError(
+        f"Template error: Unable to get mapping for {map_name}::{key1}::{key2}")
+
+
 def _resolve_refs(value, resources, params, conditions, mappings,
                   stack_name, stack_id):
     """Recursively resolve CloudFormation intrinsic functions."""
@@ -1182,26 +1199,18 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                               conditions, mappings, stack_name, stack_id)
         return base64.b64encode(str(inner).encode("utf-8")).decode("utf-8")
 
+    # --- Fn::ToJsonString (AWS::LanguageExtensions) ---
+    # The transform serialises what the template alone answers and leaves the
+    # node here when a member needs the stack (Fn::GetAtt, a pseudo parameter).
+    if "Fn::ToJsonString" in value:
+        inner = _resolve_refs(value["Fn::ToJsonString"], resources, params,
+                              conditions, mappings, stack_name, stack_id)
+        return json.dumps(inner, separators=(",", ":"))
+
     # --- Fn::FindInMap ---
     if "Fn::FindInMap" in value:
-        args = value["Fn::FindInMap"]
-        map_name = _resolve_refs(args[0], resources, params, conditions,
-                                 mappings, stack_name, stack_id)
-        key1 = _resolve_refs(args[1], resources, params, conditions,
-                             mappings, stack_name, stack_id)
-        key2 = _resolve_refs(args[2], resources, params, conditions,
-                             mappings, stack_name, stack_id)
-        top = mappings.get(str(map_name), {})
-        if str(key1) in top and str(key2) in top[str(key1)]:
-            return top[str(key1)][str(key2)]
-        # The optional fourth argument is {"DefaultValue": ...}; without it a
-        # missing key is a template error, as on AWS (measured: "Template
-        # error: Unable to get mapping for M::x::y").
-        if len(args) > 3 and isinstance(args[3], dict) and "DefaultValue" in args[3]:
-            return _resolve_refs(args[3]["DefaultValue"], resources, params,
-                                 conditions, mappings, stack_name, stack_id)
-        raise ValueError(
-            f"Template error: Unable to get mapping for {map_name}::{key1}::{key2}")
+        return find_in_map(value["Fn::FindInMap"], mappings, lambda node: _resolve_refs(
+            node, resources, params, conditions, mappings, stack_name, stack_id))
 
     # --- Fn::ImportValue ---
     if "Fn::ImportValue" in value:
@@ -1423,8 +1432,8 @@ class _IncludeError(ValueError):
     caller answers, unwrapped."""
 
 
-class _IncludeFailed(dict):
-    """The template as sent, carrying the message of an include that failed.
+class _TransformFailed(dict):
+    """The template as sent, carrying the message of a transform that failed.
 
     The handlers apply the transforms in one step and wrap everything that
     step raises as ``Template format error: ...``; a real account answers
@@ -1432,7 +1441,8 @@ class _IncludeFailed(dict):
     so the failure travels with the template to ``validate_template_support``,
     which raises it as is. UpdateStack with ``UsePreviousTemplate`` swaps in
     the stored processed template before that point, so a snippet that went
-    missing since the deploy does not fail the update."""
+    missing since the deploy does not fail the update. The
+    ``AWS::LanguageExtensions`` transform reports the same way."""
 
     def __init__(self, template: dict, error: str):
         super().__init__(template)
@@ -1513,7 +1523,7 @@ def _apply_include_transform(template: dict) -> dict:
     resource, a ``Properties`` map) takes the snippet's keys, the snippet
     winning a duplicate key (unmeasured). The ``Parameters`` section and the
     template version are not walked. An include that cannot be expanded
-    returns the template as ``_IncludeFailed``, which the validation step
+    returns the template as ``_TransformFailed``, which the validation step
     turns into the ``ValidationError``."""
     found: list = []
     for section, value in template.items():
@@ -1542,7 +1552,7 @@ def _apply_include_transform(template: dict) -> dict:
             if section not in _INCLUDE_SKIPPED_SECTIONS:
                 expanded[section] = walk(value)
     except _IncludeError as exc:
-        return _IncludeFailed(template, str(exc))
+        return _TransformFailed(template, str(exc))
     return expanded
 
 
@@ -1576,13 +1586,75 @@ def declared_transforms(template: dict) -> list[str]:
     return names
 
 
-def _apply_sam_transform_if_applicable(template: dict) -> dict:
+def _transform_parameters(template: dict, provided_params, previous_params) -> dict:
+    """The parameter values ``AWS::LanguageExtensions`` resolves against ("The
+    AWS::LanguageExtensions transform resolves parameters to literal values
+    during processing"). The transforms run before the operation resolves its
+    parameters; a template the resolution refuses gets the values that are
+    there, and the operation raises for the rest right after."""
+    provided = list(provided_params or [])
+    try:
+        resolved = _resolve_parameters(template, provided, previous_params)
+        return {name: entry["Value"] for name, entry in resolved.items()}
+    except ValueError:
+        pass
+    sent = {entry["Key"]: entry.get("Value", "") for entry in provided if "Key" in entry}
+    values = {}
+    for name, defn in (template.get("Parameters") or {}).items():
+        if name in sent:
+            values[name] = str(sent[name])
+        elif isinstance(defn, dict) and "Default" in defn:
+            values[name] = str(defn["Default"])
+    return values
+
+
+def _without_transform(template: dict, name: str) -> dict:
+    """The template with one transform dropped from ``Transform``: applied, it
+    is no longer declared, and its output validates like any template."""
+    declared = template.get("Transform")
+    entries = declared if isinstance(declared, list) else [declared]
+    kept = [entry for entry in entries
+            if not (entry == name
+                    or (isinstance(entry, dict) and entry.get("Name") == name))]
+    processed = dict(template)
+    if not kept:
+        processed.pop("Transform", None)
+    elif isinstance(declared, list):
+        processed["Transform"] = kept
+    else:
+        processed["Transform"] = kept[0]
+    return processed
+
+
+def refuse_undeclared_language_extensions(template: dict) -> None:
+    """Refuse a function of ``AWS::LanguageExtensions`` in a template that does
+    not declare it. ValidateTemplate runs this alone: an account refuses the
+    undeclared loop there as CreateStack does, and validates a declaring
+    template without expanding it (both measured). Raises
+    ``LanguageExtensionsError``, a ``ValueError``."""
+    if language_extensions.TRANSFORM not in declared_transforms(template):
+        language_extensions.refuse_undeclared(template)
+
+
+def _apply_transforms(template: dict, provided_params=None,
+                      previous_params=None) -> dict:
     """The transforms a stack operation applies before validation: every
-    embedded ``AWS::Include`` first, then the SAM transform when the template
-    declares it."""
+    embedded ``AWS::Include``, then ``AWS::LanguageExtensions``, then SAM, each
+    when declared. "the AWS::LanguageExtensions transform must come before the
+    AWS::Serverless transform in the list"."""
     template = _apply_include_transform(template)
-    if isinstance(template, _IncludeFailed):
+    if isinstance(template, _TransformFailed):
         return template
+    try:
+        language_extensions.refuse_embedded(template)
+        refuse_undeclared_language_extensions(template)
+        if language_extensions.TRANSFORM in declared_transforms(template):
+            parameters = _transform_parameters(template, provided_params, previous_params)
+            template = _without_transform(
+                language_extensions.apply(template, parameters),
+                language_extensions.TRANSFORM)
+    except language_extensions.LanguageExtensionsError as exc:
+        return _TransformFailed(template, str(exc))
     if _SAM_TRANSFORM not in declared_transforms(template):
         return template
 

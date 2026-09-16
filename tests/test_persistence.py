@@ -5,8 +5,8 @@ Background
 ----------
 When PERSIST_STATE=1, the registry-derived `_state_map` in
 `ministack/app.py` supplies each loaded service's `get_state()` function
-to `save_all()` at shutdown. State is currently restored either by a
-service's import-time `load_state()` call or by `_load_persisted_state()`.
+to `save_all()` at shutdown. Startup restores saved snapshots centrally
+through each service's `load_persisted_state()` method.
 
 These tests protect persistence round trips and the registry contract.
 """
@@ -57,31 +57,41 @@ def test_registered_service_defines_state_contract(mod_name):
         f"Service module {mod_name} must define get_state(), "
         "load_persisted_state(data), and reset()."
     )
+    assert "restore_state" not in functions, (
+        f"Service module {mod_name} exposes restore_state(); use the public "
+        "load_persisted_state(data) contract instead."
+    )
+
+
+def test_tests_restore_state_only_through_the_public_contract():
+    """Tests must not couple themselves to service implementation helpers."""
+    private_calls = []
+    for path in Path(__file__).parent.glob("test_*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_restore_state":
+                private_calls.append(f"{path.name}:{node.lineno}")
+            elif isinstance(node, ast.Name) and node.id == "_restore_state":
+                private_calls.append(f"{path.name}:{node.lineno}")
+
+    assert not private_calls, (
+        "Tests must restore state through load_persisted_state(), not private "
+        f"helpers: {', '.join(private_calls)}"
+    )
 
 
 @pytest.mark.parametrize("svc_key,mod_name", sorted(_state_map.items()))
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.
 
-    Either the module calls `load_state()` itself at import time, or it exposes
-    `load_persisted_state(data)` and is wired into `_load_persisted_state()`.
-    Without one of the two its state is written on shutdown and dropped on the
-    next boot, silently.
+    The registry-driven app loader dispatches each saved snapshot through the
+    module's `load_persisted_state(data)` contract. Without that method its
+    state is written on shutdown and dropped on the next boot, silently.
     """
     mod = _module(mod_name)
     if not mod.get_state():
         pytest.skip(f"{mod_name} holds no state to restore")
-    src = Path(mod.__file__).read_text()
-
-    self_restoring = (
-        "from ministack.core.persistence import" in src
-        and "load_state(" in src
-    )
-    centrally_restored = hasattr(mod, "load_persisted_state") and svc_key in {
-        "apigateway", "apigateway_v1", "servicediscovery",
-    }
-
-    assert self_restoring or centrally_restored, (
+    assert callable(getattr(mod, "load_persisted_state", None)), (
         f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and will "
         f"be saved on shutdown, but has no restore path on startup."
     )
@@ -351,7 +361,7 @@ def test_appsync_events_legacy_children_follow_parent_api_region():
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        service.restore_state(
+        service.load_persisted_state(
             {
                 "apis": apis,
                 "channel_namespaces": namespaces,
@@ -451,7 +461,7 @@ def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path)
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        service.restore_state(loaded)
+        service.load_persisted_state(loaded)
 
         assert service._apis.get_scoped(account_id, api_region, api_id)[
             "apiArn"
@@ -567,7 +577,7 @@ def test_save_dict_skips_modules_never_imported(monkeypatch):
 # ── Functional round-trip tests ────────────────────────────────────────
 
 def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
-    """Helper: populate -> save -> reset -> restore -> observe."""
+    """Helper: populate -> save -> reset -> registry-style restore -> observe."""
     mod = _module(mod_name)
     mod.reset()
     populate_fn(mod)
@@ -579,22 +589,14 @@ def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
     # Wipe in-memory state — this simulates a process restart.
     mod.reset()
 
-    # Restore via the same code path the module would use at import.
+    # Restore via the same uniform contract used by the registry loader.
     loaded = persistence.load_state(svc_key)
     assert loaded is not None, (
         f"persistence.load_state({svc_key!r}) returned None — state file "
         "was not written by save_state(). Check `_state_map` membership "
         "and `get_state()` correctness."
     )
-    if hasattr(mod, "restore_state"):
-        mod.restore_state(loaded)
-    elif hasattr(mod, "load_persisted_state"):
-        mod.load_persisted_state(loaded)
-    else:
-        pytest.fail(
-            f"Module {mod_name} has neither restore_state nor "
-            "load_persisted_state — cannot restore."
-        )
+    mod.load_persisted_state(loaded)
 
     # Cleanup state file before observation, so a failure doesn't pollute
     # the next test run.
@@ -1047,7 +1049,7 @@ def test_backup_legacy_selection_migration_colocates_with_parent_plan():
             "Resources": [f"arn:aws:dynamodb:{plan_region}:{account_id}:table/WestTable"],
         }
 
-        backup.restore_state(legacy_state)
+        backup.load_persisted_state(legacy_state)
 
         assert backup._vaults.get_scoped(account_id, plan_region, vault_name) is not None
         assert backup._plans.get_scoped(account_id, plan_region, plan_id) is not None
@@ -1162,7 +1164,7 @@ def test_ecr_legacy_state_uses_parent_repository_region(
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod.load_persisted_state(
             {
                 "repositories": repositories,
                 "images": images,
@@ -1382,7 +1384,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod.load_persisted_state(
             {
                 "clusters": legacy_clusters,
                 "nodegroups": legacy_nodegroups,
@@ -1577,7 +1579,7 @@ def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        mod.restore_state(
+        mod.load_persisted_state(
             {"schedule_groups": legacy_groups, "schedules": legacy_schedules}
         )
 
@@ -1657,7 +1659,7 @@ def test_mwaa_restore_preserves_resource_region_outside_boot_scope(
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state({"environments": restored})
+        mod.load_persisted_state({"environments": restored})
 
         assert mod._environments.get_scoped(account_id, boot_region, env_name) is None
         restored_env = mod._environments.get_scoped(
@@ -1721,7 +1723,7 @@ def test_pipes_round_trip():
 
 
 def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
-    """When `restore_state` reloads pipes that are RUNNING, the background
+    """When `load_persisted_state` reloads RUNNING pipes, the background
     poller must be (re)started so events keep flowing after warm-boot."""
     mod = _module("pipes")
     mod.reset()
@@ -1729,7 +1731,7 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     monkeypatch.setattr(mod, "_poller_started", False)
 
     pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/poller-test"
-    mod.restore_state({
+    result = mod.load_persisted_state({
         "pipes": {
             "poller-test": {
                 "Name": "poller-test",
@@ -1748,66 +1750,104 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     })
 
     assert mod._poller_started, (
-        "restore_state() did not start the pipes poller for a RUNNING pipe — "
+        "load_persisted_state() did not start the pipes poller for a RUNNING pipe — "
         "warm-booted pipes would silently stop forwarding events."
     )
+    assert result is None
     mod.reset()
 
 
-def test_lambda_esm_eager_loaded_at_boot_when_persisted(monkeypatch):
-    """#889: persisted SQS event source mappings must resume polling after a
-    warm restart even under pure-SQS traffic. The ESM poller starts from
-    lambda_svc's import-time restore (`_ensure_poller`), and lambda_svc is
-    otherwise imported lazily only on a Lambda request — so `_load_persisted_state`
-    must eager-import it at boot when ESMs are persisted, else the restored
-    mapping sits Enabled-but-unpolled and messages pile up. A restore_state-level
-    test does NOT catch this: the bug is the module never being imported."""
-    import ministack.app as app
-    monkeypatch.setattr(app, "load_state",
-                        lambda key: {"esms": {"uuid-1": {"Enabled": True}}} if key == "lambda" else None)
-    requested = []
-    real = app._get_module
-    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
-    app._load_persisted_state()
-    assert "lambda_svc" in requested, (
-        "#889: persisted ESMs present but lambda_svc was not eager-imported at "
-        "boot — the SQS poller never starts under pure-SQS traffic after restart."
-    )
+def test_lambda_load_starts_event_source_mapping_poller(monkeypatch):
+    """Warm boot resumes the Lambda poller only through the loader API."""
+    mod = _module("lambda_svc")
+    mod.reset()
+    calls = []
+    monkeypatch.setattr(mod, "_ensure_poller", lambda: calls.append(None))
+
+    mod.load_persisted_state({
+        "esms": {
+            "warm-boot-esm": {
+                "UUID": "warm-boot-esm",
+                "FunctionArn": (
+                    "arn:aws:lambda:us-east-1:000000000000:function:warm-boot"
+                ),
+            },
+        },
+    })
+
+    assert calls == [None]
+    assert mod._esms.has_any()
+    mod.reset()
 
 
-def test_lambda_not_eager_loaded_without_persisted_esms(monkeypatch):
-    """Narrow: no persisted ESMs → don't pay the lambda_svc cold-start at boot."""
-    import ministack.app as app
-    monkeypatch.setattr(app, "load_state",
-                        lambda key: {"esms": {}} if key == "lambda" else None)
-    requested = []
-    real = app._get_module
-    monkeypatch.setattr(app, "_get_module", lambda n: (requested.append(n), real(n))[1])
-    app._load_persisted_state()
-    assert "lambda_svc" not in requested
-
-
-def test_opensearch_eager_loaded_at_boot_when_persisted(monkeypatch):
-    """Persisted domains must be restored before the lazy router sees traffic."""
+def test_registry_loader_dispatches_saved_state_to_the_declared_module(monkeypatch):
+    """The central loader imports only saved modules and calls their contract."""
     import ministack.app as app
 
-    requested = []
+    class Module:
+        def __init__(self):
+            self.loaded = []
 
-    def fake_load_state(key):
-        if key == "opensearch":
-            return {
-                "domains": {
-                    "persisted-domain": {"DomainName": "persisted-domain"}
-                }
-            }
-        return None
+        def load_persisted_state(self, data):
+            self.loaded.append(data)
 
-    monkeypatch.setattr(app, "load_state", fake_load_state)
-    monkeypatch.setattr(app, "_get_module", lambda name: requested.append(name) or object())
+    module = Module()
+    monkeypatch.setattr(app, "_state_map", {"saved": "module", "empty": "other"})
+    monkeypatch.setattr(app, "load_state", lambda key: {"value": key} if key == "saved" else None)
+    monkeypatch.setattr(app, "_get_module", lambda name: module if name == "module" else pytest.fail(name))
 
     app._load_persisted_state()
 
-    assert "opensearch" in requested
+    assert module.loaded == [{"value": "saved"}]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("objects_first", [False, True])
+def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path, legacy, objects_first):
+    """Object loading and central metadata restoration work in either order."""
+    import ministack.app as app
+    from ministack.core.responses import AccountScopedDict, request_scope
+    from ministack.services import s3
+
+    monkeypatch.setattr(s3, "_buckets", AccountScopedDict())
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path / "objects"))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    monkeypatch.setattr(app, "_state_map", {"s3": "s3"})
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    accounts = ["111111111111"] if legacy else ["111111111111", "222222222222"]
+    metadata = {} if legacy else AccountScopedDict()
+    for account in accounts:
+        bucket_meta = {
+            "created": "2020-01-01T00:00:00Z",
+            "region": "eu-west-1",
+            "_ownership_controls": "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            "_public_access_block": "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        }
+        for name in ("bucket", "empty-bucket"):
+            if legacy:
+                metadata[name] = dict(bucket_meta)
+            else:
+                metadata._data[(account, name)] = dict(bucket_meta)
+        object_path = tmp_path / "objects" / account / "bucket" / "key"
+        object_path.parent.mkdir(parents=True)
+        object_path.write_bytes(account.encode())
+    persistence.save_state("s3", {"buckets_meta": metadata})
+
+    with request_scope(accounts[0], "us-east-1"):
+        if objects_first:
+            s3._load_persisted_data()
+        app._load_persisted_state()
+        if not objects_first:
+            s3._load_persisted_data()
+
+    for account in accounts:
+        with request_scope(account, "us-east-1"):
+            for name in ("bucket", "empty-bucket"):
+                bucket = s3._buckets[name]
+                assert {key: value for key, value in bucket.items() if key != "objects"} == bucket_meta
+            obj = s3._buckets["bucket"]["objects"]["key"]
+            assert s3._read_body("bucket", "key", obj) == account.encode()
+            assert s3._buckets["empty-bucket"]["objects"] == {}
 
 
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
@@ -1817,8 +1857,8 @@ def test_opensearch_eager_loaded_at_boot_when_persisted(monkeypatch):
 ])
 def test_load_state_is_noop_when_persist_state_disabled(monkeypatch, svc_key, tmp_path):
     """When PERSIST_STATE=0, load_state() must return None without touching
-    disk and without invoking restore_state(). Catches a regression where
-    a service module accidentally calls restore_state() unconditionally."""
+    disk and without invoking load_persisted_state(). Catches a regression
+    where a service module accidentally loads state unconditionally."""
     monkeypatch.setattr(persistence, "PERSIST_STATE", False)
     # Pre-write a state file that *would* succeed if persistence were on,
     # so we can assert that it is NOT consumed.
@@ -1874,7 +1914,7 @@ def _round_trip_dict(mod, svc_key):
         f"persistence.load_state({svc_key!r}) returned None — state "
         "file was not written by save_state()."
     )
-    mod.restore_state(loaded)
+    mod.load_persisted_state(loaded)
 
 
 # ── secretsmanager._resource_policies ──────────────────────────────────
@@ -2209,7 +2249,7 @@ def test_ecs_legacy_account_scoped_state_migrates_by_arn(monkeypatch, tmp_path):
 
         loaded = persistence.load_state("ecs")
         assert isinstance(loaded["tasks"], AccountScopedDict)
-        mod.restore_state(loaded)
+        mod.load_persisted_state(loaded)
 
         assert mod._clusters.get_scoped(account_id, resource_region, cluster_name)[
             "clusterArn"
@@ -2301,7 +2341,7 @@ def test_ecs_legacy_task_revision_migration_reconstructs_each_region(monkeypatch
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state({
+        mod.load_persisted_state({
             "task_defs": legacy_task_defs,
             "task_def_latest": legacy_latest,
         })
@@ -2369,7 +2409,7 @@ def test_ecs_plain_dict_tasks_migrate_to_arn_region(monkeypatch):
     try:
         set_request_account_id(account_id)
         set_request_region(boot_region)
-        mod.restore_state(
+        mod.load_persisted_state(
             {
                 "tasks": {
                     task_arn: {
@@ -2753,7 +2793,7 @@ def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
             }
         ]
 
-        mod.restore_state({"rules": legacy_rules, "targets": legacy_targets})
+        mod.load_persisted_state({"rules": legacy_rules, "targets": legacy_targets})
 
         set_request_region("us-west-2")
         assert mod._rules[rule_key]["Name"] == "legacy-rule"
@@ -2812,7 +2852,7 @@ def test_iot_ca_registry_and_registration_code_survive_warm_boot():
             "persistence.load_state('iot') returned None — state file was not "
             "written by save_state()."
         )
-        mod.restore_state(loaded)
+        mod.load_persisted_state(loaded)
 
         restored = mod._ca_certificates.get(ca_id)
         assert restored is not None, (
@@ -2828,20 +2868,10 @@ def test_iot_ca_registry_and_registration_code_survive_warm_boot():
         mod.reset()
 
 
-# ── Import-order regression for the ECS NameError trap ───────────────
+# ── ECS restore-contract regression ──────────────────────────────────
 
-def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
-    """Regression for the import-order trap: `restore_state()` runs at
-    module import time (via the `try: load_state("ecs")` block at the
-    bottom of services/ecs.py). If `_attributes` is declared AFTER that
-    block, the restore call NameErrors and the surrounding try/except
-    silently swallows it — wiping all ECS state on warm-boot.
-
-    This test simulates a real warm-boot: write a populated `ecs.json`
-    to STATE_DIR, then `importlib.reload()` the module so the load_state
-    block runs against the file. If `_attributes` (or any other
-    referenced symbol) is declared too late, the restored state will
-    be missing because the entire restore_state body crashed."""
+def test_ecs_load_persisted_state_restores_attributes():
+    """ECS restores every store through the central loader contract."""
     mod = _get_module("ecs")
     mod.reset()
     arn = "arn:aws:ecs:us-east-1:000000000000:cluster/reload-canary"
@@ -2856,17 +2886,14 @@ def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
     # Persist via the same path save_all uses on shutdown.
     persistence.save_state("ecs", mod.get_state())
 
-    # Force a full reload so the module-level try/load_state/restore_state
-    # block at the bottom of ecs.py executes against the on-disk JSON.
-    importlib.reload(mod)
+    mod.reset()
+    mod.load_persisted_state(persistence.load_state("ecs"))
 
     assert arn in mod._clusters, (
-        "Cluster lost after reload — likely NameError in restore_state "
-        "swallowed by the try/except. Check that every referenced state "
-        "dict (_attributes etc.) is declared BEFORE the load_state block."
+        "Cluster lost through the ECS load_persisted_state contract."
     )
     assert "i-canary:reload-attr" in mod._attributes, (
-        "ECS _attributes lost after reload — same root cause."
+        "ECS _attributes lost through the load_persisted_state contract."
     )
     mod.reset()
 
@@ -2886,104 +2913,29 @@ def _persisted_services():
 
 
 @pytest.mark.parametrize("svc_key,mod_name", _persisted_services())
-def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
-    svc_key, mod_name, caplog,
-):
-    """Generic regression for the NameError-at-import pattern that hit
-    `ecs._attributes` (#492) and `acm._synthetic_pem` (#494).
+def test_service_defers_persistence_restore_until_registry_loader(svc_key, mod_name):
+    """Services must not restore from disk merely because they are imported.
 
-    The bug shape: `restore_state(data)` references a module-level
-    symbol declared further down the file. The import-time `try:
-    load_state(...)` block calls `restore_state()` BEFORE Python
-    evaluates the later definition, so the lookup NameErrors. The
-    surrounding try/except logs `Failed to restore persisted state` and
-    swallows the exception, so the module appears to import cleanly
-    while ALL its persisted state silently disappears.
-
-    The test:
-      1. Captures the module's current `get_state()` snapshot (a
-         non-empty dict-of-empty-dicts — important so `restore_state`
-         doesn't early-return on truthy emptiness checks).
-      2. Persists that to disk via the production `save_state` path.
-      3. **Removes the module from `sys.modules` and re-imports it
-         fresh** — `importlib.reload()` would NOT catch the bug
-         because it merges new definitions into the existing
-         namespace, leaving any late-declared symbol bound from the
-         previous import.
-      4. Asserts no WARNING+ log record mentioning "restore" / "failed"
-         / "continuing fresh" was emitted during the cold import.
-
-    Catches: unconditional symbol references in restore_state
-    (ECS-style). Does NOT catch: conditional references inside loops
-    over restored data when the data is empty (ACM-style needs
-    populated state — see the per-service tests above).
+    The registry loader is the sole startup restore path. This keeps module
+    imports lazy and ensures every saved snapshot goes through the uniform
+    ``load_persisted_state(data)`` contract.
     """
-    import sys
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin
+    source = Path(spec.origin).read_text()
+    tree = ast.parse(source)
+    import_time_restores = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Try, ast.If))
+        and "load_state(" in (ast.get_source_segment(source, node) or "")
+    ]
 
-    # Persistence is already enabled and STATE_DIR is already pointed at
-    # a per-test tmp by the autouse `_enable_persistence_dict` fixture.
-
-    # Step 1+2: produce + persist a snapshot using the already-loaded
-    # module (so we get a valid get_state() shape).
-    mod = _get_module(mod_name)
-    if hasattr(mod, "reset"):
-        mod.reset()
-    persistence.save_state(svc_key, mod.get_state())
-
-    # Step 3: cold-import — wipe sys.modules and re-import.
-    # importlib.reload() won't work because it merges into the
-    # existing namespace; the late-declared symbol stays bound from
-    # the prior import.
-    import ministack.services as _services_pkg
-
-    full_name = f"ministack.services.{mod_name}"
-    # The cold-import swaps a brand-new module object into BOTH sys.modules and
-    # the `ministack.services` package attribute. Other already-imported modules
-    # that did `from ministack.services import <mod>` keep a reference to the
-    # ORIGINAL object, so we must restore it afterwards. Otherwise the fresh
-    # module (with empty, reset state) leaks into later tests on the same xdist
-    # worker and desyncs cross-module references — e.g. cold-importing `ecs`
-    # then `secretsmanager` leaves the fresh `ecs` pointing at a stale
-    # `secretsmanager`, so ECS RunTask can no longer resolve Secrets Manager
-    # secrets created via the live module. Both the sys.modules entry and the
-    # package attribute must be restored: `from ministack.services import <mod>`
-    # reads the package attribute, not sys.modules directly.
-    original_mod = sys.modules.get(full_name)
-    sys.modules.pop(full_name, None)
-
-    try:
-        caplog.clear()
-        with caplog.at_level("WARNING"):
-            mod = importlib.import_module(full_name)
-
-        bad = [
-            r for r in caplog.records
-            if r.levelno >= 30  # WARNING+
-            and any(needle in r.getMessage().lower()
-                    for needle in ("failed to restore", "restore failed",
-                                   "continuing fresh", "continuing with fresh"))
-        ]
-        if hasattr(mod, "reset"):
-            mod.reset()
-    finally:
-        # Re-register the original module so references bound before this test
-        # (e.g. `ecs.secretsmanager`) stay valid for subsequent tests.
-        if original_mod is not None:
-            sys.modules[full_name] = original_mod
-            setattr(_services_pkg, mod_name, original_mod)
-
-    assert not bad, (
-        f"Cold import of `{mod_name}` (state-key `{svc_key}`) emitted "
-        f"a restore-failure log:\n  "
-        + "\n  ".join(r.getMessage() for r in bad)
-        + "\n\nThis usually means `restore_state` references a "
-        "module-level symbol that's declared further down the file. "
-        "The import-time `try: load_state()` block runs before the "
-        "later definition, so the symbol lookup NameErrors and the "
-        "surrounding try/except swallows it. Hoist the symbol above "
-        "the import-time `load_state` block (see ECS `_attributes` "
-        "or ACM `_synthetic_pem` for the canonical fix)."
+    assert not import_time_restores, (
+        f"{mod_name} restores state at import time; restore {svc_key!r} "
+        "through ministack.app._load_persisted_state instead."
     )
+    assert "from ministack.core.persistence import load_state" not in source
 
 
 def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_path):
@@ -3188,7 +3140,7 @@ def test_mediaconnect_region_scoped_v3_state_round_trips(monkeypatch, tmp_path):
         mediaconnect.reset()
         loaded = persistence.load_state("mediaconnect")
         assert loaded is not None
-        mediaconnect.restore_state(loaded)
+        mediaconnect.load_persisted_state(loaded)
 
         set_request_region(region)
         assert mediaconnect._flows[flow_arn]["name"] == "regional-flow"
@@ -3271,7 +3223,7 @@ def test_iot_legacy_state_migrates_resource_and_retained_regions():
     iot.reset()
     iot.broker_reset()
     try:
-        iot.restore_state(legacy_state)
+        iot.load_persisted_state(legacy_state)
 
         for store in (
             iot._things,
@@ -3504,7 +3456,7 @@ def test_cloudtrail_legacy_state_restores_trails_by_home_region():
         set_request_account_id(account_id)
         set_request_region(boot_region)
         cloudtrail.reset()
-        cloudtrail.restore_state(
+        cloudtrail.load_persisted_state(
             {
                 "trails": {
                     west_name: {
@@ -3551,8 +3503,6 @@ def test_cloudtrail_legacy_state_restores_trails_by_home_region():
 def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
     monkeypatch, tmp_path
 ):
-    import importlib
-
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.core.responses import set_request_account_id, set_request_region
     from ministack.services import cloudtrail
@@ -3600,7 +3550,7 @@ def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
         persistence.save_all({"cloudtrail": save_dict["cloudtrail"]})
 
         cloudtrail.reset()
-        importlib.reload(cloudtrail)
+        cloudtrail.load_persisted_state(persistence.load_state("cloudtrail"))
 
         assert cloudtrail._trails.get_scoped(
             first_account, west_region, "acct-one-west"
@@ -4492,7 +4442,7 @@ def test_cognito_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
         set_request_account_id(account)
         set_request_region("us-east-1")
         cognito.reset()
-        cognito.restore_state(persistence.load_state("cognito"))
+        cognito.load_persisted_state(persistence.load_state("cognito"))
 
         assert cognito._user_pools.get_scoped(
             account, "us-west-2", pool_id
@@ -4543,7 +4493,7 @@ def test_cognito_restore_rebuilds_schema_attributes_from_legacy_snapshot(monkeyp
         set_request_account_id("000000000000")
         set_request_region("us-west-2")
         cognito.reset()
-        cognito.restore_state({
+        cognito.load_persisted_state({
             "user_pools": {
                 pool_id: {
                     "Id": pool_id,
@@ -4673,7 +4623,7 @@ def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():
             "LogDestination": f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign",
         }
 
-        ec2.restore_state({"vpcs": vpcs, "flow_logs": flow_logs})
+        ec2.load_persisted_state({"vpcs": vpcs, "flow_logs": flow_logs})
 
         assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-legacy")["VpcId"] == "vpc-legacy"
         assert ec2._flow_logs.get_scoped(account_id, boot_region, "fl-legacy")["ResourceId"] == "vpc-legacy"
@@ -4743,7 +4693,7 @@ def test_ec2_legacy_vpc_peering_restores_to_boot_region_graph():
         }
         tags[pcx_id] = [{"Key": "Scope", "Value": "legacy"}]
 
-        ec2.restore_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
+        ec2.load_persisted_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
 
         boot_record = ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)
         peer_record = ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id)
@@ -4810,7 +4760,7 @@ def test_ec2_restore_preserves_deleted_default_resource_scope():
             "default_initialized_scopes"
         ]
 
-        ec2.restore_state(state)
+        ec2.load_persisted_state(state)
         ec2._ensure_defaults_initialized()
 
         assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
@@ -4864,7 +4814,7 @@ def test_ec2_legacy_generated_default_vpc_marks_scope_initialized():
             "MainRouteTableId": "rtb-0abc1234def567890",
         }
 
-        ec2.restore_state({"vpcs": vpcs})
+        ec2.load_persisted_state({"vpcs": vpcs})
         ec2._ensure_defaults_initialized()
 
         assert (
@@ -5267,7 +5217,7 @@ def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
         set_request_region(boot_region)
         opensearch.reset()
 
-        opensearch.restore_state({
+        opensearch.load_persisted_state({
             "domains": legacy_store(
                 (
                     account_id,
@@ -5399,7 +5349,7 @@ def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
         set_request_region(original_region)
 
 
-def test_opensearch_restore_recreates_dataplane_in_domain_region(monkeypatch):
+def test_opensearch_load_recreates_dataplane_in_domain_region(monkeypatch):
     from ministack.core.responses import (
         AccountScopedDict,
         get_account_id,
@@ -5458,7 +5408,7 @@ def test_opensearch_restore_recreates_dataplane_in_domain_region(monkeypatch):
         set_request_region(boot_region)
         opensearch.reset()
 
-        opensearch.restore_state({
+        opensearch.load_persisted_state({
             "domains": legacy_store(
                 (
                     account_id,
@@ -5610,9 +5560,7 @@ def test_glue_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
 
 
 def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
-    """The gateway save map and Batch import-time restore must preserve state
-    outside the ambient boot region across a process-shaped reload."""
-    import importlib
+    """The registry loader preserves state outside the ambient boot region."""
 
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.core.responses import set_request_account_id, set_request_region
@@ -5641,7 +5589,7 @@ def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_pa
         persistence.save_all({"batch": save_dict["batch"]})
 
         service.reset()
-        importlib.reload(service)
+        service.load_persisted_state(persistence.load_state("batch"))
 
         assert service._jobs.get_scoped(
             account_id, resource_region, job_id

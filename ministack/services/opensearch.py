@@ -32,7 +32,6 @@ import time
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -161,25 +160,29 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    _restore_domain_dataplanes()
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
-    _domains.update(data.get("domains") or {})
+    # No `or {}` on any of these: a scoped dict holding only other accounts'
+    # entries is falsy, and the loader runs at boot with no request scope, so
+    # the guard would drop every account's state but the default one's.
+    _domains.update(data.get("domains", {}))
     domain_regions = {
         (account_id, name): region
         for (account_id, region, name), _rec in _domains.all_items()
     }
     _restore_domain_child_store(
         _change_progress,
-        data.get("change_progress") or {},
+        data.get("change_progress", {}),
         domain_regions,
         key_to_domain=lambda key: key,
     )
-    domain_packages = data.get("domain_packages") or {}
+    domain_packages = data.get("domain_packages", {})
     _restore_domain_child_store(
         _domain_packages,
         domain_packages,
@@ -189,9 +192,8 @@ def restore_state(data):
     package_regions = _package_regions_from_domain_packages(
         domain_packages, domain_regions
     )
-    _restore_package_store(_packages, data.get("packages") or {}, package_regions)
-    _tags.update(data.get("tags") or {})
-    _restore_domain_dataplanes()
+    _restore_package_store(_packages, data.get("packages", {}), package_regions)
+    _tags.update(data.get("tags", {}))
 
 
 def _legacy_items(restored):
@@ -598,12 +600,6 @@ def _set_vpc_options(rec: dict, options) -> None:
         rec["Endpoint"] = endpoint
 
 
-try:
-    _restored = load_state("opensearch")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted OpenSearch state; continuing fresh")
 
 
 def _new_domain_record(name, payload):

@@ -38,7 +38,6 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("cloudcontrol")
 
-from ministack.core.persistence import load_state
 
 # (TypeName, Identifier) -> {"TypeName", "Identifier", "Properties" (JSON str)}
 _resources = AccountRegionScopedDict()
@@ -53,10 +52,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     resources = data.get("resources")
@@ -67,14 +66,6 @@ def restore_state(data):
         _requests.update(requests)
 
 
-try:
-    _restored = load_state("cloudcontrol")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ── Helpers ────────────────────────────────────────────────

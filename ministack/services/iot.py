@@ -45,7 +45,7 @@ lookups (mTLS).
 
 State is fully isolated per account and region via
 ``AccountRegionScopedDict`` and persisted through
-``get_state``/``restore_state``. The Local CA (used to sign
+``get_state``/``_restore_state``. The Local CA (used to sign
 ``CreateKeysAndCertificate`` certificates) is also persisted so previously
 issued client certificates remain valid across restarts.
 """
@@ -69,7 +69,6 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -256,10 +255,10 @@ def get_state() -> dict:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict | None) -> None:
+def _restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
     global _mtls_server_cert_pem, _mtls_server_key_pem
     if not data:
@@ -332,12 +331,6 @@ def reset() -> None:
         logger.debug("IoT mTLS: restart after reset failed", exc_info=True)
 
 
-try:
-    _restored = load_state("iot")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted IoT state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

@@ -702,6 +702,67 @@ class TestEnforce:
             iam_svc._users.pop("enforce-user", None)
             iam_svc._user_inline_policies.pop("enforce-user", None)
 
+    def test_secretsmanager_suffix_grant_matches_the_stored_arn(self):
+        """The grant shape the CDK writes for a secret looked up by name.
+
+        Measured on AWS: a policy on "secret:<name>-??????" allows a request
+        against "secret:<name>-0ac6da". The resolved resource therefore has to
+        carry the stored suffix, or a correctly scoped policy denies.
+        """
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import iam as iam_svc
+        from ministack.services import secretsmanager as sm
+
+        fake_key = "AKIATESTSECRET0001"
+        stored = sm.create_secret_in_process("enforce-suffix-secret", "v")
+        prefix = stored.rsplit("-", 1)[0]
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "secret-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["secret-user"] = {
+            "UserName": "secret-user",
+            "Arn": "arn:aws:iam::000000000000:user/secret-user",
+            "UserId": "AIDA789", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["secret-user"] = {
+            "p": json.dumps({"Statement": [{
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": f"{prefix}-??????",
+            }]})
+        }
+
+        def decide(secret_id):
+            resource = extract_resource_arn(
+                "secretsmanager", "POST", "/", {},
+                json.dumps({"SecretId": secret_id}).encode(), {},
+                "us-east-1", get_account_id(),
+            )
+            return enforce(
+                fake_key, "secretsmanager:GetSecretValue", "secretsmanager",
+                "us-east-1", resource_arn=resource,
+            )
+
+        try:
+            assert decide("enforce-suffix-secret") is None
+            # The same grant on a different secret still denies.
+            assert decide("some-other-secret").decision == "ImplicitDeny"
+            # An explicit Deny on the stored ARN now matches as well.
+            iam_svc._user_inline_policies["secret-user"]["d"] = json.dumps({"Statement": [{
+                "Effect": "Deny",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": f"{prefix}-*",
+            }]})
+            assert decide("enforce-suffix-secret").decision == "Deny"
+        finally:
+            sm._secrets.pop("enforce-suffix-secret", None)
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("secret-user", None)
+            iam_svc._user_inline_policies.pop("secret-user", None)
+
     def test_explicit_deny_in_policy_blocks(self):
         from ministack.services import iam as iam_svc
         fake_key = "AKIATESTDENY000001"
@@ -1131,6 +1192,112 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         body = json.dumps({"SecretId": "my-secret"}).encode()
         assert extract_resource_arn("secretsmanager", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:secretsmanager:us-east-1:123:secret:my-secret"
+
+    @pytest.mark.parametrize("form", ["name", "arn", "partial_arn"])
+    def test_secretsmanager_resolves_the_stored_arn(self, form):
+        # AWS evaluates against the stored ARN with its six random characters.
+        # A request may name the secret by name, full ARN or ARN without them.
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import secretsmanager as sm
+
+        stored = sm.create_secret_in_process("suffix-secret", "v")
+        try:
+            secret_id = {
+                "name": "suffix-secret",
+                "arn": stored,
+                "partial_arn": stored.rsplit("-", 1)[0],
+            }[form]
+            body = json.dumps({"SecretId": secret_id}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, body, {}, "us-east-1", get_account_id()
+            ) == stored
+        finally:
+            sm._secrets.pop("suffix-secret", None)
+
+    def test_secretsmanager_resolves_the_stored_arn_when_routed_through_detect_service(self):
+        """A signed GetSecretValue reaches this branch through detect_service."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.core.router import detect_service
+        from ministack.services import secretsmanager as sm
+
+        stored = sm.create_secret_in_process("router-secret", "v")
+        try:
+            headers = {
+                **_sigv4_headers("secretsmanager", "secretsmanager.us-east-1.amazonaws.com"),
+                "x-amz-target": "secretsmanager.GetSecretValue",
+                "content-type": "application/x-amz-json-1.1",
+            }
+            body = json.dumps({"SecretId": "router-secret"}).encode()
+            service = detect_service("POST", "/", headers, {})
+            assert service == "secretsmanager"
+            assert extract_resource_arn(
+                service, "POST", "/", headers, body, {}, "us-east-1", get_account_id()
+            ) == stored
+        finally:
+            sm._secrets.pop("router-secret", None)
+
+    @pytest.mark.parametrize("owner_region,owner_account", [
+        ("eu-central-1", None),
+        ("us-east-1", "111122223333"),
+    ])
+    def test_secretsmanager_secret_in_another_scope_is_not_resolved(self, owner_region, owner_account):
+        """The lookup is scoped to the request's account and region, like the
+        handlers'. A name held only in another region or account keeps the
+        name-derived ARN, and that secret's full ARN passes through unchanged."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import (
+            _request_account_id,
+            get_account_id,
+            get_region,
+            set_request_region,
+        )
+        from ministack.services import secretsmanager as sm
+
+        account_id = get_account_id()
+        owner = owner_account or account_id
+        prev_region = get_region()
+        token = _request_account_id.set(owner)
+        set_request_region(owner_region)
+        try:
+            stored = sm.create_secret_in_process("scoped-secret", "v")
+        finally:
+            _request_account_id.reset(token)
+            set_request_region("us-east-1")
+        try:
+            name_arn = f"arn:aws:secretsmanager:us-east-1:{account_id}:secret:scoped-secret"
+            for secret_id, expected in (("scoped-secret", name_arn), (stored, stored)):
+                body = json.dumps({"SecretId": secret_id}).encode()
+                assert extract_resource_arn(
+                    "secretsmanager", "POST", "/", {}, body, {}, "us-east-1", account_id
+                ) == expected
+        finally:
+            set_request_region(prev_region)
+            sm._secrets.pop_scoped(owner, owner_region, "scoped-secret", None)
+
+    def test_createsecret_on_an_existing_name_resolves_the_stored_arn(self):
+        """CreateSecret on a name the store already holds resolves the stored
+        ARN; a new name keeps the name-derived ARN. Which ARN AWS evaluates
+        here is unmeasured."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import secretsmanager as sm
+
+        account_id = get_account_id()
+        stored = sm.create_secret_in_process("existing-createsecret-name", "v")
+        try:
+            existing_body = json.dumps({"Name": "existing-createsecret-name"}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, existing_body, {}, "us-east-1", account_id
+            ) == stored
+
+            new_body = json.dumps({"Name": "brand-new-createsecret-name"}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, new_body, {}, "us-east-1", account_id
+            ) == f"arn:aws:secretsmanager:us-east-1:{account_id}:secret:brand-new-createsecret-name"
+        finally:
+            sm._secrets.pop("existing-createsecret-name", None)
 
     def test_iam_role(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2330,6 +2497,54 @@ def test_put_role_policy_rejects_malformed_document(iam):
         assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
     finally:
         iam.delete_role(RoleName="validation-test-role-2")
+
+
+def test_put_group_policy_rejects_malformed_document(iam):
+    """PutGroupPolicy validates its document like PutRolePolicy and
+    PutUserPolicy. Measured: a real account answers MalformedPolicyDocument for
+    a document that is not JSON, one without a Statement, one whose Effect is
+    neither Allow nor Deny, and one whose statement has no Resource."""
+    iam.create_group(GroupName="validation-test-group")
+    try:
+        for document in ("not json",
+                         json.dumps({"Version": "2012-10-17"}),
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]}),
+                         json.dumps({"Statement": [{"Effect": "Allow",
+                                                    "Action": "s3:GetObject"}]})):
+            with pytest.raises(ClientError) as exc:
+                iam.put_group_policy(GroupName="validation-test-group",
+                                     PolicyName="bad", PolicyDocument=document)
+            assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+        assert iam.list_group_policies(
+            GroupName="validation-test-group")["PolicyNames"] == []
+    finally:
+        iam.delete_group(GroupName="validation-test-group")
+
+
+def test_put_inline_policy_reports_the_missing_entity_before_the_document(iam):
+    """A call that is wrong in both ways at once is answered NoSuchEntity, not
+    MalformedPolicyDocument.
+
+    Measured per kind on a real account, with a document whose Effect is
+    neither Allow nor Deny on a group, a role and a user, and again, on a role
+    and a user, with one that is not JSON: the missing entity is reported
+    before the document is read."""
+    for call, kind, kwargs in (
+        (iam.put_group_policy, "group", {"GroupName": "validation-absent-group"}),
+        (iam.put_role_policy, "role", {"RoleName": "validation-absent-role"}),
+        (iam.put_user_policy, "user", {"UserName": "validation-absent-user"}),
+    ):
+        for document in ("not json",
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]})):
+            with pytest.raises(ClientError) as exc:
+                call(PolicyName="bad", PolicyDocument=document, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+            assert exc.value.response["Error"]["Message"] == \
+                f"The {kind} with name validation-absent-{kind} cannot be found."
 
 
 # ---------------------------------------------------------------------------

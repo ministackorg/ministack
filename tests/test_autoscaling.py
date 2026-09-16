@@ -152,7 +152,7 @@ def test_restore_legacy_child_state_uses_parent_asg_region():
 
     service.reset()
     try:
-        service.restore_state(
+        service.load_persisted_state(
             {
                 "asgs": asgs,
                 "policies": policies,
