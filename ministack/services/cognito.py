@@ -1510,21 +1510,177 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
 
 
 
-def _srp_password_verifier_challenge_parameters(username: str) -> dict:
-    """ChallengeParameters shape Amplify expects for PASSWORD_VERIFIER."""
-    return {
-        "USER_ID_FOR_SRP": username,
-        "SRP_B": base64.b64encode(secrets.token_bytes(128)).hex(),
-        "SALT": base64.b64encode(secrets.token_bytes(16)).hex(),
-        "SECRET_BLOCK": base64.b64encode(secrets.token_bytes(32)).decode(),
+# ---------------------------------------------------------------------------
+# SRP password verifier (USER_SRP_AUTH and CUSTOM_WITH_SRP)
+# ---------------------------------------------------------------------------
+
+# The 3072-bit prime of RFC 5054 (Appendix A) with generator 2, the group Cognito and its client SDKs
+# use; the RFC itself lists generator 5 for this prime.
+_SRP_N = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C"
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+    16,
+)
+_SRP_G = 2
+_SRP_A_RE = re.compile(r"^[0-9a-fA-F]+$")
+_SRP_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_SRP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+# EEE MMM d HH:mm:ss z yyyy in English, parsed the way AWS does (measured): the weekday and
+# month names in any case, one or two digits for the day, and UTC or GMT as the zone.
+_SRP_TIMESTAMP_RE = re.compile(
+    r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (UTC|GMT) (\d{4})$",
+    re.IGNORECASE,
+)
+
+
+def _srp_pad(n: int) -> bytes:
+    """Big-endian bytes with a leading zero byte when the high bit is set, as the SDKs pad."""
+    return n.to_bytes(n.bit_length() // 8 + 1, "big")
+
+
+def _srp_hash(*parts: bytes) -> int:
+    return int.from_bytes(hashlib.sha256(b"".join(parts)).digest(), "big")
+
+
+_SRP_K = _srp_hash(_srp_pad(_SRP_N), _srp_pad(_SRP_G))
+
+
+def _srp_verifier(pool_id: str, user_id: str, password: str, salt_hex: str) -> int:
+    """v = g^x with x = H(salt | H(poolName + userId + ":" + password))."""
+    pool_name = pool_id.split("_", 1)[-1]
+    inner = hashlib.sha256(f"{pool_name}{user_id}:{password}".encode()).digest()
+    return pow(_SRP_G, _srp_hash(_srp_pad(int(salt_hex, 16)), inner), _SRP_N)
+
+
+def _srp_salt(seed: str) -> str:
+    """A per-user salt derived from a stable seed, so it survives restarts like the user does.
+
+    The first byte is never zero: the JavaScript SDK pads the salt as an
+    integer and pycognito as the hex string, and the two only agree when no
+    leading zero byte can be dropped.
+    """
+    digest = hashlib.sha256(f"cognito-srp-salt:{seed}".encode()).digest()
+    while digest[0] == 0:
+        digest = hashlib.sha256(digest).digest()
+    return digest[:16].hex()
+
+
+def _srp_challenge(pool_id: str, user: dict | None, user_id: str, srp_a: str,
+                   secret_block: str) -> tuple:
+    """PASSWORD_VERIFIER ChallengeParameters plus the state the response is checked against.
+
+    An unknown user (PreventUserExistenceErrors=ENABLED) gets a salt derived from
+    the name it was asked for and a verifier nobody can answer.
+    """
+    if user is not None:
+        seed = _attr_list_to_dict(user.get("Attributes", [])).get("sub") or user["Username"]
+        salt = _srp_salt(seed)
+        v = _srp_verifier(pool_id, user_id, user.get("_password") or "", salt)
+    else:
+        salt = _srp_salt(f"{pool_id}:{user_id}")
+        v = pow(_SRP_G, secrets.randbelow(_SRP_N - 2) + 1, _SRP_N)
+    b = secrets.randbelow(_SRP_N - 2) + 1
+    big_b = (_SRP_K * v + pow(_SRP_G, b, _SRP_N)) % _SRP_N
+    params = {
+        "SALT": salt,
+        "SECRET_BLOCK": secret_block,
+        "SRP_B": format(big_b, "x"),
+        "USERNAME": user_id,
+        "USER_ID_FOR_SRP": user_id,
     }
+    state = {"srp_a": srp_a, "srp_b": format(big_b, "x"), "b": format(b, "x"),
+             "salt": salt, "secret_block": secret_block}
+    return params, state
 
 
-def _return_custom_auth_password_verifier(token: str, session: dict, username: str):
+def _srp_canonical_timestamp(timestamp: str) -> str | None:
+    """The timestamp the proof is signed over, or None when it does not parse.
+
+    The format check is lenient, the signature is not: it is computed over the
+    canonical form (weekday derived from the date, unpadded day, UTC), so a
+    padded day or a wrong weekday parses and then fails the proof.
+    """
+    match = _SRP_TIMESTAMP_RE.match(timestamp)
+    if not match:
+        return None
+    _, month, day, hour, minute, second, _zone, year = match.groups()
+    month = month.capitalize()
+    try:
+        moment = datetime(int(year), _SRP_MONTHS.index(month) + 1, int(day),
+                          int(hour), int(minute), int(second))
+    except ValueError:
+        return None
+    return (f"{_SRP_WEEKDAYS[moment.weekday()]} {month} {moment.day} "
+            f"{moment:%H:%M:%S} UTC {moment.year}")
+
+
+def _srp_response_format_error(responses: dict):
+    """The request validation PASSWORD_VERIFIER applies before it looks at the proof.
+
+    The keys are checked in the order AWS names them (measured): an empty
+    response set is its own message, then USERNAME, TIMESTAMP, the signature
+    and the secret block.
+    """
+    if not responses:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter challenge responses.", 400)
+    for key in ("USERNAME", "TIMESTAMP", "PASSWORD_CLAIM_SIGNATURE", "PASSWORD_CLAIM_SECRET_BLOCK"):
+        if not responses.get(key):
+            return error_response_json("InvalidParameterException",
+                                       f"Missing required parameter {key}", 400)
+    if _srp_canonical_timestamp(responses["TIMESTAMP"]) is None:
+        return error_response_json("InvalidParameterException",
+                                   "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english.", 400)
+    try:
+        base64.b64decode(responses["PASSWORD_CLAIM_SIGNATURE"], validate=True)
+    except (ValueError, base64.binascii.Error):
+        return error_response_json("InvalidParameterException",
+                                   "Invalid PASSWORD_CLAIM_SIGNATURE format. Must be a Base64 string.", 400)
+    return None
+
+
+def _srp_proof_valid(pool_id: str, user: dict, state: dict, responses: dict) -> bool:
+    """Recompute the client's PASSWORD_CLAIM_SIGNATURE from the stored password."""
+    secret_block = responses["PASSWORD_CLAIM_SECRET_BLOCK"]
+    if not hmac.compare_digest(secret_block.encode(), state["secret_block"].encode()):
+        return False
+    try:
+        big_a = int(state["srp_a"], 16)
+    except (TypeError, ValueError):
+        # CUSTOM_AUTH stores SRP_A as the client sent it; a value that is not
+        # hex cannot pass the proof.
+        return False
+    if big_a % _SRP_N == 0:
+        return False
+    big_b = int(state["srp_b"], 16)
+    u = _srp_hash(_srp_pad(big_a), _srp_pad(big_b))
+    if u == 0:
+        return False
+    user_id = user["Username"]
+    v = _srp_verifier(pool_id, user_id, user.get("_password") or "", state["salt"])
+    s = pow(big_a * pow(v, u, _SRP_N), int(state["b"], 16), _SRP_N)
+    prk = hmac.new(_srp_pad(u), _srp_pad(s), hashlib.sha256).digest()
+    key = hmac.new(prk, b"Caldera Derived Key\x01", hashlib.sha256).digest()[:16]
+    message = (pool_id.split("_", 1)[-1] + user_id).encode() + base64.b64decode(secret_block) \
+        + _srp_canonical_timestamp(responses["TIMESTAMP"]).encode()
+    expected = hmac.new(key, message, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, base64.b64decode(responses["PASSWORD_CLAIM_SIGNATURE"]))
+
+
+def _return_custom_auth_password_verifier(token: str, session: dict, user: dict):
     """Return Cognito-owned PASSWORD_VERIFIER for CUSTOM_AUTH (CUSTOM_WITH_SRP)."""
-    params = _srp_password_verifier_challenge_parameters(username)
+    params, session["srp"] = _srp_challenge(
+        session["pool_id"], user, user["Username"], session.get("srp_a", ""),
+        base64.b64encode(secrets.token_bytes(32)).decode(),
+    )
     session["pending_builtin_challenge"] = "PASSWORD_VERIFIER"
-    session["srp_challenge_parameters"] = params
     return json_response({
         "ChallengeName": "PASSWORD_VERIFIER",
         "Session": token,
@@ -1567,9 +1723,7 @@ def _continue_custom_auth_after_define(
 
     # Cognito-owned SRP challenges — do not invoke CreateAuthChallenge.
     if next_challenge in ("PASSWORD_VERIFIER", "SRP_A"):
-        return _return_custom_auth_password_verifier(
-            token, session, session["username"]
-        )
+        return _return_custom_auth_password_verifier(token, session, user)
 
     if next_challenge != "CUSTOM_CHALLENGE":
         del _challenge_sessions[token]
@@ -3345,6 +3499,117 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
     }
 
 
+def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: str,
+                          client_metadata: dict | None = None):
+    """What a verified password answers: NEW_PASSWORD_REQUIRED, an MFA challenge or tokens."""
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        session = base64.b64encode(secrets.token_bytes(32)).decode()
+        return json_response({
+            "ChallengeName": "NEW_PASSWORD_REQUIRED",
+            "Session": session,
+            "ChallengeParameters": {
+                "USER_ID_FOR_SRP": username,
+                "requiredAttributes": "[]",
+                "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
+            },
+        })
+    mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
+    if mfa_challenge:
+        return json_response(mfa_challenge)
+    return json_response({"AuthenticationResult": _build_auth_result(
+        pid, cid, user, client_metadata=client_metadata)})
+
+
+def _initiate_user_srp_auth(pool: dict, pid: str, cid: str, auth_params: dict):
+    """USER_SRP_AUTH for InitiateAuth and AdminInitiateAuth: a real PASSWORD_VERIFIER.
+
+    AWS returns no Session here; the SECRET_BLOCK the client echoes back is the
+    handle to the pending challenge, valid for AuthSessionValidity.
+    """
+    flows = pool["_clients"].get(cid, {}).get("ExplicitAuthFlows") or []
+    # An empty or legacy-only ExplicitAuthFlows keeps SRP enabled.
+    if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_USER_SRP_AUTH" not in flows:
+        return error_response_json("InvalidParameterException",
+                                   "USER_SRP_AUTH is not enabled for the client.", 400)
+    srp_a = auth_params.get("SRP_A")
+    if not srp_a:
+        return error_response_json("InvalidParameterException", "Missing required parameter SRP_A", 400)
+    if not _SRP_A_RE.match(srp_a):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{srp_a}' at 'sRPA' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: ^[0-9a-fA-F]+$", 400)
+    username = auth_params.get("USERNAME")
+    user, _err = _resolve_user(pool, username)
+    # Username and aliases sign in; unlike the directory operations, the sub does not.
+    if user is not None and user["Username"] != username \
+            and _attr_list_to_dict(user.get("Attributes", [])).get("sub") == username:
+        user = None
+    if user is None:
+        if not username or not _hides_user_existence(pool, cid):
+            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user_id = username
+    else:
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        user_id = user["Username"]
+    token, session = _create_challenge_session(pid, cid, user_id)
+    params, session["srp"] = _srp_challenge(pid, user, user_id, srp_a, token)
+    return json_response({"ChallengeName": "PASSWORD_VERIFIER", "ChallengeParameters": params})
+
+
+def _respond_to_password_verifier(data: dict, cid: str):
+    """PASSWORD_VERIFIER for RespondToAuthChallenge and its admin variant.
+
+    A CUSTOM_WITH_SRP round arrives with the CUSTOM_AUTH Session and continues
+    with DefineAuthChallenge; USER_SRP_AUTH is found by its SECRET_BLOCK.
+    """
+    responses = data.get("ChallengeResponses") or {}
+    err = _srp_response_format_error(responses)
+    if err:
+        return err
+    denied = error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+    token = data.get("Session")
+    session = _get_challenge_session(token)[0] if token else None
+    custom = session is not None and session.get("pending_builtin_challenge") == "PASSWORD_VERIFIER"
+    if not custom:
+        token = responses.get("PASSWORD_CLAIM_SECRET_BLOCK") or ""
+        session = _get_challenge_session(token)[0]
+        if session is None or "srp" not in session or session.get("pending_builtin_challenge"):
+            return denied
+    if session["client_id"] != cid:
+        return denied
+    pool = _user_pools.get(session["pool_id"])
+    if not pool:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Pool {session['pool_id']} not found.", 400)
+    user = _resolve_user(pool, session["username"])[0]
+    # A challenge answers any number of proofs until the session expires, as on AWS.
+    if user is None or not _srp_proof_valid(session["pool_id"], user, session["srp"], responses):
+        return denied
+    refused = _password_signin_refused(user)
+    if refused:
+        return refused
+    client_metadata = data.get("ClientMetadata", {})
+    if not custom:
+        return _password_auth_result(pool, session["pool_id"], cid, user, user["Username"],
+                                     client_metadata)
+    _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
+    session["pending_builtin_challenge"] = None
+    user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+    define_result, err = _invoke_define_auth_challenge_trigger(
+        session["pool_id"], session["client_id"], session["username"],
+        user_attrs, session, client_metadata
+    )
+    if err:
+        return err
+    return _continue_custom_auth_after_define(
+        token, session, user, user_attrs, client_metadata, define_result
+    )
+
+
 def _admin_initiate_auth(data):
     pid = data.get("UserPoolId")
     cid = data.get("ClientId")
@@ -3365,26 +3630,19 @@ def _admin_initiate_auth(data):
             return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
-        if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
-            session = base64.b64encode(secrets.token_bytes(32)).decode()
-            return json_response({
-                "ChallengeName": "NEW_PASSWORD_REQUIRED",
-                "Session": session,
-                "ChallengeParameters": {
-                    "USER_ID_FOR_SRP": username,
-                    "requiredAttributes": "[]",
-                    "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
-                },
-            })
-        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
-        if mfa_challenge:
-            return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return _password_auth_result(pool, pid, cid, user, username)
+
+    if auth_flow == "USER_SRP_AUTH":
+        return _initiate_user_srp_auth(pool, pid, cid, auth_params)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
@@ -3441,6 +3699,7 @@ def _admin_initiate_auth(data):
         # PASSWORD_VERIFIER (built-in), then later CUSTOM_CHALLENGE for MFA.
         if auth_params.get("SRP_A") or auth_params.get("CHALLENGE_NAME") == "SRP_A":
             _append_challenge_to_session(session, "SRP_A", True, None, {}, {})
+            session["srp_a"] = auth_params.get("SRP_A") or ""
 
         # Invoke DefineAuthChallenge first
         define_result, err = _invoke_define_auth_challenge_trigger(
@@ -3530,36 +3789,7 @@ def _admin_respond_to_auth_challenge(data):
         )
 
     if challenge_name == "PASSWORD_VERIFIER":
-        token = data.get("Session")
-        session, sess_err = _get_challenge_session(token) if token else (None, None)
-        if session is not None and session.get("pending_builtin_challenge") == "PASSWORD_VERIFIER":
-            client_metadata = data.get("ClientMetadata", {})
-            username = responses.get("USERNAME") or session["username"]
-            pool = _user_pools.get(session["pool_id"])
-            if not pool:
-                return error_response_json("ResourceNotFoundException",
-                        f"Pool {session['pool_id']} not found.", 400)
-            user, err = _resolve_user(pool, username)
-            if err:
-                del _challenge_sessions[token]
-                return _hidden_user_error(pool, cid, err)
-            refused = _password_signin_refused(user)
-            if refused:
-                return refused
-            _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
-            session["pending_builtin_challenge"] = None
-            user_attrs = _attr_list_to_dict(user.get("Attributes", []))
-            define_result, err = _invoke_define_auth_challenge_trigger(
-                session["pool_id"], session["client_id"], session["username"],
-                user_attrs, session, client_metadata
-            )
-            if err:
-                return err
-            return _continue_custom_auth_after_define(
-                token, session, user, user_attrs, client_metadata, define_result
-            )
-        return error_response_json("InvalidParameterException",
-                "PASSWORD_VERIFIER session not found for CUSTOM_AUTH", 400)
+        return _respond_to_password_verifier(data, cid)
 
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
@@ -3699,26 +3929,16 @@ def _initiate_auth(data):
             return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
-        if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
-            session = base64.b64encode(secrets.token_bytes(32)).decode()
-            return json_response({
-                "ChallengeName": "NEW_PASSWORD_REQUIRED",
-                "Session": session,
-                "ChallengeParameters": {
-                    "USER_ID_FOR_SRP": username,
-                    "requiredAttributes": "[]",
-                    "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
-                },
-            })
-        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
-        if mfa_challenge:
-            return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return _password_auth_result(pool, pid, cid, user, username)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
@@ -3726,19 +3946,8 @@ def _initiate_auth(data):
             return err
         return json_response({"AuthenticationResult": result})
 
-    # USER_SRP_AUTH — return SRP challenge stub
     if auth_flow == "USER_SRP_AUTH":
-        username = auth_params.get("USERNAME", "")
-        return json_response({
-            "ChallengeName": "PASSWORD_VERIFIER",
-            "Session": base64.b64encode(secrets.token_bytes(32)).decode(),
-            "ChallengeParameters": {
-                "USER_ID_FOR_SRP": username,
-                "SRP_B": base64.b64encode(secrets.token_bytes(128)).hex(),
-                "SALT": base64.b64encode(secrets.token_bytes(16)).hex(),
-                "SECRET_BLOCK": base64.b64encode(secrets.token_bytes(32)).decode(),
-            },
-        })
+        return _initiate_user_srp_auth(pool, pid, cid, auth_params)
 
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
@@ -3775,6 +3984,7 @@ def _initiate_auth(data):
         # PASSWORD_VERIFIER (built-in), then later CUSTOM_CHALLENGE for MFA.
         if auth_params.get("SRP_A") or auth_params.get("CHALLENGE_NAME") == "SRP_A":
             _append_challenge_to_session(session, "SRP_A", True, None, {}, {})
+            session["srp_a"] = auth_params.get("SRP_A") or ""
 
         # Invoke DefineAuthChallenge first
         define_result, err = _invoke_define_auth_challenge_trigger(
@@ -3869,53 +4079,7 @@ def _respond_to_auth_challenge(data):
         )
 
     if challenge_name == "PASSWORD_VERIFIER":
-        token = data.get("Session")
-        session, sess_err = _get_challenge_session(token) if token else (None, None)
-        # CUSTOM_AUTH / CUSTOM_WITH_SRP session: stub-accept SRP claim, then DefineAuth.
-        if session is not None and session.get("pending_builtin_challenge") == "PASSWORD_VERIFIER":
-            client_metadata = data.get("ClientMetadata", {})
-            username = responses.get("USERNAME") or session["username"]
-            pool = _user_pools.get(session["pool_id"])
-            if not pool:
-                return error_response_json("ResourceNotFoundException",
-                        f"Pool {session['pool_id']} not found.", 400)
-            user, err = _resolve_user(pool, username)
-            if err:
-                del _challenge_sessions[token]
-                return _hidden_user_error(pool, cid, err)
-            refused = _password_signin_refused(user)
-            if refused:
-                return refused
-            # Emulator parity with USER_SRP_AUTH: accept Amplify's PASSWORD_CLAIM_* without
-            # full SRP math.
-            _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
-            session["pending_builtin_challenge"] = None
-            user_attrs = _attr_list_to_dict(user.get("Attributes", []))
-            define_result, err = _invoke_define_auth_challenge_trigger(
-                session["pool_id"], session["client_id"], session["username"],
-                user_attrs, session, client_metadata
-            )
-            if err:
-                return err
-            return _continue_custom_auth_after_define(
-                token, session, user, user_attrs, client_metadata, define_result
-            )
-
-        username = responses.get("USERNAME")
-        new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
-        client_metadata = data.get("ClientMetadata", {})
-        user, _err = _resolve_user(pool, username)
-        if _err:
-            return _hidden_user_error(pool, cid, _err)
-        refused = _password_signin_refused(user)
-        if refused:
-            return refused
-        if new_password:
-            user["_password"] = new_password
-        user["UserStatus"] = "CONFIRMED"
-        user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(
-            pid, cid, user, client_metadata=client_metadata)})
+        return _respond_to_password_verifier(data, cid)
 
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
