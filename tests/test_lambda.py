@@ -2984,11 +2984,23 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
         with pytest.raises(ClientError) as update_exc:
             east.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
         assert update_exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+        assert update_exc.value.response["Error"]["Message"] == (
+            "Layers are not in the same region as the function. "
+            "Layers are expected to be in region us-east-1."
+        )
     finally:
         east.delete_function(FunctionName=update_name)
 
 
-def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
+def test_lambda_wrong_account_layer_arn_does_not_resolve_to_the_local_layer(lam):
+    """A foreign-account ARN is opaque, never the local layer of the same name.
+
+    The layer store is keyed by account and region, so rewriting the account
+    field of an ARN this account published must not hand back that layer's
+    content. Since an unregistered cross-account layer is accepted as an opaque
+    reference, the visible proof is the code size: the real layer has one, the
+    opaque reference reports zero.
+    """
     suffix = _uuid_mod.uuid4().hex[:8]
 
     layer_buf = io.BytesIO()
@@ -3005,16 +3017,17 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
     create_name = f"wrong-account-layer-create-{suffix}"
     update_name = f"wrong-account-layer-update-{suffix}"
     try:
-        with pytest.raises(ClientError) as create_exc:
-            lam.create_function(
-                FunctionName=create_name,
-                Runtime="python3.12",
-                Role=_LAMBDA_ROLE,
-                Handler="index.handler",
-                Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
-                Layers=[wrong_account_arn],
-            )
-        assert create_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        lam.create_function(
+            FunctionName=create_name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            Layers=[wrong_account_arn],
+        )
+        assert lam.get_function_configuration(FunctionName=create_name)["Layers"] == [
+            {"Arn": wrong_account_arn, "CodeSize": 0}
+        ]
 
         lam.create_function(
             FunctionName=update_name,
@@ -3023,11 +3036,16 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
             Handler="index.handler",
             Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
         )
-        with pytest.raises(ClientError) as update_exc:
-            lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
-        assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
-        cfg = lam.get_function_configuration(FunctionName=update_name)
-        assert cfg["Layers"] == []
+        lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
+        assert lam.get_function_configuration(FunctionName=update_name)["Layers"] == [
+            {"Arn": wrong_account_arn, "CodeSize": 0}
+        ]
+
+        # The layer this account really published still resolves to its bytes.
+        lam.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
+        own = lam.get_function_configuration(FunctionName=update_name)
+        assert own["Layers"][0]["Arn"] == layer_arn
+        assert own["Layers"][0]["CodeSize"] > 0
     finally:
         for name in (create_name, update_name):
             try:
@@ -4674,6 +4692,427 @@ def test_esm_response_no_function_name_field(lam, sqs):
             lam.delete_event_source_mapping(UUID=esm_uuid)
         lam.delete_function(FunctionName=fname)
         sqs.delete_queue(QueueUrl=q_url)
+
+
+# CloudWatch Lambda Insights, the layer people reference cross-account; nothing resolves the version locally.
+_AWS_MANAGED_LAYER = "arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38"
+_OTHER_REGION_LAYER = "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:38"
+_FOREIGN_ACCOUNT = "580247275435"
+_FOREIGN_REGION = "us-east-1"
+_FOREIGN_CODE_SIZE = 4198176
+_CALLER_ACCOUNT = "000000000000"
+
+
+def _via_endpoint(url):
+    """Content.Location names MINISTACK_HOST/GATEWAY_PORT; aim it at MINISTACK_ENDPOINT."""
+    endpoint = urlparse(_endpoint)
+    return urlparse(url)._replace(scheme=endpoint.scheme, netloc=endpoint.netloc).geturl()
+
+
+def _foreign_arn(layer_name, version=7, account=_FOREIGN_ACCOUNT):
+    return f"arn:aws:lambda:{_FOREIGN_REGION}:{account}:layer:{layer_name}:{version}"
+
+
+def _layer_access_denied(arn, caller=f"arn:aws:iam::{_CALLER_ACCOUNT}:root"):
+    return (f"User: {caller} is not authorized to perform: lambda:GetLayerVersion on resource: {arn} "
+            "because no resource-based policy allows the lambda:GetLayerVersion action")
+
+
+def _import_handler(module):
+    """Handler code reporting whether a layer module imports, and its VALUE."""
+    return _make_zip(
+        "def handler(e, c):\n    try:\n"
+        f"        import {module}\n        return {{'value': getattr({module}, 'VALUE', True)}}\n"
+        "    except ImportError:\n        return {'value': None}\n"
+    )
+
+
+def _layer_verdicts(arn):
+    """(attach config, attach error, GetLayerVersionByArn payload, read error), in process;
+    an error is (code, message) or None."""
+    import ministack.services.lambda_svc as _lsvc
+
+    version_config, err = _lsvc._resolve_layer_version_for_attachment(arn)
+    status, _headers, body = _lsvc._get_layer_version_by_arn(arn)
+    payload = json.loads(body)
+
+    def error(response_body):
+        parsed = json.loads(response_body)
+        return parsed["__type"], parsed.get("message", "")
+    return (version_config, err and error(err[2]),
+            None if status >= 400 else payload, error(body) if status >= 400 else None)
+
+
+@contextlib.contextmanager
+def _foreign_layer(layer_name, version=7, granted_to=None, org_id=None, owner=_FOREIGN_ACCOUNT):
+    """Seed one layer version in *owner*'s scope, grant it through the real
+    AddLayerVersionPermission, and run the block as the consumer account."""
+    import ministack.services.lambda_svc as _lsvc
+    from ministack.core.responses import request_scope
+
+    version_config = None
+    if layer_name is not None:
+        arn = _foreign_arn(layer_name, version, owner)
+        version_config = {"LayerArn": arn.rsplit(":", 1)[0], "LayerVersionArn": arn, "Version": version,
+                          "Content": {"CodeSize": _FOREIGN_CODE_SIZE}}
+        _lsvc._layers.set_scoped(owner, _FOREIGN_REGION, layer_name,
+                                 {"versions": [version_config], "next_version": version + 1})
+    try:
+        if granted_to is not None:
+            grant = {"StatementId": "shared", "Action": "lambda:GetLayerVersion", "Principal": granted_to}
+            if org_id:
+                grant["OrganizationId"] = org_id
+            with request_scope(owner, _FOREIGN_REGION):
+                status, _headers, body = _lsvc._add_layer_version_permission(layer_name, version, grant)
+            assert status == 201, body
+        with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+            yield version_config
+    finally:
+        if layer_name is not None:
+            _lsvc._layers.pop_scoped(owner, _FOREIGN_REGION, layer_name, None)
+
+
+_DENIED = "AccessDeniedException"
+
+
+# (seeded layer name, grant principal, explicit ARN, attachment error code, GetLayerVersionByArn error code)
+@pytest.mark.parametrize(("layer_name", "granted_to", "arn", "attach_error", "read_error"), [
+    pytest.param("owner-granted", _CALLER_ACCOUNT, None, None, None, id="account-grant"),
+    pytest.param("root-granted", f"arn:aws:iam::{_CALLER_ACCOUNT}:root", None, None, None,
+                 id="account-root-arn-grant"),
+    pytest.param("everyone-granted", "*", None, None, None, id="wildcard-grant"),
+    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),
+    pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
+    pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
+                 id="missing-version-of-known-layer"),
+    pytest.param(None, None, _AWS_MANAGED_LAYER, None, _DENIED, id="unknown-layer-is-opaque"),
+    pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
+    pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
+                 "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
+])
+def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
+    """A grant makes stored foreign content attachable and readable. An unknown
+    foreign layer name attaches as metadata only; a missing layer of this
+    account never does. The resolver does not read AUTH (see the next test)."""
+    arn = arn or _foreign_arn(layer_name)
+    with _foreign_layer(layer_name, granted_to=granted_to):
+        version_config, attach, payload, read = _layer_verdicts(arn)
+    assert ((attach or [None])[0], (read or [None])[0]) == (attach_error, read_error)
+    messages = {"InvalidParameterValueException": f"Layer version {arn} does not exist.",
+                "ResourceNotFoundException": "The resource you requested does not exist."}
+    for error in filter(None, (attach, read)):
+        assert error[1] == messages.get(error[0], _layer_access_denied(arn))
+    if attach_error is None:
+        assert version_config["Content"]["CodeSize"] == (_FOREIGN_CODE_SIZE if layer_name else 0)
+    if read_error is None:
+        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, _FOREIGN_CODE_SIZE)
+        assert not [key for key in payload if key.startswith("_")]
+
+
+def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):
+    """Through the app with AUTH=true as an IAM user of the consuming account: the
+    layer policy decides, and a denial names that user the way AWS does."""
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
+    user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
+    seeded = [
+        (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
+        (iam_svc._user_inline_policies, user,
+         {"lambda": {"Statement": [{"Effect": "Allow", "Action": "lambda:*", "Resource": "*"}]}}),
+        (iam_svc._access_keys, key, {"AccessKeyId": key, "SecretAccessKey": "s", "Status": "Active", "UserName": user}),
+    ]
+    for store, name, record in seeded:
+        store.set_scoped(_CALLER_ACCOUNT, None, name, record)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    try:
+        for granted_to in ("*", None):
+            sent.clear()
+            arn = _foreign_arn("auth-layer")
+            with _foreign_layer("auth-layer", granted_to=granted_to):
+                asyncio.run(app_mod.app({
+                    "type": "http", "method": "GET", "path": "/2018-10-31/layers",
+                    "query_string": f"find=LayerVersion&Arn={arn}".encode(),
+                    "headers": [(b"host", b"lambda.localhost"), (b"authorization", (
+                        f"AWS4-HMAC-SHA256 Credential={key}/20260915/{_FOREIGN_REGION}/lambda/aws4_request, "
+                        "SignedHeaders=host, Signature=0").encode())],
+                }, receive, send))
+            status, body = sent[0]["status"], json.loads(sent[1]["body"])
+            if granted_to:
+                assert (status, body["Content"]["CodeSize"]) == (200, _FOREIGN_CODE_SIZE)
+            else:
+                assert (status, body["message"]) == (403, _layer_access_denied(arn, user_arn))
+    finally:
+        for store, name, _record in seeded:
+            store.pop_scoped(_CALLER_ACCOUNT, None, name, None)
+
+
+@pytest.fixture
+def shared_layer():
+    """Publish real layer bytes and provision the consumer's execution role."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    caller_id = str(int(owner_id) + 400000000000)
+    owner = _account_context_client("lambda", owner_id)
+    caller = _account_context_client("lambda", caller_id)
+    iam = _account_context_client("iam", caller_id)
+    name = f"shared-layer-{_uuid_mod.uuid4().hex[:8]}"
+    role = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({"Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}),
+    )["Role"]["Arn"]
+    published = owner.publish_layer_version(
+        LayerName=name, Content={"ZipFile": _make_zip_js("VALUE = 'shared bytes'\n", "python/shared_module.py")})
+    try:
+        yield owner, caller, published, role
+    finally:
+        # Functions first: a deleted layer version is retained while one is still attached.
+        for fn in caller.list_functions()["Functions"]:
+            caller.delete_function(FunctionName=fn["FunctionName"])
+        owner.delete_layer_version(LayerName=name, VersionNumber=published["Version"])
+        iam.delete_role(RoleName=name)
+
+
+def test_lambda_shared_layer_execution_and_lifecycle(shared_layer):
+    owner, caller, published, role = shared_layer
+    arn, layer_arn, version = published["LayerVersionArn"], published["LayerArn"], published["Version"]
+    layer_name = arn.split(":")[-2]
+    owner.add_layer_version_permission(LayerName=layer_name, VersionNumber=version, StatementId="shared",
+                                       Action="lambda:GetLayerVersion", Principal=role.split(":")[4])
+    for result in [caller.get_layer_version_by_arn(Arn=arn),
+                   caller.get_layer_version(LayerName=layer_arn, VersionNumber=version)]:
+        assert (result["LayerVersionArn"], result["Content"]["CodeSize"]) == (arn, published["Content"]["CodeSize"])
+        assert not any(key.startswith("_") for key in result)
+        with _urlreq.urlopen(_via_endpoint(result["Content"]["Location"])) as response:
+            assert len(response.read()) == published["Content"]["CodeSize"]
+
+    code = _import_handler("shared_module")
+    for name, layers in [("created", [arn]), ("updated", [])]:
+        caller.create_function(FunctionName=name, Runtime="python3.13", Handler="index.handler",
+                               Role=role, Code={"ZipFile": code}, Layers=layers)
+    assert _invoke_lambda_payload(caller, "created")[1] == {"value": "shared bytes"}
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": None}
+    caller.update_function_configuration(FunctionName="updated", Layers=[arn])
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": "shared bytes"}
+    fn_version = caller.publish_version(FunctionName="updated")["Version"]
+
+    owner.remove_layer_version_permission(LayerName=layer_name, VersionNumber=version, StatementId="shared")
+    for deleted in [False, True]:
+        if deleted:
+            owner.delete_layer_version(LayerName=layer_name, VersionNumber=version)
+            assert owner.list_layer_versions(LayerName=layer_name)["LayerVersions"] == []
+            assert owner.list_layers()["Layers"] == []
+            with pytest.raises(ClientError) as missing:
+                owner.get_layer_version(LayerName=layer_name, VersionNumber=version)
+            assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        for call in [
+            lambda: caller.create_function(FunctionName="denied", Runtime="python3.13", Handler="index.handler",
+                                           Role=role, Code={"ZipFile": code}, Layers=[arn]),
+            lambda: caller.update_function_configuration(FunctionName="updated", Layers=[arn]),
+            lambda: caller.get_layer_version_by_arn(Arn=arn),
+            lambda: caller.get_layer_version(LayerName=layer_arn, VersionNumber=version),
+        ]:
+            with pytest.raises(ClientError) as denied:
+                call()
+            assert denied.value.response["Error"]["Code"] == _DENIED
+        # Force a cold start after revocation/deletion without reattaching the layer.
+        caller.update_function_configuration(FunctionName="updated", Environment={"Variables": {"D": str(deleted)}})
+        assert _invoke_lambda_payload(caller, "updated")[1] == {"value": "shared bytes"}
+        assert caller.get_function_configuration(FunctionName="updated")["Layers"] == [
+            {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+
+    caller.update_function_configuration(FunctionName="updated", Layers=[])
+    caller.delete_function(FunctionName="created")
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": None}
+    # First invocation of the published version is cold, after deletion and detach.
+    assert _invoke_lambda_payload(caller, "updated", Qualifier=fn_version)[1] == {"value": "shared bytes"}
+
+
+@pytest.mark.parametrize(("membership", "allowed"), [("matching", True), ("different", False), ("absent", False)])
+def test_lambda_shared_layer_organization_condition(monkeypatch, membership, allowed):
+    """A wildcard grant carrying OrganizationId reaches org members only, and
+    asking the question must not enrol the caller in an organization."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_svc, organizations
+
+    orgs = AccountScopedDict()
+    monkeypatch.setattr(organizations, "_orgs", orgs)
+    if membership != "absent":
+        orgs.set_scoped(_CALLER_ACCOUNT, None, "self",
+                        {"Id": "o-0123456789" if membership == "matching" else "o-9876543210"})
+    with _foreign_layer("org-layer", granted_to="*", org_id="o-0123456789"):
+        arn = _foreign_arn("org-layer")
+        assert (_layer_verdicts(arn)[1] is None) is allowed
+        for response in [lambda_svc._get_layer_version_by_arn(arn),
+                         lambda_svc._get_layer_version(arn.rsplit(":", 1)[0], 7)]:
+            assert response[0] == (200 if allowed else 403)
+    assert len(orgs._data) == (0 if membership == "absent" else 1)
+
+
+def test_lambda_opaque_layer_does_not_load_later_private_content(shared_layer):
+    """A metadata-only attachment must not pick up content the owner publishes
+    afterwards at the same ARN, at a cold start or on reattachment."""
+    owner, caller, published, role = shared_layer
+    name = published["LayerArn"].split(":")[-1] + "-later"
+    arn = published["LayerVersionArn"].replace(published["LayerArn"].split(":")[-1], name)
+    fname = f"opaque-{_uuid_mod.uuid4().hex[:8]}"
+    later = None
+    try:
+        caller.create_function(FunctionName=fname, Runtime="python3.13", Handler="index.handler", Role=role,
+                               Code={"ZipFile": _import_handler("private_layer_module")}, Layers=[arn])
+        later = owner.publish_layer_version(
+            LayerName=name, Content={"ZipFile": _make_zip_js("SECRET = 123\n", "python/private_layer_module.py")})
+        assert later["LayerVersionArn"] == arn
+        # No invocation before publication, so this is a cold start.
+        assert _invoke_lambda_payload(caller, fname)[1] == {"value": None}
+        assert caller.get_function_configuration(FunctionName=fname)["Layers"] == [{"Arn": arn, "CodeSize": 0}]
+        with pytest.raises(ClientError) as denied:
+            caller.update_function_configuration(FunctionName=fname, Layers=[arn])
+        assert denied.value.response["Error"]["Code"] == _DENIED
+    finally:
+        with contextlib.suppress(ClientError):
+            caller.delete_function(FunctionName=fname)
+        if later is not None:
+            owner.delete_layer_version(LayerName=name, VersionNumber=later["Version"])
+
+
+@pytest.fixture
+def isolated_layers(lambda_svc_isolated, monkeypatch):
+    """lambda_svc with an empty layer store and extraction cache."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    svc, _ = lambda_svc_isolated
+    monkeypatch.setattr(svc, "_layers", AccountRegionScopedDict())
+    monkeypatch.setattr(svc, "_docker_extract_dirs", {})
+    return svc
+
+
+def test_lambda_deleted_shared_layer_retention_and_restore(isolated_layers):
+    """A deleted version keeps serving the functions attached to it, survives a
+    state round trip while one still is, and is reaped when the last goes."""
+    import base64
+
+    from ministack.core.responses import request_scope
+
+    svc = isolated_layers
+    layer_zip = _make_zip("retained bytes")
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        _, _, body = svc._publish_layer_version("retained", {"Content": {"ZipFile": base64.b64encode(layer_zip).decode()}})
+        arn = json.loads(body)["LayerVersionArn"]
+        svc._add_layer_version_permission(
+            "retained", 1, {"StatementId": "shared", "Action": "lambda:GetLayerVersion", "Principal": "*"})
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        svc._functions["retains-version"] = {
+            "config": {"FunctionName": "retains-version", "Layers": []},
+            "versions": {"1": {"config": {"Layers": [{"Arn": arn, "CodeSize": len(layer_zip)}]}}},
+        }
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        svc._delete_layer_version("retained", 1)
+        # A deleted version reads back the way AWS reports it; the two APIs word it differently.
+        status, _, body = svc._get_layer_version("retained", 1)
+        assert (status, json.loads(body)["message"]) == (404, "The resource you requested does not exist.")
+        status, _, body = svc._get_layer_version_policy("retained", 1)
+        assert (status, json.loads(body)["message"]) == (404, f"Layer version {arn} does not exist.")
+        assert svc.serve_layer_content("retained", 1)[0] == 404
+        assert [vc["Version"] for vc in svc._layers["retained"]["versions"]] == [1]
+
+    state = svc.get_state()
+    svc._layers.clear()
+    svc._functions.clear()
+    svc.restore_state(state)
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        assert svc._resolve_layer_zip(arn) == layer_zip
+        assert svc._layer_unzipped_size(arn) == len("retained bytes")
+        assert _layer_verdicts(arn)[1][0] == _DENIED
+        svc._delete_function("retains-version", {}, path_qualifier="1")
+        assert svc._resolve_layer_zip(arn) is None
+        assert _layer_verdicts(arn)[1][0] == _DENIED
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert svc._layers["retained"]["versions"] == []
+    assert not [vc for layer in svc.get_state()["layers"]._data.values() for vc in layer["versions"]]
+
+
+def _seed_attached_layer(svc, name, attached_code_size, deleted):
+    from ministack.core.responses import request_scope
+
+    arn = _foreign_arn(name, 1)
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        svc._layers[name] = {"versions": [{"Version": 1, "LayerVersionArn": arn, "Content": {"CodeSize": 4096},
+                                           "_zip_data": _make_zip("x"), "_deleted": deleted}], "next_version": 2}
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        svc._functions["attached"] = {"config": {"FunctionName": "attached",
+                                                 "Layers": [{"Arn": arn, "CodeSize": attached_code_size}]}}
+    return arn
+
+
+@pytest.mark.parametrize(("attached_code_size", "reaped"), [
+    pytest.param(4096, False, id="attached-with-content-retained"),
+    pytest.param(0, True, id="opaque-attachment-does-not-retain"),
+])
+def test_lambda_deleted_layer_version_reaping(isolated_layers, attached_code_size, reaped):
+    """Only an attachment that carries the bytes keeps a deleted version alive."""
+    from ministack.core.responses import request_scope
+
+    _seed_attached_layer(isolated_layers, "reaped-layer", attached_code_size, deleted=True)
+    isolated_layers._sweep_extract_cache()
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert (isolated_layers._layers["reaped-layer"]["versions"] == []) is reaped
+
+
+def test_lambda_cfn_deletes_and_restore_reap_unreferenced_layer_versions(isolated_layers):
+    """CloudFormation deletes tombstone and sweep like the Lambda API, and a
+    restored snapshot drops a tombstone nothing references."""
+    from ministack.core.responses import AccountRegionScopedDict, request_scope
+    from ministack.services.cloudformation import provisioners
+
+    svc = isolated_layers
+    arn = _seed_attached_layer(svc, "cfn-layer", 4096, deleted=False)
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        provisioners._lambda_layer_delete(arn, {})
+        assert svc._layers["cfn-layer"]["versions"][0]["_deleted"]
+    state = svc.get_state()
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        provisioners._lambda_delete("attached", {})
+    state["functions"] = AccountRegionScopedDict()
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert svc._layers["cfn-layer"]["versions"] == []
+        svc._layers.clear()
+        svc.restore_state(state)
+        assert svc._layers["cfn-layer"]["versions"] == []
+
+
+@pytest.mark.parametrize("owner", [_FOREIGN_ACCOUNT, _CALLER_ACCOUNT], ids=["shared-layer", "own-layer"])
+def test_lambda_layer_attachment_checks_total_unzipped_size(monkeypatch, owner):
+    """The function-plus-layers unzipped limit covers create and update, for a
+    granted foreign layer and an own one; a rejected update changes nothing."""
+    import base64
+
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_svc, "_functions", AccountRegionScopedDict())
+    monkeypatch.setattr(lambda_svc, "_UNZIPPED_LIMIT_BYTES", 30)
+    with _foreign_layer("quota-layer", granted_to="*" if owner != _CALLER_ACCOUNT else None, owner=owner) as vc:
+        vc["_zip_data"] = _make_zip("x" * 20)
+        arn = _foreign_arn("quota-layer", account=owner)
+        fname = f"quota-{_uuid_mod.uuid4().hex[:8]}"
+        original = {"FunctionName": fname, "Layers": [], "Description": "before"}
+        lambda_svc._functions[fname] = {"config": original.copy(), "code_zip": _make_zip("x" * 20)}
+        response = lambda_svc._update_config(fname, {"Layers": [arn], "Description": "after"})
+        assert (response[0], json.loads(response[2])["__type"]) == (400, "InvalidParameterValueException")
+        assert lambda_svc._functions[fname]["config"] == original
+        response = lambda_svc._create_function({
+            "FunctionName": "too-large", "Runtime": "python3.13", "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+            "Code": {"ZipFile": base64.b64encode(_make_zip("x" * 20)).decode()}, "Layers": [arn]})
+        assert response[0] == 400
+        assert "too-large" not in lambda_svc._functions
 
 
 def test_lambda_update_function_configuration_layers(lam):
