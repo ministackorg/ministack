@@ -1680,15 +1680,85 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
-def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Resolve another account's layer version through its stored grant."""
+def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version, *, register=False):
+    """Resolve another account's layer version through its stored grant.
+
+    A version of a layer AWS publishes from one of its own accounts carries a
+    public grant on AWS. When the publisher account has not registered a layer
+    of that name itself, the version is answered as such a record; an
+    attachment (``register``) stores it under the publisher account, so
+    snapshots, restores and later reads see one record, while a plain read
+    stores nothing."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+    if vc is None and _is_aws_layer_publisher(spec.account_id, spec.region):
+        with _aws_published_lock:
+            layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
+            if layer is None or layer.get("_aws_published"):
+                vc = _aws_published_layer_version(layer_arn, spec, layer_name, version)
+                if register:
+                    _register_aws_published_layer(spec, layer_name, version, vc, layer)
     if vc is not None and _layer_policy_allows(vc, get_account_id()):
         return vc, None
     return _layer_access_denied(layer_arn)
+
+
+_aws_published_lock = threading.Lock()
+
+
+def _aws_published_layer_version(layer_arn: str, spec, layer_name: str, version: int) -> dict:
+    """The record of a layer version AWS publishes, with the public grant AWS
+    put on it. The bytes are not available offline: the record carries no
+    content, the function runs without the extension, the attachment reports a
+    CodeSize of 0 and the content URL answers 404."""
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return {
+        "LayerArn": layer_arn.rsplit(":", 1)[0],
+        "LayerVersionArn": layer_arn,
+        "Version": version,
+        "Description": "",
+        "CompatibleRuntimes": [],
+        "CompatibleArchitectures": [],
+        "LicenseInfo": "",
+        "CreatedDate": _now_iso(),
+        "Content": {
+            "CodeSha256": "",
+            "CodeSize": 0,
+            "Location": (
+                f"http://{_MINISTACK_HOST}:{port}/_ministack/lambda-layers/"
+                f"{spec.account_id}/{spec.region}/{layer_name}/{version}/content"
+            ),
+        },
+        "_policy": {
+            "Version": "2012-10-17",
+            "Id": "default",
+            "Statement": [
+                {
+                    "Sid": "aws-published",
+                    "Effect": "Allow",
+                    "Principal": _layer_statement_principal("*"),
+                    "Action": "lambda:GetLayerVersion",
+                    "Resource": layer_arn,
+                }
+            ],
+        },
+        "_aws_published": True,
+    }
+
+
+def _register_aws_published_layer(spec, layer_name: str, version: int, vc: dict, layer: dict | None) -> None:
+    """Store ``vc`` under the publisher account. The layer record is marked as
+    AWS-published, so further versions of the same name register too, while a
+    layer the publisher account registered locally keeps its own versions and
+    refuses a missing one."""
+    if layer is None:
+        layer = {"versions": [], "next_version": 1, "_aws_published": True}
+        _layers.set_scoped(spec.account_id, spec.region, layer_name, layer)
+    layer["versions"].append(vc)
+    layer["next_version"] = max(layer["next_version"], version + 1)
+    logger.info("Registered the AWS-published layer %s on first attachment", vc["LayerVersionArn"])
 
 
 def _resolve_layer_version_for_attachment(layer_arn: str):
@@ -1702,7 +1772,7 @@ def _resolve_layer_version_for_attachment(layer_arn: str):
         return None, _invalid_layer_version_arn(layer_arn)
 
     if spec.account_id != get_account_id():
-        return _resolve_cross_account_layer(layer_arn, spec, layer_ref)
+        return _resolve_cross_account_layer(layer_arn, spec, layer_ref, register=True)
     if spec.region != get_region():
         return None, error_response_json(
             "InvalidParameterValueException",
@@ -3095,6 +3165,127 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         raw = payload.encode("utf-8") if isinstance(payload, str) else payload
         return 200, resp_headers, raw
     return 200, resp_headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Accounts AWS publishes Lambda layers from
+# ---------------------------------------------------------------------------
+# Every account attaches these layers by ARN, so the ARN carries an account that is
+# not the caller's, and AWS grants lambda:GetLayerVersion on them to everyone. The
+# publisher account differs per region for most families, so the tables are keyed
+# by region. Sources, read 2026-09-16:
+#
+# - CloudWatch Lambda Insights, LambdaInsightsExtension and -Arm64:
+#   https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Lambda-Insights-extension-versionsx86-64.html
+#   https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Lambda-Insights-extension-versionsARM.html
+# - AWS Parameters and Secrets Lambda Extension, AWS-Parameters-and-Secrets-Lambda-Extension and -Arm64:
+#   https://docs.aws.amazon.com/systems-manager/latest/userguide/ps-integration-lambda-extensions.html
+# - AWS AppConfig Agent Lambda extension, AWS-AppConfig-Extension and -Arm64:
+#   https://docs.aws.amazon.com/appconfig/latest/userguide/appconfig-integration-lambda-extensions-versions.html
+# - AWS Distro for OpenTelemetry, AWSOpenTelemetryDistro* and aws-otel-*:
+#   https://aws-otel.github.io/docs/getting-started/lambda
+# - AWS SDK for pandas, AWSSDKPandas-Python*:
+#   https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+
+_INSIGHTS_LAYER_ACCOUNTS = {
+    "af-south-1": "012438385374", "ap-east-1": "519774774795", "ap-east-2": "145023102084",
+    "ap-northeast-1": "580247275435", "ap-northeast-2": "580247275435", "ap-northeast-3": "194566237122",
+    "ap-south-1": "580247275435", "ap-south-2": "891564319516", "ap-southeast-1": "580247275435",
+    "ap-southeast-2": "580247275435", "ap-southeast-3": "439286490199", "ap-southeast-4": "158895979263",
+    "ap-southeast-5": "590183865173", "ap-southeast-6": "727646510379", "ap-southeast-7": "761018874580",
+    "ca-central-1": "580247275435", "ca-west-1": "946466191631", "cn-north-1": "488211338238",
+    "cn-northwest-1": "488211338238", "eu-central-1": "580247275435", "eu-central-2": "033019950311",
+    "eu-north-1": "580247275435", "eu-south-1": "339249233099", "eu-south-2": "352183217350",
+    "eu-west-1": "580247275435", "eu-west-2": "580247275435", "eu-west-3": "580247275435",
+    "il-central-1": "459530977127", "me-central-1": "732604637566", "me-south-1": "285320876703",
+    "mx-central-1": "879381266642", "sa-east-1": "580247275435", "us-east-1": "580247275435",
+    "us-east-2": "580247275435", "us-gov-east-1": "122132214140", "us-gov-west-1": "751350123760",
+    "us-west-1": "580247275435", "us-west-2": "580247275435",
+}
+
+_PARAMETERS_AND_SECRETS_LAYER_ACCOUNTS = {
+    "af-south-1": "317013901791", "ap-east-1": "768336418462", "ap-east-2": "890742577149",
+    "ap-northeast-1": "133490724326", "ap-northeast-2": "738900069198", "ap-northeast-3": "576959938190",
+    "ap-south-1": "176022468876", "ap-south-2": "070087711984", "ap-southeast-1": "044395824272",
+    "ap-southeast-2": "665172237481", "ap-southeast-3": "490737872127", "ap-southeast-4": "090732460067",
+    "ap-southeast-5": "381492012281", "ap-southeast-6": "995508174458", "ap-southeast-7": "941377119484",
+    "ca-central-1": "200266452380", "ca-west-1": "243964427225", "cn-north-1": "287114880934",
+    "cn-northwest-1": "287310001119", "eu-central-1": "187925254637", "eu-central-2": "772501565639",
+    "eu-north-1": "427196147048", "eu-south-1": "325218067255", "eu-south-2": "524103009944",
+    "eu-west-1": "015030872274", "eu-west-2": "133256977650", "eu-west-3": "780235371811",
+    "eusc-de-east-1": "041683371183", "il-central-1": "148806536434", "me-central-1": "858974508948",
+    "me-south-1": "832021897121", "mx-central-1": "241533131596", "sa-east-1": "933737806257",
+    "us-east-1": "177933569100", "us-east-2": "590474943231", "us-gov-east-1": "129776340158",
+    "us-gov-west-1": "127562683043", "us-west-1": "997803712105", "us-west-2": "345057560386",
+}
+
+_APPCONFIG_LAYER_ACCOUNTS = {
+    "af-south-1": "574348263942", "ap-east-1": "630222743974", "ap-east-2": "730335625313",
+    "ap-northeast-1": "980059726660", "ap-northeast-2": "826293736237", "ap-northeast-3": "706869817123",
+    "ap-south-1": "554480029851", "ap-south-2": "489524808438", "ap-southeast-1": "421114256042",
+    "ap-southeast-2": "080788657173", "ap-southeast-3": "418787028745", "ap-southeast-4": "307021474294",
+    "ap-southeast-5": "631746059939", "ap-southeast-6": "381491832265", "ap-southeast-7": "851725616657",
+    "ca-central-1": "039592058896", "ca-west-1": "436199621743", "cn-north-1": "615057806174",
+    "cn-northwest-1": "615084187847", "eu-central-1": "066940009817", "eu-central-2": "758369105281",
+    "eu-north-1": "646970417810", "eu-south-1": "203683718741", "eu-south-2": "586093569114",
+    "eu-west-1": "434848589818", "eu-west-2": "282860088358", "eu-west-3": "493207061005",
+    "eusc-de-east-1": "426221636601", "il-central-1": "895787185223", "mx-central-1": "891376990304",
+    "sa-east-1": "000010852771", "us-east-1": "027255383542", "us-east-2": "728743619870",
+    "us-gov-east-1": "946561847325", "us-gov-west-1": "946746059096", "us-west-1": "958113053741",
+    "us-west-2": "359756378197",
+}
+
+_ADOT_LAYER_ACCOUNTS = {
+    "af-south-1": "904233096616", "ap-east-1": "888577020596", "ap-east-2": "412664885777",
+    "ap-northeast-1": "615299751070", "ap-northeast-2": "615299751070", "ap-northeast-3": "615299751070",
+    "ap-south-1": "615299751070", "ap-south-2": "796973505492", "ap-southeast-1": "615299751070",
+    "ap-southeast-2": "615299751070", "ap-southeast-3": "039612877180", "ap-southeast-4": "713881805771",
+    "ap-southeast-5": "152034782359", "ap-southeast-6": "313828097273", "ap-southeast-7": "980416031188",
+    "ca-central-1": "615299751070", "ca-west-1": "595944127152", "cn-north-1": "440179912924",
+    "cn-northwest-1": "440180067931", "eu-central-1": "615299751070", "eu-central-2": "156041407956",
+    "eu-north-1": "615299751070", "eu-south-1": "257394471194", "eu-south-2": "490004653786",
+    "eu-west-1": "615299751070", "eu-west-2": "615299751070", "eu-west-3": "615299751070",
+    "il-central-1": "746669239226", "me-central-1": "739275441131", "mx-central-1": "610118373846",
+    "sa-east-1": "615299751070", "us-east-1": "615299751070", "us-east-2": "615299751070",
+    "us-west-1": "615299751070", "us-west-2": "615299751070",
+}
+
+_SDK_PANDAS_LAYER_ACCOUNTS = {
+    "af-south-1": "336392948345", "ap-east-1": "839552336658", "ap-northeast-1": "336392948345",
+    "ap-northeast-2": "336392948345", "ap-northeast-3": "336392948345", "ap-south-1": "336392948345",
+    "ap-south-2": "246107603503", "ap-southeast-1": "336392948345", "ap-southeast-2": "336392948345",
+    "ap-southeast-3": "258944054355", "ap-southeast-4": "945386623051", "ca-central-1": "336392948345",
+    "ca-west-1": "941713567376", "cn-north-1": "406640652441", "cn-northwest-1": "406640652441",
+    "eu-central-1": "336392948345", "eu-central-2": "956415814219", "eu-north-1": "336392948345",
+    "eu-south-1": "774444163449", "eu-south-2": "982086096842", "eu-west-1": "336392948345",
+    "eu-west-2": "336392948345", "eu-west-3": "336392948345", "il-central-1": "263840725265",
+    "me-central-1": "593833071574", "sa-east-1": "336392948345", "us-east-1": "336392948345",
+    "us-east-2": "336392948345", "us-west-1": "336392948345", "us-west-2": "336392948345",
+}
+
+# The older ADOT layer names (``aws-otel-python-amd64-ver-1-25-0`` and the like)
+# are published from one account in every region.
+_ADOT_LEGACY_LAYER_ACCOUNT = "901920570463"
+
+
+def _layer_publishers_by_region(*tables: dict[str, str]) -> dict[str, frozenset[str]]:
+    merged: dict[str, set[str]] = {}
+    for table in tables:
+        for region, account in table.items():
+            merged.setdefault(region, set()).add(account)
+    for region in merged:
+        merged[region].add(_ADOT_LEGACY_LAYER_ACCOUNT)
+    return {region: frozenset(accounts) for region, accounts in merged.items()}
+
+
+_AWS_LAYER_PUBLISHERS: dict[str, frozenset[str]] = _layer_publishers_by_region(
+    _INSIGHTS_LAYER_ACCOUNTS, _PARAMETERS_AND_SECRETS_LAYER_ACCOUNTS, _APPCONFIG_LAYER_ACCOUNTS,
+    _ADOT_LAYER_ACCOUNTS, _SDK_PANDAS_LAYER_ACCOUNTS,
+)
+
+
+def _is_aws_layer_publisher(account_id: str, region: str) -> bool:
+    return account_id in _AWS_LAYER_PUBLISHERS.get(region, frozenset())
 
 
 # ---------------------------------------------------------------------------

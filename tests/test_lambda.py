@@ -3051,6 +3051,61 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
                 pass
 
 
+def test_lambda_aws_published_layer_attaches_and_runs(lam):
+    """The layers AWS publishes from its own accounts attach by ARN alone.
+
+    Every account references the CloudWatch Lambda Insights extension or the
+    Parameters and Secrets extension by the publisher's ARN, and AWS grants
+    lambda:GetLayerVersion on them to everyone. The bytes are not available
+    offline, so the attachment reports a CodeSize of 0 and the function runs
+    without the extension; a layer this account published keeps its size.
+    """
+    from ministack.services.lambda_svc import (
+        _INSIGHTS_LAYER_ACCOUNTS as INSIGHTS,
+    )
+    from ministack.services.lambda_svc import (
+        _PARAMETERS_AND_SECRETS_LAYER_ACCOUNTS as PARAMETERS_AND_SECRETS,
+    )
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    region = lam.meta.region_name
+    insights = f"arn:aws:lambda:{region}:{INSIGHTS[region]}:layer:LambdaInsightsExtension:38"
+    secrets_ext = (f"arn:aws:lambda:{region}:{PARAMETERS_AND_SECRETS[region]}"
+                   ":layer:AWS-Parameters-and-Secrets-Lambda-Extension:12")
+    name = f"aws-published-layer-{suffix}"
+    own_layer = lam.publish_layer_version(
+        LayerName=f"own-next-to-published-{suffix}",
+        Content={"ZipFile": _make_zip("")},
+    )["LayerVersionArn"]
+    try:
+        lam.create_function(
+            FunctionName=name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            Layers=[insights],
+        )
+        assert lam.get_function_configuration(FunctionName=name)["Layers"] == [
+            {"Arn": insights, "CodeSize": 0}
+        ]
+        version = lam.get_layer_version_by_arn(Arn=insights)
+        assert (version["LayerVersionArn"], version["Version"], version["Content"]["CodeSize"]) == (
+            insights, 38, 0)
+        assert lam.invoke(FunctionName=name)["StatusCode"] == 200
+
+        lam.update_function_configuration(FunctionName=name, Layers=[secrets_ext, own_layer])
+        layers = lam.get_function_configuration(FunctionName=name)["Layers"]
+        assert [layer["Arn"] for layer in layers] == [secrets_ext, own_layer]
+        assert (layers[0]["CodeSize"], layers[1]["CodeSize"] > 0) == (0, True)
+    finally:
+        try:
+            lam.delete_function(FunctionName=name)
+        except ClientError:
+            pass
+        lam.delete_layer_version(LayerName=own_layer.rsplit(":", 2)[1], VersionNumber=1)
+
+
 def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
     """Docker's put_archive requires dest_dir to exist. For /opt/layer_N
     (which doesn't exist in the base RIE image), the fix is to extract into
@@ -4694,6 +4749,9 @@ def test_esm_response_no_function_name_field(lam, sqs):
 # CloudWatch Lambda Insights, the layer people reference cross-account; nothing resolves the version locally.
 _AWS_MANAGED_LAYER = "arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38"
 _OTHER_REGION_LAYER = "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:38"
+# The Insights publisher of af-south-1, used in us-east-1, and an account AWS never publishes from.
+_OTHER_REGION_PUBLISHER = "arn:aws:lambda:us-east-1:012438385374:layer:LambdaInsightsExtension:38"
+_UNKNOWN_FOREIGN_LAYER = "arn:aws:lambda:us-east-1:111111111111:layer:LambdaInsightsExtension:38"
 _FOREIGN_ACCOUNT = "580247275435"
 _FOREIGN_REGION = "us-east-1"
 _FOREIGN_CODE_SIZE = 4198176
@@ -4782,7 +4840,12 @@ _DENIED = "AccessDeniedException"
     pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
     pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
                  id="missing-version-of-known-layer"),
-    pytest.param(None, None, _AWS_MANAGED_LAYER, _DENIED, _DENIED, id="unknown-foreign-layer"),
+    pytest.param(None, None, _AWS_MANAGED_LAYER, None, None, id="aws-published-layer"),
+    pytest.param(None, None, _UNKNOWN_FOREIGN_LAYER, _DENIED, _DENIED, id="unknown-foreign-layer"),
+    pytest.param(None, None, _OTHER_REGION_PUBLISHER, _DENIED, _DENIED, id="publisher-of-another-region"),
+    pytest.param("LambdaInsightsExtension", None, None, _DENIED, _DENIED, id="published-name-registered-without-grant"),
+    pytest.param("LambdaInsightsExtension", None, _foreign_arn("LambdaInsightsExtension", 35), _DENIED, _DENIED,
+                 id="published-name-missing-version"),
     pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
     pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
                  "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
@@ -4790,11 +4853,20 @@ _DENIED = "AccessDeniedException"
 def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
     """A grant makes stored foreign content attachable and readable. Without
     one — no statement, a statement naming another account, or no layer of that
-    name at all — the attachment and the read are denied. The resolver does not
+    name at all — the attachment and the read are denied. A layer AWS publishes
+    from its own account in the request's region attaches without a stored
+    grant, as a record without content; the same publisher account in another
+    region, an account AWS does not publish from, and a name the publisher
+    account registered locally follow the stored grants. The resolver does not
     read AUTH (see the next test)."""
+    import ministack.services.lambda_svc as _lsvc
+
     arn = arn or _foreign_arn(layer_name)
-    with _foreign_layer(layer_name, granted_to=granted_to):
-        version_config, attach, payload, read = _layer_verdicts(arn)
+    try:
+        with _foreign_layer(layer_name, granted_to=granted_to):
+            version_config, attach, payload, read = _layer_verdicts(arn)
+    finally:
+        _lsvc._layers.pop_scoped(_FOREIGN_ACCOUNT, _FOREIGN_REGION, "LambdaInsightsExtension", None)
     assert ((attach or [None])[0], (read or [None])[0]) == (attach_error, read_error)
     messages = {"InvalidParameterValueException": f"Layer version {arn} does not exist.",
                 "ResourceNotFoundException": "The resource you requested does not exist."}
@@ -4803,7 +4875,8 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
     if attach_error is None:
         assert version_config["Content"]["CodeSize"] == (_FOREIGN_CODE_SIZE if layer_name else 0)
     if read_error is None:
-        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, _FOREIGN_CODE_SIZE)
+        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (
+            arn, _FOREIGN_CODE_SIZE if layer_name else 0)
         assert not [key for key in payload if key.startswith("_")]
 
 
@@ -5008,6 +5081,37 @@ def test_lambda_deleted_shared_layer_retention_and_restore(isolated_layers):
     with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
         assert svc._layers["retained"]["versions"] == []
     assert not [vc for layer in svc.get_state()["layers"]._data.values() for vc in layer["versions"]]
+
+
+def test_lambda_aws_published_layer_survives_restore_and_sweep(isolated_layers):
+    """The record the first attachment registers is state like any layer: it
+    comes back from a snapshot and the extract-cache sweep leaves it alone. A
+    read alone stores nothing, and a second version of the same AWS layer
+    registers next to the first."""
+    from ministack.core.responses import request_scope
+
+    svc = isolated_layers
+    second = _AWS_MANAGED_LAYER.rsplit(":", 1)[0] + ":53"
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        status, _, body = svc._get_layer_version_by_arn(_AWS_MANAGED_LAYER)
+        assert (status, json.loads(body)["Version"]) == (200, 38)
+        assert svc._layers.get_scoped(_FOREIGN_ACCOUNT, _FOREIGN_REGION, "LambdaInsightsExtension") is None
+        version_config, err = svc._resolve_layer_version_for_attachment(_AWS_MANAGED_LAYER)
+        assert err is None and version_config["_aws_published"]
+        second_config, err = svc._resolve_layer_version_for_attachment(second)
+        assert err is None and second_config["Version"] == 53
+    layer = svc._layers.get_scoped(_FOREIGN_ACCOUNT, _FOREIGN_REGION, "LambdaInsightsExtension")
+    assert ([vc["Version"] for vc in layer["versions"]], layer["next_version"]) == ([38, 53], 54)
+
+    state = svc.get_state()
+    svc._layers.clear()
+    svc.load_persisted_state(state)
+    svc._sweep_extract_cache()
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        restored, err = svc._resolve_layer_version_for_attachment(_AWS_MANAGED_LAYER)
+        assert err is None and restored["LayerVersionArn"] == _AWS_MANAGED_LAYER
+        assert svc._resolve_layer_zip(_AWS_MANAGED_LAYER) is None
+    assert len(svc._layers.get_scoped(_FOREIGN_ACCOUNT, _FOREIGN_REGION, "LambdaInsightsExtension")["versions"]) == 2
 
 
 def _seed_attached_layer(svc, name, attached, deleted):
