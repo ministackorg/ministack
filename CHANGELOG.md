@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Lambda — a layer shared through `AddLayerVersionPermission` attaches** — every layer ARN from another account was refused before the stored policy was read. Attachment, from the API and from a CloudFormation function, and `GetLayerVersionByArn` now evaluate it for account, root, public and organization grants, and an attached function keeps the content after the grant is revoked or the version is deleted. Contributed by @iot-rocket.
+
 ## [1.5.12] — 2026-09-15
 
 ### Added
