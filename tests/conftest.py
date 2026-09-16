@@ -191,11 +191,10 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_iot_rule_where_clause_gates_dispatch",
     "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
     "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
-    "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
     # IoT Jobs data-plane routing test: a raw urllib GET with the advertised
     # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
     # xdist pressure on the shared event loop makes it time out at random.
-    "tests/test_iot_jobs.py::test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane",
+    "tests/test_iot_jobs.py::test_iot_jobs_endpoint_host_reaches_the_data_plane",
     # ECS service task-spawn: with a Docker daemon present (CI has one) a task
     # whose container fails to start/exits under parallel container churn is set
     # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
@@ -273,6 +272,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
     "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
     "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_jitr_auto_registers_an_unknown_cert_without_connack",
     "tests/test_iot_data.py::test_mtls_account_scoped_delivery",
     "tests/test_iot_data.py::test_mtls_garbage_bytes_dropped",
     "tests/test_iot_data.py::test_mtls_duplicate_client_id_evicts_first_connection",

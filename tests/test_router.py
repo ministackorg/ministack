@@ -130,8 +130,7 @@ def test_iot_jobs_data_credential_scope_routes():
 @pytest.mark.parametrize(
     "host",
     [
-        # What DescribeEndpoint(endpointType="iot:Jobs") actually hands out —
-        # a device following the documented flow signs against exactly this.
+        # The legacy iot:Jobs endpoint shape.
         "a1b2c3.jobs.iot.us-east-1.localhost:4566",
         # The spelling the AWS Device SDK's jobs documentation uses.
         "a1b2c3.data.jobs.iot.us-east-1.localhost:4566",
