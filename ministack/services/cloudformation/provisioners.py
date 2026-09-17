@@ -634,6 +634,27 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "ThingGroupName",
         "requires_replacement": lambda old, new: old.get("ParentGroupName") != new.get("ParentGroupName"),
     },
+    # Measured on an account: a ThingTypeDescription or SearchableAttributes
+    # change under an explicit, unchanged ThingTypeName fails the update with
+    # the custom-named-resource sentence, while an Mqtt5Configuration change
+    # updates in place ("After a thing type is created, you can only update
+    # Mqtt5Configuration").
+    "AWS::IoT::ThingType": {
+        "name": "ThingTypeName",
+        "requires_replacement": lambda old, new: any(
+            (old.get("ThingTypeProperties") or {}).get(p)
+            != (new.get("ThingTypeProperties") or {}).get(p)
+            for p in ("ThingTypeDescription", "SearchableAttributes")
+        ),
+    },
+    # BackupVaultName is required, so every vault is custom-named. Measured on
+    # an account: adding EncryptionKeyArn fails with the refusal sentence.
+    "AWS::Backup::BackupVault": {
+        "name": "BackupVaultName",
+        "requires_replacement": lambda old, new: (
+            old.get("EncryptionKeyArn", "") != new.get("EncryptionKeyArn", "")
+        ),
+    },
     # KmsKeyId is "Update requires: Replacement" in the resource reference.
     "AWS::Location::Tracker": {
         "name": "TrackerName",
@@ -642,6 +663,38 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::IAM::InstanceProfile": {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
+    },
+    # "If you specify a name, you cannot perform updates that require
+    # replacement of this resource, but you can perform other updates"
+    # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
+    # written out on the type's own page. Scheme and Type are its two
+    # replacing properties.
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: (
+            old.get("Scheme", "internet-facing") != new.get("Scheme", "internet-facing")
+            or old.get("Type", "application") != new.get("Type", "application")
+        ),
+    },
+    # A target group name "must be unique per region per account"; Port,
+    # Protocol, ProtocolVersion, TargetType, VpcId and IpAddressType are
+    # "Update requires: Replacement".
+    "AWS::ElasticLoadBalancingV2::TargetGroup": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: any(
+            old.get(p) != new.get(p) for p in (
+                "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
+                "IpAddressType",
+            )
+        ),
+    },
+    # A web ACL name is unique per scope per account and cannot be changed
+    # after creation; Scope is the other replacing property.
+    "AWS::WAFv2::WebACL": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: (
+            old.get("Scope", "REGIONAL") != new.get("Scope", "REGIONAL")
+        ),
     },
 }
 
@@ -669,11 +722,27 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
     return None
 
 
+def _requires_replacement(resource_type, old_props, new_props):
+    """Whether a replacing property of the type changed, read from the table
+    ``_custom_named_replacement_error`` reads. An explicit physical name
+    refuses that replacement above the handler; under a generated name there
+    is nothing to refuse and the handler performs it, so both answers come
+    from one definition."""
+    spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
+    return bool(spec and spec["requires_replacement"](old_props, new_props))
+
+
 # Set by the stack engine around an update whose resource carries
 # ``UpdateReplacePolicy: Retain`` (or ``RetainExceptOnCreate``): a handler that
 # replaces the resource must then leave the predecessor in place; the engine
 # records the DELETE_SKIPPED event.
 _RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+# Set by the stack engine to a list around an update handler: a predecessor
+# delete is then queued there and run in the cleanup phase after the update
+# succeeds, so a rollback still finds the old resource. Unset (None), the
+# delete runs at once.
+_DEFERRED_PREDECESSOR_DELETES = contextvars.ContextVar(
+    "cfn_deferred_predecessor_deletes", default=None)
 # The DeletionPolicy / UpdateReplacePolicy values that keep a resource; the
 # engine reads the same tuple for the cleanup phase and the stack delete.
 # Snapshot is not among them: the emulator takes no snapshots, so a Snapshot
@@ -716,15 +785,19 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with three exceptions. Two have a
-    deterministic generated name (the DynamoDB table and the Location
-    tracker): the replacement takes the name back, so there is nothing left
-    to retain. The third is the Lambda permission's degenerate ``Id`` branch,
+    cannot be forgotten at one site, with four exceptions. Three have a
+    deterministic generated name (the DynamoDB table, the Location tracker
+    and the IoT thing type): the replacement takes the name back, so there is
+    nothing left to retain. The fourth is the Lambda permission's degenerate ``Id`` branch,
     which removes and re-puts one statement under a Sid that cannot change:
     the physical id is kept, nothing is replaced, and the policy does not
     apply.
     """
     if _RETAIN_REPLACED.get():
+        return
+    deferred = _DEFERRED_PREDECESSOR_DELETES.get()
+    if deferred is not None:
+        deferred.append((delete_fn, args, kwargs))
         return
     delete_fn(*args, **kwargs)
 
@@ -866,6 +939,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
     "AWS::DynamoDB::Table": ("Tags", "list"),
     "AWS::EC2::VPCEndpoint": ("Tags", "list"),
+    "AWS::ECR::Repository": ("Tags", "list"),
     "AWS::ECS::Cluster": ("Tags", "list"),
     "AWS::ECS::Service": ("Tags", "list"),
     "AWS::EKS::Cluster": ("Tags", "list"),
@@ -3762,12 +3836,16 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                     res_def, "UpdateReplacePolicy", provisioned, param_values,
                     conditions, mappings, child_name, child_stack_id,
                 ) in _RETAINING_POLICIES)
+                # The child has no cleanup phase of its own: its handlers
+                # delete the predecessor at once, not into the parent's queue.
+                deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(None)
                 try:
                     physical_id, attrs = _update_resource(
                         resource_type, prev.get("PhysicalResourceId", child_logical_id),
                         old_tagged, new_tagged, child_name, child_logical_id,
                     )
                 finally:
+                    _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
             else:
                 physical_id, attrs = _provision_resource(
@@ -4672,6 +4750,25 @@ def _apigw_account_delete(physical_id, props):
     settings = dict(_apigw_v1._account_settings.get("settings") or {})
     settings.pop("cloudwatchRoleArn", None)
     _apigw_v1._account_settings["settings"] = settings
+
+
+def _apigw_account_update(physical_id, old_props, new_props, stack_name,
+                          logical_id=None):
+    """Update the account settings in place. ``CloudWatchRoleArn`` is the
+    type's only property and is "Update requires: No interruption"
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-account.html).
+    The create handler only ever wrote a declared role, so a template that
+    dropped the property left the old role in the settings the ``GetAccount``
+    call answers; here it is removed, as ``UpdateAccount`` with a null value
+    does."""
+    settings = dict(_apigw_v1._account_settings.get("settings") or {})
+    role_arn = new_props.get("CloudWatchRoleArn")
+    if role_arn is None:
+        settings.pop("cloudwatchRoleArn", None)
+    else:
+        settings["cloudwatchRoleArn"] = role_arn
+    _apigw_v1._account_settings["settings"] = settings
+    return physical_id, {}
 
 
 # --- API Gateway DomainName ---
@@ -6121,25 +6218,71 @@ def _cognito_user_pool_domain_delete(physical_id, props):
 # ===========================================================================
 # --- ECR resource provisioners ---
 
+def _ecr_cfn_to_api(props):
+    """The ``CreateRepository`` members an ``AWS::ECR::Repository`` declares,
+    in the API's casing and shapes: the store keeps what the API writes, and
+    ``DescribeRepositories`` and ``ListTagsForResource`` answer it verbatim.
+    A member the template leaves out takes the API's default."""
+    scanning = props.get("ImageScanningConfiguration") or {}
+    encryption = props.get("EncryptionConfiguration") or {}
+    encryption_config = {"encryptionType": encryption.get("EncryptionType", "AES256")}
+    if encryption.get("KmsKey"):
+        encryption_config["kmsKey"] = encryption["KmsKey"]
+    return {
+        "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
+        "imageScanningConfiguration": {
+            "scanOnPush": str(scanning.get("ScanOnPush", False)).lower() == "true",
+        },
+        "encryptionConfiguration": encryption_config,
+        "tags": [{"Key": t["Key"], "Value": t.get("Value", "")}
+                 for t in props.get("Tags") or [] if isinstance(t, dict) and "Key" in t],
+    }
+
+
+def _ecr_repo_apply_policies(name, props):
+    """Write the lifecycle policy and the repository policy through the ECR
+    calls that own them, and remove one the template no longer declares."""
+    lifecycle = (props.get("LifecyclePolicy") or {}).get("LifecyclePolicyText")
+    if lifecycle:
+        _ecr._put_lifecycle_policy({"repositoryName": name, "lifecyclePolicyText": lifecycle})
+    else:
+        _ecr._lifecycle_policies.pop(name, None)
+    policy = props.get("RepositoryPolicyText")
+    if policy:
+        _ecr._set_repository_policy({
+            "repositoryName": name,
+            "policyText": policy if isinstance(policy, str) else json.dumps(policy),
+        })
+    else:
+        _ecr._repo_policies.pop(name, None)
+
+
 def _ecr_repo_create(logical_id, props, stack_name):
     name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
-    arn = f"arn:aws:ecr:{get_region()}:{get_account_id()}:repository/{name}"
-    _ecr._repositories[name] = {
-        "repositoryName": name,
-        "repositoryArn": arn,
-        "registryId": get_account_id(),
-        "repositoryUri": f"{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/{name}",
-        "createdAt": __import__("time").time(),
-        "imageTagMutability": props.get("ImageTagMutability", "MUTABLE"),
-        "imageScanningConfiguration": props.get("ImageScanningConfiguration", {"scanOnPush": False}),
-        "encryptionConfiguration": props.get("EncryptionConfiguration", {"encryptionType": "AES256"}),
-        "images": [],
-    }
-    return name, {"Arn": arn, "RepositoryUri": _ecr._repositories[name]["repositoryUri"]}
+    api = _ecr_cfn_to_api(props)
+    if name in _ecr._repositories:
+        # The create has always overwritten an existing record; refusing the
+        # duplicate is a separate change.
+        _ecr._repositories[name].update(api)
+    else:
+        _ecr._create_repository({"repositoryName": name, **api})
+    _ecr_repo_apply_policies(name, props)
+    repo = _ecr._repositories[name]
+    return name, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
 
 
 def _ecr_repo_delete(physical_id, props):
-    _ecr._repositories.pop(physical_id, None)
+    """Delete through ``DeleteRepository``, which drops the images and both
+    policies with the repository and refuses one that still holds images
+    unless ``EmptyOnDelete`` is true."""
+    if physical_id not in _ecr._repositories:
+        return
+    status, _, body = _ecr._delete_repository({
+        "repositoryName": physical_id,
+        "force": str(props.get("EmptyOnDelete", False)).lower() == "true",
+    })
+    if status >= 400:
+        raise ValueError(json.loads(body).get("message", body))
 
 
 # --- CodeBuild Project provisioner ---
@@ -6889,6 +7032,23 @@ def _elbv2_tags(tags):
     return out
 
 
+def _elbv2_merge_attributes(store, declared):
+    """Apply the attributes a template declares over the ones the resource
+    already carries, which is what the resource reference documents for
+    ``LoadBalancerAttributes``, ``TargetGroupAttributes`` and
+    ``ListenerAttributes``: "Attributes that you do not modify retain their
+    current values". The list is changed in place."""
+    declared = [a for a in (declared or []) if isinstance(a, dict) and a.get("Key")]
+    if not declared:
+        return
+    merged = {a.get("Key"): a for a in store if isinstance(a, dict)}
+    for attribute in declared:
+        merged[attribute["Key"]] = {
+            "Key": attribute["Key"], "Value": str(attribute.get("Value", "")),
+        }
+    store[:] = list(merged.values())
+
+
 def _elbv2_load_balancer_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(
         stack_name,
@@ -6962,6 +7122,96 @@ def _elbv2_load_balancer_delete(physical_id, props):
     _alb._tags.pop(physical_id, None)
 
 
+def _elbv2_load_balancer_update(physical_id, old_props, new_props, stack_name,
+                                logical_id=None):
+    """Update a load balancer in place, keeping its ARN (what ``Ref``
+    returns), its DNS name, its listeners and the targets registered behind
+    them. ``IpAddressType``, ``SecurityGroups``, ``Subnets``,
+    ``LoadBalancerAttributes`` and ``Tags`` are "Update requires: No
+    interruption" on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-loadbalancer.html);
+    ``Name``, ``Scheme`` and ``Type`` require replacement. A changed name
+    replaces through the shared prologue, and a ``Scheme`` or ``Type`` change
+    under a custom name is refused by ``_custom_named_replacement_error``,
+    which is what the reference states for this type: "If you specify a name,
+    you cannot perform updates that require replacement of this resource, but
+    you can perform other updates." Under a generated name there is nothing to
+    refuse and the replacement is performed here. ``SubnetMappings`` is No
+    interruption as well and is modelled on neither path, here or in the
+    create.
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, lowercase=True, max_len=32)
+    lb = _alb._lbs.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, lb.get("LoadBalancerName") if lb else None,
+        _elbv2_load_balancer_create, _elbv2_load_balancer_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::ElasticLoadBalancingV2::LoadBalancer",
+                             old_props, new_props):
+        # Scheme and Type replace. A generated name does not refuse that, and
+        # the new ARN carries a fresh id, so the predecessor is a resource of
+        # its own and an UpdateReplacePolicy of Retain can keep it.
+        created = _elbv2_load_balancer_create(
+            logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_elbv2_load_balancer_delete, physical_id, old_props)
+        return created
+
+    lb["IpAddressType"] = new_props.get("IpAddressType", "ipv4")
+    lb["Subnets"] = _elbv2_as_list(new_props.get("Subnets"))
+    lb["SecurityGroups"] = _elbv2_as_list(new_props.get("SecurityGroups"))
+    _elbv2_merge_attributes(
+        _alb._lb_attrs.setdefault(physical_id, []),
+        new_props.get("LoadBalancerAttributes"),
+    )
+    _reconcile_tag_list(_alb._tags.setdefault(physical_id, []), old_props, new_props)
+    lb_id = _alb._load_balancer_id_from_arn(physical_id)
+    return physical_id, {
+        "Arn": physical_id,
+        "LoadBalancerArn": physical_id,
+        "LoadBalancerName": lb["LoadBalancerName"],
+        "DNSName": lb["DNSName"],
+        "LoadBalancerFullName": f"app/{lb['LoadBalancerName']}/{lb_id}",
+        "CanonicalHostedZoneID": "Z35SXDOTRQ7X7K",
+        "SecurityGroups": lb["SecurityGroups"],
+    }
+
+
+def _elbv2_listener_actions(props, lb_arn, prop="DefaultActions"):
+    """The action records an ``AWS::ElasticLoadBalancingV2::Listener`` or
+    ``ListenerRule`` stores, in the shape the ALB service keeps. A forward
+    action also records the listener's load balancer on the target group, the
+    way ``CreateListener`` does; a rule passes no ``lb_arn`` and skips that."""
+    actions = []
+    for idx, action in enumerate(props.get(prop) or [], start=1):
+        if not isinstance(action, dict):
+            continue
+        entry = {
+            "Type": action.get("Type", "fixed-response" if lb_arn else "forward"),
+            "Order": int(action.get("Order", idx)),
+        }
+        tg_arn = action.get("TargetGroupArn")
+        if not tg_arn:
+            forward_cfg = action.get("ForwardConfig", {})
+            tg_list = forward_cfg.get("TargetGroups", []) if isinstance(forward_cfg, dict) else []
+            if tg_list and isinstance(tg_list[0], dict):
+                tg_arn = tg_list[0].get("TargetGroupArn")
+        if tg_arn:
+            entry["TargetGroupArn"] = tg_arn
+            if (lb_arn and tg_arn in _alb._tgs
+                    and lb_arn not in _alb._tgs[tg_arn].get("LoadBalancerArns", [])):
+                _alb._tgs[tg_arn].setdefault("LoadBalancerArns", []).append(lb_arn)
+        if isinstance(action.get("FixedResponseConfig"), dict):
+            entry["FixedResponseConfig"] = dict(action["FixedResponseConfig"])
+        if isinstance(action.get("RedirectConfig"), dict):
+            entry["RedirectConfig"] = dict(action["RedirectConfig"])
+        actions.append(entry)
+    return actions
+
+
 def _elbv2_listener_create(logical_id, props, stack_name):
     lb_arn = props.get("LoadBalancerArn", "")
     lb = _alb._lbs.get(lb_arn)
@@ -6976,29 +7226,7 @@ def _elbv2_listener_create(logical_id, props, stack_name):
         f"listener/app/{lb_name}/{lb_id}/{listener_id}"
     )
 
-    actions = []
-    for idx, action in enumerate(props.get("DefaultActions", []) or [], start=1):
-        if not isinstance(action, dict):
-            continue
-        entry = {
-            "Type": action.get("Type", "fixed-response"),
-            "Order": int(action.get("Order", idx)),
-        }
-        tg_arn = action.get("TargetGroupArn")
-        if not tg_arn:
-            forward_cfg = action.get("ForwardConfig", {})
-            tg_list = forward_cfg.get("TargetGroups", []) if isinstance(forward_cfg, dict) else []
-            if tg_list and isinstance(tg_list[0], dict):
-                tg_arn = tg_list[0].get("TargetGroupArn")
-        if tg_arn:
-            entry["TargetGroupArn"] = tg_arn
-            if tg_arn in _alb._tgs and lb_arn not in _alb._tgs[tg_arn].get("LoadBalancerArns", []):
-                _alb._tgs[tg_arn].setdefault("LoadBalancerArns", []).append(lb_arn)
-        if isinstance(action.get("FixedResponseConfig"), dict):
-            entry["FixedResponseConfig"] = action["FixedResponseConfig"]
-        if isinstance(action.get("RedirectConfig"), dict):
-            entry["RedirectConfig"] = action["RedirectConfig"]
-        actions.append(entry)
+    actions = _elbv2_listener_actions(props, lb_arn)
 
     listener = {
         "ListenerArn": listener_arn,
@@ -7034,6 +7262,43 @@ def _elbv2_listener_delete(physical_id, props):
     for rule_arn in [k for k, v in list(_alb._rules.items()) if v.get("ListenerArn") == physical_id]:
         _alb._rules.pop(rule_arn, None)
         _alb._tags.pop(rule_arn, None)
+
+
+def _elbv2_listener_update(physical_id, old_props, new_props, stack_name,
+                           logical_id=None):
+    """Update a listener in place, keeping its ARN (what ``Ref`` returns) and
+    the rules attached to it, which the create handler removes with the
+    listener. ``Port``, ``Protocol``, ``DefaultActions``, ``Certificates``,
+    ``AlpnPolicy``, ``ListenerAttributes``, ``MutualAuthentication`` and
+    ``Tags`` are "Update requires: No interruption" and ``SslPolicy`` is
+    "Some interruptions"; only ``LoadBalancerArn`` requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listener.html),
+    and a listener ARN carries its load balancer, so moving one is a
+    replacement under a new physical id. The default actions are written on
+    the listener's default rule as well, as ``ModifyListener`` does: the data
+    plane reads the rule.
+    """
+    listener = _alb._listeners.get(physical_id)
+    if listener is None or listener.get("LoadBalancerArn") != new_props.get("LoadBalancerArn"):
+        created = _elbv2_listener_create(
+            logical_id or physical_id, new_props, stack_name)
+        if listener is not None:
+            _delete_predecessor(_elbv2_listener_delete, physical_id, old_props)
+        return created
+
+    listener["Port"] = int(new_props.get("Port", 80) or 80)
+    listener["Protocol"] = new_props.get("Protocol", "HTTP")
+    actions = _elbv2_listener_actions(new_props, listener["LoadBalancerArn"])
+    listener["DefaultActions"] = actions
+    for rule in _alb._rules.values():
+        if rule.get("ListenerArn") == physical_id and rule.get("IsDefault"):
+            rule["Actions"] = actions
+    _elbv2_merge_attributes(
+        _alb._listener_attrs.setdefault(physical_id, []),
+        new_props.get("ListenerAttributes"),
+    )
+    _reconcile_tag_list(_alb._tags.setdefault(physical_id, []), old_props, new_props)
+    return physical_id, {"ListenerArn": physical_id, "Arn": physical_id}
 
 
 # ---------------------------------------------------------------------------
@@ -7395,6 +7660,67 @@ def _acm_certificate_delete(physical_id, props):
     _acm._certificates.pop(physical_id, None)
 
 
+# The properties that require replacing an AWS::CertificateManager::Certificate,
+# each "Update requires: Replacement" on the resource reference.
+_ACM_REPLACEMENT_PROPERTIES = (
+    "CertificateAuthorityArn", "CertificateExport", "DomainName",
+    "DomainValidationOptions", "KeyAlgorithm", "SubjectAlternativeNames",
+)
+
+
+def _acm_certificate_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    """Update a certificate in place, keeping its ARN (what ``Ref`` returns),
+    its issue and expiry dates and its key material. ``Tags``,
+    ``ValidationMethod`` and ``CertificateTransparencyLoggingPreference`` are
+    "Update requires: No interruption" on the resource reference, which says
+    of the last one: "Changing the certificate transparency logging
+    preference will update the existing resource by calling
+    UpdateCertificateOptions on the certificate. This action will not create
+    a new resource."
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-certificatemanager-certificate.html).
+    The create handler instead re-issued the certificate on any change, which
+    moved its validity window and replaced the PEM the ACM read paths serve.
+    A changed ``DomainName``, ``SubjectAlternativeNames``, ``KeyAlgorithm``,
+    ``DomainValidationOptions``, ``CertificateAuthorityArn`` or
+    ``CertificateExport`` requires replacement: the new certificate is
+    requested before the old one is deleted, CloudFormation's replacement
+    order. A ``ValidationMethod`` change regenerates ``DomainValidationOptions``
+    the same way ``_acm_certificate_create`` derives them
+    (``acm._validation_options`` per SAN); left stale, they kept describing
+    the old method after ``describe_certificate`` had already started
+    reporting the new one.
+    """
+    cert = _acm._certificates.get(physical_id)
+    if cert is None or any(old_props.get(p) != new_props.get(p)
+                           for p in _ACM_REPLACEMENT_PROPERTIES):
+        created = _acm_certificate_create(
+            logical_id or physical_id, new_props, stack_name)
+        if cert is not None:
+            _delete_predecessor(_acm_certificate_delete, physical_id, old_props)
+        return created
+
+    method = new_props.get("ValidationMethod", "DNS")
+    if method != cert.get("ValidationMethod"):
+        sans = cert.get("SubjectAlternativeNames") or [cert["DomainName"]]
+        cert["DomainValidationOptions"] = [
+            _acm._validation_options(d, method) for d in sans
+        ]
+    cert["ValidationMethod"] = method
+    _acm._update_options({
+        "CertificateArn": physical_id,
+        "Options": {
+            "CertificateTransparencyLoggingPreference":
+                (new_props.get("CertificateTransparencyLoggingPreference")
+                 or (new_props.get("Options") or {}).get(
+                     "CertificateTransparencyLoggingPreference")
+                 or "ENABLED"),
+        },
+    })
+    _reconcile_tag_list(cert.setdefault("Tags", []), old_props, new_props)
+    return physical_id, {"CertificateArn": physical_id, "Arn": physical_id}
+
+
 # ---------------------------------------------------------------------------
 # ELBv2 TargetGroup + ListenerRule
 # ---------------------------------------------------------------------------
@@ -7432,7 +7758,10 @@ def _elbv2_target_group_create(logical_id, props, stack_name):
     }
     _alb._tgs[arn] = tg
     _alb._targets[arn] = []
-    _alb._tags[arn] = {t["Key"]: t["Value"] for t in (props.get("Tags") or [])}
+    # The ALB tag store holds a list of {Key, Value} for every resource type,
+    # which is what DescribeTags iterates; a map here made that call raise on
+    # any CloudFormation-created target group.
+    _alb._tags[arn] = _elbv2_tags(props.get("Tags"))
     _alb._tg_attrs[arn] = [
         {"Key": a.get("Key", ""), "Value": a.get("Value", "")}
         for a in (props.get("TargetGroupAttributes") or [])
@@ -7453,6 +7782,75 @@ def _elbv2_target_group_delete(physical_id, props):
     _alb._targets.pop(physical_id, None)
     _alb._tags.pop(physical_id, None)
     _alb._tg_attrs.pop(physical_id, None)
+
+
+# The health-check properties the target group stores, with the value the
+# create applies when the template does not declare one, so a dropped
+# property goes back to that default instead of keeping the old value.
+_ELBV2_TG_HEALTH_CHECK = {
+    "HealthCheckProtocol": ("HealthCheckProtocol", "HTTP", str),
+    "HealthCheckPort": ("HealthCheckPort", "traffic-port", str),
+    "HealthCheckPath": ("HealthCheckPath", "/", str),
+    "HealthCheckIntervalSeconds": ("HealthCheckIntervalSeconds", 30, int),
+    "HealthCheckTimeoutSeconds": ("HealthCheckTimeoutSeconds", 5, int),
+    "HealthyThresholdCount": ("HealthyThresholdCount", 5, int),
+    "UnhealthyThresholdCount": ("UnhealthyThresholdCount", 2, int),
+}
+
+
+def _elbv2_target_group_update(physical_id, old_props, new_props, stack_name,
+                               logical_id=None):
+    """Update a target group in place, keeping its ARN (what ``Ref`` returns)
+    and the targets registered in it. The health-check properties,
+    ``Matcher``, ``TargetGroupAttributes`` and ``Tags`` are "Update requires:
+    No interruption" on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-targetgroup.html);
+    ``Name``, ``Port``, ``Protocol``, ``ProtocolVersion``, ``TargetType``,
+    ``VpcId`` and ``IpAddressType`` require replacement. A changed name
+    replaces through the shared prologue; one of the others under an
+    unchanged custom name is refused by ``_custom_named_replacement_error``,
+    as CloudFormation refuses to replace a custom-named resource, and this
+    name "must be unique per region per account". Under a generated name the
+    replacement is performed here, and the registered targets go with the old
+    group.
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=32)
+    tg = _alb._tgs.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, tg.get("TargetGroupName") if tg else None,
+        _elbv2_target_group_create, _elbv2_target_group_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::ElasticLoadBalancingV2::TargetGroup",
+                             old_props, new_props):
+        # Port, Protocol, ProtocolVersion, TargetType, VpcId and IpAddressType
+        # replace; the targets registered in the old group stay with it, as on
+        # AWS, and its ARN carries a fresh id, so Retain can keep it.
+        created = _elbv2_target_group_create(
+            logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_elbv2_target_group_delete, physical_id, old_props)
+        return created
+
+    for prop, (field, default, cast) in _ELBV2_TG_HEALTH_CHECK.items():
+        value = new_props.get(prop, default)
+        tg[field] = cast(value if value not in (None, "") else default)
+    enabled = new_props.get("HealthCheckEnabled", True)
+    tg["HealthCheckEnabled"] = (
+        enabled if isinstance(enabled, bool) else str(enabled).lower() == "true")
+    tg["Matcher"] = {"HttpCode": (new_props.get("Matcher") or {}).get("HttpCode", "200")}
+    _elbv2_merge_attributes(
+        _alb._tg_attrs.setdefault(physical_id, []),
+        new_props.get("TargetGroupAttributes"),
+    )
+    _reconcile_tag_list(_alb._tags.setdefault(physical_id, []), old_props, new_props)
+    return physical_id, {
+        "TargetGroupArn": physical_id,
+        "TargetGroupName": tg["TargetGroupName"],
+        "TargetGroupFullName": _alb._target_group_full_name_from_arn(physical_id),
+    }
 
 
 def _flatten_listener_rule_conditions(cfn_conditions):
@@ -7505,22 +7903,12 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
                 f":listener-rule/app/{lb_name}/{lb_id}/{l_id}/{rule_id}")
     # CFN Actions: list of dicts with Type, Order, TargetGroupArn / RedirectConfig
     # / FixedResponseConfig. MS' native shape matches this directly.
-    actions = []
-    for i, a in enumerate(props.get("Actions") or [], start=1):
-        record = {"Type": a.get("Type", "forward"), "Order": int(a.get("Order", i))}
-        if a.get("TargetGroupArn"):
-            record["TargetGroupArn"] = a["TargetGroupArn"]
-        if a.get("RedirectConfig"):
-            record["RedirectConfig"] = dict(a["RedirectConfig"])
-        if a.get("FixedResponseConfig"):
-            record["FixedResponseConfig"] = dict(a["FixedResponseConfig"])
-        actions.append(record)
     rule = {
         "RuleArn": rule_arn,
         "ListenerArn": l_arn,
         "Priority": str(props.get("Priority", 1)),
         "Conditions": _flatten_listener_rule_conditions(props.get("Conditions") or []),
-        "Actions": actions,
+        "Actions": _elbv2_listener_actions(props, None, prop="Actions"),
         "IsDefault": False,
     }
     _alb._rules[rule_arn] = rule
@@ -7529,6 +7917,30 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
 
 def _elbv2_listener_rule_delete(physical_id, props):
     _alb._rules.pop(physical_id, None)
+
+
+def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
+                                logical_id=None):
+    """Update a listener rule in place, keeping its ARN (what ``Ref``
+    returns). ``Actions``, ``Conditions`` and ``Priority`` are "Update
+    requires: No interruption" and only ``ListenerArn`` requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listenerrule.html);
+    a rule ARN carries its listener, so moving one is a replacement under a
+    new physical id. ``Tags`` are left alone, because the create handler does
+    not store a rule's tags either.
+    """
+    rule = _alb._rules.get(physical_id)
+    if rule is None or rule.get("ListenerArn") != new_props.get("ListenerArn"):
+        created = _elbv2_listener_rule_create(
+            logical_id or physical_id, new_props, stack_name)
+        if rule is not None:
+            _delete_predecessor(_elbv2_listener_rule_delete, physical_id, old_props)
+        return created
+
+    rule["Priority"] = str(new_props.get("Priority", 1))
+    rule["Conditions"] = _flatten_listener_rule_conditions(new_props.get("Conditions") or [])
+    rule["Actions"] = _elbv2_listener_actions(new_props, None, prop="Actions")
+    return physical_id, {"RuleArn": physical_id}
 
 
 # ---------------------------------------------------------------------------
@@ -7558,6 +7970,38 @@ def _r53_hosted_zone_create(logical_id, props, stack_name):
 def _r53_hosted_zone_delete(physical_id, props):
     _r53._zones.pop(physical_id, None)
     _r53._records.pop(physical_id, None)
+
+
+def _r53_hosted_zone_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    """Update a hosted zone in place, keeping its id (what ``Ref`` and
+    ``Fn::GetAtt Id`` return) and every record in it. ``HostedZoneConfig`` is
+    "Update requires: No interruption" on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-route53-hostedzone.html),
+    so a changed comment is written on the zone the stack already has; the
+    create handler instead minted a second zone with a fresh id and the
+    default NS and SOA records only, which orphaned every
+    ``AWS::Route53::RecordSet`` that had been created in the first one. Only
+    ``Name`` requires replacement, and a hosted-zone name is not unique, so
+    the new zone is created before the old one is removed.
+    """
+    zone_name = new_props.get("Name", "")
+    if not zone_name.endswith("."):
+        zone_name += "."
+    zone = _r53._zones.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        zone_name, zone.get("name") if zone else None,
+        _r53_hosted_zone_create, _r53_hosted_zone_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    zone["comment"] = (new_props.get("HostedZoneConfig") or {}).get("Comment", "")
+    return physical_id, {
+        "Id": physical_id,
+        "NameServers": ["ns-1.awsdns-01.org", "ns-2.awsdns-02.co.uk"],
+    }
 
 
 def _r53_normalize_hosted_zone_id(zone_ref: str) -> str:
@@ -8226,15 +8670,84 @@ def _apigw_v2_authorizer_delete(physical_id, props):
 # SES EmailIdentity
 # ---------------------------------------------------------------------------
 
+def _ses_email_identity_apply(identity, props):
+    """Write the identity into both SES stores. ``AWS::SES::EmailIdentity``
+    is the v2 resource type, so an identity that lives in the v1 store alone
+    is invisible to ``GetEmailIdentity`` and ``ListEmailIdentities``, the
+    calls a template's own resource is read back with. The two records hold
+    the attributes each API serves; the members the template does not declare
+    keep the defaults ``CreateEmailIdentity`` applies."""
+    v1 = _ses._identities.get(identity) or _ses._make_identity(
+        identity, "Domain" if "@" not in identity else "EmailAddress")
+    feedback = props.get("FeedbackAttributes") or {}
+    if "EmailForwardingEnabled" in feedback:
+        v1["FeedbackForwardingEnabled"] = bool(feedback["EmailForwardingEnabled"])
+    dkim = props.get("DkimAttributes") or {}
+    if "SigningEnabled" in dkim:
+        v1["DkimEnabled"] = bool(dkim["SigningEnabled"])
+    _ses._identities[identity] = v1
+
+    v2 = _ses_v2._identities.get(identity) or {
+        "EmailIdentity": identity,
+        "IdentityType": "DOMAIN" if "@" not in identity else "EMAIL_ADDRESS",
+        "VerifiedForSendingStatus": True,
+        "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+        "MailFromAttributes": {"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"},
+        "Tags": [],
+        "CreatedTimestamp": now_iso(),
+    }
+    v2["DkimAttributes"] = {
+        **v2["DkimAttributes"],
+        "SigningEnabled": bool(dkim.get("SigningEnabled", v2["DkimAttributes"]["SigningEnabled"])),
+    }
+    mail_from = props.get("MailFromAttributes") or {}
+    v2["MailFromAttributes"] = {
+        "MailFromDomain": mail_from.get("MailFromDomain", ""),
+        "BehaviorOnMxFailure": mail_from.get("BehaviorOnMxFailure", "USE_DEFAULT_VALUE"),
+    }
+    v2["ConfigurationSetName"] = (
+        props.get("ConfigurationSetAttributes") or {}).get("ConfigurationSetName", "")
+    v2["FeedbackForwardingStatus"] = bool(feedback.get("EmailForwardingEnabled", True))
+    v2["Tags"] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+    _ses_v2._identities[identity] = v2
+    return v2
+
+
 def _ses_email_identity_create(logical_id, props, stack_name):
     identity = props.get("EmailIdentity", "")
-    _ses._identities[identity] = _ses._make_identity(identity,
-        "Domain" if "@" not in identity else "EmailAddress")
+    _ses_email_identity_apply(identity, props)
     return identity, {"EmailIdentity": identity}
 
 
 def _ses_email_identity_delete(physical_id, props):
     _ses._identities.pop(physical_id, None)
+    _ses_v2._identities.pop(physical_id, None)
+
+
+def _ses_email_identity_update(physical_id, old_props, new_props, stack_name,
+                               logical_id=None):
+    """Update an email identity in place, keeping its verification status and
+    its DKIM tokens. ``ConfigurationSetAttributes``, ``DkimAttributes``,
+    ``FeedbackAttributes``, ``MailFromAttributes`` and ``Tags`` are "Update
+    requires: No interruption" on the resource reference and only
+    ``EmailIdentity`` requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ses-emailidentity.html);
+    the create handler rebuilt the record from scratch, which put the
+    verification status and the DKIM tokens back to their defaults. A changed
+    identity is a replacement: the new one is verified before the old one is
+    deleted.
+    """
+    identity = new_props.get("EmailIdentity", "")
+    known = physical_id in _ses._identities or physical_id in _ses_v2._identities
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        identity, physical_id if known else None,
+        _ses_email_identity_create, _ses_email_identity_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _ses_email_identity_apply(identity, new_props)
+    return physical_id, {"EmailIdentity": physical_id}
 
 
 # ---------------------------------------------------------------------------
@@ -8301,6 +8814,48 @@ def _waf_web_acl_create(logical_id, props, stack_name):
 
 def _waf_web_acl_delete(physical_id, props):
     _waf.delete_web_acl_record(physical_id, props.get("Scope", "REGIONAL"))
+
+
+def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
+                        logical_id=None):
+    """Update a web ACL in place, keeping its id and ARN, so the resources
+    associated with it through ``AWS::WAFv2::WebACLAssociation`` keep
+    pointing at a live ACL. ``DefaultAction``, ``Description``, ``Rules`` and
+    ``VisibilityConfig`` are "Update requires: No interruption" on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-wafv2-webacl.html);
+    ``Name`` and ``Scope`` require replacement. A changed name replaces
+    through the shared prologue; a ``Scope`` change under an unchanged
+    explicit name is refused by ``_custom_named_replacement_error``, and under
+    a generated name it is performed here. ``Tags`` are left alone on purpose:
+    the reference states that "With AWS CloudFormation, you can only add tags
+    to AWS WAF resources during resource creation".
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128)
+    # Under the scope the ACL was created with, not the one the template now
+    # asks for: the store is keyed by the scope's home region, so the new
+    # scope addresses a different store. _waf_web_acl_delete reads old_props
+    # for the same reason.
+    acl = _waf.web_acl_record(physical_id, old_props.get("Scope", "REGIONAL"))
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, acl.get("Name") if acl else None,
+        _waf_web_acl_create, _waf_web_acl_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::WAFv2::WebACL", old_props, new_props):
+        # The create lands the ACL in the new scope's store, the delete
+        # removes the record from the one it was created in, and the new id
+        # is a fresh uuid, so Retain can keep the predecessor.
+        created = _waf_web_acl_create(
+            logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_waf_web_acl_delete, physical_id, old_props)
+        return created
+
+    _waf.update_web_acl_record(acl, new_props)
+    return physical_id, {"Arn": acl["ARN"], "Id": physical_id}
 
 
 # ---------------------------------------------------------------------------
@@ -8805,19 +9360,97 @@ def _backup_vault_delete(physical_id, props):
     _backup._vaults.pop(physical_id, None)
 
 
+def _backup_vault_update(physical_id, old_props, new_props, stack_name,
+                         logical_id=None):
+    """Update a backup vault in place, keeping its creation date and its
+    recovery-point count. Of the "Update requires: No interruption"
+    properties on the resource reference only ``BackupVaultTags`` is stored
+    by the create, so only the tags are applied here (``AccessPolicy``,
+    ``LockConfiguration`` and ``Notifications`` stay unmodelled);
+    ``BackupVaultName`` and ``EncryptionKeyArn`` require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-backup-backupvault.html).
+    Without a handler the create ran again and answered
+    ``AlreadyExistsException``, which the create handler drops, so a tag
+    change never reached the vault. A changed name replaces; a changed
+    encryption key under the unchanged, required name is refused by the
+    ``_CUSTOM_NAME_REPLACEMENT`` rule before this handler runs.
+    """
+    name = new_props.get("BackupVaultName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=50)
+    vault = _backup._vaults.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, vault.get("BackupVaultName") if vault else None,
+        _backup_vault_create, _backup_vault_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    _reconcile_tag_map(vault.setdefault("BackupVaultTags", {}),
+                       old_props, new_props, prop="BackupVaultTags")
+    return physical_id, {
+        "BackupVaultArn": vault["BackupVaultArn"],
+        "BackupVaultName": physical_id,
+    }
+
+
+def _backup_plan_body(props):
+    """The ``CreateBackupPlan`` body for an ``AWS::Backup::BackupPlan``. The
+    CloudFormation type spells the rule list ``BackupPlanRule`` and the vault
+    of a rule ``TargetBackupVault`` where the API uses ``Rules`` and
+    ``TargetBackupVaultName``
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-backup-backupplan-backupplanresourcetype.html,
+    https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-backup-backupplan-backupruleresourcetype.html);
+    the other members carry the same names. Storing the template shape
+    verbatim left every CloudFormation plan with no rules at all when read
+    back through ``GetBackupPlan``."""
+    plan = dict(props.get("BackupPlan") or {})
+    rules = plan.pop("BackupPlanRule", None)
+    if rules is not None:
+        plan["Rules"] = [
+            {("TargetBackupVaultName" if key == "TargetBackupVault" else key): value
+             for key, value in rule.items()}
+            for rule in rules if isinstance(rule, dict)
+        ]
+    return {"BackupPlan": plan, "BackupPlanTags": _tag_map(props.get("BackupPlanTags"))}
+
+
 def _backup_plan_create(logical_id, props, stack_name):
-    plan_cfg = props.get("BackupPlan", {})
-    tags = {t["Key"]: t["Value"] for t in props.get("BackupPlanTags", [])} if isinstance(props.get("BackupPlanTags"), list) else props.get("BackupPlanTags", {})
-    body = {"BackupPlan": plan_cfg, "BackupPlanTags": tags}
-    _, _, resp_bytes = _backup._create_plan(body)
-    import json as _json
-    resp = _json.loads(resp_bytes)
+    _, _, resp_bytes = _backup._create_plan(_backup_plan_body(props))
+    resp = json.loads(resp_bytes)
     plan_id = resp["BackupPlanId"]
     return plan_id, {"BackupPlanArn": resp["BackupPlanArn"], "BackupPlanId": plan_id, "VersionId": resp["VersionId"]}
 
 
 def _backup_plan_delete(physical_id, props):
     _backup._plans.pop(physical_id, None)
+
+
+def _backup_plan_update(physical_id, old_props, new_props, stack_name,
+                        logical_id=None):
+    """Update a backup plan in place through ``UpdateBackupPlan``, keeping
+    its id (what ``Ref`` returns), its ARN and its version history. Both
+    properties of this type are "Update requires: No interruption", so it has
+    no replacement path at all
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-backup-backupplan.html);
+    the create handler minted a second plan under a fresh id and the engine
+    then deleted the first, so every ``AWS::Backup::BackupSelection`` and
+    every reader holding the old id lost it. ``VersionId`` rolls, as the call
+    does it.
+    """
+    body = _backup_plan_body(new_props)
+    status, _, resp_bytes = _backup._update_plan(physical_id, body)
+    if status >= 400:
+        raise ValueError(f"AWS::Backup::BackupPlan update failed: {resp_bytes!r}")
+    resp = json.loads(resp_bytes)
+    plan = _backup._plans[physical_id]
+    _reconcile_tag_map(plan.setdefault("Tags", {}), old_props, new_props,
+                       prop="BackupPlanTags")
+    return physical_id, {
+        "BackupPlanArn": resp["BackupPlanArn"],
+        "BackupPlanId": physical_id,
+        "VersionId": resp["VersionId"],
+    }
 
 
 def _s3tables_bucket_create(logical_id, props, stack_name):
@@ -8969,6 +9602,12 @@ def _iot_thing_type_create(logical_id, props, stack_name):
     resp = _iot._create_thing_type(name, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::ThingType create failed: {resp[2]!r}")
+    if props.get("DeprecateThingType", False):
+        # A plain property of the type: a template that declares it from the
+        # start came up non-deprecated until the next update.
+        status, _headers, body = _iot._deprecate_thing_type(name, {"undoDeprecate": False})
+        if status >= 400:
+            raise ValueError(f"DeprecateThingType failed: {body}")
     rec = _iot._thing_types.get(name) or {}
     return name, {"Arn": rec.get("thingTypeArn", _iot._thing_type_arn(name)),
                   "Id": rec.get("thingTypeId", "")}
@@ -8976,6 +9615,52 @@ def _iot_thing_type_create(logical_id, props, stack_name):
 
 def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
+
+
+def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
+                           logical_id=None):
+    """Update a thing type in place, keeping its id, its ARN and its creation
+    date. ``DeprecateThingType`` is "Update requires: No interruption" and
+    ``ThingTypeName`` requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iot-thingtype.html).
+    Of ``ThingTypeProperties`` only ``Mqtt5Configuration`` updates in place,
+    the one member the page calls updatable after creation; measured on an
+    account, a template that drops it clears it. A ``ThingTypeDescription`` or
+    ``SearchableAttributes`` change is refused under a custom name by the
+    ``_CUSTOM_NAME_REPLACEMENT`` rule. Under a generated name the type is
+    deleted and re-created: the name is deterministic, so creating first
+    would collide with the predecessor. Without a handler the create ran and
+    ``CreateThingType`` answered ``ResourceAlreadyExistsException``.
+    """
+    name = new_props.get("ThingTypeName") or _physical_name(
+        stack_name, logical_id or physical_id)
+    record = _iot._thing_types.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, physical_id if record else None,
+        _iot_thing_type_create, _iot_thing_type_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::IoT::ThingType", old_props, new_props):
+        _iot_thing_type_delete(physical_id, old_props)
+        return _iot_thing_type_create(logical_id or physical_id, new_props, stack_name)
+
+    stored = record.setdefault("thingTypeProperties", {})
+    mqtt5 = (new_props.get("ThingTypeProperties") or {}).get("Mqtt5Configuration")
+    if mqtt5:
+        stored["mqtt5Configuration"] = _pascal_to_camel(mqtt5)
+    else:
+        stored.pop("mqtt5Configuration", None)
+    deprecate = bool(new_props.get("DeprecateThingType", False))
+    if deprecate != bool(record.get("thingTypeMetadata", {}).get("deprecated")):
+        status, _headers, body = _iot._deprecate_thing_type(physical_id, {"undoDeprecate": not deprecate})
+        if status >= 400:
+            raise ValueError(f"DeprecateThingType failed: {body}")
+    return physical_id, {
+        "Arn": record.get("thingTypeArn", _iot._thing_type_arn(physical_id)),
+        "Id": record.get("thingTypeId", ""),
+    }
 
 
 # --- IoT ThingGroup ---
@@ -9452,11 +10137,20 @@ def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
     repo = _ecr._repositories.get(physical_id)
     new_name = new_props.get("RepositoryName")
     if repo is None or (new_name and new_name != physical_id):
-        return _ecr_repo_create(physical_id, new_props, stack_name)
-    for prop, key in (("ImageTagMutability", "imageTagMutability"),
-                      ("ImageScanningConfiguration", "imageScanningConfiguration")):
-        if prop in new_props:
-            repo[key] = new_props[prop]
+        # A new name is a replacement: create the new repository, then delete
+        # the old one through DeleteRepository, unless the template retains it.
+        result = _ecr_repo_create(physical_id, new_props, stack_name)
+        if repo is not None:
+            _delete_predecessor(_ecr_repo_delete, physical_id, old_props)
+        return result
+    # ImageTagMutability, ImageScanningConfiguration, LifecyclePolicy,
+    # RepositoryPolicyText and Tags update in place; EncryptionConfiguration
+    # requires replacement and stays as it is.
+    api = _ecr_cfn_to_api(new_props)
+    repo["imageTagMutability"] = api["imageTagMutability"]
+    repo["imageScanningConfiguration"] = api["imageScanningConfiguration"]
+    _reconcile_tag_list(repo.setdefault("tags", []), old_props, new_props)
+    _ecr_repo_apply_policies(physical_id, new_props)
     return physical_id, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
 
 
@@ -9849,7 +10543,12 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_base_path_mapping_update,
         "delete": _apigw_base_path_mapping_delete,
     },
-    "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::Account": {
+        "create": _apigw_account_create,
+        "update": _apigw_account_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_account_delete,
+    },
     "AWS::ApiGateway::DomainName": {
         "create": _apigw_domain_name_create,
         "update": _apigw_domain_name_update,
@@ -9946,9 +10645,24 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
-    "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
-    "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
-    "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
+    "AWS::CertificateManager::Certificate": {
+        "create": _acm_certificate_create,
+        "update": _acm_certificate_update,
+        "update_with_logical_id": True,
+        "delete": _acm_certificate_delete,
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup": {
+        "create": _elbv2_target_group_create,
+        "update": _elbv2_target_group_update,
+        "update_with_logical_id": True,
+        "delete": _elbv2_target_group_delete,
+    },
+    "AWS::ElasticLoadBalancingV2::ListenerRule": {
+        "create": _elbv2_listener_rule_create,
+        "update": _elbv2_listener_rule_update,
+        "update_with_logical_id": True,
+        "delete": _elbv2_listener_rule_delete,
+    },
     "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "update": _codebuild_project_update, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {
         "create": _iam_managed_policy_create,
@@ -9984,8 +10698,18 @@ _RESOURCE_HANDLERS = {
     "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
     "AWS::ECS::Service": {"create": _ecs_service_create, "delete": _ecs_service_delete},
     "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
-    "AWS::ElasticLoadBalancingV2::LoadBalancer": {"create": _elbv2_load_balancer_create, "delete": _elbv2_load_balancer_delete,},
-    "AWS::ElasticLoadBalancingV2::Listener": {"create": _elbv2_listener_create, "delete": _elbv2_listener_delete,},
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": {
+        "create": _elbv2_load_balancer_create,
+        "update": _elbv2_load_balancer_update,
+        "update_with_logical_id": True,
+        "delete": _elbv2_load_balancer_delete,
+    },
+    "AWS::ElasticLoadBalancingV2::Listener": {
+        "create": _elbv2_listener_create,
+        "update": _elbv2_listener_update,
+        "update_with_logical_id": True,
+        "delete": _elbv2_listener_delete,
+    },
     "AWS::Lambda::LayerVersion": {"create": _lambda_layer_create, "delete": _lambda_layer_delete},
     "AWS::Lambda::LayerVersionPermission": {
         "create": _lambda_layer_version_permission_create,
@@ -9997,7 +10721,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _sfn_state_machine_delete,
     },
-    "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
+    "AWS::Route53::HostedZone": {
+        "create": _r53_hosted_zone_create,
+        "update": _r53_hosted_zone_update,
+        "update_with_logical_id": True,
+        "delete": _r53_hosted_zone_delete,
+    },
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
     "AWS::ApiGatewayV2::Api": {
         "create": _apigw_v2_api_create,
@@ -10024,10 +10753,20 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_v2_route_delete,
     },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
-    "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
+    "AWS::SES::EmailIdentity": {
+        "create": _ses_email_identity_create,
+        "update": _ses_email_identity_update,
+        "update_with_logical_id": True,
+        "delete": _ses_email_identity_delete,
+    },
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
     "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
-    "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
+    "AWS::WAFv2::WebACL": {
+        "create": _waf_web_acl_create,
+        "update": _waf_web_acl_update,
+        "update_with_logical_id": True,
+        "delete": _waf_web_acl_delete,
+    },
     "AWS::CloudFront::CloudFrontOriginAccessIdentity": {
         "create": _cf_oai_create,
         "update": _cf_oai_update,
@@ -10089,7 +10828,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iot_topic_rule_delete,
     },
-    "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
+    "AWS::IoT::ThingType": {
+        "create": _iot_thing_type_create,
+        "update": _iot_thing_type_update,
+        "update_with_logical_id": True,
+        "delete": _iot_thing_type_delete,
+    },
     "AWS::IoT::ThingGroup": {
         "create": _iot_thing_group_create,
         "update": _iot_thing_group_update,
@@ -10137,8 +10881,18 @@ _RESOURCE_HANDLERS = {
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
     "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},
     # AWS Backup
-    "AWS::Backup::BackupVault": {"create": _backup_vault_create, "delete": _backup_vault_delete},
-    "AWS::Backup::BackupPlan": {"create": _backup_plan_create, "delete": _backup_plan_delete},
+    "AWS::Backup::BackupVault": {
+        "create": _backup_vault_create,
+        "update": _backup_vault_update,
+        "update_with_logical_id": True,
+        "delete": _backup_vault_delete,
+    },
+    "AWS::Backup::BackupPlan": {
+        "create": _backup_plan_create,
+        "update": _backup_plan_update,
+        "update_with_logical_id": True,
+        "delete": _backup_plan_delete,
+    },
     # CDK metadata — safe to ignore
     "AWS::CDK::Metadata": {"create": lambda lid, props, sn: (f"CDKMetadata-{lid}", {}), "delete": lambda pid, props: None},
     # AutoScaling
