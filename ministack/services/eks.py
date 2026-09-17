@@ -37,6 +37,7 @@ import urllib.parse
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
+from ministack.core.docker import docker_enabled
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     CredentialResolutionError,
@@ -76,8 +77,8 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
 
 try:
-    docker_lib = importlib.import_module("docker")
-    _docker_available = True
+    docker_lib = importlib.import_module("docker") if docker_enabled() else None
+    _docker_available = docker_lib is not None
 except ImportError:
     docker_lib = None
     _docker_available = False
@@ -355,6 +356,9 @@ def _error(status, code, message):
 
 
 def _get_docker():
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return None
     if not _docker_available:
         return None
     try:

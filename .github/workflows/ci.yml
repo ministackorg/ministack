@@ -13,44 +13,35 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  PARALLEL_SHARDS: 3
-  SERIAL_SHARDS: 1
-
 jobs:
-  setup:
-    name: plan shards
+  control-plane:
+    name: control plane
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      files: ${{ steps.plan.outputs.files }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      # Pinned to a full version: setup-uv stopped publishing floating major
-      # tags after v7, so there is no `@v10` to track.
-      - uses: astral-sh/setup-uv@v10.0.1
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv pip install --system -e ".[test]" -r requirements.txt
-
-      - name: Plan test shards
-        id: plan
-        run: python scripts/plan_test_shards.py
-
-  test:
-    needs: setup
-    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      matrix:
+        include:
+          - mode: parallel
+            shard_index: 0
+            shard_count: 3
+          - mode: parallel
+            shard_index: 1
+            shard_count: 3
+          - mode: parallel
+            shard_index: 2
+            shard_count: 3
+          - mode: serial
+            shard_index: 0
+            shard_count: 2
+          - mode: serial
+            shard_index: 1
+            shard_count: 2
+
+    env:
+      # Control-plane tests must not contact the Docker daemon, including
+      # background cleanup/reaper paths in the server.
+      MINISTACK_DOCKER_ENABLED: "0"
 
     services:
       redis:
@@ -90,13 +81,14 @@ jobs:
       - name: Resolve shard files
         id: shard
         env:
-          FILES_MAP: ${{ needs.setup.outputs.files }}
+          SHARD_MODE: ${{ matrix.mode }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
         run: |
-          FILES=$(python3 -c "
-          import json, os
-          m = json.loads(os.environ['FILES_MAP'])
-          print(m.get('${{ matrix.mode }}_${{ matrix.shard_index }}', ''))
-          ")
+          FILES=$(python scripts/select_test_shard.py \
+            --mode "$SHARD_MODE" \
+            --shard-index "$SHARD_INDEX" \
+            --shard-count "$SHARD_COUNT")
           echo "files=$FILES" >> $GITHUB_OUTPUT
 
       - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }})
@@ -106,9 +98,9 @@ jobs:
             exit 0
           fi
           if [ "${{ matrix.mode }}" = "serial" ]; then
-            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial" --durations=10
+            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial and not data_plane" --durations=10
           else
-            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial" --durations=25
+            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial and not data_plane" --durations=25
           fi
 
       - name: Upload MiniStack log
@@ -118,10 +110,155 @@ jobs:
           name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log
 
+  data-plane:
+    name: data plane (docker, ${{ matrix.shard_index }}, ${{ matrix.shard_count }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: data_plane
+            shard_index: 0
+            shard_count: 1
+    env:
+      MINISTACK_DOCKER_ENABLED: "1"
+      DOCKER_NETWORK: ministack-data-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard_index }}
+      LAMBDA_EXECUTOR: docker
+      OPENSEARCH_DATAPLANE: "1"
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv pip install --system -e ".[test]" -r requirements.txt
+
+      - name: Validate Docker and create isolated network
+        run: |
+          docker info
+          docker network create "$DOCKER_NETWORK"
+          docker network inspect "$DOCKER_NETWORK"
+
+      - name: Start MiniStack
+        run: |
+          REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
+          echo "MINISTACK_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4566/_ministack/health && break
+            echo "Waiting for MiniStack... ($i/15)"
+            sleep 2
+          done
+          curl -sf http://localhost:4566/_ministack/health
+
+      - name: Resolve shard files
+        id: shard
+        env:
+          SHARD_MODE: ${{ matrix.mode }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        run: |
+          FILES=$(python scripts/select_test_shard.py \
+            --mode "$SHARD_MODE" \
+            --shard-index "$SHARD_INDEX" \
+            --shard-count "$SHARD_COUNT")
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Run data-plane tests
+        run: |
+          if [ -z "${{ steps.shard.outputs.files }}" ]; then
+            echo "No tests for this shard"
+            exit 0
+          fi
+          pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "data_plane" --durations=25
+
+      - name: Upload MiniStack log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
+          path: ministack.log
+
+      - name: Stop MiniStack gracefully
+        if: always()
+        run: |
+          if [ -n "${MINISTACK_PID:-}" ] && kill -0 "$MINISTACK_PID" 2>/dev/null; then
+            kill -TERM "$MINISTACK_PID" 2>/dev/null || true
+            for i in $(seq 1 30); do
+              if ! kill -0 "$MINISTACK_PID" 2>/dev/null; then
+                exit 0
+              fi
+              sleep 1
+            done
+            {
+              echo "## Warning: MiniStack cleanup timed out"
+              echo
+              echo "MiniStack PID $MINISTACK_PID did not exit within 30 seconds after SIGTERM; force-killing it."
+            } >> "$GITHUB_STEP_SUMMARY" || true
+            kill -KILL "$MINISTACK_PID" 2>/dev/null || true
+            wait "$MINISTACK_PID" 2>/dev/null || true
+          fi
+          exit 0
+
+      - name: Remove Docker network
+        if: always()
+        run: |
+          if docker network rm "$DOCKER_NETWORK"; then
+            exit 0
+          fi
+
+          {
+            echo "## Warning: Docker network cleanup found attached containers"
+            echo
+            echo "The first attempt to remove $DOCKER_NETWORK failed. Attached containers:"
+            echo
+            echo '```text'
+            docker ps -a --filter "network=$DOCKER_NETWORK" \
+              --format 'ID={{.ID}} NAME={{.Names}} IMAGE={{.Image}} STATUS={{.Status}}' 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+          containers=$(docker ps -aq --filter "network=$DOCKER_NETWORK" 2>/dev/null || true)
+          if [ -n "$containers" ]; then
+            while IFS= read -r container; do
+              [ -n "$container" ] || continue
+              docker rm -f "$container" >/dev/null 2>&1 || true
+            done <<< "$containers"
+          fi
+
+          if ! docker network rm "$DOCKER_NETWORK"; then
+            {
+              echo
+              echo "The Docker network could not be removed after force-removing attached containers."
+              echo
+              echo '```text'
+              docker network inspect "$DOCKER_NETWORK" 2>&1 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          exit 0
+
   test-result:
     name: test
-    needs: test
+    needs: [control-plane, data-plane]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - run: '[ "${{ needs.test.result }}" = "success" ]'
+      - run: |
+          test "${{ needs['control-plane'].result }}" = "success"
+          test "${{ needs['data-plane'].result }}" = "success"

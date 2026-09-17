@@ -12,6 +12,7 @@ import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
@@ -1821,6 +1822,7 @@ def test_lambda_returned_error_shaped_dict_is_not_a_function_error(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_uncaught_exception_is_unhandled_function_error(lam):
     """Docker/RIE executor variant: the RIE does not set an error header in
     practice, so the classifier must recognise the runtime's uncaught-exception
@@ -3940,6 +3942,7 @@ def test_lambda_provided_runtime_create(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_provided_runtime_docker_invoke(lam):
     """Invoke a provided.al2023 Lambda via the Docker executor.
 
@@ -7489,6 +7492,25 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
 # ──────────────────── host.docker.internal → host-gateway ────────────────────
 
 
+def _fake_docker_lib():
+    """Return the docker-py pieces needed by mocked container tests."""
+    class _ImageNotFound(Exception):
+        pass
+
+    def _mount(target, source, **kwargs):
+        return {
+            "Target": target,
+            "Source": source,
+            "Type": kwargs.get("type", "bind"),
+            "ReadOnly": kwargs.get("read_only", False),
+        }
+
+    return SimpleNamespace(
+        types=SimpleNamespace(Mount=_mount),
+        errors=SimpleNamespace(ImageNotFound=_ImageNotFound),
+    )
+
+
 def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
     """Spawn one Lambda container against fakes and return the docker kwargs.
 
@@ -7498,6 +7520,11 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
     """
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
     monkeypatch.setattr(lsvc, "_docker_available", True)
+    # MINISTACK_DOCKER_ENABLED=0 deliberately leaves the service's docker
+    # module unloaded.  These tests exercise container argument construction
+    # with a fake client, so provide the small docker-py surface used by spawn
+    # instead of making the production import gate observable here.
+    monkeypatch.setattr(lsvc, "docker_lib", _fake_docker_lib())
     monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
 
     captured = {}
@@ -7578,6 +7605,7 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
         '--privileged --read-only --unknown-flag ignored'
     ))
     monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "docker_lib", _fake_docker_lib())
 
     captured = {}
     fake_container = _mk_container()
@@ -10721,6 +10749,7 @@ def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -10765,6 +10794,7 @@ def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_init_error_is_reported_not_retried(lam):
     """The real RIE end of the same story: a handler that cannot import.
 
@@ -11153,6 +11183,7 @@ def test_lambda_function_url_response_stream_without_prelude_defaults_to_200(lam
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_function_url_response_stream_consumes_prelude(lam):
     """RESPONSE_STREAM status/headers come from the prelude, and it never reaches the body.
 
@@ -11888,6 +11919,7 @@ def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 @pytest.mark.parametrize(
     "declared,expected_machine",
     [("arm64", "aarch64"), ("x86_64", "x86_64")],
@@ -12162,6 +12194,7 @@ def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     tree stays in the content-addressed cache — that is the point of it — and
     the retry reuses it without a second unpack (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "docker_lib", _fake_docker_lib())
     fake_client = MagicMock()
     fake_client.images.get.side_effect = TimeoutError("Read timed out.")
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)

@@ -423,6 +423,9 @@ _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
 def _get_docker():
     global _docker
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return None
     if _docker is None:
         try:
             import docker

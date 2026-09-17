@@ -27,6 +27,7 @@ import time
 
 from ministack.core import container_reaper, pgproxy
 from ministack.core.concurrency import run_offloop
+from ministack.core.docker import docker_enabled
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -189,6 +190,8 @@ def _cluster_response(cluster, include_tags=False):
 
 def _docker_available():
     """Cheap pre-flight check so we don't import docker-py for nothing."""
+    if not docker_enabled():
+        return False
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
     if sock.startswith("unix://"):
         return os.path.exists(sock[len("unix://"):])

@@ -52,6 +52,7 @@ from urllib.parse import quote, unquote
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant, spawn_background
+from ministack.core.docker import docker_enabled
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
@@ -281,8 +282,8 @@ def _proxy_url_for(config: dict) -> str | None:
 
 
 try:
-    docker_lib: Any = importlib.import_module("docker")
-    _docker_available = True
+    docker_lib: Any = importlib.import_module("docker") if docker_enabled() else None
+    _docker_available = docker_lib is not None
 except ImportError:
     docker_lib = None
     _docker_available = False
@@ -316,6 +317,8 @@ def _running_in_container() -> bool:
 def _get_docker_client():
     """Return a cached Docker client, or create one on first call."""
     global _cached_docker_client
+    if not docker_enabled():
+        return None
     if _cached_docker_client is not None:
         return _cached_docker_client
     if not _docker_available:
@@ -4423,7 +4426,15 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         # control-plane FunctionArn (already in ``_LAMBDA_FUNCTION_ARN``)
         # before user code sees it. ``provided`` bootstraps and Image-type
         # functions own their code path end-to-end and cannot be shimmed.
-        shim_cmd = _write_context_arn_shim(code_dir, runtime, handler)
+        # The RIE recognizes ``awslambda.streamifyResponse`` only when it is
+        # the entrypoint handler.  A normal handler shim would hide that
+        # marker and receive the stream object as a regular Lambda context,
+        # which makes the RIE answer the Function URL with HTTP 502.  Streaming
+        # handlers do not need the context-ARN compatibility shim, so let the
+        # runtime invoke the user's handler directly.
+        shim_cmd = None if config.get("_FunctionUrlResponseStream") else _write_context_arn_shim(
+            code_dir, runtime, handler
+        )
         if shim_cmd:
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
@@ -7926,7 +7937,14 @@ async def handle_function_url_request(
         return error_response_json("ResourceNotFoundException", f"Function not found: {func_name}", 404)
 
     event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
-    exec_record = _execution_record_for_config(func_data, func_config)
+    # Keep the Function URL's invoke mode on this per-invocation config copy.
+    # It tells the Docker entrypoint not to wrap a streamified handler in the
+    # context shim (the RIE must see that handler directly).
+    execution_config = dict(func_config)
+    execution_config["_FunctionUrlResponseStream"] = (
+        cfg.get("InvokeMode") == "RESPONSE_STREAM"
+    )
+    exec_record = _execution_record_for_config(func_data, execution_config)
     result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
                                  thread_name="ministack-lambda-url")
 

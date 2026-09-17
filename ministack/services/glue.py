@@ -66,6 +66,9 @@ _ministack_network = None
 
 def _get_docker():
     global _docker
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return None
     if _docker is None:
         try:
             import docker

@@ -816,6 +816,7 @@ end-to-end without any client config.
 | `S3_DATA_DIR` | `/tmp/ministack-data/s3` | S3 persistence directory |
 | `REDIS_HOST` | `redis` | Redis host for ElastiCache fallback |
 | `REDIS_PORT` | `6379` | Redis port for ElastiCache fallback |
+| `MINISTACK_DOCKER_ENABLED` | `1` | Set `0` to disable every Docker-backed feature and Docker cleanup/reaping path. Docker remains enabled by default for backwards compatibility |
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |
 | `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers (when `RDS_PERSIST=0`). Set to `2g` or higher for large databases |
 | `GLUE_DOCKER_IMAGE` | (auto by `GlueVersion`) | Override the `amazon/aws-glue-libs` PySpark image used for Spark Glue jobs. Defaults: `glue_libs_4.0.0_image_01` (GlueVersion 4.0), `glue_libs_3.0.0_image_01` (GlueVersion 3.0) |

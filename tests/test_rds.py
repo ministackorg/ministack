@@ -6482,6 +6482,7 @@ def _wait_for_rds(rds_client, db_id, timeout=120):
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- skipping network connectivity test",
 )
+@pytest.mark.data_plane
 def test_rds_lambda_network_connectivity(rds, lam):
     """Prove that Lambda containers can TCP-connect to an RDS container."""
     db_id = "net-test-pg"
@@ -7939,7 +7940,9 @@ def _live_cluster(rds, engine_version=None):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-
+# TODO: Keep extended Aurora live-container coverage out of standard CI until
+# a dedicated live setup can run it reliably; these tests were skipped before
+# the test-plane split as well.
 @pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
 def test_aurora_writer_data_is_visible_through_reader(rds):
     with _live_cluster(rds) as (_cid, _wid, _rid, writer, reader, _cluster):
@@ -12106,7 +12109,8 @@ def _wait_for_gtid(
         f"result={result!r}, gtid={executed!r}"
     )
 
-
+# TODO: Re-enable this extended Aurora global/replication coverage in a
+# dedicated live lane once its service dependencies are provisioned.
 @pytest.mark.skipif(
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- live Aurora",
@@ -14663,7 +14667,8 @@ def _live_pg_cluster(rds):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-
+# TODO: Re-enable this extended Aurora PostgreSQL live coverage in a dedicated
+# live lane once its service dependencies are provisioned.
 @pytest.mark.skipif(
     not _PG_REPLICATION_LIVE,
     reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "

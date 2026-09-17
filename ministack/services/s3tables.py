@@ -539,6 +539,10 @@ def _resolve_container_ip():
     This is the address a sibling container (e.g. a Glue Spark job) can use
     to reach MiniStack. Cached after the first successful resolution.
     """
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        _resolve_container_ip._cached = None
+        return None
     if hasattr(_resolve_container_ip, "_cached"):
         return _resolve_container_ip._cached
     ip = os.environ.get("MINISTACK_HOST", "")

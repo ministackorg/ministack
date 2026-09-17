@@ -64,6 +64,7 @@ def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
 
+@pytest.mark.data_plane
 def test_ecs_run_task_stops_after_exit(ecs):
     """DescribeTasks transitions to STOPPED after Docker container exits."""
     ecs.create_cluster(clusterName="task-lifecycle")
@@ -98,6 +99,7 @@ def test_ecs_run_task_stops_after_exit(ecs):
     assert stopped, "Task should transition to STOPPED after container exits"
 
 
+@pytest.mark.data_plane
 def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     """ListTasks must also reconcile lifecycle when a container has exited
     on its own. Previously only DescribeTasks ran the reconciler, so a user
@@ -139,6 +141,7 @@ def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     )
 
 
+@pytest.mark.data_plane
 def test_ecs_run_task_network_connectivity(ecs):
     """ECS container can reach Ministack (proves network detection works)."""
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -188,6 +191,7 @@ def test_ecs_run_task_network_connectivity(ecs):
             break
     assert success, "Task should transition to STOPPED"
 
+@pytest.mark.data_plane
 def test_ecs_run_task_metadata_v4(ecs):
     """Container can resolve and read its V4 task-metadata URI end-to-end.
 

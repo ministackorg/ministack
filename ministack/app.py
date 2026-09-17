@@ -2692,6 +2692,9 @@ _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 def _reaper_docker_client():
     """Docker client for the periodic reaper, or None when there is no daemon."""
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return None
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
     if sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]):
         return None

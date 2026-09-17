@@ -2013,6 +2013,9 @@ def _get_docker():
     """Docker client, or None. Imported lazily: an emulator with no registered
     image never pays for docker-py at all."""
     global _docker
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return None
     if _docker is None:
         try:
             import docker
@@ -2312,6 +2315,9 @@ def _probe_shell(container):
 def _is_image_unavailable(exc):
     """Whether a boot failure is "that reference cannot be pulled" rather than
     a daemon or runtime problem."""
+    from ministack.core.docker import docker_enabled
+    if not docker_enabled():
+        return False
     try:
         from docker import errors as docker_errors
     except Exception:

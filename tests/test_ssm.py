@@ -8,6 +8,8 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from ministack.core.docker import docker_available
+
 
 def _regional_ssm(region_name):
     return boto3.client(
@@ -839,13 +841,7 @@ def test_cloudformation_ssm_parameter_is_region_scoped():
 
 
 def _docker_reachable():
-    try:
-        import docker as _probe
-
-        _probe.from_env(timeout=5).ping()
-        return True
-    except Exception:
-        return False
+    return docker_available()
 
 
 requires_docker = pytest.mark.skipif(
@@ -879,6 +875,7 @@ def _poll_invocation(ssm, command_id, instance_id, timeout=30):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_run_command_health_probe(ssm, boxed_instance):
     """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
     tag = _uuid_mod.uuid4().hex[:8]
@@ -913,6 +910,7 @@ def test_ssm_run_command_health_probe(ssm, boxed_instance):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_run_command_probe_can_fail(ssm, boxed_instance):
     """The point of a real box: a health check that is wrong reports Failed, not Success."""
     command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
@@ -957,6 +955,7 @@ def test_ssm_send_command_validates_the_instance(ssm, ec2):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
     """Rejecting everything would satisfy the refusals above, so prove one is taken."""
     assert ssm.send_command(InstanceIds=[boxed_instance],
@@ -968,6 +967,7 @@ def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
     """listCommands narrows by command and instance; unknown ids get what AWS answers."""
     ami = ec2.register_image(Name=f"ssm-lookup-{_uuid_mod.uuid4().hex[:8]}",
