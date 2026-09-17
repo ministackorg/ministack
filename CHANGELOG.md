@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cognito — an issuer that names the host serving it (`COGNITO_ISSUER_FROM_GATEWAY`)** — tokens and the OIDC discovery document both carried AWS's issuer identifier while MiniStack served the document on its own gateway, so `{iss}/.well-known/openid-configuration` resolved to real AWS and returned "User pool does not exist". Clients that fetch keys through the issuer, rather than from a separately configured URL, could not verify a token. Set `1` and both sites name the gateway instead; the default is unchanged. Both are derived from one helper so they cannot drift.
+
 ## [1.5.13] — 2026-09-17
 
 ### Added

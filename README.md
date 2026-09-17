@@ -809,6 +809,7 @@ end-to-end without any client config.
 |----------|---------|-------------|
 | `GATEWAY_PORT` | `4566` | Port to listen on. Also accepts `EDGE_PORT` (LocalStack compatibility alias) |
 | `MINISTACK_HOST` | `localhost` | Hostname used in response URLs and EKS cluster endpoints. Set a hostname reachable by your clients, not a wildcard bind address |
+| `COGNITO_ISSUER_FROM_GATEWAY` | `0` | Set `1` to make a Cognito pool's issuer name the gateway (`http://{MINISTACK_HOST}:{GATEWAY_PORT}/{pool_id}`) in both the token `iss` claim and the OIDC discovery document, so clients that resolve keys through the issuer reach MiniStack. Default keeps AWS's identifier, which is unreachable off-cloud |
 | `MINISTACK_ACCOUNT_ID` | `000000000000` | Default AWS account ID. Overridden per-request when `AWS_ACCESS_KEY_ID` is a 12-digit number (see [Multi-Tenancy](#multi-tenancy)) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |

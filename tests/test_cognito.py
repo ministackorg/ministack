@@ -1890,6 +1890,61 @@ def test_cognito_openid_configuration():
     assert "token" in data["response_types_supported"]
 
 
+def test_cognito_issuer_from_gateway_matches_token_and_discovery():
+    """ISSUER_FROM_GATEWAY names the gateway in both the `iss` claim and the
+    discovery document, so a client that resolves keys through the issuer can
+    reach them. Default stays AWS-shaped."""
+    import json as _json
+    import urllib.request
+
+    from conftest import _ministack_config, make_client
+
+    cognito = make_client("cognito-idp")
+    pool_id = cognito.create_user_pool(PoolName="issuer-gw-pool")["UserPool"]["Id"]
+    client_id = cognito.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="issuer-gw-client"
+    )["UserPoolClient"]["ClientId"]
+    cognito.admin_create_user(UserPoolId=pool_id, Username="issuer-gw@example.com",
+                              MessageAction="SUPPRESS")
+    cognito.admin_set_user_password(UserPoolId=pool_id, Username="issuer-gw@example.com",
+                                    Password="Passw0rd!", Permanent=True)
+
+    def _discovery_issuer():
+        req = urllib.request.Request(
+            f"{ENDPOINT}/{pool_id}/.well-known/openid-configuration"
+        )
+        with urllib.request.urlopen(req) as r:
+            return _json.loads(r.read())["issuer"]
+
+    def _token_iss():
+        tok = cognito.initiate_auth(
+            ClientId=client_id,
+            AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "issuer-gw@example.com", "PASSWORD": "Passw0rd!"},
+        )["AuthenticationResult"]["IdToken"]
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return _json.loads(base64.urlsafe_b64decode(payload))["iss"]
+
+    # Default: AWS-shaped, and the two agree.
+    assert _discovery_issuer() == _token_iss()
+    assert "amazonaws.com" in _discovery_issuer()
+
+    _ministack_config({"cognito.ISSUER_FROM_GATEWAY": True})
+    try:
+        issuer = _discovery_issuer()
+        assert "amazonaws.com" not in issuer
+        assert issuer.endswith(f"/{pool_id}")
+        assert _token_iss() == issuer
+        # The issuer now serves its own discovery document.
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{issuer}/.well-known/openid-configuration")
+        ) as r:
+            assert _json.loads(r.read())["issuer"] == issuer
+    finally:
+        _ministack_config({"cognito.ISSUER_FROM_GATEWAY": False})
+
+
 def test_cognito_browser_endpoints_send_cors_headers():
     """Cognito's OAuth2/OIDC endpoints must send `Access-Control-Allow-Origin`
     so browser-based OIDC clients can fetch them. Regression for the bug

@@ -248,13 +248,9 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     and /logout are actually served (added by PR #344). Real AWS serves these
     on the pool-domain host; MiniStack serves them on the gateway.
     """
-    # The discovery `issuer` MUST match the JWT `iss` claim — OIDC clients that
-    # verify `iss == discovery.issuer` break otherwise. _fake_token derives `iss`
-    # from the pool's region (encoded in pool_id), so do the same here. The
-    # `region` argument from the request scope is only used as a last-resort
-    # fallback for malformed pool_ids.
-    r = _pool_region(pool_id) if pool_id else (region or get_region())
-    issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
+    # Shares _issuer with _fake_token so the document and the `iss` claim agree.
+    # `region` is only a fallback for malformed pool_ids.
+    issuer = _issuer(pool_id, region)
     base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     pool_base = f"{base}/{pool_id}"
     doc = {
@@ -279,6 +275,28 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
+
+# Opt in to an issuer that names the gateway instead of AWS. Off by default.
+ISSUER_FROM_GATEWAY = os.environ.get("COGNITO_ISSUER_FROM_GATEWAY", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _issuer(pool_id, region=None):
+    """Issuer for a pool's tokens and its discovery document.
+
+    AWS's identifier by default. With ISSUER_FROM_GATEWAY it names the gateway, which
+    is the host that actually serves the pool's discovery document and JWKS, so clients
+    that resolve keys through the issuer work off-cloud. Both call sites use this: they
+    must agree, or `iss == discovery.issuer` checks break.
+    """
+    r = _pool_region(pool_id) if pool_id else (region or get_region())
+    if ISSUER_FROM_GATEWAY:
+        return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/{pool_id}"
+    return f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
+
 
 # SAML XML namespaces
 _SAML_NS = {
@@ -760,7 +778,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     origin_jti = new_uuid()
     claims = {
         "sub": sub,
-        "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
+        "iss": _issuer(pool_id),
         "token_use": token_type,
         "iat": now,
         "exp": now + 3600,

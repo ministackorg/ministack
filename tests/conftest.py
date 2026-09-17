@@ -68,6 +68,9 @@ def make_client(service, additional_config_kwargs=None):
 
 _SERIAL_TESTS = {
     "tests/test_athena.py::test_athena_engine_mock_via_config",
+    # Flips cognito.ISSUER_FROM_GATEWAY, which changes the `iss` of every token
+    # minted while it is set. Run it away from other Cognito tests.
+    "tests/test_cognito.py::test_cognito_issuer_from_gateway_matches_token_and_discovery",
     "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
     "tests/test_ec2.py::test_ec2_create_default_vpc",
     "tests/test_eks.py::test_eks_cfn_cluster",
