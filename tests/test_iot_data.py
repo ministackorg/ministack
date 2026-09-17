@@ -3041,6 +3041,18 @@ def _spawn(env_extra: dict, port: int, log_path=None) -> subprocess.Popen:
             sink.close()
 
 
+def _wait_log(log_path, *needles: str, timeout: float = 30.0) -> str:
+    """Wait for any of `needles` to appear in a captured log, and return it."""
+    deadline = time.time() + timeout
+    text = ""
+    while time.time() < deadline:
+        text = log_path.read_text(errors="replace")
+        if any(n in text for n in needles):
+            return text
+        time.sleep(0.1)
+    raise AssertionError(f"none of {needles} appeared within {timeout}s:\n{text}")
+
+
 def _wait_health(url: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     last = None
@@ -3052,6 +3064,23 @@ def _wait_health(url: str, timeout: float = 30.0) -> None:
             last = e
             time.sleep(0.3)
     raise AssertionError(f"{url} did not come up within {timeout}s: {last!r}")
+
+
+def _wait_ready(url: str, timeout: float = 30.0) -> None:
+    """Wait for /_ministack/ready, which covers the mTLS listener's bind."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return
+        except urllib.error.HTTPError as e:
+            last = e
+            time.sleep(0.05)
+        except Exception as e:
+            last = e
+            time.sleep(0.3)
+    raise AssertionError(f"{url} did not become ready within {timeout}s: {last!r}")
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -3106,7 +3135,7 @@ def broker(tmp_path_factory):
         {"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port, log_path=log_path
     )
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         yield _Broker(http_port, mqtt_port, log_path)
     finally:
         _terminate(proc)
@@ -3287,7 +3316,7 @@ def test_mtls_on_by_default(tmp_path):
     proc = _spawn({"LOG_LEVEL": "INFO", "IOT_MTLS_ENABLED": None}, http_port, log_path=log)
     try:
         _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
-        text = log.read_text(errors="replace")
+        text = _wait_log(log, "MQTT listening on port 8883", "failed to bind port 8883")
         listening = "MQTT listening on port 8883" in text
         degraded = "failed to bind port 8883" in text
         assert listening or degraded, f"no default-on attempt in the log:\n{text}"
@@ -3692,7 +3721,7 @@ def test_mtls_shutdown_completes_with_a_device_connected(tmp_path):
     proc = _spawn({"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
     peer = None
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         private = _Broker(http_port, mqtt_port)
         _cert_id, cert_pem, key_pem = _new_cert(private)
         peer = _Peer(_mtls_connect(private, cert_pem, key_pem, tmp_path))

@@ -347,6 +347,25 @@ def test_iot_create_keys_and_certificate_active(iot_client):
     iot_client.delete_certificate(certificateId=resp["certificateId"])
 
 
+def test_iot_create_keys_and_certificate_is_rsa_2048(iot_client):
+    """AWS issues an RSA-2048 key pair: "Creates a 2048-bit RSA key pair and
+    issues an X.509 certificate" (CreateKeysAndCertificate)."""
+    crypto_serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    resp = iot_client.create_keys_and_certificate(setAsActive=False)
+    try:
+        key = crypto_serialization.load_pem_private_key(
+            resp["keyPair"]["PrivateKey"].encode(), password=None
+        )
+        assert isinstance(key, rsa.RSAPrivateKey)
+        assert key.key_size == 2048
+    finally:
+        iot_client.delete_certificate(certificateId=resp["certificateId"])
+
+
 def test_iot_create_keys_and_certificate_inactive(iot_client):
     pytest.importorskip("cryptography")
     resp = iot_client.create_keys_and_certificate(setAsActive=False)
