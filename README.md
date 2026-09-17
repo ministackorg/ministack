@@ -658,6 +658,32 @@ only `DeleteDBCluster` removes the container and its storage.
 
 ---
 
+### Verified PostgreSQL TLS
+
+PostgreSQL containers start without TLS by default. Set both `MINISTACK_RDS_PG_SSL_CERT` and `MINISTACK_RDS_PG_SSL_KEY` to PEM files readable by the MiniStack process to enable TLS for newly created `postgres` and `aurora-postgresql` containers, including streaming readers. The certificate file may contain the server certificate followed by intermediate certificates; the matching private key must be unencrypted. MySQL behavior is unchanged.
+
+MiniStack copies these files over the Docker API before starting PostgreSQL. The paths need not exist on the Docker daemon's host. The copied key is readable only by the container's `postgres` user and lives outside the database volume. Invalid or incomplete settings fail the backing-container launch rather than falling back to plaintext. Existing plaintext clients still work: this option enables TLS, but does not implement `rds.force_ssl` or client-certificate authentication.
+
+Use a certificate signed by your local test CA. Its subject alternative names must cover the **actual host used by the client**: the cluster's advertised DNS name on a shared user-defined Docker network, or `MINISTACK_HOST` when using a public endpoint. IP endpoints need IP SANs, not DNS SANs. Container IPs can change on recreation; prefer cluster DNS aliases for verified connections. Create the cluster first, issue its certificate for the returned names, then create its first member. Current endpoint limitations still apply: streaming readers advertise an IP, and cluster stop/start can change the advertised endpoint to an IP even though its original Docker DNS alias still resolves. Clients that use these IP endpoints need matching IP SANs; this option does not change endpoint routing. Supply the issuing CA certificate (never its private key) to clients:
+
+```python
+conn = psycopg2.connect(
+    host=endpoint["Address"], port=endpoint["Port"],
+    user="admin", password="password", dbname="appdb",
+    sslmode="verify-full", sslrootcert="/path/to/local-ca.pem",
+)
+```
+
+For Docker-executed Lambda functions, use the existing `LAMBDA_DOCKER_FLAGS` to mount a CA file from the **Docker host** read-only, and set the trust option your runtime or driver uses. For example, libpq clients support `-v /absolute/host/local-ca.pem:/opt/local-ca.pem:ro -e PGSSLROOTCERT=/opt/local-ca.pem -e PGSSLMODE=verify-full`. Go programs using system roots can instead mount the CA into a dedicated directory and append that directory to `SSL_CERT_DIR`, preserving the runtime's existing certificate directories (on the Amazon Linux provided runtime: `/etc/pki/tls/certs:/etc/ssl/certs:/opt/local-ca`). Do not replace the system CA bundle or disable verification. Local Lambda executors need the CA path accessible in MiniStack's own filesystem. Trust configuration is runtime-specific; `AWS_CA_BUNDLE` configures AWS HTTPS clients, not PostgreSQL.
+
+Retained containers keep their copied certificates across stop/start and emulator restarts. To rotate certificates or enable TLS for existing compute, recreate the backing containers using the normal resource lifecycle; merely changing the source files does not update a retained container. New containers read the current files, including when persisted database storage is reattached. Deleting a container deletes its copied TLS material; MiniStack never removes your source files. Snapshot/read-replica APIs that only emulate metadata do not gain new data-restoration behavior from this option.
+
+An opt-in Docker regression checks verified TLS, wrong CA/hostname rejection, plaintext compatibility, and restart persistence:
+
+```bash
+MINISTACK_TEST_RDS_TLS_DOCKER=1 pytest tests/test_rds_tls.py -v
+```
+
 ## Aurora DSQL
 
 Each `CreateCluster` returns an `ACTIVE` cluster with an endpoint. Set `DSQL_STRICT=1` to additionally spin up a real `postgres:16-alpine` container per cluster (capped by a fixed port window off `DSQL_BASE_PORT`, default 30 ports) behind an in-process Postgres wire-protocol proxy.
@@ -820,6 +846,8 @@ end-to-end without any client config.
 | `RDS_TMPFS_SIZE` | `256m` | Tmpfs size for RDS database containers (when `RDS_PERSIST=0`). Set to `2g` or higher for large databases |
 | `GLUE_DOCKER_IMAGE` | (auto by `GlueVersion`) | Override the `amazon/aws-glue-libs` PySpark image used for Spark Glue jobs. Defaults: `glue_libs_4.0.0_image_01` (GlueVersion 4.0), `glue_libs_3.0.0_image_01` (GlueVersion 3.0) |
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
+| `MINISTACK_RDS_PG_SSL_CERT` | _(unset)_ | PEM server certificate/chain for newly created PostgreSQL backing containers; requires `MINISTACK_RDS_PG_SSL_KEY`. See [Verified PostgreSQL TLS](#verified-postgresql-tls) |
+| `MINISTACK_RDS_PG_SSL_KEY` | _(unset)_ | Matching unencrypted PEM private key, readable by MiniStack. Copied privately into PostgreSQL containers, not mounted from the Docker host |
 | `MINISTACK_RDS_PUBLIC_ENDPOINT` | `0` | Set `1` when MiniStack itself runs in a Docker container but RDS clients connect from outside that network (remote MiniStack host, host-side clients, CI runners). `DescribeDBInstances` then returns `{MINISTACK_HOST, host_port}` — the externally-reachable host-published port — instead of the container-internal address. Set `MINISTACK_HOST` to the host clients will use |
 | `MINISTACK_RDS_PG_CLUSTER_REPLICATION` | `0` | Set `1` to give the second and later members of an Aurora PostgreSQL cluster their own hot-standby containers streaming from the writer (real read-only replicas; the cluster `ReaderEndpoint` resolves to one when available). Requires `DOCKER_NETWORK`. Off: all members alias the writer's single shared container |
 | `IOT_MTLS_ENABLED` | _(unset = on)_ | Set `0` to stop the IoT mTLS MQTT listener from binding (same shape as `SFTP_ENABLED`). It is on whenever `cryptography` is installed |

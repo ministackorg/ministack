@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **RDS — opt-in PostgreSQL TLS** — configure `MINISTACK_RDS_PG_SSL_CERT` and `MINISTACK_RDS_PG_SSL_KEY` to supply a server certificate and key to new PostgreSQL instance, cluster, and streaming-reader containers. Clients can verify the certificate and endpoint hostname using their local CA. Existing plaintext clients and MySQL behavior are unchanged. See #1768.
+
 ## [1.5.13] — 2026-09-17
 
 ### Added
