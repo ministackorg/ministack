@@ -2665,6 +2665,147 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
         m._clusters.clear()
 
 
+def test_rds_stop_start_cluster_keeps_dns_endpoint(monkeypatch):
+    """Stop/start must not rewrite the cluster's DNS endpoint to a raw IP.
+
+    The shared container carries the cluster endpoint as a Docker network
+    alias, so the DNS name advertised at create time keeps resolving after
+    a StopDBCluster/StartDBCluster cycle. StartDBCluster must keep
+    reporting that name while refreshing the internal address that the
+    readiness probe actually dials.
+    """
+    from ministack.services import rds as m
+
+    container_ip = "172.31.77.42"
+    restarted_ip = "172.31.77.43"
+    network_name = "regression-net"
+
+    class FakeContainer:
+        id = "dns-endpoint-shared-container"
+        attrs = {
+            "NetworkSettings": {
+                "Networks": {
+                    network_name: {"IPAddress": container_ip},
+                },
+            },
+        }
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+            # A real restart lands on a fresh DHCP lease; simulate the
+            # address change so the test proves the internal wiring is
+            # refreshed rather than accidentally reusing the old value.
+            self.attrs["NetworkSettings"]["Networks"][network_name][
+                "IPAddress"
+            ] = restarted_ip
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            container.status = "running"
+            return container
+
+        def get(self, identifier):
+            if identifier in (
+                container.id,
+                m._rds_cluster_docker_name("dns-endpoint-cluster"),
+            ):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    readiness_dials = []
+
+    def _fake_wait_ready(host, port, *_args, **_kwargs):
+        readiness_dials.append((host, port))
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: network_name)
+    monkeypatch.setattr(m, "_next_port", lambda: 16071)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _fake_wait_ready)
+    monkeypatch.setattr(
+        m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    def _wait_for_member_status(db_id, expected, timeout=2):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if m._instances.get(db_id, {}).get("DBInstanceStatus") == expected:
+                return
+            time.sleep(0.01)
+        pytest.fail(
+            f"instance {db_id} never reached {expected}; last status: "
+            f"{m._instances.get(db_id, {}).get('DBInstanceStatus')}",
+        )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "dns-endpoint-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "dns-endpoint-writer",
+            "DBClusterIdentifier": "dns-endpoint-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        _wait_for_member_status("dns-endpoint-writer", "available")
+        cluster = m._clusters.get("dns-endpoint-cluster")
+        assert cluster["Status"] == "available"
+
+        # Creation must publish the DNS name, not the container IP.
+        create_address = cluster["_shared_endpoint"]["Address"]
+        assert create_address.endswith(".rds.amazonaws.com")
+        assert create_address != container_ip
+
+        m._stop_db_cluster({"DBClusterIdentifier": "dns-endpoint-cluster"})
+        m._start_db_cluster({"DBClusterIdentifier": "dns-endpoint-cluster"})
+        _wait_for_member_status("dns-endpoint-writer", "available")
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+
+        # The public endpoint survives the restart unchanged.
+        assert cluster["_shared_endpoint"]["Address"] == create_address
+        assert cluster["Endpoint"] == create_address
+        # Internal wiring is refreshed to the restarted container's NEW
+        # address (the fake moves the IP in stop()), not the stale one.
+        assert cluster["_shared_internal_address"] == restarted_ip
+        # The readiness probe dials the new address directly, on the
+        # container port — never the public name or the old IP.
+        assert (restarted_ip, cluster["_shared_internal_port"]) in readiness_dials
+
+        member = m._instances.get("dns-endpoint-writer")
+        assert member["Endpoint"]["Address"] == create_address
+        assert member["_internal_address"] == restarted_ip
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_restore_keeps_stopped_cluster_compute_stopped(monkeypatch):
     """Warm boot must not revive compute for a cluster stopped via the API."""
     from ministack.services import rds as m
@@ -13353,7 +13494,10 @@ def test_rds_pg_replicating_reader_lifecycle(monkeypatch):
         assert cluster["_shared_container_id"] not in removed
         assert _poll_until(lambda: cluster["Status"] == "available")
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The restarted shared container keeps the DNS alias it launched
+        # with; the raw container address stays internal.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"].endswith(".rds.amazonaws.com")
 
         # Deleting the reader removes only its own compute; the
         # ReaderEndpoint falls back to the writer. The fake derives
@@ -14518,7 +14662,10 @@ def test_rds_pg_two_readers_survive_stop_start(monkeypatch):
         assert _poll_until(lambda: cluster["Status"] == "available")
         # Member order (reader1 first) still decides the ReaderEndpoint.
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The restarted shared container keeps the DNS alias it launched
+        # with; the raw container address stays internal.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"].endswith(".rds.amazonaws.com")
         # The two racing revival workers did not re-provision the writer:
         # replication access was provisioned exactly once, at creation.
         shared_execs = [

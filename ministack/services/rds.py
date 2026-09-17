@@ -1241,6 +1241,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         },
         "_shared_internal_address": internal_host,
         "_shared_internal_port": internal_port,
+        # The reader alias this container actually carries. Only a name
+        # registered as a network alias may be published as the reader
+        # endpoint; PG clusters launched with replication on carry the
+        # writer name only, and a later demotion must not invent a
+        # reader name nothing resolves.
+        "_shared_reader_alias": (
+            endpoint_aliases[1] if len(endpoint_aliases) > 1 else None
+        ),
         "_shared_container_ready": False,
         "_shared_container_epoch": container_epoch,
     })
@@ -2113,10 +2121,16 @@ def _restart_cluster_shared_container(cluster_id, cluster):
     readiness_host = "127.0.0.1"
     readiness_port = host_port
     if ms_network:
+        endpoint_aliases = _cluster_endpoint_aliases(cluster)
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
+            # Report the alias, not the address behind it — same rule as first
+            # launch. StopDBCluster/StartDBCluster must not rewrite a stored
+            # DNS name into a raw address: the name keeps resolving to the
+            # restarted container, while the address may not survive.
+            endpoint_host = (endpoint_aliases[0] if endpoint_aliases
+                             else container_ip)
             endpoint_port = container_port
             internal_host = container_ip
             internal_port = container_port
@@ -4223,7 +4237,22 @@ def _sync_cluster_endpoints(cluster):
         # so the address is published as before.
         if (isinstance(writer_address, str) and ".cluster-" in writer_address
                 and not _pg_cluster_replication_enabled(cluster)):
-            reader_address = writer_address.replace(".cluster-", ".cluster-ro-", 1)
+            # Derive the ro- name only when it was registered as an alias on
+            # the backing container (recorded at launch). A cluster launched
+            # with PG replication on carries the writer name alone, so after
+            # a demotion nothing resolves the derived reader name — publish
+            # the address behind the writer instead. Clusters persisted
+            # before the field existed keep the derived-name behavior.
+            if "_shared_reader_alias" in cluster:
+                reader_address = (
+                    cluster.get("_shared_reader_alias")
+                    or cluster.get("_shared_internal_address")
+                    or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+                )
+            else:
+                reader_address = writer_address.replace(
+                    ".cluster-", ".cluster-ro-", 1,
+                )
         else:
             reader_address = (
                 cluster.get("_shared_internal_address")
@@ -5594,6 +5623,7 @@ def _create_db_cluster_impl(p):
         "Capacity": 0,
         "ClusterScalabilityType": "standard",
         "_shared_container_id": None,
+        "_shared_reader_alias": None,
         "_shared_host_port": None,
         "_shared_endpoint": None,
         "_shared_volume_name": None,

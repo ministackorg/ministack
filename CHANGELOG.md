@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — StopDBCluster/StartDBCluster no longer rewrites the cluster endpoint from its DNS name to a raw container address** — restarting a cluster's shared container reported the container's IP in place of the `*.rds.amazonaws.com` name handed out at creation, even though the name still resolved to the restarted container. Connection strings kept working by accident or broke outright once the address was reused, and hostname-verified TLS could not match the address. The restart now reports the same registered network alias the first launch does, while the internal address and readiness probe keep using the refreshed container IP. The reader endpoint, in turn, only derives its `cluster-ro-` name when that name was actually registered on the backing container.
+
 ## [1.5.13] — 2026-09-17
 
 ### Added
