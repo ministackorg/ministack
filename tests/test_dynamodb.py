@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -3781,6 +3782,88 @@ def test_dynamodb_import_table(ddb):
         assert arn in arns
     finally:
         ddb.delete_table(TableName=name)
+
+
+def _await_import(ddb, arn, attempts=40):
+    for _ in range(attempts):
+        desc = ddb.describe_import(ImportArn=arn)["ImportTableDescription"]
+        if desc["ImportStatus"] != "IN_PROGRESS":
+            return desc
+        time.sleep(0.3)
+    raise AssertionError(f"import {arn} never left IN_PROGRESS")
+
+
+def test_dynamodb_import_table_csv_writes_the_rows(ddb, s3):
+    """The rows of the CSV source reach the table.
+
+    The submit response reports zeros while the import is IN_PROGRESS, and the
+    counters land with the terminal status. A key column takes the type its
+    AttributeDefinition declares; every other column is imported as a string.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, name = f"imp-csv-{suffix}", f"imp-csv-table-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="rows/data.csv", Body=b"ID,name\n1,Alice\n2,Bob\n")
+    try:
+        submitted = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": "rows/"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "ID", "AttributeType": "N"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]
+        assert (submitted["ImportStatus"], submitted["ProcessedItemCount"],
+                submitted["ImportedItemCount"]) == ("IN_PROGRESS", 0, 0)
+
+        desc = _await_import(ddb, submitted["ImportArn"])
+        assert desc["ImportStatus"] == "COMPLETED"
+        assert (desc["ProcessedItemCount"], desc["ImportedItemCount"],
+                desc["ErrorCount"]) == (2, 2, 0)
+        assert desc["ProcessedSizeBytes"] == 22
+
+        items = sorted(ddb.scan(TableName=name)["Items"], key=lambda i: i["ID"]["N"])
+        assert items == [
+            {"ID": {"N": "1"}, "name": {"S": "Alice"}},
+            {"ID": {"N": "2"}, "name": {"S": "Bob"}},
+        ]
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_import_table_missing_source_fails(ddb):
+    """A source that is not there fails the import instead of completing it.
+
+    "Since the error was caught before the data was imported into the table, a
+    new DynamoDB table is not created" — so the destination goes with it.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"imp-missing-{suffix}"
+    try:
+        arn = ddb.import_table(
+            S3BucketSource={"S3Bucket": f"no-such-bucket-{suffix}"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]["ImportArn"]
+
+        desc = _await_import(ddb, arn)
+        assert desc["ImportStatus"] == "FAILED"
+        assert desc["FailureCode"] == "S3NoSuchBucket"
+        assert desc["ImportedItemCount"] == 0
+        with pytest.raises(ClientError) as exc:
+            ddb.describe_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
 
 
 def test_dynamodb_describe_import_not_found(ddb):

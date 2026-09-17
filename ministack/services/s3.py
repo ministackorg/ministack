@@ -3593,6 +3593,16 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _post_form_access_key_id(parts) -> str:
+    for name, _filename, _part_headers, value in parts:
+        if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
+            continue
+        try:
+            credential = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return credential.split("/", 1)[0]
+    return ""
 
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
@@ -3604,11 +3614,16 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     `success_action_redirect`. Policy and signature fields are accepted and
     ignored — same lenient stance as ministack's presigned-URL handling.
     """
+    parts = _parse_multipart_form(headers.get("content-type", ""), body)
+
+    access_key_id = _post_form_access_key_id(parts)
+    if access_key_id:
+        set_request_account_id(access_key_id)
+
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    parts = _parse_multipart_form(headers.get("content-type", ""), body)
     if not parts:
         return _error(
             "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.", 400
