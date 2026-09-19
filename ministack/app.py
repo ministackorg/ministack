@@ -1265,10 +1265,12 @@ async def _handle_post_body_shortcuts(
             logging.getLogger("cloudformation").warning("CFN ResponseURL PUT for unknown token %r — ignoring", token)
         return 200, {}, b""
 
-    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS)
-    from ministack.services.cloudformation import wait_conditions as _cfn_wc
+    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS).
+    # The literal keeps the import behind the check; above it, the first request
+    # to any service pulled in the whole CloudFormation package.
+    if method == "PUT" and path.startswith("/_ministack/cfn-signal/"):
+        from ministack.services.cloudformation import wait_conditions as _cfn_wc
 
-    if method == "PUT" and path.startswith(_cfn_wc.SIGNAL_PATH):
         token = path[len(_cfn_wc.SIGNAL_PATH) :]
         if not _cfn_wc.has_handle(token):
             logging.getLogger("cloudformation").warning("CFN wait condition signal for unknown token %r", token)
