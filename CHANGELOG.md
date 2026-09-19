@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IAM — three calls are authorized against the action and resource AWS uses** — a Lambda Function URL invoke is checked against its function ARN, alias qualifier included, and supplies `lambda:FunctionUrlAuthType`, so the policy `grantInvokeUrl` writes matches. The WebSocket `@connections` API asks for `execute-api:ManageConnections` instead of `execute-api:Invoke`. `iot-jobs-data` operations are authorized under `iotjobsdata:`, except `StartCommandExecution`, which stays on `iot:`. A policy written for the old action names stops matching, as on AWS. Contributed by @iot-rocket.
+- **API Gateway — REST API gateway responses reach the data plane** — a customized gateway response was stored but never applied, so a 401 or 403 from the gateway carried none of the CORS headers a CDK stack declares for it. Gateway errors now resolve the response for their type, then `DEFAULT_4XX` or `DEFAULT_5XX`, then the built-in default, from the stage's last deployment, with header mappings, the `application/json` template and `x-amzn-ErrorType`. `GetGatewayResponse` reports an inherited `DEFAULT_4XX` or `DEFAULT_5XX`, and a response put without templates stores the default one. Contributed by @iot-rocket.
+- **API Gateway — REST API gateway errors answer with the AWS status and message** — an authorizer that raised, a missing Lambda and an unreachable HTTP backend answered with invented statuses and exception text, and an unknown stage with `404`. They now answer `500` `AUTHORIZER_FAILURE` with a null message, `500` `API_CONFIGURATION_ERROR` with `Internal server error`, and `403` `Forbidden`; an explicit Deny carries the full AWS sentence, and a TOKEN authorizer policy without `principalId` is evaluated instead of refused. Contributed by @iot-rocket.
+- **API Gateway — a MOCK integration honours its `statusCode`** — the `200` integration response was used whatever the request template set, so a MOCK method modelling an error returned `200`. The template's `statusCode` now selects the integration response by `selectionPattern`. Contributed by @iot-rocket.
 ## [1.5.13] — 2026-09-17
 
 ### Added

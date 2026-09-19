@@ -1897,7 +1897,8 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
-    headers["x-amzn-requestid"] = request_id
+    # An API Gateway gateway response already carries the id it rendered.
+    request_id = headers.setdefault("x-amzn-requestid", request_id)
     headers["x-amz-request-id"] = request_id
     if include_s3_id:
         headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
