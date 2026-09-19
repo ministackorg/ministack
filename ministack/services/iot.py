@@ -4501,11 +4501,12 @@ def jobs_update_execution(
             409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
+        # InvalidStateTransitionException, not InvalidRequestException
+        # (measured eu-north-1 2026-09-19).
         return None, error_response_json(
-            "InvalidRequestException",
-            f"A device cannot set status {status} via UpdateJobExecution; "
-            "allowed statuses are IN_PROGRESS, SUCCEEDED, FAILED, and REJECTED",
-            400,
+            "InvalidStateTransitionException",
+            f"The status of job execution cannot be changed to be {status}",
+            409,
         )
     now = _jobs_now_ms()
     execution["status"] = status
