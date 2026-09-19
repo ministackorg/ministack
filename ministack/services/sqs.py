@@ -366,7 +366,7 @@ def _validate_redrive_policy(rp_str: str) -> None:
 # CreateQueue/SetQueueAttributes time with InvalidAttributeValue (400).
 _NUMERIC_ATTR_RANGES = {
     "VisibilityTimeout":            (0, 43200),       # 0 .. 12 h
-    "MaximumMessageSize":           (1024, 262144),   # 1 KB .. 256 KB
+    "MaximumMessageSize":           (1024, 1048576),  # 1 KiB .. 1 MiB (captured default)
     "MessageRetentionPeriod":       (60, 1209600),    # 1 min .. 14 days
     "DelaySeconds":                 (0, 900),         # 0 .. 15 min
     "ReceiveMessageWaitTimeSeconds":(0, 20),          # 0 .. 20 s
@@ -428,7 +428,7 @@ def _act_create_queue(data: dict, _u: str) -> dict:
             "CreatedTimestamp": ts,
             "LastModifiedTimestamp": ts,
             "VisibilityTimeout": "30",
-            "MaximumMessageSize": "262144",
+            "MaximumMessageSize": "1048576",
             "MessageRetentionPeriod": "345600",
             "DelaySeconds": "0",
             "ReceiveMessageWaitTimeSeconds": "0",
@@ -509,12 +509,12 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         )
 
     # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
-    # (default 262144 bytes; configurable up to 1 MiB / 1048576). Real AWS error
+    # (default 1048576 bytes / 1 MiB, captured eu-north-1 2026-09-19). Real AWS error
     # is InvalidParameterValue (400) with the queue-configured limit in the message.
     try:
-        max_size = int(q["attributes"].get("MaximumMessageSize", "262144"))
+        max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
     except (TypeError, ValueError):
-        max_size = 262144
+        max_size = 1048576
     body_bytes = len(body_text.encode("utf-8"))
     if body_bytes > max_size:
         raise _Err(

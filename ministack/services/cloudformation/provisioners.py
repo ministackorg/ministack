@@ -1929,7 +1929,13 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     code = new_props.get("Code", {})
     image_uri = code.get("ImageUri")
     is_image = new_props.get("PackageType") == "Image" or bool(image_uri)
-    if is_image != (func["config"].get("PackageType") == "Image"):
+    # DurableConfig and TenancyConfig are "Update requires: Replacement" in the
+    # resource reference, like a PackageType flip: same local equivalent.
+    replacing = is_image != (func["config"].get("PackageType") == "Image") or any(
+        old_props.get(p) != new_props.get(p)
+        for p in ("DurableConfig", "TenancyConfig")
+    )
+    if replacing:
         # The re-provision replaces the whole function record under the same
         # name — a stale warm worker or pooled container would keep serving
         # the old package. Invalidate both, the way _update_code does.
@@ -3532,21 +3538,16 @@ def _cfn_wait_condition_create(logical_id, props, stack_name):
     data = _wc.wait_for(token, stack_id, stack_name, logical_id,
                         "AWS::CloudFormation::WaitCondition", count, timeout_s)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    attrs = {"Data": json.dumps(data), "Id": pid}
-    _wc.remember_result(pid, attrs)
-    return pid, attrs
+    return pid, {"Data": json.dumps(data), "Id": pid}
 
 
 def _cfn_wait_condition_update(physical_id, old_props, new_props, stack_name):
-    """Updates are not supported on AWS; the resource keeps its id and data."""
-    from ministack.services.cloudformation import wait_conditions as _wc
-    return physical_id, _wc.recall_result(physical_id) or {"Data": "{}", "Id": physical_id}
-
-
-def _cfn_wait_condition_delete(physical_id, props):
-    """Forget the recorded attributes; the signal slot went with the wait."""
-    from ministack.services.cloudformation import wait_conditions as _wc
-    _wc.forget_result(physical_id)
+    """AWS refuses the update outright: UPDATE_FAILED with "Update to resource
+    type AWS::CloudFormation::WaitCondition is not supported", then a rollback
+    (captured eu-north-1 2026-09-19). Succeeding silently hid that."""
+    raise ValueError(
+        "Update to resource type AWS::CloudFormation::WaitCondition is not supported."
+    )
 
 
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
@@ -9342,6 +9343,16 @@ def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
             "the certificate id is derived from the PEM. Declare a new "
             "CACertificate resource for the new PEM and remove this one."
         )
+    if new_props.get("VerificationCertificatePem") != old_props.get(
+        "VerificationCertificatePem"
+    ):
+        # Update-requires-replacement in the resource reference, and
+        # UpdateCACertificate carries no verification-certificate member, so
+        # the same refusal as CertificateMode below applies.
+        raise ValueError(
+            "AWS::IoT::CACertificate cannot update VerificationCertificatePem "
+            "in place: declare a new CACertificate resource for it."
+        )
     if not new_props.get("Status"):
         raise ValueError("AWS::IoT::CACertificate requires Status")
     stored_mode = (_iot._ca_certificates.get(physical_id) or {}).get(
@@ -9827,7 +9838,7 @@ _RESOURCE_HANDLERS = {
         "delete_with_logical_id": True,
     },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update, "delete": _cfn_wait_condition_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,

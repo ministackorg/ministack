@@ -4140,15 +4140,15 @@ def test_rule_where_clause_extraction(sql, expected):
 @pytest.mark.parametrize(
     ("pred", "payload", "expected"),
     [
-        # equality (both spellings) on strings and numbers
+        # equality on strings and numbers. `==` and `!=` are deliberately
+        # absent: AWS refuses both ("Unexpected character '!'", "Unexpected
+        # token, 'EQ'"), captured eu-north-1 2026-09-19.
         ("state = 'on'", {"state": "on"}, True),
-        ("state == 'on'", {"state": "on"}, True),
         ("state = 'on'", {"state": "off"}, False),
         ("temp = 22", {"temp": 22}, True),
         ("temp = 22", {"temp": 23}, False),
-        # inequality (both spellings)
+        # inequality
         ("state <> 'on'", {"state": "off"}, True),
-        ("state != 'on'", {"state": "on"}, False),
         # a predicate over a missing attribute is Undefined → never matches,
         # not even for <> (fail closed, as on AWS)
         ("absent = 'x'", {"state": "on"}, False),
@@ -4793,6 +4793,45 @@ def test_rule_sns_action_writes_a_full_sns_message_record():
         reset()
 
 
+def test_iot_jobs_in_progress_timeout_reaches_timed_out():
+    """timeoutConfig.inProgressTimeoutInMinutes: "whenever a job execution
+    remains in the IN_PROGRESS status for longer than this interval, the job
+    execution will fail and switch to the terminal TIMED_OUT status". Evaluated
+    on read, like the broker's session expiry, so no timer runs."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    reset()
+    with request_scope("123456789012", _TEST_REGION):
+        iot_module._things["t1"] = {"thingName": "t1"}
+        iot_module._jobs["j1"] = {
+            "jobId": "j1",
+            "targets": ["arn:aws:iot:%s:123456789012:thing/t1" % _TEST_REGION],
+            "targetSelection": "SNAPSHOT", "status": "IN_PROGRESS",
+            "document": "{}", "snapshotted": True,
+            "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+        }
+        now = iot_module._jobs_now_ms()
+        execution = {
+            "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+            "statusDetails": {}, "queuedAt": now, "startedAt": now,
+            "lastUpdatedAt": now, "executionNumber": 1, "versionNumber": 2,
+        }
+        iot_module._job_executions[("t1", "j1")] = execution
+
+        # Inside the interval: still running, and the device plane reports the
+        # remaining seconds.
+        assert iot_module._jobs_apply_timeout(dict(execution))["status"] == "IN_PROGRESS"
+        assert iot_module._jobs_seconds_before_timeout(execution) == 60
+
+        # Past it: terminal, and the job completes with it.
+        execution["startedAt"] = now - 61_000
+        assert iot_module._jobs_apply_timeout(execution)["status"] == "TIMED_OUT"
+        assert iot_module._jobs["j1"]["status"] == "COMPLETED"
+        assert iot_module._jobs_seconds_before_timeout(execution) is None
+    reset()
+
+
 def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
     """AWS invokes the rule's errorAction when an action fails, with the failure
     document — without it the only trace of a broken pipeline is a local log
@@ -4834,6 +4873,9 @@ def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
         doc = received[0]
         assert doc["ruleName"] == "err_rule"
         assert doc["topic"] == "err/topic"
+        # AWS reports the publisher's IP (captured eu-north-1 2026-09-19).
+        assert doc["sourceIp"] == "127.0.0.1"
+        assert doc["clientId"] == "N/A"
         assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
         assert doc["failures"] == [
             {"failedAction": "DynamoDBv2Action", "failedResource": "absent",

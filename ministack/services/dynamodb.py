@@ -75,7 +75,7 @@ _CSV_DELIMITER_RE = re.compile(r"[,;:|\t ]")
 # COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
 # on the first DescribeExport/DescribeImport calls within this grace window.
 _EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
-_IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
+_IMPORT_COMPLETE_AFTER_SEC = 1.0
 # "The log group name is /aws-dynamodb/imports. The error log stream name is
 # import-id/error."
 _IMPORT_LOG_GROUP = "/aws-dynamodb/imports"

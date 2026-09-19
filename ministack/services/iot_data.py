@@ -87,6 +87,11 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     qp = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
+    # The errorAction document reports the publisher's IP; same header the
+    # API Gateway integration reads.
+    _iot_module._publish_source_ip.set(
+        (headers.get("x-forwarded-for") or "127.0.0.1").split(",")[0].strip()
+    )
 
     if method == "POST" and path.startswith("/topics/"):
         return await _publish(path[len("/topics/"):], body, qp)

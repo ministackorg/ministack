@@ -47,7 +47,7 @@ _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
+CRAWLER_RUN_SECONDS = 5
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 

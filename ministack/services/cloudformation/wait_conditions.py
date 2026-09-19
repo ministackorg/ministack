@@ -35,9 +35,6 @@ _generation = 0
 _handles: dict = {}
 # (stack id, logical id) → {"token", "stack_name", "resource_type"}, while that wait condition waits
 _waiting: dict = {}
-# physical id of a completed wait condition → its attributes (updates are not
-# supported on AWS, so an update returns what the create produced)
-_results: dict = {}
 
 
 # --- validation of the template values -------------------------------------
@@ -253,29 +250,10 @@ def wait_for(
                 _handles.pop(token, None)
 
 
-def remember_result(physical_id: str, attrs: dict) -> None:
-    with _lock:
-        _results[physical_id] = dict(attrs)
-
-
-def recall_result(physical_id: str) -> dict:
-    with _lock:
-        return dict(_results.get(physical_id, {}))
-
-
-def forget_result(physical_id: str) -> None:
-    """Drop a completed wait condition's attributes. Kept until the resource is
-    deleted because an update returns what the create produced; without this the
-    map only ever grew."""
-    with _lock:
-        _results.pop(physical_id, None)
-
-
 def reset():
     global _generation
     with _changed:
         _generation += 1
         _handles.clear()
         _waiting.clear()
-        _results.clear()
         _changed.notify_all()

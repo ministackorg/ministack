@@ -308,7 +308,8 @@ def test_iot_jobs_update_rejects_service_side_statuses(
 ):
     """A device may only report IN_PROGRESS / SUCCEEDED / FAILED / REJECTED;
     the service-side statuses (CANCELED, TIMED_OUT, REMOVED) must be rejected
-    with InvalidRequestException (400), as on AWS."""
+    with InvalidStateTransitionException (409) and the message "The status of job
+    execution cannot be changed to be X" — captured eu-north-1 2026-09-19."""
     thing = _unique("jobs-thing")
     job_id = _unique("job")
     try:
@@ -321,10 +322,11 @@ def test_iot_jobs_update_rejects_service_side_statuses(
                     jobId=job_id, thingName=thing, status=status
                 )
             error = ei.value.response["Error"]
-            assert error["Code"] == "InvalidRequestException", status
+            assert error["Code"] == "InvalidStateTransitionException", status
             assert (
-                ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+                ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
             ), status
+            assert f"cannot be changed to be {status}" in error["Message"], status
 
         # The rejected updates must not have touched the execution.
         execution = iot_jobs_data.describe_job_execution(
@@ -447,31 +449,83 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
 # ---------------------------------------------------------------------------
 
 
-def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
-    """The documented device flow: `DescribeEndpoint(endpointType='iot:Jobs')`
-    hands out `{prefix}.jobs.iot.{region}`, and a request carrying that Host
-    must land on the jobs data plane. Routed to the `iot` control plane
-    instead, `GET /things/{t}/jobs` is ListJobExecutionsForThing and silently
-    answers a different envelope."""
+def test_iot_jobs_update_rejects_a_mismatched_execution_number(
+    iot_client, iot_jobs_data
+):
+    """UpdateJobExecution's executionNumber identifies one execution on the
+    device. Nothing re-queues here, so only number 1 exists and any other
+    number is ResourceNotFoundException, as the describe path already answers."""
     thing = _unique("jobs-thing")
     job_id = _unique("job")
     try:
         thing_arn = _create_thing(iot_client, thing)
         iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
 
-        endpoint = iot_client.describe_endpoint(endpointType="iot:Jobs")[
+        with pytest.raises(ClientError) as ei:
+            iot_jobs_data.update_job_execution(
+                jobId=job_id, thingName=thing, status="IN_PROGRESS",
+                executionNumber=7,
+            )
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # Number 1 is the one that exists.
+        iot_jobs_data.update_job_execution(
+            jobId=job_id, thingName=thing, status="IN_PROGRESS", executionNumber=1,
+        )
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_describe_job_steady_state_shape(iot_client):
+    """Captured eu-north-1 2026-09-19 across QUEUED, IN_PROGRESS and SUCCEEDED
+    executions: isConcurrent is false throughout, processingTargets is null
+    throughout, and timeoutConfig/schedulingConfig come back as {} while
+    abortConfig is omitted."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["isConcurrent"] is False
+        assert "processingTargets" not in job["jobProcessDetails"]
+        assert job["timeoutConfig"] == {}
+        assert job["schedulingConfig"] == {}
+        assert "abortConfig" not in job
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_endpoint_type_is_retired(iot_client):
+    """AWS retired `iot:Jobs`: DescribeEndpoint answers InvalidRequestException
+    and points at iot:Data-ATS (captured eu-north-1 2026-09-19). Jobs and
+    Commands are served from the Data-ATS endpoint, where the `iot-jobs-data`
+    signing scope selects the data plane."""
+    with pytest.raises(ClientError) as exc:
+        iot_client.describe_endpoint(endpointType="iot:Jobs")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert "iot:Data-ATS" in exc.value.response["Error"]["Message"]
+
+
+def test_iot_jobs_data_plane_reachable_on_the_data_ats_endpoint(
+    iot_client, iot_jobs_data
+):
+    """The replacement flow: the Data-ATS endpoint serves the jobs data plane.
+    A request signed with the `iot-jobs-data` scope must answer the
+    GetPendingJobExecutions envelope, not the control plane's
+    `executionSummaries`."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        endpoint = iot_client.describe_endpoint(endpointType="iot:Data-ATS")[
             "endpointAddress"
         ]
-        assert ".jobs.iot." in endpoint
-        request = urllib.request.Request(
-            f"{ENDPOINT}/things/{quote(thing)}/jobs",
-            method="GET",
-            headers={"Host": endpoint},
-        )
-        with urllib.request.urlopen(request, timeout=5) as resp:
-            body = json.loads(resp.read())
+        assert ".jobs.iot." not in endpoint
 
-        # The GetPendingJobExecutions envelope — not `executionSummaries`.
+        body = iot_jobs_data.get_pending_job_executions(thingName=thing)
         assert [q["jobId"] for q in body["queuedJobs"]] == [job_id]
         assert body["inProgressJobs"] == []
     finally:

@@ -3457,7 +3457,7 @@ def _ensure_reaper_thread() -> None:
 # Active / Successful asynchronously when the runtime is ready. Real AWS takes
 # seconds to tens of seconds (image pull time for Image type); we use a short
 # delay so local integration tests see the transition without spinning.
-_LAMBDA_STATE_TRANSITION_DELAY = float(os.environ.get("LAMBDA_STATE_TRANSITION_SECONDS", "0.5"))
+_LAMBDA_STATE_TRANSITION_DELAY = 0.5
 
 
 def _schedule_state_transition(func_name: str, delay: float) -> None:

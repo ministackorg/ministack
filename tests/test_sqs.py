@@ -656,7 +656,7 @@ def test_sqs_send_message_batch_rejects_oversized_aggregate(sqs):
     """
     url = sqs.create_queue(
         QueueName="intg-sqs-batch-too-long",
-        Attributes={"MaximumMessageSize": "262144"},  # default
+        Attributes={"MaximumMessageSize": "262144"},  # below the 1 MiB default
     )["QueueUrl"]
 
     # 10 × 150 KiB → 1.5 MiB total. Each individual entry is within the queue's
@@ -1060,12 +1060,13 @@ def test_sqs_localstack_queue_path_alias(sqs):
 def test_sqs_send_message_rejects_oversized_body(sqs):
     """SendMessage must reject bodies exceeding the queue's MaximumMessageSize
     attribute with InvalidParameterValue (400). MaximumMessageSize defaults to
-    262144 (256 KiB) per AWS. Before this fix MS silently accepted oversized
-    messages locally while real AWS rejected — masking client bugs."""
+    1048576 (1 MiB) — captured eu-north-1 2026-09-19; AWS raised it from 256 KiB.
+    Before this fix MS silently accepted oversized messages locally while real
+    AWS rejected — masking client bugs."""
     import pytest as _pytest
 
     q = sqs.create_queue(QueueName="intg-sqs-size-default")["QueueUrl"]
-    body = "x" * (262144 + 1)
+    body = "x" * (1048576 + 1)
     with _pytest.raises(ClientError) as exc:
         sqs.send_message(QueueUrl=q, MessageBody=body)
     assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
@@ -1073,7 +1074,7 @@ def test_sqs_send_message_rejects_oversized_body(sqs):
 
 def test_sqs_send_message_respects_configured_maximum_message_size(sqs):
     """A queue with a tighter MaximumMessageSize must reject bodies that fit
-    in the default 262144 but exceed the configured value."""
+    in the default 1048576 but exceed the configured value."""
     import pytest as _pytest
 
     q = sqs.create_queue(

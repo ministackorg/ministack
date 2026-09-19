@@ -15,8 +15,7 @@ as the documented AWS response does. QUEUED is reached on AWS only by a
 request that opted into job queueing (``JobExecutionSettings.AllowDeferredExecution``)
 while the account is at its concurrent job limit; neither the quota nor the
 opt-in is modelled here, so a job never queues. A background task
-walks the job to COMPLETED or FAILED over ``TRANSCRIBE_JOB_RUN_SECONDS``
-(0 completes immediately), reads the media
+walks the job to COMPLETED or FAILED over two seconds, reads the media
 object out of MiniStack's S3 store, and writes a transcript document back to
 S3 in the real Transcribe result format. Entering a terminal state publishes a
 ``Transcribe Job State Change`` event so EventBridge rules downstream of a
@@ -78,10 +77,8 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("transcribe")
 
-# How long a job spends between IN_PROGRESS and COMPLETED. Same knob shape as
-# GLUE_CRAWLER_RUN_SECONDS: tests that want to observe a job mid-flight need a
-# non-zero value, tests that just want a result set it to 0.
-_JOB_RUN_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_RUN_SECONDS", "2"))
+# How long a job spends between IN_PROGRESS and COMPLETED.
+_JOB_RUN_SECONDS = 2.0
 
 # Where transcripts land when the caller supplies no OutputBucketName. Real
 # Transcribe uses a service-managed bucket and hands back a presigned URL; the
