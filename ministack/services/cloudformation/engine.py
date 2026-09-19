@@ -326,6 +326,7 @@ _MAPPING_ATTRIBUTES_MAX = 200
 _NAME_MAX_CHARS = 255
 _DESCRIPTION_MAX_BYTES = 1024
 _PARAMETER_VALUE_MAX_BYTES = 4096
+_DYNAMIC_REFERENCES_MAX = 60  # "60 dynamic references in a stack template" (quotas table)
 
 
 def _quota_error(noun: str, count: int, maximum: int) -> ValueError:
@@ -366,6 +367,10 @@ def _validate_template_limits(template: dict) -> None:
                 raise ValueError(
                     f"Template format error: Mapping attribute name {str(attribute)[:32]}"
                     f"... of mapping {name} may not exceed {_NAME_MAX_CHARS} characters")
+    refs: set = set()
+    _find_dynamic_references(template, refs)
+    if len(refs) > _DYNAMIC_REFERENCES_MAX:
+        raise _quota_error("dynamic references", len(refs), _DYNAMIC_REFERENCES_MAX)
     description = template.get("Description")
     if isinstance(description, str) and len(description.encode("utf-8")) > _DESCRIPTION_MAX_BYTES:
         raise ValueError(

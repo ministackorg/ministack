@@ -1389,13 +1389,28 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
+    # s3control is rest-xml: a JSON body dies in the SDK's XML parser instead of
+    # raising something the caller can catch. The envelope is S3's — <Error> at the
+    # root, no <ErrorResponse> wrapper and no <Type>, which is what the rest-xml
+    # unmarshallers in the Java and Go v2 SDKs expect, not just botocore.
+    # NotFoundException is the nearest modeled code; s3control has no NotImplemented.
+    from xml.sax.saxutils import escape as _xml_esc
+
+    unsupported = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Error>"
+        "<Code>NotFoundException</Code>"
+        f"<Message>No S3 Control operation at {_xml_esc(path)}</Message>"
+        f"<RequestId>{request_id}</RequestId>"
+        "</Error>"
+    ).encode()
     return (
-        200,
+        404,
         {
-            "Content-Type": "application/json",
+            "Content-Type": "application/xml",
             "x-amzn-requestid": request_id,
         },
-        b"{}",
+        unsupported,
     )
 
 

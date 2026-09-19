@@ -3998,17 +3998,16 @@ def test_rule_event_replace_of_missing_or_nonstring_is_omitted():
     assert event == {}
 
 
-def test_rule_event_clientid_resolves_for_mqtt_and_is_omitted_for_http():
+def test_rule_event_clientid_resolves_for_mqtt_and_is_n_a_for_http():
     from ministack.services.iot import _rule_event
 
     sql = "SELECT clientid() AS cid, temp FROM 't'"
     # MQTT publish: the broker threads the publishing client's id through.
     event = _rule_event(sql, "t", b'{"temp": 22}', client_id="sensor-7")
     assert event == {"cid": "sensor-7", "temp": 22}
-    # HTTP publish: no MQTT client exists — AWS resolves clientid() to
-    # Undefined, so the field is omitted from the projection.
+    # HTTP publish: documented as "n/a", so the field is projected, not dropped.
     event = _rule_event(sql, "t", b'{"temp": 22}')
-    assert event == {"temp": 22}
+    assert event == {"cid": "n/a", "temp": 22}
 
 
 def test_rule_event_replace_handles_escaped_quotes():
@@ -4057,14 +4056,17 @@ def test_eval_where_clientid_reaches_every_leaf_form():
         ("isUndefined(clientid())", False),
     ):
         assert _eval_where(pred, "t", raw, message, "sensor-7") is expected
-    # An HTTP publish carries no client id, so every one of them fails closed.
+    # An HTTP publish carries no client id, so every comparison fails closed —
+    # clientid() is the literal "n/a" there, which matches none of them.
     for pred in (
         "clientid() = 'sensor-7'",
         "clientid() IN ('sensor-7')",
         "clientid() LIKE 'sensor-%'",
     ):
         assert _eval_where(pred, "t", raw, message) is False
-    assert _eval_where("isUndefined(clientid())", "t", raw, message) is True
+    # ...but "n/a" is a value, so the function is never Undefined.
+    assert _eval_where("isUndefined(clientid())", "t", raw, message) is False
+    assert _eval_where("clientid() = 'n/a'", "t", raw, message) is True
 
 
 def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
@@ -4101,12 +4103,12 @@ def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
             PKT_PUBLISH, 0, _encode_string("sensors/door") + b'{"n": 1}'
         )
         await session.cleanup()
-        # ...while the HTTP publish path passes none.
+        # ...while the HTTP publish path passes none, so clientid() is "n/a".
         await publish(account_id, "sensors/door", b'{"n": 2}')
 
     try:
         asyncio.run(_run())
-        assert dispatched == [{"cid": "sensor-7"}, {}]
+        assert dispatched == [{"cid": "sensor-7"}, {"cid": "n/a"}]
     finally:
         iot_module._topic_rules.clear()
         reset()
@@ -4834,7 +4836,8 @@ def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
         assert doc["topic"] == "err/topic"
         assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
         assert doc["failures"] == [
-            {"action": "dynamoDBv2", "errorMessage": "RuntimeError: dispatch blew up"}
+            {"failedAction": "dynamoDBv2", "failedResource": "absent",
+             "errorMessage": "RuntimeError: dispatch blew up"}
         ]
     finally:
         iot_module._topic_rules.clear()
@@ -4900,7 +4903,7 @@ def test_rule_error_action_runs_on_an_undeliverable_destination(
         assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
         assert len(doc["failures"]) == 1
         failure = doc["failures"][0]
-        assert failure["action"] == action_type
+        assert failure["failedAction"] == action_type
         assert error_fragment in failure["errorMessage"]
     finally:
         iot_module._topic_rules.clear()

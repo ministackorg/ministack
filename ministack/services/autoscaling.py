@@ -225,7 +225,7 @@ def _create_asg(p):
     if not name:
         return _error("ValidationError", "AutoScalingGroupName is required")
     if name in _asgs:
-        return _error("AlreadyExistsFault", f"AutoScalingGroup {name} already exists")
+        return _error("AlreadyExists", f"AutoScalingGroup {name} already exists")
 
     arn = _asg_arn(name)
     _asgs[name] = {
@@ -471,7 +471,7 @@ def _create_lc(p):
     if not name:
         return _error("ValidationError", "LaunchConfigurationName is required")
     if name in _launch_configs:
-        return _error("AlreadyExistsFault", f"LaunchConfiguration {name} already exists")
+        return _error("AlreadyExists", f"LaunchConfiguration {name} already exists")
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _launch_configs[name] = {
         "LaunchConfigurationName": name,

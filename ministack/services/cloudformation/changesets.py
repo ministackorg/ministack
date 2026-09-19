@@ -397,7 +397,7 @@ def _execute_change_set(params):
                       f"ChangeSet [{cs_name}] does not exist", 404)
 
     if cs["ExecutionStatus"] != "AVAILABLE":
-        return _error("InvalidChangeSetStatusException",
+        return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
 
     cs["ExecutionStatus"] = "EXECUTE_IN_PROGRESS"
