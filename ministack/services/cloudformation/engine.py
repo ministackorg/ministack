@@ -647,11 +647,9 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 # ===========================================================================
 
 # The functions the Rules section accepts. rules-section-structure.html lists
-# Fn::If among them, but a real account refuses it: CreateStack answers
-# "Template format error: Following functions are not supported in the Rules
-# block of the template: [Fn::If]" (measured us-east-1, 2026-09-19). The
-# capture wins over the page. Ref may be nested in all but Fn::ValueOf and
-# Fn::ValueOfAll.
+# Fn::If, but a real account refuses it: "Following functions are not supported
+# in the Rules block of the template: [Fn::If]" (measured eu-north-1 2026-09-19). Ref may be nested in
+# all but Fn::ValueOf and Fn::ValueOfAll.
 _RULE_FUNCTIONS = frozenset({
     "Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals", "Fn::Contains",
     "Fn::EachMemberEquals", "Fn::EachMemberIn", "Fn::RefAll", "Fn::ValueOf",
@@ -1188,10 +1186,8 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         args = value["Fn::If"]
         cond_name = args[0]
         if not isinstance(cond_name, str):
-            # AWS wants a condition NAME, not an inline condition: CreateStack
-            # answers this for {"Fn::If": [{"Fn::Equals": [...]}, a, b]}
-            # (measured us-east-1, 2026-09-19). Without the check the dict
-            # reaches conditions.get() and raises TypeError: unhashable type.
+            # AWS wants a condition NAME here, not an inline condition
+            # (measured eu-north-1 2026-09-19); without this the dict reaches conditions.get().
             raise ValueError(
                 "Template error: Fn::If requires a list argument with the "
                 "first element being a condition")

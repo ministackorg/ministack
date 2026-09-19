@@ -1389,14 +1389,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
-    # Measured against a real account (eu-north-1, 2026-09-19): a signed GET to an
-    # undefined path under /v20180820 answers 400 with
-    #   <ErrorResponse><Error><Code>InvalidURI</Code>
-    #     <Message>Couldn't parse the specified URI.</Message><URI>..</URI></Error>
-    #     <RequestId>..</RequestId><HostId>..</HostId></ErrorResponse>
-    # so the wrapper IS <ErrorResponse> (not a bare <Error> root), the code is
-    # InvalidURI (not a NotFound of any kind), the status is 400, and <URI> echoes
-    # the offending path segment.
+    # An undefined /v20180820 path answers 400 InvalidURI inside an
+    # <ErrorResponse> wrapper, with <URI> echoing the bad segment (measured eu-north-1 2026-09-19).
     from xml.sax.saxutils import escape as _xml_esc
 
     bad_uri = path.split("/v20180820/", 1)[-1] if "/v20180820/" in path else path.lstrip("/")

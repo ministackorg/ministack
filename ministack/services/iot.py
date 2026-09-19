@@ -5347,9 +5347,7 @@ async def _dispatch_rule_error_action(
         "topic": topic,
         # The emulator's publish path carries no CloudWatch trace id.
         "cloudwatchTraceId": "",
-        # Measured: a publish with no MQTT client reports "N/A" here, not "".
-        # Note the casing differs from rule SQL's clientid(), which the SQL
-        # functions reference documents as lowercase "n/a".
+        # "N/A", not "" — and not clientid()'s lowercase "n/a" (measured eu-north-1 2026-09-19).
         "clientId": client_id or "N/A",
         "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
         "failures": failures,
@@ -5367,9 +5365,7 @@ async def _dispatch_rule_error_action(
         )
 
 
-# rule-error-handling.html documents each failures[] entry as failedAction /
-# failedResource / errorMessage. failedResource is "the name of the resource"
-# the action targeted, which is a different member per action type.
+# failedResource is the resource the action targeted, a different member per type.
 _RULE_ACTION_RESOURCE_KEYS = {
     "dynamoDBv2": ("putItem", "tableName"),
     "sns": ("targetArn",),
@@ -5380,13 +5376,8 @@ _RULE_ACTION_RESOURCE_KEYS = {
 
 
 def _rule_action_name(action_type: str) -> str:
-    """The errorAction document's ``failedAction`` string for an action type.
-
-    Measured: a dynamoDBv2 failure reports ``DynamoDBv2Action`` (real account,
-    eu-north-1, 2026-09-19), and rule-error-handling.html's own example is
-    ``S3Action``. Both are the payload key with its first letter upper-cased and
-    ``Action`` appended, so the same transform covers the rest.
-    """
+    """``failedAction`` for an action type: the key capitalised, plus ``Action``.
+    ``DynamoDBv2Action`` (measured eu-north-1 2026-09-19); ``S3Action`` is the reference's own example."""
     if not action_type:
         return ""
     return action_type[0].upper() + action_type[1:] + "Action"
