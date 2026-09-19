@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — dynamic HTTP parameters for API destinations** — `HttpParameters` JSON paths now resolve against the original event before input transformation, including array indexes and wildcards. Literal values, connection precedence and stored target configuration are preserved. Verified against AWS EventBridge using a MongoDB partner event bus and an HTTPS request recorder.
+
 ## [1.5.13] — 2026-09-17
 
 ### Added
