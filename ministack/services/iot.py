@@ -5347,7 +5347,10 @@ async def _dispatch_rule_error_action(
         "topic": topic,
         # The emulator's publish path carries no CloudWatch trace id.
         "cloudwatchTraceId": "",
-        "clientId": client_id or "",
+        # Measured: a publish with no MQTT client reports "N/A" here, not "".
+        # Note the casing differs from rule SQL's clientid(), which the SQL
+        # functions reference documents as lowercase "n/a".
+        "clientId": client_id or "N/A",
         "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
         "failures": failures,
     }
@@ -5374,6 +5377,19 @@ _RULE_ACTION_RESOURCE_KEYS = {
     "republish": ("topic",),
     "lambda": ("functionArn",),
 }
+
+
+def _rule_action_name(action_type: str) -> str:
+    """The errorAction document's ``failedAction`` string for an action type.
+
+    Measured: a dynamoDBv2 failure reports ``DynamoDBv2Action`` (real account,
+    eu-north-1, 2026-09-19), and rule-error-handling.html's own example is
+    ``S3Action``. Both are the payload key with its first letter upper-cased and
+    ``Action`` appended, so the same transform covers the rest.
+    """
+    if not action_type:
+        return ""
+    return action_type[0].upper() + action_type[1:] + "Action"
 
 
 def _rule_action_resource(action: dict, action_type: str) -> str:
@@ -5440,7 +5456,7 @@ async def _run_rule_actions(
                 exc,
             )
             failures.append({
-                "failedAction": action_type,
+                "failedAction": _rule_action_name(action_type),
                 "failedResource": _rule_action_resource(action, action_type),
                 "errorMessage": f"{type(exc).__name__}: {exc}",
             })

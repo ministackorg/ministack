@@ -4836,7 +4836,7 @@ def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
         assert doc["topic"] == "err/topic"
         assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
         assert doc["failures"] == [
-            {"failedAction": "dynamoDBv2", "failedResource": "absent",
+            {"failedAction": "DynamoDBv2Action", "failedResource": "absent",
              "errorMessage": "RuntimeError: dispatch blew up"}
         ]
     finally:
@@ -4903,7 +4903,7 @@ def test_rule_error_action_runs_on_an_undeliverable_destination(
         assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
         assert len(doc["failures"]) == 1
         failure = doc["failures"][0]
-        assert failure["failedAction"] == action_type
+        assert failure["failedAction"] == iot_module._rule_action_name(action_type)
         assert error_fragment in failure["errorMessage"]
     finally:
         iot_module._topic_rules.clear()

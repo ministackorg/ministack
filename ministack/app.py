@@ -1389,23 +1389,30 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
-    # s3control is rest-xml: a JSON body dies in the SDK's XML parser instead of
-    # raising something the caller can catch. The envelope is S3's — <Error> at the
-    # root, no <ErrorResponse> wrapper and no <Type>, which is what the rest-xml
-    # unmarshallers in the Java and Go v2 SDKs expect, not just botocore.
-    # NotFoundException is the nearest modeled code; s3control has no NotImplemented.
+    # Measured against a real account (eu-north-1, 2026-09-19): a signed GET to an
+    # undefined path under /v20180820 answers 400 with
+    #   <ErrorResponse><Error><Code>InvalidURI</Code>
+    #     <Message>Couldn't parse the specified URI.</Message><URI>..</URI></Error>
+    #     <RequestId>..</RequestId><HostId>..</HostId></ErrorResponse>
+    # so the wrapper IS <ErrorResponse> (not a bare <Error> root), the code is
+    # InvalidURI (not a NotFound of any kind), the status is 400, and <URI> echoes
+    # the offending path segment.
     from xml.sax.saxutils import escape as _xml_esc
 
+    bad_uri = path.split("/v20180820/", 1)[-1] if "/v20180820/" in path else path.lstrip("/")
     unsupported = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Error>"
-        "<Code>NotFoundException</Code>"
-        f"<Message>No S3 Control operation at {_xml_esc(path)}</Message>"
-        f"<RequestId>{request_id}</RequestId>"
+        "<ErrorResponse><Error>"
+        "<Code>InvalidURI</Code>"
+        "<Message>Couldn't parse the specified URI.</Message>"
+        f"<URI>{_xml_esc(bad_uri)}</URI>"
         "</Error>"
+        f"<RequestId>{request_id}</RequestId>"
+        f"<HostId>{uuid.uuid4().hex}</HostId>"
+        "</ErrorResponse>"
     ).encode()
     return (
-        404,
+        400,
         {
             "Content-Type": "application/xml",
             "x-amzn-requestid": request_id,

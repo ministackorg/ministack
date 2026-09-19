@@ -646,10 +646,14 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 # Rules section
 # ===========================================================================
 
-# The functions the Rules section accepts (rules-section-structure.html lists
-# them; Ref may be nested in all but Fn::ValueOf and Fn::ValueOfAll).
+# The functions the Rules section accepts. rules-section-structure.html lists
+# Fn::If among them, but a real account refuses it: CreateStack answers
+# "Template format error: Following functions are not supported in the Rules
+# block of the template: [Fn::If]" (measured us-east-1, 2026-09-19). The
+# capture wins over the page. Ref may be nested in all but Fn::ValueOf and
+# Fn::ValueOfAll.
 _RULE_FUNCTIONS = frozenset({
-    "Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals", "Fn::If", "Fn::Contains",
+    "Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals", "Fn::Contains",
     "Fn::EachMemberEquals", "Fn::EachMemberIn", "Fn::RefAll", "Fn::ValueOf",
     "Fn::ValueOfAll", "Ref",
 })
@@ -672,12 +676,12 @@ class _RuleUnsupported(Exception):
 
 
 # The argument list each rule function takes (intrinsic-function-reference-rules):
-# ``Fn::Not`` one condition, ``Fn::If`` a condition and two values, the rest
-# two elements; ``Fn::And`` / ``Fn::Or`` any list, ``Ref`` / ``Fn::RefAll`` a name.
+# ``Fn::Not`` one condition, the rest two elements; ``Fn::And`` / ``Fn::Or`` any
+# list, ``Ref`` / ``Fn::RefAll`` a name.
 _RULE_ARITY = {
     "Fn::Equals": 2, "Fn::Contains": 2, "Fn::EachMemberEquals": 2,
     "Fn::EachMemberIn": 2, "Fn::ValueOf": 2, "Fn::ValueOfAll": 2,
-    "Fn::Not": 1, "Fn::If": 3,
+    "Fn::Not": 1,
 }
 
 
@@ -879,15 +883,6 @@ def _evaluate_rules(template: dict, params: dict, conditions: dict) -> None:
             return any(as_bool(ev(a), fn) for a in args)
         if fn == "Fn::Not":
             return not as_bool(ev(args[0]), fn)
-        if fn == "Fn::If":
-            chosen = ev(args[0])
-            if isinstance(args[0], str):
-                if args[0] not in conditions:
-                    raise ValueError(
-                        f"Template error: Fn::If refers to condition {args[0]} "
-                        "which is not defined in the Conditions block")
-                chosen = conditions[args[0]]
-            return ev(args[1]) if as_bool(chosen, fn) else ev(args[2])
         if fn == "Fn::Contains":
             return str(ev(args[1])) in as_list(ev(args[0]), fn)
         if fn == "Fn::EachMemberEquals":
@@ -1192,6 +1187,14 @@ def _resolve_refs(value, resources, params, conditions, mappings,
     if "Fn::If" in value:
         args = value["Fn::If"]
         cond_name = args[0]
+        if not isinstance(cond_name, str):
+            # AWS wants a condition NAME, not an inline condition: CreateStack
+            # answers this for {"Fn::If": [{"Fn::Equals": [...]}, a, b]}
+            # (measured us-east-1, 2026-09-19). Without the check the dict
+            # reaches conditions.get() and raises TypeError: unhashable type.
+            raise ValueError(
+                "Template error: Fn::If requires a list argument with the "
+                "first element being a condition")
         cond_val = conditions.get(cond_name, False)
         branch = args[1] if cond_val else args[2]
         result = _resolve_refs(branch, resources, params, conditions,
