@@ -1680,14 +1680,50 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
+# The extensions AWS publishes from its own accounts and grants
+# lambda:GetLayerVersion on to everyone. Keyed by LAYER NAME, not by publisher
+# account: the name is stable while the account differs in every region, so one
+# short list replaces ~190 account ids that go stale as regions are added.
+_AWS_PUBLISHED_LAYER_PREFIXES = (
+    "LambdaInsightsExtension",
+    "AWS-Parameters-and-Secrets-Lambda-Extension",
+    "AWS-AppConfig-Extension",
+    "AWSOpenTelemetryDistro",
+    "aws-otel-",
+    "AWSSDKPandas-",
+)
+
+
+def _is_aws_published_layer(layer_name: str) -> bool:
+    return layer_name.startswith(_AWS_PUBLISHED_LAYER_PREFIXES)
+
+
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Resolve another account's layer version through its stored grant."""
+    """Resolve another account's layer version through its stored grant.
+
+    An extension AWS publishes itself carries a public grant on AWS, so a
+    template referencing one by the publisher's ARN deploys there. Nothing is
+    stored for an account this emulator never saw, so those are allowed by name
+    instead. The bytes are not available offline: the reference resolves, the
+    attachment reports a CodeSize of 0 and the extension does not run.
+    """
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
     vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
     if vc is not None and _layer_policy_allows(vc, get_account_id()):
         return vc, None
+    if vc is None and _is_aws_published_layer(layer_name):
+        logger.warning(
+            "Layer %s is an AWS-published extension: the reference resolves so "
+            "the stack deploys, but the bytes are not available offline and the "
+            "extension will not run", layer_arn,
+        )
+        return {
+            "LayerVersionArn": layer_arn,
+            "Version": version,
+            "Content": {"CodeSize": 0},
+        }, None
     return _layer_access_denied(layer_arn)
 
 

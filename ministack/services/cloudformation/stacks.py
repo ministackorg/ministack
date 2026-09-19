@@ -78,15 +78,36 @@ def _is_custom_resource(resource_type: str) -> bool:
 # ===========================================================================
 
 
+def _default_resource_policy(res_def, attribute) -> str:
+    """``Delete``, except where AWS documents ``Snapshot`` as the default."""
+    if attribute != "DeletionPolicy":
+        return "Delete"
+    rtype = (res_def or {}).get("Type")
+    props = (res_def or {}).get("Properties") or {}
+    if rtype == "AWS::RDS::DBCluster":
+        return "Retain"
+    if rtype == "AWS::RDS::DBInstance" and not props.get("DBClusterIdentifier"):
+        return "Retain"
+    return "Delete"
+
+
 def _resource_policy(res_def, attribute, resources, params, conditions, mappings,
                      stack_name, stack_id):
     """A resource's ``DeletionPolicy`` / ``UpdateReplacePolicy`` as a string,
-    ``Delete`` when the template sets none. An intrinsic (``Fn::If``) is
-    resolved like a property; one that does not resolve counts as ``Delete``
-    and is logged, since that is the destructive reading."""
+    ``Delete`` when the template sets none, with one documented exception: AWS
+    defaults ``DeletionPolicy`` to ``Snapshot`` for ``AWS::RDS::DBCluster`` and
+    for ``AWS::RDS::DBInstance`` without ``DBClusterIdentifier``
+    (aws-attribute-deletionpolicy.html; captured eu-north-1 2026-09-19, the
+    stack delete left a manual snapshot behind). This emulator takes no
+    snapshots, so those two default to ``Retain``: the data survives the stack
+    delete, which is what Snapshot is for, where ``Delete`` would destroy it.
+
+    An intrinsic (``Fn::If``) is resolved like a property; one that does not
+    resolve counts as ``Delete`` and is logged, since that is the destructive
+    reading."""
     value = (res_def or {}).get(attribute)
     if value is None:
-        return "Delete"
+        return _default_resource_policy(res_def, attribute)
     if isinstance(value, dict):
         try:
             value = _resolve_refs(copy.deepcopy(value), resources, params, conditions,
