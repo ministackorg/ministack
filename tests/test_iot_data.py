@@ -1541,7 +1541,7 @@ def test_iot_rule_sqs_action_missing_queue_does_not_stop_the_rule(
     doc = json.loads(_poll_body(sqs, dlq))
     assert doc["ruleName"] == rule
     assert doc["topic"] == "sensors/a1/telemetry"
-    assert [f["action"] for f in doc["failures"]] == ["sqs"]
+    assert [f["failedAction"] for f in doc["failures"]] == ["SqsAction"]
     assert "QueueDoesNotExist" in doc["failures"][0]["errorMessage"]
 
     iot_client.delete_topic_rule(ruleName=rule)

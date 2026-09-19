@@ -107,6 +107,7 @@ logger = logging.getLogger("signer")
 _jobs = AccountRegionScopedDict()      # jobId -> job record (camelCase fields)
 _profiles = AccountRegionScopedDict()  # profileName -> profile record
 _tokens = AccountRegionScopedDict()    # clientRequestToken -> first StartSigningJob response
+_TOKEN_CACHE_MAX = 1024                # same bound apigateway_v1 uses for its authorizer cache
 
 
 def reset():
@@ -544,8 +545,23 @@ def _start_signing_job(body, headers=None):
     }
     response = {"jobId": job_id, "jobOwner": account}
     if token:
-        _tokens[token] = dict(response)
+        _remember_token(token, response)
     return json_response(response)
+
+
+def _remember_token(token: str, response: dict) -> None:
+    """Record a clientRequestToken's first response so a replay returns it.
+
+    Bounded like ``_AUTHORIZER_CACHE_MAX`` in ``apigateway_v1``: the key is the
+    caller's, so an unbounded map grows with every distinct token and is
+    persisted with the rest of the service state. The oldest entries go first;
+    replaying a token older than the bound re-runs the job, which is the same
+    outcome as never having sent one.
+    """
+    if len(_tokens) >= _TOKEN_CACHE_MAX:
+        for stale in list(_tokens)[: len(_tokens) - _TOKEN_CACHE_MAX + 1]:
+            _tokens.pop(stale, None)
+    _tokens[token] = dict(response)
 
 
 def _describe_signing_job(job_id):

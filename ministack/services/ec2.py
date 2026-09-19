@@ -2393,7 +2393,16 @@ def _parse_ec2_docker_flags(flags: str) -> dict:
     if args.privileged:
         kwargs["privileged"] = True
     if args.env:
-        kwargs["environment"] = dict(e.partition("=")[::2] for e in args.env)
+        # Bare `-e FOO` takes the host value, or is left out if unset: docker's rule.
+        environment = {}
+        for entry in args.env:
+            name, sep, value = entry.partition("=")
+            if sep:
+                environment[name] = value
+            elif name in os.environ:
+                environment[name] = os.environ[name]
+        if environment:
+            kwargs["environment"] = environment
     if args.volume:
         kwargs["volumes"] = args.volume
     if args.cap_add:

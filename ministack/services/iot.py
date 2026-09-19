@@ -2969,9 +2969,8 @@ def _eval_select_function(
             return _MISSING
         return value.replace(old, new)
     if name == "clientid" and not args:
-        # HTTP publishes carry no MQTT client id — AWS resolves clientid() to
-        # Undefined there, so the field is omitted from the projection.
-        return client_id if client_id else _MISSING
+        # Documented as the client id "or n/a if the message wasn't sent over MQTT".
+        return client_id if client_id else "n/a"
     # principal() and traceid() land here too: this publish path carries no
     # certificate identity or trace id to report, so they warn like any other
     # function the evaluator does not implement.
@@ -3757,9 +3756,9 @@ def _jobs_now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _jobs_ms_to_s(millis: int | None) -> float | None:
-    """Millisecond record stamp → epoch-seconds float for `timestamp` shapes."""
-    return None if millis is None else millis / 1000.0
+def _jobs_ms_to_s(millis: int | None) -> int | None:
+    """Millisecond record stamp → whole epoch seconds for `timestamp` shapes."""
+    return None if millis is None else millis // 1000
 
 
 def _jobs_ms_to_long_s(millis: int | None) -> int | None:
@@ -3994,6 +3993,23 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             )
         target_things.update(resolved)
     document = payload.get("document")
+    if isinstance(document, str) and len(document) > 32768:
+        return error_response_json(
+            "InvalidRequestException",
+            "document exceeds the maximum length of 32768", 400,
+        )
+    source = payload.get("documentSource")
+    if isinstance(source, str) and not 1 <= len(source) <= 1350:
+        return error_response_json(
+            "InvalidRequestException",
+            "documentSource must be between 1 and 1350 characters", 400,
+        )
+    if not document and not payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "document is required if you do not specify a value for documentSource",
+            400,
+        )
     if not document and payload.get("documentSource"):
         # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
         # serves its CONTENT to devices. MiniStack does not fetch it — it
@@ -4022,6 +4038,18 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
+        # Modelled CreateJob members stored so DescribeJob echoes them. Storing
+        # is all this does: nothing acts on timeoutConfig or abortConfig, so no
+        # execution reaches TIMED_OUT and nothing aborts.
+        "abortConfig": payload.get("abortConfig"),
+        "timeoutConfig": payload.get("timeoutConfig"),
+        "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
+        "namespaceId": payload.get("namespaceId"),
+        "jobTemplateArn": payload.get("jobTemplateArn"),
+        "documentParameters": payload.get("documentParameters"),
+        "schedulingConfig": payload.get("schedulingConfig"),
+        "destinationPackageVersions": payload.get("destinationPackageVersions"),
+        "tags": payload.get("tags"),
         "snapshotted": False,
     }
     _jobs_materialize_executions(job_id)
@@ -4087,6 +4115,17 @@ def _describe_job(job_id: str) -> tuple:
         job_doc["comment"] = job["comment"]
     if job.get("reasonCode") is not None:
         job_doc["reasonCode"] = job["reasonCode"]
+    if job.get("forceCanceled") is not None:
+        job_doc["forceCanceled"] = job["forceCanceled"]
+    # Members the Job shape models and CreateJob accepted. `tags` is NOT among
+    # them (tags are read through ListTagsForResource), so it is not echoed.
+    for member in (
+        "abortConfig", "timeoutConfig", "jobExecutionsRetryConfig", "namespaceId",
+        "jobTemplateArn", "documentParameters", "schedulingConfig",
+        "destinationPackageVersions",
+    ):
+        if job.get(member) is not None:
+            job_doc[member] = job[member]
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]
@@ -4161,6 +4200,8 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
     force = _qp_bool(qp, "force")
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
+    if force:
+        job["forceCanceled"] = True
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -4248,6 +4289,7 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
             "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
             "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
             "executionNumber": execution["executionNumber"],
+            "retryAttempt": execution.get("retryAttempt", 0),
         }
         if execution.get("startedAt") is not None:
             summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
@@ -5305,7 +5347,10 @@ async def _dispatch_rule_error_action(
         "topic": topic,
         # The emulator's publish path carries no CloudWatch trace id.
         "cloudwatchTraceId": "",
-        "clientId": client_id or "",
+        # Measured: a publish with no MQTT client reports "N/A" here, not "".
+        # Note the casing differs from rule SQL's clientid(), which the SQL
+        # functions reference documents as lowercase "n/a".
+        "clientId": client_id or "N/A",
         "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
         "failures": failures,
     }
@@ -5320,6 +5365,47 @@ async def _dispatch_rule_error_action(
             type(exc).__name__,
             exc,
         )
+
+
+# rule-error-handling.html documents each failures[] entry as failedAction /
+# failedResource / errorMessage. failedResource is "the name of the resource"
+# the action targeted, which is a different member per action type.
+_RULE_ACTION_RESOURCE_KEYS = {
+    "dynamoDBv2": ("putItem", "tableName"),
+    "sns": ("targetArn",),
+    "sqs": ("queueUrl",),
+    "republish": ("topic",),
+    "lambda": ("functionArn",),
+}
+
+
+def _rule_action_name(action_type: str) -> str:
+    """The errorAction document's ``failedAction`` string for an action type.
+
+    Measured: a dynamoDBv2 failure reports ``DynamoDBv2Action`` (real account,
+    eu-north-1, 2026-09-19), and rule-error-handling.html's own example is
+    ``S3Action``. Both are the payload key with its first letter upper-cased and
+    ``Action`` appended, so the same transform covers the rest.
+    """
+    if not action_type:
+        return ""
+    return action_type[0].upper() + action_type[1:] + "Action"
+
+
+def _rule_action_resource(action: dict, action_type: str) -> str:
+    """The resource an action names, for the errorAction document's
+    ``failedResource``. Empty when the action type does not name one."""
+    spec = action.get(action_type)
+    if not isinstance(spec, dict):
+        return ""
+    for key in _RULE_ACTION_RESOURCE_KEYS.get(action_type, ()):
+        value = spec.get(key)
+        if isinstance(value, dict):
+            spec = value
+            continue
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 async def _run_rule_actions(
@@ -5369,9 +5455,11 @@ async def _run_rule_actions(
                 type(exc).__name__,
                 exc,
             )
-            failures.append(
-                {"action": action_type, "errorMessage": f"{type(exc).__name__}: {exc}"}
-            )
+            failures.append({
+                "failedAction": _rule_action_name(action_type),
+                "failedResource": _rule_action_resource(action, action_type),
+                "errorMessage": f"{type(exc).__name__}: {exc}",
+            })
     if failures:
         await _dispatch_rule_error_action(
             account_id, region, rule, topic, payload, client_id, failures

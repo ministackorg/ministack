@@ -263,6 +263,14 @@ def recall_result(physical_id: str) -> dict:
         return dict(_results.get(physical_id, {}))
 
 
+def forget_result(physical_id: str) -> None:
+    """Drop a completed wait condition's attributes. Kept until the resource is
+    deleted because an update returns what the create produced; without this the
+    map only ever grew."""
+    with _lock:
+        _results.pop(physical_id, None)
+
+
 def reset():
     global _generation
     with _changed:

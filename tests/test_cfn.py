@@ -21664,8 +21664,11 @@ def test_cfn_rules_cdk_check_bootstrap_version(cfn, ssm):
 def test_cfn_rules_condition_and_list_functions(cfn):
     """A rule whose RuleCondition is false is skipped; Fn::Contains,
     Fn::EachMemberEquals and Fn::EachMemberIn see a CommaDelimitedList
-    parameter as a list of trimmed members; Fn::And, Fn::Or, Fn::Equals and
-    Fn::If nest; the pseudo parameters resolve."""
+    parameter as a list of trimmed members; Fn::And, Fn::Or and Fn::Equals
+    nest; the pseudo parameters resolve. Fn::If is deliberately absent: a real
+    account refuses it in the Rules block ("Following functions are not
+    supported in the Rules block of the template: [Fn::If]", us-east-1
+    2026-09-19), even though the resource reference lists it."""
     uid = _uuid_mod.uuid4().hex[:8]
     params = {
         "Env": {"Type": "String", "Default": "test"},
@@ -21690,9 +21693,7 @@ def test_cfn_rules_condition_and_list_functions(cfn):
             {"Fn::Or": [{"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]},
                         {"Fn::Equals": [{"Ref": "AWS::AccountId"}, "000000000000"]}]},
             {"Fn::Not": [{"Fn::Equals": [{"Ref": "AWS::Partition"}, "aws-cn"]}]},
-            {"Fn::Contains": [{"Ref": "Zones"},
-                              {"Fn::If": [{"Fn::Equals": [{"Ref": "Env"}, "test"]},
-                                          "us-east-1b", "us-east-1z"]}]},
+            {"Fn::Contains": [{"Ref": "Zones"}, "us-east-1b"]},
         ]}}]},
     }
     body = _rules_template(rules, params)

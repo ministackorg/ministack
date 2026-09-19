@@ -6342,6 +6342,9 @@ def _find_layer_version(
 # rejected with PreconditionFailedException (412) rather than silently
 # clobbering a policy that changed underneath them.
 _LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+# The other two modeled constraints on AddLayerVersionPermission.
+_LAYER_ORG_ID_RE = re.compile(r"^o-[a-z0-9]{10,32}$")
+_LAYER_STATEMENT_ID_RE = re.compile(r"^[a-zA-Z0-9\-_]{1,100}$")
 
 
 def _layer_policy_revision_id(vc: dict) -> str:
@@ -6434,12 +6437,28 @@ def _add_layer_version_permission(
             "The principal must be * when an organization id is provided.",
             400,
         )
+    if org_id and not _LAYER_ORG_ID_RE.match(org_id):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{org_id}' at 'organizationId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"o-[a-z0-9]{10,32}",
+            400,
+        )
 
     err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
     sid = data.get("StatementId", "")
+    if not _LAYER_STATEMENT_ID_RE.match(sid):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{sid}' at 'statementId' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            r"([a-zA-Z0-9-_]+)",
+            400,
+        )
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
     for s in policy["Statement"]:
         if s.get("Sid") == sid:
