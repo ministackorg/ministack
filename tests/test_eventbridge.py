@@ -5630,3 +5630,94 @@ def test_eventbridge_dotted_key_rule_delivers_to_sqs(eb, sqs):
     assert len(msgs.get("Messages", [])) == 1
     body = json.loads(msgs["Messages"][0]["Body"])
     assert body["detail"]["name"] == "dotted.ping"
+
+
+@pytest.mark.parametrize("input_mode", ["Input", "InputPath", "InputTransformer"])
+@pytest.mark.parametrize("topic_path", ["topicKey", "topicKeys[0]"])
+def test_eventbridge_api_destination_dynamic_http_parameters_use_original_event(eb, input_mode, topic_path):
+    """AWS resolves HttpParameters before body transformation (verified on a real bus)."""
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    server, captured = _start_api_dest_capture_server()
+    try:
+        prefix = "$.detail.fullDocument.payload"
+        http_parameters = {
+            "PathParameterValues": [prefix + "." + topic_path],
+            "HeaderParameters": {
+                "X-Subscriber": prefix + ".subscriberId",
+                "X-Missing": prefix + ".missing",
+                "X-Precedence": prefix + ".subscriberId",
+                "X-Literal": "literal-$.detail.value",
+                "X-Count": prefix + ".count",
+                "X-Active": prefix + ".active",
+                "X-Null": prefix + ".nil",
+                "X-Object": prefix + ".object",
+                "X-Topics": prefix + ".topicKeys[*]",
+            },
+            "QueryStringParameters": {
+                "subscriber": prefix + ".subscriberId",
+                "missing": prefix + ".missing",
+                "precedence": prefix + ".subscriberId",
+                "literal": "fixed",
+                "topics": prefix + ".topicKeys[*]",
+            },
+        }
+        body_options = {
+            "Input": {"Input": '{"constant":true}'},
+            "InputPath": {"InputPath": prefix + ".body"},
+            "InputTransformer": {"InputTransformer": {
+                "InputPathsMap": {"subscriber": prefix + ".subscriberId"},
+                "InputTemplate": '{"subscriptions":[{"subscriberId":<subscriber>}]}'
+            }},
+        }
+        slug = "dynamic-" + input_mode.lower() + ("-index" if "[" in topic_path else "-field")
+        bus, source = _api_dest_pipeline(
+            eb, slug,
+            f"http://127.0.0.1:{server.server_address[1]}/v2/topics/*/subscriptions",
+            "API_KEY", {
+                "ApiKeyAuthParameters": {"ApiKeyName": "X-Key", "ApiKeyValue": "test"},
+                "InvocationHttpParameters": {
+                    "HeaderParameters": [{"Key": "X-Precedence", "Value": "connection"}],
+                    "QueryStringParameters": [{"Key": "precedence", "Value": "connection"}],
+                },
+            },
+            target_extras={"HttpParameters": http_parameters, **body_options[input_mode]},
+        )
+        # Reuse the same target for different events: resolution must not mutate it.
+        for i in range(2):
+            subscriber = f"alice-{i}"
+            topic = f"venue:{i}"
+            payload = {
+                "subscriberId": subscriber, "topicKey": topic, "topicKeys": [topic, "artist:2"],
+                "count": 42, "active": False, "nil": None, "object": {"key": "value"},
+                "body": {"selected": True},
+            }
+            assert eb.put_events(Entries=[{
+                "Source": source, "DetailType": "MongoDB Database Trigger",
+                "Detail": json.dumps({"fullDocument": {"payload": payload}}), "EventBusName": bus,
+            }])["FailedEntryCount"] == 0
+            assert _wait_until(lambda: len(captured) > i)
+            request = captured[i]
+            url = urlsplit(request["path"])
+            assert unquote(url.path) == f"/v2/topics/{topic}/subscriptions"
+            assert parse_qs(url.query, keep_blank_values=True) == {
+                "subscriber": [subscriber], "missing": [""], "precedence": ["connection"],
+                "literal": ["fixed"], "topics": [f"[{topic},artist:2]"],
+            }
+            expected_headers = {
+                "x-subscriber": subscriber, "x-missing": "", "x-precedence": "connection",
+                "x-literal": "literal-$.detail.value", "x-count": "42", "x-active": "false",
+                "x-null": "null", "x-object": "{key:value}", "x-topics": f"[{topic},artist:2]",
+            }
+            for name, value in expected_headers.items():
+                assert request["headers"][name] == value
+            expected_body = {
+                "Input": {"constant": True}, "InputPath": {"selected": True},
+                "InputTransformer": {"subscriptions": [{"subscriberId": subscriber}]},
+            }[input_mode]
+            assert json.loads(request["body"]) == expected_body
+        assert eb.list_targets_by_rule(
+            Rule="qa-eb-apidest-" + slug + "-rule", EventBusName=bus,
+        )["Targets"][0]["HttpParameters"] == http_parameters
+    finally:
+        server.shutdown()

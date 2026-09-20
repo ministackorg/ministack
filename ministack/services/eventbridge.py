@@ -2258,7 +2258,10 @@ def _invoke_target(target, event, rule, view=None):
             return
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
-            _dispatch_to_api_destination(spec, event_payload, target)
+            http_parameters = _resolve_http_parameters(
+                target.get("HttpParameters") or {}, view.event_with_detail()
+            )
+            _dispatch_to_api_destination(spec, event_payload, {**target, "HttpParameters": http_parameters})
         elif spec.service == "events":
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
@@ -2603,6 +2606,58 @@ def _connection_params_map(params) -> dict:
         if key:
             out[key] = item.get("Value", "")
     return out
+
+
+_HTTP_JSON_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_/*-]+|\[(?:[0-9]+|\*)\])*")
+_HTTP_JSON_PATH_TOKEN = re.compile(r"\.([A-Za-z0-9_/*-]+)|\[([0-9]+|\*)\]")
+
+
+def _resolve_http_parameter(value, event):
+    """Resolve a whole JSON path; literal strings are not interpolated.
+
+    AWS uses the original event, renders missing matches as an empty string,
+    and strips JSON quotes from structured values in HTTP parameters.
+    """
+    if not _HTTP_JSON_PATH.fullmatch(value):
+        return value
+    nodes = [event]
+    multiple = False
+    for field, index in _HTTP_JSON_PATH_TOKEN.findall(value):
+        selected = []
+        wildcard = field == "*" or index == "*"
+        multiple = multiple or wildcard
+        for node in nodes:
+            if wildcard:
+                if isinstance(node, dict):
+                    selected.extend(node.values())
+                elif isinstance(node, list):
+                    selected.extend(node)
+            elif field and isinstance(node, dict) and field in node:
+                selected.append(node[field])
+            elif index and isinstance(node, list) and int(index) < len(node):
+                selected.append(node[int(index)])
+        nodes = selected
+    if not nodes:
+        return ""
+    result = nodes if multiple else nodes[0]
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, separators=(",", ":"), ensure_ascii=False).replace('"', "")
+
+
+def _resolve_http_parameters(parameters, event):
+    # Construct fresh containers: targets are reused by subsequent events and
+    # concurrent deliveries. Header/query names are always literal.
+    result = dict(parameters)
+    for field in ("HeaderParameters", "QueryStringParameters"):
+        if field in parameters:
+            result[field] = {key: _resolve_http_parameter(value, event)
+                             for key, value in parameters[field].items()}
+    if "PathParameterValues" in parameters:
+        result["PathParameterValues"] = [
+            _resolve_http_parameter(value, event) for value in parameters["PathParameterValues"]
+        ]
+    return result
 
 
 def _apply_path_parameters(url: str, values) -> str:
