@@ -2513,6 +2513,10 @@ async def app(scope, receive, send):
         else:
             headers[key] = decoded
 
+    # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
+    if scope.get("scheme") == "https":
+        headers.setdefault("x-forwarded-proto", "https")
+
     request_id = str(uuid.uuid4())
 
     # If a /_ministack/reset is in flight, wait for it to finish before

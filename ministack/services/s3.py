@@ -2812,6 +2812,53 @@ def _get_bucket_notification(name: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
+def _generated_notification_id() -> str:
+    """AWS auto-generates an omitted notification Id as base64 of a UUID: the
+    reported sample decodes to 98c3a7f8-db28-4cea-8b36-b7c6f3928f1a, 48 chars
+    with no padding because a 36-char UUID divides by 3."""
+    return base64.b64encode(new_uuid().encode()).decode().rstrip("=")
+
+
+def _notification_configs_to_xml(configs, has_eventbridge: bool) -> str:
+    """The canonical wire form of a notification configuration.
+
+    Element names come from the S3 model's locationName, which is what every
+    AWS SDK reads: LambdaFunctionConfigurations -> CloudFunctionConfiguration
+    and LambdaFunctionArn -> CloudFunction. Storing whatever spelling the
+    caller happened to send means a GET only parses for that same client.
+    """
+    root = Element("NotificationConfiguration", xmlns=S3_NS)
+    wire = {
+        "sqs": ("QueueConfiguration", "Queue"),
+        "sns": ("TopicConfiguration", "Topic"),
+        "lambda": ("CloudFunctionConfiguration", "CloudFunction"),
+    }
+    for config in configs or []:
+        names = wire.get(config.get("type"))
+        if not names:
+            continue
+        cfg_tag, arn_tag = names
+        cfg_el = SubElement(root, cfg_tag)
+        if config.get("id"):
+            SubElement(cfg_el, "Id").text = str(config["id"])
+        SubElement(cfg_el, arn_tag).text = str(config.get("arn", ""))
+        for event in config.get("events") or []:
+            SubElement(cfg_el, "Event").text = str(event)
+        rules = [("prefix", config.get("filter_prefix")),
+                 ("suffix", config.get("filter_suffix"))]
+        if any(value is not None for _name, value in rules):
+            s3key_el = SubElement(SubElement(cfg_el, "Filter"), "S3Key")
+            for name, value in rules:
+                if value is None:
+                    continue
+                rule_el = SubElement(s3key_el, "FilterRule")
+                SubElement(rule_el, "Name").text = name
+                SubElement(rule_el, "Value").text = value
+    if has_eventbridge:
+        SubElement(root, "EventBridgeConfiguration")
+    return tostring(root, encoding="unicode")
+
+
 def _put_bucket_notification(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
@@ -2821,7 +2868,8 @@ def _put_bucket_notification(name: str, body: bytes):
     validation_error = _validate_notification_configs(configs, bucket_region)
     if validation_error:
         return validation_error
-    _bucket_notifications[name] = raw
+    _bucket_notifications[name] = _notification_configs_to_xml(
+        configs, "EventBridgeConfiguration" in raw)
     # Fire the s3:TestEvent synchronously so it's delivered before PutBucketNotification
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
@@ -3110,7 +3158,8 @@ def _parse_notification_config_raw(raw: str | None) -> list[dict]:
                 continue
 
             id_el = _find_xml_tag(cfg_el, "Id")
-            config_id = id_el.text if id_el is not None and id_el.text else new_uuid()
+            config_id = (id_el.text if id_el is not None and id_el.text
+                         else _generated_notification_id())
 
             events: list[str] = []
             for ev_el in list(cfg_el.findall(f"{{{S3_NS}}}Event")) + list(cfg_el.findall("Event")):

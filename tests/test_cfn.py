@@ -23964,3 +23964,57 @@ def test_cfn_language_extensions_condition_from_an_intrinsic(cfn, ssm):
             ssm.get_parameter(Name=prefix + "/beta")
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_s3_bucket_lambda_notification_reads_back(cfn, s3, lam):
+    """An AWS::S3::Bucket NotificationConfiguration with a LambdaConfigurations
+    entry has to be readable through GetBucketNotificationConfiguration. The CFN
+    property names differ from the API's (Function, singular Event), and the wire
+    element names differ again -- the S3 model spells the lambda list
+    CloudFunctionConfiguration -- so a config could be stored and delivered yet
+    come back empty to every SDK."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-s3-notif-{uid}"
+    bucket = f"cfn-s3-notif-{uid}"
+    fn_name = f"cfn-s3-notif-{uid}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {}\n")
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    template = json.dumps({"Resources": {
+        "Permission": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceAccount": {"Ref": "AWS::AccountId"}}},
+        "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {
+            "BucketName": bucket,
+            "NotificationConfiguration": {"LambdaConfigurations": [{
+                "Function": {"Fn::Sub":
+                             "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:"
+                             f"function:{fn_name}"},
+                "Event": "s3:ObjectCreated:*",
+                "Filter": {"S3Key": {"Rules": [{"Name": "prefix", "Value": "in/"}]}},
+            }]}}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        configs = s3.get_bucket_notification_configuration(
+            Bucket=bucket)["LambdaFunctionConfigurations"]
+        assert len(configs) == 1, configs
+        assert configs[0]["LambdaFunctionArn"].endswith(f"function:{fn_name}")
+        assert configs[0]["Events"] == ["s3:ObjectCreated:*"]
+        assert configs[0]["Id"]
+        assert configs[0]["Filter"]["Key"]["FilterRules"] == [
+            {"Name": "prefix", "Value": "in/"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn_name)
+        except ClientError:
+            pass
