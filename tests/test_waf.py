@@ -764,7 +764,7 @@ def test_wafv2_restore_legacy_state_canonicalizes_cloudfront_arns_direct(direct_
 
 def test_wafv2_cloudformation_uses_canonical_web_acl_records_direct(direct_waf_scope):
     set_request_region("us-west-2")
-    uid, attrs = cfn_provisioners._waf_web_acl_create(
+    physical_id, attrs = cfn_provisioners._waf_web_acl_create(
         "Acl",
         {
             "Name": "cfn-cf-acl",
@@ -779,6 +779,8 @@ def test_wafv2_cloudformation_uses_canonical_web_acl_records_direct(direct_waf_s
         },
         "stack",
     )
+    uid = attrs["Id"]
+    assert physical_id == f"cfn-cf-acl|{uid}|CLOUDFRONT"
     assert attrs["Arn"] == (
         f"arn:aws:wafv2:us-east-1:000000000000:global/webacl/cfn-cf-acl/{uid}"
     )
@@ -787,7 +789,7 @@ def test_wafv2_cloudformation_uses_canonical_web_acl_records_direct(direct_waf_s
     ] == attrs["Arn"]
     assert waf_service._waf_tags[attrs["Arn"]] == [{"Key": "from", "Value": "cfn"}]
 
-    cfn_provisioners._waf_web_acl_delete(uid, {"Scope": "CLOUDFRONT"})
+    cfn_provisioners._waf_web_acl_delete(physical_id, {"Scope": "CLOUDFRONT"})
     assert waf_service._web_acls.get_scoped("000000000000", "us-east-1", uid) is None
     assert attrs["Arn"] not in waf_service._waf_tags
 
