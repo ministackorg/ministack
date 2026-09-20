@@ -10,6 +10,7 @@ Supports: RequestCertificate, DescribeCertificate, ListCertificates,
 """
 
 import copy
+import datetime
 import hashlib
 import json
 import logging
@@ -130,11 +131,16 @@ def _future_iso(seconds):
 
 
 def _epoch(iso_or_epoch):
-    """Convert ISO timestamp to epoch float if needed. ACM API returns epoch floats."""
+    """Convert ISO timestamp to epoch float if needed. ACM API returns epoch
+    floats. The seconds-only format this used to parse does not match the
+    millisecond timestamps ``now_iso`` writes, so ``CreatedAt`` and
+    ``IssuedAt`` fell through to the fallback and every certificate answered
+    the time of the call, which made each read look like a fresh issue."""
     if isinstance(iso_or_epoch, (int, float)):
         return float(iso_or_epoch)
     try:
-        return time.mktime(time.strptime(iso_or_epoch, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        return datetime.datetime.fromisoformat(
+            str(iso_or_epoch).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return time.time()
 

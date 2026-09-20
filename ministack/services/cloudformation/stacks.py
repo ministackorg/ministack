@@ -20,6 +20,7 @@ from .engine import (
     _topological_sort,
 )
 from .provisioners import (
+    _DEFERRED_PREDECESSOR_DELETES,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
     _delete_resource,
@@ -371,6 +372,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
                     stack_name, stack_id, logical_id)
+                pending_deletes = []
+                deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
                 try:
                     if _is_custom_resource(resource_type):
                         physical_id, attrs = await run_reentrant(
@@ -383,14 +386,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
+                    _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
-                if physical_id != old_pid:
-                    # A changed physical id is a replacement. Real
-                    # CloudFormation deletes the predecessor in the
-                    # UPDATE_COMPLETE_CLEANUP phase; without this the old
-                    # resource leaked forever, still holding its data.
+                if physical_id != old_pid or pending_deletes:
+                    # A changed physical id, or a predecessor delete the
+                    # handler queued, is a replacement. Real CloudFormation
+                    # deletes the predecessor in the UPDATE_COMPLETE_CLEANUP
+                    # phase and keeps it when the update rolls back.
                     replaced_resources.append(
-                        (logical_id, resource_type, old_pid, old_props))
+                        (logical_id, resource_type, old_pid, physical_id,
+                         old_props, pending_deletes))
             else:
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
@@ -428,10 +433,35 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         _add_event(stack_id, stack_name, logical_id, resource_type,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
+    resolved_outputs: list = []
+    new_exports: dict = {}
+    if not failed:
+        try:
+            # A resource the update removes is still recorded here (its delete
+            # runs below); an output that reads it must fail, as on AWS.
+            surviving = {k: v for k, v in provisioned_resources.items() if k not in to_remove}
+            resolved_outputs, new_exports = _resolve_stack_outputs(
+                outputs_defs, conditions, surviving, param_values,
+                mappings, stack_name, stack_id)
+        except Exception as exc:
+            # An output that cannot be resolved -- typically Fn::GetAtt to an
+            # attribute the resource does not expose -- fails the operation
+            # after every resource was created. Real CloudFormation rolls back
+            # at exactly this point, with the resolution error as the reason.
+            logger.error("Failed to resolve outputs of %s: %s", stack_name, exc)
+            failed = True
+            fail_reason = str(exc)
+            _add_event(stack_id, stack_name, stack_name,
+                       "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
+                       fail_reason, stack_id)
+
     # Replacement cleanup (update case): delete each replaced resource's
-    # predecessor, as real CloudFormation does after UPDATE_COMPLETE.
+    # predecessor, as real CloudFormation does after UPDATE_COMPLETE, in
+    # reverse order so a dependent goes before what it depends on. Nothing
+    # is deleted before this point, so a rollback keeps the old resources.
     if not failed and replaced_resources:
-        for logical_id, rtype, old_pid, old_props in replaced_resources:
+        for (logical_id, rtype, old_pid, new_pid, old_props,
+             pending_deletes) in reversed(replaced_resources):
             policy = _resource_policy(
                 resources_defs.get(logical_id), "UpdateReplacePolicy",
                 provisioned_resources, param_values, conditions, mappings,
@@ -439,10 +469,17 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if policy in _RETAINING_POLICIES:
                 # The predecessor leaves CloudFormation's scope and keeps
                 # existing, as on AWS (a DELETE_SKIPPED event, no delete call).
-                _add_event(stack_id, stack_name, logical_id, rtype,
-                           "DELETE_SKIPPED", physical_id=old_pid)
+                if new_pid != old_pid:
+                    _add_event(stack_id, stack_name, logical_id, rtype,
+                               "DELETE_SKIPPED", physical_id=old_pid)
                 continue
             try:
+                # The handler's own delete first: it knows the old record's
+                # key where the physical id does not carry it.
+                for delete_fn, args, kwargs in pending_deletes:
+                    delete_fn(*args, **kwargs)
+                if new_pid == old_pid:
+                    continue
                 if _is_custom_resource(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, old_pid, old_props,
@@ -505,25 +542,6 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     await asyncio.sleep(0)
 
-    resolved_outputs: list = []
-    new_exports: dict = {}
-    if not failed:
-        try:
-            resolved_outputs, new_exports = _resolve_stack_outputs(
-                outputs_defs, conditions, provisioned_resources, param_values,
-                mappings, stack_name, stack_id)
-        except Exception as exc:
-            # An output that cannot be resolved -- typically Fn::GetAtt to an
-            # attribute the resource does not expose -- fails the operation
-            # after every resource was created. Real CloudFormation rolls back
-            # at exactly this point, with the resolution error as the reason.
-            logger.error("Failed to resolve outputs of %s: %s", stack_name, exc)
-            failed = True
-            fail_reason = str(exc)
-            _add_event(stack_id, stack_name, stack_name,
-                       "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
-                       fail_reason, stack_id)
-
     if failed:
         if disable_rollback:
             stack["StackStatus"] = f"{status_prefix}_FAILED"
@@ -545,19 +563,22 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 previous_stack.get("_resources", {})
                 if is_update and previous_stack else {}
             )
+            replaced_ids = {entry[0] for entry in replaced_resources}
             for logical_id in reversed(created_in_this_run):
                 res = provisioned_resources.get(logical_id, {})
                 rtype = res.get("ResourceType", "")
                 pid = res.get("PhysicalResourceId", "")
                 res_props = res.get("Properties", {})
                 prev = previous_resources.get(logical_id)
-                if prev is not None and prev.get("PhysicalResourceId") == pid:
+                if (prev is not None and prev.get("PhysicalResourceId") == pid
+                        and logical_id not in replaced_ids):
                     # The resource existed before this update and kept its
                     # identity (untouched, or updated in place), so it is not
                     # something this run created: deleting it would destroy a
                     # resource the restored stack still records. Only new
-                    # resources and replacements under a new physical id are
-                    # undone. An in-place change is not reverted here.
+                    # resources and replacements are undone, a replacement
+                    # under an unchanged id by its new properties. An in-place
+                    # change is not reverted here.
                     continue
                 policy = _resource_policy(
                     resources_defs.get(logical_id), "DeletionPolicy",
