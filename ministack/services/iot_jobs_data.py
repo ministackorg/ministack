@@ -8,8 +8,8 @@ Implements the device-side REST surface of AWS IoT Jobs:
 
 Routing reaches us either through credential-scope detection (the SDK signs
 requests with the ``iot-jobs-data`` scope — botocore signingName) or via the
-host pattern ``{prefix}.jobs.iot.{region}.{host}``, which is what
-``DescribeEndpoint(endpointType='iot:Jobs')`` hands out.
+host pattern ``{prefix}.jobs.iot.{region}.{host}``, the shape of the legacy
+``iot:Jobs`` endpoint.
 
 This module is a wire adapter: it parses requests, shapes responses, and logs.
 The job store, the execution store, and every rule of the execution state

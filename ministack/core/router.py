@@ -333,9 +333,9 @@ SERVICE_PATTERNS = {
     # routing would otherwise swallow it — and on the `iot` control plane
     # `GET /things/{t}/jobs` is a DIFFERENT operation (ListJobExecutionsForThing)
     # that answers with a different envelope. The pattern must cover both host
-    # spellings: `DescribeEndpoint(endpointType='iot:Jobs')` hands out
-    # `{prefix}.jobs.iot.{region}.{host}`, while the AWS Device SDK's jobs
-    # topics document `{prefix}.data.jobs.iot.{region}.{host}`. The SDK also
+    # spellings: `{prefix}.jobs.iot.{region}.{host}`, the legacy iot:Jobs
+    # endpoint, and `{prefix}.data.jobs.iot.{region}.{host}`, which the AWS
+    # Device SDK's jobs topics document. The SDK also
     # signs with credential scope `iot-jobs-data` (botocore signingName), which
     # the scope early-return resolves via this key.
     "iot-jobs-data": {
