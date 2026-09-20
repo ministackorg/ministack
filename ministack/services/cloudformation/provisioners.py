@@ -669,6 +669,8 @@ _CUSTOM_NAME_REPLACEMENT = {
         "requires_replacement": lambda old, new: (
             old.get("TemplateType", "FLEET_PROVISIONING")
             != new.get("TemplateType", "FLEET_PROVISIONING")
+        ),
+    },
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
     # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
@@ -8837,15 +8839,30 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 
+def _waf_web_acl_parts(physical_id, props):
+    """The ``name, id, scope`` a web ACL's physical id carries. A physical id
+    written before the Ref carried all three is the bare id, so its scope has
+    to come from the template."""
+    parts = str(physical_id).split("|")
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    return "", str(physical_id), props.get("Scope", "REGIONAL")
+
+
 def _waf_web_acl_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    scope = props.get("Scope", "REGIONAL")
-    uid, arn, _record = _waf.create_web_acl_record(name, scope, props)
-    return uid, {"Arn": arn, "Id": uid}
+    uid, arn, record = _waf.create_web_acl_record(
+        name, props.get("Scope", "REGIONAL"), props)
+    # Ref is "name|id|scope", not the bare id: "The Ref for the resource,
+    # containing the resource name, physical ID, and scope, formatted as
+    # follows: name|id|scope" (aws-resource-wafv2-webacl). The scope comes
+    # from the record, which normalised it.
+    return f"{name}|{uid}|{record['Scope']}", {"Arn": arn, "Id": uid}
 
 
 def _waf_web_acl_delete(physical_id, props):
-    _waf.delete_web_acl_record(physical_id, props.get("Scope", "REGIONAL"))
+    _name, uid, scope = _waf_web_acl_parts(physical_id, props)
+    _waf.delete_web_acl_record(uid, scope)
 
 
 def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
@@ -8869,7 +8886,9 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
     # asks for: the store is keyed by the scope's home region, so the new
     # scope addresses a different store. _waf_web_acl_delete reads old_props
     # for the same reason.
-    acl = _waf.web_acl_record(physical_id, old_props.get("Scope", "REGIONAL"))
+    # The physical id is "name|id|scope"; the store is keyed by the id alone.
+    _old_name, acl_id, acl_scope = _waf_web_acl_parts(physical_id, old_props)
+    acl = _waf.web_acl_record(acl_id, acl_scope)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         name, acl.get("Name") if acl else None,
@@ -8887,7 +8906,7 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
         return created
 
     _waf.update_web_acl_record(acl, new_props)
-    return physical_id, {"Arn": acl["ARN"], "Id": physical_id}
+    return physical_id, {"Arn": acl["ARN"], "Id": acl_id}
 
 
 # ---------------------------------------------------------------------------

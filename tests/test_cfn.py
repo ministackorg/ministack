@@ -5335,7 +5335,8 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             },
         },
         "Outputs": {
-            "AclId": {"Value": {"Ref": "Acl"}},
+            "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
         },
     }
@@ -5349,6 +5350,10 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             f"arn:aws:wafv2:{arn_region}:000000000000:"
             f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
         )
+        # Ref carries all three, not the bare id: "The Ref for the resource,
+        # containing the resource name, physical ID, and scope, formatted as
+        # follows: name|id|scope" (aws-resource-wafv2-webacl).
+        assert outputs["AclRef"] == f"{acl_name}|{outputs['AclId']}|{scope}"
         acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
         assert outputs["AclArn"] in {acl["ARN"] for acl in acls}
         tags = wafv2.list_tags_for_resource(ResourceARN=outputs["AclArn"])
@@ -6520,6 +6525,7 @@ def _cfn_web_acl_template(uid, description, scope="REGIONAL", metric="cfnacl"):
         },
         "Outputs": {
             "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
         },
     })
@@ -6538,14 +6544,16 @@ def test_cfn_wafv2_web_acl_update_keeps_its_id_and_arn(cfn, wafv2):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        acl_id = _output(stack, "AclRef")
+        acl_id = _output(stack, "AclId")
+        acl_ref = _output(stack, "AclRef")
         acl_arn = _output(stack, "AclArn")
 
         cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_web_acl_template(
             uid, "after", metric="cfnaclrenamed"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "AclRef") == acl_id
+        assert _output(stack, "AclRef") == acl_ref
+        assert _output(stack, "AclId") == acl_id
         assert _output(stack, "AclArn") == acl_arn
         acl = wafv2.get_web_acl(Name=f"cfn-acl-{uid}", Scope="REGIONAL",
                                 Id=acl_id)["WebACL"]
@@ -7037,7 +7045,7 @@ def test_cfn_replacing_change_under_custom_name_fails_loudly(
             _cfn_web_acl_template(uid, "d"),
             _cfn_web_acl_template(uid, "d", scope="CLOUDFRONT"),
             lambda st: [a["Id"] for a in wafv2.list_web_acls(Scope="REGIONAL")["WebACLs"]
-                        if a["Name"] == f"cfn-acl-{uid}"] == [_output(st, "AclRef")],
+                        if a["Name"] == f"cfn-acl-{uid}"] == [_output(st, "AclId")],
             True),
         "vault_key": (
             _cfn_backup_template(uid, 1, "a"),
@@ -7107,6 +7115,7 @@ def _cfn_auto_named_template(uid, *, lb_type="application", port=80,
             "LbRef": {"Value": {"Ref": "LB"}},
             "TgRef": {"Value": {"Ref": "TG"}},
             "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
         },
     })
 
@@ -7127,7 +7136,7 @@ def test_cfn_replacing_property_replaces_an_auto_named_resource(
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         lb_arn = _output(stack, "LbRef")
         tg_arn = _output(stack, "TgRef")
-        acl_id = _output(stack, "AclRef")
+        acl_id = _output(stack, "AclId")
 
         cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_auto_named_template(
             uid, lb_type="network", port=8080, scope="CLOUDFRONT"))
@@ -7135,7 +7144,7 @@ def test_cfn_replacing_property_replaces_an_auto_named_resource(
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         new_lb = _output(stack, "LbRef")
         new_tg = _output(stack, "TgRef")
-        new_acl = _output(stack, "AclRef")
+        new_acl = _output(stack, "AclId")
         assert new_lb != lb_arn
         assert new_tg != tg_arn
         assert new_acl != acl_id
