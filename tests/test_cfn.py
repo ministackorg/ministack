@@ -13036,6 +13036,69 @@ def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_gateway_response_applies_with_its_deployment(cfn, apigw_v1):
+    """A GatewayResponse reaches the data plane through the Deployment that
+    depends on it; updating only the response leaves the deployed one in effect."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    stack_name = f"intg-cfn-gateway-response-deploy-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(marker):
+        return json.dumps({
+            "Resources": {
+                "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": stack_name}},
+                "Method": {
+                    "Type": "AWS::ApiGateway::Method",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "ResourceId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                        "HttpMethod": "GET",
+                        "AuthorizationType": "NONE",
+                        "Integration": {"Type": "MOCK"},
+                    },
+                },
+                "Response": {
+                    "Type": "AWS::ApiGateway::GatewayResponse",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "ResponseType": "MISSING_AUTHENTICATION_TOKEN",
+                        "ResponseParameters": {"gatewayresponse.header.X-Cfn": f"'{marker}'"},
+                    },
+                },
+                "Deploy": {
+                    "Type": "AWS::ApiGateway::Deployment",
+                    "DependsOn": ["Method", "Response"],
+                    "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "s1"},
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+        })
+
+    def marker(api_id):
+        req = urllib.request.Request(f"http://localhost:{port}/_aws/execute-api/{api_id}/s1/nope")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=30)
+        assert exc.value.code == 403
+        return exc.value.headers.get("X-Cfn")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = stack["Outputs"][0]["OutputValue"]
+        assert marker(api_id) == "v1"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        response = apigw_v1.get_gateway_response(restApiId=api_id, responseType="MISSING_AUTHENTICATION_TOKEN")
+        assert response["responseParameters"] == {"gatewayresponse.header.X-Cfn": "'v2'"}
+        assert marker(api_id) == "v1"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
     """DocumentationPart supports create, update, replacement, Ref, and delete.
 

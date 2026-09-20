@@ -1265,10 +1265,12 @@ async def _handle_post_body_shortcuts(
             logging.getLogger("cloudformation").warning("CFN ResponseURL PUT for unknown token %r — ignoring", token)
         return 200, {}, b""
 
-    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS)
-    from ministack.services.cloudformation import wait_conditions as _cfn_wc
+    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS).
+    # The literal keeps the import behind the check; above it, the first request
+    # to any service pulled in the whole CloudFormation package.
+    if method == "PUT" and path.startswith("/_ministack/cfn-signal/"):
+        from ministack.services.cloudformation import wait_conditions as _cfn_wc
 
-    if method == "PUT" and path.startswith(_cfn_wc.SIGNAL_PATH):
         token = path[len(_cfn_wc.SIGNAL_PATH) :]
         if not _cfn_wc.has_handle(token):
             logging.getLogger("cloudformation").warning("CFN wait condition signal for unknown token %r", token)
@@ -1879,7 +1881,8 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
-    headers["x-amzn-requestid"] = request_id
+    # An API Gateway gateway response already carries the id it rendered.
+    request_id = headers.setdefault("x-amzn-requestid", request_id)
     headers["x-amz-request-id"] = request_id
     if include_s3_id:
         headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
