@@ -67,6 +67,7 @@ from ministack.core.responses import (
     set_request_account_id,
     set_request_region,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.core.sigv4 import (
     build_canonical_request,
     build_string_to_sign,
@@ -759,6 +760,156 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if obj is None:
         return None
     return _read_body(bucket_name, key, obj)
+
+
+_ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+# The permissions that answer a read and a write, FULL_CONTROL covering both.
+_ACL_READ_PERMS = ("READ", "FULL_CONTROL")
+_ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
+
+
+def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
+    """``(group URI, permission)`` for every Group grant in a stored ACL."""
+    if not stored_xml:
+        return []
+    try:
+        root = fromstring(stored_xml.encode() if isinstance(stored_xml, str) else stored_xml)
+    except Exception:
+        return []
+    grants = []
+    for grant in root.iter():
+        if not grant.tag.endswith("Grant"):
+            continue
+        uri = permission = ""
+        for child in grant.iter():
+            if child.tag.endswith("URI") and child.text:
+                uri = child.text.strip()
+            elif child.tag.endswith("Permission") and child.text:
+                permission = child.text.strip()
+        if uri and permission:
+            grants.append((uri, permission))
+    return grants
+
+
+def _public_access_blocked(owner_account: str, bucket_name: str) -> bool:
+    """Whether the bucket's Public Access Block shuts public grants off."""
+    record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
+    stored = record.get("_public_access_block")
+    if not stored:
+        return False
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return False
+    for child in root.iter():
+        if child.tag.endswith(("BlockPublicAcls", "RestrictPublicBuckets",
+                               "BlockPublicPolicy", "IgnorePublicAcls")):
+            if (child.text or "").strip().lower() == "true":
+                return True
+    return False
+
+
+def _account_from_access_key(access_key: str) -> str:
+    """The tenant an access key selects, the way the router scopes a request."""
+    try:
+        return find_iam_access_key_account(access_key) or access_key
+    except AmbiguousAccessKeyError:
+        return ""
+
+
+def _bucket_owner_account(name: str) -> str | None:
+    """The account that owns *name*, or None.
+
+    "General purpose buckets exist in a global namespace, which means that each
+    bucket name must be unique across all AWS accounts in all the AWS Regions
+    within a partition" — so a name identifies one bucket, whoever asks. The
+    store stays account-scoped; this is the index over it.
+    """
+    for account_id, bucket_name in _buckets._data:
+        if bucket_name == name:
+            return account_id
+    return None
+
+
+def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
+                           method: str, query_params: dict, caller: str) -> bool:
+    """Whether a caller who does not own the bucket may have this request.
+
+    The owner's grants decide it: a Group grant on the bucket or the object
+    ACL, or an allow in the bucket policy. Nothing granted means the request
+    is denied, which is S3's default for a bucket nobody has opened up.
+    """
+    if _public_access_blocked(owner_account, bucket_name):
+        return False
+    wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
+    groups = [_ACL_GROUP_ALL_USERS] if not caller else [
+        _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
+
+    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
+    if key:
+        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, "")))
+    for stored in acls:
+        for uri, permission in _acl_group_grants(stored):
+            if uri in groups and permission in wants:
+                return True
+
+    policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
+    if policy:
+        from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+        action = "s3:GetObject" if method in ("GET", "HEAD") else "s3:PutObject"
+        resource = f"arn:aws:s3:::{bucket_name}"
+        ctx = EvalContext(
+            principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
+            principal_type="Root" if caller else "Anonymous",
+            principal_account=caller or "",
+            action=action,
+            resource_arn=f"{resource}/{key}" if key else resource,
+            region=get_region(),
+        )
+        if evaluate_resource_policy(policy, ctx).decision == "Allow":
+            return True
+    return False
+
+
+def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
+                        body: bytes) -> str:
+    """The caller's access key, including the one a browser POST signs into its
+    form rather than a header or the query string."""
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key and method == "POST" and not key:
+        access_key = _post_form_access_key_id(
+            _parse_multipart_form(headers.get("content-type", ""), body))
+    return access_key
+
+
+def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
+                        query_params: dict, body: bytes = b""):
+    """Resolve the request's bucket in the global namespace and gate it.
+
+    A bucket name identifies one bucket whoever asks, so a request for a name
+    another account owns is answered by that bucket — if its owner granted the
+    access. The scope is pinned to the owner for the rest of the request, so
+    every account-scoped lookup behind this reads the right tenant's state.
+    """
+    if not bucket:
+        return None
+    owner = _bucket_owner_account(bucket)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return None
+    if method == "PUT" and not key and not query_params:
+        # CreateBucket answers BucketAlreadyExists for a taken name.
+        return None
+    access_key = _request_access_key(method, key, headers, query_params, body)
+    if access_key and _account_from_access_key(access_key) == owner:
+        # The caller is the owner; the credential just was not in a header.
+        set_request_account_id(owner)
+        return None
+    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller):
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+    set_request_account_id(owner)
+    return None
 
 
 def _ensure_bucket(name: str):
@@ -1705,6 +1856,13 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
+    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body)
+    if denied is not None:
+        status, resp_headers, resp_body = denied
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
+
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
     status, resp_headers, resp_body = result
@@ -1979,6 +2137,18 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if name in _buckets:
         # Idempotent: same account already owns it — return 200 like real AWS
         return 200, {"Location": f"/{name}"}, b""
+    if _bucket_owner_account(name) is not None:
+        # "After creating a general purpose bucket in the shared global
+        # namespace, that bucket name is unavailable for anyone else to create
+        # within a partition."
+        return _error(
+            "BucketAlreadyExists",
+            "The requested bucket name is not available. The bucket namespace "
+            "is shared by all users of the system. Please select a different "
+            "name and try again.",
+            409,
+            f"/{name}",
+        )
 
     region = None
     tags = {}
@@ -3593,6 +3763,16 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _post_form_access_key_id(parts) -> str:
+    for name, _filename, _part_headers, value in parts:
+        if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
+            continue
+        try:
+            credential = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return credential.split("/", 1)[0]
+    return ""
 
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
@@ -3604,11 +3784,16 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     `success_action_redirect`. Policy and signature fields are accepted and
     ignored — same lenient stance as ministack's presigned-URL handling.
     """
+    parts = _parse_multipart_form(headers.get("content-type", ""), body)
+
+    access_key_id = _post_form_access_key_id(parts)
+    if access_key_id:
+        set_request_account_id(access_key_id)
+
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    parts = _parse_multipart_form(headers.get("content-type", ""), body)
     if not parts:
         return _error(
             "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.", 400

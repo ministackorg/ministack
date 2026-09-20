@@ -416,6 +416,11 @@ def sts_as_role(sts):
 
 
 @pytest.fixture(scope="session")
+def backup():
+    return make_client("backup")
+
+
+@pytest.fixture(scope="session")
 def sm():
     return make_client("secretsmanager")
 
