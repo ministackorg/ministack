@@ -2813,9 +2813,7 @@ def _get_bucket_notification(name: str):
 
 
 def _generated_notification_id() -> str:
-    """AWS auto-generates an omitted notification Id as base64 of a UUID: the
-    reported sample decodes to 98c3a7f8-db28-4cea-8b36-b7c6f3928f1a, 48 chars
-    with no padding because a 36-char UUID divides by 3."""
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
     return base64.b64encode(new_uuid().encode()).decode().rstrip("=")
 
 

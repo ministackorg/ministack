@@ -720,14 +720,8 @@ def _start_configuration_session(body):
 
 
 def _retrieval_time_content(app_id, profile_id, content: bytes) -> bytes:
-    """A feature-flag profile is stored in deployment-time format and served in
-    retrieval-time format: "Retrieval-time format is the format returned when
-    the flag is retrieved from the GetLatestConfiguration API, which only
-    contains the flag's value" (appconfig-agent-how-to-use-local-development-
-    samples). That is the `values` map lifted to the top level; disabled flags
-    stay, carrying enabled false. Anything that is not a feature-flag profile,
-    or does not parse as that shape, is served verbatim.
-    """
+    """Feature flags are served in retrieval-time format: the `values` map
+    lifted to the top level. Anything else is served verbatim."""
     profile = _config_profiles.get(f"{app_id}/{profile_id}") or {}
     if profile.get("Type") != "AWS.AppConfig.FeatureFlags":
         return content

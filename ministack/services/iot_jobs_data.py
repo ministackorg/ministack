@@ -199,9 +199,7 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
 
 
 async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
-    # executionNumber identifies a particular execution on the device; nothing
-    # re-queues here, so only number 1 exists. The describe path answers the
-    # same way for a number that does not match.
+    # Nothing re-queues here, so only execution number 1 exists.
     execution_number = payload.get("executionNumber")
     if execution_number is not None:
         try:

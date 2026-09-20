@@ -1699,14 +1699,8 @@ def _is_aws_published_layer(layer_name: str) -> bool:
 
 
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Resolve another account's layer version through its stored grant.
-
-    An extension AWS publishes itself carries a public grant on AWS, so a
-    template referencing one by the publisher's ARN deploys there. Nothing is
-    stored for an account this emulator never saw, so those are allowed by name
-    instead. The bytes are not available offline: the reference resolves, the
-    attachment reports a CodeSize of 0 and the extension does not run.
-    """
+    """Another account's layer through its grant; an unknown account passes by
+    name, and the bytes are not available offline (CodeSize 0, does not run)."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version

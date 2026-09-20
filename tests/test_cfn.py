@@ -5350,9 +5350,7 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             f"arn:aws:wafv2:{arn_region}:000000000000:"
             f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
         )
-        # Ref carries all three, not the bare id: "The Ref for the resource,
-        # containing the resource name, physical ID, and scope, formatted as
-        # follows: name|id|scope" (aws-resource-wafv2-webacl).
+        # Ref is name|id|scope, not the bare id.
         assert outputs["AclRef"] == f"{acl_name}|{outputs['AclId']}|{scope}"
         acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
         assert outputs["AclArn"] in {acl["ARN"] for acl in acls}

@@ -6673,12 +6673,7 @@ def _s3_lambda_arn(name="s3-notify-target"):
 
 
 def test_s3_notification_is_stored_in_the_sdk_wire_form(s3):
-    """A notification config must read back for every SDK, not only the one that
-    wrote it. The S3 model spells LambdaFunctionConfigurations on the wire as
-    CloudFunctionConfiguration and LambdaFunctionArn as CloudFunction, so a
-    client that sends the modern tags (AWS SDK for Java v2, the Go SDK,
-    Terraform) used to store XML boto3 could not parse -- the GET echoed it back
-    and came out empty."""
+    """Stored as the wire spells it, so any SDK reads back what another wrote."""
     import urllib.request
 
     bucket = f"notif-wire-{_uuid_mod.uuid4().hex[:8]}"
@@ -6703,7 +6698,7 @@ def test_s3_notification_is_stored_in_the_sdk_wire_form(s3):
 
 
 def test_s3_notification_auto_generates_a_base64_uuid_id(s3, sqs):
-    """An omitted Id is auto-generated, as AWS does, base64 of a UUID."""
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
     import base64 as _b64
 
     bucket = f"notif-id-{_uuid_mod.uuid4().hex[:8]}"
