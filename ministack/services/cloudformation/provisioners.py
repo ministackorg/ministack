@@ -10476,6 +10476,65 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
+# CloudFormation reporting rules, checked against DescribeType and change sets.
+# A row lists the schema's createOnlyProperties (Always); the conditional table
+# below lists its conditionalCreateOnlyProperties (Conditionally). Any other
+# property of a listed type is in place (Never), as AWS reports it. Service API
+# immutability is different: an update may fail without being reported as a
+# replacement (for example Cognito sign-in attributes). Keep the execution
+# predicates separate until their behavior has been reconciled. Types without
+# a row keep the conservative Conditionally answer.
+_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
+    "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
+    "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
+    "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
+    "AWS::IoT::ThingType": ("ThingTypeName",),
+    "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
+    "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
+    "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
+    "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
+    "AWS::ElasticLoadBalancingV2::TargetGroup": (
+        "Name", "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
+        "IpAddressType",
+    ),
+    "AWS::WAFv2::WebACL": ("Name", "Scope"),
+    "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
+    "AWS::CloudFront::Function": ("Name",),
+    "AWS::SSM::Parameter": ("Name",),
+    "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
+    "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
+    "AWS::Cognito::UserPool": (),
+    "AWS::Lambda::Function": (
+        "FunctionName", "PackageType", "TenancyConfig",
+    ),
+    "AWS::Lambda::LayerVersion": (
+        "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
+        "Description", "LicenseInfo",
+    ),
+}
+
+
+_CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::DynamoDB::Table": ("KeySchema",),
+    "AWS::Lambda::Function": ("DurableConfig",),
+}
+
+
+def _property_recreation(resource_type: str, name: str) -> str:
+    """Classify a changed property for DescribeChangeSet, not update execution."""
+    replacing = _REPLACING_PROPERTIES.get(resource_type)
+    if replacing is None:
+        return "Conditionally"
+    if name in replacing:
+        return "Always"
+    if name in _CONDITIONALLY_REPLACING_PROPERTIES.get(resource_type, ()):
+        return "Conditionally"
+    return "Never"
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,

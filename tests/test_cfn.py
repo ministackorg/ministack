@@ -1679,7 +1679,7 @@ def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
         change = described["Changes"][0]["ResourceChange"]
         assert change["Scope"] == ["Properties"]
         assert [d["Target"]["Name"] for d in change["Details"]] == ["QueueName"]
-        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Conditionally"
+        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Always"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
