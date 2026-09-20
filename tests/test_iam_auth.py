@@ -30,6 +30,7 @@ from ministack.core.iam_evaluator import (
     evaluate_trust_policy,
     find_iam_access_key_account,
     fnmatch_iam,
+    fnmatch_iam_cs,
     parse_policy_document,
     resolve_credential,
     resolve_principal,
@@ -37,7 +38,8 @@ from ministack.core.iam_evaluator import (
 )
 
 # ---------------------------------------------------------------------------
-# Wildcard matching (IAM spec: case-insensitive, * = any, ? = single char)
+# Wildcard matching. Action/NotAction is case-insensitive; Resource/NotResource,
+# StringLike and the Arn operators are case-sensitive.
 # ---------------------------------------------------------------------------
 
 class TestFnmatchIam:
@@ -72,6 +74,73 @@ class TestFnmatchIam:
     def test_empty_pattern_matches_empty(self):
         assert fnmatch_iam("", "")
         assert not fnmatch_iam("something", "")
+
+
+class TestFnmatchIamCaseSensitive:
+    """"In the Resource element, the IAM user name is case sensitive."
+    (reference_policies_elements_resource)"""
+
+    @pytest.mark.parametrize("pattern", ("*", "arn:aws:iam::1:user/Bob", "arn:aws:iam::1:user/B*",
+                                         "arn:aws:iam::1:user/Bo?"))
+    def test_matching_case_matches(self, pattern):
+        assert fnmatch_iam_cs("arn:aws:iam::1:user/Bob", pattern)
+
+    @pytest.mark.parametrize("pattern", ("arn:aws:iam::1:user/bob", "arn:aws:iam::1:user/BOB",
+                                         "arn:aws:iam::1:user/b*", "ARN:AWS:IAM::1:USER/Bob"))
+    def test_wrong_case_does_not_match(self, pattern):
+        assert not fnmatch_iam_cs("arn:aws:iam::1:user/Bob", pattern)
+
+    def test_the_two_matchers_disagree_only_on_case(self):
+        value, pattern = "arn:aws:s3:::MyBucket/Key", "arn:aws:s3:::mybucket/*"
+        assert fnmatch_iam(value, pattern)
+        assert not fnmatch_iam_cs(value, pattern)
+
+    def test_action_matching_stays_case_insensitive(self):
+        assert fnmatch_iam("s3:PutObject", "s3:putobject")
+
+
+class TestResourceAndConditionCaseSensitivity:
+    def _decide(self, resource, request_arn="arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser",
+                condition=None):
+        stmt = {"Effect": "Allow", "Action": "rds-db:connect", "Resource": resource}
+        if condition:
+            stmt["Condition"] = condition
+        doc = {"Version": "2012-10-17", "Statement": [stmt]}
+        return evaluate(EvalContext(
+            principal_arn="arn:aws:iam::1:user/u", principal_type="user",
+            principal_account="1", action="rds-db:connect",
+            resource_arn=request_arn, region="us-east-1",
+            service_context={"tag": "Prod", "arn": "arn:aws:sns:us-east-1:1:Topic"},
+        ), [parse_policy_document(json.dumps(doc))]).decision
+
+    def test_resource_case_decides_the_outcome(self):
+        assert self._decide("arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser") == "Allow"
+        assert self._decide("arn:aws:rds-db:us-east-1:1:dbuser:db-X/appuser") == "ImplicitDeny"
+
+    def test_not_resource_case_decides_the_outcome(self):
+        doc = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "rds-db:connect",
+            "NotResource": "arn:aws:rds-db:us-east-1:1:dbuser:db-X/appuser"}]}
+        assert evaluate(EvalContext(
+            principal_arn="arn:aws:iam::1:user/u", principal_type="user",
+            principal_account="1", action="rds-db:connect",
+            resource_arn="arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser",
+            region="us-east-1",
+        ), [parse_policy_document(json.dumps(doc))]).decision == "Allow"
+
+    @pytest.mark.parametrize("pattern,expected", (("Prod*", "Allow"), ("prod*", "ImplicitDeny")))
+    def test_string_like_is_case_sensitive(self, pattern, expected):
+        """"Case-sensitive matching" (reference_policies_elements_condition_operators)."""
+        assert self._decide(
+            "*", condition={"StringLike": {"tag": pattern}}) == expected
+
+    @pytest.mark.parametrize("value,expected", (
+        ("arn:aws:sns:us-east-1:1:Topic", "Allow"),
+        ("arn:aws:sns:us-east-1:1:topic", "ImplicitDeny"),
+    ))
+    def test_arn_like_is_case_sensitive(self, value, expected):
+        """"Case-sensitive matching of the ARN" (same page)."""
+        assert self._decide("*", condition={"ArnLike": {"arn": value}}) == expected
 
 
 # ---------------------------------------------------------------------------

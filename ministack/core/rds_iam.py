@@ -16,7 +16,15 @@ import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlsplit
 
-from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
+from ministack.core.iam_evaluator import (
+    AuthError,
+    CredentialResolutionError,
+    EvalContext,
+    evaluate,
+    resolve_credential,
+    resolve_principal,
+)
+from ministack.core.responses import request_scope
 from ministack.core.sigv4 import build_canonical_request, build_string_to_sign, calculate_signature, signatures_match
 
 _MAX_TOKEN_LENGTH = 65536
@@ -181,3 +189,110 @@ def verify_rds_iam_token(
         db_user=db_user,
         expires_at=expires_at,
     )
+
+
+# Stage 5 of #1744: resource-bound authorization. No runtime callers, no AUTH
+# lookup; integration gates AUTH at its call site.
+
+@dataclass(frozen=True)
+class RdsIamAuthorizationError:
+    """A bounded failure code, with no client token or credential material."""
+
+    code: str
+
+
+@dataclass(frozen=True)
+class AuthorizedRdsConnection:
+    identity: VerifiedRdsToken
+    resource_arn: str
+
+
+def authorize_rds_iam_token(
+    token: str,
+    *,
+    account_id: str,
+    region: str,
+    resource_kind: str,
+    resource_identifier: str,
+    db_user: str,
+    reader_endpoint: bool = False,
+) -> AuthorizedRdsConnection | RdsIamAuthorizationError | RdsIamTokenError:
+    """Verify and authorize against a trusted instance or cluster identifier.
+
+    The future broker must bind these arguments to its resource capability,
+    not accept a target/account claimed by the client. Endpoint/port, enablement,
+    and the stable dbuser resource ID are read from that resource's scoped state.
+    Aurora members use the parent cluster's enablement and resource ID, but the
+    member's endpoint. Cluster callers may explicitly select the reader endpoint.
+    Cross-account credentials must first assume a role in the resource account.
+    A success is a point-in-time decision, not a reusable authorization cache.
+    """
+    from ministack.services import rds
+
+    if (
+        not isinstance(account_id, str) or not re.fullmatch(r"[0-9]{12}", account_id)
+        or not isinstance(region, str) or not re.fullmatch(r"[a-z0-9-]+", region)
+        or resource_kind not in ("instance", "cluster")
+        or not isinstance(resource_identifier, str) or not resource_identifier
+        or type(reader_endpoint) is not bool
+        or (reader_endpoint and resource_kind != "cluster")
+    ):
+        return RdsIamAuthorizationError("InvalidTarget")
+
+    store = rds._instances if resource_kind == "instance" else rds._clusters
+    target = store.get_scoped(account_id, region, resource_identifier)
+    if target is None:
+        return RdsIamAuthorizationError("ResourceNotFound")
+    engines = ("mysql", "aurora", "aurora-mysql") if resource_kind == "instance" else ("aurora", "aurora-mysql")
+    if target.get("Engine") not in engines:
+        return RdsIamAuthorizationError("UnsupportedEngine")
+    if resource_kind == "instance" and target.get("Engine") != "mysql" and not target.get("DBClusterIdentifier"):
+        return RdsIamAuthorizationError("InvalidTarget")
+
+    owner = target
+    resource_id_key = "DbiResourceId" if resource_kind == "instance" else "DbClusterResourceId"
+    if resource_kind == "instance" and target.get("DBClusterIdentifier"):
+        owner = rds._clusters.get_scoped(account_id, region, target["DBClusterIdentifier"])
+        if owner is None:
+            return RdsIamAuthorizationError("ResourceNotFound")
+        if owner.get("Engine") not in ("aurora", "aurora-mysql"):
+            return RdsIamAuthorizationError("UnsupportedEngine")
+        resource_id_key = "DbClusterResourceId"
+    if owner.get("IAMDatabaseAuthenticationEnabled") is not True:
+        return RdsIamAuthorizationError("IAMDatabaseAuthenticationDisabled")
+    resource_id = owner.get(resource_id_key)
+    prefix = "db-" if resource_id_key == "DbiResourceId" else "cluster-"
+    if not isinstance(resource_id, str) or not re.fullmatch(prefix + r"[A-Za-z0-9]+", resource_id):
+        return RdsIamAuthorizationError("InvalidTarget")
+
+    endpoint = target.get("ReaderEndpoint" if reader_endpoint else "Endpoint")
+    if isinstance(endpoint, dict):
+        hostname, port = endpoint.get("Address"), endpoint.get("Port")
+    else:
+        hostname, port = endpoint, target.get("Port")
+    verified = verify_rds_iam_token(
+        token, hostname=hostname, port=port, db_user=db_user, region=region, account_id=account_id,
+    )
+    if isinstance(verified, RdsIamTokenError):
+        return verified
+
+    # MiniStack's credential and RDS stores currently issue arn:aws identities.
+    resource_arn = f"arn:aws:rds-db:{region}:{account_id}:dbuser:{resource_id}/{db_user}"
+    # Policy gathering includes ambient-scoped user/group/managed-policy stores.
+    # Pin the explicit resource account, restoring both contextvars on all exits.
+    with request_scope(account_id, region):
+        principal = resolve_principal(verified.access_key_id, account_id)
+        if (
+            isinstance(principal, AuthError) or principal.account != account_id
+            or principal.arn != verified.principal_arn or principal.type != verified.principal_type
+        ):
+            return RdsIamAuthorizationError("InvalidCredentials")
+        if principal.policies is not None:
+            result = evaluate(EvalContext(
+                principal_arn=principal.arn, principal_type=principal.type,
+                principal_account=account_id, action="rds-db:connect",
+                resource_arn=resource_arn, region=region,
+            ), principal.policies)
+            if result.decision != "Allow":
+                return RdsIamAuthorizationError(result.decision)
+    return AuthorizedRdsConnection(verified, resource_arn)

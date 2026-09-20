@@ -82,28 +82,47 @@ class AuthError:
 # Wildcard matching (IAM-style)
 # ---------------------------------------------------------------------------
 
-_FNMATCH_CACHE: dict[str, re.Pattern] = {}
+_FNMATCH_CACHE: dict[tuple[str, bool], re.Pattern] = {}
 
 
-def fnmatch_iam(value: str, pattern: str) -> bool:
-    """Case-insensitive IAM wildcard match.  ``*`` = any chars, ``?`` = one char."""
-    if pattern == "*":
-        return True
-    key = pattern.lower()
+def _fnmatch_compile(pattern: str, ignore_case: bool) -> re.Pattern:
+    key = (pattern.lower() if ignore_case else pattern, ignore_case)
     compiled = _FNMATCH_CACHE.get(key)
     if compiled is None:
         regex = ""
-        for ch in key:
+        for ch in key[0]:
             if ch == "*":
                 regex += ".*"
             elif ch == "?":
                 regex += "."
             else:
                 regex += re.escape(ch)
-        compiled = re.compile(f"^{regex}$", re.IGNORECASE)
+        compiled = re.compile(f"^{regex}$", re.IGNORECASE if ignore_case else 0)
         if len(_FNMATCH_CACHE) < 4096:
             _FNMATCH_CACHE[key] = compiled
-    return compiled.match(value) is not None
+    return compiled
+
+
+def fnmatch_iam(value: str, pattern: str) -> bool:
+    """Case-insensitive IAM wildcard match, for Action/NotAction.
+
+    ``*`` = any chars, ``?`` = one char.
+    """
+    if pattern == "*":
+        return True
+    return _fnmatch_compile(pattern, True).match(value) is not None
+
+
+def fnmatch_iam_cs(value: str, pattern: str) -> bool:
+    """Case-sensitive IAM wildcard match, for Resource/NotResource, StringLike
+    and the Arn operators: "In the Resource element, the IAM user name is case
+    sensitive" (reference_policies_elements_resource), "Case-sensitive matching"
+    for StringLike and "Case-sensitive matching of the ARN" for ArnEquals/ArnLike
+    (reference_policies_elements_condition_operators).
+    """
+    if pattern == "*":
+        return True
+    return _fnmatch_compile(pattern, False).match(value) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +141,9 @@ def _action_matches(request_action: str, actions: list[str],
 def _resource_matches(resource_arn: str, resources: list[str],
                       not_resources: list[str]) -> bool:
     if resources:
-        return any(fnmatch_iam(resource_arn, p) for p in resources)
+        return any(fnmatch_iam_cs(resource_arn, p) for p in resources)
     if not_resources:
-        return not any(fnmatch_iam(resource_arn, p) for p in not_resources)
+        return not any(fnmatch_iam_cs(resource_arn, p) for p in not_resources)
     return True
 
 
@@ -224,11 +243,11 @@ def _op_string_not_equals_ignore_case(actual: str, expected: str) -> bool:
 
 
 def _op_string_like(actual: str, expected: str) -> bool:
-    return fnmatch_iam(actual, expected)
+    return fnmatch_iam_cs(actual, expected)
 
 
 def _op_string_not_like(actual: str, expected: str) -> bool:
-    return not fnmatch_iam(actual, expected)
+    return not fnmatch_iam_cs(actual, expected)
 
 
 def _op_numeric(actual: str, expected: str, cmp: str) -> bool:
@@ -307,11 +326,11 @@ def _op_not_ip_address(actual: str, expected: str) -> bool:
 
 
 def _op_arn_like(actual: str, expected: str) -> bool:
-    return fnmatch_iam(actual, expected)
+    return fnmatch_iam_cs(actual, expected)
 
 
 def _op_arn_not_like(actual: str, expected: str) -> bool:
-    return not fnmatch_iam(actual, expected)
+    return not fnmatch_iam_cs(actual, expected)
 
 
 # Operator dispatch table

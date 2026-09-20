@@ -3,6 +3,7 @@
 """Offline RDS tokens signed by boto3/botocore, not the verifier's helpers."""
 
 import datetime as dt
+import time
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -13,9 +14,21 @@ from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
 from ministack.core import rds_iam
-from ministack.core.rds_iam import RdsIamTokenError, VerifiedRdsToken, verify_rds_iam_token
-from ministack.core.responses import get_account_id
-from ministack.services import iam, sts
+from ministack.core.rds_iam import (
+    AuthorizedRdsConnection,
+    RdsIamTokenError,
+    VerifiedRdsToken,
+    authorize_rds_iam_token,
+    verify_rds_iam_token,
+)
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    request_scope,
+)
+from ministack.services import iam, rds, sts
 
 ACCOUNT = "123456789012"
 KEY = "AKIARDSVERIFIERTEST"
@@ -257,3 +270,236 @@ def test_verifier_is_strict_independently_of_auth_setting(clock, monkeypatch, au
     monkeypatch.setenv("AUTH", auth)
     assert isinstance(verify_rds_iam_token(sdk_token(), **TARGET), VerifiedRdsToken)
     assert isinstance(verify_rds_iam_token(sdk_token(secret="wrong"), **TARGET), RdsIamTokenError)
+
+
+# Stage 5 of #1744: resource-bound authorization.
+
+OTHER_ACCOUNT = "210987654321"
+AUTHZ_KEY = "test-rds-authorization-key"
+AUTHZ_SECRET = "authorization-test-secret"
+AUTHZ_USER = "AppUser"
+AUTHZ_HOST = "db.example.com"
+AUTHZ_ARN = f"arn:aws:rds-db:{REGION}:{ACCOUNT}:dbuser:db-TEST/{AUTHZ_USER}"
+AUTHZ_ARGS = dict(account_id=ACCOUNT, region=REGION, resource_kind="instance",
+                  resource_identifier="database", db_user=AUTHZ_USER)
+
+
+def _authz_policy(resource=AUTHZ_ARN, effect="Allow", **extra):
+    return {"Statement": [{"Effect": effect, "Action": "rds-db:connect", "Resource": resource, **extra}]}
+
+
+def _authz_token(*, host=AUTHZ_HOST, port=3306, user=AUTHZ_USER, key=AUTHZ_KEY, secret=AUTHZ_SECRET, session_token=None):
+    return boto3.client("rds", region_name=REGION, aws_access_key_id=key,
+                        aws_secret_access_key=secret, aws_session_token=session_token).generate_db_auth_token(
+        DBHostname=host, Port=port, DBUsername=user,
+    )
+
+
+class TestResourceBoundAuthorization:
+    @pytest.fixture(autouse=True)
+    def state(self, monkeypatch):
+        for name in ("_users", "_access_keys", "_user_inline_policies", "_roles", "_groups",
+                     "_group_inline_policies", "_policies"):
+            monkeypatch.setattr(iam, name, AccountScopedDict())
+        monkeypatch.setattr(rds, "_instances", AccountRegionScopedDict())
+        monkeypatch.setattr(rds, "_clusters", AccountRegionScopedDict())
+        monkeypatch.setattr(sts, "_sessions", {})
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "root-secret")
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+        iam._users.set_scoped(ACCOUNT, None, "alice", {
+            "UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice",
+        })
+        iam._access_keys.set_scoped(ACCOUNT, None, AUTHZ_KEY, {
+            "UserName": "alice", "Status": "Active", "SecretAccessKey": AUTHZ_SECRET,
+        })
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"connect": _authz_policy()})
+        instance = dict(Engine="mysql", DbiResourceId="db-TEST", IAMDatabaseAuthenticationEnabled=True,
+                        Endpoint={"Address": AUTHZ_HOST, "Port": 3306})
+        rds._instances.set_scoped(ACCOUNT, REGION, "database", instance)
+        return instance
+
+
+    @pytest.mark.parametrize("auth", [None, "false", "true"])
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_strict_primitive_independent_of_auth(self, state, monkeypatch, auth, enabled):
+        if auth is None:
+            monkeypatch.delenv("AUTH", raising=False)
+        else:
+            monkeypatch.setenv("AUTH", auth)
+        state["IAMDatabaseAuthenticationEnabled"] = enabled
+        with request_scope(OTHER_ACCOUNT, "eu-west-1"):
+            result = authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS)
+            assert (get_account_id(), get_region()) == (OTHER_ACCOUNT, "eu-west-1")
+        if enabled:
+            assert isinstance(result, AuthorizedRdsConnection)
+            assert result.resource_arn == AUTHZ_ARN
+            assert AUTHZ_SECRET not in repr(result)
+        else:
+            assert result.code == "IAMDatabaseAuthenticationDisabled"
+
+
+    @pytest.mark.parametrize("resource", [AUTHZ_ARN, AUTHZ_ARN.replace(AUTHZ_USER, "*"), "*"])
+    def test_exact_and_wildcard_grants(self, resource):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"grant": _authz_policy(resource)})
+        assert isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection)
+
+
+    @pytest.mark.parametrize("resource", [AUTHZ_ARN.replace(AUTHZ_USER, AUTHZ_USER.lower()), AUTHZ_ARN.replace("db-TEST", "db-OTHER_ACCOUNT"),
+                                          AUTHZ_ARN.replace(ACCOUNT, OTHER_ACCOUNT), AUTHZ_ARN.replace(REGION, "eu-west-1"),
+                                          AUTHZ_ARN.replace("db-TEST", "database")])
+    def test_wrong_policy_resource_is_denied(self, resource):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"grant": _authz_policy(resource)})
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "ImplicitDeny"
+
+
+    def test_explicit_deny_overrides_allow(self):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"allow": _authz_policy("*"), "deny": _authz_policy(effect="Deny")})
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "Deny"
+
+
+    @pytest.mark.parametrize("exception,allowed", [(AUTHZ_ARN, True), (AUTHZ_ARN.replace(AUTHZ_USER, AUTHZ_USER.lower()), False)])
+    def test_not_resource_respects_case(self, exception, allowed):
+        deny = {"Statement": [{"Effect": "Deny", "Action": "rds-db:connect", "NotResource": exception}]}
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"allow": _authz_policy("*"), "deny": deny})
+        result = authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS)
+        assert isinstance(result, AuthorizedRdsConnection) is allowed
+
+
+    def test_missing_policy_and_wrong_action_deny(self):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {})
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "ImplicitDeny"
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"rds": _authz_policy(Action="rds:*")})
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "ImplicitDeny"
+
+
+    @pytest.mark.parametrize("kind", ["group", "managed"])
+    def test_policies_use_explicit_account_and_restore_context(self, kind):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {})
+        iam._user_inline_policies.set_scoped(OTHER_ACCOUNT, None, "alice", {"deny": _authz_policy("*", "Deny")})
+        if kind == "group":
+            iam._groups.set_scoped(ACCOUNT, None, "team", {"Users": ["alice"]})
+            iam._group_inline_policies.set_scoped(ACCOUNT, None, "team", {"grant": _authz_policy()})
+        else:
+            arn = f"arn:aws:iam::{ACCOUNT}:policy/connect"
+            iam._users.get_scoped(ACCOUNT, None, "alice")["AttachedPolicies"] = [arn]
+            iam._policies.set_scoped(ACCOUNT, None, "connect", {
+                "Arn": arn, "DefaultVersionId": "v1", "Versions": {"v1": {"Document": _authz_policy()}},
+            })
+        with request_scope(OTHER_ACCOUNT, "eu-west-1"):
+            assert isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection)
+            assert (get_account_id(), get_region()) == (OTHER_ACCOUNT, "eu-west-1")
+
+
+    @pytest.mark.parametrize("override", [dict(host="other.example.com"), dict(port=3307), dict(user="appuser"),
+                                         dict(secret="wrong"), dict(key="unknown")])
+    def test_invalid_token_never_reaches_allow(self, override):
+        assert not isinstance(authorize_rds_iam_token(_authz_token(**override), **AUTHZ_ARGS), AuthorizedRdsConnection)
+
+
+    def test_inactive_key(self):
+        iam._access_keys.get_scoped(ACCOUNT, None, AUTHZ_KEY)["Status"] = "Inactive"
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "InvalidCredentials"
+
+
+    @pytest.mark.parametrize("field,value", [("account_id", OTHER_ACCOUNT), ("region", "eu-west-1"),
+                                            ("resource_identifier", "missing")])
+    def test_resource_lookup_does_not_fall_back_to_ambient_tenant(self, field, value):
+        with request_scope(ACCOUNT, REGION):
+            assert authorize_rds_iam_token(_authz_token(), **{**AUTHZ_ARGS, field: value}).code == "ResourceNotFound"
+
+
+    @pytest.mark.parametrize("field,value", [("DbiResourceId", ""), ("DbiResourceId", "db-TEST/*"),
+                                            ("Endpoint", {}), ("Endpoint", {"Address": AUTHZ_HOST})])
+    def test_incomplete_resource_fails_closed(self, state, field, value):
+        state[field] = value
+        assert not isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection)
+
+
+    @pytest.mark.parametrize("kind", ["instance", "cluster"])
+    def test_unsupported_engine(self, state, kind):
+        state["Engine"] = "postgres"
+        rds._clusters.set_scoped(ACCOUNT, REGION, "database", state)
+        assert authorize_rds_iam_token(_authz_token(), **{**AUTHZ_ARGS, "resource_kind": kind}).code == "UnsupportedEngine"
+
+
+    @pytest.mark.parametrize("kind,reader", [("instance", False), ("cluster", False), ("cluster", True)])
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_aurora_uses_cluster_resource_and_flag(self, state, kind, reader, enabled):
+        state.update(Engine="aurora-mysql", DBClusterIdentifier="database", IAMDatabaseAuthenticationEnabled=not enabled)
+        cluster_arn = AUTHZ_ARN.replace("db-TEST", "cluster-TEST")
+        rds._clusters.set_scoped(ACCOUNT, REGION, "database", {
+            "Engine": "aurora-mysql", "DbClusterResourceId": "cluster-TEST",
+            "IAMDatabaseAuthenticationEnabled": enabled, "Endpoint": AUTHZ_HOST,
+            "ReaderEndpoint": "reader.example.com", "Port": 3306,
+        })
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"grant": _authz_policy(cluster_arn)})
+        result = authorize_rds_iam_token(_authz_token(host="reader.example.com" if reader else AUTHZ_HOST),
+                                        **{**AUTHZ_ARGS, "resource_kind": kind}, reader_endpoint=reader)
+        if enabled:
+            assert result.resource_arn == cluster_arn
+        else:
+            assert result.code == "IAMDatabaseAuthenticationDisabled"
+
+
+    def test_missing_parent_cluster_is_not_standalone(self, state):
+        state.update(Engine="aurora-mysql", DBClusterIdentifier="missing")
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "ResourceNotFound"
+
+
+    @pytest.mark.parametrize("session_account", [ACCOUNT, OTHER_ACCOUNT])
+    def test_role_session_must_belong_to_resource_account(self, session_account):
+        key = "test-rds-authorization-session-key"
+        sts._sessions[key] = dict(Arn=f"arn:aws:sts::{session_account}:assumed-role/db-role/session",
+                                 AccountId=session_account, SecretAccessKey=AUTHZ_SECRET, SessionToken="session-token",
+                                 Expiration=time.time() + 600, PrincipalType="AssumedRole")
+        iam._roles.set_scoped(session_account, None, "db-role", {"InlinePolicies": {"grant": _authz_policy()}})
+        result = authorize_rds_iam_token(_authz_token(key=key, session_token="session-token"), **AUTHZ_ARGS)
+        assert isinstance(result, AuthorizedRdsConnection) is (session_account == ACCOUNT)
+
+
+    def test_root_still_requires_enabled_resource(self, state):
+        signed = _authz_token(key="test", secret="root-secret")
+        assert isinstance(authorize_rds_iam_token(signed, **AUTHZ_ARGS), AuthorizedRdsConnection)
+        state["IAMDatabaseAuthenticationEnabled"] = False
+        assert authorize_rds_iam_token(signed, **AUTHZ_ARGS).code == "IAMDatabaseAuthenticationDisabled"
+
+
+    def test_ambient_policy_cannot_grant_access(self):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {})
+        iam._user_inline_policies.set_scoped(OTHER_ACCOUNT, None, "alice", {"grant": _authz_policy("*")})
+        with request_scope(OTHER_ACCOUNT, "eu-west-1"):
+            assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "ImplicitDeny"
+            assert (get_account_id(), get_region()) == (OTHER_ACCOUNT, "eu-west-1")
+
+
+    @pytest.mark.parametrize("region,allowed", [(REGION, True), ("eu-west-1", False)])
+    def test_policy_conditions_use_target_region(self, region, allowed):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {
+            "grant": _authz_policy(Condition={"StringEquals": {"aws:RequestedRegion": region}}),
+        })
+        assert isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection) is allowed
+
+
+    def test_cluster_dictionary_endpoint_uses_advertised_port(self):
+        rds._clusters.set_scoped(ACCOUNT, REGION, "database", {
+            "Engine": "aurora-mysql", "DbClusterResourceId": "cluster-TEST",
+            "IAMDatabaseAuthenticationEnabled": True, "Endpoint": {"Address": AUTHZ_HOST, "Port": 13306},
+            "Port": 3306,
+        })
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"grant": _authz_policy(AUTHZ_ARN.replace("db-", "cluster-"))})
+        args = {**AUTHZ_ARGS, "resource_kind": "cluster"}
+        assert isinstance(authorize_rds_iam_token(_authz_token(port=13306), **args), AuthorizedRdsConnection)
+        assert not isinstance(authorize_rds_iam_token(_authz_token(), **args), AuthorizedRdsConnection)
+
+
+    def test_aurora_without_parent_cannot_use_instance_arn(self, state):
+        state["Engine"] = "aurora-mysql"
+        assert authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS).code == "InvalidTarget"
+
+
+    @pytest.mark.parametrize("override", [dict(account_id=""), dict(region=""), dict(resource_kind="proxy"),
+                                         dict(resource_identifier=""), dict(reader_endpoint=True),
+                                         dict(reader_endpoint="false")])
+    def test_invalid_target(self, override):
+        assert authorize_rds_iam_token(_authz_token(), **{**AUTHZ_ARGS, **override}).code == "InvalidTarget"
