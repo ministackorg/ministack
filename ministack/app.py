@@ -1283,9 +1283,8 @@ async def _handle_post_body_shortcuts(
         return 200, {}, b""
 
     # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS).
-    # The prefix is spelled out rather than read off wait_conditions.SIGNAL_PATH
-    # so that matching it is what imports CloudFormation: an import above the
-    # check pulled the package into the first request to any service (#1734).
+    # The literal keeps the import behind the check; above it, the first request
+    # to any service pulled in the whole CloudFormation package.
     if method == "PUT" and path.startswith("/_ministack/cfn-signal/"):
         from ministack.services.cloudformation import wait_conditions as _cfn_wc
 
@@ -1899,7 +1898,8 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
-    headers["x-amzn-requestid"] = request_id
+    # An API Gateway gateway response already carries the id it rendered.
+    request_id = headers.setdefault("x-amzn-requestid", request_id)
     headers["x-amz-request-id"] = request_id
     if include_s3_id:
         headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
