@@ -671,8 +671,18 @@ def _execute_statement(data):
         cursor = conn.cursor()
         cursor.execute(exec_sql, params or None)
 
+        updated = max(cursor.rowcount, 0)
+        if engine in ("postgres", "aurora-postgresql"):
+            status = getattr(cursor, "statusmessage", None)
+            command = status.split()[:1] if isinstance(status, str) else []
+            # psycopg2 counts returned rows for SELECT, not affected rows.
+            # Use the command tag, not SQL text or description: DML RETURNING
+            # also returns rows. This is not an audit of side effects in CTEs.
+            if command == ["SELECT"]:
+                updated = 0
+
         response = {
-            "numberOfRecordsUpdated": cursor.rowcount if cursor.rowcount >= 0 else 0,
+            "numberOfRecordsUpdated": updated,
             "generatedFields": [],
         }
 

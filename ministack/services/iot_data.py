@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 from urllib.parse import unquote
 
 from ministack.core.responses import (
@@ -34,6 +35,14 @@ logger = logging.getLogger("iot_data")
 
 # AWS IoT topics: max 7 segments, max 256 UTF-8 bytes total.
 _MAX_TOPIC_BYTES = 256
+
+# HTTPS Publish to a topic starting with "$" is refused unless the topic sits
+# under one of these reserved families. Within them, the device-side jobs,
+# Device Defender and commands topics are MQTT-only.
+_HTTP_RESERVED_PREFIXES = _iot_module.RESERVED_PUBLISH_PREFIXES
+_HTTP_RESTRICTED_TOPIC_RE = re.compile(
+    r"^\$aws/(things/[^/]+/(jobs|defender)/|commands/)"
+)
 
 
 def _validate_topic(topic: str) -> tuple | None:
@@ -54,6 +63,17 @@ def _validate_topic(topic: str) -> tuple | None:
             f"Topic exceeds {_MAX_TOPIC_BYTES} bytes",
             400,
         )
+    if topic.startswith("$"):
+        if not topic.startswith(_HTTP_RESERVED_PREFIXES):
+            return error_response_json(
+                "InvalidRequestException", "Topic can't start with $", 400
+            )
+        if _HTTP_RESTRICTED_TOPIC_RE.match(topic):
+            return error_response_json(
+                "InvalidRequestException",
+                "Invalid publish to restricted topic using HTTP",
+                400,
+            )
     return None
 
 
