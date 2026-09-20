@@ -8419,3 +8419,45 @@ def test_cognito_presignup_trigger_fires_on_plain_signup(cognito_idp, lam):
 
     cognito_idp.delete_user_pool(UserPoolId=pid)
     lam.delete_function(FunctionName=fname)
+
+
+def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():
+    """OIDC discovery requires the document's issuer to equal the URL it was
+    fetched from. Routing the AWS hostname to MiniStack satisfies that, and
+    behind a TLS terminator every URL has to be https or it disagrees with the
+    https issuer."""
+    import json as _json
+    import urllib.request
+
+    from conftest import make_client
+    cognito = make_client("cognito-idp")
+    pool_id = cognito.create_user_pool(PoolName="oidc-consistent")["UserPool"]["Id"]
+    aws_host = "cognito-idp.us-east-1.amazonaws.com"
+    endpoints = ("jwks_uri", "authorization_endpoint", "token_endpoint",
+                 "userinfo_endpoint", "end_session_endpoint")
+
+    def fetch(host, forwarded_proto=None):
+        req = urllib.request.Request(
+            f"{ENDPOINT}/{pool_id}/.well-known/openid-configuration")
+        req.add_header("Host", host)
+        if forwarded_proto:
+            req.add_header("X-Forwarded-Proto", forwarded_proto)
+        with urllib.request.urlopen(req) as r:
+            return _json.loads(r.read())
+
+    # The issuer keeps the AWS form, so it still matches the JWT iss claim.
+    plain = fetch(aws_host)
+    assert plain["issuer"] == f"https://{aws_host}/{pool_id}"
+    assert all(plain[name].startswith(f"http://{aws_host}") for name in endpoints)
+
+    secured = fetch(aws_host, "https")
+    origin = f"https://{aws_host}"
+    assert secured["issuer"] == f"{origin}/{pool_id}"
+    for name in endpoints:
+        assert secured[name].startswith(origin), name
+
+    # The keys are really served at that host, so discovery can follow jwks_uri.
+    keys = urllib.request.Request(f"{ENDPOINT}/{pool_id}/.well-known/jwks.json")
+    keys.add_header("Host", aws_host)
+    with urllib.request.urlopen(keys) as r:
+        assert "keys" in _json.loads(r.read())

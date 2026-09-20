@@ -2014,11 +2014,7 @@ async def _authorize_request_v1(
     return None, auth_ctx
 
 
-# The message API Gateway puts in $context.error.message for each gateway
-# response it raises. Status codes and triggers are from
-# supported-gateway-response-types; the strings below were captured on a real
-# account (eu-north-1 2026-09-20) except QUOTA_EXCEEDED, whose probe was
-# refused as an invalid key before the quota could be reached.
+# $context.error.message per gateway response type.
 _GATEWAY_ERROR_MESSAGES = {
     "INVALID_API_KEY": "Forbidden",
     "THROTTLED": "Too Many Requests",
@@ -2027,8 +2023,7 @@ _GATEWAY_ERROR_MESSAGES = {
     "BAD_REQUEST_BODY": "Invalid request body",
 }
 
-# Per-stage counters for throttling and usage-plan quota. In-process only: a
-# restart forgets them, like the tokens of a fresh deployment.
+# In-process only; a restart forgets them.
 _throttle_state = {}
 _quota_state = {}
 _QUOTA_PERIOD_SECONDS = {"DAY": 86400, "WEEK": 7 * 86400, "MONTH": 30 * 86400}
@@ -2063,10 +2058,7 @@ def _usage_plans_for_key(key_id, api_id, stage_name):
 
 
 def _check_api_key(method_obj, api_id, stage_name, headers):
-    """A method with apiKeyRequired needs an enabled key that a usage plan
-    attaches to this api and stage: "The gateway response for an invalid API key
-    submitted for a method requiring an API key"
-    (supported-gateway-response-types). Returns (error, key_record)."""
+    """(error, key_record) for a method with apiKeyRequired."""
     if not method_obj.get("apiKeyRequired"):
         return None, None
     key = _resolve_api_key(_api_key_from_request(headers))
@@ -2074,19 +2066,16 @@ def _check_api_key(method_obj, api_id, stage_name, headers):
         return _gw_error("INVALID_API_KEY",
                          _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
     if not _usage_plans_for_key(key["id"], api_id, stage_name):
-        # A key that no plan associates with this stage is as good as unknown.
         return _gw_error("INVALID_API_KEY",
                          _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
     return None, key
 
 
 def _method_throttle_settings(stage, resource_path, http_method):
-    """The stage's throttle for this method, most specific first: the
-    method override, then the stage-wide "*/*" entry."""
+    """The method override, else the stage-wide "*/*" entry."""
     settings = stage.get("methodSettings") or {}
     stripped = resource_path.lstrip("/")
-    # UpdateStage stores the key as the patch spelled it, which keeps the
-    # resource path's leading slash; accept either spelling before "*/*".
+    # UpdateStage keeps the path's leading slash; accept either spelling.
     for key in (f"/{stripped}/{http_method}", f"{stripped}/{http_method}", "*/*"):
         entry = settings.get(key)
         if isinstance(entry, dict) and (
@@ -2096,9 +2085,7 @@ def _method_throttle_settings(stage, resource_path, http_method):
 
 
 def _check_throttle(stage, api_id, stage_name, resource_path, http_method):
-    """Token bucket per method: rate refills the bucket, burst caps it. A limit
-    of 0 refuses everything, which is what "throttling limits exceeded" means at
-    0/0 (supported-gateway-response-types)."""
+    """Token bucket per method: rate refills, burst caps, 0/0 refuses all."""
     entry = _method_throttle_settings(stage, resource_path, http_method)
     if entry is None:
         return None
@@ -2122,7 +2109,7 @@ def _check_throttle(stage, api_id, stage_name, resource_path, http_method):
 
 
 def _check_quota(key, api_id, stage_name):
-    """Usage-plan quota, counted per key per plan period."""
+    """Usage-plan quota, per key per plan period."""
     if key is None:
         return None
     now = time.time()
@@ -2145,8 +2132,7 @@ def _check_quota(key, api_id, stage_name):
 
 
 def _missing_request_parameters(method_obj, request, headers, query_params):
-    """The names of the required request parameters that are absent, in the
-    order AWS reports them."""
+    """The absent required request parameters, in declaration order."""
     missing = []
     for name, required in (method_obj.get("requestParameters") or {}).items():
         if not required:
@@ -2168,11 +2154,7 @@ def _missing_request_parameters(method_obj, request, headers, query_params):
 
 
 def _json_schema_violation(schema, document):
-    """The first way `document` breaks `schema`, or None.
-
-    A deliberately small subset -- type, required, and per-property type --
-    because the point is to refuse a body AWS refuses, not to ship a validator.
-    """
+    """The first violation, or None. Subset: type, required, property type."""
     if not isinstance(schema, dict):
         return None
     expected = schema.get("type")
@@ -2197,10 +2179,7 @@ def _json_schema_violation(schema, document):
 
 
 def _check_request_validation(method_obj, api_id, request, headers, body, query_params):
-    """Run the method's request validator: parameters first, then the body
-    against the model for the request content type. BAD_REQUEST_PARAMETERS and
-    BAD_REQUEST_BODY are the two types this raises
-    (supported-gateway-response-types)."""
+    """The method's request validator: parameters first, then the body."""
     validator_id = method_obj.get("requestValidatorId")
     if not validator_id:
         return None
@@ -2242,9 +2221,7 @@ def _check_request_validation(method_obj, api_id, request, headers, body, query_
 
 
 def _check_passthrough_behavior(integration, headers):
-    """NEVER means "reject a content type no request template matches":
-    "when a payload is of an unsupported media type, if strict passthrough
-    behavior is enabled" (supported-gateway-response-types)."""
+    """NEVER rejects a content type no request template matches."""
     behavior = (integration.get("passthroughBehavior") or "WHEN_NO_MATCH").upper()
     if behavior != "NEVER":
         return None
@@ -2346,9 +2323,7 @@ async def _execute_in_scope(
     if auth_error is not None:
         return auth_error
 
-    # API Gateway's own checks, in the order it runs them: key, then throttle
-    # and quota, then request validation, then the integration's passthrough
-    # behaviour. Each answers through its gateway response type.
+    # API Gateway's own checks, in the order it runs them.
     key_error, api_key = _check_api_key(method_obj, api_id, stage_name, headers)
     if key_error is not None:
         return key_error

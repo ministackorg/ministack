@@ -4814,12 +4814,7 @@ def test_apigwv1_gateway_response_defaults_on_the_control_plane(apigw_v1, gwresp
     assert (got["defaultResponse"], got["responseParameters"]) == (True, {})
 
 
-# ---------------------------------------------------------------------------
-# The checks API Gateway runs before the integration: API key, throttling,
-# usage-plan quota, request validation, and strict passthrough. Status codes
-# and triggers from supported-gateway-response-types; the message strings
-# captured on a real account (eu-north-1 2026-09-20) except QUOTA_EXCEEDED.
-# ---------------------------------------------------------------------------
+# The checks API Gateway runs before the integration.
 
 def _mock_method(apigw_v1, api_id, resource_id, http_method, **method_kwargs):
     apigw_v1.put_method(restApiId=api_id, resourceId=resource_id,
@@ -4859,8 +4854,7 @@ def _gw_api(apigw_v1, name):
 
 
 def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
-    """"The gateway response for an invalid API key submitted for a method
-    requiring an API key" -- 403 INVALID_API_KEY."""
+    """403 INVALID_API_KEY for a missing or unknown key."""
     api_id, root = _gw_api(apigw_v1, f"gwkey-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
@@ -4874,7 +4868,6 @@ def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
 
         key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
                                       enabled=True)
-        # A key no usage plan attaches to this stage is as good as unknown.
         assert _stage_call(api_id, "/key",
                            headers=[("x-api-key", key["value"])])[0] == 403
         plan = apigw_v1.create_usage_plan(
@@ -4889,8 +4882,7 @@ def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
 
 
 def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
-    """A plan with quota 1 serves one request and then answers 429
-    QUOTA_EXCEEDED."""
+    """Quota 1 serves one request, then 429 QUOTA_EXCEEDED."""
     api_id, root = _gw_api(apigw_v1, f"gwquota-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
@@ -4914,8 +4906,7 @@ def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
 
 
 def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
-    """"when usage plan-, method-, stage-, or account-level throttling limits
-    exceeded" -- a 0/0 limit refuses everything, a real limit does not."""
+    """A 0/0 limit refuses everything; a real limit does not."""
     api_id, root = _gw_api(apigw_v1, f"gwthr-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
@@ -4936,7 +4927,6 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
         assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
         throttle("/~1thr/GET", 100, 50)
         assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
-        # The stage-wide entry applies where no method override does.
         apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
             {"op": "remove", "path": "/~1thr/GET"}])
         throttle("/*/*", 0, 0)
@@ -4946,8 +4936,7 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
 
 
 def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
-    """BAD_REQUEST_PARAMETERS and BAD_REQUEST_BODY, the two types an enabled
-    request validator raises."""
+    """BAD_REQUEST_PARAMETERS and BAD_REQUEST_BODY."""
     api_id, root = _gw_api(apigw_v1, f"gwval-{_uuid_mod.uuid4().hex[:8]}")
     try:
         apigw_v1.create_model(
@@ -4981,8 +4970,7 @@ def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
 
 
 def test_apigwv1_strict_passthrough_refuses_an_unmatched_media_type(apigw_v1):
-    """"when a payload is of an unsupported media type, if strict passthrough
-    behavior is enabled" -- 415 UNSUPPORTED_MEDIA_TYPE."""
+    """415 UNSUPPORTED_MEDIA_TYPE."""
     api_id, root = _gw_api(apigw_v1, f"gwmedia-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,

@@ -239,7 +239,8 @@ def well_known_jwks(pool_id: str):
     return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
 
 
-def well_known_openid_configuration(pool_id: str, region: str | None = None, host: str | None = None):
+def well_known_openid_configuration(pool_id: str, region: str | None = None,
+                                    host: str | None = None, scheme: str = "http"):
     """Return OpenID Connect discovery document.
 
     `issuer` matches the JWT `iss` claim (real AWS URL) so OIDC clients that
@@ -255,7 +256,9 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     # fallback for malformed pool_ids.
     r = _pool_region(pool_id) if pool_id else (region or get_region())
     issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
-    base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    # Behind a TLS terminator every URL in the document has to be https, or it
+    # disagrees with the https issuer and discovery fails.
+    base = f"{scheme}://{host}" if host else f"{scheme}://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     pool_base = f"{base}/{pool_id}"
     doc = {
         "issuer": issuer,
