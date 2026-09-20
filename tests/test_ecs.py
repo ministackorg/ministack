@@ -1104,6 +1104,20 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
     ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")
 
+    # ECS keeps both deployments while the replacement becomes healthy, then
+    # drains the old deployment and collapses the service to the new one.
+    _wait_until(
+        lambda: (
+            len(ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"]) == 1
+            and ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"][0]["rolloutState"] == "COMPLETED"
+        ),
+        timeout=30,
+    )
+
     # New tasks should be on the new TD
     new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
     assert len(new_tasks["taskArns"]) == 2
