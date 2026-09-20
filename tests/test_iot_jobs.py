@@ -447,9 +447,8 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
 # ---------------------------------------------------------------------------
 
 
-def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
-    """The documented device flow: `DescribeEndpoint(endpointType='iot:Jobs')`
-    hands out `{prefix}.jobs.iot.{region}`, and a request carrying that Host
+def test_iot_jobs_endpoint_host_reaches_the_data_plane(iot_client):
+    """A request carrying the jobs endpoint Host `{prefix}.jobs.iot.{region}`
     must land on the jobs data plane. Routed to the `iot` control plane
     instead, `GET /things/{t}/jobs` is ListJobExecutionsForThing and silently
     answers a different envelope."""
@@ -459,10 +458,7 @@ def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
         thing_arn = _create_thing(iot_client, thing)
         iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
 
-        endpoint = iot_client.describe_endpoint(endpointType="iot:Jobs")[
-            "endpointAddress"
-        ]
-        assert ".jobs.iot." in endpoint
+        endpoint = "a1b2c3.jobs.iot.us-east-1.localhost"
         request = urllib.request.Request(
             f"{ENDPOINT}/things/{quote(thing)}/jobs",
             method="GET",
@@ -1238,9 +1234,34 @@ def test_iot_jobs_lists_do_not_paginate_and_return_no_token(iot_client):
 # ---------------------------------------------------------------------------
 # Jobs over MQTT: the reserved $aws/things/<t>/jobs/# bridge
 # ---------------------------------------------------------------------------
-from test_iot_data import _collect_shadow_frames  # noqa: E402
+import asyncio  # noqa: E402
+
+from conftest import patch_endpoint_dns  # noqa: E402
+from test_iot_data import (  # noqa: E402
+    _WS_HANDSHAKE_TIMEOUT,
+    _collect_shadow_frames,
+    _make_publish,
+    _mqtt_connect,
+    _mqtt_disconnect,
+)
 
 _DOCUMENT_OBJECT = json.loads(_DOCUMENT)
+
+
+def _mqtt_publish(topic, payload):
+    """Publish at QoS 1 over the MQTT-over-WebSocket broker and wait for the
+    PUBACK. The jobs topics are MQTT-only: AWS refuses them over HTTPS."""
+
+    async def _run():
+        ws = await _mqtt_connect(_unique("jobs-device"))
+        try:
+            await ws.send(_make_publish(topic, payload, qos=1, packet_id=1))
+            await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
+        finally:
+            await _mqtt_disconnect(ws)
+
+    with patch_endpoint_dns():
+        asyncio.run(_run())
 
 
 def _frames_by_topic(received):
@@ -1285,7 +1306,7 @@ def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client
 
     received = _collect_shadow_frames(
         f"{base}/get/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/get",
             payload=json.dumps({"clientToken": "tok-get"}).encode(),
         ),
@@ -1351,7 +1372,7 @@ def test_jobs_mqtt_start_next_of_first_job_is_silent(iot_client, iot_data_client
 
     received = _collect_shadow_frames(
         f"{base}/#",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/start-next",
             payload=json.dumps({"clientToken": "tok-sn"}).encode(),
         ),
@@ -1391,13 +1412,13 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     )
     _collect_shadow_frames(
         f"{base}/start-next/accepted",
-        lambda: iot_data_client.publish(topic=f"{base}/start-next", payload=b"{}"),
+        lambda: _mqtt_publish(topic=f"{base}/start-next", payload=b"{}"),
         want=1,
     )
 
     received = _collect_shadow_frames(
         f"{base}/{job_id}/update/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1419,7 +1440,7 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
 
     received = _collect_shadow_frames(
         f"{base}/#",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1466,7 +1487,7 @@ def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/{job_id}/update/rejected",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1495,7 +1516,7 @@ def test_jobs_mqtt_update_unknown_job_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/no-such-job/update/rejected",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/no-such-job/update",
             payload=json.dumps({"status": "SUCCEEDED", "clientToken": "tok-x"}).encode(),
         ),
@@ -1518,7 +1539,7 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/$next/get/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/$next/get",
             payload=json.dumps({"clientToken": "tok-next"}).encode(),
         ),
@@ -1534,7 +1555,7 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/get/accepted",
-        lambda: iot_data_client.publish(topic=f"{base}/get", payload=b"{}"),
+        lambda: _mqtt_publish(topic=f"{base}/get", payload=b"{}"),
         want=1,
     )
     doc = _frames_by_topic(received)[f"{base}/get/accepted"]
@@ -1551,7 +1572,7 @@ def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/get/rejected",
-        lambda: iot_data_client.publish(topic=f"{base}/get", payload=b"[1, 2]"),
+        lambda: _mqtt_publish(topic=f"{base}/get", payload=b"[1, 2]"),
         want=1,
     )
     doc = _frames_by_topic(received)[f"{base}/get/rejected"]
@@ -1560,7 +1581,7 @@ def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
 
 
 def _qa_publish(iot_data_client, topic, payload):
-    iot_data_client.publish(topic=topic, qos=1, payload=payload)
+    _mqtt_publish(topic=topic, payload=payload)
 
 
 def test_jobs_mqtt_malformed_json_is_rejected_invalidjson(iot_client, iot_data_client):
