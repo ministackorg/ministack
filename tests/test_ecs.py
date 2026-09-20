@@ -1137,7 +1137,12 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
         timeout=30,
     )
     svc = ecs.describe_services(cluster=cluster, services=["tdu-svc"])
-    assert svc["services"][0]["runningCount"] == 2
+    service = svc["services"][0]
+    assert service["runningCount"] == 2
+    assert len(service["deployments"]) == 1
+    assert service["deployments"][0]["taskDefinition"] == new_td_arn
+    assert service["deployments"][0]["status"] == "PRIMARY"
+    assert service["deployments"][0]["rolloutState"] == "COMPLETED"
 
 
 def test_ecs_service_delete_stops_tasks(ecs):
