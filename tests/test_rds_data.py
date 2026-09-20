@@ -11,6 +11,8 @@ import json
 import os
 import urllib.request
 import uuid
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import boto3
 import pytest
@@ -1465,3 +1467,98 @@ def test_rds_data_stub_state_is_region_isolated():
         rd._stub_databases.pop("iso-cluster", None)
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# numberOfRecordsUpdated: PostgreSQL reports returned rows in cursor.rowcount
+# for SELECT, so the command tag decides. Measured on PostgreSQL 16:
+# "SELECT 3" for a 3-row select, "INSERT 0 1" even with RETURNING.
+# ---------------------------------------------------------------------------
+
+_PG_ENGINES = ("postgres", "aurora-postgresql")
+_MYSQL_ENGINES = ("mysql", "aurora-mysql", "mariadb")
+
+
+def _execute_with_cursor(monkeypatch, engine, rowcount, status=None, rows=None,
+                         sql="SELECT 1", with_status=True):
+    """Run _execute_statement against a stubbed driver cursor."""
+    from ministack.services import rds_data
+
+    cursor = SimpleNamespace(
+        rowcount=rowcount,
+        description=([("value", 23, None, None, None, None, None)]
+                     if rows is not None else None),
+        execute=Mock(), fetchall=Mock(return_value=rows), close=Mock(),
+    )
+    if with_status:
+        cursor.statusmessage = status
+    connection = Mock()
+    connection.cursor.return_value = cursor
+
+    monkeypatch.setattr(rds_data, "_resolve_target",
+                        lambda _arn: ({"DBInstanceIdentifier": "unit"}, engine, {}))
+    monkeypatch.setattr(rds_data, "_validate_http_endpoint_enabled", lambda *_a, **_k: None)
+    monkeypatch.setattr(rds_data, "_require_secret_credentials",
+                        lambda _arn: ("user", "password", None))
+    monkeypatch.setattr(rds_data, "_has_real_endpoint", lambda *_a, **_k: True)
+    monkeypatch.setattr(rds_data, "_connect", lambda *_a, **_k: connection)
+
+    status_code, _headers, body = rds_data._execute_statement({
+        "resourceArn": "resource", "secretArn": "secret", "sql": sql,
+        "includeResultMetadata": True,
+    })
+    assert status_code == 200, body
+    cursor.execute.assert_called_once_with(sql, None)
+    cursor.close.assert_called_once()
+    connection.close.assert_called_once()
+    return json.loads(body)
+
+
+@pytest.mark.parametrize("engine", _PG_ENGINES)
+@pytest.mark.parametrize("rows", ([], [(1,)], [(1,), (2,)]), ids=("none", "one", "two"))
+def test_rds_data_pg_select_reports_no_updated_records(monkeypatch, engine, rows):
+    """A SELECT updates nothing, whatever psycopg2 puts in rowcount."""
+    result = _execute_with_cursor(
+        monkeypatch, engine, len(rows), f"SELECT {len(rows)}", rows,
+        sql="/* comment */ WITH x AS (SELECT 1) SELECT * FROM x")
+    assert result["numberOfRecordsUpdated"] == 0
+    assert result["records"] == [[{"longValue": row[0]}] for row in rows]
+    assert result["columnMetadata"][0]["name"] == "value"
+
+
+@pytest.mark.parametrize("command", ("INSERT", "UPDATE", "DELETE"))
+@pytest.mark.parametrize("count", (0, 2))
+@pytest.mark.parametrize("returning", (False, True), ids=("plain", "returning"))
+def test_rds_data_pg_dml_keeps_its_count(monkeypatch, command, count, returning):
+    """DML keeps its count, RETURNING included: the tag stays INSERT/UPDATE/DELETE."""
+    rows = [(1,)] * count if returning else None
+    tag = f"INSERT 0 {count}" if command == "INSERT" else f"{command} {count}"
+    result = _execute_with_cursor(monkeypatch, "postgres", count, tag, rows)
+    assert result["numberOfRecordsUpdated"] == count
+    assert len(result["records"]) == (count if returning else 0)
+
+
+@pytest.mark.parametrize("status", (
+    None, "", "   ", 123, b"SELECT 2", "SELECTED 2", "select 2",
+    "CREATE TABLE AS", "FETCH 2",
+))
+def test_rds_data_pg_unrecognised_tag_preserves_the_count(monkeypatch, status):
+    assert _execute_with_cursor(
+        monkeypatch, "postgres", 2, status)["numberOfRecordsUpdated"] == 2
+
+
+def test_rds_data_pg_missing_statusmessage_preserves_the_count(monkeypatch):
+    assert _execute_with_cursor(
+        monkeypatch, "postgres", 2, with_status=False)["numberOfRecordsUpdated"] == 2
+
+
+@pytest.mark.parametrize("engine", _PG_ENGINES + ("mysql",))
+def test_rds_data_negative_rowcount_is_clamped(monkeypatch, engine):
+    assert _execute_with_cursor(monkeypatch, engine, -1)["numberOfRecordsUpdated"] == 0
+
+
+@pytest.mark.parametrize("engine", _MYSQL_ENGINES)
+def test_rds_data_mysql_row_counts_are_unchanged(monkeypatch, engine):
+    """pymysql has no statusmessage, so the MySQL path is untouched."""
+    assert _execute_with_cursor(
+        monkeypatch, engine, 2, "SELECT 2", [(1,), (2,)])["numberOfRecordsUpdated"] == 2
