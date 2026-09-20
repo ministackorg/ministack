@@ -24016,3 +24016,108 @@ def test_cfn_s3_bucket_lambda_notification_reads_back(cfn, s3, lam):
             lam.delete_function(FunctionName=fn_name)
         except ClientError:
             pass
+
+
+def test_cfn_rds_instance_defaults_to_snapshot_on_delete(cfn, rds):
+    """A DBInstance without DBClusterIdentifier defaults to DeletionPolicy
+    Snapshot: the stack delete takes a snapshot and then removes the instance."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-snap-{uid}"
+    db_id = f"cfn-rds-snap-{uid}"
+    template = json.dumps({"Resources": {
+        "Db": {"Type": "AWS::RDS::DBInstance", "Properties": {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "DBInstanceClass": "db.t3.micro",
+            "AllocatedStorage": "20",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        }},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"]
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+        snap = rds.describe_db_snapshots(
+            DBSnapshotIdentifier=f"{db_id}-final-snapshot")["DBSnapshots"][0]
+        assert snap["DBInstanceIdentifier"] == db_id
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_instances(DBInstanceIdentifier=db_id)
+        assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            rds.delete_db_snapshot(DBSnapshotIdentifier=f"{db_id}-final-snapshot")
+        except ClientError:
+            pass
+
+
+def test_cfn_rds_cluster_defaults_to_snapshot_on_delete(cfn, rds):
+    """Same default for AWS::RDS::DBCluster, through the cluster snapshot API."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rdsc-snap-{uid}"
+    cluster_id = f"cfn-rdsc-snap-{uid}"
+    template = json.dumps({"Resources": {
+        "Cluster": {"Type": "AWS::RDS::DBCluster", "Properties": {
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        }},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+        snap = rds.describe_db_cluster_snapshots(
+            DBClusterSnapshotIdentifier=f"{cluster_id}-final-snapshot",
+        )["DBClusterSnapshots"][0]
+        assert snap["DBClusterIdentifier"] == cluster_id
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            rds.delete_db_cluster_snapshot(
+                DBClusterSnapshotIdentifier=f"{cluster_id}-final-snapshot")
+        except ClientError:
+            pass
+
+
+def test_cfn_rds_instance_in_a_cluster_defaults_to_delete(cfn, rds):
+    """A DBInstance that names DBClusterIdentifier is outside AWS's exception,
+    so it defaults to Delete and leaves no snapshot behind."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rdsm-snap-{uid}"
+    cluster_id, db_id = f"cfn-rdsm-c-{uid}", f"cfn-rdsm-i-{uid}"
+    template = json.dumps({"Resources": {
+        "Cluster": {"Type": "AWS::RDS::DBCluster", "DeletionPolicy": "Delete",
+                    "Properties": {
+                        "DBClusterIdentifier": cluster_id,
+                        "Engine": "aurora-postgresql",
+                        "MasterUsername": "admin",
+                        "MasterUserPassword": "password123"}},
+        "Member": {"Type": "AWS::RDS::DBInstance", "Properties": {
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-postgresql",
+            "DBInstanceClass": "db.t3.medium"}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_snapshots(DBSnapshotIdentifier=f"{db_id}-final-snapshot")
+        assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

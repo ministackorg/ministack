@@ -25,6 +25,7 @@ from .provisioners import (
     _RETAINING_POLICIES,
     _delete_resource,
     _provision_resource,
+    _snapshot_resource,
     _update_resource,
     _with_stack_tags,
 )
@@ -86,9 +87,9 @@ def _default_resource_policy(res_def, attribute) -> str:
     rtype = (res_def or {}).get("Type")
     props = (res_def or {}).get("Properties") or {}
     if rtype == "AWS::RDS::DBCluster":
-        return "Retain"
+        return "Snapshot"
     if rtype == "AWS::RDS::DBInstance" and not props.get("DBClusterIdentifier"):
-        return "Retain"
+        return "Snapshot"
     return "Delete"
 
 
@@ -99,9 +100,7 @@ def _resource_policy(res_def, attribute, resources, params, conditions, mappings
     defaults ``DeletionPolicy`` to ``Snapshot`` for ``AWS::RDS::DBCluster`` and
     for ``AWS::RDS::DBInstance`` without ``DBClusterIdentifier``
     (aws-attribute-deletionpolicy.html; captured eu-north-1 2026-09-19, the
-    stack delete left a manual snapshot behind). This emulator takes no
-    snapshots, so those two default to ``Retain``: the data survives the stack
-    delete, which is what Snapshot is for, where ``Delete`` would destroy it.
+    stack delete left a manual snapshot behind).
 
     An intrinsic (``Fn::If``) is resolved like a property; one that does not
     resolve counts as ``Delete`` and is logged, since that is the destructive
@@ -514,6 +513,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 provisioned_resources.pop(logical_id, None)
                 continue
             try:
+                if policy == "Snapshot":
+                    _snapshot_resource(rtype, pid, old_props)
                 if _is_custom_resource(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, pid, old_props,
@@ -723,6 +724,8 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
+            if policy == "Snapshot":
+                _snapshot_resource(rtype, pid, res_props)
             if _is_custom_resource(rtype):
                 await run_reentrant(
                     _delete_resource, rtype, pid, res_props,

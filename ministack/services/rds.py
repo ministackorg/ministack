@@ -6628,28 +6628,14 @@ def _reset_db_cluster_param_group(p):
 # DB Cluster Snapshots
 # ---------------------------------------------------------------------------
 
-def _create_db_cluster_snapshot(p):
-    snap_id = _p(p, "DBClusterSnapshotIdentifier")
-    cluster_id = _p(p, "DBClusterIdentifier")
-    if not snap_id:
-        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
-    if snap_id in _db_cluster_snapshots:
-        return _error("DBClusterSnapshotAlreadyExistsFault",
-            f"DB cluster snapshot {snap_id} already exists.", 400)
-
-    cluster = _resolve_cluster_in_request_region(cluster_id)
-    if not cluster:
-        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
-        if wrong_region:
-            return wrong_region
-        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
-    cluster_id = cluster["DBClusterIdentifier"]
-
+def _create_cluster_snapshot_internal(snap_id, cluster):
+    """The snapshot record for one cluster. Shared with the CloudFormation
+    ``DeletionPolicy: Snapshot`` path, which has no request to parse."""
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
     now_ts = time.time()
     snap = {
         "DBClusterSnapshotIdentifier": snap_id,
-        "DBClusterIdentifier": cluster_id,
+        "DBClusterIdentifier": cluster["DBClusterIdentifier"],
         "DBClusterSnapshotArn": arn,
         "Engine": cluster["Engine"],
         "EngineVersion": cluster["EngineVersion"],
@@ -6672,6 +6658,28 @@ def _create_db_cluster_snapshot(p):
     }
     _db_cluster_snapshots[snap_id] = snap
 
+    return snap
+
+
+def _create_db_cluster_snapshot(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    cluster_id = _p(p, "DBClusterIdentifier")
+    if not snap_id:
+        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
+    if snap_id in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotAlreadyExistsFault",
+            f"DB cluster snapshot {snap_id} already exists.", 400)
+
+    cluster = _resolve_cluster_in_request_region(cluster_id)
+    if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster["DBClusterIdentifier"]
+
+    snap = _create_cluster_snapshot_internal(snap_id, cluster)
+    arn = snap["DBClusterSnapshotArn"]
     req_tags = _parse_tags(p)
     if req_tags:
         _tags[arn] = req_tags

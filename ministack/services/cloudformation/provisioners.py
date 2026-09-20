@@ -532,6 +532,20 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     raise ValueError(f"Unsupported resource type: {resource_type}")
 
 
+def _snapshot_id(physical_id: str) -> str:
+    """Name for a `DeletionPolicy: Snapshot` snapshot. AWS generates one too;
+    its format is not documented, so this is the emulator's."""
+    return f"{physical_id}-final-snapshot"
+
+
+def _snapshot_resource(resource_type: str, physical_id: str, props: dict) -> None:
+    """Snapshot a resource before its stack deletes it. A type that does not
+    support snapshots has no handler, and `Snapshot` is a plain delete there."""
+    handler = _RESOURCE_HANDLERS.get(resource_type)
+    if handler and "snapshot" in handler:
+        handler["snapshot"](physical_id, props)
+
+
 def _delete_resource(resource_type: str, physical_id: str, props: dict,
                      stack_name: str | None = None, logical_id: str | None = None):
     """Delete a provisioned resource."""
@@ -9102,6 +9116,12 @@ def _rds_db_cluster_delete(physical_id, props):
     _rds._clusters.pop(physical_id, None)
 
 
+def _rds_db_cluster_snapshot(physical_id, props):
+    cluster = _rds._clusters.get(physical_id)
+    if cluster is not None:
+        _rds._create_cluster_snapshot_internal(_snapshot_id(physical_id), cluster)
+
+
 # ---------------------------------------------------------------------------
 # RDS DBInstance
 # ---------------------------------------------------------------------------
@@ -9232,6 +9252,12 @@ def _rds_db_instance_create(logical_id, props, stack_name):
         "DbiResourceId": dbi_resource_id,
         "DBInstanceArn": arn,
     }
+
+
+def _rds_db_instance_snapshot(physical_id, props):
+    instance = _rds._instances.get(physical_id)
+    if instance is not None:
+        _rds._create_snapshot_internal(_snapshot_id(physical_id), instance)
 
 
 def _rds_db_instance_delete(physical_id, props):
@@ -10894,8 +10920,10 @@ _RESOURCE_HANDLERS = {
         "update": _cw_dashboard_update,
         "delete": _cw_dashboard_delete,
     },
-    "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
-    "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
+    "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete,
+                            "snapshot": _rds_db_cluster_snapshot},
+    "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete,
+                             "snapshot": _rds_db_instance_snapshot},
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,
         "update": _iot_topic_rule_update,

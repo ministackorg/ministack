@@ -4168,9 +4168,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
-        # Modelled CreateJob members stored so DescribeJob echoes them. Storing
-        # is all this does: nothing acts on timeoutConfig or abortConfig, so no
-        # execution reaches TIMED_OUT and nothing aborts.
+        # Stored so DescribeJob echoes them. timeoutConfig is acted on; nothing aborts.
         "abortConfig": payload.get("abortConfig"),
         "timeoutConfig": payload.get("timeoutConfig"),
         "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
