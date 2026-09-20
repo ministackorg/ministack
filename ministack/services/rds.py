@@ -1127,6 +1127,10 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
     """
     if engine not in ("postgres", "aurora-postgresql"):
         return docker_client.containers.run(**container_kwargs)
+    # Injecting the certificate needs create -> put_archive -> start, so a
+    # client that cannot do that keeps the plain launch and serves plaintext.
+    if not hasattr(docker_client.containers, "create"):
+        return docker_client.containers.run(**container_kwargs)
 
     container = None
     try:
