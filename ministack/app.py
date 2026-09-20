@@ -30,14 +30,20 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
-_VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
-if _VERSION == "dev":
-    try:
-        from importlib.metadata import version as _pkg_version
+_VERSION = os.environ.get("MINISTACK_VERSION") or ""
 
-        _VERSION = _pkg_version("ministack")
-    except Exception:
-        pass
+
+def _version() -> str:
+    """The reported version, resolved on first ask and cached."""
+    global _VERSION
+    if not _VERSION:
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _VERSION = _pkg_version("ministack")
+        except Exception:
+            _VERSION = "dev"
+    return _VERSION
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
@@ -773,7 +779,8 @@ def _handle_health_request(path: str, request_id: str):
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
-                "version": _VERSION,
+                "version": _version(),
+                "iot_mtls": _iot_mtls_state,
                 "ready_scripts": dict(_ready_scripts_state),
             }
         ).encode(),
@@ -784,15 +791,20 @@ def _handle_ready_request(path: str, request_id: str):
     """Return readiness state once ready.d scripts have completed."""
     if path != "/_ministack/ready":
         return None
-    ready = _ready_scripts_state["status"] == "completed"
+    # The mTLS listener binds after the HTTP port, so readiness covers it: a
+    # consumer polling one endpoint does not race the MQTT port.
+    ready = (_ready_scripts_state["status"] == "completed"
+             and _iot_mtls_state != "starting")
     status = 200 if ready else 503
+    body = dict(_ready_scripts_state)
+    body["iot_mtls"] = _iot_mtls_state
     return (
         status,
         {
             "Content-Type": "application/json",
             "x-amzn-requestid": request_id,
         },
-        json.dumps(dict(_ready_scripts_state)).encode(),
+        json.dumps(body).encode(),
     )
 
 
@@ -2548,8 +2560,34 @@ async def app(scope, receive, send):
 # ---------------------------------------------------------------------------
 
 
+# The boot task that imports iot and binds the mTLS listener, and the state
+# /_ministack/health and /_ministack/ready report for it.
+_iot_mtls_task = None
+_iot_mtls_state = "disabled"
+
+
+async def _start_iot_mtls():
+    """Import the iot module and bind the mTLS MQTT listener."""
+    global _iot_mtls_state
+    try:
+        from ministack.services import iot as _iot_svc
+
+        await _iot_svc.mtls_start()
+        if _iot_svc.mtls_is_listening():
+            _iot_mtls_state = "listening"
+        else:
+            # mtls_start returns without binding when the listener is off
+            # (cryptography missing, or IOT_MTLS_ENABLED=0), which is not a
+            # failure and must not report a healthy MiniStack as degraded.
+            _iot_mtls_state = "degraded" if _iot_svc.mtls_enabled() else "disabled"
+    except Exception as e:
+        _iot_mtls_state = "degraded"
+        logger.warning("IoT mTLS listener startup failed: %s", e)
+
+
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events."""
+    global _iot_mtls_task, _iot_mtls_state
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -2640,12 +2678,12 @@ async def _handle_lifespan(scope, receive, send):
             if _iot_mtls_env in ("0", "false", "no", "off"):
                 logger.debug("IOT_MTLS_ENABLED=%s — skipping iot module import.", _iot_mtls_env)
             else:
-                try:
-                    from ministack.services import iot as _iot_svc
-
-                    await _iot_svc.mtls_start()
-                except Exception as e:
-                    logger.warning("IoT mTLS listener startup failed: %s", e)
+                # Off the startup sequence: importing iot and minting the
+                # broker certificate is the bulk of a boot. The listener comes
+                # up after the HTTP port; /_ministack/ready waits for it and
+                # shutdown joins the task before stopping the listener.
+                _iot_mtls_state = "starting"
+                _iot_mtls_task = asyncio.create_task(_start_iot_mtls())
             # Start DSQL wire proxies for clusters restored from persistence.
             # Guarded on the module already being loaded (i.e. it had state
             # or was used this boot) so we never import dsql just for this.
@@ -2689,6 +2727,11 @@ async def _handle_lifespan(scope, receive, send):
                 await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
+            if _iot_mtls_task is not None:
+                try:
+                    await _iot_mtls_task
+                except Exception as e:
+                    logger.debug("IoT mTLS startup error: %s", e)
             _iot_mod = sys.modules.get("ministack.services.iot")
             if _iot_mod is not None:
                 try:

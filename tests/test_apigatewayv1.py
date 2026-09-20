@@ -1034,8 +1034,8 @@ def test_apigwv1_execute_token_authorizer(apigw_v1, lam):
     - Allow policy               -> 200, with the returned context (values
       stringified) plus principalId injected into requestContext.authorizer.
     """
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
     import uuid as _uuid
 
     suffix = _uuid.uuid4().hex[:8]
@@ -1155,8 +1155,8 @@ def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
 
     We do not verify the SigV4 signature; only the presence check is enforced.
     """
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
     import uuid as _uuid
 
     fname = f"intg-v1-iam-{_uuid.uuid4().hex[:8]}"

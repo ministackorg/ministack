@@ -26,12 +26,12 @@ import urllib.request
 import uuid
 import zipfile as _zipfile
 from urllib.parse import quote, urlparse
-from conftest import patch_endpoint_dns
 
 import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import patch_endpoint_dns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -3054,7 +3054,9 @@ def _spawn(env_extra: dict, port: int, log_path=None) -> subprocess.Popen:
             sink.close()
 
 
-def _wait_health(url: str, timeout: float = 30.0) -> None:
+def _wait_ready(url: str, timeout: float = 30.0) -> None:
+    """Poll until 200. /_ministack/ready answers 503 while the mTLS listener is
+    still binding, so this covers the MQTT port too."""
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -3119,7 +3121,7 @@ def broker(tmp_path_factory):
         {"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port, log_path=log_path
     )
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         yield _Broker(http_port, mqtt_port, log_path)
     finally:
         _terminate(proc)
@@ -3299,7 +3301,7 @@ def test_mtls_on_by_default(tmp_path):
     http_port = _free_port()
     proc = _spawn({"LOG_LEVEL": "INFO", "IOT_MTLS_ENABLED": None}, http_port, log_path=log)
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         text = log.read_text(errors="replace")
         listening = "MQTT listening on port 8883" in text
         degraded = "failed to bind port 8883" in text
@@ -3319,7 +3321,7 @@ def test_mtls_disabled_by_env(tmp_path):
     http_port = _free_port()
     proc = _spawn({"LOG_LEVEL": "DEBUG"}, http_port, log_path=log)
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         text = log.read_text(errors="replace")
         assert "skipping iot module import" in text, f"no opt-out line in the log:\n{text}"
         assert "MQTT listening on port" not in text
@@ -3781,7 +3783,7 @@ def test_mtls_shutdown_completes_with_a_device_connected(tmp_path):
     proc = _spawn({"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
     peer = None
     try:
-        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         private = _Broker(http_port, mqtt_port)
         _cert_id, cert_pem, key_pem = _new_cert(private)
         peer = _Peer(_mtls_connect(private, cert_pem, key_pem, tmp_path))

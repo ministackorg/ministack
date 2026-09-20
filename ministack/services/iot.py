@@ -7773,6 +7773,11 @@ def _mtls_build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def mtls_is_listening() -> bool:
+    """Whether the mTLS listener holds a bound socket."""
+    return _mtls_server is not None
+
+
 async def mtls_start() -> None:
     """Idempotent: bind the mTLS MQTT listener, unless disabled."""
     if not mtls_enabled():
