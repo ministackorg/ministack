@@ -3830,6 +3830,44 @@ def test_apigwv1_authorizer_invalid_validation_expression_is_500(apigw_v1, lam):
         _auth_drop_lambda(lam, authz)
 
 
+def test_apigwv1_authorizer_without_principal_id_reaches_the_backend(apigw_v1, lam, sqs):
+    """An Allow policy with no principalId is NOT a configuration error: the
+    request reaches the backend with 200 and an authorizer context carrying no
+    principalId (captured eu-north-1 2026-09-20 — HTTP 200, body "ok").
+
+    Restores the coverage #1756 dropped. The sibling below is the contrast: a
+    response with no policyDocument IS a configuration error, because API
+    Gateway has nothing to authorize against.
+    """
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(
+        lam, "noprincipal",
+        _AUTH_MARK_PRELUDE
+        + "def handler(event, context):\n"
+        f"    _mark({qname!r})\n"
+        "    return {'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        "        {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
+        "         'Resource': event['methodArn']}]}}\n",
+    )
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="noprincipal", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _auth_execute_url(api_id, "test", "secure")
+        status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
+        assert status == 200, body
+        context = json.loads(body)
+        assert not (context or {}).get("principalId")
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
 def test_apigwv1_authorizer_without_policy_document_is_500_and_not_cached(apigw_v1, lam, sqs):
     """A response with no policyDocument is a misconfigured authorizer: AWS
     answers 500 AuthorizerConfigurationException, not an implicit deny — and
