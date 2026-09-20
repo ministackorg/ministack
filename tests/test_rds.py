@@ -15771,3 +15771,100 @@ def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
     assert rds_service._cluster_endpoint_aliases(
         {"Endpoint": name, "Engine": "aurora-mysql"}) == [
         name, "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"]
+
+
+def _rds_ca_pem(tmp_path):
+    """The CA that signs DB server certificates, written where libpq can read it."""
+    import urllib.request
+    path = tmp_path / "ministack-rds-ca.pem"
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/rds/ca.pem", timeout=10) as response:
+        assert response.status == 200
+        path.write_bytes(response.read())
+    return str(path)
+
+
+@pytest.mark.parametrize("engine", ("postgres", "aurora-postgresql"))
+def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
+    """AWS installs the DB server certificate itself and every instance we
+    report carries CACertificateIdentifier, so TLS is on without asking: a
+    client using our CA connects, and plaintext still works as it does on AWS
+    without rds.force_ssl."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    db_id = f"tls-{engine.split('-')[-1]}-{_uuid_mod.uuid4().hex[:8]}"
+    cluster_id = f"{db_id}-c"
+    try:
+        if engine == "aurora-postgresql":
+            rds.create_db_cluster(
+                DBClusterIdentifier=cluster_id, Engine=engine,
+                MasterUsername="admin", MasterUserPassword="password",
+                DatabaseName="appdb",
+            )
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large", Engine=engine,
+            )
+        else:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
+                Engine=engine, MasterUsername="admin",
+                MasterUserPassword="password", DBName="appdb",
+                AllocatedStorage=20,
+            )
+        endpoint = None
+        for _ in range(90):
+            detail = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+            if detail["DBInstanceStatus"] == "available" and detail.get("Endpoint"):
+                endpoint = detail["Endpoint"]
+                break
+            time.sleep(2)
+        if endpoint is None:
+            pytest.skip("no backing container available in this environment")
+        assert detail["CACertificateIdentifier"] == "rds-ca-rsa2048-g1"
+
+        ca = _rds_ca_pem(tmp_path)
+
+        def connect(sslmode):
+            connection = psycopg2.connect(
+                host=endpoint["Address"], port=endpoint["Port"], user="admin",
+                password="password", dbname="appdb", sslmode=sslmode,
+                sslrootcert=ca, connect_timeout=15,
+            )
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                return cursor.fetchone()[0]
+            finally:
+                connection.close()
+
+        # verify-full also pins the hostname, so the SAN has to cover the
+        # endpoint the API advertises.
+        for sslmode in ("require", "verify-ca", "verify-full"):
+            assert connect(sslmode) is True, sslmode
+        assert connect("disable") is False
+    finally:
+        try:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        if engine == "aurora-postgresql":
+            try:
+                rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
+
+
+def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
+    """The CA is minted once and served as PEM, the local stand-in for AWS's
+    certificate bundle."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+
+    again = tmp_path / "again"
+    again.mkdir()
+    first = open(_rds_ca_pem(tmp_path), "rb").read()
+    second = open(_rds_ca_pem(again), "rb").read()
+    assert first == second, "the CA must not be re-minted per request"
+    cert = x509.load_pem_x509_certificate(first)
+    assert cert.issuer == cert.subject
+    assert "Ministack RDS Root CA" in cert.subject.rfc4514_string()

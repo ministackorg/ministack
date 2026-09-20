@@ -836,3 +836,86 @@ def test_appconfig_applications_are_region_scoped():
                 client.delete_application(ApplicationId=app_id)
             except Exception:
                 pass
+
+
+def _deploy_and_fetch(appconfig_client, appconfigdata_client, profile_type, content,
+                      suffix):
+    """Create app/env/profile, deploy `content`, and return the served bytes."""
+    app = appconfig_client.create_application(Name=f"ff-app-{suffix}")
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="env")
+    profile = appconfig_client.create_configuration_profile(
+        ApplicationId=app["Id"], Name=f"p-{suffix}", LocationUri="hosted",
+        Type=profile_type,
+    )
+    appconfig_client.create_hosted_configuration_version(
+        ApplicationId=app["Id"], ConfigurationProfileId=profile["Id"],
+        Content=json.dumps(content).encode("utf-8"), ContentType="application/json",
+    )
+    strategy = appconfig_client.create_deployment_strategy(
+        Name=f"s-{suffix}", DeploymentDurationInMinutes=0, GrowthFactor=100.0,
+        ReplicateTo="NONE",
+    )
+    appconfig_client.start_deployment(
+        ApplicationId=app["Id"], EnvironmentId=env["Id"],
+        DeploymentStrategyId=strategy["Id"],
+        ConfigurationProfileId=profile["Id"], ConfigurationVersion="1",
+    )
+    session = appconfigdata_client.start_configuration_session(
+        ApplicationIdentifier=app["Id"], EnvironmentIdentifier=env["Id"],
+        ConfigurationProfileIdentifier=profile["Id"],
+    )
+    latest = appconfigdata_client.get_latest_configuration(
+        ConfigurationToken=session["InitialConfigurationToken"])
+    return json.loads(latest["Configuration"].read())
+
+
+_FEATURE_FLAGS_DEPLOYMENT_TIME = {
+    "flags": {
+        "my_flag": {"name": "my_flag", "attributes": {"level": {"constraints": {"type": "string"}}}},
+        "off_flag": {"name": "off_flag"},
+    },
+    "values": {
+        "my_flag": {"enabled": True, "level": "INFO"},
+        "off_flag": {"enabled": False},
+    },
+    "version": "1",
+}
+
+
+def test_appconfig_feature_flags_are_served_in_retrieval_time_format(
+        appconfig_client, appconfigdata_client):
+    """A feature-flag profile is stored in deployment-time format and served in
+    retrieval-time format, "which only contains the flag's value" -- the values
+    map lifted to the top level, with no flags/version wrapper. A disabled flag
+    is still served, carrying enabled false."""
+    served = _deploy_and_fetch(
+        appconfig_client, appconfigdata_client, "AWS.AppConfig.FeatureFlags",
+        _FEATURE_FLAGS_DEPLOYMENT_TIME, "ff",
+    )
+    assert served == {
+        "my_flag": {"enabled": True, "level": "INFO"},
+        "off_flag": {"enabled": False},
+    }
+    assert "flags" not in served
+    assert "version" not in served
+
+
+def test_appconfig_freeform_content_is_served_verbatim(
+        appconfig_client, appconfigdata_client):
+    """Only a feature-flag profile is transformed; a freeform profile that
+    happens to carry a `values` key keeps it."""
+    document = {"values": {"not": "a flag"}, "greeting": "hello"}
+    assert _deploy_and_fetch(
+        appconfig_client, appconfigdata_client, "AWS.Freeform", document, "free",
+    ) == document
+
+
+def test_appconfig_feature_flags_without_values_are_served_verbatim(
+        appconfig_client, appconfigdata_client):
+    """Content that does not carry the deployment-time shape is passed through
+    rather than emptied."""
+    document = {"my_flag": {"enabled": True}}
+    assert _deploy_and_fetch(
+        appconfig_client, appconfigdata_client, "AWS.AppConfig.FeatureFlags",
+        document, "noval",
+    ) == document

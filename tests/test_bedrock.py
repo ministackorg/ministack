@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 
 import botocore.exceptions
+import pytest
 from conftest import ENDPOINT, make_client
 
 # ---------------------------------------------------------------------------
@@ -1815,3 +1816,159 @@ def test_bedrock_list_tags_rejects_unknown_resource_arn():
         assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
     else:
         raise AssertionError("expected ResourceNotFoundException")
+
+
+# ---------------------------------------------------------------------------
+# Converse toolConfig <-> OpenAI tools. The mapping is pure, so it is exercised
+# directly rather than through a live model endpoint.
+# ---------------------------------------------------------------------------
+
+_TOOL_SPEC = {
+    "tools": [{"toolSpec": {
+        "name": "get_weather",
+        "description": "Get weather",
+        "inputSchema": {"json": {"type": "object",
+                                 "properties": {"city": {"type": "string"}},
+                                 "required": ["city"]}},
+    }}],
+}
+
+
+def test_bedrock_converse_tool_config_maps_to_openai_tools():
+    from ministack.services import bedrock_runtime as br
+
+    tools, choice = br._openai_tools(_TOOL_SPEC)
+    assert tools == [{"type": "function", "function": {
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]},
+        "description": "Get weather",
+    }}]
+    assert choice is None
+
+
+@pytest.mark.parametrize(("tool_choice", "expected"), [
+    ({"auto": {}}, "auto"),
+    ({"any": {}}, "required"),
+    ({"tool": {"name": "get_weather"}},
+     {"type": "function", "function": {"name": "get_weather"}}),
+])
+def test_bedrock_converse_tool_choice_maps(tool_choice, expected):
+    from ministack.services import bedrock_runtime as br
+
+    _tools, choice = br._openai_tools({**_TOOL_SPEC, "toolChoice": tool_choice})
+    assert choice == expected
+
+
+def test_bedrock_converse_tool_use_and_result_survive_the_round_trip():
+    """A tool-calling loop keeps its history: the assistant's toolUse becomes an
+    OpenAI tool_call and the user's toolResult becomes a role "tool" message."""
+    from ministack.services import bedrock_runtime as br
+
+    messages = [
+        {"role": "user", "content": [{"text": "weather in Paris?"}]},
+        {"role": "assistant", "content": [{"toolUse": {
+            "toolUseId": "call_abc", "name": "get_weather", "input": {"city": "Paris"}}}]},
+        {"role": "user", "content": [{"toolResult": {
+            "toolUseId": "call_abc", "content": [{"json": {"tempC": 18}}],
+            "status": "success"}}]},
+    ]
+    assert br._openai_messages(messages, []) == [
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_abc", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
+        {"role": "tool", "tool_call_id": "call_abc", "content": '{"tempC": 18}'},
+    ]
+
+
+def test_bedrock_converse_tool_call_becomes_a_tool_use_block():
+    from ministack.services import bedrock_runtime as br
+
+    blocks, stop_reason = br._converse_blocks_from_message({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "call_abc", "type": "function",
+                        "function": {"name": "get_weather",
+                                     "arguments": '{"city": "Paris"}'}}],
+    })
+    assert stop_reason == "tool_use"
+    assert blocks == [{"toolUse": {"toolUseId": "call_abc", "name": "get_weather",
+                                  "input": {"city": "Paris"}}}]
+
+
+def test_bedrock_converse_plain_reply_still_ends_the_turn():
+    from ministack.services import bedrock_runtime as br
+
+    blocks, stop_reason = br._converse_blocks_from_message(
+        {"role": "assistant", "content": "hello"})
+    assert (blocks, stop_reason) == ([{"text": "hello"}], "end_turn")
+
+
+def test_bedrock_converse_unparseable_tool_arguments_are_malformed_tool_use():
+    """malformed_tool_use is a documented Converse stopReason; a model that
+    emits invalid JSON arguments is not a proxy failure."""
+    from ministack.services import bedrock_runtime as br
+
+    _blocks, stop_reason = br._converse_blocks_from_message({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "t", "arguments": "{not json"}}],
+    })
+    assert stop_reason == "malformed_tool_use"
+
+
+def test_bedrock_converse_without_tool_config_sends_no_tools():
+    from ministack.services import bedrock_runtime as br
+
+    assert br._openai_tools(None) == ([], None)
+    assert br._openai_tools({}) == ([], None)
+
+
+def test_bedrock_converse_stream_emits_the_tool_use_event_sequence():
+    """A tool call streams as its own content block: contentBlockStart carries
+    toolUseId and name, the input arrives as a JSON string in a toolUse delta,
+    and the turn stops with tool_use."""
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "hi"}]}], [], 0, "",
+        stop_reason="tool_use",
+        tool_uses=[{"toolUseId": "call_abc", "name": "get_weather",
+                    "input": {"city": "Paris"}}],
+    )
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    events = []
+    for event in buffer:
+        headers = event.headers
+        events.append((headers.get(":event-type"), json.loads(event.payload)))
+
+    kinds = [name for name, _ in events]
+    assert kinds == ["messageStart", "contentBlockDelta", "contentBlockStop",
+                     "contentBlockStart", "contentBlockDelta", "contentBlockStop",
+                     "messageStop", "metadata"], kinds
+    start = dict(events)["contentBlockStart"]
+    assert start == {"contentBlockIndex": 1,
+                     "start": {"toolUse": {"toolUseId": "call_abc",
+                                           "name": "get_weather"}}}
+    tool_delta = [p for name, p in events
+                  if name == "contentBlockDelta" and "toolUse" in p["delta"]][0]
+    assert tool_delta["contentBlockIndex"] == 1
+    assert json.loads(tool_delta["delta"]["toolUse"]["input"]) == {"city": "Paris"}
+    assert dict(events)["messageStop"] == {"stopReason": "tool_use"}
+
+
+def test_bedrock_converse_stream_without_tools_is_unchanged():
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "hi"}]}], [], 0, "hello")
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    kinds = [e.headers.get(":event-type") for e in buffer]
+    assert "contentBlockStart" not in kinds
+    assert kinds[0] == "messageStart" and kinds[-1] == "metadata"

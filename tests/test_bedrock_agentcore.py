@@ -5,12 +5,14 @@ InvokeAgentRuntime (deterministic echo), region isolation, and validation.
 """
 import json
 import os
+import urllib.request
 import uuid as _uuid_mod
 
 import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from botocore.utils import parse_timestamp
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -156,3 +158,62 @@ def test_agentcore_create_validation():
             agentRuntimeName="bad name!", agentRuntimeArtifact=_ARTIFACT,
             roleArn=_ROLE, networkConfiguration=_NET)
     assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def _raw(method, path, body=None):
+    """The wire bytes, not boto3's parse: botocore accepts a number for an
+    iso8601 timestamp, so only the raw JSON shows what the SDKs actually get."""
+    request = urllib.request.Request(
+        f"{ENDPOINT}{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/bedrock-agentcore/aws4_request",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read() or b"{}")
+
+
+def test_agentcore_timestamps_are_iso8601_strings_on_the_wire():
+    """DateTimestamp carries timestampFormat iso8601, so every timestamp this
+    service answers is an RFC 3339 string. A JSON number fails the Go SDK's
+    deserializer outright, so Terraform cannot record the resource."""
+    ctl = _client("bedrock-agentcore-control")
+    name = f"rt_{_uuid_mod.uuid4().hex[:8]}"
+    created = _raw("PUT", "/runtimes", {
+        "agentRuntimeName": name, "roleArn": _ROLE,
+        "networkConfiguration": _NET, "agentRuntimeArtifact": _ARTIFACT,
+    })
+    rid = created["agentRuntimeId"]
+    try:
+        def check(payload, *fields, where=""):
+            for field in fields:
+                value = payload[field]
+                assert isinstance(value, str), f"{where}{field} is {type(value).__name__}"
+                # botocore parses what it is handed; a float would also parse,
+                # so the type assertion above is the one that matters.
+                assert parse_timestamp(value).tzinfo is not None, f"{where}{field}"
+
+        check(created, "createdAt", where="CreateAgentRuntime.")
+        check(_raw("GET", f"/runtimes/{rid}"), "createdAt", "lastUpdatedAt",
+              where="GetAgentRuntime.")
+        listed = _raw("POST", "/runtimes?maxResults=10", {})["agentRuntimes"]
+        check(next(r for r in listed if r["agentRuntimeId"] == rid),
+              "lastUpdatedAt", where="ListAgentRuntimes.")
+        updated = _raw("PUT", f"/runtimes/{rid}", {
+            "roleArn": _ROLE, "networkConfiguration": _NET,
+            "agentRuntimeArtifact": _ARTIFACT,
+        })
+        check(updated, "createdAt", "lastUpdatedAt", where="UpdateAgentRuntime.")
+
+        endpoint = _raw("PUT", f"/runtimes/{rid}/runtime-endpoints", {"name": "ep1"})
+        check(endpoint, "createdAt", where="CreateAgentRuntimeEndpoint.")
+        check(_raw("GET", f"/runtimes/{rid}/runtime-endpoints/ep1"),
+              "createdAt", "lastUpdatedAt", where="GetAgentRuntimeEndpoint.")
+        eps = _raw("POST", f"/runtimes/{rid}/runtime-endpoints?maxResults=10", {})
+        check(eps["runtimeEndpoints"][0], "createdAt", "lastUpdatedAt",
+              where="ListAgentRuntimeEndpoints.")
+    finally:
+        ctl.delete_agent_runtime(agentRuntimeId=rid)

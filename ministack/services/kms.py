@@ -35,7 +35,7 @@ logger = logging.getLogger("kms")
 
 try:
     from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes, keywrap, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
     HAS_CRYPTO = True
 except ImportError:
@@ -109,7 +109,18 @@ def get_state():
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
                  if k not in ("_private_key", "_public_key_der", "_symmetric_key",
-                              "_hmac_key")}
+                              "_hmac_key", "_import_wrapping_key", "_import_token")}
+        if "_import_token" in rec:
+            entry["_import_token_b64"] = base64.b64encode(rec["_import_token"]).decode()
+        if "_import_wrapping_key" in rec and HAS_CRYPTO:
+            try:
+                entry["_import_wrapping_key_pem"] = base64.b64encode(
+                    rec["_import_wrapping_key"].private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.PKCS8,
+                        serialization.NoEncryption())).decode()
+            except Exception:
+                pass
         if "_symmetric_key" in rec:
             entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
         if "_hmac_key" in rec:
@@ -150,6 +161,15 @@ def _restore_state(data):
         def _restore_key_entry(entry):
             if "_symmetric_key_b64" in entry:
                 entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
+            if "_import_token_b64" in entry:
+                entry["_import_token"] = base64.b64decode(entry.pop("_import_token_b64"))
+            if "_import_wrapping_key_pem" in entry and HAS_CRYPTO:
+                try:
+                    entry["_import_wrapping_key"] = serialization.load_pem_private_key(
+                        base64.b64decode(entry.pop("_import_wrapping_key_pem")),
+                        password=None)
+                except Exception:
+                    entry.pop("_import_wrapping_key_pem", None)
             if "_hmac_key_b64" in entry:
                 entry["_hmac_key"] = base64.b64decode(entry.pop("_hmac_key_b64"))
             if "_public_key_der_b64" in entry:
@@ -235,6 +255,11 @@ def _key_metadata(rec):
     # that is, when its KeyState is PendingDeletion."
     if "DeletionDate" in rec:
         metadata["DeletionDate"] = rec["DeletionDate"]
+    # Both are reported only for a key with imported material.
+    if "ExpirationModel" in rec:
+        metadata["ExpirationModel"] = rec["ExpirationModel"]
+    if "ValidTo" in rec:
+        metadata["ValidTo"] = rec["ValidTo"]
     metadata["MultiRegion"] = rec.get("MultiRegion", False)
     if rec.get("MultiRegion"):
         account = get_account_id()
@@ -306,6 +331,12 @@ def _check_key_state(rec):
             f"{rec['Arn']} is pending deletion.",
             400,
         )
+    if rec["KeyState"] == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending import.",
+            400,
+        )
     if rec["KeyState"] == "Disabled":
         return error_response_json(
             "DisabledException",
@@ -368,6 +399,16 @@ def _create_key(data):
         )
     description = data.get("Description", "")
     tags = data.get("Tags", [])
+    origin = data.get("Origin", "AWS_KMS")
+    if origin not in ("AWS_KMS", "EXTERNAL"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"Origin {origin} is not supported.", 400)
+    if origin == "EXTERNAL" and key_spec != "SYMMETRIC_DEFAULT":
+        return error_response_json(
+            "UnsupportedOperationException",
+            "Imported key material is supported for SYMMETRIC_DEFAULT keys only.",
+            400)
     policy = data.get("Policy", json.dumps({
         "Version": "2012-10-17",
         "Id": "key-default-1",
@@ -389,7 +430,7 @@ def _create_key(data):
         "KeyUsage": key_usage,
         "Description": description,
         "CreationDate": int(time.time()),
-        "Origin": "AWS_KMS",
+        "Origin": origin,
         "Tags": tags,
         "Policy": policy,
         "MultiRegion": multi_region,
@@ -404,7 +445,13 @@ def _create_key(data):
         rec["_mrk_regions"] = [get_region()]
 
     if key_spec == "SYMMETRIC_DEFAULT":
-        rec["_symmetric_key"] = os.urandom(32)
+        # An EXTERNAL key has no material until ImportKeyMaterial supplies it,
+        # so it starts PendingImport rather than Enabled.
+        if origin != "EXTERNAL":
+            rec["_symmetric_key"] = os.urandom(32)
+        else:
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
         rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
         rec["SigningAlgorithms"] = []
     elif key_spec in _HMAC_KEY_SPECS:
@@ -1625,6 +1672,175 @@ def _cancel_key_deletion(data):
 # ---- Tags ----
 
 
+# ---------------------------------------------------------------------------
+# Imported key material (BYOK). AWS's own flow, not a config file: create the
+# key with Origin EXTERNAL, fetch a wrapping public key and an import token
+# with GetParametersForImport, wrap the material, and hand it to
+# ImportKeyMaterial. Enums and errors from botocore kms service-2.json.
+# ---------------------------------------------------------------------------
+
+_WRAPPING_ALGORITHMS = (
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+)
+_WRAPPING_KEY_SIZES = {"RSA_2048": 2048, "RSA_3072": 3072, "RSA_4096": 4096}
+_IMPORT_TOKEN_VALID_SECONDS = 24 * 3600
+
+
+def _unwrap_key_material(private_key, algorithm: str, wrapped: bytes) -> bytes:
+    """The key material inside `wrapped`, per the WrappingAlgorithm used."""
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return private_key.decrypt(wrapped, padding.PKCS1v15())
+    if algorithm in ("RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"):
+        digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+        return private_key.decrypt(wrapped, padding.OAEP(
+            mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None))
+    # RSA_AES_KEY_WRAP_*: an ephemeral AES key wrapped with RSA-OAEP, followed
+    # by the material wrapped under it with AES key wrap with padding (RFC 5649).
+    digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+    rsa_len = private_key.key_size // 8
+    if len(wrapped) <= rsa_len:
+        raise ValueError("wrapped material is shorter than the RSA block")
+    ephemeral = private_key.decrypt(wrapped[:rsa_len], padding.OAEP(
+        mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None))
+    return keywrap.aes_key_unwrap_with_padding(ephemeral, wrapped[rsa_len:])
+
+
+def _get_parameters_for_import(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    algorithm = data.get("WrappingAlgorithm", "")
+    key_spec = data.get("WrappingKeySpec", "")
+    if algorithm not in _WRAPPING_ALGORITHMS:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at "
+            "'wrappingAlgorithm' failed to satisfy constraint: Member must "
+            "satisfy enum value set: " + str(sorted(_WRAPPING_ALGORITHMS)), 400)
+    if key_spec not in _WRAPPING_KEY_SIZES:
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"WrappingKeySpec {key_spec} is not supported.", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    err = _require_crypto("GetParametersForImport")
+    if err:
+        return err
+
+    wrapping_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=_WRAPPING_KEY_SIZES[key_spec])
+    token = os.urandom(32)
+    rec["_import_wrapping_key"] = wrapping_key
+    rec["_import_token"] = token
+    rec["_import_algorithm"] = algorithm
+    rec["_import_token_expires"] = int(time.time()) + _IMPORT_TOKEN_VALID_SECONDS
+    return json_response({
+        "KeyId": rec["Arn"],
+        "ImportToken": base64.b64encode(token).decode(),
+        "PublicKey": base64.b64encode(wrapping_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)).decode(),
+        "ParametersValidTo": rec["_import_token_expires"],
+    })
+
+
+def _import_key_material(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    expiration = data.get("ExpirationModel", "KEY_MATERIAL_EXPIRES")
+    if expiration not in ("KEY_MATERIAL_EXPIRES", "KEY_MATERIAL_DOES_NOT_EXPIRE"):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{expiration}' at "
+            "'expirationModel' failed to satisfy constraint: Member must "
+            "satisfy enum value set: [KEY_MATERIAL_DOES_NOT_EXPIRE, "
+            "KEY_MATERIAL_EXPIRES]", 400)
+    if expiration == "KEY_MATERIAL_EXPIRES" and data.get("ValidTo") is None:
+        return error_response_json(
+            "ValidationException",
+            "ValidTo is required when ExpirationModel is KEY_MATERIAL_EXPIRES.",
+            400)
+    try:
+        token = base64.b64decode(data.get("ImportToken", "") or "", validate=True)
+        wrapped = base64.b64decode(data.get("EncryptedKeyMaterial", "") or "",
+                                   validate=True)
+    except (binascii.Error, ValueError):
+        return error_response_json(
+            "ValidationException", "Invalid base64 in the request.", 400)
+    stored = rec.get("_import_token")
+    if not stored or token != stored:
+        return error_response_json(
+            "InvalidImportTokenException",
+            "The import token is invalid for this key.", 400)
+    if int(time.time()) > rec.get("_import_token_expires", 0):
+        return error_response_json(
+            "ExpiredImportTokenException", "The import token has expired.", 400)
+
+    try:
+        material = _unwrap_key_material(
+            rec["_import_wrapping_key"], rec["_import_algorithm"], wrapped)
+    except Exception:
+        return error_response_json(
+            "InvalidCiphertextException",
+            "The key material could not be unwrapped with the wrapping key.",
+            400)
+    if len(material) != 32:
+        return error_response_json(
+            "IncorrectKeyMaterialException",
+            "A SYMMETRIC_DEFAULT key takes 256 bits of key material.", 400)
+
+    rec["_symmetric_key"] = material
+    rec["KeyState"] = "Enabled"
+    rec["Enabled"] = True
+    rec["ExpirationModel"] = expiration
+    if expiration == "KEY_MATERIAL_EXPIRES":
+        rec["ValidTo"] = data["ValidTo"]
+    else:
+        rec.pop("ValidTo", None)
+    # The token is single-use: a second import needs fresh parameters.
+    for field in ("_import_wrapping_key", "_import_token", "_import_algorithm",
+                  "_import_token_expires"):
+        rec.pop(field, None)
+    logger.info("ImportKeyMaterial: %s", rec["KeyId"])
+    return json_response({"KeyId": rec["Arn"]})
+
+
+def _delete_imported_key_material(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    rec.pop("_symmetric_key", None)
+    rec.pop("ValidTo", None)
+    rec["KeyState"] = "PendingImport"
+    rec["Enabled"] = False
+    logger.info("DeleteImportedKeyMaterial: %s", rec["KeyId"])
+    return json_response({"KeyId": rec["Arn"]})
+
+
 def _tag_resource(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
@@ -1746,6 +1962,9 @@ async def handle_request(method, path, headers, body, query_params):
         "UpdateKeyDescription": _update_key_description,
         "ScheduleKeyDeletion": _schedule_key_deletion,
         "CancelKeyDeletion": _cancel_key_deletion,
+        "GetParametersForImport": _get_parameters_for_import,
+        "ImportKeyMaterial": _import_key_material,
+        "DeleteImportedKeyMaterial": _delete_imported_key_material,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "ListResourceTags": _list_resource_tags,

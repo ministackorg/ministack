@@ -1126,7 +1126,33 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_rds_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_rds_ca_request(method: str, path: str):
+    """`GET /_ministack/rds/ca.pem` returns the CA that signs DB server
+    certificates, the local stand-in for AWS's certificate bundle."""
+    if path != "/_ministack/rds/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import rds
+
+        cert_pem = rds.pg_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (
+        200,
+        {"Content-Type": "application/x-pem-file"},
+        cert_pem.encode(),
+    )
 
 
 def _handle_iot_ca_request(method: str, path: str):

@@ -44,6 +44,7 @@ import contextvars
 import copy
 import datetime
 import hashlib
+import io
 import json
 import logging
 import math
@@ -51,6 +52,7 @@ import os
 import re
 import secrets as stdlib_secrets
 import socket
+import tarfile
 import threading
 import time
 from urllib.parse import parse_qs
@@ -1049,6 +1051,142 @@ def _rds_container_is_owned_by(
     return labels.get("region") in (None, region or get_region())
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL server TLS. AWS installs the DB server certificate itself and
+# rotates it; there is no way to supply your own ("The CA signs the DB server
+# certificate, which is installed on each DB instance", UsingWithRDS.SSL), and
+# every instance we report already carries CACertificateIdentifier
+# rds-ca-rsa2048-g1. So MiniStack mints its own CA and signs a per-container
+# server certificate, and TLS is always on. The stock postgres image ships no
+# key material and dies with `ssl=on` alone, unlike MySQL, which
+# auto-generates (measured: `auto-generate-certs TRUE`).
+# ---------------------------------------------------------------------------
+
+_PG_TLS_DIR = "/ministack-rds-tls"
+_pg_ca_lock = threading.Lock()
+_pg_ca: tuple[str, str] | None = None
+
+
+def pg_ca_cert_pem() -> str:
+    """The RDS CA certificate, minted on first use. Clients verifying a
+    MiniStack database trust this one file, as they would AWS's bundle."""
+    return _ensure_pg_ca()[0]
+
+
+def _ensure_pg_ca() -> tuple[str, str]:
+    global _pg_ca
+    if _pg_ca is not None:
+        return _pg_ca
+    with _pg_ca_lock:
+        if _pg_ca is None:
+            from ministack.core.x509_utils import generate_ca
+
+            _pg_ca = generate_ca(common_name="Ministack RDS Root CA")
+            logger.info("RDS: generated the server-certificate CA")
+        return _pg_ca
+
+
+def _pg_server_material(names, ips) -> tuple[str, str]:
+    """A server certificate for the names a client may connect to."""
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    ca_cert, ca_key = _ensure_pg_ca()
+    cert_pem, key_pem, _public = sign_leaf_certificate(
+        ca_cert, ca_key,
+        common_name=(names[0] if names else "localhost"),
+        san_dns=names, san_ips=ips,
+    )
+    return cert_pem, key_pem
+
+
+def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
+    """The cert and key as a tar for put_archive: no host path is shared with
+    the daemon, and the key lands outside every PGDATA mount at 0600."""
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as bundle:
+        entry = tarfile.TarInfo(_PG_TLS_DIR.lstrip("/"))
+        entry.type = tarfile.DIRTYPE
+        entry.mode = 0o700
+        bundle.addfile(entry)
+        for filename, content in (("server.crt", cert_pem), ("server.key", key_pem)):
+            data = content.encode()
+            entry = tarfile.TarInfo(f"{_PG_TLS_DIR.lstrip('/')}/{filename}")
+            entry.mode = 0o600
+            entry.size = len(data)
+            bundle.addfile(entry, io.BytesIO(data))
+    return archive.getvalue()
+
+
+def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tls_ips=()):
+    """Start a backing container, with PostgreSQL TLS enabled.
+
+    MySQL needs nothing: its image generates its own material and defaults to
+    ssl=ON. PostgreSQL gets a certificate copied in before it starts, so a
+    client using sslmode=verify-full with our CA connects. Plaintext clients
+    keep working, as they do on AWS without rds.force_ssl.
+    """
+    if engine not in ("postgres", "aurora-postgresql"):
+        return docker_client.containers.run(**container_kwargs)
+
+    container = None
+    try:
+        names = [n for n in dict.fromkeys(tls_names) if n and not _is_ip_address(n)]
+        names += [n for n in ("localhost", _MINISTACK_HOST) if n and n not in names]
+        ips = [i for i in dict.fromkeys(tuple(tls_ips) + ("127.0.0.1", "::1")) if i]
+        cert_pem, key_pem = _pg_server_material(names, ips)
+        archive = _pg_tls_archive(cert_pem, key_pem)
+
+        kwargs = dict(container_kwargs)
+        command = list(kwargs.get("command") or ["postgres"])
+        if command[:2] == ["sh", "-c"]:
+            # `sh -c SCRIPT` takes the next argument as $0, so the flags land
+            # in "$@" for the script's own exec.
+            command.append("ministack-pg")
+        command += ["-c", "ssl=on",
+                    "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
+                    "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        entrypoint = kwargs.get("entrypoint") or ["docker-entrypoint.sh"]
+        if isinstance(entrypoint, str):
+            entrypoint = [entrypoint]
+        # Archive members arrive root-owned; chown before the image's own
+        # entrypoint drops privileges. postgres refuses a group/world-readable
+        # key, so the mode matters as much as the owner.
+        kwargs["user"] = "0:0"
+        kwargs["entrypoint"] = [
+            "sh", "-c",
+            f"chown -R postgres:postgres {_PG_TLS_DIR} && exec \"$@\"",
+            "ministack-pg-tls",
+        ]
+        kwargs["command"] = list(entrypoint) + command
+
+        from docker.errors import ImageNotFound
+        try:
+            container = docker_client.containers.create(**kwargs)
+        except ImageNotFound:
+            docker_client.images.pull(kwargs["image"])
+            container = docker_client.containers.create(**kwargs)
+        if not container.put_archive("/", archive):
+            raise RuntimeError("Docker rejected the PostgreSQL TLS archive")
+        container.start()
+        return container
+    except Exception:
+        if container is not None:
+            try:
+                container.remove(force=True, v=False)
+            except Exception:
+                logger.warning("RDS: could not remove a failed TLS container")
+        raise
+
+
+def _is_ip_address(value: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     """Start the single backing container owned by an Aurora cluster.
 
@@ -1198,7 +1336,10 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         cluster["_shared_container_ready"] = False
         logger.warning("RDS: failed to start shared container for cluster %s: %s", cluster_id, e)
@@ -1431,7 +1572,11 @@ def _start_pg_reader_container(db_id, cluster):
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=_cluster_endpoint_aliases(cluster)
+            + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
@@ -2296,7 +2441,11 @@ def _start_rds_container_for_instance(db_id, instance):
         }
 
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
+                       container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
@@ -4561,7 +4710,11 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
-                container = docker_client.containers.run(**container_kwargs)
+                container = _run_rds_container(
+                    docker_client, engine, container_kwargs,
+                    tls_names=[endpoint_host or "",
+                               container_kwargs.get("name") or ""],
+                )
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:
