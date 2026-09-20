@@ -4812,3 +4812,219 @@ def test_apigwv1_gateway_response_defaults_on_the_control_plane(apigw_v1, gwresp
     apigw_v1.delete_gateway_response(restApiId=gwresp_api, responseType="DEFAULT_4XX")
     got = apigw_v1.get_gateway_response(restApiId=gwresp_api, responseType="UNAUTHORIZED")
     assert (got["defaultResponse"], got["responseParameters"]) == (True, {})
+
+
+# ---------------------------------------------------------------------------
+# The checks API Gateway runs before the integration: API key, throttling,
+# usage-plan quota, request validation, and strict passthrough. Status codes
+# and triggers from supported-gateway-response-types; the message strings
+# captured on a real account (eu-north-1 2026-09-20) except QUOTA_EXCEEDED.
+# ---------------------------------------------------------------------------
+
+def _mock_method(apigw_v1, api_id, resource_id, http_method, **method_kwargs):
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource_id,
+                        httpMethod=http_method, authorizationType="NONE",
+                        **method_kwargs)
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        type="MOCK", requestTemplates={"application/json": '{"statusCode":200}'})
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=resource_id,
+                                 httpMethod=http_method, statusCode="200")
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        statusCode="200", responseTemplates={"application/json": '{"ok":true}'})
+
+
+def _stage_call(api_id, path, method="GET", body=None, headers=()):
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    req = _urlreq.Request(f"http://{host}/p{path}", method=method,
+                          data=body.encode() if isinstance(body, str) else body)
+    req.add_header("Host", host)
+    for name, value in headers:
+        req.add_header(name, value)
+    try:
+        response = _urlreq.urlopen(req)
+        return response.status, response.read().decode()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def _gw_api(apigw_v1, name):
+    api_id = apigw_v1.create_rest_api(name=name)["id"]
+    root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+    return api_id, root
+
+
+def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
+    """"The gateway response for an invalid API key submitted for a method
+    requiring an API key" -- 403 INVALID_API_KEY."""
+    api_id, root = _gw_api(apigw_v1, f"gwkey-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+
+        assert _stage_call(api_id, "/key") == (403, '{"message":"Forbidden"}')
+        assert _stage_call(api_id, "/key", headers=[("x-api-key", "nope")]) == (
+            403, '{"message":"Forbidden"}')
+
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                      enabled=True)
+        # A key no usage plan attaches to this stage is as good as unknown.
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", key["value"])])[0] == 403
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", key["value"])]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
+    """A plan with quota 1 serves one request and then answers 429
+    QUOTA_EXCEEDED."""
+    api_id, root = _gw_api(apigw_v1, f"gwquota-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                      enabled=True)
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}],
+            quota={"limit": 1, "offset": 0, "period": "DAY"})["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        headers = [("x-api-key", key["value"])]
+        assert _stage_call(api_id, "/key", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/key", headers=headers) == (
+            429, '{"message":"Limit Exceeded"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
+    """"when usage plan-, method-, stage-, or account-level throttling limits
+    exceeded" -- a 0/0 limit refuses everything, a real limit does not."""
+    api_id, root = _gw_api(apigw_v1, f"gwthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="thr")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET")
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
+
+        def throttle(path_prefix, rate, burst):
+            apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+                {"op": "replace", "path": f"{path_prefix}/throttling/rateLimit",
+                 "value": str(rate)},
+                {"op": "replace", "path": f"{path_prefix}/throttling/burstLimit",
+                 "value": str(burst)},
+            ])
+
+        throttle("/~1thr/GET", 0, 0)
+        assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+        throttle("/~1thr/GET", 100, 50)
+        assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
+        # The stage-wide entry applies where no method override does.
+        apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+            {"op": "remove", "path": "/~1thr/GET"}])
+        throttle("/*/*", 0, 0)
+        assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
+    """BAD_REQUEST_PARAMETERS and BAD_REQUEST_BODY, the two types an enabled
+    request validator raises."""
+    api_id, root = _gw_api(apigw_v1, f"gwval-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        apigw_v1.create_model(
+            restApiId=api_id, name="m1", contentType="application/json",
+            schema=json.dumps({"type": "object", "required": ["name"],
+                               "properties": {"name": {"type": "string"}}}))
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True,
+            validateRequestParameters=True)["id"]
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="val")["id"]
+        _mock_method(apigw_v1, api_id, resource, "POST",
+                     requestValidatorId=validator,
+                     requestModels={"application/json": "m1"},
+                     requestParameters={"method.request.querystring.q": True})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+
+        assert _stage_call(api_id, "/val", "POST", '{"name":"x"}', json_header) == (
+            400, '{"message":"Missing required request parameters: [q]"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
+            400, '{"message":"Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", "not json", json_header) == (
+            400, '{"message":"Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", '{"name":123}', json_header) == (
+            400, '{"message":"Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", '{"name":"x"}',
+                           json_header) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_strict_passthrough_refuses_an_unmatched_media_type(apigw_v1):
+    """"when a payload is of an unsupported media type, if strict passthrough
+    behavior is enabled" -- 415 UNSUPPORTED_MEDIA_TYPE."""
+    api_id, root = _gw_api(apigw_v1, f"gwmedia-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="media")["id"]
+        _mock_method(apigw_v1, api_id, resource, "POST")
+        apigw_v1.update_integration(
+            restApiId=api_id, resourceId=resource, httpMethod="POST",
+            patchOperations=[{"op": "replace", "path": "/passthroughBehavior",
+                              "value": "NEVER"}])
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/media", "POST", "hello",
+                           [("Content-Type", "text/plain")]) == (
+            415, '{"message":"Unsupported Media Type"}')
+        assert _stage_call(api_id, "/media", "POST", "{}",
+                           [("Content-Type", "application/json")]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_crud(apigw_v1):
+    api_id, _root = _gw_api(apigw_v1, f"gwrv-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        created = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v1", validateRequestBody=True,
+            validateRequestParameters=True)
+        assert created["name"] == "v1"
+        assert created["validateRequestBody"] is True
+        assert [v["name"] for v in apigw_v1.get_request_validators(
+            restApiId=api_id)["items"]] == ["v1"]
+        assert apigw_v1.get_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"])["name"] == "v1"
+        updated = apigw_v1.update_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"], patchOperations=[
+                {"op": "replace", "path": "/name", "value": "renamed"},
+                {"op": "replace", "path": "/validateRequestBody", "value": "false"}])
+        assert (updated["name"], updated["validateRequestBody"]) == ("renamed", False)
+        apigw_v1.delete_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"])
+        assert apigw_v1.get_request_validators(restApiId=api_id)["items"] == []
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_request_validator(restApiId=api_id,
+                                           requestValidatorId=created["id"])
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)

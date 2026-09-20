@@ -163,6 +163,7 @@ _gateway_responses = AccountRegionScopedDict()   # rest_api_id -> {response_type
 # rest_api_id -> {deployment_id -> customized gateway responses at CreateDeployment}
 _deployed_gateway_responses = AccountRegionScopedDict()
 _documentation_parts = AccountRegionScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
+_request_validators = AccountRegionScopedDict()   # rest_api_id -> {validator_id -> RequestValidator}
 
 
 _GATEWAY_RESPONSE_TYPES = (
@@ -795,6 +796,7 @@ def get_state():
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
+        "request_validators": copy.deepcopy(_request_validators),
         "gateway_responses": copy.deepcopy(_gateway_responses),
         "deployed_gateway_responses": copy.deepcopy(_deployed_gateway_responses),
         "documentation_parts": copy.deepcopy(_documentation_parts),
@@ -1011,6 +1013,7 @@ def load_persisted_state(data):
     _restore_child_store(_deployments_v1, data.get("deployments_v1", {}), api_regions)
     _restore_child_store(_authorizers_v1, data.get("authorizers_v1", {}), api_regions)
     _restore_child_store(_models, data.get("models", {}), api_regions)
+    _restore_child_store(_request_validators, data.get("request_validators", {}), api_regions)
     _restore_child_store(_gateway_responses, data.get("gateway_responses", {}), api_regions)
     _restore_child_store(
         _deployed_gateway_responses, data.get("deployed_gateway_responses", {}), api_regions
@@ -1037,6 +1040,7 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _request_validators.clear()
     _gateway_responses.clear()
     _deployed_gateway_responses.clear()
     _documentation_parts.clear()
@@ -1298,6 +1302,22 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_authorizer(api_id, auth_id, data)
                 if method == "DELETE":
                     return _delete_authorizer(api_id, auth_id)
+
+        # /restapis/{id}/requestvalidators[/{validatorId}]
+        elif sub == "requestvalidators":
+            validator_id = parts[3] if len(parts) > 3 else None
+            if not validator_id:
+                if method == "POST":
+                    return _create_request_validator(api_id, data)
+                if method == "GET":
+                    return _get_request_validators(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_request_validator(api_id, validator_id)
+                if method == "PATCH":
+                    return _update_request_validator(api_id, validator_id, data)
+                if method == "DELETE":
+                    return _delete_request_validator(api_id, validator_id)
 
         # /restapis/{id}/models[/{modelName}]
         elif sub == "models":
@@ -1994,6 +2014,251 @@ async def _authorize_request_v1(
     return None, auth_ctx
 
 
+# The message API Gateway puts in $context.error.message for each gateway
+# response it raises. Status codes and triggers are from
+# supported-gateway-response-types; the strings below were captured on a real
+# account (eu-north-1 2026-09-20) except QUOTA_EXCEEDED, whose probe was
+# refused as an invalid key before the quota could be reached.
+_GATEWAY_ERROR_MESSAGES = {
+    "INVALID_API_KEY": "Forbidden",
+    "THROTTLED": "Too Many Requests",
+    "QUOTA_EXCEEDED": "Limit Exceeded",  # not captured
+    "UNSUPPORTED_MEDIA_TYPE": "Unsupported Media Type",
+    "BAD_REQUEST_BODY": "Invalid request body",
+}
+
+# Per-stage counters for throttling and usage-plan quota. In-process only: a
+# restart forgets them, like the tokens of a fresh deployment.
+_throttle_state = {}
+_quota_state = {}
+_QUOTA_PERIOD_SECONDS = {"DAY": 86400, "WEEK": 7 * 86400, "MONTH": 30 * 86400}
+
+
+def _api_key_from_request(headers):
+    return _header_ci(headers, "x-api-key")
+
+
+def _resolve_api_key(value):
+    """The enabled ApiKey record whose value matches, or None."""
+    if not value:
+        return None
+    for _scope, key in _api_keys.all_items():
+        if key.get("value") == value and key.get("enabled", True):
+            return key
+    return None
+
+
+def _usage_plans_for_key(key_id, api_id, stage_name):
+    """Every usage plan that carries this key and covers this api+stage."""
+    plans = []
+    for (account, region, plan_id), plan in list(_usage_plans.all_items()):
+        keys = _usage_plan_keys.get(plan_id, {}) or {}
+        if key_id not in keys:
+            continue
+        for entry in plan.get("apiStages") or []:
+            if entry.get("apiId") == api_id and entry.get("stage") == stage_name:
+                plans.append((plan_id, plan, entry))
+                break
+    return plans
+
+
+def _check_api_key(method_obj, api_id, stage_name, headers):
+    """A method with apiKeyRequired needs an enabled key that a usage plan
+    attaches to this api and stage: "The gateway response for an invalid API key
+    submitted for a method requiring an API key"
+    (supported-gateway-response-types). Returns (error, key_record)."""
+    if not method_obj.get("apiKeyRequired"):
+        return None, None
+    key = _resolve_api_key(_api_key_from_request(headers))
+    if key is None:
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    if not _usage_plans_for_key(key["id"], api_id, stage_name):
+        # A key that no plan associates with this stage is as good as unknown.
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    return None, key
+
+
+def _method_throttle_settings(stage, resource_path, http_method):
+    """The stage's throttle for this method, most specific first: the
+    method override, then the stage-wide "*/*" entry."""
+    settings = stage.get("methodSettings") or {}
+    stripped = resource_path.lstrip("/")
+    # UpdateStage stores the key as the patch spelled it, which keeps the
+    # resource path's leading slash; accept either spelling before "*/*".
+    for key in (f"/{stripped}/{http_method}", f"{stripped}/{http_method}", "*/*"):
+        entry = settings.get(key)
+        if isinstance(entry, dict) and (
+                "throttlingRateLimit" in entry or "throttlingBurstLimit" in entry):
+            return entry
+    return None
+
+
+def _check_throttle(stage, api_id, stage_name, resource_path, http_method):
+    """Token bucket per method: rate refills the bucket, burst caps it. A limit
+    of 0 refuses everything, which is what "throttling limits exceeded" means at
+    0/0 (supported-gateway-response-types)."""
+    entry = _method_throttle_settings(stage, resource_path, http_method)
+    if entry is None:
+        return None
+    rate = entry.get("throttlingRateLimit")
+    burst = entry.get("throttlingBurstLimit")
+    if rate is None and burst is None:
+        return None
+    rate = float(rate if rate is not None else 0)
+    burst = float(burst if burst is not None else 0)
+    if rate <= 0 and burst <= 0:
+        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+    slot = (api_id, stage_name, resource_path, http_method)
+    now = time.time()
+    tokens, last = _throttle_state.get(slot, (burst, now))
+    tokens = min(burst, tokens + (now - last) * rate)
+    if tokens < 1:
+        _throttle_state[slot] = (tokens, now)
+        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+    _throttle_state[slot] = (tokens - 1, now)
+    return None
+
+
+def _check_quota(key, api_id, stage_name):
+    """Usage-plan quota, counted per key per plan period."""
+    if key is None:
+        return None
+    now = time.time()
+    for plan_id, plan, _entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+        quota = plan.get("quota") or {}
+        limit = quota.get("limit")
+        if limit is None:
+            continue
+        period = _QUOTA_PERIOD_SECONDS.get(quota.get("period", "DAY"), 86400)
+        slot = (plan_id, key["id"])
+        used, window_start = _quota_state.get(slot, (0, now))
+        if now - window_start >= period:
+            used, window_start = 0, now
+        if used >= int(limit):
+            _quota_state[slot] = (used, window_start)
+            return _gw_error("QUOTA_EXCEEDED",
+                             _GATEWAY_ERROR_MESSAGES["QUOTA_EXCEEDED"])
+        _quota_state[slot] = (used + 1, window_start)
+    return None
+
+
+def _missing_request_parameters(method_obj, request, headers, query_params):
+    """The names of the required request parameters that are absent, in the
+    order AWS reports them."""
+    missing = []
+    for name, required in (method_obj.get("requestParameters") or {}).items():
+        if not required:
+            continue
+        if name.startswith("method.request.querystring."):
+            key = name[len("method.request.querystring."):]
+            value = (query_params or {}).get(key)
+            if value in (None, "", []):
+                missing.append(key)
+        elif name.startswith("method.request.header."):
+            key = name[len("method.request.header."):]
+            if not _header_ci(headers, key):
+                missing.append(key)
+        elif name.startswith("method.request.path."):
+            key = name[len("method.request.path."):]
+            if not (request.get("path_params") or {}).get(key):
+                missing.append(key)
+    return missing
+
+
+def _json_schema_violation(schema, document):
+    """The first way `document` breaks `schema`, or None.
+
+    A deliberately small subset -- type, required, and per-property type --
+    because the point is to refuse a body AWS refuses, not to ship a validator.
+    """
+    if not isinstance(schema, dict):
+        return None
+    expected = schema.get("type")
+    if expected == "object" and not isinstance(document, dict):
+        return "expected an object"
+    if expected == "array" and not isinstance(document, list):
+        return "expected an array"
+    if expected == "string" and not isinstance(document, str):
+        return "expected a string"
+    if expected in ("number", "integer") and not isinstance(document, (int, float)):
+        return "expected a number"
+    if isinstance(document, dict):
+        for name in schema.get("required") or []:
+            if name not in document:
+                return f"missing required property {name}"
+        for name, sub in (schema.get("properties") or {}).items():
+            if name in document:
+                violation = _json_schema_violation(sub, document[name])
+                if violation:
+                    return violation
+    return None
+
+
+def _check_request_validation(method_obj, api_id, request, headers, body, query_params):
+    """Run the method's request validator: parameters first, then the body
+    against the model for the request content type. BAD_REQUEST_PARAMETERS and
+    BAD_REQUEST_BODY are the two types this raises
+    (supported-gateway-response-types)."""
+    validator_id = method_obj.get("requestValidatorId")
+    if not validator_id:
+        return None
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return None
+    if validator.get("validateRequestParameters"):
+        missing = _missing_request_parameters(method_obj, request, headers, query_params)
+        if missing:
+            return _gw_error(
+                "BAD_REQUEST_PARAMETERS",
+                "Missing required request parameters: [" + ", ".join(missing) + "]")
+    if not validator.get("validateRequestBody"):
+        return None
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    model_name = (method_obj.get("requestModels") or {}).get(
+        content_type.split(";", 1)[0].strip()) or (
+        method_obj.get("requestModels") or {}).get("application/json")
+    if not model_name:
+        return None
+    model = _models.get(api_id, {}).get(model_name)
+    if not model:
+        return None
+    schema = model.get("schema")
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema or "{}")
+        except json.JSONDecodeError:
+            return None
+    try:
+        document = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    if _json_schema_violation(schema, document):
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    return None
+
+
+def _check_passthrough_behavior(integration, headers):
+    """NEVER means "reject a content type no request template matches":
+    "when a payload is of an unsupported media type, if strict passthrough
+    behavior is enabled" (supported-gateway-response-types)."""
+    behavior = (integration.get("passthroughBehavior") or "WHEN_NO_MATCH").upper()
+    if behavior != "NEVER":
+        return None
+    templates = integration.get("requestTemplates") or {}
+    if not templates:
+        return None
+    content_type = (_header_ci(headers, "content-type")
+                    or "application/json").split(";", 1)[0].strip().lower()
+    if any(key.split(";", 1)[0].strip().lower() == content_type for key in templates):
+        return None
+    return _gw_error("UNSUPPORTED_MEDIA_TYPE",
+                     _GATEWAY_ERROR_MESSAGES["UNSUPPORTED_MEDIA_TYPE"])
+
+
 async def _handle_execute_in_scope(
     api_id, stage_name, method, path, headers, body, query_params,
     owner_account_id, owner_region,
@@ -2080,6 +2345,27 @@ async def _execute_in_scope(
     )
     if auth_error is not None:
         return auth_error
+
+    # API Gateway's own checks, in the order it runs them: key, then throttle
+    # and quota, then request validation, then the integration's passthrough
+    # behaviour. Each answers through its gateway response type.
+    key_error, api_key = _check_api_key(method_obj, api_id, stage_name, headers)
+    if key_error is not None:
+        return key_error
+    throttle_error = _check_throttle(
+        stage, api_id, stage_name, resource["path"], method)
+    if throttle_error is not None:
+        return throttle_error
+    quota_error = _check_quota(api_key, api_id, stage_name)
+    if quota_error is not None:
+        return quota_error
+    validation_error = _check_request_validation(
+        method_obj, api_id, request, headers, body, query_params)
+    if validation_error is not None:
+        return validation_error
+    media_error = _check_passthrough_behavior(integration, headers)
+    if media_error is not None:
+        return media_error
 
     int_type = integration.get("type", "")
 
@@ -3039,6 +3325,7 @@ def _put_method(api_id, resource_id, http_method, data):
         "operationName": data.get("operationName", ""),
         "requestParameters": data.get("requestParameters", {}),
         "requestModels": data.get("requestModels", {}),
+        "requestValidatorId": data.get("requestValidatorId"),
         "methodResponses": {},
         "methodIntegration": None,
     }
@@ -3454,6 +3741,60 @@ def _delete_authorizer(api_id, auth_id):
 
 
 # ---- Control plane: Models ----
+
+def _create_request_validator(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    validator = {
+        "id": _new_id()[:6],
+        "name": data.get("name", ""),
+        "validateRequestBody": bool(data.get("validateRequestBody", False)),
+        "validateRequestParameters": bool(data.get("validateRequestParameters", False)),
+    }
+    _request_validators.setdefault(api_id, {})[validator["id"]] = validator
+    return _v1_response(validator, 201)
+
+
+def _get_request_validators(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(
+        list(_request_validators.get(api_id, {}).values()), query_params)
+
+
+def _get_request_validator(api_id, validator_id):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    return _v1_response(validator)
+
+
+def _update_request_validator(api_id, validator_id, data):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    for op in data.get("patchOperations", []) or []:
+        if op.get("op") != "replace":
+            continue
+        path = (op.get("path") or "").lstrip("/")
+        value = op.get("value")
+        if path == "name":
+            validator["name"] = value
+        elif path in ("validateRequestBody", "validateRequestParameters"):
+            validator[path] = str(value).lower() == "true"
+    return _v1_response(validator)
+
+
+def _delete_request_validator(api_id, validator_id):
+    validators = _request_validators.get(api_id, {})
+    if validator_id not in validators:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    del validators[validator_id]
+    return 204, {}, b""
+
 
 def _create_model(api_id, data):
     if api_id not in _rest_apis:
