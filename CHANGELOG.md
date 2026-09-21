@@ -5,6 +5,14 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **RDS — PostgreSQL TLS with long endpoint names** — use a short certificate common name while retaining complete DNS and IP subject alternative names, so endpoints longer than 64 bytes no longer fail certificate generation.
+- **API Gateway — an OpenAPI body's `securityDefinitions` reach the methods** — the import discarded security outright, so a SAM API declaring a Cognito authorizer created none and every method imported as `authorizationType: NONE`, serving anonymous callers where AWS answers 401. Each scheme carrying `x-amazon-apigateway-authorizer` now becomes an authorizer, and an operation's `security` — or the document's — sets the method's `authorizationType`, `authorizerId` and `authorizationScopes`, so the enforcement added in 1.5.10 engages for body-defined APIs.
+- **CloudFormation — `AWS::ApiGateway::Stage` method settings reach the stage as a map** — the template's `MethodSettings` list was stored verbatim, so the throttling lookup added in 1.5.14 raised on it and every request to a CloudFormation- or SAM-deployed API answered 500. The list is now keyed `"<resourcePath>/<httpMethod>"`, `"*/*"` for the stage-wide entry, over the account-level defaults AWS reports from `GetStage`.
+
 ## [1.5.14] — 2026-09-20
 
 ### Added

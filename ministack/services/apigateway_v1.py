@@ -2895,6 +2895,103 @@ _OPENAPI_HTTP_METHODS = {
 }
 
 
+def _security_schemes(spec):
+    """Security schemes, from swagger 2.0 or OAS 3.0."""
+    schemes = spec.get("securityDefinitions")
+    if not isinstance(schemes, dict):
+        schemes = (spec.get("components") or {}).get("securitySchemes")
+    return schemes if isinstance(schemes, dict) else {}
+
+
+def _import_identity_source(scheme, extension):
+    """The ``method.request.*`` identity source a security scheme names.
+
+    A ``request`` authorizer carries its own ``identitySource``; the others
+    derive it from the scheme's ``name`` and ``in``, which is how SAM and the
+    console spell the header carrying the token."""
+    if extension.get("identitySource"):
+        return extension["identitySource"]
+    name = scheme.get("name") or "Authorization"
+    location = (scheme.get("in") or "header").lower()
+    prefix = "method.request.querystring." if location == "query" else "method.request.header."
+    return prefix + name
+
+
+def _import_security_schemes(api_id, spec):
+    """Create an authorizer per ``x-amazon-apigateway-authorizer`` scheme.
+
+    Returns a scheme name -> method authorization mapping; this is the only
+    mechanism by which SAM's ``Auth`` property reaches a method, since the
+    translator emits no AWS::ApiGateway::Authorizer resource."""
+    mapping = {}
+    for scheme_name, scheme in _security_schemes(spec).items():
+        if not isinstance(scheme, dict):
+            continue
+        extension = scheme.get("x-amazon-apigateway-authorizer")
+        auth_type = str(scheme.get("x-amazon-apigateway-authtype") or "").lower()
+        if not isinstance(extension, dict):
+            if auth_type == "awssigv4":
+                mapping[scheme_name] = {"authorizationType": "AWS_IAM"}
+            elif scheme.get("type") == "apiKey" and (scheme.get("name") or "").lower() == "x-api-key":
+                mapping[scheme_name] = {"apiKeyRequired": True}
+            continue
+        kind = str(extension.get("type") or "").lower()
+        data = {
+            "name": scheme_name,
+            "identitySource": _import_identity_source(scheme, extension),
+            "authType": auth_type or kind,
+        }
+        if kind == "cognito_user_pools":
+            data["type"] = "COGNITO_USER_POOLS"
+            data["providerARNs"] = extension.get("providerARNs") or []
+            method_auth = "COGNITO_USER_POOLS"
+        elif kind in ("token", "request"):
+            data["type"] = kind.upper()
+            data["authorizerUri"] = extension.get("authorizerUri", "")
+            data["authorizerCredentials"] = extension.get("authorizerCredentials")
+            data["identityValidationExpression"] = extension.get(
+                "identityValidationExpression", ""
+            )
+            if extension.get("authorizerResultTtlInSeconds") is not None:
+                data["authorizerResultTtlInSeconds"] = extension[
+                    "authorizerResultTtlInSeconds"
+                ]
+            method_auth = "CUSTOM"
+        else:
+            continue
+        _status, _headers, body = _create_authorizer(api_id, data)
+        if _status >= 400:
+            continue
+        mapping[scheme_name] = {
+            "authorizationType": method_auth,
+            "authorizerId": json.loads(body)["id"],
+        }
+    return mapping
+
+
+def _method_security(security, scheme_map):
+    """Resolve an operation's ``security`` list against the scheme map."""
+    data = {"authorizationType": "NONE"}
+    for requirement in security or []:
+        if not isinstance(requirement, dict):
+            continue
+        for scheme_name, scopes in requirement.items():
+            mapped = scheme_map.get(scheme_name)
+            if not mapped:
+                continue
+            if mapped.get("apiKeyRequired"):
+                data["apiKeyRequired"] = True
+                continue
+            if data["authorizationType"] != "NONE":
+                continue
+            data["authorizationType"] = mapped["authorizationType"]
+            if mapped.get("authorizerId"):
+                data["authorizerId"] = mapped["authorizerId"]
+            if isinstance(scopes, list) and scopes:
+                data["authorizationScopes"] = list(scopes)
+    return data
+
+
 def _import_rest_api(spec, base_data=None):
     data = dict(base_data or {})
     info = spec.get("info") or {}
@@ -2905,12 +3002,14 @@ def _import_rest_api(spec, base_data=None):
 
     _status, _headers, body = _create_rest_api(data)
     api_id = json.loads(body)["id"]
+    scheme_map = _import_security_schemes(api_id, spec)
+    default_security = spec.get("security")
     for path, path_item in (spec.get("paths") or {}).items():
-        _import_path_item(api_id, path, path_item)
+        _import_path_item(api_id, path, path_item, scheme_map, default_security)
     return api_id
 
 
-def _import_path_item(api_id, path, path_item):
+def _import_path_item(api_id, path, path_item, scheme_map=None, default_security=None):
     resource_id = next(
         rid for rid, res in _resources.get(api_id, {}).items()
         if res.get("path") == "/"
@@ -2932,11 +3031,17 @@ def _import_path_item(api_id, path, path_item):
 
     for method, operation in path_item.items():
         if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation)
+            _import_operation(api_id, resource_id, method.upper(), operation,
+                              scheme_map, default_security)
 
 
-def _import_operation(api_id, resource_id, http_method, operation):
-    _put_method(api_id, resource_id, http_method, {"authorizationType": "NONE"})
+def _import_operation(api_id, resource_id, http_method, operation,
+                      scheme_map=None, default_security=None):
+    security = (operation or {}).get("security")
+    if security is None:
+        security = default_security
+    _put_method(api_id, resource_id, http_method,
+                _method_security(security, scheme_map or {}))
 
     integration = (operation or {}).get("x-amazon-apigateway-integration")
     if integration:

@@ -18,7 +18,7 @@ ministack/
 │       └── cognito.py      # example of a two-client service file
 ├── tests/
 │   ├── conftest.py         # pytest fixtures (boto3 clients)
-│   └── test_services.py    # all integration tests
+│   └── test_<service>.py   # integration tests by service
 ├── Dockerfile
 ├── pyproject.toml
 └── CHANGELOG.md
@@ -47,7 +47,7 @@ A maintainer will confirm the scope, flag overlap with existing work, and point 
 
 ## Adding a New Service
 
-Every service follows the same 4-step pattern:
+For a new service, follow these steps:
 
 ### 1. Create `ministack/services/myservice.py`
 
@@ -58,16 +58,14 @@ JSON-based API via X-Amz-Target.
 Supports: OperationOne, OperationTwo, ...
 """
 
+import copy
 import json
 import logging
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, json_response, error_response_json
 
 logger = logging.getLogger("myservice")
 
-ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
-
-_state: dict = {}  # in-memory storage
+_state = AccountRegionScopedDict()  # for account- and region-scoped resources
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -98,15 +96,32 @@ def _operation_two(data):
     return json_response({})
 
 
+def get_state():
+    return {"state": copy.deepcopy(_state)}
+
+
+def load_persisted_state(data):
+    if data:
+        _state.update(data.get("state", {}))
+
+
 def reset():
     _state.clear()
 ```
 
-**Protocol guide:**
+**Protocol guide:** Check the botocore service model and an existing handler
+before choosing how to dispatch an operation.
 
-- JSON services (DynamoDB, SecretsManager, Glue, Athena, Cognito, etc.) — use `json_response` / `error_response_json`, route via `X-Amz-Target`
-- XML/Query services (S3, SQS, SNS, IAM, STS, RDS, ElastiCache, EC2) — build XML responses, route via `Action` query param; use `_xml(status, root_tag, inner)` pattern; verify field names against botocore shapes via `Loader().load_service_model()`
-- REST services (Lambda, ECS, Route53) — route via URL path
+- **JSON:** Commonly uses `X-Amz-Target` and the shared `json_response` /
+  `error_response_json` helpers.
+- **Query:** Uses `Action` in the URL or a form-encoded POST body and returns
+  XML; verify response shapes against botocore with
+  `Loader().load_service_model()`.
+- **S3:** Uses a REST-style API with XML responses and dispatches by method,
+  path, and subresource.
+
+Some services support more than one protocol, so follow the operation's actual
+wire format.
 
 ### 2. Register in `ministack/app.py`
 
@@ -143,7 +158,7 @@ def mysvc():
     return make_client("myservice")
 ```
 
-### 5. Add tests to `tests/test_services.py`
+### 5. Add tests to `tests/test_myservice.py`
 
 ```python
 def test_myservice_operation_one(mysvc):
@@ -185,10 +200,9 @@ pytest tests/ -v -k "cognito"
 
 ## Code Conventions
 
-- **One file per service** — keep everything for a service in `ministack/services/myservice.py`
 - **Imports** — always `from ministack.core.responses import ...`, never `from core.responses import ...`
-- **In-memory state** — use module-level dicts (`_things: dict = {}`)
-- **reset()** — every service must expose a `reset()` that clears all module-level state; it's called by `/_ministack/reset`
+- **In-memory state** — scope resources by account and region where AWS does; follow the existing `AccountRegionScopedDict` pattern
+- **State contract** — every registered service module defines `get_state()`, `load_persisted_state(data)`, and `reset()`; `tests/test_persistence.py` checks this, and `/_ministack/reset` calls `reset()`
 - **No external AWS deps** — no `boto3`, `botocore`, or `aws-sdk` in service code
 - **Minimal dependencies** — `duckdb` and `docker` are optional; guard with `try/except ImportError`
 - **Error responses** — match real AWS error codes and HTTP status codes as closely as possible
@@ -203,6 +217,7 @@ pytest tests/ -v -k "cognito"
 - [ ] Detection patterns added to `ministack/core/router.py`
 - [ ] Fixture added to `tests/conftest.py`
 - [ ] Tests added and passing (`pytest tests/ -v`)
+- [ ] Registered modules expose `get_state()`, `load_persisted_state(data)`, and `reset()`
 - [ ] Linting passes (`ruff check ministack/`)
 - [ ] Service added to the table in `README.md`
 - [ ] Entry added to `CHANGELOG.md`
