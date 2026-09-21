@@ -5,14 +5,27 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.5.15] — 2026-09-22
+
+### Added
+
+- **ECS — `awslogs` container output reaches CloudWatch Logs** — a task definition's `awslogs` configuration was stored and ignored, so a Docker-backed `RunTask` container's output went nowhere. Lines now reach the configured group, on a stream named `<prefix>/<container>/<task-id>` or after the container id without a prefix, in `awslogs-region`. Contributed by @rszabo50.
+- **RDS — an internal broker answers IAM database authentication** — `POST /_ministack/rds/iam-auth` verifies a token against a process-local capability bound to one endpoint, so the MySQL plugin can decide a login. Capabilities are never persisted or issued over HTTP, and nothing calls the endpoint yet. Contributed by @Areson.
 
 ### Fixed
 
 - **KMS — imported key material for HMAC and asymmetric keys** — `CreateKey` with `Origin=EXTERNAL` refused every spec but `SYMMETRIC_DEFAULT`, where AWS supports imported material for symmetric encryption, HMAC and asymmetric keys, ML-DSA excepted. HMAC material is the raw bytes of the spec's length and asymmetric material is the private key alone, DER-encoded PKCS#8, from which the public key is derived; material that does not match the key's `KeySpec` answers `IncorrectKeyMaterialException`, and `GetPublicKey` on a key still awaiting material answers `KMSInvalidStateException`. Reported by @guymahieu.
-- **RDS — the server certificate carries the endpoint AWS puts in it** — certificate generation raised `ValueError` once an endpoint passed the X.509 64-byte common-name bound, so a database with a long identifier could not start. The common name is now the advertised endpoint at its full length, the subject carries `OU=RDS, O=Amazon.com, L=Seattle, ST=Washington, C=US`, and the signing CA is named `Amazon RDS <region> Root CA RSA2048 G1`, matching a certificate captured from a real instance. Reported by @jayjanssen.
-- **API Gateway — an OpenAPI body's `securityDefinitions` reach the methods** — the import discarded security outright, so a SAM API declaring a Cognito authorizer created none and every method imported as `authorizationType: NONE`, serving anonymous callers where AWS answers 401. Each scheme carrying `x-amazon-apigateway-authorizer` now becomes an authorizer, and an operation's `security` — or the document's — sets the method's `authorizationType`, `authorizerId` and `authorizationScopes`, so the enforcement added in 1.5.10 engages for body-defined APIs.
-- **CloudFormation — `AWS::ApiGateway::Stage` method settings reach the stage as a map** — the template's `MethodSettings` list was stored verbatim, so the throttling lookup added in 1.5.14 raised on it and every request to a CloudFormation- or SAM-deployed API answered 500. The list is now keyed `"<resourcePath>/<httpMethod>"`, `"*/*"` for the stage-wide entry, over the account-level defaults AWS reports from `GetStage`.
+- **RDS — the server certificate carries the endpoint AWS puts in it** — certificate generation raised `ValueError` once an endpoint passed the X.509 64-byte common-name bound, so a database with a long identifier could not start. The common name is now the advertised endpoint at its full length, the subject carries `OU=RDS, O=Amazon.com, L=Seattle, ST=Washington, C=US`, and the signing CA is named `Amazon RDS <region> Root CA RSA2048 G1`, matching a certificate captured from a real instance. Contributed by @jayjanssen.
+- **API Gateway — an OpenAPI body's `securityDefinitions` reach the methods** — the import discarded security outright, so a SAM API declaring a Cognito authorizer created none and every method imported as `authorizationType: NONE`, serving anonymous callers where AWS answers 401. Each scheme carrying `x-amazon-apigateway-authorizer` now becomes an authorizer, and an operation's `security` — or the document's — sets the method's `authorizationType`, `authorizerId` and `authorizationScopes`, so the enforcement added in 1.5.10 engages for body-defined APIs. Contributed by @maximoosemine.
+- **CloudFormation — `AWS::ApiGateway::Stage` method settings reach the stage as a map** — the template's `MethodSettings` list was stored verbatim, so the throttling lookup added in 1.5.14 raised on it and every request to a CloudFormation- or SAM-deployed API answered 500. The list is now keyed `"<resourcePath>/<httpMethod>"`, `"*/*"` for the stage-wide entry, over the account-level defaults AWS reports from `GetStage`. Contributed by @maximoosemine.
+- **DynamoDB — a table restored outside the current scope keeps working** — startup restore walked the account-scoped store through `values()`, which filters to the request's scope, so another tenant's tables kept the plain dict JSON returns and their first `UpdateItem` raised `KeyError`. Contributed by @ihmpavel.
+- **Lambda MicroVMs — requests reach the MicroVM surface** — the AWS CLI signs `/2025-09-09/microvms` and `/2025-09-09/microvm-images` with credential scope `lambda`, so Lambda's function router read the versioned path as a function name. The path now selects MicroVMs first. Contributed by @edersonbrilhante.
+- **IoT — the mTLS broker certificate is issued for the endpoint it serves** — its common name was `Ministack IoT Broker` and its SANs covered only `localhost` and the host's addresses, so a client verifying the ATS endpoint hostname refused the handshake. It now carries `*.iot.<region>.<host>` as common name and first SAN.
+
+### Internal
+
+- **CI — control-plane and data-plane tests run in separate lanes** — live-container tests shared the lane with everything else, so a Docker failure looked like a service failure. They now carry a `data_plane` marker and run on their own isolated network, while the control-plane lane runs with no daemon reachable. No user-visible behavior changes. Contributed by @jgrumboe.
+- **Contributor guidance** — `CONTRIBUTING.md` documents the three test lanes and the commands that select them, and a new `AGENTS.md` points AI coding agents at the repository layout and the expectations before a behavior change. Contributed by @jgrumboe.
 
 ## [1.5.14] — 2026-09-20
 
