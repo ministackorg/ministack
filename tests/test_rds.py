@@ -15789,88 +15789,23 @@ def _rds_ca_pem(tmp_path):
     return str(path)
 
 
-def _rds_local_hostaddr(engine, db_id, endpoint):
-    """Return the Docker IP for a local endpoint, if one is available.
-
-    MiniStack advertises the stable AWS-shaped hostname for an Aurora cluster,
-    but that name only exists in Docker's embedded DNS.  libpq's ``hostaddr``
-    lets the test use the container IP for transport while retaining ``host``
-    for certificate-name verification.
-    """
-    host = endpoint["Address"]
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        return host
-
-    network_name = os.environ.get("DOCKER_NETWORK")
-    if not network_name:
-        return None
-
-    label_key = "cluster_id" if engine == "aurora-postgresql" else "db_id"
-    client = docker.from_env()
-    try:
-        containers = client.containers.list(
-            filters={
-                "label": [
-                    "ministack=rds",
-                    f"{label_key}={db_id}",
-                ],
-            },
-        )
-        if not containers:
-            raise AssertionError(
-                f"no running RDS container with {label_key}={db_id}"
-            )
-        container = containers[0]
-        container.reload()
-        address = (
-            container.attrs.get("NetworkSettings", {})
-            .get("Networks", {})
-            .get(network_name, {})
-            .get("IPAddress")
-        )
-    finally:
-        client.close()
-    if not address:
-        raise AssertionError(
-            f"no Docker IP for {label_key}={db_id} on {network_name}"
-        )
-    return address
-
-
 @pytest.mark.data_plane
-@pytest.mark.parametrize("engine", ("postgres", "aurora-postgresql"))
-def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
+# TODO: Re-enable Aurora verify-full coverage once data-plane pytest runs
+# inside DOCKER_NETWORK, so Docker DNS resolves the advertised endpoint.
+def test_rds_postgres_serves_verified_tls(rds, tmp_path):
     """AWS installs the DB server certificate itself and every instance we
     report carries CACertificateIdentifier, so TLS is on without asking: a
     client using our CA connects, and plaintext still works as it does on AWS
     without rds.force_ssl."""
     psycopg2 = pytest.importorskip("psycopg2")
-    # Keep derived Aurora endpoint/CN and container names under their 64-byte
-    # limits while retaining a per-test suffix for parallel-run isolation.
-    db_id = f"tls-pg-{_uuid_mod.uuid4().hex[:8]}"
-    cluster_id = f"{db_id}-c"
+    db_id = f"tls-postgres-{_uuid_mod.uuid4().hex[:8]}"
     try:
-        if engine == "aurora-postgresql":
-            rds.create_db_cluster(
-                DBClusterIdentifier=cluster_id, Engine=engine,
-                MasterUsername="admin", MasterUserPassword="password",
-                DatabaseName="appdb",
-            )
-            rds.create_db_instance(
-                DBInstanceIdentifier=db_id, DBClusterIdentifier=cluster_id,
-                DBInstanceClass="db.r6g.large", Engine=engine,
-            )
-        else:
-            rds.create_db_instance(
-                DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
-                Engine=engine, MasterUsername="admin",
-                MasterUserPassword="password", DBName="appdb",
-                AllocatedStorage=20,
-            )
+        rds.create_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
+            Engine="postgres", MasterUsername="admin",
+            MasterUserPassword="password", DBName="appdb",
+            AllocatedStorage=20,
+        )
         endpoint = None
         for _ in range(90):
             detail = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
@@ -15886,7 +15821,6 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
 
         def connect(sslmode):
             host = endpoint["Address"]
-            hostaddr = _rds_local_hostaddr(engine, db_id, endpoint)
             connect_kwargs = {
                 "host": host,
                 "port": endpoint["Port"],
@@ -15897,12 +15831,15 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
                 "sslrootcert": ca,
                 "connect_timeout": 15,
             }
-            if hostaddr:
-                connect_kwargs["hostaddr"] = hostaddr
-                if hostaddr == host:
-                    # Docker-network endpoints can be advertised as a raw IP,
-                    # while the generated certificate carries localhost SANs.
-                    connect_kwargs["host"] = "localhost"
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            else:
+                # Docker-network endpoints can be advertised as container IPs,
+                # while the generated certificate carries localhost SANs.
+                connect_kwargs["hostaddr"] = host
+                connect_kwargs["host"] = "localhost"
             connection = psycopg2.connect(**connect_kwargs)
             try:
                 cursor = connection.cursor()
@@ -15922,11 +15859,6 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
             rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
         except ClientError:
             pass
-        if engine == "aurora-postgresql":
-            try:
-                rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
-            except ClientError:
-                pass
 
 
 def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
