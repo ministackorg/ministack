@@ -15809,18 +15809,22 @@ def _rds_local_hostaddr(engine, db_id, endpoint):
     if not network_name:
         return None
 
-    import docker
-
-    from ministack.services import rds as rds_service
-
-    container_name = (
-        rds_service._rds_cluster_docker_name(db_id)
-        if engine == "aurora-postgresql"
-        else rds_service._rds_docker_name(db_id)
-    )
+    label_key = "cluster_id" if engine == "aurora-postgresql" else "db_id"
     client = docker.from_env()
     try:
-        container = client.containers.get(container_name)
+        containers = client.containers.list(
+            filters={
+                "label": [
+                    "ministack=rds",
+                    f"{label_key}={db_id}",
+                ],
+            },
+        )
+        if not containers:
+            raise AssertionError(
+                f"no running RDS container with {label_key}={db_id}"
+            )
+        container = containers[0]
         container.reload()
         address = (
             container.attrs.get("NetworkSettings", {})
@@ -15832,7 +15836,7 @@ def _rds_local_hostaddr(engine, db_id, endpoint):
         client.close()
     if not address:
         raise AssertionError(
-            f"no Docker IP for {container_name} on {network_name}"
+            f"no Docker IP for {label_key}={db_id} on {network_name}"
         )
     return address
 
