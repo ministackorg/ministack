@@ -15789,6 +15789,54 @@ def _rds_ca_pem(tmp_path):
     return str(path)
 
 
+def _rds_local_hostaddr(engine, db_id, endpoint):
+    """Return the Docker IP for a local endpoint, if one is available.
+
+    MiniStack advertises the stable AWS-shaped hostname for an Aurora cluster,
+    but that name only exists in Docker's embedded DNS.  libpq's ``hostaddr``
+    lets the test use the container IP for transport while retaining ``host``
+    for certificate-name verification.
+    """
+    host = endpoint["Address"]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return host
+
+    network_name = os.environ.get("DOCKER_NETWORK")
+    if not network_name:
+        return None
+
+    import docker
+
+    from ministack.services import rds as rds_service
+
+    container_name = (
+        rds_service._rds_cluster_docker_name(db_id)
+        if engine == "aurora-postgresql"
+        else rds_service._rds_docker_name(db_id)
+    )
+    client = docker.from_env()
+    try:
+        container = client.containers.get(container_name)
+        container.reload()
+        address = (
+            container.attrs.get("NetworkSettings", {})
+            .get("Networks", {})
+            .get(network_name, {})
+            .get("IPAddress")
+        )
+    finally:
+        client.close()
+    if not address:
+        raise AssertionError(
+            f"no Docker IP for {container_name} on {network_name}"
+        )
+    return address
+
+
 @pytest.mark.data_plane
 @pytest.mark.parametrize("engine", ("postgres", "aurora-postgresql"))
 def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
@@ -15834,6 +15882,7 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
 
         def connect(sslmode):
             host = endpoint["Address"]
+            hostaddr = _rds_local_hostaddr(engine, db_id, endpoint)
             connect_kwargs = {
                 "host": host,
                 "port": endpoint["Port"],
@@ -15844,16 +15893,12 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
                 "sslrootcert": ca,
                 "connect_timeout": 15,
             }
-            try:
-                ipaddress.ip_address(host)
-            except ValueError:
-                pass
-            else:
-                # Docker-network endpoints are advertised as container IPs,
-                # while the generated certificate carries localhost SANs.
-                # Keep the socket target and TLS verification name separate.
-                connect_kwargs["hostaddr"] = host
-                connect_kwargs["host"] = "localhost"
+            if hostaddr:
+                connect_kwargs["hostaddr"] = hostaddr
+                if hostaddr == host:
+                    # Docker-network endpoints can be advertised as a raw IP,
+                    # while the generated certificate carries localhost SANs.
+                    connect_kwargs["host"] = "localhost"
             connection = psycopg2.connect(**connect_kwargs)
             try:
                 cursor = connection.cursor()
