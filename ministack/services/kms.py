@@ -375,6 +375,31 @@ def _require_crypto(operation):
 # ---- Operations ----
 
 
+def _set_asymmetric_material(rec, private_key):
+    """Record an asymmetric private key and the public key AWS derives from it."""
+    rec["_private_key"] = private_key
+    rec["_public_key_der"] = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def _asymmetric_key_spec(private_key):
+    """The KeySpec a loaded private key corresponds to, or None if unsupported."""
+    if isinstance(private_key, rsa.RSAPrivateKey):
+        return f"RSA_{private_key.key_size}"
+    if isinstance(private_key, ed25519.Ed25519PrivateKey):
+        return "ECC_NIST_EDWARDS25519"
+    if isinstance(private_key, ec.EllipticCurvePrivateKey):
+        return {
+            "secp256r1": "ECC_NIST_P256",
+            "secp384r1": "ECC_NIST_P384",
+            "secp521r1": "ECC_NIST_P521",
+            "secp256k1": "ECC_SECG_P256K1",
+        }.get(private_key.curve.name)
+    return None
+
+
 def _create_key(data):
     # A multi-Region key's id carries the mrk- prefix, and the id is what ties
     # the primary and its replicas together across regions.
@@ -404,11 +429,6 @@ def _create_key(data):
         return error_response_json(
             "UnsupportedOperationException",
             f"Origin {origin} is not supported.", 400)
-    if origin == "EXTERNAL" and key_spec != "SYMMETRIC_DEFAULT":
-        return error_response_json(
-            "UnsupportedOperationException",
-            "Imported key material is supported for SYMMETRIC_DEFAULT keys only.",
-            400)
     policy = data.get("Policy", json.dumps({
         "Version": "2012-10-17",
         "Id": "key-default-1",
@@ -456,20 +476,22 @@ def _create_key(data):
         rec["SigningAlgorithms"] = []
     elif key_spec in _HMAC_KEY_SPECS:
         mac_algorithm, material_len = _HMAC_KEY_SPECS[key_spec]
-        rec["_hmac_key"] = os.urandom(material_len)
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            rec["_hmac_key"] = os.urandom(material_len)
         rec["MacAlgorithms"] = [mac_algorithm]
     elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=int(key_spec.split("_")[1])
-        )
-        rec["_private_key"] = private_key
-        rec["_public_key_der"] = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, rsa.generate_private_key(
+                public_exponent=65537, key_size=int(key_spec.split("_")[1])))
         if key_usage == "SIGN_VERIFY":
             rec["SigningAlgorithms"] = [
                 "RSASSA_PKCS1_V1_5_SHA_256",
@@ -496,12 +518,11 @@ def _create_key(data):
             "ECC_NIST_P521": ec.SECP521R1(),
             "ECC_SECG_P256K1": ec.SECP256K1(),
         }
-        private_key = ec.generate_private_key(curve_map[key_spec])
-        rec["_private_key"] = private_key
-        rec["_public_key_der"] = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, ec.generate_private_key(curve_map[key_spec]))
         signing_algo_map = {
             "ECC_NIST_P256": ["ECDSA_SHA_256"],
             "ECC_NIST_P384": ["ECDSA_SHA_384"],
@@ -514,12 +535,11 @@ def _create_key(data):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        private_key = ed25519.Ed25519PrivateKey.generate()
-        rec["_private_key"] = private_key
-        rec["_public_key_der"] = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, ed25519.Ed25519PrivateKey.generate())
         # Real AWS exposes both for ECC_NIST_EDWARDS25519 — verified against the
         # KMS Developer Guide "Supported signing algorithms for ECC key specs"
         # table. PH variant is listed in metadata even though Sign/Verify return
@@ -563,6 +583,11 @@ def _get_public_key(data):
     err = _reject_hmac_key(rec, "GetPublicKey")
     if err:
         return err
+    # An EXTERNAL asymmetric key has no public key until its material is
+    # imported, so the absence below is a key state, not a symmetric key.
+    if rec["KeyState"] == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending import.", 400)
     if "_public_key_der" not in rec:
         return error_response_json(
             "UnsupportedOperationException",
@@ -1751,6 +1776,44 @@ def _get_parameters_for_import(data):
     })
 
 
+def _store_imported_material(rec, material):
+    """Place unwrapped key material on the record, per the key's KeySpec.
+
+    Symmetric and HMAC material is raw bytes of the spec's length; asymmetric
+    material is the private key alone, DER-encoded PKCS#8, from which the
+    public key is derived.
+    """
+    key_spec = rec.get("KeySpec", "SYMMETRIC_DEFAULT")
+    if key_spec == "SYMMETRIC_DEFAULT":
+        if len(material) != 32:
+            return error_response_json(
+                "IncorrectKeyMaterialException",
+                "A SYMMETRIC_DEFAULT key takes 256 bits of key material.", 400)
+        rec["_symmetric_key"] = material
+        return None
+    if key_spec in _HMAC_KEY_SPECS:
+        material_len = _HMAC_KEY_SPECS[key_spec][1]
+        if len(material) != material_len:
+            return error_response_json(
+                "IncorrectKeyMaterialException",
+                f"A {key_spec} key takes {material_len * 8} bits of key material.",
+                400)
+        rec["_hmac_key"] = material
+        return None
+    try:
+        private_key = serialization.load_der_private_key(material, password=None)
+    except Exception:
+        return error_response_json(
+            "IncorrectKeyMaterialException",
+            f"A {key_spec} key takes a DER-encoded PKCS#8 private key.", 400)
+    if _asymmetric_key_spec(private_key) != key_spec:
+        return error_response_json(
+            "IncorrectKeyMaterialException",
+            f"The key material does not match KeySpec {key_spec}.", 400)
+    _set_asymmetric_material(rec, private_key)
+    return None
+
+
 def _import_key_material(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
@@ -1800,12 +1863,9 @@ def _import_key_material(data):
             "InvalidCiphertextException",
             "The key material could not be unwrapped with the wrapping key.",
             400)
-    if len(material) != 32:
-        return error_response_json(
-            "IncorrectKeyMaterialException",
-            "A SYMMETRIC_DEFAULT key takes 256 bits of key material.", 400)
-
-    rec["_symmetric_key"] = material
+    err = _store_imported_material(rec, material)
+    if err:
+        return err
     rec["KeyState"] = "Enabled"
     rec["Enabled"] = True
     rec["ExpirationModel"] = expiration
@@ -1833,7 +1893,8 @@ def _delete_imported_key_material(data):
     if rec["KeyState"] == "PendingDeletion":
         return error_response_json(
             "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
-    rec.pop("_symmetric_key", None)
+    for field in ("_symmetric_key", "_hmac_key", "_private_key", "_public_key_der"):
+        rec.pop(field, None)
     rec.pop("ValidTo", None)
     rec["KeyState"] = "PendingImport"
     rec["Enabled"] = False

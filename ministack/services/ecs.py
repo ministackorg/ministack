@@ -1398,27 +1398,27 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
-def _awslogs_config(cdef, task_id):
-    log_config = cdef.get("logConfiguration") or cdef.get("LogConfiguration") or {}
-    log_driver = log_config.get("logDriver") or log_config.get("LogDriver")
-    if log_driver != "awslogs":
+def _awslogs_config(cdef, task_id, container_id):
+    log_config = cdef.get("logConfiguration") or {}
+    if log_config.get("logDriver") != "awslogs":
         return None
 
-    options = log_config.get("options") or log_config.get("Options") or {}
+    options = log_config.get("options") or {}
     group_name = options.get("awslogs-group")
     if not group_name:
         return None
 
-    container_name = cdef.get("name", "container")
     stream_prefix = options.get("awslogs-stream-prefix")
     if stream_prefix:
-        stream_name = f"{stream_prefix}/{container_name}/{task_id}"
+        stream_name = f"{stream_prefix}/{cdef.get('name', 'container')}/{task_id}"
     else:
-        stream_name = f"{container_name}/{task_id}"
+        # Without a prefix AWS names the stream after the Docker container id.
+        stream_name = container_id
 
     return {
         "group": group_name,
         "stream": stream_name,
+        "region": options.get("awslogs-region"),
         "create_group": str(options.get("awslogs-create-group", "")).lower() == "true",
     }
 
@@ -1481,11 +1481,12 @@ def _forward_awslogs(container, config, account_id, region):
 
 
 def _start_awslogs_forwarder(container, cdef, task_id):
-    config = _awslogs_config(cdef, task_id)
+    config = _awslogs_config(cdef, task_id, container.id)
     if not config:
         return
     account_id = get_account_id()
-    region = get_region()
+    # awslogs-region is where the driver ships the logs, not where the task ran.
+    region = config["region"] or get_region()
     thread = threading.Thread(
         target=_forward_awslogs,
         args=(container, config, account_id, region),

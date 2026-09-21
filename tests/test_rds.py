@@ -5,6 +5,7 @@ import ipaddress
 import io
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -8082,9 +8083,7 @@ def _live_cluster(rds, engine_version=None):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-# TODO: Keep extended Aurora live-container coverage out of standard CI until
-# a dedicated live setup can run it reliably; these tests were skipped before
-# the test-plane split as well.
+@pytest.mark.data_plane
 @pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
 def test_aurora_writer_data_is_visible_through_reader(rds):
     with _live_cluster(rds) as (_cid, _wid, _rid, writer, reader, _cluster):
@@ -12251,8 +12250,7 @@ def _wait_for_gtid(
         f"result={result!r}, gtid={executed!r}"
     )
 
-# TODO: Re-enable this extended Aurora global/replication coverage in a
-# dedicated live lane once its service dependencies are provisioned.
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- live Aurora",
@@ -14815,8 +14813,7 @@ def _live_pg_cluster(rds):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-# TODO: Re-enable this extended Aurora PostgreSQL live coverage in a dedicated
-# live lane once its service dependencies are provisioned.
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not _PG_REPLICATION_LIVE,
     reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
@@ -15790,22 +15787,33 @@ def _rds_ca_pem(tmp_path):
 
 
 @pytest.mark.data_plane
-# TODO: Re-enable Aurora verify-full coverage once data-plane pytest runs
-# inside DOCKER_NETWORK, so Docker DNS resolves the advertised endpoint.
-def test_rds_postgres_serves_verified_tls(rds, tmp_path):
+@pytest.mark.parametrize("engine", ("postgres", "aurora-postgresql"))
+def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
     """AWS installs the DB server certificate itself and every instance we
     report carries CACertificateIdentifier, so TLS is on without asking: a
     client using our CA connects, and plaintext still works as it does on AWS
     without rds.force_ssl."""
     psycopg2 = pytest.importorskip("psycopg2")
-    db_id = f"tls-postgres-{_uuid_mod.uuid4().hex[:8]}"
+    db_id = f"tls-{engine.split('-')[-1]}-{_uuid_mod.uuid4().hex[:8]}"
+    cluster_id = f"{db_id}-c"
     try:
-        rds.create_db_instance(
-            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
-            Engine="postgres", MasterUsername="admin",
-            MasterUserPassword="password", DBName="appdb",
-            AllocatedStorage=20,
-        )
+        if engine == "aurora-postgresql":
+            rds.create_db_cluster(
+                DBClusterIdentifier=cluster_id, Engine=engine,
+                MasterUsername="admin", MasterUserPassword="password",
+                DatabaseName="appdb",
+            )
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large", Engine=engine,
+            )
+        else:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
+                Engine="postgres", MasterUsername="admin",
+                MasterUserPassword="password", DBName="appdb",
+                AllocatedStorage=20,
+            )
         endpoint = None
         for _ in range(90):
             detail = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
@@ -15834,10 +15842,10 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path):
             try:
                 ipaddress.ip_address(host)
             except ValueError:
-                pass
+                # A cluster endpoint resolves only inside the Docker network, so
+                # dial loopback while verify-full still matches the advertised name.
+                connect_kwargs["hostaddr"] = "127.0.0.1"
             else:
-                # Docker-network endpoints can be advertised as container IPs,
-                # while the generated certificate carries localhost SANs.
                 connect_kwargs["hostaddr"] = host
                 connect_kwargs["host"] = "localhost"
             connection = psycopg2.connect(**connect_kwargs)
@@ -15859,6 +15867,11 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path):
             rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
         except ClientError:
             pass
+        if engine == "aurora-postgresql":
+            try:
+                rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
 
 
 def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
@@ -15874,4 +15887,94 @@ def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
     assert first == second, "the CA must not be re-minted per request"
     cert = x509.load_pem_x509_certificate(first)
     assert cert.issuer == cert.subject
-    assert "Ministack RDS Root CA" in cert.subject.rfc4514_string()
+    assert "Root CA RSA2048 G1" in cert.subject.rfc4514_string()
+
+
+def _tls_handshake(ca_pem, cert_pem, key_pem, hostname, tmp_path):
+    """A real verifying handshake, both ends in memory, SAN matching only."""
+    import ssl
+
+    chain = tmp_path / "server.pem"
+    chain.write_text(cert_pem + key_pem)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(chain)
+    client_context = ssl.create_default_context(cadata=ca_pem)
+    client_context.verify_flags |= ssl.VERIFY_X509_STRICT
+    client_context.hostname_checks_common_name = False
+    client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = client_context.wrap_bio(client_in, client_out, server_hostname=hostname)
+    server = server_context.wrap_bio(server_in, server_out, server_side=True)
+    done = set()
+    for _ in range(10):
+        for endpoint in (client, server):
+            if endpoint not in done:
+                try:
+                    endpoint.do_handshake()
+                    done.add(endpoint)
+                except ssl.SSLWantReadError:
+                    pass
+        server_in.write(client_out.read())
+        client_in.write(server_out.read())
+        if len(done) == 2:
+            return
+    pytest.fail("TLS handshake did not complete")
+
+
+def _fresh_pg_ca(monkeypatch):
+    from ministack.services import rds as rds_service
+
+    monkeypatch.setattr(rds_service, "_pg_ca", None)
+    return rds_service.pg_ca_cert_pem()
+
+
+@pytest.mark.parametrize("hostname", [
+    "db.example.test",
+    "db-" + "a" * 37 + ".cluster-abcdefghijkl.us-east-1.rds.amazonaws.com",
+])
+def test_rds_server_certificate_carries_every_endpoint_as_a_san(hostname, monkeypatch, tmp_path):
+    """An endpoint longer than the 64-byte CN limit must still get a certificate,
+    and every name it is reached by has to verify."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    from ministack.services import rds as rds_service
+
+    ca_pem = _fresh_pg_ca(monkeypatch)
+    names = [hostname, "reader." + hostname, "localhost"]
+    ips = ["127.0.0.1", "::1"]
+    cert_pem, key_pem = rds_service._pg_server_material(names, ips)
+
+    cert = x509.load_pem_x509_certificate(cert_pem.encode())
+    cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    assert cn == hostname
+    sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert sans.get_values_for_type(x509.DNSName) == names
+    assert sans.get_values_for_type(x509.IPAddress) == [
+        ipaddress.ip_address(ip) for ip in ips]
+
+    for name in names + ips:
+        _tls_handshake(ca_pem, cert_pem, key_pem, name, tmp_path)
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _tls_handshake(ca_pem, cert_pem, key_pem, "unlisted.example.test", tmp_path)
+
+
+def test_rds_server_certificate_without_dns_names_verifies_its_ip(monkeypatch, tmp_path):
+    from ministack.services import rds as rds_service
+
+    pytest.importorskip("cryptography")
+    ca_pem = _fresh_pg_ca(monkeypatch)
+    cert_pem, key_pem = rds_service._pg_server_material([], ["127.0.0.1"])
+    _tls_handshake(ca_pem, cert_pem, key_pem, "127.0.0.1", tmp_path)
+
+
+def test_rds_server_certificate_without_cryptography_raises(monkeypatch):
+    pytest.importorskip("cryptography")
+    from ministack.core import x509_utils
+    from ministack.services import rds as rds_service
+
+    _fresh_pg_ca(monkeypatch)
+    monkeypatch.setattr(x509_utils, "HAS_CRYPTO", False)
+    with pytest.raises(RuntimeError, match="requires the `cryptography` package"):
+        rds_service._pg_server_material(["localhost"], [])
