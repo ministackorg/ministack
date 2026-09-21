@@ -37,6 +37,14 @@ _LAMBDA_PATH_RE = re.compile(
 # apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
 _LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
 
+# Lambda MicroVMs uses the Lambda endpoint prefix and, in the AWS CLI version
+# currently published for this API, signs requests with the credential scope
+# `lambda` rather than a distinct `lambda-microvms` scope.  Keep the path
+# check available so signed requests are not sent to Lambda's function router.
+_LAMBDA_MICROVM_PATH_RE = re.compile(
+    r"^/2025-09-09/(?:microvms|microvm-images)(?:/|$)"
+)
+
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
 # url-safe base64, generated per-container in services/ecs.py.
 _ECS_METADATA_PATH_RE = re.compile(r"^/v4/[A-Za-z0-9_-]{8,}(?:/.*)?$")
@@ -79,10 +87,9 @@ SERVICE_PATTERNS = {
     "lambda-core": {
         "path_patterns": [r"^/2026-04-04/network-connectors"],
     },
-    # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
-    # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
-    # Lambda's `lambda.` host, so this must be its own entry. Listed before
-    # `lambda` for clarity; the patterns are disjoint.
+    # Lambda MicroVMs (2025-09-09) uses a distinct service host, while the
+    # AWS CLI currently signs the local endpoint with credential scope
+    # `lambda`; detect the path before the generic Lambda function router.
     "lambda-microvms": {
         "path_patterns": [r"^/2025-09-09/microvm"],
         "host_patterns": [r"lambda-microvms\."],
@@ -723,10 +730,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
-            # Lambda Core signs as `lambda`: its endpointPrefix AND signingName
-            # are both `lambda` (botocore lambda-core/2026-04-30), unlike
-            # lambda-microvms which has its own scope. So the credential scope
-            # cannot tell the two apart and the path has to. This must sit
+            # Lambda MicroVMs currently signs as `lambda` in the AWS CLI model,
+            # even though its API has a distinct service host. Resolve its
+            # versioned path before the generic Lambda credential-scope return.
+            if svc_name == "lambda" and _LAMBDA_MICROVM_PATH_RE.match(path):
+                return "lambda-microvms"
+            # Lambda Core also signs as `lambda`: its endpointPrefix AND
+            # signingName are both `lambda` (botocore lambda-core/2026-04-30),
+            # so the credential scope cannot distinguish it from the generic
+            # Lambda and MicroVM surfaces. The path checks must sit
             # before the SERVICE_PATTERNS early-return below, or `lambda`
             # matches there and the request reaches the function router, which
             # reads `/2026-04-04/network-connectors` as a function name.
@@ -1205,6 +1217,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "apigateway"
     # Before the Lambda path check: both live on the Lambda endpoint, and an
     # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_MICROVM_PATH_RE.match(path_lower):
+        return "lambda-microvms"
     if _LAMBDA_CORE_PATH_RE.match(path_lower):
         return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):

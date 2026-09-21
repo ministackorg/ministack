@@ -121,6 +121,29 @@ def _sigv4_headers(service):
     }
 
 
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvm-images/ministack/versions/1",
+    "/2025-09-09/microvms",
+    "/2025-09-09/microvms/microvm-123/terminate",
+])
+def test_lambda_microvm_paths_override_lambda_credential_scope(path):
+    """The AWS CLI signs Lambda MicroVM requests with the `lambda` scope.
+
+    The path must therefore win over the generic Lambda function router, or
+    `/2025-09-09/microvm-images` is treated as a Lambda function name.
+    """
+    assert detect_service("POST", path, _sigv4_headers("lambda"), {}) == "lambda-microvms"
+
+
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvms",
+])
+def test_lambda_microvm_paths_route_without_signature(path):
+    assert detect_service("POST", path, _HEADERS, {}) == "lambda-microvms"
+
+
 def test_iot_jobs_data_credential_scope_routes():
     """The SDK signs iot-jobs-data requests with the `iot-jobs-data` scope
     (botocore signingName); the same path signed with `iot` must stay on the
