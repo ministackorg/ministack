@@ -5119,6 +5119,7 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
     ssm.delete_parameter(Name="sfn-pascal-test-param")
 
 
+@pytest.mark.data_plane
 def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
     """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
     try:

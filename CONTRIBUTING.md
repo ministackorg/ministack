@@ -179,11 +179,18 @@ docker compose up -d
 # Install test dependencies
 pip install boto3 pytest pytest-xdist duckdb docker cbor2 
 
-# Parallel-safe phase: run tests that are safe to run concurrently
-pytest tests/ -v -n 4 --dist=loadfile -m "not serial"
+# Full suite (the default local verification command)
+pytest tests/ -v
 
-# Serial/global-state phase: run tests that mutate runtime state or require isolation
-pytest tests/ -v -m serial
+# Control-plane parallel lane: excludes serial and live-container tests
+pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane"
+
+# Control-plane serial/global-state lane
+pytest tests/ -v -m "serial and not data_plane"
+
+# Docker-backed data-plane lane (requires a Docker daemon and network)
+DOCKER_NETWORK=ministack-data-local LAMBDA_EXECUTOR=docker \
+pytest tests/ -v -m data_plane
 
 # Run a specific service
 pytest tests/ -v -k "cognito"

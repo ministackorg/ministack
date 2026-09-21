@@ -466,6 +466,7 @@ def test_opensearch_account_isolation():
     os.environ.get("OPENSEARCH_DATAPLANE") != "1",
     reason="set OPENSEARCH_DATAPLANE=1 to run the real-cluster smoke",
 )
+@pytest.mark.data_plane
 def test_opensearch_dataplane_cluster_health():
     """When OPENSEARCH_DATAPLANE=1 is set on the ministack server, CreateDomain
     spawns a real opensearchproject/opensearch container and DescribeDomain

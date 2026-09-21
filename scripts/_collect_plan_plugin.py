@@ -5,7 +5,7 @@ single ``--collect-only`` pass yields both the ``serial`` and ``parallel``
 counts. Collecting twice (once per ``-m`` filter) doubled the cost of the
 shard-planning job for data one pass already has.
 
-Writes ``{"tests/test_x.py": {"parallel": 12, "serial": 3}, ...}`` to
+Writes ``{"tests/test_x.py": {"parallel": 12, "serial": 3, "data_plane": 2}, ...}`` to
 ``<rootpath>/.pytest_collect_plan.json``. The path is derived from the pytest
 session rather than handed in through the environment: the plugin and its one
 caller already agree on the repo root, so an env var would only be a second
@@ -28,8 +28,14 @@ def pytest_collection_finish(session):
             path = item.path.relative_to(rootpath).as_posix()
         except ValueError:
             path = item.path.as_posix()
-        mode = "serial" if item.get_closest_marker("serial") else "parallel"
-        counts.setdefault(path, {"parallel": 0, "serial": 0})[mode] += 1
+        if item.get_closest_marker("data_plane"):
+            # Data-plane tests run in their own Docker-enabled lane.  Keep
+            # them out of the control-plane shard counts regardless of their
+            # serial marker.
+            mode = "data_plane"
+        else:
+            mode = "serial" if item.get_closest_marker("serial") else "parallel"
+        counts.setdefault(path, {"parallel": 0, "serial": 0, "data_plane": 0})[mode] += 1
 
     with open(out, "w") as fh:
         json.dump(dict(sorted(counts.items())), fh)
