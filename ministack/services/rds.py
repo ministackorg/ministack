@@ -11093,6 +11093,9 @@ _ACTION_MAP = {
 
 
 def reset():
+    from ministack.core import rds_iam_broker
+
+    rds_iam_broker.reset()
     # Serialize teardown with warm-boot shared-container startup. Otherwise a
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
