@@ -205,7 +205,7 @@ def _restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
         # Restore items as defaultdict(dict) — JSON deserializes as plain dict
-        for tbl in _tables.values():
+        for tbl in _tables.all_values():
             if isinstance(tbl.get("items"), dict) and not isinstance(tbl["items"], defaultdict):
                 tbl["items"] = defaultdict(dict, tbl["items"])
             # Migrate legacy SSEDescription shape (pre-#411): convert

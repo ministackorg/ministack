@@ -1,3 +1,12 @@
+"""Collect tests and select one shard for a static CI matrix runner.
+
+Each control-plane or data-plane matrix runner invokes this script with its own mode,
+shard index, and shard count. The script collects the current test files,
+balances them for that mode, and emits only the files assigned to that
+runner. The matrix is deliberately defined in the workflow; this script
+does not create or plan the matrix itself.
+"""
+
 import argparse
 import json
 import os
@@ -11,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def collect_by_file(mode: str | None = None) -> dict[str, dict[str, int]] | dict[str, int]:
     """Collect test counts per file, split by mode, in a single pytest pass.
 
-    Returns ``{file: {"parallel": n, "serial": n}}``. When ``mode`` is given,
+    Returns ``{file: {"parallel": n, "serial": n, "data_plane": n}}``. When ``mode`` is given,
     returns the flat ``{file: n}`` for that mode only (files with 0 omitted),
     which is the shape the sharding helpers consume.
 
@@ -60,7 +69,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--shard-index", type=int, required=True)
     p.add_argument("--shard-count", type=int, required=True)
-    p.add_argument("--mode", choices=["parallel", "serial"], required=True)
+    p.add_argument("--mode", choices=["parallel", "serial", "data_plane"], required=True)
     p.add_argument("--exclude", action="append", default=[])
     p.add_argument("--format", choices=["shell", "json"], default="shell")
     args = p.parse_args()

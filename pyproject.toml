@@ -65,6 +65,8 @@ test = [
     "docker>=7.0.0",
     "cbor2>=5.4.0",
     "cryptography>=41.0",
+    "psycopg2-binary>=2.9",
+    "pymysql>=1.1",
     "aws-sam-translator>=1.90",
     "websockets>=12.0",
 ]
@@ -103,6 +105,7 @@ python_functions = ["test_*"]
 addopts = "--dist=loadfile"
 markers = [
     "serial: tests that mutate global server state and must run alone",
+    "data_plane: tests that require live Docker-backed service behavior",
 ]
 
 [tool.ruff]
@@ -127,4 +130,3 @@ ignore = [
 [tool.coverage.run]
 source = ["ministack"]
 omit = ["tests/*"]
-

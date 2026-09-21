@@ -4506,6 +4506,46 @@ def _apigw_deployment_delete(physical_id, props):
 
 # --- API Gateway Stage ---
 
+_APIGW_METHOD_SETTING_FIELDS = (
+    ("CacheDataEncrypted", "cacheDataEncrypted"),
+    ("CacheTtlInSeconds", "cacheTtlInSeconds"),
+    ("CachingEnabled", "cachingEnabled"),
+    ("DataTraceEnabled", "dataTraceEnabled"),
+    ("LoggingLevel", "loggingLevel"),
+    ("MetricsEnabled", "metricsEnabled"),
+    ("ThrottlingBurstLimit", "throttlingBurstLimit"),
+    ("ThrottlingRateLimit", "throttlingRateLimit"),
+)
+
+
+def _apigw_method_settings(raw):
+    """Map a CFN MethodSettings list to the map GetStage returns.
+
+    CloudFormation takes a list of method-setting objects; the service keys
+    them ``"<resourcePath>/<httpMethod>"``, with ``"*/*"`` for the stage-wide
+    entry, over the account-level defaults."""
+    if isinstance(raw, dict):
+        return raw
+    settings = {}
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        resource_path = item.get("ResourcePath", "/*")
+        http_method = item.get("HttpMethod", "*")
+        if resource_path == "/*" and http_method == "*":
+            key = "*/*"
+        else:
+            key = f"{resource_path}/{http_method}"
+        entry = _apigw_v1._default_method_setting_entry()
+        for prop, field in _APIGW_METHOD_SETTING_FIELDS:
+            if item.get(prop) is not None:
+                entry[field] = _apigw_v1._parse_stage_method_setting_value(
+                    field, item[prop]
+                )
+        settings[key] = entry
+    return settings
+
+
 def _apigw_stage_create(logical_id, props, stack_name):
     api_id = props.get("RestApiId", "")
     stage_name = props.get("StageName", "")
@@ -4514,7 +4554,7 @@ def _apigw_stage_create(logical_id, props, stack_name):
         "deploymentId": props.get("DeploymentId", ""),
         "description": props.get("Description", ""),
         "variables": props.get("Variables", {}),
-        "methodSettings": props.get("MethodSettings", {}),
+        "methodSettings": _apigw_method_settings(props.get("MethodSettings")),
         "tracingEnabled": props.get("TracingEnabled", False),
         "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
     }
@@ -4541,14 +4581,14 @@ def _apigw_stage_update(physical_id, old_props, new_props, stack_name):
         ("DeploymentId", "/deploymentId", ""),
         ("Description", "/description", ""),
         ("Variables", "/variables", {}),
-        ("MethodSettings", "/methodSettings", {}),
+        ("MethodSettings", "/methodSettings", []),
         ("TracingEnabled", "/tracingEnabled", False),
     ):
         if new_props.get(prop, default) != old_props.get(prop, default):
-            patch_ops.append({
-                "op": "replace", "path": path,
-                "value": new_props.get(prop, default),
-            })
+            value = new_props.get(prop, default)
+            if prop == "MethodSettings":
+                value = _apigw_method_settings(value)
+            patch_ops.append({"op": "replace", "path": path, "value": value})
     if patch_ops:
         resp = _apigw_v1._update_stage(api_id, stage_name, {"patchOperations": patch_ops})
         if resp[0] >= 400:

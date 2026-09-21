@@ -4374,6 +4374,7 @@ def test_ec2_exec_on_instance_without_a_box_fails(vm):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ec2_docker_end_to_end_live(ec2):
     ami = ec2.register_image(Name=f"live-{_uuid_mod.uuid4().hex[:8]}",
                              ImageLocation="alpine:3")["ImageId"]
@@ -4485,6 +4486,7 @@ def test_ec2_container_instance_creates_no_root_volume(vm):
                 for a in v.get("Attachments", []) if a.get("InstanceId") == iids[0]]
 
 
+@pytest.mark.data_plane
 def test_ec2_unpullable_image_is_a_client_error(ec2):
     """A reference that cannot be pulled is the caller's problem, not the
     server's — retrying an InternalError here would fail identically forever."""

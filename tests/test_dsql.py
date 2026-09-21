@@ -1728,6 +1728,9 @@ class TestContainersE2E:
     Postgres container behind the wire proxy, reachable over SQL. Runs
     in-process (flag monkeypatched on) wherever a Docker daemon exists."""
 
+    # TODO: Move this extended live-container coverage into a dedicated DSQL
+    # lane; it was intentionally skipped by the pre-PR control-plane suite.
+
     def test_env_flag_spins_up_real_backend(self, monkeypatch):
         import json
 

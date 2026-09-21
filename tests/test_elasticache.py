@@ -36,6 +36,7 @@ def _ec_client(region):
     )
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_create(ec):
     ec.create_cache_cluster(
         CacheClusterId="test-redis",
@@ -50,6 +51,7 @@ def test_elasticache_create(ec):
     assert clusters[0]["Engine"] == "redis"
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_cache_node_full_fields(ec):
     """terraform-provider-aws v6 derefs CacheNodeCreateTime / ParameterGroupStatus /
     CustomerAvailabilityZone without nil checks. Issue #675."""
@@ -69,6 +71,7 @@ def test_elasticache_cache_node_full_fields(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-rg",
@@ -78,12 +81,10 @@ def test_elasticache_replication_group(ec):
     resp = ec.describe_replication_groups(ReplicationGroupId="test-rg")
     assert resp["ReplicationGroups"][0]["ReplicationGroupId"] == "test-rg"
 
-@requires_docker
 def test_elasticache_engines(ec):
     resp = ec.describe_cache_engine_versions(Engine="redis")
     assert len(resp["CacheEngineVersions"]) > 0
 
-@requires_docker
 def test_elasticache_valkey_engine_versions(ec):
     resp = ec.describe_cache_engine_versions(Engine="valkey")
     versions = resp["CacheEngineVersions"]
@@ -92,6 +93,7 @@ def test_elasticache_valkey_engine_versions(ec):
     assert all(v["CacheParameterGroupFamily"].startswith("valkey") for v in versions)
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_valkey_create_cluster(ec):
     ec.create_cache_cluster(
         CacheClusterId="test-valkey",
@@ -109,6 +111,7 @@ def test_elasticache_valkey_create_cluster(ec):
     assert cluster["CacheNodes"][0]["Endpoint"]["Port"] != 11211
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_valkey_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-valkey-rg",
@@ -121,7 +124,6 @@ def test_elasticache_valkey_replication_group(ec):
     assert rg["ReplicationGroupId"] == "test-valkey-rg"
     assert rg["NodeGroups"][0]["PrimaryEndpoint"]["Port"] != 11211
 
-@requires_docker
 def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
@@ -136,7 +138,6 @@ def test_elasticache_modify_subnet_group(ec):
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
 
-@requires_docker
 def test_elasticache_user_crud(ec):
     ec.create_user(
         UserId="test-user-1",
@@ -151,7 +152,6 @@ def test_elasticache_user_crud(ec):
     ec.modify_user(UserId="test-user-1", AccessString="on ~keys:* +get")
     ec.delete_user(UserId="test-user-1")
 
-@requires_docker
 def test_elasticache_user_group_crud(ec):
     ec.create_user(
         UserId="ug-usr-1",
@@ -167,7 +167,6 @@ def test_elasticache_user_group_crud(ec):
     ec.delete_user_group(UserGroupId="test-ug-1")
     ec.delete_user(UserId="ug-usr-1")
 
-@requires_docker
 def test_elasticache_reset_clears_param_groups():
     """ElastiCache reset restores built-in parameter groups and resets port counter."""
     from ministack.services import elasticache as _ec
@@ -178,7 +177,6 @@ def test_elasticache_reset_clears_param_groups():
     assert "default.redis7" in _ec._param_group_params
     assert _ec._port_counter[0] == _ec.BASE_PORT
 
-@requires_docker
 def test_elasticache_parameter_group_crud(ec):
     """CreateCacheParameterGroup / DescribeCacheParameterGroups / DeleteCacheParameterGroup."""
     ec.create_cache_parameter_group(
@@ -194,6 +192,7 @@ def test_elasticache_parameter_group_crud(ec):
     ec.delete_cache_parameter_group(CacheParameterGroupName="test-pg-v39")
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_snapshot_crud(ec):
     """CreateSnapshot / DescribeSnapshots / DeleteSnapshot."""
     ec.create_cache_cluster(
@@ -209,6 +208,7 @@ def test_elasticache_snapshot_crud(ec):
     ec.delete_snapshot(SnapshotName="test-snap-v39")
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_tags(ec):
     """AddTagsToResource / ListTagsForResource / RemoveTagsFromResource."""
     ec.create_cache_cluster(
@@ -281,6 +281,7 @@ def test_elasticache_cluster_tag_arn_uses_cache_cluster_arn_field(ec):
 
 # Migrated from test_ec.py
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_create_cluster_v2(ec):
     resp = ec.create_cache_cluster(
         CacheClusterId="ec-cc-v2",
@@ -295,6 +296,7 @@ def test_elasticache_create_cluster_v2(ec):
     assert len(c["CacheNodes"]) == 1
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_describe_clusters_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-dc-v2a",
@@ -317,6 +319,7 @@ def test_elasticache_describe_clusters_v2(ec):
     assert resp2["CacheClusters"][0]["Engine"] == "memcached"
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_replication_group_v2(ec):
     resp = ec.create_replication_group(
         ReplicationGroupId="ec-rg-v2",
@@ -334,7 +337,6 @@ def test_elasticache_replication_group_v2(ec):
     desc = ec.describe_replication_groups(ReplicationGroupId="ec-rg-v2")
     assert desc["ReplicationGroups"][0]["ReplicationGroupId"] == "ec-rg-v2"
 
-@requires_docker
 def test_elasticache_engine_versions_v2(ec):
     redis = ec.describe_cache_engine_versions(Engine="redis")
     assert len(redis["CacheEngineVersions"]) > 0
@@ -344,6 +346,7 @@ def test_elasticache_engine_versions_v2(ec):
     assert len(mc["CacheEngineVersions"]) > 0
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_tags_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-tag-v2",
@@ -371,6 +374,7 @@ def test_elasticache_tags_v2(ec):
     assert any(t["Key"] == "tier" for t in tags2)
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_snapshot_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-snap-v2",
@@ -386,7 +390,6 @@ def test_elasticache_snapshot_v2(ec):
     assert len(desc["Snapshots"]) == 1
     assert desc["Snapshots"][0]["SnapshotName"] == "ec-snap-v2-s1"
 
-@requires_docker
 def test_elasticache_describe_cache_parameters(ec):
     """DescribeCacheParameters returns parameters for a parameter group."""
     ec.create_cache_parameter_group(
@@ -398,7 +401,6 @@ def test_elasticache_describe_cache_parameters(ec):
     assert "Parameters" in resp
     assert len(resp["Parameters"]) > 0
 
-@requires_docker
 def test_elasticache_modify_cache_parameter_group(ec):
     """ModifyCacheParameterGroup updates parameter values."""
     ec.create_cache_parameter_group(
@@ -844,6 +846,7 @@ def test_elasticache_restore_legacy_account_scoped_state_adopts_record_arn_regio
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_cache_cluster_num_nodes(ec):
     """ModifyCacheCluster: scale NumCacheNodes up and down."""
     cid = f"mod-cc-{_uid()}"
@@ -869,6 +872,7 @@ def test_modify_cache_cluster_num_nodes(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_cache_cluster_node_type_and_engine(ec):
     """ModifyCacheCluster: update CacheNodeType and EngineVersion."""
     cid = f"mod-nt-{_uid()}"
@@ -895,6 +899,7 @@ def test_modify_cache_cluster_node_type_and_engine(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_reboot_cache_cluster(ec):
     """RebootCacheCluster: reboot and verify cluster stays available."""
     cid = f"reboot-{_uid()}"
@@ -920,6 +925,7 @@ def test_reboot_cache_cluster(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_delete_replication_group(ec):
     """DeleteReplicationGroup: create then delete, verify gone."""
     rg_id = f"del-rg-{_uid()}"
@@ -946,6 +952,7 @@ def test_delete_replication_group(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_replication_group(ec):
     """ModifyReplicationGroup: update description and CacheNodeType."""
     rg_id = f"mod-rg-{_uid()}"
@@ -1016,6 +1023,7 @@ def test_modify_replication_group_missing_user_group_fails_before_mutation(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_increase_replica_count(ec):
     """IncreaseReplicaCount: scale replicas up from 1 to 3."""
     rg_id = f"inc-rep-{_uid()}"
@@ -1048,6 +1056,7 @@ def test_increase_replica_count(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_decrease_replica_count(ec):
     """DecreaseReplicaCount: scale replicas down from 3 to 1."""
     rg_id = f"dec-rep-{_uid()}"
@@ -1078,7 +1087,6 @@ def test_decrease_replica_count(ec):
 # 7. DeleteCacheSubnetGroup
 # ---------------------------------------------------------------------------
 
-@requires_docker
 def test_delete_cache_subnet_group(ec):
     """DeleteCacheSubnetGroup: create then delete, verify gone."""
     name = f"del-sg-{_uid()}"
@@ -1104,7 +1112,6 @@ def test_delete_cache_subnet_group(ec):
 # 8. ResetCacheParameterGroup
 # ---------------------------------------------------------------------------
 
-@requires_docker
 def test_reset_cache_parameter_group_full(ec):
     """ResetCacheParameterGroup: full reset restores defaults."""
     pg = f"reset-full-{_uid()}"
@@ -1134,7 +1141,6 @@ def test_reset_cache_parameter_group_full(ec):
     ec.delete_cache_parameter_group(CacheParameterGroupName=pg)
 
 
-@requires_docker
 def test_reset_cache_parameter_group_selective(ec):
     """ResetCacheParameterGroup: selective reset of specific parameter."""
     pg = f"reset-sel-{_uid()}"
@@ -1173,6 +1179,7 @@ def test_reset_cache_parameter_group_selective(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_delete_snapshot_explicit(ec):
     """DeleteSnapshot: create snapshot, delete it, verify gone."""
     cid = f"snap-del-{_uid()}"
@@ -1205,6 +1212,7 @@ def test_delete_snapshot_explicit(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_all(ec):
     """DescribeEvents: listing all events returns results."""
     # create a cluster to generate at least one event
@@ -1223,6 +1231,7 @@ def test_describe_events_all(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_filter_source_type(ec):
     """DescribeEvents: filter by SourceType."""
     rg_id = f"evt-rg-{_uid()}"
@@ -1241,6 +1250,7 @@ def test_describe_events_filter_source_type(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_filter_source_id(ec):
     """DescribeEvents: filter by SourceIdentifier."""
     cid = f"evt-src-{_uid()}"
@@ -1262,6 +1272,7 @@ def test_describe_events_filter_source_id(ec):
 # 11. Replication group member cluster lifecycle
 # ---------------------------------------------------------------------------
 
+@pytest.mark.data_plane
 def test_replication_group_creates_member_clusters(ec):
     """CreateReplicationGroup should register member clusters visible via DescribeCacheClusters."""
     rg_id = f"rg-members-{_uid()}"
@@ -1284,6 +1295,7 @@ def test_replication_group_creates_member_clusters(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_delete_replication_group_removes_member_clusters(ec):
     """DeleteReplicationGroup should also remove its member clusters."""
     rg_id = f"rg-del-mem-{_uid()}"
@@ -1305,6 +1317,7 @@ def test_delete_replication_group_removes_member_clusters(ec):
         assert "CacheClusterNotFound" in str(exc.value)
 
 
+@pytest.mark.data_plane
 def test_replication_group_tags_on_create(ec):
     """Tags passed at CreateReplicationGroup should be retrievable via ListTagsForResource."""
     rg_id = f"rg-tags-{_uid()}"
@@ -1326,6 +1339,7 @@ def test_replication_group_tags_on_create(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
     """Cluster-mode-enabled replication groups use the .cluster.on default group."""
     rg_id = f"rg-cluster-pg-{_uid()}"
@@ -1343,6 +1357,7 @@ def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
     """AddTagsToResource/RemoveTagsFromResource on a replication group fan out to members."""
     rg_id = f"rg-tag-fanout-{_uid()}"
@@ -1833,6 +1848,7 @@ def test_elasticache_delete_during_deferred_start_leaves_no_container(fake_docke
     )
 
 
+@pytest.mark.data_plane
 def test_elasticache_cluster_create_time_present_and_parsed(ec):
     """DescribeCacheClusters emits CacheClusterCreateTime as an ISO8601 TStamp
     (it was stored as a float epoch and previously absent from the XML)."""

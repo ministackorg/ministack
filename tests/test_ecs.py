@@ -64,6 +64,7 @@ def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
 
+@pytest.mark.data_plane
 def test_ecs_run_task_stops_after_exit(ecs):
     """DescribeTasks transitions to STOPPED after Docker container exits."""
     ecs.create_cluster(clusterName="task-lifecycle")
@@ -98,6 +99,60 @@ def test_ecs_run_task_stops_after_exit(ecs):
     assert stopped, "Task should transition to STOPPED after container exits"
 
 
+@pytest.mark.data_plane
+def test_ecs_run_task_forwards_awslogs_to_cloudwatch_logs(ecs, logs):
+    cluster = f"awslogs-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"{cluster}-td"
+    group = f"/ecs/{cluster}"
+    marker = f"ECS-AWSLOGS-{_uuid_mod.uuid4().hex[:8]}"
+    stream_prefix = "ecs"
+
+    logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family,
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", f"echo {marker}"],
+            "essential": True,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": group,
+                    "awslogs-region": "us-east-1",
+                    "awslogs-stream-prefix": stream_prefix,
+                },
+            },
+        }],
+    )
+
+    try:
+        resp = ecs.run_task(cluster=cluster, taskDefinition=family)
+    except Exception as exc:
+        pytest.skip(f"ECS RunTask unavailable in this environment: {exc}")
+
+    task_arn = resp["tasks"][0]["taskArn"]
+    task_id = task_arn.rsplit("/", 1)[-1]
+    stream_name = f"{stream_prefix}/app/{task_id}"
+
+    def marker_reached_cloudwatch_logs():
+        streams = logs.describe_log_streams(
+            logGroupName=group,
+            logStreamNamePrefix=stream_name,
+        )["logStreams"]
+        if not streams:
+            return False
+        events = logs.get_log_events(
+            logGroupName=group,
+            logStreamName=stream_name,
+        )["events"]
+        return any(marker in event["message"] for event in events)
+
+    _wait_until(marker_reached_cloudwatch_logs, timeout=20)
+
+
+@pytest.mark.data_plane
 def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     """ListTasks must also reconcile lifecycle when a container has exited
     on its own. Previously only DescribeTasks ran the reconciler, so a user
@@ -139,6 +194,7 @@ def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     )
 
 
+@pytest.mark.data_plane
 def test_ecs_run_task_network_connectivity(ecs):
     """ECS container can reach Ministack (proves network detection works)."""
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -188,6 +244,7 @@ def test_ecs_run_task_network_connectivity(ecs):
             break
     assert success, "Task should transition to STOPPED"
 
+@pytest.mark.data_plane
 def test_ecs_run_task_metadata_v4(ecs):
     """Container can resolve and read its V4 task-metadata URI end-to-end.
 

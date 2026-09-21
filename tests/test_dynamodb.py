@@ -7194,3 +7194,83 @@ def test_contributor_insights_last_update_is_int_epoch(ddb):
             assert isinstance(lud, int), f"expected int epoch, got {type(lud).__name__}: {lud}"
     finally:
         ddb.delete_table(TableName=table)
+
+def test_dynamodb_restore_rebuilds_item_store_for_every_account_and_region():
+    import asyncio
+    from collections import defaultdict
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        request_scope,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import dynamodb as ddb_service
+
+    table_name = f"restore-scope-{_uuid_mod.uuid4().hex[:8]}"
+    scopes = (("000000000000", "us-east-1"), ("111111111111", "eu-west-1"))
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ddb_service.reset()
+    tables = AccountRegionScopedDict()
+    for account_id, region in scopes:
+        tables.set_scoped(
+            account_id,
+            region,
+            table_name,
+            {
+                "TableName": table_name,
+                "TableArn": f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "pk_name": "pk",
+                "sk_name": None,
+                "TableStatus": "ACTIVE",
+                # Plain dicts - returned directly from JSON decoder
+                "items": {"existing": {"__no_sort__": {"pk": {"S": "existing"}}}},
+            },
+        )
+
+    def _call(action, payload):
+        headers = {
+            "x-amz-target": f"DynamoDB_20120810.{action}",
+            "content-type": "application/x-amz-json-1.0",
+        }
+        status, _, body = asyncio.run(
+            ddb_service.handle_request("POST", "/", headers, json.dumps(payload).encode(), {})
+        )
+        return status, json.loads(body)
+
+    try:
+        ddb_service.load_persisted_state({"tables": tables})
+
+        for account_id, region in scopes:
+            items = ddb_service._tables.get_scoped(account_id, region, table_name)["items"]
+            assert isinstance(items, defaultdict), (account_id, region)
+
+            with request_scope(account_id, region):
+                status, body = _call("UpdateItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "new-after-restart"}},
+                    "UpdateExpression": "SET attr = :v",
+                    "ExpressionAttributeValues": {":v": {"S": "value"}},
+                    "ReturnValues": "ALL_NEW",
+                })
+                assert status == 200, (account_id, region, body)
+                assert body["Attributes"]["attr"] == {"S": "value"}
+
+                status, body = _call("PutItem", {
+                    "TableName": table_name,
+                    "Item": {"pk": {"S": "another-after-restart"}},
+                })
+                assert status == 200, (account_id, region, body)
+
+                status, body = _call("GetItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "existing"}},
+                })
+                assert status == 200
+                assert body["Item"] == {"pk": {"S": "existing"}}
+    finally:
+        ddb_service.reset()
