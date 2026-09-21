@@ -3639,6 +3639,10 @@ def _admin_initiate_auth(data):
             return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
@@ -3936,6 +3940,10 @@ def _initiate_auth(data):
             return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused

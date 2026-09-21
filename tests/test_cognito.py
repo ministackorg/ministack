@@ -337,6 +337,26 @@ def test_cognito_initiate_auth_user_password(cognito_idp):
     assert "IdToken" in result
     assert "RefreshToken" in result
 
+@pytest.mark.parametrize("admin", [False, True], ids=["user-password-auth", "admin-user-password-auth"])
+@pytest.mark.parametrize("password", ["GinaPass1!", "Wrong1!"], ids=["right-password", "wrong-password"])
+def test_cognito_password_auth_unconfirmed_user_is_refused(cognito_idp, admin, password):
+    """An unconfirmed user is refused before the password is checked."""
+    pid = cognito_idp.create_user_pool(PoolName="UnconfirmedPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="UnconfirmedApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.sign_up(ClientId=cid, Username="gina", Password="GinaPass1!")
+    params = {"USERNAME": "gina", "PASSWORD": password}
+    with pytest.raises(ClientError) as exc:
+        if admin:
+            cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                                            AuthParameters=params)
+        else:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)
+    assert exc.value.response["Error"]["Code"] == "UserNotConfirmedException"
+    assert exc.value.response["Error"]["Message"] == "User is not confirmed."
+
 def test_cognito_signup_and_confirm(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="SignupPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="SignupApp")["UserPoolClient"]["ClientId"]
@@ -8543,6 +8563,47 @@ def test_cognito_srp_bad_proof_is_refused(cognito_idp, password, overrides, code
         _srp_sign_in(cognito_idp, pid, cid, "srp-user", password, overrides=overrides)
     assert exc.value.response["Error"]["Code"] == code
     assert exc.value.response["Error"]["Message"] == message
+
+
+def test_cognito_srp_salt_never_starts_with_a_zero_byte():
+    """The JavaScript SDK pads the salt as an integer, pycognito as a string; a
+    leading zero byte is the one case where they disagree, so no salt has one."""
+    from ministack.services import cognito as cognito_module
+
+    seeds = [str(n) for n in range(4000)]
+    salts = [cognito_module._srp_salt(seed) for seed in seeds]
+    assert all(len(salt) == 32 and not salt.startswith("00") for salt in salts)
+    # The loop re-hashes at least once for some seed in this range, so it is exercised.
+    plain = [hashlib.sha256(f"cognito-srp-salt:{seed}".encode()).digest()[:16].hex() for seed in seeds]
+    assert any(p.startswith("00") for p in plain)
+    assert len(set(salts)) == len(salts)
+
+
+def test_cognito_srp_proof_refuses_a_non_hex_srp_a():
+    """CUSTOM_AUTH stores SRP_A as sent; the proof check answers False instead of raising."""
+    from ministack.services import cognito as cognito_module
+
+    state = {"srp_a": "zzz-not-hex", "srp_b": "2", "b": "1", "salt": "00", "secret_block": "YQ=="}
+    assert cognito_module._srp_proof_valid("eu-central-1_pool", {"Username": "u"}, state,
+                                           {"PASSWORD_CLAIM_SECRET_BLOCK": "YQ==", "TIMESTAMP": "x",
+                                            "PASSWORD_CLAIM_SIGNATURE": "YQ=="}) is False
+
+
+@pytest.mark.parametrize("flow", ["USER_SRP_AUTH", "USER_PASSWORD_AUTH", "ADMIN_USER_PASSWORD_AUTH"])
+def test_cognito_disabled_unconfirmed_user_is_refused_as_disabled(cognito_idp, flow):
+    """A user that is both UNCONFIRMED and disabled is refused as disabled in every flow (measured)."""
+    pid, cid = _srp_pool(cognito_idp, ["ALLOW_USER_SRP_AUTH", "ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH"])
+    cognito_idp.sign_up(ClientId=cid, Username="srp-both", Password="Correct1!")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="srp-both")
+    params = {"USERNAME": "srp-both"}
+    params.update({"SRP_A": format(_srp_a()[1], "x")} if flow == "USER_SRP_AUTH" else {"PASSWORD": "Correct1!"})
+    with pytest.raises(ClientError) as exc:
+        if flow == "ADMIN_USER_PASSWORD_AUTH":
+            cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow=flow, AuthParameters=params)
+        else:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow=flow, AuthParameters=params)
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert exc.value.response["Error"]["Message"] == "User is disabled."
 
 
 def test_cognito_srp_empty_challenge_responses(cognito_idp):

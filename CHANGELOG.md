@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Cognito — `USER_SRP_AUTH` checks the password** — `PASSWORD_VERIFIER` answered random `SALT` and `SRP_B` values and accepted any response, so a wrong password, a missing `TIMESTAMP` or a disabled or unconfirmed user all got tokens. The challenge now carries SRP-6a parameters with a stable salt per user, and the response is refused with `NotAuthorizedException` unless its signature proves the stored password. `TIMESTAMP` must read `EEE MMM d HH:mm:ss z yyyy` with `UTC` or `GMT` as the zone, the signature is computed over its canonical form, `PASSWORD_CLAIM_SIGNATURE` must be base64, and a temporary password leads to `NEW_PASSWORD_REQUIRED`. A client without `ALLOW_USER_SRP_AUTH`, an unknown user under `LEGACY`, a disabled and an unconfirmed user are refused at `InitiateAuth`. The built-in `PASSWORD_VERIFIER` step of `CUSTOM_WITH_SRP` gets the same check. Contributed by @iot-rocket.
+- **Cognito — an unconfirmed user cannot sign in with a password** — `USER_PASSWORD_AUTH` and `ADMIN_USER_PASSWORD_AUTH` issued tokens to a user who never confirmed the sign-up. Both now answer `UserNotConfirmedException` before the password is checked, as AWS does. Contributed by @iot-rocket.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 
