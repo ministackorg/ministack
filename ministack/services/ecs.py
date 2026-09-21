@@ -1398,6 +1398,103 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
+def _awslogs_config(cdef, task_id):
+    log_config = cdef.get("logConfiguration") or cdef.get("LogConfiguration") or {}
+    log_driver = log_config.get("logDriver") or log_config.get("LogDriver")
+    if log_driver != "awslogs":
+        return None
+
+    options = log_config.get("options") or log_config.get("Options") or {}
+    group_name = options.get("awslogs-group")
+    if not group_name:
+        return None
+
+    container_name = cdef.get("name", "container")
+    stream_prefix = options.get("awslogs-stream-prefix")
+    if stream_prefix:
+        stream_name = f"{stream_prefix}/{container_name}/{task_id}"
+    else:
+        stream_name = f"{container_name}/{task_id}"
+
+    return {
+        "group": group_name,
+        "stream": stream_name,
+        "create_group": str(options.get("awslogs-create-group", "")).lower() == "true",
+    }
+
+
+def _ensure_awslogs_stream(config):
+    from ministack.services import cloudwatch_logs as _cwl
+
+    group_name = config["group"]
+    stream_name = config["stream"]
+
+    if group_name not in _cwl._log_groups:
+        if not config["create_group"]:
+            logger.warning(
+                "ECS: awslogs group %s does not exist; container output is not forwarded",
+                group_name,
+            )
+            return False
+        status, _, _ = _cwl._create_log_group({"logGroupName": group_name})
+        if status >= 400 and group_name not in _cwl._log_groups:
+            return False
+
+    if stream_name not in _cwl._log_groups[group_name]["streams"]:
+        status, _, _ = _cwl._create_log_stream({
+            "logGroupName": group_name,
+            "logStreamName": stream_name,
+        })
+        if status >= 400 and stream_name not in _cwl._log_groups[group_name]["streams"]:
+            return False
+
+    return True
+
+
+def _emit_awslogs_event(config, message):
+    from ministack.services import cloudwatch_logs as _cwl
+
+    _cwl._put_log_events({
+        "logGroupName": config["group"],
+        "logStreamName": config["stream"],
+        "logEvents": [{
+            "timestamp": int(time.time() * 1000),
+            "message": message,
+        }],
+    })
+
+
+def _forward_awslogs(container, config, account_id, region):
+    with request_scope(account_id, region):
+        if not _ensure_awslogs_stream(config):
+            return
+        try:
+            for chunk in container.logs(
+                    stream=True, follow=True, stdout=True, stderr=True):
+                if not chunk:
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                for line in text.splitlines():
+                    _emit_awslogs_event(config, line)
+        except Exception as exc:
+            logger.debug("ECS: awslogs forwarding stopped: %s", exc)
+
+
+def _start_awslogs_forwarder(container, cdef, task_id):
+    config = _awslogs_config(cdef, task_id)
+    if not config:
+        return
+    account_id = get_account_id()
+    region = get_region()
+    thread = threading.Thread(
+        target=_forward_awslogs,
+        args=(container, config, account_id, region),
+        daemon=True,
+        name=f"ministack-ecs-awslogs-{task_id[:8]}-{cdef.get('name', 'container')}",
+    )
+    thread.start()
+
+
 class _SecretResolutionError(Exception):
     """A container secret's ``valueFrom`` could not be resolved.
 
@@ -1811,6 +1908,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
                 task, container, i, metadata_token, ecs_network):
             _cleanup_task_resources(task, docker_client, container)
             return
+        _start_awslogs_forwarder(container, effective_cdef, task_id)
 
     if not _mark_task_running(task_arn, task):
         _cleanup_task_resources(task, docker_client)

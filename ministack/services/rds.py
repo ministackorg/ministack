@@ -1093,7 +1093,9 @@ def _pg_server_material(names, ips) -> tuple[str, str]:
     ca_cert, ca_key = _ensure_pg_ca()
     cert_pem, key_pem, _public = sign_leaf_certificate(
         ca_cert, ca_key,
-        common_name=(names[0] if names else "localhost"),
+        # X.509 limits CN to 64 bytes; valid RDS DNS endpoints can be longer.
+        # Connection identities belong in SANs, preserved in full below.
+        common_name="Ministack RDS Server",
         san_dns=names, san_ips=ips,
     )
     return cert_pem, key_pem
