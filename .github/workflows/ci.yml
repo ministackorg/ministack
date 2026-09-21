@@ -128,6 +128,7 @@ jobs:
       LAMBDA_EXECUTOR: docker
       OPENSEARCH_DATAPLANE: "1"
       DSQL_STRICT: "1"
+      MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
     services:
       redis:
         image: redis:7-alpine

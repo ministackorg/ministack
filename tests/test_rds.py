@@ -5,6 +5,7 @@ import ipaddress
 import io
 import json
 import os
+import socket
 import ssl
 import sys
 import threading
@@ -8020,12 +8021,40 @@ def _wait_for_instance(rds, db_id, timeout=120):
     raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
 
 
+def _host_dialable(endpoint):
+    """Map an advertised endpoint onto an address this process can reach.
+
+    A cluster endpoint is a Docker network alias resolvable only by containers
+    on that network; pytest runs on the host, so dial the published port of the
+    container carrying the alias.
+    """
+    address, port = endpoint["Address"], int(endpoint["Port"])
+    try:
+        socket.getaddrinfo(address, port)
+        return address, port
+    except socket.gaierror:
+        pass
+    import docker
+
+    for container in docker.from_env().containers.list(
+        filters={"label": "ministack=rds"},
+    ):
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if not any(address in (n.get("Aliases") or []) for n in networks.values()):
+            continue
+        published = container.attrs["NetworkSettings"]["Ports"].get(f"{port}/tcp") or []
+        if published:
+            return "127.0.0.1", int(published[0]["HostPort"])
+    raise AssertionError(f"no container publishes {address}:{port}")
+
+
 def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
     import pymysql
 
+    host, port = _host_dialable(endpoint)
     return pymysql.connect(
-        host=endpoint["Address"],
-        port=int(endpoint["Port"]),
+        host=host,
+        port=port,
         user=user,
         password=password,
         database=database,
@@ -14869,6 +14898,7 @@ def test_aurora_pg_replicating_reader_live(rds):
         assert excinfo.value.pgcode == "25006"
 
 
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not _PG_REPLICATION_LIVE,
     reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
@@ -15829,9 +15859,10 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
 
         def connect(sslmode):
             host = endpoint["Address"]
+            dial_host, dial_port = _host_dialable(endpoint)
             connect_kwargs = {
                 "host": host,
-                "port": endpoint["Port"],
+                "port": dial_port,
                 "user": "admin",
                 "password": "password",
                 "dbname": "appdb",
@@ -15842,9 +15873,7 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
             try:
                 ipaddress.ip_address(host)
             except ValueError:
-                # A cluster endpoint resolves only inside the Docker network, so
-                # dial loopback while verify-full still matches the advertised name.
-                connect_kwargs["hostaddr"] = "127.0.0.1"
+                connect_kwargs["hostaddr"] = dial_host
             else:
                 connect_kwargs["hostaddr"] = host
                 connect_kwargs["host"] = "localhost"
