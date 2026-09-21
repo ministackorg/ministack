@@ -14786,9 +14786,10 @@ _PG_REPLICATION_LIVE = (
 def _pg_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
     import psycopg2
 
+    host, port = _host_dialable(endpoint)
     return psycopg2.connect(
-        host=endpoint["Address"],
-        port=int(endpoint["Port"]),
+        host=host,
+        port=port,
         user=user,
         password=password,
         dbname=database,
@@ -15873,7 +15874,8 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
             try:
                 ipaddress.ip_address(host)
             except ValueError:
-                connect_kwargs["hostaddr"] = dial_host
+                if dial_host != host:
+                    connect_kwargs["hostaddr"] = dial_host
             else:
                 connect_kwargs["hostaddr"] = host
                 connect_kwargs["host"] = "localhost"
