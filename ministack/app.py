@@ -2490,6 +2490,14 @@ async def app(scope, receive, send):
     if scope["type"] != "http":
         return
 
+    # Credential-bearing broker requests bypass generic body decoding, routing
+    # and tenant inference. The capability, not a client claim, selects RDS.
+    if scope["path"] == "/_ministack/rds/iam-auth":
+        from ministack.core import rds_iam
+
+        await rds_iam.handle(scope, receive, send, auth_enabled=AUTH)
+        return
+
     method = scope["method"]
     path = scope["path"]
     query_string = scope.get("query_string", b"").decode("utf-8")

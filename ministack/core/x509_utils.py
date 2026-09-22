@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import logging
+import warnings
 
 logger = logging.getLogger("x509_utils")
 
@@ -117,6 +118,7 @@ def sign_leaf_certificate(
     san_ips: list[str] | None = None,
     days_valid: int = 825,
     key_type: str = "rsa2048",
+    subject_rdns: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str, str]:
     """Generate a fresh keypair and sign a leaf certificate with the given CA.
 
@@ -128,6 +130,8 @@ def sign_leaf_certificate(
         san_ips: Optional list of IPv4/IPv6 strings to include as SubjectAltName.
         days_valid: Validity period in days (default 825, AWS-style).
         key_type: ``"rsa2048"`` (default) or ``"ec256"``.
+        subject_rdns: extra subject attributes after the CN, as
+            ``[("OU", "RDS"), ("O", "Amazon.com"), ...]`` in wire order.
 
     Returns:
         Tuple ``(cert_pem, private_key_pem, public_key_pem)``.
@@ -146,9 +150,20 @@ def sign_leaf_certificate(
     else:
         raise ValueError(f"Unsupported key_type: {key_type!r}")
 
-    subject = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-    ])
+    _RDN_OIDS = {
+        "OU": NameOID.ORGANIZATIONAL_UNIT_NAME,
+        "O": NameOID.ORGANIZATION_NAME,
+        "L": NameOID.LOCALITY_NAME,
+        "ST": NameOID.STATE_OR_PROVINCE_NAME,
+        "C": NameOID.COUNTRY_NAME,
+    }
+    with warnings.catch_warnings():
+        # RDS ships the endpoint as CN, 105 bytes on a 63-char identifier.
+        warnings.simplefilter("ignore")
+        attributes = [x509.NameAttribute(NameOID.COMMON_NAME, common_name, _validate=False)]
+        for key, value in subject_rdns or []:
+            attributes.append(x509.NameAttribute(_RDN_OIDS[key], value))
+        subject = x509.Name(attributes)
     now = _dt.datetime.now(_dt.timezone.utc)
 
     builder = (

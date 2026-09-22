@@ -2159,8 +2159,8 @@ def _wrap_material(public_key_der, algorithm, material=_BYOK_MATERIAL):
 
 
 def _import_external_key(kms, algorithm="RSAES_OAEP_SHA_256", material=_BYOK_MATERIAL,
-                         expiration=_NO_EXPIRY, valid_to=None):
-    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+                         expiration=_NO_EXPIRY, valid_to=None, **create_kwargs):
+    key_id = kms.create_key(Origin="EXTERNAL", **create_kwargs)["KeyMetadata"]["KeyId"]
     params = kms.get_parameters_for_import(
         KeyId=key_id, WrappingAlgorithm=algorithm, WrappingKeySpec="RSA_2048")
     kwargs = {"ExpirationModel": expiration}
@@ -2298,15 +2298,126 @@ def test_kms_import_flow_refuses_a_non_external_key():
     assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
 
 
-def test_kms_external_origin_is_symmetric_only_and_specs_are_validated():
+def test_kms_external_origin_wrapping_key_specs_are_validated():
     pytest.importorskip("cryptography")
     kms = _regional_kms("us-east-1")
-    with pytest.raises(ClientError) as exc:
-        kms.create_key(Origin="EXTERNAL", KeySpec="RSA_2048")
-    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
     key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
     with pytest.raises(ClientError) as exc:
         kms.get_parameters_for_import(
             KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
             WrappingKeySpec="SM2")
     assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def _pkcs8_der(private_key):
+    """The private key alone, DER-encoded PKCS#8, which is the form AWS imports."""
+    from cryptography.hazmat.primitives import serialization
+    return private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def test_kms_external_hmac_key_imports_its_own_material():
+    """AWS supports imported key material for HMAC keys, and the imported bytes
+    are the ones the MAC is computed with."""
+    pytest.importorskip("cryptography")
+    import hashlib
+    import hmac
+    kms = _regional_kms("us-east-1")
+    material = bytes(range(32))
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSAES_OAEP_SHA_256", material=material,
+        KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Origin"] == "EXTERNAL"
+    mac = kms.generate_mac(KeyId=key_id, Message=b"hmac byok",
+                           MacAlgorithm="HMAC_SHA_256")["Mac"]
+    assert hmac.new(material, b"hmac byok", hashlib.sha256).digest() == mac
+
+
+@pytest.mark.parametrize("key_spec", [
+    "RSA_2048", "ECC_NIST_P256", "ECC_NIST_EDWARDS25519",
+])
+def test_kms_external_asymmetric_key_imports_its_own_private_key(key_spec):
+    """AWS imports the private key alone and derives the public key from it, so
+    GetPublicKey returns the pair of the material the caller supplied."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    kms = _regional_kms("us-east-1")
+    if key_spec == "RSA_2048":
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    elif key_spec == "ECC_NIST_P256":
+        private_key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    # A private key is far larger than RSAES_OAEP can wrap directly, so
+    # asymmetric material travels under the AES key-wrap algorithms.
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec=key_spec, KeyUsage="SIGN_VERIFY")
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+    assert kms.get_public_key(KeyId=key_id)["PublicKey"] == \
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_kms_imported_asymmetric_key_signs_with_the_imported_material():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    signature = kms.sign(KeyId=key_id, Message=b"sign byok",
+                         SigningAlgorithm="ECDSA_SHA_256")["Signature"]
+    assert kms.verify(KeyId=key_id, Message=b"sign byok", Signature=signature,
+                      SigningAlgorithm="ECDSA_SHA_256")["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("key_spec,key_usage,material", [
+    ("HMAC_256", "GENERATE_VERIFY_MAC", bytes(16)),
+    ("ECC_NIST_P256", "SIGN_VERIFY", b"not a der private key"),
+])
+def test_kms_import_rejects_material_that_does_not_fit_the_key_spec(
+        key_spec, key_usage, material):
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=material,
+            KeySpec=key_spec, KeyUsage=key_usage)
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_import_rejects_a_private_key_of_the_wrong_curve():
+    """The material must be the key the KeySpec declares, not merely parseable."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+            material=_pkcs8_der(ec.generate_private_key(ec.SECP384R1())),
+            KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_delete_imported_material_clears_the_asymmetric_key():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+        material=_pkcs8_der(ec.generate_private_key(ec.SECP256R1())),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    kms.delete_imported_key_material(KeyId=key_id)
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingImport"
+    with pytest.raises(ClientError) as exc:
+        kms.get_public_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"

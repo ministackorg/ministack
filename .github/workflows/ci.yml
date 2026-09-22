@@ -127,6 +127,8 @@ jobs:
       DOCKER_NETWORK: ministack-data-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard_index }}
       LAMBDA_EXECUTOR: docker
       OPENSEARCH_DATAPLANE: "1"
+      DSQL_STRICT: "1"
+      MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
     services:
       redis:
         image: redis:7-alpine
@@ -142,6 +144,8 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Pinned to a full version: setup-uv stopped publishing floating major
+      # tags after v7, so there is no `@v10` to track.
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true

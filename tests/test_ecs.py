@@ -152,6 +152,112 @@ def test_ecs_run_task_forwards_awslogs_to_cloudwatch_logs(ecs, logs):
     _wait_until(marker_reached_cloudwatch_logs, timeout=20)
 
 
+def _logs_client(region):
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT
+    return boto3.client("logs", endpoint_url=ENDPOINT, region_name=region,
+                        aws_access_key_id="test", aws_secret_access_key="test",
+                        config=Config(region_name=region, inject_host_prefix=False))
+
+
+@pytest.mark.data_plane
+def test_ecs_awslogs_without_stream_prefix_names_the_stream_after_the_container_id(ecs, logs):
+    """AWS: "If you don't specify a prefix with this option, then the log stream
+    is named after the container ID that's assigned by the Docker daemon"."""
+    cluster = f"awslogs-noprefix-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"{cluster}-td"
+    group = f"/ecs/{cluster}"
+    marker = f"ECS-NOPREFIX-{_uuid_mod.uuid4().hex[:8]}"
+
+    logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family,
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", f"echo {marker}"],
+            "essential": True,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {"awslogs-group": group, "awslogs-region": "us-east-1"},
+            },
+        }],
+    )
+
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+
+    def runtime_id():
+        containers = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])["tasks"][0]["containers"]
+        return containers[0].get("runtimeId")
+
+    _wait_until(runtime_id, timeout=30)
+    short_id = runtime_id()
+
+    def stream_named_after_the_container():
+        streams = logs.describe_log_streams(logGroupName=group)["logStreams"]
+        names = {s["logStreamName"] for s in streams}
+        if not names:
+            return False
+        assert not any("/" in n for n in names), f"expected a bare container id, got {names}"
+        assert names == {n for n in names if n.startswith(short_id)}, names
+        stream = next(iter(names))
+        assert len(stream) == 64, f"expected the full docker container id, got {stream}"
+        events = logs.get_log_events(logGroupName=group, logStreamName=stream)["events"]
+        return any(marker in e["message"] for e in events)
+
+    _wait_until(stream_named_after_the_container, timeout=30)
+
+
+@pytest.mark.data_plane
+def test_ecs_awslogs_region_option_decides_where_the_logs_land(ecs, logs):
+    """awslogs-region is where the driver ships the logs, not where the task ran."""
+    target_region = _different_region("us-east-1")
+    remote_logs = _logs_client(target_region)
+    cluster = f"awslogs-region-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"{cluster}-td"
+    group = f"/ecs/{cluster}"
+    marker = f"ECS-REGION-{_uuid_mod.uuid4().hex[:8]}"
+
+    remote_logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family,
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", f"echo {marker}"],
+            "essential": True,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": group,
+                    "awslogs-region": target_region,
+                    "awslogs-stream-prefix": "ecs",
+                },
+            },
+        }],
+    )
+
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+    stream = f"ecs/app/{task_arn.rsplit('/', 1)[-1]}"
+
+    def marker_in_target_region():
+        streams = remote_logs.describe_log_streams(
+            logGroupName=group, logStreamNamePrefix=stream)["logStreams"]
+        if not streams:
+            return False
+        events = remote_logs.get_log_events(logGroupName=group, logStreamName=stream)["events"]
+        return any(marker in e["message"] for e in events)
+
+    _wait_until(marker_in_target_region, timeout=30)
+
+    with pytest.raises(ClientError) as exc:
+        logs.describe_log_streams(logGroupName=group)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 @pytest.mark.data_plane
 def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     """ListTasks must also reconcile lifecycle when a container has exited
