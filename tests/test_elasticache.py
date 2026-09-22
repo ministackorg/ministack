@@ -1388,6 +1388,7 @@ def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_serverless_cache_not_implemented(ec):
     """Serverless cache operations are not yet implemented; verify graceful error."""
     with pytest.raises(ClientError):
@@ -1419,6 +1420,7 @@ def _make_zip_js(code: str) -> bytes:
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_lambda_network_connectivity(ec, lam):
     """Prove that Lambda containers can TCP-connect to an ElastiCache container."""
     cluster_id = "net-test-redis"
