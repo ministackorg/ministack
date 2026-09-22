@@ -888,10 +888,73 @@ def _refresh_service_state(cluster_name, group):
             pending += 1
     svc["runningCount"] = running
     svc["pendingCount"] = pending
-    if svc.get("deployments"):
-        svc["deployments"][0]["runningCount"] = running
-        svc["deployments"][0]["pendingCount"] = pending
+    _refresh_service_deployments(cluster_name, svc)
     _sync_service_targets(cluster_name, svc)
+
+
+def _refresh_service_deployments(cluster_name, svc):
+    """Reconcile per-deployment counts and retire a completed old deployment."""
+    deployments = svc.get("deployments") or []
+    if not deployments:
+        return
+
+    cluster_arn = svc.get("clusterArn", "")
+    group = f"service:{svc.get('serviceName', '')}"
+    service_tasks = [
+        task for task in _tasks.values()
+        if task.get("group") == group
+        and task.get("clusterArn") == cluster_arn
+    ]
+    for deployment in deployments:
+        td_arn = deployment.get("taskDefinition")
+        matching = [task for task in service_tasks
+                    if task.get("taskDefinitionArn") == td_arn]
+        deployment["runningCount"] = sum(
+            task.get("lastStatus") == "RUNNING" for task in matching
+        )
+        deployment["pendingCount"] = sum(
+            task.get("lastStatus") == "PENDING" for task in matching
+        )
+
+    primary = deployments[0]
+    primary_desired = primary.get("desiredCount", svc.get("desiredCount", 0))
+    healthy = primary.get("runningCount", 0) >= primary_desired
+    if len(deployments) > 1 and not healthy:
+        primary["rolloutState"] = "IN_PROGRESS"
+        primary["rolloutStateReason"] = ""
+        return
+    if not healthy:
+        return
+
+    primary["rolloutState"] = "COMPLETED"
+    primary["rolloutStateReason"] = "ECS deployment completed."
+    primary_td = primary.get("taskDefinition")
+    for deployment in deployments[1:]:
+        deployment["desiredCount"] = 0
+    stale = [
+        task for task in service_tasks
+        if task.get("taskDefinitionArn") != primary_td
+        and task.get("lastStatus") in _PRE_STOP_STATUSES
+    ]
+    for task in stale:
+        _stop_task({
+            "task": task["taskArn"],
+            "cluster": cluster_name,
+            "reason": "ECS deployment completed",
+        })
+
+    # _stop_task refreshes this service recursively, so only live tasks can
+    # keep an old deployment in the response.
+    for deployment in list(deployments[1:]):
+        td_arn = deployment.get("taskDefinition")
+        if not any(
+            task.get("taskDefinitionArn") == td_arn
+            and task.get("group") == group
+            and task.get("clusterArn") == cluster_arn
+            and task.get("lastStatus") in _PRE_STOP_STATUSES
+            for task in _tasks.values()
+        ):
+            deployments.remove(deployment)
 
 
 def _reconcile_service_tasks(cluster_name, svc_key):
@@ -926,11 +989,6 @@ def _reconcile_service_tasks(cluster_name, svc_key):
             else:
                 stale_tasks.append((arn, t))
 
-    # Stop tasks running on a stale task definition
-    for task_arn, _ in stale_tasks:
-        _stop_task({"task": task_arn, "cluster": cluster_name,
-                     "reason": "Task definition updated"})
-
     # Scale up: spawn tasks to reach desiredCount
     to_spawn = desired - len(current_tasks)
     if to_spawn > 0:
@@ -939,6 +997,19 @@ def _reconcile_service_tasks(cluster_name, svc_key):
             if svc["deployments"]:
                 svc["deployments"][0]["runningCount"] = desired
             return
+        deployment_config = svc.get("deploymentConfiguration") or {}
+        maximum_percent = int(deployment_config.get("maximumPercent", 200))
+        max_running = max(1, desired * maximum_percent // 100)
+        capacity = max_running - len(current_tasks) - len(stale_tasks)
+        if capacity < to_spawn:
+            # A maximumPercent of 100 requires old tasks to drain before
+            # replacement tasks can be started.
+            for task_arn, _ in stale_tasks[:to_spawn - max(0, capacity)]:
+                _stop_task({
+                    "task": task_arn,
+                    "cluster": cluster_name,
+                    "reason": "Deployment capacity limit",
+                })
         _run_task({
             "cluster": cluster_name,
             "taskDefinition": td_arn,
@@ -1012,6 +1083,8 @@ def _create_service(data):
         "healthCheckGracePeriodSeconds": data.get("healthCheckGracePeriodSeconds", 0),
         "schedulingStrategy": data.get("schedulingStrategy", "REPLICA"),
         "deploymentController": data.get("deploymentController", {"type": "ECS"}),
+        # deploymentCircuitBreaker and alarms are accepted for API
+        # compatibility but are not evaluated by the emulator.
         "deploymentConfiguration": data.get("deploymentConfiguration", {
             "maximumPercent": 200,
             "minimumHealthyPercent": 100,
@@ -1398,27 +1471,27 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
-def _awslogs_config(cdef, task_id):
-    log_config = cdef.get("logConfiguration") or cdef.get("LogConfiguration") or {}
-    log_driver = log_config.get("logDriver") or log_config.get("LogDriver")
-    if log_driver != "awslogs":
+def _awslogs_config(cdef, task_id, container_id):
+    log_config = cdef.get("logConfiguration") or {}
+    if log_config.get("logDriver") != "awslogs":
         return None
 
-    options = log_config.get("options") or log_config.get("Options") or {}
+    options = log_config.get("options") or {}
     group_name = options.get("awslogs-group")
     if not group_name:
         return None
 
-    container_name = cdef.get("name", "container")
     stream_prefix = options.get("awslogs-stream-prefix")
     if stream_prefix:
-        stream_name = f"{stream_prefix}/{container_name}/{task_id}"
+        stream_name = f"{stream_prefix}/{cdef.get('name', 'container')}/{task_id}"
     else:
-        stream_name = f"{container_name}/{task_id}"
+        # Without a prefix AWS names the stream after the Docker container id.
+        stream_name = container_id
 
     return {
         "group": group_name,
         "stream": stream_name,
+        "region": options.get("awslogs-region"),
         "create_group": str(options.get("awslogs-create-group", "")).lower() == "true",
     }
 
@@ -1481,11 +1554,12 @@ def _forward_awslogs(container, config, account_id, region):
 
 
 def _start_awslogs_forwarder(container, cdef, task_id):
-    config = _awslogs_config(cdef, task_id)
+    config = _awslogs_config(cdef, task_id, container.id)
     if not config:
         return
     account_id = get_account_id()
-    region = get_region()
+    # awslogs-region is where the driver ships the logs, not where the task ran.
+    region = config["region"] or get_region()
     thread = threading.Thread(
         target=_forward_awslogs,
         args=(container, config, account_id, region),

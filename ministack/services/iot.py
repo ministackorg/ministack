@@ -7605,7 +7605,8 @@ def _mtls_server_cert_sans() -> tuple[list[str], list[str]]:
     import ipaddress
     import socket as _socket
 
-    dns_names = ["localhost"]
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    dns_names = [f"*.iot.{region}.{_MINISTACK_HOST}", "localhost"]
     ip_addresses = ["127.0.0.1", "::1"]
     candidates = [os.environ.get("MINISTACK_HOST", "localhost"), _socket.gethostname()]
     for candidate in candidates:
@@ -7662,7 +7663,7 @@ def _mtls_ensure_server_cert() -> tuple[str, str]:
     cert_pem, key_pem, _public_pem = sign_leaf_certificate(
         ca_cert_pem,
         ca_key_pem,
-        common_name="Ministack IoT Broker",
+        common_name=dns_names[0],
         san_dns=dns_names,
         san_ips=ip_addresses,
     )

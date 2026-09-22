@@ -152,6 +152,112 @@ def test_ecs_run_task_forwards_awslogs_to_cloudwatch_logs(ecs, logs):
     _wait_until(marker_reached_cloudwatch_logs, timeout=20)
 
 
+def _logs_client(region):
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT
+    return boto3.client("logs", endpoint_url=ENDPOINT, region_name=region,
+                        aws_access_key_id="test", aws_secret_access_key="test",
+                        config=Config(region_name=region, inject_host_prefix=False))
+
+
+@pytest.mark.data_plane
+def test_ecs_awslogs_without_stream_prefix_names_the_stream_after_the_container_id(ecs, logs):
+    """AWS: "If you don't specify a prefix with this option, then the log stream
+    is named after the container ID that's assigned by the Docker daemon"."""
+    cluster = f"awslogs-noprefix-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"{cluster}-td"
+    group = f"/ecs/{cluster}"
+    marker = f"ECS-NOPREFIX-{_uuid_mod.uuid4().hex[:8]}"
+
+    logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family,
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", f"echo {marker}"],
+            "essential": True,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {"awslogs-group": group, "awslogs-region": "us-east-1"},
+            },
+        }],
+    )
+
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+
+    def runtime_id():
+        containers = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])["tasks"][0]["containers"]
+        return containers[0].get("runtimeId")
+
+    _wait_until(runtime_id, timeout=30)
+    short_id = runtime_id()
+
+    def stream_named_after_the_container():
+        streams = logs.describe_log_streams(logGroupName=group)["logStreams"]
+        names = {s["logStreamName"] for s in streams}
+        if not names:
+            return False
+        assert not any("/" in n for n in names), f"expected a bare container id, got {names}"
+        assert names == {n for n in names if n.startswith(short_id)}, names
+        stream = next(iter(names))
+        assert len(stream) == 64, f"expected the full docker container id, got {stream}"
+        events = logs.get_log_events(logGroupName=group, logStreamName=stream)["events"]
+        return any(marker in e["message"] for e in events)
+
+    _wait_until(stream_named_after_the_container, timeout=30)
+
+
+@pytest.mark.data_plane
+def test_ecs_awslogs_region_option_decides_where_the_logs_land(ecs, logs):
+    """awslogs-region is where the driver ships the logs, not where the task ran."""
+    target_region = _different_region("us-east-1")
+    remote_logs = _logs_client(target_region)
+    cluster = f"awslogs-region-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"{cluster}-td"
+    group = f"/ecs/{cluster}"
+    marker = f"ECS-REGION-{_uuid_mod.uuid4().hex[:8]}"
+
+    remote_logs.create_log_group(logGroupName=group)
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=family,
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", f"echo {marker}"],
+            "essential": True,
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": group,
+                    "awslogs-region": target_region,
+                    "awslogs-stream-prefix": "ecs",
+                },
+            },
+        }],
+    )
+
+    task_arn = ecs.run_task(cluster=cluster, taskDefinition=family)["tasks"][0]["taskArn"]
+    stream = f"ecs/app/{task_arn.rsplit('/', 1)[-1]}"
+
+    def marker_in_target_region():
+        streams = remote_logs.describe_log_streams(
+            logGroupName=group, logStreamNamePrefix=stream)["logStreams"]
+        if not streams:
+            return False
+        events = remote_logs.get_log_events(logGroupName=group, logStreamName=stream)["events"]
+        return any(marker in e["message"] for e in events)
+
+    _wait_until(marker_in_target_region, timeout=30)
+
+    with pytest.raises(ClientError) as exc:
+        logs.describe_log_streams(logGroupName=group)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 @pytest.mark.data_plane
 def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     """ListTasks must also reconcile lifecycle when a container has exited
@@ -1091,10 +1197,10 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
         containerDefinitions=[{"name": "app", "image": "nginx:latest", "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
-        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=2,
+        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=1,
     )
     old_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(old_tasks["taskArns"]) == 2
+    assert len(old_tasks["taskArns"]) == 1
 
     # Register new revision and update service
     resp2 = ecs.register_task_definition(
@@ -1104,9 +1210,23 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
     ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")
 
+    # ECS keeps both deployments while the replacement becomes healthy, then
+    # drains the old deployment and collapses the service to the new one.
+    _wait_until(
+        lambda: (
+            len(ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"]) == 1
+            and ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"][0]["rolloutState"] == "COMPLETED"
+        ),
+        timeout=30,
+    )
+
     # New tasks should be on the new TD
     new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(new_tasks["taskArns"]) == 2
+    assert len(new_tasks["taskArns"]) == 1
 
     # Verify all running tasks use the new task definition
     _wait_until(
@@ -1133,11 +1253,16 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     _wait_until(
         lambda: ecs.describe_services(
             cluster=cluster, services=["tdu-svc"]
-        )["services"][0]["runningCount"] == 2,
+        )["services"][0]["runningCount"] == 1,
         timeout=30,
     )
     svc = ecs.describe_services(cluster=cluster, services=["tdu-svc"])
-    assert svc["services"][0]["runningCount"] == 2
+    service = svc["services"][0]
+    assert service["runningCount"] == 1
+    assert len(service["deployments"]) == 1
+    assert service["deployments"][0]["taskDefinition"] == new_td_arn
+    assert service["deployments"][0]["status"] == "PRIMARY"
+    assert service["deployments"][0]["rolloutState"] == "COMPLETED"
 
 
 def test_ecs_service_delete_stops_tasks(ecs):

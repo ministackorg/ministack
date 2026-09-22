@@ -1081,7 +1081,11 @@ def _ensure_pg_ca() -> tuple[str, str]:
         if _pg_ca is None:
             from ministack.core.x509_utils import generate_ca
 
-            _pg_ca = generate_ca(common_name="Ministack RDS Root CA")
+            region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            _pg_ca = generate_ca(
+                org_name="Amazon Web Services, Inc.",
+                common_name=f"Amazon RDS {region} Root CA RSA2048 G1",
+            )
             logger.info("RDS: generated the server-certificate CA")
         return _pg_ca
 
@@ -1093,10 +1097,10 @@ def _pg_server_material(names, ips) -> tuple[str, str]:
     ca_cert, ca_key = _ensure_pg_ca()
     cert_pem, key_pem, _public = sign_leaf_certificate(
         ca_cert, ca_key,
-        # X.509 limits CN to 64 bytes; valid RDS DNS endpoints can be longer.
-        # Connection identities belong in SANs, preserved in full below.
-        common_name="Ministack RDS Server",
+        common_name=(names[0] if names else "localhost"),
         san_dns=names, san_ips=ips,
+        subject_rdns=[("OU", "RDS"), ("O", "Amazon.com"), ("L", "Seattle"),
+                      ("ST", "Washington"), ("C", "US")],
     )
     return cert_pem, key_pem
 
@@ -11095,9 +11099,9 @@ _ACTION_MAP = {
 
 
 def reset():
-    from ministack.core import rds_iam_broker
+    from ministack.core import rds_iam
 
-    rds_iam_broker.reset()
+    rds_iam.reset()
     # Serialize teardown with warm-boot shared-container startup. Otherwise a
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
