@@ -7098,7 +7098,9 @@ def _ecs_service_update(physical_id, old_props, new_props, stack_name):
     # properties are replacement-only and are intentionally left to their
     # existing semantics; these are the fields UpdateService can apply in
     # place and that MiniStack currently models.
-    _ecs._update_service(request)
+    response = _ecs._update_service(request)
+    if response[0] >= 400:
+        raise ValueError(f"AWS::ECS::Service update failed: {response[2]!r}")
     return physical_id, {"ServiceArn": physical_id, "Name": name}
 
 
