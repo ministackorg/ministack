@@ -1197,10 +1197,10 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
         containerDefinitions=[{"name": "app", "image": "nginx:latest", "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
-        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=2,
+        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=1,
     )
     old_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(old_tasks["taskArns"]) == 2
+    assert len(old_tasks["taskArns"]) == 1
 
     # Register new revision and update service
     resp2 = ecs.register_task_definition(
@@ -1210,9 +1210,23 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
     ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")
 
+    # ECS keeps both deployments while the replacement becomes healthy, then
+    # drains the old deployment and collapses the service to the new one.
+    _wait_until(
+        lambda: (
+            len(ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"]) == 1
+            and ecs.describe_services(
+                cluster=cluster, services=["tdu-svc"]
+            )["services"][0]["deployments"][0]["rolloutState"] == "COMPLETED"
+        ),
+        timeout=30,
+    )
+
     # New tasks should be on the new TD
     new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(new_tasks["taskArns"]) == 2
+    assert len(new_tasks["taskArns"]) == 1
 
     # Verify all running tasks use the new task definition
     _wait_until(
@@ -1239,11 +1253,16 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     _wait_until(
         lambda: ecs.describe_services(
             cluster=cluster, services=["tdu-svc"]
-        )["services"][0]["runningCount"] == 2,
+        )["services"][0]["runningCount"] == 1,
         timeout=30,
     )
     svc = ecs.describe_services(cluster=cluster, services=["tdu-svc"])
-    assert svc["services"][0]["runningCount"] == 2
+    service = svc["services"][0]
+    assert service["runningCount"] == 1
+    assert len(service["deployments"]) == 1
+    assert service["deployments"][0]["taskDefinition"] == new_td_arn
+    assert service["deployments"][0]["status"] == "PRIMARY"
+    assert service["deployments"][0]["rolloutState"] == "COMPLETED"
 
 
 def test_ecs_service_delete_stops_tasks(ecs):

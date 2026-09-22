@@ -3594,6 +3594,7 @@ def _allocate_address(p):
         "NetworkInterfaceId": None,
         "PrivateIpAddress": None,
     }
+    _parse_tag_specs(p, "elastic-ip", allocation_id)
     return _xml(200, "AllocateAddressResponse", f"""
         <publicIp>{public_ip}</publicIp>
         <domain>{domain}</domain>
@@ -3647,6 +3648,7 @@ def _describe_addresses(p):
             <publicIp>{addr['PublicIp']}</publicIp>
             <domain>{addr['Domain']}</domain>
             {assoc}{inst}
+            {_tag_set_xml(addr['AllocationId'])}
         </item>"""
     return _xml(200, "DescribeAddressesResponse", f"<addressesSet>{items}</addressesSet>")
 
@@ -4875,6 +4877,20 @@ def _delete_nat_gateway(params):
 # Network ACLs
 # ---------------------------------------------------------------------------
 
+def _network_acl_entry_xml(entry):
+    cidr = (
+        f"<cidrBlock>{entry['CidrBlock']}</cidrBlock>"
+        if entry.get("CidrBlock")
+        else f"<ipv6CidrBlock>{entry['Ipv6CidrBlock']}</ipv6CidrBlock>"
+    )
+    return f"""<item>
+            <ruleNumber>{entry['RuleNumber']}</ruleNumber>
+            <protocol>{entry['Protocol']}</protocol>
+            <ruleAction>{entry['RuleAction']}</ruleAction>
+            <egress>{'true' if entry['Egress'] else 'false'}</egress>
+            {cidr}
+        </item>"""
+
 def _create_network_acl(params):
     vpc_id = _p(params, "VpcId")
     if not vpc_id:
@@ -4921,13 +4937,7 @@ def _describe_network_acls(params):
             want_default = filters["default"][0].lower() == "true"
             if acl.get("IsDefault", False) != want_default:
                 continue
-        entries = "".join(f"""<item>
-            <ruleNumber>{e['RuleNumber']}</ruleNumber>
-            <protocol>{e['Protocol']}</protocol>
-            <ruleAction>{e['RuleAction']}</ruleAction>
-            <egress>{'true' if e['Egress'] else 'false'}</egress>
-            <cidrBlock>{e.get('CidrBlock','0.0.0.0/0')}</cidrBlock>
-        </item>""" for e in acl["Entries"])
+        entries = "".join(_network_acl_entry_xml(e) for e in acl["Entries"])
         assocs = "".join(f"""<item>
             <networkAclAssociationId>{a['NetworkAclAssociationId']}</networkAclAssociationId>
             <networkAclId>{acl['NetworkAclId']}</networkAclId>
@@ -4963,8 +4973,15 @@ def _create_network_acl_entry(params):
         "Protocol": _p(params, "Protocol") or "-1",
         "RuleAction": _p(params, "RuleAction") or "allow",
         "Egress": _p(params, "Egress") == "true",
-        "CidrBlock": _p(params, "CidrBlock") or "0.0.0.0/0",
     }
+    cidr_block = _p(params, "CidrBlock")
+    ipv6_cidr_block = _p(params, "Ipv6CidrBlock")
+    if cidr_block:
+        entry["CidrBlock"] = cidr_block
+    elif ipv6_cidr_block:
+        entry["Ipv6CidrBlock"] = ipv6_cidr_block
+    else:
+        entry["CidrBlock"] = "0.0.0.0/0"
     _network_acls[acl_id]["Entries"].append(entry)
     return _xml(200, "CreateNetworkAclEntryResponse", "<return>true</return>")
 
@@ -4990,13 +5007,21 @@ def _replace_network_acl_entry(params):
     acl = _network_acls[acl_id]
     acl["Entries"] = [e for e in acl["Entries"]
                       if not (e["RuleNumber"] == rule_num and e["Egress"] == egress)]
-    acl["Entries"].append({
+    entry = {
         "RuleNumber": rule_num,
         "Protocol": _p(params, "Protocol") or "-1",
         "RuleAction": _p(params, "RuleAction") or "allow",
         "Egress": egress,
-        "CidrBlock": _p(params, "CidrBlock") or "0.0.0.0/0",
-    })
+    }
+    cidr_block = _p(params, "CidrBlock")
+    ipv6_cidr_block = _p(params, "Ipv6CidrBlock")
+    if cidr_block:
+        entry["CidrBlock"] = cidr_block
+    elif ipv6_cidr_block:
+        entry["Ipv6CidrBlock"] = ipv6_cidr_block
+    else:
+        entry["CidrBlock"] = "0.0.0.0/0"
+    acl["Entries"].append(entry)
     return _xml(200, "ReplaceNetworkAclEntryResponse", "<return>true</return>")
 
 
