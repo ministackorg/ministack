@@ -3571,6 +3571,208 @@ def test_s3_delete_bucket_removes_persisted_dir(tmp_path, monkeypatch):
         s3mod._buckets._data.pop(("000000000000", "issue824-delete"), None)
 
 
+# ---------------------------------------------------------------------------
+# Delete-marker persistence (S3_PERSIST)
+#
+# A delete marker has no body, so the data file left on disk belongs to the
+# version it hides. Persisting the marker to the key's .meta.json sidecar is
+# what stops a restart from reloading that file as a live object.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def s3_persist(tmp_path, monkeypatch):
+    """Point S3 at a throwaway DATA_DIR with persistence on, default account."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+
+    buckets_before = set(s3mod._buckets._data)
+    versions_before = set(s3mod._object_versions._data)
+    versioning_before = set(s3mod._bucket_versioning._data)
+    yield s3mod
+    for store, before in (
+        (s3mod._buckets._data, buckets_before),
+        (s3mod._object_versions._data, versions_before),
+        (s3mod._bucket_versioning._data, versioning_before),
+    ):
+        for key in set(store) - before:
+            store.pop(key, None)
+
+
+def _reload_bucket(s3mod, tmp_path, bucket, account="000000000000"):
+    """Drop one bucket from memory and reload it from disk (a restart)."""
+    s3mod._buckets._data.pop((account, bucket), None)
+    for vkey in [k for k in s3mod._object_versions._data
+                 if k[0] == account and k[1][0] == bucket]:
+        s3mod._object_versions._data.pop(vkey, None)
+    s3mod._load_persisted_bucket(
+        account, bucket, os.path.join(str(tmp_path), account, bucket))
+
+
+def test_s3_delete_marker_survives_restart(s3_persist, tmp_path):
+    """A versioned delete persists its marker; a restart keeps the key hidden
+    instead of reloading the object's still-present data file as current."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "gone.txt", b"payload", {})
+
+    status, del_headers, _ = s3mod._delete_object(bucket, "gone.txt")
+    assert status == 204
+    assert del_headers["x-amz-delete-marker"] == "true"
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "gone.txt.meta.json")
+    with open(meta_path) as mf:
+        meta = json.load(mf)
+    assert meta["is_delete_marker"] is True
+    assert meta["version_id"] == del_headers["x-amz-version-id"]
+    assert meta["previous"]["etag"]
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert "gone.txt" not in restored["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "gone.txt"))]
+    assert versions[-1]["is_delete_marker"] is True
+    assert versions[-1]["is_latest"] is True
+
+    # GetObject on the hidden key reports the miss as a delete marker.
+    status, get_headers, _ = s3mod._get_object(bucket, "gone.txt", {})
+    assert status == 404
+    assert get_headers.get("x-amz-delete-marker") == "true"
+
+
+def test_s3_delete_marker_restores_previous_version_metadata(s3_persist, tmp_path):
+    """The version a marker displaced is rebuilt below it from `previous`, so
+    ListObjectVersions does not lose it across a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-prev"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+
+    s3mod._delete_object(bucket, "k")
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [bool(v.get("is_delete_marker")) for v in versions] == [False, True]
+    assert versions[0]["version_id"] == version_id
+    assert versions[0]["etag"] == put_headers["ETag"]
+    assert versions[0]["is_latest"] is False
+    assert versions[1]["is_latest"] is True
+
+
+def test_s3_lone_delete_marker_sidecar_restores_without_data_file(s3_persist, tmp_path):
+    """A marker whose data file is gone (key never had a body, or the version
+    was purged) still survives as a lone .meta.json sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-lone"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+    s3mod._delete_object(bucket, "k")
+
+    os.remove(os.path.join(str(tmp_path), "000000000000", bucket, "k"))
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_purging_delete_marker_restores_object_after_restart(s3_persist, tmp_path):
+    """Deleting the marker by version id un-hides the object, and the sidecar
+    must be rewritten so a restart does not keep it hidden."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-undelete"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+    _, del_headers, _ = s3mod._delete_object(bucket, "k")
+    marker_id = del_headers["x-amz-version-id"]
+
+    status, _, _ = s3mod._delete_object(bucket, "k", query_params={"versionId": marker_id})
+    assert status == 204
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert restored["objects"]["k"]["version_id"] == version_id
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert not versions[-1].get("is_delete_marker")
+
+
+def test_s3_put_after_delete_marker_clears_marker_on_disk(s3_persist, tmp_path):
+    """A write over a delete marker replaces the marker sidecar, so the new
+    object is visible again after a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-reput"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"one", {})
+    s3mod._delete_object(bucket, "k")
+    s3mod._put_object(bucket, "k", b"two", {})
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "k.meta.json")
+    with open(meta_path) as mf:
+        assert "is_delete_marker" not in json.load(mf)
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert s3mod._read_body(bucket, "k", restored["objects"]["k"]) == b"two"
+
+
+def test_s3_batch_delete_objects_persists_delete_marker(s3_persist, tmp_path):
+    """DeleteObjects on a versioned bucket creates a marker via the same path
+    as DeleteObject, so it must persist too."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-batch-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    body = (
+        b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Object><Key>k</Key></Object></Delete>"
+    )
+    status, _, _ = s3mod._delete_objects(bucket, body)
+    assert status == 200
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_unversioned_delete_removes_persisted_files(s3_persist, tmp_path):
+    """Regression guard: a plain delete on an unversioned bucket still removes
+    both the data file and its sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-unversioned"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    data_path = os.path.join(str(tmp_path), "000000000000", bucket, "k")
+    assert os.path.isfile(data_path)
+
+    s3mod._delete_object(bucket, "k")
+    assert not os.path.exists(data_path)
+    assert not os.path.exists(data_path + ".meta.json")
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    assert s3mod._buckets._data.get(("000000000000", bucket), {}).get("objects", {}) == {}
+
+
 def test_s3_copy_object_propagates_storage_class(s3):
     """CopyObject with explicit StorageClass overrides the source's class (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc-copy")
