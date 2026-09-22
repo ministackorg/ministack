@@ -1650,6 +1650,29 @@ def test_ecs_cfn_service_deployment_circuit_breaker_create_and_update(ecs, cfn):
     cfn.delete_stack(StackName=stack_name)
 
 
+def test_ecs_cfn_service_update_propagates_ecs_errors(monkeypatch):
+    """A rejected ECS UpdateService must fail the CloudFormation update."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setattr(
+        ecs_service,
+        "_update_service",
+        lambda _request: (
+            400,
+            {"Content-Type": "application/x-amz-json-1.0"},
+            b'{"__type":"ClientException","message":"task definition not found"}',
+        ),
+    )
+
+    with pytest.raises(ValueError, match="AWS::ECS::Service update failed"):
+        provisioners._ecs_service_update(
+            "arn:aws:ecs:us-east-1:000000000000:service/default/example",
+            {"TaskDefinition": "example:1"},
+            {"TaskDefinition": "example:99"},
+            "stack",
+        )
+
+
 def test_ecs_cfn_taskdef_populates_registered_fields(ecs, cfn):
     """CFN-created TaskDefinitions must surface registeredAt/registeredBy/compatibilities,
     matching what RegisterTaskDefinition emits. Workloads like Go-SDK reconcilers fall
