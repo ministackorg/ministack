@@ -14,6 +14,36 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  no-image-build:
+    name: no image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # MiniStack runs containers from images it names; it never builds one.
+      # A request body must never reach a build context, so no source file may
+      # call a Docker build at all. This blocks the capability, not a misuse.
+      - name: Reject any Docker image build in the served source tree
+        run: |
+          if grep -rnE '\.images\.build\(|\bbuildx\b|docker[[:space:]]+build\b|APIClient\(.*\)\.build\(' \
+               ministack/ 2>/dev/null; then
+            echo "::error::MiniStack must never build a Docker image. Run images it names instead."
+            exit 1
+          fi
+
+      # Only the two release images at the repository root may exist. Any other
+      # Dockerfile is a build input nobody is allowed to introduce, and one
+      # outside the root does not trip the preview-build path guard either.
+      - name: Reject any Dockerfile outside the two release images
+        run: |
+          extra=$(git ls-files -- '*Dockerfile' '*Dockerfile.*' '*dockerfile' \
+            | grep -vE '^(Dockerfile|Dockerfile\.full)$' || true)
+          if [ -n "$extra" ]; then
+            echo "$extra"
+            echo "::error::Only Dockerfile and Dockerfile.full may exist. MiniStack never builds an image."
+            exit 1
+          fi
+
   control-plane:
     name: control plane
     runs-on: ubuntu-latest
@@ -259,7 +289,7 @@ jobs:
 
   test-result:
     name: test
-    needs: [control-plane, data-plane]
+    needs: [control-plane, data-plane, no-image-build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -267,3 +297,4 @@ jobs:
       - run: |
           test "${{ needs['control-plane'].result }}" = "success"
           test "${{ needs['data-plane'].result }}" = "success"
+          test "${{ needs['no-image-build'].result }}" = "success"
