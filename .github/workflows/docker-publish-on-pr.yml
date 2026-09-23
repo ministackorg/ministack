@@ -41,6 +41,7 @@ jobs:
           skip_preview() {
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "plugin_changed=false" >> "$GITHUB_OUTPUT"
+            echo "docker_change=${2:-false}" >> "$GITHUB_OUTPUT"
             echo "skip_reason=$1" >> "$GITHUB_OUTPUT"
             echo "::warning::$1"
             exit 0
@@ -70,14 +71,23 @@ jobs:
           echo "Changed files:"
           printf '%s' "$files" | jq -r '.[][] | .filename'
 
+          # Deliberately unanchored: a Dockerfile in any path is a build input,
+          # and one is never auto-built from a PR regardless of where it lives.
           if printf '%s' "$files" | jq -e \
-            'any(.[][]; .filename | test("^(Dockerfile([.].*)?|[.]dockerignore|[.]github/)"))' \
+            'any(.[][]; .filename | test("(^|/)[Dd]ockerfile([.][^/]*)?$"))' \
+            >/dev/null; then
+            skip_preview "this PR creates or modifies a Dockerfile." true
+          fi
+
+          if printf '%s' "$files" | jq -e \
+            'any(.[][]; .filename | test("^([.]dockerignore|[.]github/)"))' \
             >/dev/null; then
             skip_preview "PR modifies the build/CI surface; auto-preview skipped pending manual maintainer build."
           fi
 
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          echo "docker_change=false" >> "$GITHUB_OUTPUT"
           if printf '%s' "$files" | jq -e \
             'any(.[][]; .filename | test("^contrib/mysql-iam-plugin/"))' \
             >/dev/null; then
@@ -87,13 +97,27 @@ jobs:
           fi
 
       - name: Comment that auto-preview was skipped
-        if: steps.guard.outputs.skip == 'true'
+        if: steps.guard.outputs.skip == 'true' && steps.guard.outputs.docker_change != 'true'
         uses: marocchino/sticky-pull-request-comment@v3
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           header: docker-preview
           message: |
             Auto-preview build skipped: ${{ steps.guard.outputs.skip_reason }}
+
+      - name: Comment that a Dockerfile change is not accepted
+        if: steps.guard.outputs.docker_change == 'true'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: docker-preview
+          message: |
+            Auto-preview build skipped: ${{ steps.guard.outputs.skip_reason }}
+
+            MiniStack runs containers from images it names and never builds one,
+            so a Dockerfile in any path is not accepted through a pull request.
+            Please open an issue first stating what you want to achieve, and we
+            will agree the approach there before any code changes.
 
       # checkout@v6 now refuses fork-PR checkouts from pull_request_target
       # unless explicitly allowed, which has failed this job for every fork PR

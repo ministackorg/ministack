@@ -4528,16 +4528,18 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
         versions[:] = [v for v in versions if v["version_id"] != "null"]
     for v in versions:
         v["is_latest"] = False
-    versions.append(
-        {
-            "version_id": marker_id,
-            "last_modified": now_iso(),
-            "etag": "",
-            "size": 0,
-            "is_latest": True,
-            "is_delete_marker": True,
-        }
-    )
+    marker = {
+        "version_id": marker_id,
+        "last_modified": now_iso(),
+        "etag": "",
+        "size": 0,
+        "is_latest": True,
+        "is_delete_marker": True,
+    }
+    versions.append(marker)
+    # Persist the marker to the key's sidecar so a restart keeps the object
+    # hidden instead of resurrecting it from its still-present data file.
+    _persist_delete_marker(bucket_name, key, marker, prior_obj)
     return marker_id
 
 
@@ -4624,6 +4626,9 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
         bucket["objects"].pop(key, None)
     else:
         bucket["objects"][key] = _object_record_from_version(latest)
+    # The key now resolves to a different version (or to a marker): align the
+    # sidecar so a restart does not restore the pre-delete view.
+    _persist_version_state(bucket_name, key, bucket)
     return True, was_delete_marker
 
 
@@ -6604,33 +6609,91 @@ def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
     os.replace(tmp, fpath)
 
 
+def _object_meta_from_record(obj: dict) -> dict:
+    """The metadata snapshot stored in an object's .meta.json sidecar."""
+    return {
+        "content_type": obj.get("content_type", "application/octet-stream"),
+        "content_encoding": obj.get("content_encoding"),
+        "etag": obj.get("etag", ""),
+        "last_modified": obj.get("last_modified", ""),
+        "size": obj.get("size", 0),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class", "STANDARD"),
+        "checksums": obj.get("checksums", {}),
+        "version_id": obj.get("version_id"),
+    }
+
+
 def _persist_object(bucket: str, key: str, obj):
     try:
         fpath = _object_disk_path(bucket, key)
         if fpath is None:
             return
         os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
-        data = obj["body"] if isinstance(obj, dict) else obj
-        _atomic_write(fpath, data)
         if isinstance(obj, dict):
-            meta = {
-                "content_type": obj.get("content_type", "application/octet-stream"),
-                "content_encoding": obj.get("content_encoding"),
-                "etag": obj.get("etag", ""),
-                "last_modified": obj.get("last_modified", ""),
-                "size": obj.get("size", 0),
-                "metadata": obj.get("metadata", {}),
-                "preserved_headers": obj.get("preserved_headers", {}),
-                "storage_class": obj.get("storage_class", "STANDARD"),
-                "checksums": obj.get("checksums", {}),
-                "version_id": obj.get("version_id"),
-            }
-            _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
-        # Drop body from in-memory record to save RAM
-        if isinstance(obj, dict):
+            # A record rebuilt from a version entry may carry no body; the
+            # data file already on disk then stands, and only the sidecar is
+            # refreshed.
+            data = obj.get("body")
+            if data is not None:
+                _atomic_write(fpath, data)
+            _atomic_write(fpath + ".meta.json", json.dumps(_object_meta_from_record(obj)), text=True)
+            # Drop body from in-memory record to save RAM
             obj["body"] = None
+        else:
+            _atomic_write(fpath, obj)
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
+
+
+def _persist_delete_marker(bucket_name: str, key: str, marker: dict, prior_obj: dict | None):
+    """Record a delete marker in the key's .meta.json sidecar.
+
+    A marker has no body, so it cannot ride the data file the way a version
+    does — the sidecar is its only on-disk record. Without it a restart finds
+    the hidden object's data file, reloads it as current, and the deleted
+    object reappears. The displaced object's metadata is kept under
+    ``previous`` so its version entry can be rebuilt when the marker is later
+    removed."""
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _object_disk_path(bucket_name, key)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        meta = {
+            "is_delete_marker": True,
+            "version_id": marker.get("version_id"),
+            "last_modified": marker.get("last_modified", ""),
+        }
+        if prior_obj:
+            meta["previous"] = _object_meta_from_record(prior_obj)
+        _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
+    except Exception as e:
+        logger.warning("Failed to persist S3 delete marker %s/%s: %s", bucket_name, key, e)
+
+
+def _persist_version_state(bucket_name: str, key: str, bucket: dict):
+    """Rewrite a key's on-disk state after a version operation.
+
+    Purging a version can change what the key resolves to — a removed delete
+    marker may expose an older version, or promote another marker — and the
+    sidecar must agree with that, or a restart restores the pre-delete view."""
+    if not S3_PERSIST:
+        return
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker"):
+        # Keep the newest real version below the marker so its metadata is not
+        # lost from the sidecar's `previous` snapshot.
+        prior = next((v for v in reversed(versions[:-1]) if not v.get("is_delete_marker")), None)
+        _persist_delete_marker(bucket_name, key, latest, prior)
+    elif key in bucket["objects"]:
+        _persist_object(bucket_name, key, bucket["objects"][key])
+    else:
+        _delete_persisted_object(bucket_name, key)
 
 
 def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
@@ -6759,6 +6822,13 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                         meta = json.load(mf)
                 except Exception:
                     pass
+            # A delete marker's sidecar stands in for the object it hides: the
+            # data file belongs to the version underneath, not to the current
+            # key. Rebuild the marker (and the version it covers) instead of
+            # resurrecting the object as current.
+            if meta.get("is_delete_marker"):
+                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+                continue
             # Body stays on disk — only load metadata into memory.
             # Compute size/etag from meta sidecar; fall back to reading
             # the file only when the sidecar is missing or incomplete.
@@ -6803,6 +6873,67 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                         "checksums": meta.get("checksums", {}),
                     }
                 )
+    # Delete markers whose data file is gone (a key that never held a body, or
+    # whose version was purged) live on as a lone sidecar.
+    for dirpath, _dirnames, filenames in os.walk(bucket_path):
+        for fname in filenames:
+            if not fname.endswith(".meta.json"):
+                continue
+            meta_path = os.path.join(dirpath, fname)
+            data_path = meta_path[: -len(".meta.json")]
+            if os.path.exists(data_path):
+                continue  # handled with its data file above
+            try:
+                with open(meta_path) as mf:
+                    meta = json.load(mf)
+            except Exception:
+                continue
+            if meta.get("is_delete_marker"):
+                key = os.path.relpath(data_path, bucket_path)
+                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+
+
+def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a persisted delete marker and hide the key.
+
+    The metadata of the version the marker displaced is kept under
+    ``previous`` so its version entry can be restored below the marker —
+    otherwise ListObjectVersions would lose it across a restart."""
+    scoped_vkey = (account_id, (bucket_name, key))
+    versions = _object_versions._data.setdefault(scoped_vkey, [])
+    prev = meta.get("previous")
+    if prev:
+        prev_id = prev.get("version_id") or "null"
+        if not any(not v.get("is_delete_marker") and v.get("version_id") == prev_id for v in versions):
+            versions.append(
+                {
+                    "version_id": prev_id,
+                    "last_modified": prev.get("last_modified") or now_iso(),
+                    "etag": prev.get("etag", ""),
+                    "size": prev.get("size", 0),
+                    "is_latest": False,
+                    "data": None,
+                    "content_type": prev.get("content_type", "application/octet-stream"),
+                    "content_encoding": prev.get("content_encoding"),
+                    "metadata": prev.get("metadata", {}),
+                    "preserved_headers": prev.get("preserved_headers", {}),
+                    "storage_class": prev.get("storage_class", "STANDARD"),
+                    "checksums": prev.get("checksums", {}),
+                }
+            )
+    marker_id = meta.get("version_id") or "null"
+    if not any(v.get("is_delete_marker") and v.get("version_id") == marker_id for v in versions):
+        versions.append(
+            {
+                "version_id": marker_id,
+                "last_modified": meta.get("last_modified") or now_iso(),
+                "etag": "",
+                "size": 0,
+                "is_latest": True,
+                "is_delete_marker": True,
+            }
+        )
+    bucket["objects"].pop(key, None)
 
 
 _load_persisted_data()

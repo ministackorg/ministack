@@ -32,6 +32,20 @@ def _wait_until(predicate, timeout=5):
     assert predicate(), "condition did not become true before timeout"
 
 
+def _ecs_docker_reachable():
+    """Whether this end-to-end ECS lifecycle test can start real containers."""
+    try:
+        import docker
+        docker.from_env(timeout=2).ping()
+    except Exception:
+        return False
+    return True
+
+
+requires_ecs_docker = pytest.mark.skipif(
+    not _ecs_docker_reachable(), reason="requires a reachable Docker daemon")
+
+
 def _replace_arn_region(arn):
     return _replace_arn_section(arn, 3, _different_region(arn.split(":", 5)[3]))
 
@@ -1197,10 +1211,10 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
         containerDefinitions=[{"name": "app", "image": "nginx:latest", "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
-        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=1,
+        cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=2,
     )
     old_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(old_tasks["taskArns"]) == 1
+    assert len(old_tasks["taskArns"]) == 2
 
     # Register new revision and update service
     resp2 = ecs.register_task_definition(
@@ -1210,59 +1224,188 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
     ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")
 
-    # ECS keeps both deployments while the replacement becomes healthy, then
-    # drains the old deployment and collapses the service to the new one.
+    # A rolling deployment keeps the old tasks until the replacement is
+    # healthy.  Wait specifically for two RUNNING tasks on the new revision
+    # instead of treating the still-running old tasks as replacements.
     _wait_until(
-        lambda: (
-            len(ecs.describe_services(
-                cluster=cluster, services=["tdu-svc"]
-            )["services"][0]["deployments"]) == 1
-            and ecs.describe_services(
-                cluster=cluster, services=["tdu-svc"]
-            )["services"][0]["deployments"][0]["rolloutState"] == "COMPLETED"
-        ),
+        lambda: len([
+            task for task in ecs.describe_tasks(
+                cluster=cluster,
+                tasks=ecs.list_tasks(
+                    cluster=cluster, serviceName="tdu-svc"
+                )["taskArns"],
+            )["tasks"]
+            if task["taskDefinitionArn"] == new_td_arn
+            and task["lastStatus"] == "RUNNING"
+        ]) == 2,
         timeout=30,
     )
 
-    # New tasks should be on the new TD
-    new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
-    assert len(new_tasks["taskArns"]) == 1
-
-    # Verify all running tasks use the new task definition
+    # Old tasks should be stopped
     _wait_until(
         lambda: all(
-            task["lastStatus"] == "RUNNING"
+            task["lastStatus"] == "STOPPED"
             for task in ecs.describe_tasks(
-                cluster=cluster, tasks=new_tasks["taskArns"]
+                cluster=cluster, tasks=old_tasks["taskArns"]
             )["tasks"]
         ),
         timeout=30,
     )
-    desc = ecs.describe_tasks(cluster=cluster, tasks=new_tasks["taskArns"])
-    for t in desc["tasks"]:
-        assert t["taskDefinitionArn"] == new_td_arn, \
-            f"Task still on old TD: {t['taskDefinitionArn']}"
-        assert t["lastStatus"] == "RUNNING"
 
-    # Old tasks should be stopped
-    old_desc = ecs.describe_tasks(cluster=cluster, tasks=old_tasks["taskArns"])
-    for t in old_desc["tasks"]:
-        assert t["lastStatus"] == "STOPPED"
+    new_tasks = ecs.list_tasks(cluster=cluster, serviceName="tdu-svc")
+    assert len(new_tasks["taskArns"]) == 2
+    desc = ecs.describe_tasks(cluster=cluster, tasks=new_tasks["taskArns"])
+    assert all(t["taskDefinitionArn"] == new_td_arn for t in desc["tasks"])
 
     # Service should reflect correct counts
     _wait_until(
         lambda: ecs.describe_services(
             cluster=cluster, services=["tdu-svc"]
-        )["services"][0]["runningCount"] == 1,
+        )["services"][0]["runningCount"] == 2,
         timeout=30,
     )
     svc = ecs.describe_services(cluster=cluster, services=["tdu-svc"])
-    service = svc["services"][0]
-    assert service["runningCount"] == 1
-    assert len(service["deployments"]) == 1
-    assert service["deployments"][0]["taskDefinition"] == new_td_arn
-    assert service["deployments"][0]["status"] == "PRIMARY"
-    assert service["deployments"][0]["rolloutState"] == "COMPLETED"
+    assert svc["services"][0]["runningCount"] == 2
+    deployments = svc["services"][0]["deployments"]
+    assert len(deployments) == 1
+    assert deployments[0]["taskDefinition"] == new_td_arn
+    assert deployments[0]["status"] == "PRIMARY"
+    assert deployments[0]["rolloutState"] == "COMPLETED"
+
+
+@requires_ecs_docker
+@pytest.mark.serial
+def test_ecs_service_circuit_breaker_rolls_back_crashing_revision(ecs):
+    """A real container exit fails the new deployment and restores the old one.
+
+    This deliberately observes only DescribeServices after UpdateService.  The
+    service's background lifecycle watcher, rather than an incidental
+    DescribeTasks request, must discover every ``exit 1`` and give the circuit
+    breaker the failure signal.
+    """
+    cluster = "circuit-breaker-c"
+    family = "circuit-breaker-td"
+    service = "circuit-breaker-svc"
+    ecs.create_cluster(clusterName=cluster)
+    healthy = ecs.register_task_definition(
+        family=family,
+        requiresCompatibilities=["FARGATE"],
+        networkMode="awsvpc",
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", "sleep 600"],
+        }],
+    )["taskDefinition"]["taskDefinitionArn"]
+    ecs.create_service(
+        cluster=cluster,
+        serviceName=service,
+        taskDefinition=healthy,
+        desiredCount=1,
+        launchType="FARGATE",
+        networkConfiguration={"awsvpcConfiguration": {"subnets": ["subnet-test"]}},
+    )
+    _wait_until(
+        lambda: ecs.describe_services(cluster=cluster, services=[service])
+        ["services"][0]["runningCount"] == 1,
+        timeout=30,
+    )
+
+    crashing = ecs.register_task_definition(
+        family=family,
+        requiresCompatibilities=["FARGATE"],
+        networkMode="awsvpc",
+        containerDefinitions=[{
+            "name": "app",
+            "image": "alpine:latest",
+            "command": ["sh", "-c", "exit 1"],
+        }],
+    )["taskDefinition"]["taskDefinitionArn"]
+    ecs.update_service(
+        cluster=cluster,
+        service=service,
+        taskDefinition=crashing,
+        deploymentConfiguration={
+            "deploymentCircuitBreaker": {"enable": True, "rollback": True},
+        },
+    )
+
+    final_service = None
+
+    def rolled_back():
+        nonlocal final_service
+        final_service = ecs.describe_services(
+            cluster=cluster, services=[service]
+        )["services"][0]
+        deployments = final_service["deployments"]
+        failed = next(
+            (deployment for deployment in deployments
+             if deployment["taskDefinition"] == crashing
+             and deployment.get("rolloutState") == "FAILED"),
+            None,
+        )
+        primary = next(
+            (deployment for deployment in deployments
+             if deployment.get("status") == "PRIMARY"),
+            None,
+        )
+        return bool(
+            failed and failed.get("rolloutStateReason")
+            and primary and primary["taskDefinition"] == healthy
+            and primary.get("rolloutState") == "COMPLETED"
+            and final_service["taskDefinition"] == healthy
+            and final_service["runningCount"] == 1
+        )
+
+    _wait_until(rolled_back, timeout=30)
+    failed = next(
+        deployment for deployment in final_service["deployments"]
+        if deployment["taskDefinition"] == crashing
+    )
+    assert failed["failedTasks"] == 3
+    assert failed["rolloutState"] == "FAILED"
+    assert "circuit breaker" in failed["rolloutStateReason"]
+
+
+@pytest.mark.parametrize(
+    ("reset_on_healthy", "expected_failures"),
+    [(None, 0), (True, 0), (False, 2)],
+)
+def test_ecs_circuit_breaker_reset_on_healthy_task(
+        reset_on_healthy, expected_failures):
+    """A stable task resets failures unless cumulative mode is requested."""
+    from ministack.services import ecs as _ecs
+
+    cluster = f"reset-healthy-{_uuid_mod.uuid4().hex[:8]}"
+    service = "svc"
+    svc_key = f"{cluster}/{service}"
+    deployment = _ecs._make_deployment("reset-healthy-td:2", 2)
+    deployment["rolloutState"] = "IN_PROGRESS"
+    deployment["rolloutStateReason"] = ""
+    deployment["failedTasks"] = 2
+    breaker = {"enable": True, "rollback": True}
+    if reset_on_healthy is not None:
+        breaker["resetOnHealthyTask"] = reset_on_healthy
+    svc = {
+        "serviceName": service,
+        "clusterArn": (
+            f"arn:aws:ecs:us-east-1:000000000000:cluster/{cluster}"
+        ),
+        "status": "ACTIVE",
+        "deploymentConfiguration": {"deploymentCircuitBreaker": breaker},
+        "deployments": [deployment],
+    }
+    task = {
+        "taskDefinitionArn": "reset-healthy-td:2",
+        "_deployment_id": deployment["id"],
+        "lastStatus": "RUNNING",
+    }
+    _ecs._services[svc_key] = svc
+    try:
+        _ecs._record_service_task_healthy(svc_key, task)
+        assert deployment["failedTasks"] == expected_failures
+    finally:
+        _ecs._services.pop(svc_key, None)
 
 
 def test_ecs_service_delete_stops_tasks(ecs):
@@ -1386,6 +1529,148 @@ def test_ecs_cfn_service_visible(ecs, cfn):
 
     # Cleanup
     cfn.delete_stack(StackName=stack_name)
+
+
+def test_ecs_cfn_service_deployment_circuit_breaker_create_and_update(ecs, cfn):
+    """CloudFormation maps circuit-breaker fields and updates them in place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"ecs-cfn-circuit-{suffix}"
+    cluster_name = f"ecs-cfn-circuit-c-{suffix}"
+    service_name = f"ecs-cfn-circuit-s-{suffix}"
+    first_family = f"ecs-cfn-circuit-one-{suffix}"
+    second_family = f"ecs-cfn-circuit-two-{suffix}"
+
+    def template(task_definition, configuration):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Cluster": {
+                    "Type": "AWS::ECS::Cluster",
+                    "Properties": {"ClusterName": cluster_name},
+                },
+                "FirstTaskDefinition": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": first_family,
+                        "ContainerDefinitions": [{"Name": "app", "Image": "busybox"}],
+                    },
+                },
+                "SecondTaskDefinition": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": second_family,
+                        "ContainerDefinitions": [{"Name": "app", "Image": "busybox"}],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "DependsOn": [
+                        "Cluster", "FirstTaskDefinition", "SecondTaskDefinition",
+                    ],
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": service_name,
+                        "TaskDefinition": {"Ref": task_definition},
+                        "DesiredCount": 0,
+                        "DeploymentConfiguration": configuration,
+                    },
+                },
+            },
+        }
+
+    initial = {
+        "MaximumPercent": 150,
+        "MinimumHealthyPercent": 50,
+        "DeploymentCircuitBreaker": {
+            "Enable": True,
+            "Rollback": True,
+            "ResetOnHealthyTask": False,
+            "ThresholdConfiguration": {"Type": "COUNT", "Value": 5},
+        },
+    }
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("FirstTaskDefinition", initial)),
+    )
+    _wait_until(
+        lambda: cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"]
+        == "CREATE_COMPLETE",
+        timeout=30,
+    )
+    service = ecs.describe_services(
+        cluster=cluster_name, services=[service_name]
+    )["services"][0]
+    assert service["deploymentConfiguration"] == {
+        "maximumPercent": 150,
+        "minimumHealthyPercent": 50,
+        "deploymentCircuitBreaker": {
+            "enable": True,
+            "rollback": True,
+            "resetOnHealthyTask": False,
+            "thresholdConfiguration": {"type": "COUNT", "value": 5},
+        },
+    }
+
+    updated = {
+        "DeploymentCircuitBreaker": {
+            "Enable": True,
+            "Rollback": False,
+            "ResetOnHealthyTask": True,
+            "ThresholdConfiguration": {
+                "Type": "UNBOUNDED_PERCENT", "Value": 25,
+            },
+        },
+    }
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("SecondTaskDefinition", updated)),
+    )
+    _wait_until(
+        lambda: cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"]
+        == "UPDATE_COMPLETE",
+        timeout=30,
+    )
+    service = ecs.describe_services(
+        cluster=cluster_name, services=[service_name]
+    )["services"][0]
+    second_arn = ecs.describe_task_definition(
+        taskDefinition=second_family
+    )["taskDefinition"]["taskDefinitionArn"]
+    assert service["taskDefinition"] == second_arn
+    assert service["deploymentConfiguration"] == {
+        "deploymentCircuitBreaker": {
+            "enable": True,
+            "rollback": False,
+            "resetOnHealthyTask": True,
+            "thresholdConfiguration": {
+                "type": "UNBOUNDED_PERCENT", "value": 25,
+            },
+        },
+    }
+    cfn.delete_stack(StackName=stack_name)
+
+
+def test_ecs_cfn_service_update_propagates_ecs_errors(monkeypatch):
+    """A rejected ECS UpdateService must fail the CloudFormation update."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setattr(
+        ecs_service,
+        "_update_service",
+        lambda _request: (
+            400,
+            {"Content-Type": "application/x-amz-json-1.0"},
+            b'{"__type":"ClientException","message":"task definition not found"}',
+        ),
+    )
+
+    with pytest.raises(ValueError, match="AWS::ECS::Service update failed"):
+        provisioners._ecs_service_update(
+            "arn:aws:ecs:us-east-1:000000000000:service/default/example",
+            {"TaskDefinition": "example:1"},
+            {"TaskDefinition": "example:99"},
+            "stack",
+        )
 
 
 def test_ecs_cfn_taskdef_populates_registered_fields(ecs, cfn):
