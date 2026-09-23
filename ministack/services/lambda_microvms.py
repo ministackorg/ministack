@@ -10,8 +10,9 @@ GetMicrovm / GetMicrovmImage needs to proceed.
 
 Shapes verified against the AWS Lambda MicroVM API reference (2025-09-09):
 RunMicrovm, GetMicrovm, ListMicrovms, SuspendMicrovm, ResumeMicrovm,
-TerminateMicrovm, CreateMicrovmImage, CreateMicrovmAuthToken,
-CreateMicrovmShellAuthToken.
+TerminateMicrovm, ListMicrovmImages, CreateMicrovmImage, CreateMicrovmAuthToken,
+CreateMicrovmShellAuthToken, GetMicrovmImage, GetMicrovmImageVersion,
+UpdateMicrovmImage.
 """
 
 import copy
@@ -292,6 +293,133 @@ def _create_microvm_image(body):
     return json_response(view, 201)
 
 
+def _microvm_image_item(record: dict) -> dict:
+    """Summary item for ListMicrovmImages."""
+    fields = (
+        "imageArn", "name", "state", "latestActiveImageVersion",
+        "latestFailedImageVersion", "createdAt",
+    )
+    return {k: record[k] for k in fields if record.get(k) is not None}
+
+
+def _list_microvm_images(query_params):
+    def _qp(name):
+        val = query_params.get(name) if query_params else None
+        if isinstance(val, (list, tuple)):
+            return val[0] if val else None
+        return val
+
+    name_filter = _qp("nameFilter")
+    images = [
+        record for record in _images.values()
+        if not name_filter or name_filter in record.get("name", "")
+    ]
+    images.sort(key=lambda record: record.get("name", ""))
+
+    raw_max_results = _qp("maxResults")
+    if raw_max_results is None:
+        max_results = len(images) or 1
+    else:
+        try:
+            max_results = int(raw_max_results)
+        except (TypeError, ValueError):
+            return _validation("maxResults must be an integer")
+        if max_results < 1:
+            return _validation("maxResults must be greater than zero")
+
+    raw_next_token = _qp("nextToken")
+    try:
+        start = int(raw_next_token) if raw_next_token else 0
+    except (TypeError, ValueError):
+        return _validation("nextToken is invalid")
+    if start < 0:
+        return _validation("nextToken is invalid")
+
+    end = min(start + max_results, len(images))
+    response = {
+        "items": [_microvm_image_item(record) for record in images[start:end]],
+    }
+    if end < len(images):
+        response["nextToken"] = str(end)
+    return json_response(response)
+
+
+def _find_microvm_image(image_identifier):
+    image_identifier = unquote(image_identifier)
+    for record in _images.values():
+        if image_identifier in (record.get("name"), record.get("imageArn")):
+            return record
+        # AWS examples also use the colon-delimited ARN form while the local
+        # image ARN uses a slash before the image name.
+        if image_identifier.rsplit(":", 1)[-1] == record.get("name"):
+            return record
+    return None
+
+
+def _get_microvm_image_version(image_identifier, image_version):
+    record = _find_microvm_image(image_identifier)
+    if not record or record.get("imageVersion") != image_version:
+        return _not_found(
+            f"MicroVM image version {image_identifier}/{image_version} not found")
+
+    fields = (
+        "baseImageArn", "baseImageVersion", "buildRoleArn", "description",
+        "codeArtifact", "logging", "egressNetworkConnectors",
+        "cpuConfigurations", "resources", "additionalOsCapabilities", "hooks",
+        "environmentVariables", "imageArn", "imageVersion", "createdAt",
+        "updatedAt", "tags",
+    )
+    view = {k: record[k] for k in fields if record.get(k) is not None}
+    # A completed MiniStack image represents a successful, active version.
+    view.update({"state": "SUCCESSFUL", "status": "ACTIVE"})
+    return json_response(view)
+
+
+def _microvm_image_view(record: dict) -> dict:
+    fields = (
+        "createdAt", "imageArn", "latestActiveImageVersion",
+        "latestFailedImageVersion", "name", "state", "tags", "updatedAt",
+    )
+    return {k: record[k] for k in fields if record.get(k) is not None}
+
+
+def _get_microvm_image(image_identifier):
+    record = _find_microvm_image(image_identifier)
+    if not record:
+        return _not_found(f"MicroVM image {image_identifier} not found")
+    return json_response(_microvm_image_view(record))
+
+
+def _update_microvm_image(image_identifier, body):
+    record = _find_microvm_image(image_identifier)
+    if not record:
+        return _not_found(f"MicroVM image {image_identifier} not found")
+
+    data = _parse_body(body)
+    for field in ("baseImageArn", "buildRoleArn", "codeArtifact"):
+        if not data.get(field):
+            return _validation(f"{field} is required")
+
+    version = str(int(record.get("imageVersion", "0")) + 1)
+    for field in (
+        "baseImageArn", "baseImageVersion", "buildRoleArn", "codeArtifact",
+        "cpuConfigurations", "description", "egressNetworkConnectors",
+        "environmentVariables", "hooks", "logging", "resources", "tags",
+    ):
+        if field in data:
+            record[field] = data[field]
+    record.update({
+        "imageVersion": version,
+        "latestActiveImageVersion": version,
+        "state": "UPDATED",
+        "updatedAt": _now(),
+    })
+    return json_response({
+        **{k: v for k, v in record.items() if v is not None},
+        "imageVersion": version,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
@@ -311,6 +439,18 @@ async def handle_request(method, path, headers, body, query_params):
     n = len(segments)
 
     if root == "microvm-images":
+        if n >= 4 and segments[-2] == "versions" and method == "GET":
+            image_identifier = "/".join(segments[1:-2])
+            image_version = unquote(segments[-1])
+            return _get_microvm_image_version(image_identifier, image_version)
+        if n >= 2:
+            image_identifier = "/".join(segments[1:])
+            if method == "GET":
+                return _get_microvm_image(image_identifier)
+            if method == "PUT":
+                return _update_microvm_image(image_identifier, body)
+        if n == 1 and method == "GET":
+            return _list_microvm_images(query_params)
         if n == 1 and method == "POST":
             return _create_microvm_image(body)
 

@@ -1217,6 +1217,10 @@ def test_ec2_elastic_ip_crud(ec2):
     assert alloc_id.startswith("eipalloc-")
     assert "PublicIp" in alloc
 
+    ec2.create_tags(Resources=[alloc_id], Tags=[{"Key": "Name", "Value": "nat-eip"}])
+    tagged = ec2.describe_addresses(AllocationIds=[alloc_id])["Addresses"][0]
+    assert tagged["Tags"] == [{"Key": "Name", "Value": "nat-eip"}]
+
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1)
     iid = resp["Instances"][0]["InstanceId"]
 
@@ -1639,6 +1643,36 @@ def test_ec2_network_acl_replace_entry(ec2):
     entries = desc["NetworkAcls"][0]["Entries"]
     assert len(entries) == 1
     assert entries[0]["RuleAction"] == "allow"
+
+
+def test_ec2_network_acl_ipv6_entry(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.105.0.0/16")["Vpc"]["VpcId"]
+    try:
+        acl_id = ec2.create_network_acl(VpcId=vpc_id)["NetworkAcl"]["NetworkAclId"]
+        ec2.create_network_acl_entry(
+            NetworkAclId=acl_id,
+            RuleNumber=101,
+            Protocol="-1",
+            RuleAction="allow",
+            Egress=True,
+            Ipv6CidrBlock="::/0",
+        )
+        ec2.replace_network_acl_entry(
+            NetworkAclId=acl_id,
+            RuleNumber=101,
+            Protocol="-1",
+            RuleAction="allow",
+            Egress=True,
+            Ipv6CidrBlock="2001:db8::/32",
+        )
+
+        entries = ec2.describe_network_acls(NetworkAclIds=[acl_id])["NetworkAcls"][0]["Entries"]
+        ipv6_entry = next(entry for entry in entries if entry["RuleNumber"] == 101)
+        assert ipv6_entry["Ipv6CidrBlock"] == "2001:db8::/32"
+        assert "CidrBlock" not in ipv6_entry
+    finally:
+        ec2.delete_network_acl(NetworkAclId=acl_id)
+        ec2.delete_vpc(VpcId=vpc_id)
 
 def test_ec2_flow_logs_crud(ec2):
     vpc = ec2.create_vpc(CidrBlock="10.104.0.0/16")

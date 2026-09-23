@@ -7036,10 +7036,18 @@ def _ecs_task_def_delete(physical_id, props):
     _ecs._task_defs.pop(td_key, None)
 
 
+def _ecs_deployment_configuration(props):
+    """Translate AWS::ECS::Service deployment configuration to ECS API form."""
+    configuration = props.get("DeploymentConfiguration")
+    if configuration is None:
+        return None
+    return _pascal_to_camel(configuration)
+
+
 def _ecs_service_create(logical_id, props, stack_name):
     name = props.get("ServiceName", f"{stack_name}-{logical_id}")
     cluster = props.get("Cluster", "default")
-    _ecs._create_service({
+    request = {
         "serviceName": name,
         "cluster": cluster,
         "taskDefinition": props.get("TaskDefinition", ""),
@@ -7048,9 +7056,52 @@ def _ecs_service_create(logical_id, props, stack_name):
         "loadBalancers": props.get("LoadBalancers", []),
         "networkConfiguration": props.get("NetworkConfiguration", {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-    })
+    }
+    deployment_configuration = _ecs_deployment_configuration(props)
+    if deployment_configuration is not None:
+        request["deploymentConfiguration"] = deployment_configuration
+    _ecs._create_service(request)
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:service/{cluster}/{name}"
     return arn, {"ServiceArn": arn, "Name": name}
+
+
+def _ecs_service_update(physical_id, old_props, new_props, stack_name):
+    """Apply mutable AWS::ECS::Service properties through UpdateService."""
+    cluster = new_props.get("Cluster", old_props.get("Cluster", "default"))
+    name = new_props.get("ServiceName") or physical_id.rsplit("/", 1)[-1]
+    request = {"cluster": cluster, "service": name}
+    property_map = {
+        "TaskDefinition": "taskDefinition",
+        "DesiredCount": "desiredCount",
+        "NetworkConfiguration": "networkConfiguration",
+        "LoadBalancers": "loadBalancers",
+        "HealthCheckGracePeriodSeconds": "healthCheckGracePeriodSeconds",
+        "EnableExecuteCommand": "enableExecuteCommand",
+        "PlatformVersion": "platformVersion",
+    }
+    for cf_property, ecs_property in property_map.items():
+        if new_props.get(cf_property) != old_props.get(cf_property):
+            request[ecs_property] = new_props.get(cf_property)
+
+    if (new_props.get("DeploymentConfiguration")
+            != old_props.get("DeploymentConfiguration")):
+        deployment_configuration = _ecs_deployment_configuration(new_props)
+        if deployment_configuration is None:
+            deployment_configuration = {
+                "maximumPercent": 200,
+                "minimumHealthyPercent": 100,
+                "deploymentCircuitBreaker": {"enable": False, "rollback": False},
+            }
+        request["deploymentConfiguration"] = deployment_configuration
+
+    # The resource engine only calls us when properties changed.  Some ECS
+    # properties are replacement-only and are intentionally left to their
+    # existing semantics; these are the fields UpdateService can apply in
+    # place and that MiniStack currently models.
+    response = _ecs._update_service(request)
+    if response[0] >= 400:
+        raise ValueError(f"AWS::ECS::Service update failed: {response[2]!r}")
+    return physical_id, {"ServiceArn": physical_id, "Name": name}
 
 
 def _ecs_service_delete(physical_id, props):
@@ -10476,6 +10527,65 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
+# CloudFormation reporting rules, checked against DescribeType and change sets.
+# A row lists the schema's createOnlyProperties (Always); the conditional table
+# below lists its conditionalCreateOnlyProperties (Conditionally). Any other
+# property of a listed type is in place (Never), as AWS reports it. Service API
+# immutability is different: an update may fail without being reported as a
+# replacement (for example Cognito sign-in attributes). Keep the execution
+# predicates separate until their behavior has been reconciled. Types without
+# a row keep the conservative Conditionally answer.
+_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
+    "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
+    "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
+    "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
+    "AWS::IoT::ThingType": ("ThingTypeName",),
+    "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
+    "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
+    "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
+    "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
+    "AWS::ElasticLoadBalancingV2::TargetGroup": (
+        "Name", "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
+        "IpAddressType",
+    ),
+    "AWS::WAFv2::WebACL": ("Name", "Scope"),
+    "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
+    "AWS::CloudFront::Function": ("Name",),
+    "AWS::SSM::Parameter": ("Name",),
+    "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
+    "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
+    "AWS::Cognito::UserPool": (),
+    "AWS::Lambda::Function": (
+        "FunctionName", "PackageType", "TenancyConfig",
+    ),
+    "AWS::Lambda::LayerVersion": (
+        "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
+        "Description", "LicenseInfo",
+    ),
+}
+
+
+_CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::DynamoDB::Table": ("KeySchema",),
+    "AWS::Lambda::Function": ("DurableConfig",),
+}
+
+
+def _property_recreation(resource_type: str, name: str) -> str:
+    """Classify a changed property for DescribeChangeSet, not update execution."""
+    replacing = _REPLACING_PROPERTIES.get(resource_type)
+    if replacing is None:
+        return "Conditionally"
+    if name in replacing:
+        return "Always"
+    if name in _CONDITIONALLY_REPLACING_PROPERTIES.get(resource_type, ()):
+        return "Conditionally"
+    return "Never"
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -10836,7 +10946,11 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
     "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
     "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
-    "AWS::ECS::Service": {"create": _ecs_service_create, "delete": _ecs_service_delete},
+    "AWS::ECS::Service": {
+        "create": _ecs_service_create,
+        "update": _ecs_service_update,
+        "delete": _ecs_service_delete,
+    },
     "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
     "AWS::ElasticLoadBalancingV2::LoadBalancer": {
         "create": _elbv2_load_balancer_create,

@@ -24,6 +24,7 @@ from .provisioners import (
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
     _delete_resource,
+    _property_recreation,
     _provision_resource,
     _snapshot_resource,
     _update_resource,
@@ -828,12 +829,14 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
             details = []
             old_props = old_res[key].get("Properties", {}) or {}
             new_props = new_res[key].get("Properties", {}) or {}
+            rtype = new_res[key].get("Type", "")
             if old_props != new_props:
                 for name in sorted(set(old_props) | set(new_props)):
                     if old_props.get(name) != new_props.get(name):
                         details.append({
                             "Target": {"Attribute": "Properties", "Name": name,
-                                       "RequiresRecreation": "Conditionally"},
+                                       "RequiresRecreation":
+                                           _property_recreation(rtype, name)},
                             "Evaluation": "Static",
                             "ChangeSource": "DirectModification",
                         })
@@ -851,8 +854,11 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
             for d in details:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            if type_changed or old_props != new_props:
-                replacement = "True" if type_changed else "Conditional"
+            recreation = {d["Target"].get("RequiresRecreation") for d in details}
+            if type_changed or "Always" in recreation:
+                replacement = "True"
+            elif "Conditionally" in recreation:
+                replacement = "Conditional"
             else:
                 replacement = "False"
             changes.append({
