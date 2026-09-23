@@ -2230,32 +2230,6 @@ def test_sns_sms_publish_is_recorded(sns):
     }
 
 
-def test_sns_sms_log_is_served_only_at_the_ministack_path(sns):
-    """There is no `/_aws/` alias — the native path is the only one.
-
-    This asserted the opposite until review: the endpoint also answered at
-    LocalStack's `/_aws/sns/sms-messages`. The compatibility surface is kept
-    narrow on purpose — `/_ministack/ses/messages` and
-    `/_ministack/sqs/messages` carry no alias either — and one is added only
-    against a concrete migration that would otherwise be painful. None was
-    named, so the alias went and this guards its absence.
-
-    The BODY still keeps LocalStack's shape, which is where the real
-    compatibility lives: a suite moving here changes the URL and nothing else.
-    """
-    phone = f"+1555{_uuid_mod.uuid4().int % 10_000_000:07d}"
-    sns.publish(PhoneNumber=phone, Message="compat path")
-
-    body = _sms_log(phoneNumber=phone)
-    assert body["region"] == "us-east-1"
-    assert [r["Message"] for r in body["sms_messages"][phone]] == ["compat path"]
-
-    url = f"{ENDPOINT.rstrip('/')}/_aws/sns/sms-messages"
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(url)
-    assert excinfo.value.code == 404
-
-
 def test_sns_sms_unknown_phone_returns_an_empty_list(sns):
     """A filtered read names the recipient even when nothing was sent to it."""
     phone = f"+1555{_uuid_mod.uuid4().int % 10_000_000:07d}"

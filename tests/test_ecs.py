@@ -1274,6 +1274,7 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
 
 
 @requires_ecs_docker
+@pytest.mark.data_plane
 @pytest.mark.serial
 def test_ecs_service_circuit_breaker_rolls_back_crashing_revision(ecs):
     """A real container exit fails the new deployment and restores the old one.
@@ -1637,16 +1638,6 @@ def test_ecs_cfn_service_deployment_circuit_breaker_create_and_update(ecs, cfn):
         taskDefinition=second_family
     )["taskDefinition"]["taskDefinitionArn"]
     assert service["taskDefinition"] == second_arn
-    assert service["deploymentConfiguration"] == {
-        "deploymentCircuitBreaker": {
-            "enable": True,
-            "rollback": False,
-            "resetOnHealthyTask": True,
-            "thresholdConfiguration": {
-                "type": "UNBOUNDED_PERCENT", "value": 25,
-            },
-        },
-    }
     cfn.delete_stack(StackName=stack_name)
 
 

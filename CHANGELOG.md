@@ -5,11 +5,26 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.5.16] — 2026-09-23
 
 ### Added
 
 - **Organizations — member accounts, service control policies and attachments** — `CreateAccount`, `DescribeCreateAccountStatus`, `MoveAccount`, `CloseAccount`, `CreatePolicy`, `DescribePolicy`, `UpdatePolicy`, `DeletePolicy`, `ListPolicies`, `AttachPolicy`, `DetachPolicy`, `ListPoliciesForTarget`, `ListTargetsForPolicy`, `EnablePolicyType` and `DisablePolicyType`, so `aws_organizations_account`, `aws_organizations_policy` and `aws_organizations_policy_attachment` apply. `CreateAccount` answers with a `CreateAccountStatus` whose id the provider reads back through `DescribeCreateAccountStatus`, as on AWS. A root carries `SERVICE_CONTROL_POLICY` enabled and the AWS-managed `p-FullAWSAccess`, attaching a policy whose type the root has disabled is `PolicyTypeNotEnabledException`, and deleting an attached policy is `PolicyInUseException`. Requested by @rv0lt.
+- **SNS — direct-to-phone publishes can be read back** — a `Publish` with a `PhoneNumber` and no `TopicArn` is recorded and served at `GET /_ministack/sns/sms-messages`, filterable by `account`, `region` and `phoneNumber`. Contributed by @himangshuj.
+- **Lambda MicroVMs — image lifecycle** — `ListMicrovmImages`, `GetMicrovmImage`, `GetMicrovmImageVersion` and `UpdateMicrovmImage`. Contributed by @edersonbrilhante.
+
+### Fixed
+
+- **S3 — a versioned object keeps its history across a restart** — with `S3_PERSIST=1` a delete marker was lost on restart, so a deleted object came back. Every version and delete marker now persists with the object on disk, each version keeps its own bytes, tags and ACL, and object tags and ACLs survive a restart for unversioned objects too. Contributed by @pauloRohling.
+- **ECS — service deployments track task health and roll back** — a completed deployment drains the previous task definition's tasks, `deploymentCircuitBreaker` fails a deployment whose tasks keep stopping and, with `rollback`, restores the previous one, and replacement stays within `maximumPercent` while keeping `minimumHealthyPercent` of `desiredCount` running. Contributed by @jgrumboe.
+- **CloudFormation — change sets report which property edits replace a resource** — every property edit answered `Replacement: Conditional` and `RequiresRecreation: Conditionally`. For 21 resource types a create-only property is now `Always` with `Replacement: True`, a conditionally create-only one stays `Conditionally`, and every other property is `Never`. Contributed by @iot-rocket.
+- **EC2 — Elastic IP tags and IPv6 network ACL entries survive a read** — `DescribeAddresses` omitted EIP tags, so Terraform repeatedly planned `tags` and `tags_all`; network ACL entries always stored and returned an IPv4 CIDR, so an IPv6 rule was read back as a changed IPv4 rule on every plan. Tags and `Ipv6CidrBlock` now round-trip through the EC2 API, and `ReleaseAddress` drops the address's tags. Contributed by @edersonbrilhante.
+- **Bedrock — a proxied tool-call turn reports its real token usage** — with `MINISTACK_BEDROCK_PROXY_URL` set, `Converse` and `ConverseStream` estimated usage from the reply text, so a turn that returned only a `toolUse` block reported `outputTokens: 0`, and `inputTokens` ignored the `toolConfig`. Usage now comes from the proxy's own `prompt_tokens` and `completion_tokens`, with the estimate kept for a proxy that sends none. Reported by @Vidminas.
+
+### Internal
+
+- **CI — one Docker preview comment per PR** — the preview-image workflow updates a single comment instead of posting one per push. Contributed by @jgrumboe.
+- **Tests** — split test files folded into their service's file.
 
 ## [1.5.15] — 2026-09-22
 
@@ -20,7 +35,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **EC2 — Elastic IP tags and IPv6 network ACL entries survive a read** — `DescribeAddresses` omitted EIP tags, so Terraform repeatedly planned `tags` and `tags_all`; network ACL entries always stored and returned an IPv4 CIDR, so an IPv6 rule was read back as a changed IPv4 rule on every plan. Tags and `Ipv6CidrBlock` now round-trip through the EC2 API. Reported by @edersonbrilhante.
 - **KMS — imported key material for HMAC and asymmetric keys** — `CreateKey` with `Origin=EXTERNAL` refused every spec but `SYMMETRIC_DEFAULT`, where AWS supports imported material for symmetric encryption, HMAC and asymmetric keys, ML-DSA excepted. HMAC material is the raw bytes of the spec's length and asymmetric material is the private key alone, DER-encoded PKCS#8, from which the public key is derived; material that does not match the key's `KeySpec` answers `IncorrectKeyMaterialException`, and `GetPublicKey` on a key still awaiting material answers `KMSInvalidStateException`. Reported by @guymahieu.
 - **RDS — the server certificate carries the endpoint AWS puts in it** — certificate generation raised `ValueError` once an endpoint passed the X.509 64-byte common-name bound, so a database with a long identifier could not start. The common name is now the advertised endpoint at its full length, the subject carries `OU=RDS, O=Amazon.com, L=Seattle, ST=Washington, C=US`, and the signing CA is named `Amazon RDS <region> Root CA RSA2048 G1`, matching a certificate captured from a real instance. Contributed by @jayjanssen.
 - **API Gateway — an OpenAPI body's `securityDefinitions` reach the methods** — the import discarded security outright, so a SAM API declaring a Cognito authorizer created none and every method imported as `authorizationType: NONE`, serving anonymous callers where AWS answers 401. Each scheme carrying `x-amazon-apigateway-authorizer` now becomes an authorizer, and an operation's `security` — or the document's — sets the method's `authorizationType`, `authorizerId` and `authorizationScopes`, so the enforcement added in 1.5.10 engages for body-defined APIs. Contributed by @maximoosemine.

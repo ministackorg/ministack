@@ -128,12 +128,7 @@ _sub_arn_to_topic = AccountRegionScopedDict()
 _platform_applications = AccountRegionScopedDict()
 _platform_endpoints = AccountRegionScopedDict()
 
-# Direct-to-phone publishes, keyed by recipient phone number. SES and SQS both
-# keep what they were sent so a test can read it back
-# (/_ministack/ses/messages, /_ministack/sqs/messages); SNS was the one
-# messaging service that logged a line and stored nothing, so an SMS was the
-# only thing you could send and not observe. Served by app.py at
-# /_ministack/sns/sms-messages.
+# Direct-to-phone publishes by recipient, served at /_ministack/sns/sms-messages.
 _sms_messages = AccountRegionScopedDict()
 
 
@@ -749,10 +744,6 @@ def _publish(params):
 
     if phone_number and not topic_arn:
         msg_id = new_uuid()
-        # There is nowhere for an SMS to go, so record it instead of dropping
-        # it. Field names and nulls match what the endpoint serves, so the
-        # record needs no reshaping on the way out. `_p` defaults an absent
-        # parameter to "", and an absent Subject reads as null, not "".
         _sms_log_for(phone_number).append({
             "PhoneNumber": phone_number,
             "TopicArn": None,

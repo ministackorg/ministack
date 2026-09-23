@@ -1086,26 +1086,7 @@ _SNS_SMS_PATH = "/_ministack/sns/sms-messages"
 
 
 async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict, query_params: dict):
-    """Handle the SNS SMS log endpoint.
-
-    A `Publish` that carries a `PhoneNumber` and no `TopicArn` has nowhere to
-    deliver to, so sns.py records it and this serves the recording back. Same
-    read-only introspection as `/_ministack/ses/messages` and
-    `/_ministack/sqs/messages`.
-
-    The body keeps LocalStack's shape —
-    `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` — so a suite
-    moving here changes the URL and nothing else. Only the native
-    `/_ministack/` path serves it: the compatibility surface stays narrow, and
-    a `/_aws/` alias earns its place only against a concrete migration that
-    would otherwise be painful.
-
-    Filters:
-      ?account=<12-digit-id>   restrict to one account
-      ?region=<aws-region>     restrict to one region
-      ?phoneNumber=<e164>      restrict to one recipient; the key is present
-                               with an empty list when nothing was sent to it
-    """
+    """Serve direct-to-phone SNS publishes, filtered by ?account, ?region and ?phoneNumber."""
     if path != _SNS_SMS_PATH or method != "GET":
         return None
 
@@ -1160,9 +1141,7 @@ async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict
             if isinstance(records, list):
                 sms_messages.setdefault(phone, []).extend(records)
 
-        # LocalStack answers a filtered request with the key present and empty
-        # rather than with an absent key, and a poller that reads
-        # `body.sms_messages[phone]` depends on that.
+        # A filtered recipient is present even with nothing sent to it.
         if phone_filter is not None:
             sms_messages.setdefault(phone_filter, [])
 

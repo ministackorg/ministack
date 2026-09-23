@@ -750,11 +750,7 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if version_id:
         for v in _object_versions.get((bucket_name, key), []):
             if v["version_id"] == version_id:
-                data = v.get("data")
-                if data is not None:
-                    return data
-                obj = bucket["objects"].get(key)
-                return _read_body(bucket_name, key, obj) if obj else None
+                return _version_body(bucket, bucket_name, key, v)
         return None
     obj = bucket["objects"].get(key)
     if obj is None:
@@ -3709,20 +3705,21 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
 
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
         if obj.get("_replica"):
             dest_name, replica_version = obj["_replica"]
             _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+            _persist_version_state(dest_name, key, _buckets[dest_name])
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
     return 200, resp_headers, b""
 
 
@@ -3949,17 +3946,18 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     _maybe_replicate(bucket_name, key, obj, file_value)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
 
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
         if obj.get("_replica"):
             _object_tags[(obj["_replica"][0], key, obj["_replica"][1])] = dict(pending_tags)
+            _persist_version_state(obj["_replica"][0], key, _buckets[obj["_replica"][0]])
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -4095,9 +4093,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 precondition = _check_read_preconditions(headers, vobj, resp_headers)
                 if precondition is not None:
                     return precondition
-                body = v.get("data")
+                body = _version_body(bucket, bucket_name, key, v)
                 if body is None:
-                    body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                    break
                 return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -4497,6 +4495,7 @@ def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, o
     versioning = _bucket_versioning.get(bucket_name)
     if versioning not in ("Enabled", "Suspended"):
         return None
+    _persist_displaced_version(bucket_name, key, prior_obj, versioning)
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
     if versioning == "Enabled":
@@ -4518,9 +4517,11 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
     """Append a delete marker per the bucket's versioning state and return its
     version id: a fresh id on Enabled, the literal "null" on Suspended — where
     the marker REPLACES any existing null version, as AWS does."""
+    enabled = _bucket_versioning.get(bucket_name) == "Enabled"
+    _persist_displaced_version(bucket_name, key, prior_obj, "Enabled" if enabled else "Suspended")
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
-    if _bucket_versioning.get(bucket_name) == "Enabled":
+    if enabled:
         _preserve_null_version(bucket_name, key, versions, prior_obj)
         marker_id = new_uuid()
     else:
@@ -4539,7 +4540,7 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
     versions.append(marker)
     # Persist the marker to the key's sidecar so a restart keeps the object
     # hidden instead of resurrecting it from its still-present data file.
-    _persist_delete_marker(bucket_name, key, marker, prior_obj)
+    _persist_delete_marker(bucket_name, key, marker)
     return marker_id
 
 
@@ -4603,6 +4604,7 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
         return False, False
 
     removed = versions.pop(idx)
+    _delete_version_file(bucket_name, key, version_id)
     was_delete_marker = bool(removed.get("is_delete_marker"))
     # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
@@ -4625,7 +4627,9 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     if latest.get("is_delete_marker"):
         bucket["objects"].pop(key, None)
     else:
-        bucket["objects"][key] = _object_record_from_version(latest)
+        record = _object_record_from_version(latest)
+        record["body"] = _version_body(bucket, bucket_name, key, latest)
+        bucket["objects"][key] = record
     # The key now resolves to a different version (or to a marker): align the
     # sidecar so a restart does not restore the pre-delete view.
     _persist_version_state(bucket_name, key, bucket)
@@ -4856,7 +4860,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        ventry_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            ventry_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if ventry_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
@@ -4867,7 +4874,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         # the body plus the wire metadata, so a COPY metadata-directive carries
         # the version's user metadata and headers like a current-object copy.
         src_obj = {
-            "body": ventry.get("data", b""),
+            "body": ventry_body,
             "etag": ventry["etag"],
             "size": ventry["size"],
             "last_modified": ventry["last_modified"],
@@ -5005,16 +5012,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
 
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, dest_key, dest_obj)
-
     dest_version_id = dest_obj.get("version_id")
     if pending_dest_tags is not None:
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
         if dest_obj.get("_replica"):
             _object_tags[(dest_obj["_replica"][0], dest_key, dest_obj["_replica"][1])] = dict(pending_dest_tags)
+            _persist_version_state(dest_obj["_replica"][0], dest_key, _buckets[dest_obj["_replica"][0]])
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
 
@@ -5026,6 +5029,11 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         # The destination is a new object: it does not inherit whatever the
         # key it replaced was permissioned with.
         _object_acl.pop((bucket_name, dest_key, dest_version_id), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, dest_key, dest_obj)
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -5129,6 +5137,7 @@ def _put_object_tagging(bucket_name: str, key: str, body: bytes, query_params: d
         return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags[(bucket_name, key, version_id)] = tags
+    _persist_version_state(bucket_name, key, bucket)
     resp_headers = {"Content-Type": "application/xml"}
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -5151,6 +5160,7 @@ def _delete_object_tagging(bucket_name: str, key: str, query_params: dict | None
         return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags.pop((bucket_name, key, version_id), None)
+    _persist_version_state(bucket_name, key, bucket)
     resp_headers = {}
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -5543,6 +5553,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
         if canned not in _CANNED_OBJECT_ACLS:
             return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned, _canonical_owner_id())
+        _persist_version_state(bucket_name, key, bucket)
         return 200, {}, b""
 
     if not body:
@@ -5560,6 +5571,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
             400,
         )
     _object_acl[(bucket_name, key, version_id)] = body.decode("utf-8", errors="replace")
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {}, b""
 
 
@@ -6148,14 +6160,16 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        src_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            src_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if src_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
                 404,
                 f"/{src_bucket_name}/{src_key}",
             )
-        src_body = ventry.get("data") or b""
     else:
         if src_key not in src_bucket["objects"]:
             return _error("NoSuchKey", "The specified key does not exist.", 404)
@@ -6638,7 +6652,8 @@ def _persist_object(bucket: str, key: str, obj):
             data = obj.get("body")
             if data is not None:
                 _atomic_write(fpath, data)
-            _atomic_write(fpath + ".meta.json", json.dumps(_object_meta_from_record(obj)), text=True)
+            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key)}
+            _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
             # Drop body from in-memory record to save RAM
             obj["body"] = None
         else:
@@ -6647,15 +6662,13 @@ def _persist_object(bucket: str, key: str, obj):
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
 
 
-def _persist_delete_marker(bucket_name: str, key: str, marker: dict, prior_obj: dict | None):
+def _persist_delete_marker(bucket_name: str, key: str, marker: dict):
     """Record a delete marker in the key's .meta.json sidecar.
 
     A marker has no body, so it cannot ride the data file the way a version
     does — the sidecar is its only on-disk record. Without it a restart finds
     the hidden object's data file, reloads it as current, and the deleted
-    object reappears. The displaced object's metadata is kept under
-    ``previous`` so its version entry can be rebuilt when the marker is later
-    removed."""
+    object reappears."""
     if not S3_PERSIST:
         return
     try:
@@ -6667,9 +6680,8 @@ def _persist_delete_marker(bucket_name: str, key: str, marker: dict, prior_obj: 
             "is_delete_marker": True,
             "version_id": marker.get("version_id"),
             "last_modified": marker.get("last_modified", ""),
+            **_key_history_meta(bucket_name, key),
         }
-        if prior_obj:
-            meta["previous"] = _object_meta_from_record(prior_obj)
         _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
     except Exception as e:
         logger.warning("Failed to persist S3 delete marker %s/%s: %s", bucket_name, key, e)
@@ -6686,14 +6698,94 @@ def _persist_version_state(bucket_name: str, key: str, bucket: dict):
     versions = _object_versions.get((bucket_name, key)) or []
     latest = versions[-1] if versions else None
     if latest is not None and latest.get("is_delete_marker"):
-        # Keep the newest real version below the marker so its metadata is not
-        # lost from the sidecar's `previous` snapshot.
-        prior = next((v for v in reversed(versions[:-1]) if not v.get("is_delete_marker")), None)
-        _persist_delete_marker(bucket_name, key, latest, prior)
+        _persist_delete_marker(bucket_name, key, latest)
     elif key in bucket["objects"]:
         _persist_object(bucket_name, key, bucket["objects"][key])
     else:
         _delete_persisted_object(bucket_name, key)
+
+
+def _key_history_meta(bucket_name: str, key: str) -> dict:
+    versions = _object_versions.get((bucket_name, key)) or []
+    extra = {}
+    if versions:
+        extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
+    vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
+    for field, store in (("tags", _object_tags), ("acl", _object_acl)):
+        found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
+        found = {vid: value for vid, value in found.items() if value is not None}
+        if found:
+            extra[field] = found
+    return extra
+
+
+_VERSIONS_DIR = ".versions"
+
+
+def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
+    if account_id is None:
+        account_id = get_account_id()
+    root = os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id))
+    candidate = os.path.realpath(os.path.join(root, key))
+    try:
+        if candidate == root or os.path.commonpath([root, candidate]) != root:
+            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+            return None
+    except ValueError:
+        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+        return None
+    return candidate
+
+
+def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
+    fpath = _version_disk_path(bucket_name, key, version_id, account_id)
+    return fpath is not None and os.path.isfile(fpath)
+
+
+def _persist_displaced_version(bucket_name: str, key: str, prior_obj: dict | None, versioning: str):
+    if not S3_PERSIST:
+        return
+    try:
+        if versioning == "Suspended":
+            _delete_version_file(bucket_name, key, "null")
+        if prior_obj is None:
+            return
+        prior_vid = prior_obj.get("version_id") or "null"
+        if versioning == "Suspended" and prior_vid == "null":
+            return
+        fpath = _version_disk_path(bucket_name, key, prior_vid)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        _atomic_write(fpath, _read_body(bucket_name, key, prior_obj))
+    except Exception as e:
+        logger.warning("Failed to persist S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_version_file(bucket_name: str, key: str, version_id: str):
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _version_disk_path(bucket_name, key, version_id)
+        if fpath is not None and os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception as e:
+        logger.warning("Failed to delete persisted S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _version_body(bucket: dict, bucket_name: str, key: str, v: dict) -> bytes | None:
+    if v.get("data") is not None:
+        return v["data"]
+    if S3_PERSIST and _version_file_exists(bucket_name, key, v["version_id"]):
+        try:
+            with open(_version_disk_path(bucket_name, key, v["version_id"]), "rb") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning("Failed to read persisted S3 object version %s/%s: %s", bucket_name, key, e)
+    current = bucket["objects"].get(key)
+    if current is not None and (current.get("version_id") or "null") == v["version_id"]:
+        return _read_body(bucket_name, key, current)
+    return None
 
 
 def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
@@ -6774,6 +6866,8 @@ def _load_persisted_data():
             entry_path = os.path.join(DATA_DIR, entry)
             if not os.path.isdir(entry_path):
                 continue
+            if entry == _VERSIONS_DIR:
+                continue
             # Detect if this entry is an account ID directory (12-digit or has bucket subdirs)
             if entry.isdigit() and len(entry) == 12:
                 # New layout: entry is an account ID
@@ -6853,6 +6947,9 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             }
             if meta.get("version_id"):
                 bucket["objects"][key]["version_id"] = meta["version_id"]
+            if "versions" in meta or "tags" in meta or "acl" in meta:
+                _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+            elif meta.get("version_id"):
                 vkey = (bucket_name, key)
                 scoped_vkey = (account_id, vkey)
                 if scoped_vkey not in _object_versions._data:
@@ -6894,46 +6991,50 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
 
 
 def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
-    """Rebuild a persisted delete marker and hide the key.
-
-    The metadata of the version the marker displaced is kept under
-    ``previous`` so its version entry can be restored below the marker —
-    otherwise ListObjectVersions would lose it across a restart."""
-    scoped_vkey = (account_id, (bucket_name, key))
-    versions = _object_versions._data.setdefault(scoped_vkey, [])
-    prev = meta.get("previous")
-    if prev:
-        prev_id = prev.get("version_id") or "null"
-        if not any(not v.get("is_delete_marker") and v.get("version_id") == prev_id for v in versions):
-            versions.append(
-                {
-                    "version_id": prev_id,
-                    "last_modified": prev.get("last_modified") or now_iso(),
-                    "etag": prev.get("etag", ""),
-                    "size": prev.get("size", 0),
-                    "is_latest": False,
-                    "data": None,
-                    "content_type": prev.get("content_type", "application/octet-stream"),
-                    "content_encoding": prev.get("content_encoding"),
-                    "metadata": prev.get("metadata", {}),
-                    "preserved_headers": prev.get("preserved_headers", {}),
-                    "storage_class": prev.get("storage_class", "STANDARD"),
-                    "checksums": prev.get("checksums", {}),
-                }
-            )
-    marker_id = meta.get("version_id") or "null"
-    if not any(v.get("is_delete_marker") and v.get("version_id") == marker_id for v in versions):
-        versions.append(
-            {
-                "version_id": marker_id,
-                "last_modified": meta.get("last_modified") or now_iso(),
-                "etag": "",
-                "size": 0,
-                "is_latest": True,
-                "is_delete_marker": True,
-            }
-        )
+    """Rebuild a persisted delete marker and hide the key."""
     bucket["objects"].pop(key, None)
+    if "versions" in meta:
+        _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        return
+    _object_versions._data[(account_id, (bucket_name, key))] = [
+        {
+            "version_id": meta.get("version_id") or "null",
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "etag": "",
+            "size": 0,
+            "is_latest": True,
+            "is_delete_marker": True,
+        }
+    ]
+
+
+def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a key's version history, tags and ACLs from its sidecar. A real
+    version comes back only when its bytes did."""
+    current = bucket["objects"].get(key)
+    current_vid = (current.get("version_id") or "null") if current is not None else None
+    versions = [
+        dict(v, data=None)
+        for v in meta.get("versions", [])
+        if v.get("is_delete_marker")
+        or v["version_id"] == current_vid
+        or _version_file_exists(bucket_name, key, v["version_id"], account_id)
+    ]
+    scoped_vkey = (account_id, (bucket_name, key))
+    if versions:
+        for v in versions:
+            v["is_latest"] = False
+        versions[-1]["is_latest"] = True
+        _object_versions._data[scoped_vkey] = versions
+    else:
+        _object_versions._data.pop(scoped_vkey, None)
+    live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
+    if current is not None and not current.get("version_id"):
+        live.add("null")
+    for field, store in (("tags", _object_tags), ("acl", _object_acl)):
+        for vid, value in (meta.get(field) or {}).items():
+            if vid in live:
+                store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value
 
 
 _load_persisted_data()

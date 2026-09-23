@@ -3605,6 +3605,7 @@ def _release_address(p):
     allocation_id = _p(p, "AllocationId")
     if allocation_id and allocation_id in _addresses:
         del _addresses[allocation_id]
+        _tags.pop(allocation_id, None)
     elif allocation_id:
         return _error("InvalidAllocationID.NotFound",
                       f"The allocation ID '{allocation_id}' does not exist", 400)

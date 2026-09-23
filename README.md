@@ -130,15 +130,11 @@ docker run -p 4566:4566 \
 
 Or use the multi-tenancy feature — a 12-digit access key automatically becomes the account ID (see [Multi-Tenancy](#multi-tenancy) below).
 
-Also compatible with LocalStack's health and SMS-log endpoints:
+Also compatible with LocalStack's health endpoint:
 
 ```bash
 curl http://localhost:4566/_localstack/health
 curl http://localhost:4566/health
-
-# Direct-to-phone SNS publishes, in LocalStack's
-# {"sms_messages": {"<phone>": [...]}, "region": "<region>"} shape
-curl http://localhost:4566/_ministack/sns/sms-messages
 ```
 
 ---

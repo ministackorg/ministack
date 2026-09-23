@@ -3632,7 +3632,7 @@ def test_s3_delete_marker_survives_restart(s3_persist, tmp_path):
         meta = json.load(mf)
     assert meta["is_delete_marker"] is True
     assert meta["version_id"] == del_headers["x-amz-version-id"]
-    assert meta["previous"]["etag"]
+    assert meta["versions"][0]["etag"]
 
     _reload_bucket(s3mod, tmp_path, bucket)
 
@@ -3649,7 +3649,7 @@ def test_s3_delete_marker_survives_restart(s3_persist, tmp_path):
 
 
 def test_s3_delete_marker_restores_previous_version_metadata(s3_persist, tmp_path):
-    """The version a marker displaced is rebuilt below it from `previous`, so
+    """The version a marker displaced is rebuilt below it, so
     ListObjectVersions does not lose it across a restart."""
     s3mod = s3_persist
     bucket = "qa-s3-persist-dm-prev"
@@ -3752,6 +3752,29 @@ def test_s3_batch_delete_objects_persists_delete_marker(s3_persist, tmp_path):
     assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
     versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
     assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_noncurrent_versions_keep_bytes_tags_and_acls_across_restart(s3_persist, tmp_path):
+    """Every version comes back with its own bytes, tags and ACL, including
+    after a noncurrent version is purged under a delete marker."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-history"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    vids = [s3mod._put_object(bucket, "k", body, {"x-amz-tagging": f"n={body.decode()}"})[1]["x-amz-version-id"]
+            for body in (b"one", b"two", b"three")]
+    s3mod._put_object_acl(bucket, "k", b"", {"x-amz-acl": "public-read"}, {"versionId": [vids[0]]})
+    s3mod._delete_object(bucket, "k")
+    s3mod._delete_object(bucket, "k", query_params={"versionId": vids[2]})
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [v["version_id"] for v in versions[:-1]] == vids[:2]
+    assert versions[-1]["is_delete_marker"] and versions[-1]["is_latest"]
+    assert [s3mod._get_object_data(bucket, "k", version_id=v) for v in vids[:2]] == [b"one", b"two"]
+    assert [s3mod._object_tags[(bucket, "k", v)] for v in vids[:2]] == [{"n": "one"}, {"n": "two"}]
+    assert "AllUsers" in s3mod._object_acl[(bucket, "k", vids[0])]
 
 
 def test_s3_unversioned_delete_removes_persisted_files(s3_persist, tmp_path):

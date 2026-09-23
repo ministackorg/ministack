@@ -101,8 +101,7 @@ _ECS_RESTORE_RECONCILE_DELAY = float(
 # A container that merely reaches RUNNING is not immediately a steady service
 # deployment: it can exit during its process startup.  Keep a short window
 # before completing a rollout so the lifecycle watcher can report that exit.
-_ECS_DEPLOYMENT_STEADY_DELAY = float(
-    os.environ.get("ECS_DEPLOYMENT_STEADY_DELAY_SECONDS", "1"))
+_ECS_DEPLOYMENT_STEADY_DELAY = 1.0
 _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
@@ -1202,31 +1201,36 @@ def _reconcile_service_tasks(cluster_name, svc_key):
             if svc["deployments"]:
                 svc["deployments"][0]["runningCount"] = desired
             return
-        # Preserve #1779's rolling-deployment capacity guard.  New tasks may
-        # overlap old ones up to maximumPercent; at 100%, drain enough stale
-        # capacity before starting the replacement.
+        # Replacements fit under maximumPercent; stale tasks are stopped for
+        # room only while minimumHealthyPercent stays RUNNING.
         deployment_config = svc.get("deploymentConfiguration") or {}
         maximum_percent = int(deployment_config.get("maximumPercent", 200))
+        minimum_percent = int(deployment_config.get("minimumHealthyPercent", 100))
         max_running = max(1, desired * maximum_percent // 100)
+        min_running = -(-desired * minimum_percent // 100)
+        running = sum(1 for _, t in current_tasks + stale_tasks if t.get("lastStatus") == "RUNNING")
         capacity = max_running - len(current_tasks) - len(stale_tasks)
         if capacity < to_spawn:
-            for task_arn, _ in stale_tasks[:to_spawn - max(0, capacity)]:
+            to_stop = min(to_spawn - max(0, capacity), max(0, running - min_running), len(stale_tasks))
+            for task_arn, _ in stale_tasks[:to_stop]:
                 _stop_task({
                     "task": task_arn,
                     "cluster": cluster_name,
                     "reason": "Deployment capacity limit",
                 })
-        _run_task({
-            "cluster": cluster_name,
-            "taskDefinition": td_arn,
-            "count": to_spawn,
-            "group": f"service:{svc_name}",
-            "startedBy": svc_name,
-            "launchType": launch_type,
-            "networkConfiguration": network_cfg,
-            "enableExecuteCommand": svc.get("enableExecuteCommand", False),
-            "_deploymentId": primary.get("id") if primary else None,
-        })
+            to_spawn = max(0, capacity) + to_stop
+        if to_spawn > 0:
+            _run_task({
+                "cluster": cluster_name,
+                "taskDefinition": td_arn,
+                "count": to_spawn,
+                "group": f"service:{svc_name}",
+                "startedBy": svc_name,
+                "launchType": launch_type,
+                "networkConfiguration": network_cfg,
+                "enableExecuteCommand": svc.get("enableExecuteCommand", False),
+                "_deploymentId": primary.get("id") if primary else None,
+            })
     elif to_spawn < 0:
         # Scale down: stop newest tasks first
         excess = -to_spawn

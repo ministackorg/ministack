@@ -122,8 +122,7 @@ def _ensure_org():
     }
     _policies[FULL_ACCESS_POLICY_ID] = {
         "Id": FULL_ACCESS_POLICY_ID,
-        "Arn": f"arn:aws:organizations::aws:policy/{org_id}/service_control_policy/"
-               f"{FULL_ACCESS_POLICY_ID}",
+        "Arn": f"arn:aws:organizations::aws:policy/service_control_policy/{FULL_ACCESS_POLICY_ID}",
         "Name": "FullAWSAccess",
         "Description": "Allows access to every operation",
         "Type": "SERVICE_CONTROL_POLICY",
@@ -446,12 +445,15 @@ def _move_account(payload):
     if account is None:
         return error_response_json("AccountNotFoundException",
                                    f"We can't find an account with the AccountId {account_id}", 400)
-    if _target(source)[0] is None:
+    if _target(source)[1] not in ("ROOT", "ORGANIZATIONAL_UNIT"):
         return error_response_json("SourceParentNotFoundException",
                                    f"We can't find a parent with the ParentId {source}", 400)
-    if _target(destination)[0] is None:
+    if _target(destination)[1] not in ("ROOT", "ORGANIZATIONAL_UNIT"):
         return error_response_json("DestinationParentNotFoundException",
                                    f"We can't find a parent with the ParentId {destination}", 400)
+    if account.get("_ParentId") == destination:
+        return error_response_json("DuplicateAccountException",
+                                   "That account is already present in the specified destination.", 400)
     updated = dict(account)
     updated["_ParentId"] = destination
     _accounts[account_id] = updated

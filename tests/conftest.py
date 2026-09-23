@@ -194,7 +194,7 @@ _SERIAL_TESTS = {
     # IoT Jobs data-plane routing test: a raw urllib GET with the advertised
     # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
     # xdist pressure on the shared event loop makes it time out at random.
-    "tests/test_iot_jobs.py::test_iot_jobs_endpoint_host_reaches_the_data_plane",
+    "tests/test_iot_jobs_data.py::test_iot_jobs_endpoint_host_reaches_the_data_plane",
     # ECS service task-spawn: with a Docker daemon present (CI has one) a task
     # whose container fails to start/exits under parallel container churn is set
     # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes

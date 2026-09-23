@@ -324,8 +324,8 @@ def _list_microvm_images(query_params):
             max_results = int(raw_max_results)
         except (TypeError, ValueError):
             return _validation("maxResults must be an integer")
-        if max_results < 1:
-            return _validation("maxResults must be greater than zero")
+        if max_results < 1 or max_results > 50:
+            return _validation("maxResults must be between 1 and 50")
 
     raw_next_token = _qp("nextToken")
     try:
@@ -404,7 +404,7 @@ def _update_microvm_image(image_identifier, body):
     for field in (
         "baseImageArn", "baseImageVersion", "buildRoleArn", "codeArtifact",
         "cpuConfigurations", "description", "egressNetworkConnectors",
-        "environmentVariables", "hooks", "logging", "resources", "tags",
+        "environmentVariables", "hooks", "logging", "resources", "additionalOsCapabilities",
     ):
         if field in data:
             record[field] = data[field]
@@ -414,10 +414,7 @@ def _update_microvm_image(image_identifier, body):
         "state": "UPDATED",
         "updatedAt": _now(),
     })
-    return json_response({
-        **{k: v for k, v in record.items() if v is not None},
-        "imageVersion": version,
-    })
+    return json_response({k: v for k, v in record.items() if v is not None and k != "tags"})
 
 
 # ---------------------------------------------------------------------------
