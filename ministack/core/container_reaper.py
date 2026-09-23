@@ -199,7 +199,8 @@ def start(get_docker) -> None:
 SERVICE_LABELS = (
     "ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks",
     "ministack=lambda", "ministack=dsql", "ministack=mwaa", "ministack=glue",
-    "ministack=codebuild", "ministack=opensearch",
+    "ministack=codebuild", "ministack=opensearch", "ministack=lambda-microvm",
+    "ministack=lambda-microvm-build",
     "ministack", "com.ministack.service",
 )
 
@@ -280,4 +281,3 @@ def drop_containers(containers, stop_timeout: int = 2, force: bool = False) -> i
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(16, len(targets)), thread_name_prefix="ministack-reap") as pool:
         return sum(1 for ok in pool.map(_drop, targets) if ok)
-

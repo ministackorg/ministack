@@ -1061,6 +1061,42 @@ are also dropped from `DescribeInstances` after 60 seconds; AWS says only that a
 "remains visible in the console for a short while", so a `wait instance-terminated` followed by a
 describe can find nothing where AWS would still answer.
 
+### Docker-backed Lambda MicroVM draft
+
+Set `MINISTACK_MICROVM_BACKEND=docker` to exercise the Lambda MicroVM image
+workflow locally. `CreateMicrovmImage` reads the required `codeArtifact.uri`
+from MiniStack S3, extracts its root `Dockerfile`, builds a Docker image, and
+starts a temporary validation container. The image must expose the configured
+MicroVM hook server; `/ready` is required and `/validate` is called when
+enabled. A successful build stores the local image reference in the MicroVM
+image record. `RunMicrovm` then starts a fresh container from that exact built
+image and calls the runtime `/run` hook. Suspend, resume, and terminate call
+their corresponding hooks when enabled.
+
+This is an opt-in local/CI draft, not a Firecracker implementation. The
+Docker-backed path requires the MiniStack Docker socket and does not provide a
+separate guest kernel, VM networking, or snapshot-preserved memory. See
+[`contrib/microvm-docker-hook/`](contrib/microvm-docker-hook/) for a minimal
+Dockerfile and hook server.
+
+The AWS CLI operation requires the four create parameters explicitly. After
+uploading the hook ZIP to S3, create the image with the real operation shape:
+
+```bash
+aws --endpoint-url=http://localhost:4566 lambda-microvms create-microvm-image \
+  --base-image-arn arn:aws:lambda:us-east-1:aws:microvm-image:base \
+  --build-role-arn arn:aws:iam::000000000000:role/build \
+  --code-artifact uri=s3://microvm-artifacts/microvm-hook.zip \
+  --name docker-hook-smoke \
+  --hooks file:///tmp/microvm-hooks.json
+```
+
+`/tmp/microvm-hooks.json` contains the `port`, `microvmImageHooks`, and
+`microvmHooks` configuration shown in the contrib example. The shorthand
+`uri=s3://...` is the AWS CLI syntax for the tagged-union `--code-artifact`
+structure; omitting the four required flags produces the CLI validation error
+before MiniStack receives the request.
+
 ### EKS with Real Kubernetes (k3s)
 
 MiniStack's EKS spawns a real [k3s](https://k3s.io) cluster (75 MB image) when you create a cluster. `kubectl`, Helm, and any Kubernetes tooling work out of the box.
