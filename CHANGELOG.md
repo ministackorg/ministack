@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Organizations — member accounts, service control policies and attachments** — `CreateAccount`, `DescribeCreateAccountStatus`, `MoveAccount`, `CloseAccount`, `CreatePolicy`, `DescribePolicy`, `UpdatePolicy`, `DeletePolicy`, `ListPolicies`, `AttachPolicy`, `DetachPolicy`, `ListPoliciesForTarget`, `ListTargetsForPolicy`, `EnablePolicyType` and `DisablePolicyType`, so `aws_organizations_account`, `aws_organizations_policy` and `aws_organizations_policy_attachment` apply. `CreateAccount` answers with a `CreateAccountStatus` whose id the provider reads back through `DescribeCreateAccountStatus`, as on AWS. A root carries `SERVICE_CONTROL_POLICY` enabled and the AWS-managed `p-FullAWSAccess`, attaching a policy whose type the root has disabled is `PolicyTypeNotEnabledException`, and deleting an attached policy is `PolicyInUseException`. Requested by @rv0lt.
+
 ## [1.5.15] — 2026-09-22
 
 ### Added
