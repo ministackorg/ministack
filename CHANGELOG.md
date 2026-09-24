@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **CloudFront — public keys and key groups** — `CreatePublicKey`, `GetPublicKey`, `GetPublicKeyConfig`, `UpdatePublicKey`, `DeletePublicKey`, `ListPublicKeys`, `CreateKeyGroup`, `GetKeyGroup`, `GetKeyGroupConfig`, `UpdateKeyGroup`, `DeleteKeyGroup`, `ListKeyGroups`, so `aws_cloudfront_public_key` / `aws_cloudfront_key_group` (and Upbound's Terraform-based `provider-aws-cloudfront`) apply instead of hitting `NoSuchResource` on every create. Key groups validate their `Items` against real public keys, `DeletePublicKey` refuses a key still referenced by a key group, and `DeleteKeyGroup` refuses a group still referenced by a distribution's trusted key groups — both ETag/`If-Match` optimistic concurrency like the other CloudFront policy families.
+
 ## [1.5.16] — 2026-09-23
 
 ### Added

@@ -25,6 +25,10 @@ Supports:
   Response headers policies: CreateResponseHeadersPolicy, GetResponseHeadersPolicy,
                  GetResponseHeadersPolicyConfig, UpdateResponseHeadersPolicy,
                  DeleteResponseHeadersPolicy, ListDistributionsByResponseHeadersPolicyId
+  Public keys: CreatePublicKey, GetPublicKey, GetPublicKeyConfig,
+                 UpdatePublicKey, DeletePublicKey, ListPublicKeys
+  Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
+                 UpdateKeyGroup, DeleteKeyGroup, ListKeyGroups
   Tags: TagResource, UntagResource, ListTagsForResource
   SaaS Manager (multi-tenant distributions):
                  CreateConnectionGroup, GetConnectionGroup,
@@ -99,6 +103,14 @@ _RHP_CFG_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/config$"
 _RHP_ID_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/?$")
 _DIST_BY_RHP_RE = re.compile(r"^/2020-05-31/distributionsByResponseHeadersPolicyId/([^/]+)/?$")
 
+_PUBLIC_KEY_RE = re.compile(r"^/2020-05-31/public-key/?$")
+_PUBLIC_KEY_CFG_RE = re.compile(r"^/2020-05-31/public-key/([^/]+)/config$")
+_PUBLIC_KEY_ID_RE = re.compile(r"^/2020-05-31/public-key/([^/]+)/?$")
+
+_KEY_GROUP_RE = re.compile(r"^/2020-05-31/key-group/?$")
+_KEY_GROUP_CFG_RE = re.compile(r"^/2020-05-31/key-group/([^/]+)/config$")
+_KEY_GROUP_ID_RE = re.compile(r"^/2020-05-31/key-group/([^/]+)/?$")
+
 # SaaS Manager path regexes. Get* identifiers may be an ARN — the ASGI layer
 # hands us the percent-decoded path, so an ARN's embedded "/" lands in the
 # identifier segment. The identifier regexes are greedy and MUST be matched
@@ -128,8 +140,6 @@ _DIST_BY_CONN_MODE_RE = re.compile(r"^/2020-05-31/distributionsByConnectionMode/
 # the payload member's locationName, MaxItems defaults to 100, an empty list
 # omits Items, and NextMarker is omitted when there is no next page.
 # ---------------------------------------------------------------------------
-_KEY_GROUP_LIST_RE = re.compile(r"^/2020-05-31/key-group/?$")
-_PUBLIC_KEY_LIST_RE = re.compile(r"^/2020-05-31/public-key/?$")
 _FLE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption/?$")
 _FLE_PROFILE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption-profile/?$")
 _CDP_LIST_RE = re.compile(r"^/2020-05-31/continuous-deployment-policy/?$")
@@ -152,6 +162,8 @@ _kvstores = AccountScopedDict()  # Name -> KVS record
 _cache_policies = AccountScopedDict()  # Id -> cache policy record
 _origin_request_policies = AccountScopedDict()  # Id -> origin request policy record
 _response_headers_policies = AccountScopedDict()  # Id -> response headers policy record
+_public_keys = AccountScopedDict()  # Id -> public key record
+_key_groups = AccountScopedDict()  # Id -> key group record
 _connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
 _distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
 _tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
@@ -167,6 +179,8 @@ def reset():
     _cache_policies.clear()
     _origin_request_policies.clear()
     _response_headers_policies.clear()
+    _public_keys.clear()
+    _key_groups.clear()
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
@@ -184,6 +198,8 @@ def get_state():
             "cache_policies": _cache_policies,
             "origin_request_policies": _origin_request_policies,
             "response_headers_policies": _response_headers_policies,
+            "public_keys": _public_keys,
+            "key_groups": _key_groups,
             "connection_groups": _connection_groups,
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
@@ -205,6 +221,8 @@ def _restore_state(data):
     _cache_policies.update(data.get("cache_policies", {}))
     _origin_request_policies.update(data.get("origin_request_policies", {}))
     _response_headers_policies.update(data.get("response_headers_policies", {}))
+    _public_keys.update(data.get("public_keys", {}))
+    _key_groups.update(data.get("key_groups", {}))
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
@@ -224,6 +242,14 @@ def _dist_id() -> str:
 
 def _inv_id() -> str:
     return "I" + "".join(random.choices(_ID_CHARS, k=13))
+
+
+def _pk_id() -> str:
+    return "K" + "".join(random.choices(_ID_CHARS, k=13))
+
+
+def _kg_id() -> str:
+    return "K" + "".join(random.choices(_ID_CHARS, k=13))
 
 
 # Real SaaS Manager resource IDs are dt_/cg_-prefixed KSUIDs (27 base62 chars).
@@ -1614,6 +1640,307 @@ _RHP_SPEC = {
 
 
 # ---------------------------------------------------------------------------
+# PublicKey — used by signed URLs/cookies and as KeyGroup members. Not built
+# on the generic policy CRUD helpers above: PublicKey has no Name-uniqueness
+# constraint worth enforcing (real AWS dedupes by CallerReference, which
+# nothing here reads back), tracks CreatedTime rather than LastModifiedTime,
+# and its "in use" check is against KeyGroups, not distributions.
+# ---------------------------------------------------------------------------
+
+
+def _parse_public_key_config(el):
+    caller_reference = _text(el, "CallerReference")
+    name = _text(el, "Name")
+    encoded_key = _text(el, "EncodedKey")
+    if not caller_reference or not name or not encoded_key:
+        return None, _error(
+            "InvalidArgument", "CallerReference, Name, and EncodedKey are required.", 400
+        )
+    return {
+        "CallerReference": caller_reference, "Name": name,
+        "EncodedKey": encoded_key, "Comment": _text(el, "Comment"),
+    }, None
+
+
+def _build_public_key_config_xml(parent, cfg):
+    SubElement(parent, "CallerReference").text = cfg["CallerReference"]
+    SubElement(parent, "Name").text = cfg["Name"]
+    SubElement(parent, "EncodedKey").text = cfg["EncodedKey"]
+    if cfg.get("Comment"):
+        SubElement(parent, "Comment").text = cfg["Comment"]
+
+
+def _build_public_key_xml(parent, pk):
+    SubElement(parent, "Id").text = pk["Id"]
+    SubElement(parent, "CreatedTime").text = pk["CreatedTime"]
+    cfg_el = SubElement(parent, "PublicKeyConfig")
+    _build_public_key_config_xml(cfg_el, pk["Config"])
+
+
+def _public_keys_using(pk_id):
+    return [kg.get("Id", "") for kg in _key_groups.values() if pk_id in kg["Config"].get("Items", [])]
+
+
+def _create_public_key(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_public_key_config(el)
+    if err is not None:
+        return err
+    pk_id = _pk_id()
+    etag = new_uuid()
+    pk = {"Id": pk_id, "ETag": etag, "CreatedTime": _now_iso(), "Config": cfg}
+    _public_keys[pk_id] = pk
+    logger.info("CreatePublicKey id=%s name=%s", pk_id, cfg["Name"])
+    return _xml_response(
+        "PublicKey", lambda r: _build_public_key_xml(r, pk), status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/public-key/{pk_id}"},
+    )
+
+
+def _get_public_key(pk_id):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    return _xml_response("PublicKey", lambda r: _build_public_key_xml(r, pk), extra_headers={"ETag": pk["ETag"]})
+
+
+def _get_public_key_config(pk_id):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    return _xml_response(
+        "PublicKeyConfig", lambda r: _build_public_key_config_xml(r, pk["Config"]),
+        extra_headers={"ETag": pk["ETag"]},
+    )
+
+
+def _update_public_key(pk_id, headers, body):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != pk["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_public_key_config(el)
+    if err is not None:
+        return err
+    if cfg["EncodedKey"] != pk["Config"]["EncodedKey"]:
+        return _error("CannotChangeImmutablePublicKeyFields", "The encoded key cannot be changed.", 400)
+    new_etag = new_uuid()
+    pk["Config"] = cfg
+    pk["ETag"] = new_etag
+    _public_keys[pk_id] = pk
+    logger.info("UpdatePublicKey id=%s", pk_id)
+    return _xml_response("PublicKey", lambda r: _build_public_key_xml(r, pk), extra_headers={"ETag": new_etag})
+
+
+def _delete_public_key(pk_id, headers):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != pk["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _public_keys_using(pk_id):
+        return _error("PublicKeyInUse", "The public key is attached to one or more key groups.", 409)
+    del _public_keys[pk_id]
+    logger.info("DeletePublicKey id=%s", pk_id)
+    return 204, {}, b""
+
+
+def _list_public_keys(query_params):
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    keys = list(_public_keys.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(keys))
+        if keys:
+            items_el = SubElement(root, "Items")
+            for pk in keys:
+                summary = SubElement(items_el, "PublicKeySummary")
+                SubElement(summary, "Id").text = pk["Id"]
+                SubElement(summary, "Name").text = pk["Config"]["Name"]
+                SubElement(summary, "CreatedTime").text = pk["CreatedTime"]
+                SubElement(summary, "EncodedKey").text = pk["Config"]["EncodedKey"]
+                if pk["Config"].get("Comment"):
+                    SubElement(summary, "Comment").text = pk["Config"]["Comment"]
+
+    return _xml_response("PublicKeyList", build)
+
+
+# ---------------------------------------------------------------------------
+# KeyGroup — a named list of PublicKey ids, referenced by a distribution's
+# trusted key groups (signed URLs/cookies) and by cache behaviors' OAC-signed
+# origin access. Bespoke rather than the generic policy CRUD helpers above:
+# KeyGroupConfig's own Items list has no analogue there, and AWS's error
+# codes for this family (NoSuchResource / ResourceInUse) differ from the
+# Cache/OriginRequest/ResponseHeaders policy families' Name-specific ones.
+# ---------------------------------------------------------------------------
+
+
+def _parse_key_group_config(el):
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The key group name is required.", 400)
+    items_el = _find(el, "Items")
+    items = []
+    if items_el is not None:
+        for child in items_el:
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local == "PublicKey":
+                items.append(child.text or "")
+    if not items:
+        return None, _error("InvalidArgument", "A key group must contain at least one public key.", 400)
+    for pk_id in items:
+        if pk_id not in _public_keys:
+            return None, _error("InvalidArgument", f"Public key {pk_id} does not exist.", 400)
+    return {"Name": name, "Items": items, "Comment": _text(el, "Comment")}, None
+
+
+def _build_key_group_config_xml(parent, cfg):
+    SubElement(parent, "Name").text = cfg["Name"]
+    items_el = SubElement(parent, "Items")
+    for pk_id in cfg["Items"]:
+        SubElement(items_el, "PublicKey").text = pk_id
+    if cfg.get("Comment"):
+        SubElement(parent, "Comment").text = cfg["Comment"]
+
+
+def _build_key_group_xml(parent, kg):
+    SubElement(parent, "Id").text = kg["Id"]
+    SubElement(parent, "LastModifiedTime").text = kg["LastModifiedTime"]
+    cfg_el = SubElement(parent, "KeyGroupConfig")
+    _build_key_group_config_xml(cfg_el, kg["Config"])
+
+
+def _key_groups_using(kg_id):
+    return [d.get("Id", "") for d in _distributions.values() if _value_contains(d, kg_id)]
+
+
+def _create_key_group(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_key_group_config(el)
+    if err is not None:
+        return err
+    for existing in _key_groups.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return _error("KeyGroupAlreadyExists", "A key group with the same name already exists.", 409)
+    kg_id = _kg_id()
+    etag = new_uuid()
+    kg = {"Id": kg_id, "ETag": etag, "LastModifiedTime": _now_iso(), "Config": cfg}
+    _key_groups[kg_id] = kg
+    logger.info("CreateKeyGroup id=%s name=%s", kg_id, cfg["Name"])
+    return _xml_response(
+        "KeyGroup", lambda r: _build_key_group_xml(r, kg), status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/key-group/{kg_id}"},
+    )
+
+
+def _get_key_group(kg_id):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    return _xml_response("KeyGroup", lambda r: _build_key_group_xml(r, kg), extra_headers={"ETag": kg["ETag"]})
+
+
+def _get_key_group_config(kg_id):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    return _xml_response(
+        "KeyGroupConfig", lambda r: _build_key_group_config_xml(r, kg["Config"]),
+        extra_headers={"ETag": kg["ETag"]},
+    )
+
+
+def _update_key_group(kg_id, headers, body):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kg["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_key_group_config(el)
+    if err is not None:
+        return err
+    for existing in _key_groups.values():
+        if existing["Id"] != kg_id and existing["Config"]["Name"] == cfg["Name"]:
+            return _error("KeyGroupAlreadyExists", "A key group with the same name already exists.", 409)
+    new_etag = new_uuid()
+    kg["Config"] = cfg
+    kg["ETag"] = new_etag
+    kg["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateKeyGroup id=%s", kg_id)
+    return _xml_response("KeyGroup", lambda r: _build_key_group_xml(r, kg), extra_headers={"ETag": new_etag})
+
+
+def _delete_key_group(kg_id, headers):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kg["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _key_groups_using(kg_id):
+        return _error("ResourceInUse", "The key group is attached to one or more distributions.", 409)
+    del _key_groups[kg_id]
+    logger.info("DeleteKeyGroup id=%s", kg_id)
+    return 204, {}, b""
+
+
+def _list_key_groups(query_params):
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    groups = list(_key_groups.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(groups))
+        if groups:
+            items_el = SubElement(root, "Items")
+            for kg in groups:
+                summary = SubElement(items_el, "KeyGroupSummary")
+                kg_el = SubElement(summary, "KeyGroup")
+                _build_key_group_xml(kg_el, kg)
+
+    return _xml_response("KeyGroupList", build)
+
+
+# ---------------------------------------------------------------------------
 # Read-only list handlers for resource families with no backing store.
 # Shapes verified against botocore cloudfront service-2.json (2020-05-31).
 # ---------------------------------------------------------------------------
@@ -1900,6 +2227,55 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _policy_list_distributions(_response_headers_policies, _RHP_SPEC, m.group(1))
 
+    # Public key routes. Unlike every other CloudFront policy family, real
+    # AWS puts UpdatePublicKey on the .../config path (PUT), not the bare
+    # .../{Id} path -- verified against botocore's service-2.json.
+    m = _PUBLIC_KEY_CFG_RE.match(path)
+    if m:
+        pk_id = m.group(1)
+        if method == "GET":
+            return _get_public_key_config(pk_id)
+        if method == "PUT":
+            return _update_public_key(pk_id, headers, body)
+
+    m = _PUBLIC_KEY_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_public_key(body)
+        if method == "GET":
+            return _list_public_keys(query_params)
+
+    m = _PUBLIC_KEY_ID_RE.match(path)
+    if m:
+        pk_id = m.group(1)
+        if method == "GET":
+            return _get_public_key(pk_id)
+        if method == "DELETE":
+            return _delete_public_key(pk_id, headers)
+
+    # Key group routes
+    m = _KEY_GROUP_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_key_group_config(m.group(1))
+
+    m = _KEY_GROUP_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_key_group(body)
+        if method == "GET":
+            return _list_key_groups(query_params)
+
+    m = _KEY_GROUP_ID_RE.match(path)
+    if m:
+        kg_id = m.group(1)
+        if method == "GET":
+            return _get_key_group(kg_id)
+        if method == "PUT":
+            return _update_key_group(kg_id, headers, body)
+        if method == "DELETE":
+            return _delete_key_group(kg_id, headers)
+
     # CloudFront Functions API (used by Terraform aws_cloudfront_function)
     m = _FUN_DESCRIBE_RE.match(path)
     if m:
@@ -2055,14 +2431,6 @@ async def handle_request(method, path, headers, body, query_params):
     # Read-only list surface for resource families with no backing store.
     # Family split matches botocore: KeyGroupList-style carry no Marker/
     # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
-    m = _KEY_GROUP_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "KeyGroupList", with_marker=False)
-
-    m = _PUBLIC_KEY_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "PublicKeyList", with_marker=False)
-
     m = _FLE_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "FieldLevelEncryptionList", with_marker=False)
