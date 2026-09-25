@@ -1640,11 +1640,7 @@ _RHP_SPEC = {
 
 
 # ---------------------------------------------------------------------------
-# PublicKey — used by signed URLs/cookies and as KeyGroup members. Not built
-# on the generic policy CRUD helpers above: PublicKey has no Name-uniqueness
-# constraint worth enforcing (real AWS dedupes by CallerReference, which
-# nothing here reads back), tracks CreatedTime rather than LastModifiedTime,
-# and its "in use" check is against KeyGroups, not distributions.
+# Public keys
 # ---------------------------------------------------------------------------
 
 
@@ -1735,8 +1731,9 @@ def _update_public_key(pk_id, headers, body):
     cfg, err = _parse_public_key_config(el)
     if err is not None:
         return err
-    if cfg["EncodedKey"] != pk["Config"]["EncodedKey"]:
-        return _error("CannotChangeImmutablePublicKeyFields", "The encoded key cannot be changed.", 400)
+    # Only the comment can change.
+    if any(cfg[k] != pk["Config"][k] for k in ("CallerReference", "Name", "EncodedKey")):
+        return _error("CannotChangeImmutablePublicKeyFields", "Only the comment can be changed.", 400)
     new_etag = new_uuid()
     pk["Config"] = cfg
     pk["ETag"] = new_etag
@@ -1787,12 +1784,7 @@ def _list_public_keys(query_params):
 
 
 # ---------------------------------------------------------------------------
-# KeyGroup — a named list of PublicKey ids, referenced by a distribution's
-# trusted key groups (signed URLs/cookies) and by cache behaviors' OAC-signed
-# origin access. Bespoke rather than the generic policy CRUD helpers above:
-# KeyGroupConfig's own Items list has no analogue there, and AWS's error
-# codes for this family (NoSuchResource / ResourceInUse) differ from the
-# Cache/OriginRequest/ResponseHeaders policy families' Name-specific ones.
+# Key groups
 # ---------------------------------------------------------------------------
 
 
@@ -1831,8 +1823,19 @@ def _build_key_group_xml(parent, kg):
     _build_key_group_config_xml(cfg_el, kg["Config"])
 
 
+def _trusted_key_group_ids(dist):
+    try:
+        root = fromstring(dist.get("config_xml") or "")
+    except Exception:
+        return set()
+    return {
+        el.text for tkg in root.iter() if tkg.tag.split("}")[-1] == "TrustedKeyGroups"
+        for el in tkg.iter() if el.tag.split("}")[-1] == "KeyGroup" and el.text
+    }
+
+
 def _key_groups_using(kg_id):
-    return [d.get("Id", "") for d in _distributions.values() if _value_contains(d, kg_id)]
+    return [d.get("Id", "") for d in _distributions.values() if kg_id in _trusted_key_group_ids(d)]
 
 
 def _create_key_group(body):
@@ -2227,9 +2230,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _policy_list_distributions(_response_headers_policies, _RHP_SPEC, m.group(1))
 
-    # Public key routes. Unlike every other CloudFront policy family, real
-    # AWS puts UpdatePublicKey on the .../config path (PUT), not the bare
-    # .../{Id} path -- verified against botocore's service-2.json.
+    # UpdatePublicKey is PUT .../config, unlike the other families.
     m = _PUBLIC_KEY_CFG_RE.match(path)
     if m:
         pk_id = m.group(1)
