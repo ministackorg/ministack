@@ -3129,6 +3129,47 @@ def _pid_file(port: int) -> str:
     return os.path.join(tempfile.gettempdir(), f"ministack-{port}.pid")
 
 
+# How often the MINISTACK_PARENT_PID watcher checks that the parent is alive.
+_PARENT_POLL_INTERVAL = 1.0
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    return True
+
+
+def _parent_exit_trigger():
+    """Shutdown trigger for MINISTACK_PARENT_PID, or None when it is unset.
+
+    A test runner that launches MiniStack names its own pid here. When that
+    process exits for any reason, including SIGKILL, MiniStack shuts down
+    gracefully, so the lifespan shutdown removes the containers it launched.
+    Without it an orphaned MiniStack keeps running, and keeps its containers,
+    because nothing ever signals it.
+    """
+    raw = os.environ.get("MINISTACK_PARENT_PID", "").strip()
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a process id, got {raw!r}")
+    if pid <= 0:
+        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a positive process id, got {pid}")
+
+    async def _wait_for_parent_exit():
+        while _process_alive(pid):
+            await asyncio.sleep(_PARENT_POLL_INTERVAL)
+        logger.info("Parent process %d has exited; shutting down", pid)
+
+    return _wait_for_parent_exit
+
+
 def main():
     from hypercorn.asyncio import serve as hypercorn_serve
     from hypercorn.config import Config as HypercornConfig
@@ -3137,6 +3178,7 @@ def main():
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
     parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
     args = parser.parse_args()
+    shutdown_trigger = _parent_exit_trigger()
 
     port = int(_resolve_port())
     # BIND_HOST controls the bind interface; defaults to 0.0.0.0 (existing
@@ -3240,7 +3282,7 @@ def main():
         if _tls.use_ssl_enabled():
             config.certfile, config.keyfile = _tls.resolve_tls_material()
 
-        asyncio.run(hypercorn_serve(app, config))
+        asyncio.run(hypercorn_serve(app, config, shutdown_trigger=shutdown_trigger))
     finally:
         _cleanup()
 
