@@ -810,6 +810,9 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 def _docker_config(tmp_path, monkeypatch, config, home_config=None):
     """An isolated Docker CLI setup: ``DOCKER_CONFIG`` holds ``config`` (none if
     None) and ``$HOME/.docker/config.json`` holds ``home_config``."""
+    import importlib.metadata
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "7.2.0")  # the context fallback's first release
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     monkeypatch.delenv("DOCKER_HOST", raising=False)
     home = tmp_path / "home"
