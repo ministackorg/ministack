@@ -383,6 +383,125 @@ def test_sfn_get_execution_history_v2(sfn):
     assert "ExecutionSucceeded" in types
     assert any("Pass" in t for t in types)
 
+
+def test_sfn_get_execution_history_pagination(sfn):
+    states = {
+        f"P{i}": {"Type": "Pass", **({"End": True} if i == 14 else {"Next": f"P{i + 1}"})}
+        for i in range(15)
+    }
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-pages-{_uuid_mod.uuid4().hex}",
+        definition=json.dumps({"StartAt": "P0", "States": states}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input='{"secret":"value"}')
+    assert _wait_sfn(sfn, ex["executionArn"])["status"] == "SUCCEEDED"
+
+    arn = ex["executionArn"]
+    full = sfn.get_execution_history(executionArn=arn)["events"]
+    assert len(full) > 25
+    assert full[-1]["type"] == "ExecutionSucceeded"
+
+    pages = []
+    token = None
+    while True:
+        request = {"executionArn": arn, "maxResults": 7}
+        if token is not None:
+            request["nextToken"] = token
+        page = sfn.get_execution_history(**request)
+        pages.append(page)
+        token = page.get("nextToken")
+        if token is None:
+            break
+    assert len(pages) > 2
+    assert all(len(page["events"]) == 7 for page in pages[:-1])
+    assert [event["id"] for page in pages for event in page["events"]] == [event["id"] for event in full]
+    assert "nextToken" not in pages[-1]
+
+    first_25 = sfn.get_execution_history(executionArn=arn, maxResults=25)
+    assert all(event["type"] != "ExecutionSucceeded" for event in first_25["events"])
+    assert "nextToken" in first_25
+    last = sfn.get_execution_history(executionArn=arn, maxResults=25, nextToken=first_25["nextToken"])
+    assert last["events"][-1]["type"] == "ExecutionSucceeded"
+    assert "nextToken" not in last
+
+    reverse = []
+    token = None
+    while True:
+        request = {"executionArn": arn, "maxResults": 7, "reverseOrder": True}
+        if token is not None:
+            request["nextToken"] = token
+        page = sfn.get_execution_history(**request)
+        reverse.extend(page["events"])
+        token = page.get("nextToken")
+        if token is None:
+            break
+    assert [event["id"] for event in reverse] == [event["id"] for event in reversed(full)]
+
+    without_data = sfn.get_execution_history(executionArn=arn, maxResults=7, includeExecutionData=False)
+    assert "nextToken" in without_data
+    without_data_next = sfn.get_execution_history(
+        executionArn=arn, maxResults=7, includeExecutionData=False, nextToken=without_data["nextToken"]
+    )
+    assert [event["id"] for event in without_data_next["events"]] == [event["id"] for event in pages[1]["events"]]
+    assert "input" not in without_data["events"][0]["executionStartedEventDetails"]
+    for event in without_data["events"]:
+        for key, details in event.items():
+            if key.endswith("EventDetails") and isinstance(details, dict):
+                assert "input" not in details
+                assert "output" not in details
+    assert full[0]["executionStartedEventDetails"]["input"] == '{"secret":"value"}'
+    assert sfn.get_execution_history(executionArn=arn, maxResults=0)["events"] == full
+
+
+def test_sfn_get_execution_history_rejects_unrelated_and_forged_tokens(sfn):
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-token-{_uuid_mod.uuid4().hex}",
+        definition=_pass_definition(),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    first = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])
+    second = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])
+    assert _wait_sfn(sfn, first["executionArn"])["status"] == "SUCCEEDED"
+    assert _wait_sfn(sfn, second["executionArn"])["status"] == "SUCCEEDED"
+    page = sfn.get_execution_history(executionArn=first["executionArn"], maxResults=1)
+    token = page["nextToken"]
+
+    for request in (
+        {"executionArn": second["executionArn"], "maxResults": 1, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "nextToken": "1"},
+        {"executionArn": first["executionArn"], "maxResults": 2, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "reverseOrder": True, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "includeExecutionData": False, "nextToken": token},
+    ):
+        with pytest.raises(ClientError) as exc:
+            sfn.get_execution_history(**request)
+        assert exc.value.response["Error"]["Code"] == "InvalidToken"
+
+
+def test_sfn_get_execution_history_reverse_pages_ignore_new_events(sfn):
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-running-{_uuid_mod.uuid4().hex}",
+        definition=json.dumps({"StartAt": "Wait", "States": {"Wait": {"Type": "Wait", "Seconds": 120, "End": True}}}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    arn = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])["executionArn"]
+    for _ in range(50):
+        page = sfn.get_execution_history(executionArn=arn, reverseOrder=True, maxResults=1)
+        if page["events"][0]["type"] == "WaitStateEntered" and "nextToken" in page:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("running execution did not enter Wait state")
+
+    sfn.stop_execution(executionArn=arn)
+    next_page = sfn.get_execution_history(
+        executionArn=arn, reverseOrder=True, maxResults=1, nextToken=page["nextToken"]
+    )
+    assert [event["type"] for event in next_page["events"]] == ["ExecutionStarted"]
+    assert "nextToken" not in next_page
+
+
 def test_sfn_tags_v2(sfn):
     definition = json.dumps(
         {
