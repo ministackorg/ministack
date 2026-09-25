@@ -8,12 +8,7 @@ There is no real VM behind a MicroVM here — a RunMicrovm goes straight to
 RUNNING and an image build straight to CREATED, which is what a client polling
 GetMicrovm / GetMicrovmImage needs to proceed.
 
-Docker-backed execution is available when MINISTACK_MICROVM_BACKEND=docker.
-CreateMicrovmImage reads the codeArtifact.uri from MiniStack S3, extracts its
-root Dockerfile, builds a Docker image, and runs a temporary validation
-container. RunMicrovm starts a fresh container from that image and calls the
-runtime /run hook. Suspend, resume, and terminate call their corresponding
-hooks when enabled.
+With Docker, images are built from the codeArtifact Dockerfile like AWS.
 
 Shapes verified against the AWS Lambda MicroVM API reference (2025-09-09):
 RunMicrovm, GetMicrovm, ListMicrovms, SuspendMicrovm, ResumeMicrovm,
@@ -31,6 +26,7 @@ import pathlib
 import secrets
 import stat
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -45,15 +41,11 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     json_response,
+    request_scope,
 )
 
 logger = logging.getLogger("lambda_microvms")
 
-# Docker is deliberately opt-in. The normal MicroVM emulator remains a fast
-# control-plane stub, while local smoke tests can ask for a real workload
-# behind a MicroVM by setting MINISTACK_MICROVM_BACKEND=docker and registering
-# a MicroVM image with the non-AWS `containerImage` extension.
-MICROVM_BACKEND = os.environ.get("MINISTACK_MICROVM_BACKEND", "metadata").strip().lower()
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 _docker = None
@@ -90,9 +82,7 @@ def _restore_state(data):
     _microvms.update(data.get("microvms", {}))
     _images.update(data.get("images", {}))
 
-    # Container handles are intentionally not persisted. A Docker-backed
-    # MicroVM is instance-store-like: after MiniStack restarts, the workload
-    # behind it is gone and the API must not report a phantom RUNNING VM.
+    # Workloads do not survive a restart.
     for record in _microvms.values():
         if record.get("backend") == "docker" and record.get("state") not in (
             "TERMINATED", "TERMINATING"
@@ -169,7 +159,7 @@ def _resolve_image_arn(image_identifier: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _docker_enabled() -> bool:
-    return MICROVM_BACKEND == "docker"
+    return _get_docker() is not None
 
 
 def _get_docker():
@@ -201,12 +191,7 @@ def _get_ministack_network(client):
 
 
 def _valid_container_image(value) -> bool:
-    """Reject values that cannot be a Docker image reference.
-
-    The reference is passed to docker-py as an argument, never through a
-    shell. This check mainly prevents control characters and accidental empty
-    values from crossing the service boundary.
-    """
+    """Reject values that cannot be a Docker image reference."""
     return (
         isinstance(value, str)
         and 1 <= len(value) <= 512
@@ -237,26 +222,6 @@ def _hook_timeout(record, group, name, default=30):
         return max(1, min(3600, int(raw)))
     except (TypeError, ValueError):
         return default
-
-
-def _validate_docker_image_request(data):
-    """Require the application hook server needed by the Docker emulation."""
-    hooks = data.get("hooks") or {}
-    if not _hook_port({"hooks": hooks}):
-        return _validation(
-            "Docker-backed MicroVM images require hooks.port between 1 and 65535"
-        )
-    image_hooks = hooks.get("microvmImageHooks") or {}
-    if image_hooks.get("ready") != "ENABLED":
-        return _validation(
-            "Docker-backed MicroVM images require hooks.microvmImageHooks.ready=ENABLED"
-        )
-    runtime_hooks = hooks.get("microvmHooks") or {}
-    if runtime_hooks.get("run") != "ENABLED":
-        return _validation(
-            "Docker-backed MicroVM images require hooks.microvmHooks.run=ENABLED"
-        )
-    return None
 
 
 def _s3_artifact_bytes(uri):
@@ -310,10 +275,32 @@ def _container_ip(container, network):
     return ip
 
 
-def _hook_path(name, image_phase=False):
-    if image_phase:
-        return f"/{name}"
+def _hook_path(name):
     return f"/aws/lambda-microvms/runtime/v1/{name}"
+
+
+def _hooks_missing_port(hooks):
+    hooks = hooks or {}
+    configured = any(
+        value == "ENABLED"
+        for group in ("microvmHooks", "microvmImageHooks")
+        for value in (hooks.get(group) or {}).values()
+    )
+    return configured and not _hook_port({"hooks": hooks})
+
+
+def _workload_kwargs(record):
+    kwargs = {}
+    env = record.get("environmentVariables")
+    if isinstance(env, dict) and env:
+        kwargs["environment"] = {str(k): str(v) for k, v in env.items()}
+    if record.get("additionalOsCapabilities") == ["ALL"]:
+        kwargs["cap_add"] = ["ALL"]
+    port = _hook_port(record)
+    client = _get_docker()
+    if port and client is not None and not _get_ministack_network(client):
+        kwargs["ports"] = {f"{port}/tcp": ("127.0.0.1", None)}
+    return kwargs
 
 
 def _call_hook(record, container, name, *, image_phase=False, payload=None, retry=False):
@@ -323,12 +310,20 @@ def _call_hook(record, container, name, *, image_phase=False, payload=None, retr
         raise RuntimeError("MicroVM hook port is not configured")
     client = _get_docker()
     network = _get_ministack_network(client) if client else None
-    host = _container_ip(container, network)
+    if network:
+        host = _container_ip(container, network)
+    else:
+        # Host-run MiniStack reaches the hook via the loopback-published port.
+        container.reload()
+        bindings = (container.attrs.get("NetworkSettings", {}).get("Ports") or {}).get(f"{port}/tcp")
+        if not bindings:
+            raise RuntimeError("MicroVM hook port is not published")
+        host, port = "127.0.0.1", int(bindings[0]["HostPort"])
     group = "microvmImageHooks" if image_phase else "microvmHooks"
     timeout = _hook_timeout(record, group, name)
     deadline = time.monotonic() + timeout if retry else None
     body = json.dumps(payload or {}).encode("utf-8")
-    url = f"http://{host}:{port}{_hook_path(name, image_phase=image_phase)}"
+    url = f"http://{host}:{port}{_hook_path(name)}"
 
     while True:
         request = urllib.request.Request(
@@ -363,19 +358,11 @@ def _image_has_entrypoint(client, image_ref):
         if isinstance(image, list):
             image = image[0]
     config = image.attrs.get("Config") or {}
-    # AWS starts the application from either Docker ENTRYPOINT or CMD. Keep
-    # both forms intact; only use the keepalive fallback for an image with
-    # neither, where the required hook server will fail clearly.
     return bool(config.get("Entrypoint") or config.get("Cmd"))
 
 
 def _build_docker_image(record):
-    """Build a MicroVM workload image from the S3 code-artifact ZIP.
-
-    The temporary build container must expose the required `/ready` hook. The
-    built image is retained locally and referenced by the MicroVM image record;
-    the temporary validation container is removed after the build hooks finish.
-    """
+    """Build the image from the code-artifact ZIP\'s root Dockerfile."""
     client = _get_docker()
     if client is None:
         raise RuntimeError("no Docker daemon available")
@@ -396,22 +383,59 @@ def _build_docker_image(record):
         "detach": True,
         "init": True,
         "labels": container_reaper.own_labels("lambda-microvm-build"),
+        **_workload_kwargs(record),
     }
     if network:
         build_kwargs["network"] = network
+    # Snapshot is disk-only: Docker cannot checkpoint memory without CRIU.
+    def _drop(container, what):
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            logger.warning("MicroVM: could not remove image %s container: %s", what, exc)
+
     build_container = client.containers.run(image_ref, **build_kwargs)
     try:
-        # `/ready` is retried because the application server may need time to
-        # initialize after the Dockerfile CMD starts.
-        _call_hook(record, build_container, "ready", image_phase=True, retry=True)
-        if _hook_enabled(record, "microvmImageHooks", "validate"):
-            _call_hook(record, build_container, "validate", image_phase=True, retry=True)
+        if _hook_enabled(record, "microvmImageHooks", "ready"):
+            _call_hook(record, build_container, "ready", image_phase=True, retry=True)
+        snapshot = f"ministack-microvm:{secrets.token_hex(12)}"
+        repository, tag = snapshot.split(":", 1)
+        build_container.commit(repository=repository, tag=tag)
     finally:
+        _drop(build_container, "build")
+    if _hook_enabled(record, "microvmImageHooks", "validate"):
+        validate_container = client.containers.run(snapshot, **build_kwargs)
         try:
-            build_container.remove(force=True)
-        except Exception as exc:
-            logger.warning("MicroVM: could not remove image validation container: %s", exc)
-    return image_ref
+            _call_hook(record, validate_container, "validate", image_phase=True, retry=True)
+        finally:
+            _drop(validate_container, "validate")
+    return snapshot
+
+
+def _build_in_background(record, success_state, failed_state, version):
+    account_id, region = get_account_id(), get_region()
+
+    def _run():
+        with request_scope(account_id, region):
+            try:
+                image_ref = _build_docker_image(record)
+            except Exception as exc:
+                logger.warning("MicroVM: image build failed for %s: %s", record.get("name"), exc)
+                record.update({
+                    "state": failed_state,
+                    "latestFailedImageVersion": version,
+                    "updatedAt": _now(),
+                })
+                return
+            record.update({
+                "_docker_image": image_ref,
+                "state": success_state,
+                "imageVersion": version,
+                "latestActiveImageVersion": version,
+                "updatedAt": _now(),
+            })
+
+    threading.Thread(target=_run, daemon=True, name=f"microvm-build-{record.get('name')}").start()
 
 
 def _container_name(microvm_id: str) -> str:
@@ -477,10 +501,10 @@ def _start_container(record, image_ref):
             "account_id": get_account_id(),
             "region": get_region(),
         },
+        **_workload_kwargs(record),
     }
     if not _image_has_entrypoint(client, image_ref):
-        # Keep a shell-based image alive so lifecycle and shell-auth smoke
-        # tests have a long-lived workload to address.
+        # Keep an image with no ENTRYPOINT/CMD alive.
         kwargs["command"] = ["sleep", "infinity"]
     if network:
         kwargs["network"] = network
@@ -626,12 +650,11 @@ def _run_microvm(body):
     }
     image_record = _find_microvm_image(record["imageArn"])
     if image_record:
-        record["hooks"] = image_record.get("hooks")
+        for field in ("hooks", "environmentVariables", "additionalOsCapabilities"):
+            record[field] = image_record.get(field)
     _microvms[microvm_id] = record
 
-    # Docker-backed execution is deliberately opt-in. In that mode a MicroVM
-    # must come from a successfully built MicroVM image; silently falling back
-    # to a metadata-only record would hide a broken image-build workflow.
+    # With Docker available a MicroVM must come from a successfully built image.
     if _docker_enabled():
         image_ref = _container_image_for(record)
         if not image_ref:
@@ -772,10 +795,8 @@ def _create_microvm_image(body):
     for field in ("baseImageArn", "buildRoleArn", "name", "codeArtifact"):
         if not data.get(field):
             return _validation(f"{field} is required")
-    if _docker_enabled():
-        hook_error = _validate_docker_image_request(data)
-        if hook_error:
-            return hook_error
+    if _hooks_missing_port(data.get("hooks")):
+        return _validation("hooks.port is required when hooks are configured")
     name = data["name"]
     now = _now()
     record = {
@@ -802,16 +823,9 @@ def _create_microvm_image(body):
     }
     _images[name] = record
     if _docker_enabled():
-        try:
-            # This is intentionally synchronous in the draft. A production
-            # implementation should move the build to a worker and expose the
-            # normal CREATING -> CREATED/CREATE_FAILED polling transition.
-            record["_docker_image"] = _build_docker_image(record)
-        except Exception as exc:
-            record["state"] = "CREATE_FAILED"
-            record["latestFailedImageVersion"] = record["imageVersion"]
-            logger.warning("MicroVM: image build failed for %s: %s", name, exc)
-            return error_response_json("InternalError", f"MicroVM image build failed: {exc}", 500)
+        record["state"] = "CREATING"
+        record.pop("latestActiveImageVersion", None)
+        _build_in_background(record, "CREATED", "CREATE_FAILED", "1")
     view = {k: v for k, v in record.items() if v is not None and not k.startswith("_")}
     return json_response(view, 201)
 
@@ -922,6 +936,8 @@ def _update_microvm_image(image_identifier, body):
     for field in ("baseImageArn", "buildRoleArn", "codeArtifact"):
         if not data.get(field):
             return _validation(f"{field} is required")
+    if _hooks_missing_port(data["hooks"] if "hooks" in data else record.get("hooks")):
+        return _validation("hooks.port is required when hooks are configured")
 
     version = str(int(record.get("imageVersion", "0")) + 1)
     for field in (
@@ -932,16 +948,12 @@ def _update_microvm_image(image_identifier, body):
         if field in data:
             record[field] = data[field]
     if _docker_enabled():
-        hook_error = _validate_docker_image_request(record)
-        if hook_error:
-            return hook_error
-        try:
-            record["_docker_image"] = _build_docker_image(record)
-        except Exception as exc:
-            record["state"] = "UPDATE_FAILED"
-            record["latestFailedImageVersion"] = version
-            logger.warning("MicroVM: image rebuild failed for %s: %s", image_identifier, exc)
-            return error_response_json("InternalError", f"MicroVM image rebuild failed: {exc}", 500)
+        record.update({"state": "UPDATING", "updatedAt": _now()})
+        _build_in_background(record, "UPDATED", "UPDATE_FAILED", version)
+        return json_response({
+            **{k: v for k, v in record.items() if v is not None and not k.startswith("_")},
+            "imageVersion": version,
+        })
     record.update({
         "imageVersion": version,
         "latestActiveImageVersion": version,
