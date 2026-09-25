@@ -890,6 +890,11 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
 # Tags
 # ---------------------------------------------------------------------------
 
+def _cfn_bool(value) -> bool:
+    """A template boolean, which YAML can carry as the string "false"."""
+    return str(value).lower() == "true"
+
+
 def _tag_map(tags) -> dict:
     """The ``{Key: Value}`` view of a CloudFormation ``Tags`` property; a map
     (the shape SSM and API Gateway v2 use) passes through."""
@@ -2475,11 +2480,7 @@ def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     old_name = old_props.get("PolicyName") or physical_id
     new_name = new_props.get("PolicyName") or physical_id
 
-    # Every name the new template lists is resolved before anything comes off,
-    # and the new document is validated here too: an in place change is not
-    # undone by the rollback of an update, so a put that failed after the
-    # drops below (on a missing entity or a malformed document alike) would
-    # leave the entity holding nothing.
+    # Validated before anything comes off: the rollback does not resend a failed update.
     _iam_policy_require_entities(new_props)
     _iam_policy_require_valid_document(new_props)
 
@@ -2664,9 +2665,7 @@ def _ssm_delete(physical_id, props):
 # --- AppConfig Application ---
 
 def _appconfig_reconcile_tags(arn, old_props, new_props):
-    """AppConfig keeps tags in a per-ARN map beside the record rather than on
-    it, so the shared reconcile runs against that map. Tags set through
-    TagResource stay, as they do on AWS."""
+    """Reconcile the per-ARN tag map; tags from TagResource stay."""
     if not old_props.get("Tags") and not new_props.get("Tags"):
         return
     _reconcile_tag_map(_appconfig._tags.setdefault(arn, {}), old_props, new_props)
@@ -2691,14 +2690,7 @@ def _appconfig_application_create(logical_id, props, stack_name):
 
 def _appconfig_application_update(physical_id, old_props, new_props, stack_name,
                                   logical_id=None):
-    """Update an application in place. Description, Name and Tags are each
-    No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-application.html),
-    and the type declares no replacing property at all: Ref answers the
-    generated application id, which no update changes. Without this the
-    create-fallback minted a second application and orphaned the first,
-    taking its environments and configuration profiles with it (they are
-    keyed by the old id)."""
+    """Every property is No interruption (aws-resource-appconfig-application)."""
     app = _appconfig._applications.get(physical_id)
     if app is None:
         return _appconfig_application_create(
@@ -2717,6 +2709,14 @@ def _appconfig_application_delete(physical_id, props):
 
 # --- AppConfig Environment ---
 
+def _appconfig_environment_fields(props):
+    return {
+        "Description": props.get("Description", ""),
+        "Monitors": props.get("Monitors", []),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+
+
 def _appconfig_environment_create(logical_id, props, stack_name):
     app_id = props.get("ApplicationId")
     if not app_id:
@@ -2727,10 +2727,8 @@ def _appconfig_environment_create(logical_id, props, stack_name):
         "ApplicationId": app_id,
         "Id": env_id,
         "Name": name,
-        "Description": props.get("Description", ""),
         "State": "READY_FOR_DEPLOYMENT",
-        "Monitors": props.get("Monitors", []),
-        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+        **_appconfig_environment_fields(props),
     }
     cfn_tags = props.get("Tags") or []
     if cfn_tags:
@@ -2744,17 +2742,9 @@ def _appconfig_environment_create(logical_id, props, stack_name):
 
 def _appconfig_environment_update(physical_id, old_props, new_props, stack_name,
                                   logical_id=None):
-    """Update an environment in place. DeletionProtectionCheck, Description,
-    Monitors, Name and Tags are No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-environment.html);
-    ApplicationId is Replacement, and the environment moves to the other
-    application under a freshly generated id. State belongs to the service,
-    not the template, so a replacement re-reads it and an in-place update
-    leaves it alone."""
+    """ApplicationId replaces; the rest is in place (aws-resource-appconfig-environment)."""
     app_id = new_props.get("ApplicationId", "")
-    # Keyed by the OLD application id: under a changed ApplicationId the new
-    # key holds nothing, and _rename_replacement would then read the record as
-    # gone and create the replacement without deleting the predecessor.
+    # Looked up under the old ApplicationId, so a move still deletes the predecessor.
     env = _appconfig._environments.get(
         f"{old_props.get('ApplicationId', '')}/{physical_id}")
     replaced = _rename_replacement(
@@ -2766,10 +2756,7 @@ def _appconfig_environment_update(physical_id, old_props, new_props, stack_name,
         return replaced
     if new_props.get("Name"):
         env["Name"] = new_props["Name"]
-    env["Description"] = new_props.get("Description", "")
-    env["Monitors"] = new_props.get("Monitors", [])
-    env["DeletionProtectionCheck"] = new_props.get(
-        "DeletionProtectionCheck", "ACCOUNT_DEFAULT")
+    env.update(_appconfig_environment_fields(new_props))
     _appconfig_reconcile_tags(
         _appconfig._env_arn(app_id, physical_id), old_props, new_props)
     return physical_id, {"EnvironmentId": physical_id}
@@ -2783,6 +2770,16 @@ def _appconfig_environment_delete(physical_id, props):
 
 # --- AppConfig ConfigurationProfile ---
 
+def _appconfig_configuration_profile_fields(props):
+    return {
+        "Description": props.get("Description", ""),
+        "RetrievalRoleArn": props.get("RetrievalRoleArn", ""),
+        "Validators": props.get("Validators", []),
+        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
+        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+    }
+
+
 def _appconfig_configuration_profile_create(logical_id, props, stack_name):
     app_id = props.get("ApplicationId")
     if not app_id:
@@ -2793,13 +2790,9 @@ def _appconfig_configuration_profile_create(logical_id, props, stack_name):
         "ApplicationId": app_id,
         "Id": profile_id,
         "Name": name,
-        "Description": props.get("Description", ""),
         "LocationUri": props.get("LocationUri", "hosted"),
-        "RetrievalRoleArn": props.get("RetrievalRoleArn", ""),
-        "Validators": props.get("Validators", []),
         "Type": props.get("Type", "AWS.Freeform"),
-        "KmsKeyIdentifier": props.get("KmsKeyIdentifier", ""),
-        "DeletionProtectionCheck": props.get("DeletionProtectionCheck", "ACCOUNT_DEFAULT"),
+        **_appconfig_configuration_profile_fields(props),
     }
     cfn_tags = props.get("Tags") or []
     if cfn_tags:
@@ -2818,16 +2811,9 @@ def _appconfig_configuration_profile_create(logical_id, props, stack_name):
 
 def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
                                             stack_name, logical_id=None):
-    """Update a configuration profile in place. DeletionProtectionCheck,
-    Description, KmsKeyIdentifier, Name, RetrievalRoleArn, Tags and Validators
-    are No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-configurationprofile.html);
-    ApplicationId, LocationUri and Type are Replacement, so the three are read
-    as one key. The create-fallback re-created the profile under a new id and
-    left every hosted configuration version behind it (they are keyed by
-    application and profile id)."""
+    """ApplicationId, LocationUri and Type replace; the rest is in place (aws-resource-appconfig-configurationprofile)."""
     app_id = new_props.get("ApplicationId", "")
-    # The old key, for the same reason the environment handler uses it.
+    # Looked up under the old ApplicationId, so a move still deletes the predecessor.
     profile = _appconfig._config_profiles.get(
         f"{old_props.get('ApplicationId', '')}/{physical_id}")
     replaced = _rename_replacement(
@@ -2844,12 +2830,7 @@ def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
         return replaced
     if new_props.get("Name"):
         profile["Name"] = new_props["Name"]
-    profile["Description"] = new_props.get("Description", "")
-    profile["RetrievalRoleArn"] = new_props.get("RetrievalRoleArn", "")
-    profile["Validators"] = new_props.get("Validators", [])
-    profile["KmsKeyIdentifier"] = new_props.get("KmsKeyIdentifier", "")
-    profile["DeletionProtectionCheck"] = new_props.get(
-        "DeletionProtectionCheck", "ACCOUNT_DEFAULT")
+    profile.update(_appconfig_configuration_profile_fields(new_props))
     _appconfig_reconcile_tags(
         _appconfig._profile_arn(app_id, physical_id), old_props, new_props)
     return physical_id, {
@@ -2915,17 +2896,23 @@ def _appconfig_hosted_version_delete(physical_id, props):
 
 # --- AppConfig DeploymentStrategy ---
 
+def _appconfig_deployment_strategy_fields(props):
+    return {
+        "Description": props.get("Description", ""),
+        "DeploymentDurationInMinutes": props.get("DeploymentDurationInMinutes", 0),
+        "GrowthType": props.get("GrowthType", "LINEAR"),
+        "GrowthFactor": props.get("GrowthFactor", 100.0),
+        "FinalBakeTimeInMinutes": props.get("FinalBakeTimeInMinutes", 0),
+    }
+
+
 def _appconfig_deployment_strategy_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     strategy_id = _appconfig._gen_id()
     _appconfig._deployment_strategies[strategy_id] = {
         "Id": strategy_id,
         "Name": name,
-        "Description": props.get("Description", ""),
-        "DeploymentDurationInMinutes": props.get("DeploymentDurationInMinutes", 0),
-        "GrowthType": props.get("GrowthType", "LINEAR"),
-        "GrowthFactor": props.get("GrowthFactor", 100.0),
-        "FinalBakeTimeInMinutes": props.get("FinalBakeTimeInMinutes", 0),
+        **_appconfig_deployment_strategy_fields(props),
         "ReplicateTo": props.get("ReplicateTo", "NONE"),
     }
     cfn_tags = props.get("Tags") or []
@@ -2940,13 +2927,7 @@ def _appconfig_deployment_strategy_create(logical_id, props, stack_name):
 
 def _appconfig_deployment_strategy_update(physical_id, old_props, new_props,
                                           stack_name, logical_id=None):
-    """Update a deployment strategy in place. DeploymentDurationInMinutes,
-    Description, FinalBakeTimeInMinutes, GrowthFactor, GrowthType and Tags are
-    No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appconfig-deploymentstrategy.html);
-    Name and ReplicateTo are Replacement, and both are read as one key. The
-    name is not the physical id here (Ref answers the generated strategy id),
-    so a rename is a plain replacement with nothing to refuse."""
+    """Name and ReplicateTo replace; the rest is in place (aws-resource-appconfig-deploymentstrategy)."""
     strategy = _appconfig._deployment_strategies.get(physical_id)
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64)
@@ -2959,12 +2940,7 @@ def _appconfig_deployment_strategy_update(physical_id, old_props, new_props,
     )
     if replaced is not None:
         return replaced
-    strategy["Description"] = new_props.get("Description", "")
-    strategy["DeploymentDurationInMinutes"] = new_props.get(
-        "DeploymentDurationInMinutes", 0)
-    strategy["GrowthType"] = new_props.get("GrowthType", "LINEAR")
-    strategy["GrowthFactor"] = new_props.get("GrowthFactor", 100.0)
-    strategy["FinalBakeTimeInMinutes"] = new_props.get("FinalBakeTimeInMinutes", 0)
+    strategy.update(_appconfig_deployment_strategy_fields(new_props))
     _appconfig_reconcile_tags(
         _appconfig._strategy_arn(physical_id), old_props, new_props)
     return physical_id, {"Id": physical_id}
@@ -5612,8 +5588,7 @@ def _sns_topic_policy_delete(physical_id, props):
 
 # --- AppSync resource provisioners ---
 
-# The GraphQLApi members that map one to one onto a camelCase API member and
-# are absent from the API when the template does not set them.
+# Absent from the API unless the template sets them.
 _APPSYNC_API_OPTIONAL = (
     "AdditionalAuthenticationProviders", "EnhancedMetricsConfig",
     "LambdaAuthorizerConfig", "LogConfig", "MergedApiExecutionRoleArn",
@@ -5622,16 +5597,10 @@ _APPSYNC_API_OPTIONAL = (
 
 
 def _appsync_api_members(props):
-    """A GraphQLApi's properties as the API record's members. The scalar
-    members take AppSync's defaults when the template leaves them out, which
-    is what GetGraphqlApi answers on AWS for an API created without them, and
-    after an update that removed them (measured 2026-09-21); the others are
-    set only when present. AppSync is rest-json, so a nested member is stored
-    in the API's camelCase: kept in the template's PascalCase, botocore reads
-    [{}]."""
+    """The template's properties as the API's camelCase members, scalars defaulted."""
     members = {
         "authenticationType": props.get("AuthenticationType", "API_KEY"),
-        "xrayEnabled": str(props.get("XrayEnabled", False)).lower() == "true",
+        "xrayEnabled": _cfn_bool(props.get("XrayEnabled", False)),
         "apiType": props.get("ApiType", "GRAPHQL"),
         "visibility": props.get("Visibility", "GLOBAL"),
         "introspectionConfig": props.get("IntrospectionConfig", "ENABLED"),
@@ -5643,19 +5612,16 @@ def _appsync_api_members(props):
             members[prop[:1].lower() + prop[1:]] = _pascal_to_camel(props[prop])
     oidc = members.get("openIDConnectConfig")
     if oidc is not None:
-        # AppSync answers both TTLs, 0 when unset (measured 2026-09-21).
         oidc.setdefault("authTTL", 0)
         oidc.setdefault("iatTTL", 0)
-    # A map of the caller's own names: its keys are not converted.
+    # The caller's own keys, not converted.
     if props.get("EnvironmentVariables"):
         members["environmentVariables"] = dict(props["EnvironmentVariables"])
     return members
 
 
 def _appsync_api_tags(props):
-    """The tags AppSync lists for the API: the template's and the stack-level
-    ones, without the aws:cloudformation:* tags, which AppSync does not list
-    on an API CloudFormation created (measured 2026-09-21)."""
+    """The template and stack tags, without the aws: ones AppSync does not list."""
     return {"Tags": [t for t in (props.get("Tags") or [])
                      if isinstance(t, dict) and not str(t.get("Key", "")).startswith("aws:")]}
 
@@ -5663,8 +5629,7 @@ def _appsync_api_tags(props):
 def _appsync_api_create(logical_id, props, stack_name):
     import time as _time
     name = props.get("Name") or _physical_name(stack_name, logical_id)
-    # The id shape CreateGraphqlApi mints; eight characters made an ARN that
-    # botocore refuses as too short for ListTagsForResource.
+    # CreateGraphqlApi's 26-character id shape.
     api_id = new_uuid().replace("-", "")[:26]
     arn = f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}"
     now = _time.time()
@@ -5689,32 +5654,19 @@ def _appsync_api_create(logical_id, props, stack_name):
 
 
 def _appsync_api_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a GraphQL API in place. Every property of the type is No
-    interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appsync-graphqlapi.html),
-    so the API is never replaced and keeps its id, ARN and endpoint URLs.
-    Visibility is the exception the page does not state: AWS fails the update
-    with the handler's message (measured 2026-09-21). An OpenIDConnectConfig
-    ClientId or Issuer change is in place (the registry lists the nested
-    members as conditionally create-only; measured the same day), and a
-    member the template removes goes back to its default or away.
-
-    This is the worst of the create-fallbacks: the create mints a new api id
-    AND re-seeds _api_keys, _data_sources, _resolvers and _types for it, so a
-    renamed API came back empty while the real one was orphaned under the old
-    id, still holding every child the stack had provisioned."""
-    import time as _time
+    """Every property is No interruption (aws-resource-appsync-graphqlapi)."""
     api = _appsync._apis.get(physical_id)
     if api is None:
         return _appsync_api_create(logical_id or physical_id, new_props, stack_name)
     members = _appsync_api_members(new_props)
+    # visibility "cannot be changed once the API has been created" (appsync service-2.json).
     if members["visibility"] != api.get("visibility", "GLOBAL"):
         raise ValueError(
             "Property Visibility can only be set when creating a GraphQL API. "
             "Rename the resource to force a replacement")
     if new_props.get("Name"):
         api["name"] = new_props["Name"]
-    # UpdateGraphqlApi has no apiType member; a change is not applied.
+    # UpdateGraphqlApi has no apiType member.
     members.pop("apiType")
     for prop in (*_APPSYNC_API_OPTIONAL, "EnvironmentVariables"):
         api.pop(prop[:1].lower() + prop[1:], None)
@@ -5723,7 +5675,7 @@ def _appsync_api_update(physical_id, old_props, new_props, stack_name, logical_i
     _reconcile_tag_map(tags, _appsync_api_tags(old_props), _appsync_api_tags(new_props))
     if not tags:
         _appsync._tags.pop(api["arn"], None)
-    api["lastUpdatedAt"] = _time.time()
+    api["lastUpdatedAt"] = time.time()
     return physical_id, {
         "ApiId": physical_id,
         "Arn": api["arn"],
@@ -5856,9 +5808,6 @@ def _appsync_apikey_create(logical_id, props, stack_name):
     import time
     key = {
         "id": key_id, "apiKeyId": key_id,
-        # description and createdAt are part of the record CreateApiKey
-        # writes, so ListApiKeys answered a stunted one for a key the
-        # template had created, and a Description change was unobservable.
         "description": props.get("Description", ""),
         "expires": props.get("Expires", int(time.time()) + 604800),
         "createdAt": int(time.time()),
@@ -5870,14 +5819,7 @@ def _appsync_apikey_create(logical_id, props, stack_name):
 
 def _appsync_apikey_update(physical_id, old_props, new_props, stack_name,
                            logical_id=None):
-    """Update an API key in place. Description and Expires are No interruption
-    on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-appsync-apikey.html);
-    ApiId is Replacement.
-
-    The create mints a fresh key id, so under the fallback every expiry change
-    handed clients a new key and left the previous one valid on the API."""
-    import time
+    """ApiId replaces; Description and Expires are in place (aws-resource-appsync-apikey)."""
     api_id = new_props.get("ApiId", "")
     old_api_id = old_props.get("ApiId", "")
     key = _appsync._api_keys.get(old_api_id, {}).get(physical_id)
@@ -6934,14 +6876,7 @@ def _kms_alias_delete(physical_id, props):
 # --- EC2 resource provisioners ---
 
 def _ec2_apply_tags(physical_id, props, old_props=None):
-    """The template's tags in the EC2 tag store, which is what every EC2
-    Describe renders through ``_tag_set_xml``. The networking provisioners
-    never wrote it, so no tag a template declared on a VPC, subnet, security
-    group, gateway or route table was readable at all.
-
-    An update passes ``old_props``: the change is reconciled, so a tag added
-    through CreateTags survives a template tag change, as on AWS (measured
-    2026-09-21 on a VPC)."""
+    """The template's tags into the EC2 tag store; tags from CreateTags stay."""
     tags = list(_ec2._tags.get(physical_id) or [])
     _reconcile_tag_list(tags, old_props or {}, props)
     if tags:
@@ -6951,18 +6886,10 @@ def _ec2_apply_tags(physical_id, props, old_props=None):
 
 
 def _ec2_vpc_dns_attributes(vpc, props, reset_absent=False):
-    """EnableDnsSupport and EnableDnsHostnames on the record, in the shape
-    ModifyVpcAttribute writes and DescribeVpcAttribute reads. The create never
-    read either, so a template that set them was ignored.
-
-    With ``reset_absent`` (an update), a property the template no longer sets
-    goes back to the default DescribeVpcAttribute reads, support on and
-    hostnames off, which is what AWS does (measured 2026-09-21: a removed
-    EnableDnsHostnames reads false, a removed EnableDnsSupport true)."""
+    """The DNS attributes onto the record; on update a removed one goes back to its default."""
     for prop in ("EnableDnsSupport", "EnableDnsHostnames"):
         if prop in props:
-            value = props[prop]
-            vpc[prop] = value if isinstance(value, bool) else str(value).lower() == "true"
+            vpc[prop] = _cfn_bool(props[prop])
         elif reset_absent:
             vpc.pop(prop, None)
 
@@ -7011,32 +6938,19 @@ def _ec2_vpc_create(logical_id, props, stack_name):
     return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
 
 
-# Create-only on AWS::EC2::VPC beside CidrBlock (the registry's
-# createOnlyProperties); the create does not model them.
+# Replacement beside CidrBlock (aws-resource-ec2-vpc); not on the record.
 _EC2_VPC_CREATE_ONLY = ("Ipv4IpamPoolId", "Ipv4NetmaskLength", "VpcEncryptionControl")
 
 
 def _ec2_vpc_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a VPC in place. EnableDnsSupport, EnableDnsHostnames and Tags are
-    No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpc.html);
-    CidrBlock, Ipv4IpamPoolId, Ipv4NetmaskLength and VpcEncryptionControl are
-    Replacement. InstanceTenancy is "Some interruptions", and the page is
-    explicit about the direction: dedicated to default is in place, default to
-    dedicated replaces.
-
-    The create mints a new vpc- id AND writes a default security group, main
-    route table and network ACL, none of which the delete removed, so every
-    property change left all three behind pointing at a VPC id nothing claims.
-    """
+    """Update a VPC in place (aws-resource-ec2-vpc)."""
     vpc = _ec2._vpcs.get(physical_id)
     tenancy = new_props.get("InstanceTenancy", "default")
+    # "Updating InstanceTenancy from default to dedicated requires replacement."
     replaces_tenancy = (
         old_props.get("InstanceTenancy", "default") == "default"
         and tenancy == "dedicated"
     )
-    # The record keeps none of the three create-only IPAM and encryption
-    # members, so they compare template to template.
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         (new_props.get("CidrBlock", "10.0.0.0/16"), replaces_tenancy,
@@ -7058,10 +6972,7 @@ def _ec2_vpc_update(physical_id, old_props, new_props, stack_name, logical_id=No
 
 
 def _ec2_vpc_delete(physical_id, props):
-    # Go through DeleteVpc: it removes the default security group, main route
-    # table and network ACL the create writes (popping only the VPC left all
-    # three behind for good), and it refuses with DependencyViolation while
-    # something made outside the stack still lives in the VPC, as AWS does.
+    # DeleteVpc takes the default children and refuses with DependencyViolation.
     children = [
         child_id
         for store in (_ec2._security_groups, _ec2._route_tables, _ec2._network_acls)
@@ -7145,8 +7056,7 @@ def _ec2_vpc_endpoint_delete(physical_id, props):
     _ec2._tags.pop(physical_id, None)
 
 
-# Create-only on AWS::EC2::Subnet beside VpcId, CidrBlock and the zone (the
-# registry's createOnlyProperties); the record keeps none of them.
+# Replacement beside VpcId, CidrBlock and the zone (aws-resource-ec2-subnet); not on the record.
 _EC2_SUBNET_CREATE_ONLY = (
     "Ipv4IpamPoolId", "Ipv4NetmaskLength", "Ipv6IpamPoolId", "Ipv6Native",
     "Ipv6NetmaskLength", "OutpostArn",
@@ -7154,8 +7064,7 @@ _EC2_SUBNET_CREATE_ONLY = (
 
 
 def _ec2_subnet_zone(props):
-    """The subnet's zone name: AvailabilityZone, or the zone AvailabilityZoneId
-    names, as CreateSubnet resolves it; the create ignored the id."""
+    """The zone name from AvailabilityZone or AvailabilityZoneId."""
     if props.get("AvailabilityZone"):
         return props["AvailabilityZone"]
     if props.get("AvailabilityZoneId"):
@@ -7166,17 +7075,13 @@ def _ec2_subnet_zone(props):
 
 
 def _ec2_subnet_attributes(subnet, props):
-    """PrivateDnsNameOptionsOnLaunch and EnableDns64 onto the record, in the
-    shape DescribeSubnets renders. Only the members the template sets are
-    written: AWS keeps a removed one as it is (measured 2026-09-21, as for
-    MapPublicIpOnLaunch). EnableDns64 needs an IPv6 block, which no subnet
-    here has; AWS fails the operation with the handler's message."""
-    if str(props.get("EnableDns64", False)).lower() == "true" and not (
+    """The DNS attributes the template sets onto the record; a removed one stays."""
+    if _cfn_bool(props.get("EnableDns64", False)) and not (
             props.get("Ipv6CidrBlock") or props.get("Ipv6IpamPoolId")):
         raise ValueError("Invalid request provided: Property Ipv6CidrBlock or "
                          "Ipv6IpamPoolId cannot be empty.")
     if "EnableDns64" in props:
-        subnet["EnableDns64"] = str(props["EnableDns64"]).lower() == "true"
+        subnet["EnableDns64"] = _cfn_bool(props["EnableDns64"])
     options = props.get("PrivateDnsNameOptionsOnLaunch")
     if isinstance(options, dict):
         current = dict(_ec2._subnet_dns_name_options(subnet))
@@ -7184,7 +7089,7 @@ def _ec2_subnet_attributes(subnet, props):
             current["HostnameType"] = options["HostnameType"]
         for member in ("EnableResourceNameDnsARecord", "EnableResourceNameDnsAAAARecord"):
             if member in options:
-                current[member] = str(options[member]).lower() == "true"
+                current[member] = _cfn_bool(options[member])
         subnet["PrivateDnsNameOptionsOnLaunch"] = current
 
 
@@ -7202,7 +7107,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
         "State": "available",
         "AvailableIpAddressCount": 251,
         "DefaultForAz": False,
-        "MapPublicIpOnLaunch": _ec2_subnet_public_ip(props),
+        "MapPublicIpOnLaunch": _cfn_bool(props.get("MapPublicIpOnLaunch", False)),
         "OwnerId": get_account_id(),
     }
     try:
@@ -7215,17 +7120,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
 
 
 def _ec2_subnet_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a subnet in place. AssignIpv6AddressOnCreation, EnableDns64,
-    EnableLniAtDeviceIndex, MapPublicIpOnLaunch, PrivateDnsNameOptionsOnLaunch
-    and Tags are No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet.html);
-    VpcId, CidrBlock, the zone (by name or id), the IPAM members, Ipv6Native
-    and OutpostArn are Replacement (the registry's createOnlyProperties) and
-    are read as one key.
-
-    The create mints a new subnet- id, so the fallback replaced the subnet and
-    left every instance, network interface, NAT gateway and load balancer
-    subnet list holding an id that no longer resolves."""
+    """Update a subnet in place (aws-resource-ec2-subnet)."""
     subnet = _ec2._subnets.get(physical_id)
     key = (new_props.get("VpcId", ""),
            new_props.get("CidrBlock", "10.0.1.0/24"),
@@ -7241,25 +7136,12 @@ def _ec2_subnet_update(physical_id, old_props, new_props, stack_name, logical_id
     )
     if replaced is not None:
         return replaced
-    # A template that stops setting one of these leaves the attribute as it
-    # is: on AWS a removed MapPublicIpOnLaunch keeps reading true, and so does
-    # a removed PrivateDnsNameOptionsOnLaunch (measured 2026-09-21), unlike a
-    # VPC's DNS attributes. AssignIpv6AddressOnCreation and
-    # EnableLniAtDeviceIndex have nothing to act on without an IPv6 block or
-    # an Outpost, neither of which is modelled.
     _ec2_subnet_attributes(subnet, new_props)
     if "MapPublicIpOnLaunch" in new_props:
-        subnet["MapPublicIpOnLaunch"] = _ec2_subnet_public_ip(new_props)
+        subnet["MapPublicIpOnLaunch"] = _cfn_bool(new_props["MapPublicIpOnLaunch"])
     _ec2_apply_tags(physical_id, new_props, old_props)
     return physical_id, {"SubnetId": physical_id,
                          "AvailabilityZone": subnet["AvailabilityZone"]}
-
-
-def _ec2_subnet_public_ip(props):
-    """MapPublicIpOnLaunch as a boolean: DescribeSubnets renders the record's
-    truthiness, so a YAML template's string "false" read back as true."""
-    value = props.get("MapPublicIpOnLaunch", False)
-    return value if isinstance(value, bool) else str(value).lower() == "true"
 
 
 def _ec2_subnet_delete(physical_id, props):
@@ -7288,11 +7170,7 @@ def _ec2_sg_create(logical_id, props, stack_name):
 
 
 def _ec2_sg_permissions(rules):
-    """A template's ingress or egress rules in the shape the EC2 store keeps
-    and DescribeSecurityGroups renders, each source with the rule's
-    Description. A prefix-list source (SourcePrefixListId, and
-    DestinationPrefixListId on egress) and a source group's name and owner are
-    rule members too; dropping them lost a prefix-list rule outright."""
+    """A template's ingress or egress rules in the EC2 store's shape."""
     permissions = []
     for rule in (rules or []):
         if not isinstance(rule, dict):
@@ -7330,57 +7208,27 @@ def _ec2_sg_permissions(rules):
 
 
 def _ec2_sg_egress_permissions(rules):
-    """The egress a create gives a group from its SecurityGroupEgress: the
-    template's own rules, or the allow-all rule AWS adds when it declares
-    none (the create used to hard-code allow-all and drop the template's
-    egress entirely)."""
+    """The template's egress rules, or allow-all when it declares none."""
     return _ec2_sg_permissions(rules) or [
         {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
          "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []},
     ]
 
 
-def _ec2_sg_permission_key(perm):
-    """A permission reduced to what identifies it, its protocol, ports and
-    sources, so the same rule declared twice compares equal whatever its
-    description."""
-    return (
-        perm.get("IpProtocol"),
-        perm.get("FromPort"),
-        perm.get("ToPort"),
-        tuple(sorted(r.get("CidrIp", "") for r in perm.get("IpRanges", []))),
-        tuple(sorted(r.get("CidrIpv6", "") for r in perm.get("Ipv6Ranges", []))),
-        tuple(sorted(r.get("PrefixListId", "") for r in perm.get("PrefixListIds", []))),
-        tuple(sorted((p.get("GroupId", ""), p.get("GroupName", ""), p.get("UserId", ""))
-                     for p in perm.get("UserIdGroupPairs", []))),
-    )
-
-
 def _ec2_sg_reconcile(store, old_perms, new_perms):
-    """Apply a rule-property change the way the tag reconcilers apply a tag
-    change: rules the template dropped are revoked, the new ones authorized,
-    a rule whose description changed is replaced by its new form, and a rule
-    added through AuthorizeSecurityGroupIngress/Egress outside the template is
-    left alone, as it is on AWS. Both sides are what the create would write
-    for that template, so the allow-all egress rule comes and goes with the
-    template's own egress rules."""
+    """Swap the template's old rules for its new ones; rules authorized outside it stay."""
     if old_perms == new_perms:
         return
-    keys = ({_ec2_sg_permission_key(p) for p in old_perms}
-            | {_ec2_sg_permission_key(p) for p in new_perms})
-    store[:] = [p for p in store if _ec2_sg_permission_key(p) not in keys] + new_perms
+
+    def key(perm):
+        return json.dumps(_ec2._strip_descriptions(perm), sort_keys=True)
+
+    keys = {key(p) for p in old_perms} | {key(p) for p in new_perms}
+    store[:] = [p for p in store if key(p) not in keys] + new_perms
 
 
 def _ec2_sg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a security group in place. SecurityGroupIngress and
-    SecurityGroupEgress are "Some interruptions" on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-securitygroup.html),
-    which is an in-place update, and Tags is No interruption; GroupDescription,
-    GroupName and VpcId are Replacement and are read as one key.
-
-    The create mints a new sg- id, so the fallback replaced the group and took
-    every rule authorized outside the template with it, while each instance
-    still held the old group id."""
+    """Update a security group in place (aws-resource-ec2-securitygroup)."""
     _ec2._ensure_defaults_initialized()
     group = _ec2._security_groups.get(physical_id)
     name = new_props.get("GroupName", f"{stack_name}-{logical_id or physical_id}")
@@ -7399,9 +7247,7 @@ def _ec2_sg_update(physical_id, old_props, new_props, stack_name, logical_id=Non
                       _ec2_sg_permissions(old_props.get("SecurityGroupIngress")),
                       _ec2_sg_permissions(new_props.get("SecurityGroupIngress")))
     if old_props.get("SecurityGroupEgress") != new_props.get("SecurityGroupEgress"):
-        # Declaring egress takes the create's allow-all rule away. Dropping the
-        # declaration again does not bring it back: measured on AWS, the group
-        # is left with no egress rule from the template.
+        # A dropped egress declaration does not bring allow-all back.
         _ec2_sg_reconcile(group.setdefault("IpPermissionsEgress", []),
                           _ec2_sg_egress_permissions(old_props.get("SecurityGroupEgress")),
                           _ec2_sg_permissions(new_props.get("SecurityGroupEgress")))
@@ -7427,14 +7273,7 @@ def _ec2_igw_create(logical_id, props, stack_name):
 
 
 def _ec2_igw_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update an internet gateway in place. Tags is the only property
-    AWS::EC2::InternetGateway has and it is No interruption
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-internetgateway.html),
-    so nothing about this type can ever require a replacement.
-
-    The create ignored props entirely, so the one change a template can make
-    to a gateway minted a new igw- id, reset Attachments to empty and still
-    applied no tags."""
+    """Tags, the type's only property, is No interruption (aws-resource-ec2-internetgateway)."""
     gateway = _ec2._internet_gateways.get(physical_id)
     if gateway is None:
         return _ec2_igw_create(logical_id or physical_id, new_props, stack_name)
@@ -7486,13 +7325,7 @@ def _ec2_rtb_create(logical_id, props, stack_name):
 
 
 def _ec2_rtb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a route table in place. Tags is No interruption and VpcId is
-    Replacement on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-routetable.html).
-
-    The create mints a new rtb- id and rebuilds the record with Routes back to
-    the local route and Associations empty, so a tag change destroyed every
-    route and association added through CreateRoute or AssociateRouteTable."""
+    """Update a route table in place (aws-resource-ec2-routetable)."""
     table = _ec2._route_tables.get(physical_id)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
@@ -7511,18 +7344,14 @@ def _ec2_rtb_delete(physical_id, props):
     _ec2._tags.pop(physical_id, None)
 
 
-# The route target properties, every one of them No interruption on the
-# resource reference, in the order CreateRoute resolves them.
+# No interruption (aws-resource-ec2-route).
 _EC2_ROUTE_TARGETS = (
     "GatewayId", "NatGatewayId", "InstanceId", "NetworkInterfaceId",
     "TransitGatewayId", "VpcPeeringConnectionId", "EgressOnlyInternetGatewayId",
     "CarrierGatewayId", "LocalGatewayId", "VpcEndpointId", "CoreNetworkArn",
     "OdbNetworkArn",
 )
-# The three destination properties, each create-only and each naming its own
-# route: a table holds an IPv4, an IPv6 and a prefix-list route side by side
-# (measured 2026-09-21), so the destination has to be read from the property
-# the template set, not defaulted to 0.0.0.0/0.
+# Replacement, each naming its own route (aws-resource-ec2-route).
 _EC2_ROUTE_DESTINATIONS = (
     "DestinationCidrBlock", "DestinationIpv6CidrBlock", "DestinationPrefixListId",
 )
@@ -7547,8 +7376,7 @@ def _ec2_route_record(props, dest):
 
 
 def _ec2_route_put(rtb, props, dest):
-    """Put the route for ``dest`` into the table, replacing the one already
-    holding that destination rather than appending beside it."""
+    """Put the route for ``dest``, replacing any route already at that destination."""
     prop, value = dest
     rtb["Routes"] = [
         r for r in rtb["Routes"] if r.get(prop) != value
@@ -7560,26 +7388,13 @@ def _ec2_route_create(logical_id, props, stack_name):
     dest = _ec2_route_destination(props)
     rtb = _ec2._route_tables.get(rtb_id)
     if rtb:
-        # Put, not append: a route the table already holds for this
-        # destination is replaced rather than duplicated.
         _ec2_route_put(rtb, props, dest)
     physical_id = f"{rtb_id}|{dest[1]}"
     return physical_id, {}
 
 
 def _ec2_route_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a route in place. Every target property is No interruption on the
-    resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route.html),
-    which is what ReplaceRoute does; RouteTableId and the three destination
-    properties are Replacement, and all four are already carried by the
-    physical id "{table}|{destination}".
-
-    That deterministic id is what made this the one type in the family to
-    corrupt state rather than replace it: a changed target left the id
-    unmoved, so the engine declared no replacement and ran no predecessor
-    delete, while the create appended a second entry. The table then held two
-    routes for one destination, both rendered by DescribeRouteTables."""
+    """A target change is in place; a table or destination change replaces (aws-resource-ec2-route)."""
     rtb_id, _, dest_value = physical_id.partition("|")
     dest = _ec2_route_destination(new_props)
     if (new_props.get("RouteTableId", "") != rtb_id or dest[1] != dest_value
@@ -7639,9 +7454,6 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "runningTasksCount": 0,
         "pendingTasksCount": 0,
         "activeServicesCount": 0,
-        # ECS is a JSON API with camelCase members: kept in the template's
-        # PascalCase, botocore dropped every member and DescribeClusters
-        # answered [{}] for the settings and the strategy.
         "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
         "defaultCapacityProviderStrategy": _pascal_to_camel(
@@ -7649,7 +7461,6 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     }
     if props.get("Configuration"):
-        # Where UpdateCluster keeps it, in the same shape.
         _ecs._clusters[name]["configuration"] = _pascal_to_camel(props["Configuration"])
     return name, {"Arn": arn, "ClusterName": name}
 
@@ -7802,33 +7613,31 @@ def _ecs_service_delete(physical_id, props):
 
 # --- EC2 Launch Template provisioners ---
 
-def _ec2_launch_template_create(logical_id, props, stack_name):
-    name = props.get("LaunchTemplateName", _physical_name(stack_name, logical_id))
-    lt_data = props.get("LaunchTemplateData", {})
-    lt_id = _ec2._new_lt_id()
-    now = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
-    version = {
+def _ec2_launch_template_version(lt_id, name, number, props, default):
+    return {
         "LaunchTemplateId": lt_id,
         "LaunchTemplateName": name,
-        "VersionNumber": 1,
+        "VersionNumber": number,
         "VersionDescription": props.get("VersionDescription", ""),
-        "DefaultVersion": True,
-        "CreateTime": now,
-        "LaunchTemplateData": lt_data,
+        "DefaultVersion": default,
+        "CreateTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "LaunchTemplateData": props.get("LaunchTemplateData", {}),
     }
+
+
+def _ec2_launch_template_create(logical_id, props, stack_name):
+    name = props.get("LaunchTemplateName", _physical_name(stack_name, logical_id))
+    lt_id = _ec2._new_lt_id()
+    version = _ec2_launch_template_version(lt_id, name, 1, props, True)
     lt = {
         "LaunchTemplateId": lt_id,
         "LaunchTemplateName": name,
-        "CreateTime": now,
+        "CreateTime": version["CreateTime"],
         "DefaultVersionNumber": 1,
         "LatestVersionNumber": 1,
         "Versions": [version],
     }
-    # The type has no Tags property: the template's own tags come from the
-    # TagSpecifications entry for "launch-template", the rest of which tag
-    # what the template launches. Kept where CreateLaunchTemplate keeps them
-    # (the record and the tag store share one list), so CreateTags stays
-    # visible; the dead Tags read left every template untagged.
+    # The type has no Tags property; its own tags are the "launch-template" TagSpecifications entry.
     tags = [
         {"Key": str(t.get("Key", "")), "Value": str(t.get("Value", ""))}
         for spec in (props.get("TagSpecifications") or [])
@@ -7849,22 +7658,7 @@ def _ec2_launch_template_create(logical_id, props, stack_name):
 
 def _ec2_launch_template_update(physical_id, old_props, new_props, stack_name,
                                 logical_id=None):
-    """Update a launch template in place. LaunchTemplateData, TagSpecifications
-    and VersionDescription are No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-launchtemplate.html)
-    and LaunchTemplateName is Replacement.
-
-    A data change adds version N+1 on AWS and leaves the template's id alone.
-    The create instead minted a new lt- id, threw the Versions list away and
-    reset LatestVersionNumber and DefaultVersionNumber to 1, which is exactly
-    what an Auto Scaling group reads through Fn::GetAtt LatestVersionNumber.
-
-    Measured on AWS 2026-09-21, one property per update: a LaunchTemplateData,
-    a TagSpecifications and a VersionDescription change each add a version
-    (latest 2, 3, 4), the default version stays 1 throughout, and a
-    TagSpecifications change leaves the template's own tags as they were;
-    they are applied at creation only."""
-    import time as _time
+    """A change adds a version and leaves the default (aws-resource-ec2-launchtemplate)."""
     template = _ec2._launch_templates.get(physical_id)
     name = new_props.get("LaunchTemplateName", _physical_name(
         stack_name, logical_id or physical_id))
@@ -7876,15 +7670,8 @@ def _ec2_launch_template_update(physical_id, old_props, new_props, stack_name,
     if replaced is not None:
         return replaced
     version_number = int(template.get("LatestVersionNumber", 1)) + 1
-    template.setdefault("Versions", []).append({
-        "LaunchTemplateId": physical_id,
-        "LaunchTemplateName": template["LaunchTemplateName"],
-        "VersionNumber": version_number,
-        "VersionDescription": new_props.get("VersionDescription", ""),
-        "DefaultVersion": False,
-        "CreateTime": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-        "LaunchTemplateData": new_props.get("LaunchTemplateData", {}),
-    })
+    template.setdefault("Versions", []).append(_ec2_launch_template_version(
+        physical_id, template["LaunchTemplateName"], version_number, new_props, False))
     template["LatestVersionNumber"] = version_number
     return physical_id, {
         "LaunchTemplateId": physical_id,
@@ -10121,24 +9908,12 @@ def _asg_create(logical_id, props, stack_name):
     asg = {
         "AutoScalingGroupName": name,
         "AutoScalingGroupARN": arn,
-        "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
-        "LaunchTemplate": {},
-        "MinSize": int(props.get("MinSize", 0)),
-        "MaxSize": int(props.get("MaxSize", 0)),
-        "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
-        "DefaultCooldown": int(props.get("Cooldown", 300)),
-        "AvailabilityZones": props.get("AvailabilityZones", [f"{get_region()}a"]),
-        "HealthCheckType": props.get("HealthCheckType", "EC2"),
-        "HealthCheckGracePeriod": int(props.get("HealthCheckGracePeriod", 300)),
+        **_asg_fields(props),
         "Instances": [],
         "CreatedTime": now_iso(),
-        "VPCZoneIdentifier": ",".join(props.get("VPCZoneIdentifier", [])) if isinstance(props.get("VPCZoneIdentifier"), list) else props.get("VPCZoneIdentifier", ""),
-        "TerminationPolicies": props.get("TerminationPolicies", ["Default"]),
-        "NewInstancesProtectedFromScaleIn": props.get("NewInstancesProtectedFromScaleIn", False),
         "Tags": [],
         "Status": "",
     }
-    asg["LaunchTemplate"] = _asg_launch_template(props.get("LaunchTemplate"))
     tags = []
     for t in props.get("Tags", []):
         tags.append({
@@ -10146,7 +9921,7 @@ def _asg_create(logical_id, props, stack_name):
             "Value": t.get("Value", ""),
             "ResourceId": name,
             "ResourceType": "auto-scaling-group",
-            "PropagateAtLaunch": _asg_propagate_at_launch(t),
+            "PropagateAtLaunch": _cfn_bool(t.get("PropagateAtLaunch", False)),
         })
     asg["Tags"] = tags
     _asg._asgs[name] = asg
@@ -10154,12 +9929,27 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
+def _asg_fields(props):
+    """The group members a template sets, for create and update alike."""
+    zone_id = props.get("VPCZoneIdentifier", "")
+    return {
+        "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
+        "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
+        "MinSize": int(props.get("MinSize", 0)),
+        "MaxSize": int(props.get("MaxSize", 0)),
+        "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
+        "DefaultCooldown": int(props.get("Cooldown", 300)),
+        "AvailabilityZones": props.get("AvailabilityZones", [f"{get_region()}a"]),
+        "HealthCheckType": props.get("HealthCheckType", "EC2"),
+        "HealthCheckGracePeriod": int(props.get("HealthCheckGracePeriod", 300)),
+        "VPCZoneIdentifier": ",".join(zone_id) if isinstance(zone_id, list) else zone_id,
+        "TerminationPolicies": props.get("TerminationPolicies", ["Default"]),
+        "NewInstancesProtectedFromScaleIn": props.get("NewInstancesProtectedFromScaleIn", False),
+    }
+
+
 def _asg_launch_template(spec):
-    """A group's LaunchTemplate as DescribeAutoScalingGroups answers it: the
-    template's id and name, whichever of the two the group was given, and the
-    version as given. A template references its launch template through Ref,
-    the id, and the provisioner copied only that, so LaunchTemplateName read
-    "" where AWS answers the real name (measured 2026-09-21)."""
+    """The launch template's id and name, whichever of the two the group was given."""
     if not spec:
         return {}
     lt_id = spec.get("LaunchTemplateId", "")
@@ -10177,16 +9967,7 @@ def _asg_launch_template(spec):
 
 
 def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update an Auto Scaling group in place. The sizes, cooldown, health
-    check, zones, subnets, termination policies, launch configuration and
-    launch template are No interruption on the resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-autoscalinggroup.html);
-    AutoScalingGroupName and InstanceId are Replacement (the registry's
-    createOnlyProperties).
-
-    The create mints a fresh ARN off a uuid, re-stamps CreatedTime and resets
-    Instances to an empty list, so the fallback handed every consumer of the
-    ARN a new value and dropped the group's instances on a size change."""
+    """AutoScalingGroupName and InstanceId replace; the rest is in place (aws-resource-autoscaling-autoscalinggroup)."""
     name = new_props.get("AutoScalingGroupName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=255)
     asg = _asg._asgs.get(physical_id)
@@ -10198,25 +9979,8 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
-    asg["LaunchConfigurationName"] = new_props.get("LaunchConfigurationName", "")
-    asg["MinSize"] = int(new_props.get("MinSize", 0))
-    asg["MaxSize"] = int(new_props.get("MaxSize", 0))
-    asg["DesiredCapacity"] = int(
-        new_props.get("DesiredCapacity", new_props.get("MinSize", 0)))
-    asg["DefaultCooldown"] = int(new_props.get("Cooldown", 300))
-    asg["AvailabilityZones"] = new_props.get(
-        "AvailabilityZones", [f"{get_region()}a"])
-    asg["HealthCheckType"] = new_props.get("HealthCheckType", "EC2")
-    asg["HealthCheckGracePeriod"] = int(new_props.get("HealthCheckGracePeriod", 300))
-    zone_id = new_props.get("VPCZoneIdentifier", "")
-    asg["VPCZoneIdentifier"] = ",".join(zone_id) if isinstance(zone_id, list) else zone_id
-    asg["TerminationPolicies"] = new_props.get("TerminationPolicies", ["Default"])
-    asg["NewInstancesProtectedFromScaleIn"] = new_props.get(
-        "NewInstancesProtectedFromScaleIn", False)
-    asg["LaunchTemplate"] = _asg_launch_template(new_props.get("LaunchTemplate"))
-    # Reconciled rather than overwritten: a tag added through CreateOrUpdateTags
-    # survives a template tag change, as on AWS (measured 2026-09-21), and the
-    # template's own tags take its PropagateAtLaunch.
+    asg.update(_asg_fields(new_props))
+    # Tags from CreateOrUpdateTags stay.
     tags = _asg._tags.get(physical_id)
     if tags is None:
         tags = list(asg.get("Tags") or [])
@@ -10230,18 +9994,11 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
         if spec is not None:
             tag["ResourceId"] = physical_id
             tag["ResourceType"] = "auto-scaling-group"
-            tag["PropagateAtLaunch"] = _asg_propagate_at_launch(spec)
+            tag["PropagateAtLaunch"] = _cfn_bool(spec.get("PropagateAtLaunch", False))
     asg["Tags"] = tags
     _asg._tags[physical_id] = tags
     arn = asg["AutoScalingGroupARN"]
     return physical_id, {"AutoScalingGroupARN": arn, "Arn": arn}
-
-
-def _asg_propagate_at_launch(tag):
-    """A template tag's PropagateAtLaunch as a boolean; a YAML template can
-    carry it as the string "false", which is truthy."""
-    value = tag.get("PropagateAtLaunch", False)
-    return value if isinstance(value, bool) else str(value).lower() == "true"
 
 
 def _asg_delete(physical_id, props):
@@ -10269,40 +10026,17 @@ def _asg_lc_delete(physical_id, props):
     _asg._launch_configs.pop(physical_id, None)
 
 
-def _asg_policy_name(props, stack_name, logical_id):
-    """The registry lists PolicyName among the read-only attributes of
-    AWS::AutoScaling::ScalingPolicy, but AWS applies one the template sets
-    when it creates the policy (measured 2026-09-21: the policy carries
-    exactly that name), and never after: the update ignores it. Without one,
-    CloudFormation generates ``{stack}-{LogicalId}-{suffix}`` (measured the
-    same day)."""
-    return props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
-
-
 def _asg_policy_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
-    policy_name = _asg_policy_name(props, stack_name, logical_id)
+    policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
-    # The service's own record builder, so a target-tracking or step policy
-    # keeps its configuration the way PutScalingPolicy stores it.
     _asg._policies[key] = _asg._policy_record(asg_name, policy_name, arn, props)
     return arn, {"Arn": arn, "PolicyName": policy_name}
 
 
 def _asg_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Update a scaling policy in place. AdjustmentType, Cooldown,
-    EstimatedInstanceWarmup, MetricAggregationType, MinAdjustmentMagnitude,
-    PolicyType, PredictiveScalingConfiguration, ScalingAdjustment,
-    StepAdjustments and TargetTrackingConfiguration are No interruption on the
-    resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-scalingpolicy.html);
-    AutoScalingGroupName is Replacement. PolicyName is read-only in the
-    registry: a change or removal leaves the policy's name and ARN as they are
-    (measured 2026-09-21), so it is no part of the replacement key.
-
-    The physical id is the policy ARN and the create mints a new one off a
-    uuid, so the fallback answered a different Ref for an unchanged policy."""
+    """AutoScalingGroupName replaces; the rest is in place (aws-resource-autoscaling-scalingpolicy)."""
     asg_name = new_props.get("AutoScalingGroupName", "")
     current = next(
         (p for p in _asg._policies.values() if p.get("PolicyARN") == physical_id), None)
@@ -10313,8 +10047,6 @@ def _asg_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     )
     if replaced is not None:
         return replaced
-    # Rebuilt from the new properties rather than patched, so a member the
-    # template dropped (a step list, a warmup) goes with it.
     record = _asg._policy_record(asg_name, current["PolicyName"], physical_id, new_props)
     current.clear()
     current.update(record)
@@ -10351,24 +10083,17 @@ def _asg_hook_delete(physical_id, props):
 
 
 def _asg_scheduled_create(logical_id, props, stack_name):
-    """CloudFormation names a scheduled action itself and Ref answers that
-    name. The registry lists ScheduledActionName as read-only, and AWS
-    ignores one the template sets (measured 2026-09-21: the action carries a
-    generated name, and a changed or removed ScheduledActionName leaves it as
-    it is)."""
+    """Ref returns the generated name (aws-resource-autoscaling-scheduledaction)."""
     asg_name = props.get("AutoScalingGroupName", "")
     action_name = _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
-    # The service's own record builder, as for a scaling policy.
     _asg._scheduled_actions[f"{asg_name}/{action_name}"] = _asg._scheduled_action_record(
         asg_name, action_name, arn, props)
     return action_name, {"Arn": arn, "ScheduledActionName": action_name}
 
 
 def _asg_scheduled_find(physical_id, props):
-    """The store key and record of a scheduled action: by name within the
-    group the properties name, or by ARN, the physical id before Ref answered
-    the name."""
+    """The store key and record, by name in the group or by ARN (the older physical id)."""
     asg_name = props.get("AutoScalingGroupName", "")
     for key, action in _asg._scheduled_actions.items():
         if (action.get("ScheduledActionARN") == physical_id
@@ -10380,20 +10105,10 @@ def _asg_scheduled_find(physical_id, props):
 
 def _asg_scheduled_update(physical_id, old_props, new_props, stack_name,
                           logical_id=None):
-    """Update a scheduled action in place. DesiredCapacity, EndTime, MaxSize,
-    MinSize, Recurrence, StartTime and TimeZone are No interruption on the
-    resource reference
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-autoscaling-scheduledaction.html),
-    and AWS applies each in place with the ARN unchanged (measured
-    2026-09-21); AutoScalingGroupName is Replacement. ScheduledActionName is
-    read-only and ignored (see _asg_scheduled_create).
-
-    The create minted a new ARN on every change, so an unchanged action came
-    back under a new identity."""
+    """AutoScalingGroupName replaces; the rest is in place (aws-resource-autoscaling-scheduledaction)."""
     asg_name = new_props.get("AutoScalingGroupName", "")
     _key, current = _asg_scheduled_find(physical_id, old_props)
-    # The replacement keeps the generated name, so the physical id does not
-    # move and the predecessor in the old group has to go explicitly.
+    # The replacement keeps the generated name, so the predecessor goes explicitly.
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         asg_name, current["AutoScalingGroupName"] if current else None,

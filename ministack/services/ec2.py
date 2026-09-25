@@ -3129,9 +3129,7 @@ def _describe_vpc_classic_link_dns_support(p):
 
 
 def _subnet_dns_name_options(subnet):
-    """A subnet's PrivateDnsNameOptionsOnLaunch, with AWS's defaults for a
-    subnet created without them: IP-based host names, no resource-name DNS
-    records."""
+    """A subnet's PrivateDnsNameOptionsOnLaunch, defaulted when never set."""
     return subnet.get("PrivateDnsNameOptionsOnLaunch") or {
         "HostnameType": "ip-name",
         "EnableResourceNameDnsARecord": False,
@@ -3148,7 +3146,6 @@ def _modify_subnet_attribute(p):
     val = _p(p, "MapPublicIpOnLaunch.Value")
     if val:
         subnet["MapPublicIpOnLaunch"] = val.lower() == "true"
-    # One DNS name option per call, as on AWS; the others keep their values.
     options = dict(_subnet_dns_name_options(subnet))
     hostname_type = _p(p, "PrivateDnsHostnameTypeOnLaunch")
     if hostname_type:
@@ -4344,8 +4341,7 @@ def _vpc_xml(vpc):
 
 
 def _subnet_fields_xml(subnet, tag="item"):
-    # A subnet has no IPv6 block here, so it is never IPv6-native and assigns
-    # no IPv6 address on creation; DescribeSubnets answers both as false.
+    # No IPv6 block is modelled, so the two IPv6 members are always false.
     dns_options = _subnet_dns_name_options(subnet)
     return f"""<{tag}>
         <subnetId>{subnet['SubnetId']}</subnetId>
@@ -4392,8 +4388,7 @@ def _igw_xml(igw):
     return _igw_fields_xml(igw, tag="item")
 
 
-# A route record's members as DescribeRouteTables names them. A gateway
-# endpoint target is answered as gatewayId, as on AWS.
+# The Route shape has no vpcEndpointId member; an endpoint target is a gatewayId.
 _ROUTE_MEMBERS = (
     ("DestinationIpv6CidrBlock", "destinationIpv6CidrBlock"),
     ("DestinationPrefixListId", "destinationPrefixListId"),
@@ -4414,9 +4409,6 @@ _ROUTE_MEMBERS = (
 
 def _rtb_fields_xml(rtb, tag="item"):
     def _route_xml(r):
-        # Every target and destination member a route can carry; an IPv6 or
-        # prefix-list route has no destinationCidrBlock, and one rendered
-        # empty read back as a route to "".
         target = "".join(
             f"<{element}>{_esc(r[key])}</{element}>"
             for key, element in _ROUTE_MEMBERS if r.get(key))
@@ -6813,7 +6805,6 @@ def _describe_launch_template_versions(p):
                       "The specified launch template does not exist", 400)
     # Filter by version numbers
     req_versions = _parse_member_list(p, "LaunchTemplateVersion")
-    # Newest first, as AWS lists them (measured 2026-09-21).
     versions = sorted(lt["Versions"], key=lambda v: v["VersionNumber"], reverse=True)
     if req_versions:
         filtered = []

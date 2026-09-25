@@ -442,13 +442,7 @@ def test_put_and_describe_scaling_policy(autoscaling):
 
 
 def test_put_scaling_policy_target_tracking_and_step_read_back(autoscaling):
-    """PutScalingPolicy stored neither TargetTrackingConfiguration nor
-    StepAdjustments (nor the warmup, aggregation and magnitude members), and
-    DescribePolicies answered AdjustmentType, ScalingAdjustment and Cooldown
-    for every type. The shape is AWS's, measured 2026-09-21: a
-    target-tracking policy has none of those three, a step policy no
-    ScalingAdjustment or Cooldown, and both carry Enabled and
-    StepAdjustments."""
+    """Target-tracking and step policies read back with only their type's members."""
     asg = _uid("asg-ttpol")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
@@ -496,9 +490,7 @@ def test_put_scaling_policy_target_tracking_and_step_read_back(autoscaling):
 
 
 def test_put_scaling_policy_predictive_read_back(autoscaling):
-    """PutScalingPolicy dropped PredictiveScalingConfiguration. AWS answers it
-    with MaxCapacityBreachBehavior defaulted to HonorMaxCapacity and
-    TargetValue as a double (measured 2026-09-21)."""
+    """PredictiveScalingConfiguration reads back with MaxCapacityBreachBehavior defaulted."""
     asg = _uid("asg-pred")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
@@ -531,10 +523,7 @@ def test_put_scaling_policy_predictive_read_back(autoscaling):
     {"PolicyType": "SimpleScaling", "ScalingAdjustment": "one"},
 ], ids=["target-value", "step-bound", "scaling-adjustment"])
 def test_put_scaling_policy_non_numeric_member_is_a_validation_error(autoscaling, members):
-    """A number member that does not parse (a TargetValue, a step bound, a
-    ScalingAdjustment) is refused with a ValidationError. The float()/int()
-    conversion raised out of the handler, so the call answered 500. Sent raw:
-    boto3 will not serialize a string where the model has a number."""
+    """A non-numeric number member is a ValidationError, not a 500."""
     asg = _uid("asg-badnum")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
@@ -796,8 +785,7 @@ def test_put_and_describe_scheduled_action(autoscaling):
 
 
 def test_scheduled_action_times_read_back(autoscaling):
-    """PutScheduledUpdateGroupAction dropped StartTime, EndTime and TimeZone.
-    AWS answers all three, StartTime also as Time (measured 2026-09-21)."""
+    """StartTime (also as Time), EndTime and TimeZone read back."""
     asg = _uid("asg-stimes")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg, MinSize=0, MaxSize=2,

@@ -729,8 +729,6 @@ def _execute_change_set(params):
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
             "_conditions": copy.deepcopy(stack.get("_conditions", {})),
-            # A rollback restores what DescribeStacks reports, parameters
-            # included, as the UpdateStack snapshot does.
             "Parameters": copy.deepcopy(stack.get("Parameters", [])),
             "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),

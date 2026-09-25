@@ -516,16 +516,12 @@ def _delete_lc(p):
 # Scaling Policy
 # ---------------------------------------------------------------------------
 
-# The typed scalars of a policy's members; every other leaf is a string.
-# DescribePolicies serializes TargetValue and the step bounds as doubles, the
-# switches as booleans (measured on AWS 2026-09-21: TargetValue 40.0,
-# MetricIntervalLowerBound 0.0, DisableScaleIn false).
+# Typed per the autoscaling service-2.json shapes; every other leaf is a string.
 _POLICY_FLOATS = frozenset({"TargetValue", "MetricIntervalLowerBound", "MetricIntervalUpperBound"})
 _POLICY_INTS = frozenset({"ScalingAdjustment", "EstimatedInstanceWarmup",
                           "MinAdjustmentMagnitude", "Period", "SchedulingBufferTime",
                           "MaxCapacityBuffer"})
 _POLICY_BOOLS = frozenset({"DisableScaleIn", "ReturnData", "Enabled"})
-# The optional members a policy keeps as given, in DescribePolicies' names.
 _POLICY_OPTIONAL = ("EstimatedInstanceWarmup", "MetricAggregationType",
                     "MinAdjustmentMagnitude", "PredictiveScalingConfiguration",
                     "StepAdjustments", "TargetTrackingConfiguration")
@@ -546,9 +542,7 @@ def _policy_typed(value, key=None):
 
 
 def _parse_nested(params, prefix):
-    """The query members under ``prefix`` as nested dicts, each
-    ``.member.N`` level as a list: ``Dimensions.member.1.Name`` becomes
-    ``{"Dimensions": [{"Name": ...}]}``."""
+    """The query members under ``prefix`` as nested dicts, ``.member.N`` levels as lists."""
     tree = {}
     for key in params:
         if not key.startswith(prefix + "."):
@@ -579,12 +573,7 @@ def _parse_nested(params, prefix):
 
 
 def _policy_record(asg_name, policy_name, arn, fields):
-    """A scaling policy as the store keeps it, from PutScalingPolicy's members
-    or an AWS::AutoScaling::ScalingPolicy's properties (the same PascalCase
-    names). Only the members the policy type has are kept, which is what
-    DescribePolicies answers on AWS: a target-tracking policy carries no
-    AdjustmentType, ScalingAdjustment or Cooldown, a step policy no
-    ScalingAdjustment or Cooldown."""
+    """A policy record with only the members its type has, from API members or template properties."""
     policy_type = fields.get("PolicyType") or "SimpleScaling"
     record = {
         "PolicyARN": arn,
@@ -607,8 +596,7 @@ def _policy_record(asg_name, policy_name, arn, fields):
         tracking.setdefault("DisableScaleIn", False)
     predictive = record.get("PredictiveScalingConfiguration")
     if predictive is not None:
-        # AWS answers the default when the caller leaves it out (measured
-        # 2026-09-21).
+        # "Defaults to HonorMaxCapacity if not specified" (service-2.json).
         predictive.setdefault("MaxCapacityBreachBehavior", "HonorMaxCapacity")
     return record
 
@@ -630,8 +618,6 @@ def _put_scaling_policy(p):
     try:
         record = _policy_record(asg_name, policy_name, arn, fields)
     except ValueError as exc:
-        # A number member (TargetValue, a step bound, ScalingAdjustment) that
-        # does not parse is the caller's error, not a 500.
         return _error("ValidationError", f"Invalid numeric value in the scaling policy: {escape(str(exc))}")
     _policies[key] = record
     return _xml(200, "PutScalingPolicyResponse",
@@ -639,8 +625,7 @@ def _put_scaling_policy(p):
 
 
 def _member_xml(value):
-    """A stored member in the query protocol's XML: a dict as its members, a
-    list as ``<member>`` entries, a boolean as true/false."""
+    """A stored member as query-protocol XML."""
     if isinstance(value, dict):
         return "".join(f"<{k}>{_member_xml(v)}</{k}>" for k, v in value.items())
     if isinstance(value, list):
@@ -656,10 +641,6 @@ def _describe_policies(p):
     for key, pol in _policies.items():
         if asg_name and pol["AutoScalingGroupName"] != asg_name:
             continue
-        # The optional members were dropped here, so a target-tracking or step
-        # policy read back without its whole configuration. AWS answers the
-        # type's members only, StepAdjustments and Alarms as (empty) lists,
-        # and MinAdjustmentStep beside MinAdjustmentMagnitude.
         body = dict(pol)
         body.setdefault("Enabled", True)
         body.setdefault("StepAdjustments", [])
@@ -736,11 +717,7 @@ def _record_lifecycle_heartbeat(p):
 # ---------------------------------------------------------------------------
 
 def _scheduled_action_record(asg_name, action_name, arn, fields):
-    """A scheduled action as the store keeps it, from
-    PutScheduledUpdateGroupAction's members or an
-    AWS::AutoScaling::ScheduledAction's properties (the same PascalCase
-    names). A capacity the caller omitted is -1, which DescribeScheduledActions
-    leaves out; StartTime, EndTime and TimeZone are kept only when given."""
+    """A scheduled action record; an omitted capacity is -1 and left out of the response."""
     def capacity(member):
         value = fields.get(member)
         return -1 if value in (None, "") else int(value)
@@ -778,11 +755,6 @@ def _describe_scheduled_actions(p):
     for key, sa in _scheduled_actions.items():
         if asg_name and sa["AutoScalingGroupName"] != asg_name:
             continue
-        # Recurrence and the three capacity members are what the action is
-        # for, and PutScheduledUpdateGroupAction stores all four; leaving them
-        # out of the response made a scheduled action's whole payload
-        # unreadable. The capacities carry -1 when the caller omitted them,
-        # and AWS leaves an omitted one out rather than answering -1.
         members += (f"<member>"
                     f"<ScheduledActionARN>{sa['ScheduledActionARN']}</ScheduledActionARN>"
                     f"<ScheduledActionName>{sa['ScheduledActionName']}</ScheduledActionName>"
@@ -792,8 +764,7 @@ def _describe_scheduled_actions(p):
             value = sa.get(member, -1)
             if value is not None and int(value) >= 0:
                 members += f"<{member}>{int(value)}</{member}>"
-        # AWS answers StartTime twice, the second time as the deprecated Time
-        # (measured 2026-09-21).
+        # StartTime is also answered as the deprecated Time.
         if sa.get("StartTime"):
             members += (f"<StartTime>{escape(sa['StartTime'])}</StartTime>"
                         f"<Time>{escape(sa['StartTime'])}</Time>")

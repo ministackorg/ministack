@@ -189,9 +189,7 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
 
 
 def _rollback_failure_reason(failed_records: dict) -> str:
-    """The StackStatusReason of a rollback that could not finish: the
-    resources whose revert failed, then those whose delete failed, in the
-    wording AWS uses for each."""
+    """The reason of a rollback that could not finish: failed reverts, then failed deletes."""
     reverts = sorted(k for k, v in failed_records.items() if "RevertTo" in v)
     deletes = sorted(k for k, v in failed_records.items() if "RevertTo" not in v)
     parts = []
@@ -203,23 +201,15 @@ def _rollback_failure_reason(failed_records: dict) -> str:
 
 
 def _sends_back_failed_update(resource_type: str) -> bool:
-    """Whether the rollback sends the resource whose own update failed back to
-    its previous properties. AWS does for a custom resource (measured
-    2026-09-21: the provider that answered FAILED gets UPDATE_IN_PROGRESS /
-    UPDATE_COMPLETE in the rollback), whose provider may have changed state
-    before it failed. A resource type's own handler that failed is taken to
-    have changed nothing: AWS records a lone UPDATE_COMPLETE for it without
-    calling it again (a scaling policy refused with AlreadyExists, the same
-    day). A nested stack is sent back so its own in-place changes are undone,
-    as AWS rolls the child stack back."""
+    """Whether the resource whose own update failed is sent back too: a provider
+    or a child stack may have changed state before failing; a type's handler did not."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::Stack"))
 
 
 def _mark_rolled_back(record):
-    """A restored stack record of a resource the rollback updated reports
-    that update, as DescribeStackResources does on AWS afterwards."""
+    """The restored record of a resource the rollback updated reports UPDATE_COMPLETE."""
     if record is not None:
         record["ResourceStatus"] = "UPDATE_COMPLETE"
         record["Timestamp"] = now_iso()
@@ -227,15 +217,8 @@ def _mark_rolled_back(record):
 
 async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
                          applied_props, previous_props, attrs, record=None):
-    """Undo an in-place update during an update rollback: run the type's
-    update handler from the properties the update applied back to the ones
-    the stack held before it, as AWS does in UPDATE_ROLLBACK_IN_PROGRESS,
-    with the UPDATE_IN_PROGRESS / UPDATE_COMPLETE events it records for that.
-
-    ``record`` is the restored stack record of the resource; it takes the
-    attributes the handler answers now (a launch template's rollback adds a
-    version, for one). On failure the UPDATE_FAILED event is recorded and the
-    handler's exception propagates."""
+    """Send an in-place update back to the previous properties through the
+    type's update handler; ``record`` takes the attributes it answers."""
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
                physical_id=physical_id)
     try:
@@ -254,8 +237,6 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
         raise
     if record is not None:
         if new_pid != physical_id:
-            # The revert itself replaced the resource; the stack has to
-            # follow it or it records an id that no longer exists.
             logger.warning("Rollback update of %s moved it from %s to %s",
                            logical_id, physical_id, new_pid)
             record["PhysicalResourceId"] = new_pid
@@ -268,11 +249,8 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
 
 async def _continue_update_rollback_async(stack_name: str, stack_id: str,
                                           resources_to_skip):
-    """Background task for ContinueUpdateRollback: retry the reverts and
-    deletes that failed the update rollback, skipping the logical ids the
-    caller named (their status becomes UPDATE_COMPLETE and the resource stays
-    as it is, as on AWS), and land the stack in UPDATE_ROLLBACK_COMPLETE or,
-    if a retry fails again, UPDATE_ROLLBACK_FAILED."""
+    """ContinueUpdateRollback: retry the failed reverts and deletes; a skipped
+    resource is set to UPDATE_COMPLETE and left as it is."""
     from ministack.services.cloudformation import _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -378,14 +356,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     fail_reason = ""
     cancelled = False
     replaced_resources = []
-    # The resource that failed the update, when it existed before it, as
-    # (logical id, type, physical id, applied props, previous props, attrs):
-    # a custom resource's provider may have changed state before it failed,
-    # so the rollback sends it back too (_sends_back_failed_update). The three
-    # props are None when the update never reached the handler.
+    # (logical id, type, pid, applied, previous, attrs) of a pre-existing resource that failed.
     failed_update = None
-    # The logical id of the resource whose create or update failed, which the
-    # rollback's reason names.
     failed_logical_id = None
     stack.pop("_cancel_requested", None)
 
@@ -471,10 +443,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     stack_name, stack_id, logical_id)
                 pending_deletes = []
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
+                # A custom-named refusal never reaches the handler: nothing to send back.
                 if not _custom_named_replacement_error(
                         resource_type, old_tagged, new_tagged):
-                    # Refused above the handler, the update changes nothing
-                    # and there is nothing to send back.
                     update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
                     if _is_custom_resource(resource_type):
@@ -610,7 +581,14 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         old_resources = previous_stack.get("_resources", {})
         old_template = previous_stack.get("_template", {}) or {}
         old_defs = old_template.get("Resources", {}) or {}
-        for logical_id in to_remove:
+        # Dependents first, as the stack delete orders it.
+        try:
+            removal_order = [lid for lid in _topological_sort(
+                old_defs, previous_stack.get("_conditions", conditions)) if lid in to_remove]
+        except ValueError:
+            removal_order = []
+        removal_order += [lid for lid in to_remove if lid not in removal_order]
+        for logical_id in reversed(removal_order):
             old_res = old_resources.get(logical_id, {})
             rtype = old_res.get("ResourceType", "")
             pid = old_res.get("PhysicalResourceId", "")
@@ -669,8 +647,6 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if cancelled:
                 rollback_reason = "User Initiated"
             elif is_update and failed_logical_id:
-                # AWS names the resource and whether it existed before the
-                # update (measured 2026-09-21), trailing space included.
                 verb = "update" if failed_update is not None else "create"
                 rollback_reason = (f"The following resource(s) failed to {verb}: "
                                    f"[{failed_logical_id}]. ")
@@ -688,8 +664,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             replaced_ids = {entry[0] for entry in replaced_resources}
 
             async def revert(logical_id, rtype, pid, applied, previous, attrs):
-                # An in-place change goes back through the update handler; one
-                # that fails is kept for ContinueUpdateRollback to retry or skip.
+                # A failed revert is kept for ContinueUpdateRollback.
                 try:
                     await _revert_update(stack_id, stack_name, logical_id, rtype,
                                          pid, applied, previous, attrs,
@@ -701,11 +676,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         "Attributes": attrs,
                     }
 
-            # AWS rolls an update back as an update to the previous template
-            # (measured 2026-09-21): what the update changed in place goes back
-            # through the update handler, in the template's dependency order,
-            # and the resource that failed comes last. What the update created
-            # is deleted after that, in the cleanup phase, in reverse order.
+            # In-place changes go back first; what the update created is deleted in cleanup.
             to_delete = []
             for logical_id in created_in_this_run:
                 res = provisioned_resources.get(logical_id, {})
@@ -715,12 +686,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         or logical_id in replaced_ids):
                     to_delete.append(logical_id)
                     continue
-                # The resource existed before this update and kept its
-                # identity (untouched, or updated in place), so it is not
-                # something this run created: it goes back to the properties
-                # it had, with the tags the forward update gave it on one side
-                # and the previous tags on the other, exactly as that update
-                # was called. An untouched one has nothing to send back.
+                # Pre-existing and same identity: sent back with the tags each side was called with.
                 rtype = res.get("ResourceType", "")
                 applied = _with_stack_tags(rtype, res.get("Properties", {}), stack_tags,
                                            stack_name, stack_id, logical_id)
@@ -736,18 +702,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         and _sends_back_failed_update(rtype)):
                     await revert(logical_id, rtype, pid, applied, previous, attrs)
                 else:
-                    # Nothing to send back: the update never reached a handler
-                    # (a custom-named replacement refused above it), or the
-                    # type's own handler refused it. AWS still records the
-                    # resource as complete.
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "UPDATE_COMPLETE", physical_id=pid)
                     _mark_rolled_back(previous_resources.get(logical_id))
-            # Everything is back; what the update created goes in the cleanup
-            # phase, which AWS reports as a stack status of its own. The
-            # rollback is complete by then, so a delete that fails in it is a
-            # DELETE_FAILED event and nothing more: it cannot turn the stack
-            # into UPDATE_ROLLBACK_FAILED.
+            # "rolled back to its previous working state ... still deleting any new
+            # resources" (view-stack-events): a cleanup delete failure does not fail it.
             cleanup_phase = bool(is_update and previous_stack
                                  and not rollback_failed_records)
             if cleanup_phase:
@@ -832,8 +791,6 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                            "AWS::CloudFormation::Stack", stack["StackStatus"],
                            reason, stack_id)
                 return
-            # AWS's final UPDATE_ROLLBACK_COMPLETE carries no reason
-            # (measured 2026-09-21).
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
                        "" if is_update and previous_stack else "Rollback complete",

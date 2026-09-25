@@ -1381,11 +1381,7 @@ def test_ec2_modify_vpc_attribute(ec2):
 
 
 def test_ec2_subnet_dns_and_ipv6_attributes_read_back(ec2):
-    """DescribeSubnets answers PrivateDnsNameOptionsOnLaunch, EnableDns64,
-    Ipv6Native and AssignIpv6AddressOnCreation on AWS (false and "ip-name"
-    for a subnet created without them), and ModifySubnetAttribute changes the
-    DNS name options one member at a time. None of the four was answered or
-    stored."""
+    """DescribeSubnets answers the DNS and IPv6 attributes; ModifySubnetAttribute sets the DNS options."""
     vpc_id = subnet_id = None
     try:
         vpc_id = ec2.create_vpc(CidrBlock="10.61.0.0/16")["Vpc"]["VpcId"]
@@ -2633,9 +2629,7 @@ def test_ec2_launch_template_crud(ec2):
 
 
 def test_ec2_launch_template_versions_newest_first(ec2):
-    """DescribeLaunchTemplateVersions lists a template's versions newest
-    first on AWS (measured 2026-09-21: 4, 3, 2, 1 after three new versions);
-    the emulator answered them oldest first."""
+    """DescribeLaunchTemplateVersions lists newest first."""
     name = f"qa-lt-order-{_uuid_mod.uuid4().hex[:8]}"
     lt_id = ec2.create_launch_template(
         LaunchTemplateName=name, LaunchTemplateData={"InstanceType": "t3.micro"},
@@ -2652,10 +2646,7 @@ def test_ec2_launch_template_versions_newest_first(ec2):
 
 
 def test_ec2_launch_template_tags_read_back(ec2):
-    """A launch template's tags are the TagSpecifications entry for
-    "launch-template". CreateLaunchTemplate and DescribeLaunchTemplates
-    rendered them under <tags>, where the EC2 model reads <tagSet>, so botocore
-    dropped them and no launch template ever read back a tag."""
+    """Launch template tags read back through tagSet."""
     name = f"qa-lt-tags-{_uuid_mod.uuid4().hex[:8]}"
     resp = ec2.create_launch_template(
         LaunchTemplateName=name,
