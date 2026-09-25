@@ -8983,7 +8983,7 @@ def _apigw_v2_api_props(props, stack_name, logical_id):
     return {
         "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
         "routeSelectionExpression": props.get("RouteSelectionExpression", default_rse),
-        "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),  # sadscan:disable np.twitter.1 - API route expression, not a credential.
+        "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
         "disableSchemaValidation": props.get("DisableSchemaValidation", False),
         "disableExecuteApiEndpoint": props.get("DisableExecuteApiEndpoint", False),
         "version": props.get("Version", ""),
