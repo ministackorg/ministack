@@ -2868,11 +2868,31 @@ _DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
+def _docker_context_selected() -> bool:
+    """Whether a Docker CLI context other than ``default`` is selected.
+
+    docker-py follows the selected context when ``DOCKER_HOST`` is unset (the
+    ``DOCKER_CONTEXT`` variable, then ``currentContext`` in the CLI config), so
+    on Colima, Docker Desktop, Rancher Desktop or OrbStack the daemon is reached
+    through a per-user socket and ``/var/run/docker.sock`` need not exist.
+    """
+    name = os.environ.get("DOCKER_CONTEXT")
+    if name is None:
+        config_dir = os.environ.get("DOCKER_CONFIG") or os.path.join(os.path.expanduser("~"), ".docker")
+        try:
+            with open(os.path.join(config_dir, "config.json")) as f:
+                name = json.load(f).get("currentContext")
+        except (OSError, ValueError, AttributeError):
+            name = None
+    return bool(name) and name != "default"
+
+
 def _reaper_docker_client():
     """Docker client for the periodic reaper, or None when there is no daemon."""
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
     if sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]):
-        return None
+        if os.environ.get("DOCKER_HOST") or not _docker_context_selected():
+            return None
     try:
         import docker
 

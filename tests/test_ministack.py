@@ -807,6 +807,58 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
 
 
+def _docker_config(tmp_path, monkeypatch, config):
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    if config is not None:
+        (tmp_path / "config.json").write_text(config)
+
+
+@pytest.mark.parametrize(
+    "context_env, config, selected",
+    [
+        ("colima", None, True),
+        ("default", '{"currentContext": "colima"}', False),  # the variable wins, as in the CLI
+        (None, '{"currentContext": "desktop-linux"}', True),
+        (None, '{"currentContext": "default"}', False),
+        (None, '{"auths": {}}', False),
+        (None, None, False),
+        (None, "not json", False),
+    ],
+)
+def test_docker_context_selected(tmp_path, monkeypatch, context_env, config, selected):
+    from ministack.app import _docker_context_selected
+
+    _docker_config(tmp_path, monkeypatch, config)
+    if context_env is not None:
+        monkeypatch.setenv("DOCKER_CONTEXT", context_env)
+    assert _docker_context_selected() is selected
+
+
+def test_reaper_reaches_the_daemon_through_the_selected_context(tmp_path, monkeypatch):
+    """Colima and Docker Desktop serve Docker on a per-user socket. The reaper
+    used to give up when /var/run/docker.sock was missing, although every
+    service reached the daemon through the context, so no container was ever
+    reaped at boot, periodically, or at shutdown."""
+    import docker
+
+    from ministack.app import _reaper_docker_client
+
+    _docker_config(tmp_path, monkeypatch, '{"currentContext": "colima"}')
+    monkeypatch.setattr(os.path, "exists", lambda path: False)
+    client = object()
+    monkeypatch.setattr(docker, "from_env", lambda **kwargs: client)
+    assert _reaper_docker_client() is client
+
+    (tmp_path / "config.json").write_text('{"currentContext": "default"}')
+    assert _reaper_docker_client() is None
+
+    monkeypatch.setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")  # an explicit host is authoritative
+    (tmp_path / "config.json").write_text('{"currentContext": "colima"}')
+    assert _reaper_docker_client() is None
+
+
 def test_persistence_keeps_state_when_a_module_fails_to_load():
     """A service that could not import must not overwrite its persisted state.
 
