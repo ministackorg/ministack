@@ -1,6 +1,10 @@
 /*
- * MiniStack's AWSAuthenticationPlugin adapter (stage 7 of #1744).
- * No runtime capability provisioning until stage 8; absent config denies.
+ * MiniStack's L0 emulation of Aurora MySQL's AWSAuthenticationPlugin.
+ *
+ * This plugin intentionally rejects every authentication attempt. It exists
+ * so local Aurora users can be created with the same authentication-plugin
+ * name as AWS and retain that name in mysql.user. Token authentication is a
+ * later fidelity level; accepting credentials here would be unsafe.
  */
 
 #include <stddef.h>
@@ -12,37 +16,12 @@
 #endif
 
 #include <mysql/plugin_auth.h>
-#include "broker_client.h"
 
-static int broker_authentication(MYSQL_PLUGIN_VIO *vio,
+static int reject_authentication(MYSQL_PLUGIN_VIO *vio,
                                  MYSQL_SERVER_AUTH_INFO *info) {
-  try {
-    if (!vio || !info || !vio->read_packet) return CR_ERROR;
-    info->password_used = PASSWORD_USED_YES;
-    unsigned char *packet = nullptr;
-    const int length = vio->read_packet(vio, &packet);
-    // read_packet may populate user_name during the initial handshake. Never
-    // authorize an anonymous/proxy account under a client-supplied identity.
-    if (!info->user_name || info->user_name_length == 0 ||
-        info->user_name_length > MYSQL_USERNAME_LENGTH ||
-        std::strlen(info->authenticated_as) != info->user_name_length ||
-        std::memcmp(info->authenticated_as, info->user_name, info->user_name_length))
-      return CR_ERROR;
-    if (ministack_iam::authorize(info->user_name, info->user_name_length, packet, length))
-      return CR_OK;
-  } catch (...) {
-    // Never leak tokens/capabilities through errors or across the C plugin ABI.
-  }
+  (void)vio;
+  (void)info;
   return CR_ERROR;
-}
-
-static int initialize_broker(void *) {
-  return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK ? 0 : 1;
-}
-
-static int deinitialize_broker(void *) {
-  curl_global_cleanup();
-  return 0;
 }
 
 static int generate_authentication_string(char *outbuf,
@@ -74,8 +53,8 @@ static int set_salt(const char *password, unsigned int password_len,
 
 static struct st_mysql_auth aws_auth_handler = {
     MYSQL_AUTHENTICATION_INTERFACE_VERSION,
-    "mysql_clear_password",
-    broker_authentication,
+    NULL,
+    reject_authentication,
     generate_authentication_string,
     validate_authentication_string,
     set_salt,
@@ -88,11 +67,11 @@ mysql_declare_plugin(aws_auth_plugin) {
   &aws_auth_handler,
   "AWSAuthenticationPlugin",
   "MiniStack",
-  "RDS IAM authentication broker adapter",
+  "Aurora IAM authentication compatibility plugin (reject-all L0)",
   PLUGIN_LICENSE_GPL,
-  initialize_broker,
   NULL,
-  deinitialize_broker,
+  NULL,
+  NULL,
   0x0100,
   NULL,
   NULL,

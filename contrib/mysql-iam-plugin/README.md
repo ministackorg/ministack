@@ -3,60 +3,83 @@
 This directory contains MiniStack's server-side compatibility plugin for
 Aurora MySQL users declared with `AWSAuthenticationPlugin`.
 
-The plugin supports provider workflows that create, alter, grant, revoke,
-inspect, and drop IAM-authenticated users. Stage 7 of #1744 adds delegation to
-the internal IAM broker. Normal container provisioning does not yet configure
-the callback, so IAM logins still fail by default. Stage 8 supplies that wiring
-and the first end-to-end login tests; this change alone does not enable them.
+The initial L0 implementation deliberately rejects every login, matching
+MySQL's `mysql_no_login` behavior. It supports provider workflows that create,
+alter, grant, revoke, inspect, and drop IAM-authenticated users without
+enabling direct IAM logins before the isolated proxy topology is provisioned.
 
-## Internal callback contract
+## Stage 7: inactive Python gatekeeper
 
-The plugin requests `mysql_clear_password` and forwards the NUL-terminated token
-with the actual MySQL username. It rejects anonymous/proxy account mismatches
-and never changes the selected SQL account or its privileges. The broker owns
-the `AUTH` gate: strict token and IAM-policy checks for `AUTH=true`, permissive
-IAM checks otherwise. Both modes still require a valid capability, a current
-resource binding, and resource IAM-auth enablement. The plugin has no local
-`AUTH` bypass and only accepts HTTP 200 with the exact body `{"allowed":true}`.
+`ministack/core/mysqlproxy.py` implements the narrow MySQL connection adapter.
+It relays ordinary password authentication to MySQL and delegates IAM admission
+to a caller-supplied Python authorizer. No C++ HTTP callback or libcurl dependency
+is needed. The opt-in connection fixture uses the existing `rds_iam._decision`
+implementation with a resource capability and SDK-signed tokens; it does not
+duplicate SigV4 or IAM policy evaluation.
 
-Trusted container provisioning will supply these process environment values:
+`gatekeeper_shim.cc` is the minimal accepting variant, compiled only by the live
+test fixture. **It is not bundled or installed by normal runtime provisioning.**
+`Dockerfile.full` continues to build the reject-all `aws_auth_plugin.cc`.
+The accepting variant must never replace that artifact while MySQL is directly
+reachable. A caller inside the trusted backend namespace can bypass the proxy;
+the tests demonstrate both that bypass and denial from outside the namespace.
 
-* `MINISTACK_RDS_IAM_BROKER_HOST`: numeric IPv4 address reachable from MySQL.
-* `MINISTACK_RDS_IAM_BROKER_PORT`: broker TCP port (1–65535).
-* `MINISTACK_RDS_IAM_CAPABILITY`: the broker-issued 64-character lowercase hex capability.
+MySQL selects the private `ministack_iam_gate_v1` client method for IAM accounts.
+The adapter rejects client claims of that method and translates the backend's
+auth switch to `mysql_clear_password`. Account creation and changes between IAM
+and password methods therefore require no cached user list. MySQL still owns
+account locks, SQL identity, grants, and password verification.
 
-The path is fixed at `/_ministack/rds/iam-auth`. No account, resource, or callback
-address comes from the login request. Missing/invalid settings deny access.
-One process-level capability binds one resource endpoint; stage 8 must resolve
-cluster/member/reader endpoint routing before claiming those login paths work.
-Capabilities must be reprovisioned after broker restart or resource replacement.
+With `AUTH=true`, IAM admission requires frontend TLS before requesting a token
+and applies the existing token/policy decision. False or unset remains permissive
+for IAM credentials and transport. Valid resource capability, current binding,
+and resource IAM enablement remain required by the authorizer in either mode.
+Password users retain MySQL's password checks and account-specific SSL rules.
 
-libcurl provides HTTP framing, a one-second connection timeout, and a three-second
-total callback timeout. Numeric addresses avoid synchronous DNS lookup delays.
-Redirects and environment proxies are disabled. Responses are capped at 1 KiB,
-tokens at 64 KiB, and JSON requests at the broker's 70 KiB limit. Errors deny
-access without logging credentials. The callback uses HTTP on a trusted internal
-network; it must not cross an untrusted network without transport protection.
+### Validation and limits
 
-Stage 8 must require TLS for IAM-authenticated MySQL logins when `AUTH=true`.
-With `AUTH` unset or false, it must preserve permissive transport behavior and
-add no TLS requirement. Non-IAM users' transport requirements remain unchanged;
-do not unconditionally add `REQUIRE SSL` to IAM accounts. This callback cannot
-attest to client TLS, so stage 8 must establish that enforcement at the MySQL
-connection boundary. Protection of the plugin-to-broker transport is a separate
-concern from client-to-MySQL TLS.
+Offline handshake tests run in the normal Python test lane without image builds:
 
-Existing database-user checks and SQL privileges must remain in force.
-End-to-end acceptance tests must cover TLS refusal and token expiry on new
-IAM logins with `AUTH=true`, permissive transport with `AUTH` unset or false,
-and continued use of already-established sessions.
-
-Native callback tests run offline with a C++ compiler and libcurl development
-headers/libraries (for example `g++` and `libcurl4-openssl-dev` on Debian):
-
-```bash
-uv run --extra dev pytest tests/test_rds_iam_plugin_client.py -q
+```sh
+uv run --extra dev pytest tests/test_mysqlproxy.py tests/test_rds_iam.py tests/test_rds_iam_plugin.py -q
 ```
+
+The opt-in live tests compile the unbundled shim and connect through the Python
+adapter to MySQL 8.0 and 8.4. They cover signed-token acceptance/rejection,
+password users, account changes, grants, TLS rules, method spoofing, disabled
+LOCAL INFILE, and backend isolation. They are not part of normal PR CI and do
+not rebuild plugin images there. On the existing ARM64 validation environment:
+
+```sh
+docker build -f Dockerfile.full --target plugin-build-80 -t ministack-spike-compiler80:local .
+docker build -f Dockerfile.full --target plugin-build -t ministack-iam-stage7-build:local .
+uv run --extra dev pytest contrib/mysql-iam-plugin/tests/test_connections.py -q
+```
+
+Requires Docker, OpenSSL, a native `mysql` client on PATH, and the repo's dev
+dependencies. The Python helper image is `ghcr.io/ministackorg/ministack:full`;
+local source is mounted read-only. Fixtures own and remove their containers,
+volumes and network; Compose is unnecessary. The native client covers cold-cache
+plaintext RSA authentication because the installed PyMySQL 1.2.3 cold RSA path
+returns no packet to its caller. PyMySQL covers TLS and warmed password logins.
+
+This is not yet a provisioned integration. The adapter only forwards QUERY,
+QUIT, INIT_DB and PING; reauthentication, prepared statements and compression
+are unsupported. Frames are capped at 1 MiB, socket operations at five seconds,
+and idle sessions at ten seconds. These bounds are not a whole-handshake
+deadline or a concurrency limit. Backend TLS is encrypted but its certificate
+is not verified. Host-specific account selection is unproven: fixtures use `%`
+accounts and MySQL sees the proxy's loopback address. Broader client compatibility
+and fragmentation/multi-statement behavior still need validation.
+
+Item 8 of #1744 must provide isolated backend networking, endpoint/resource and
+capability provisioning, lifecycle handling, TLS certificates, and tests through
+normal MiniStack provisioning before activating the accepting shim. It should
+expose a supported internal decision API rather than the fixture's private seam.
+The authorizer fixture creates local state; it is not production provisioning
+or validation against AWS. Token expiry affects new logins, not existing sessions.
+
+## Bundled compatibility artifact
 
 The same C++ source is compiled separately against MySQL 8.0 and 8.4 headers.
 MySQL checks the authentication-plugin interface version when the library is
@@ -74,8 +97,7 @@ The official runtime images expose only a minimal repository. Installing
 owned by `mysql-community-server-minimal`, and it does not contain the server
 plugin header. The build therefore installs the exact-version
 `mysql-community-debugsource` package from the image's series repository and
-compiles with its server headers and `libcurl-devel`. The target MySQL runtime
-must provide `libcurl.so.4`, as the supported official images do. Generated `mysql_version.h` and the unused
+compiles with its server headers. Generated `mysql_version.h` and the unused
 server-internal headers are excluded with MySQL's `MYSQL_ABI_CHECK` compile
 mode. `MYSQL_DYNAMIC_PLUGIN` emits the three loader-facing symbols instead of
 the built-in-plugin symbol names, and the image build asserts that the interface

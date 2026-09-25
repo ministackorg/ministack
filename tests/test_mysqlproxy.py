@@ -1,9 +1,15 @@
-"""Offline fail-closed checks for the spike's explicitly limited handshake."""
+"""Offline fail-closed checks for the adapter's explicitly limited handshake."""
 import socket
 
 import pytest
-from relay import client_identity, read
-from trusted_bypass import handshake
+
+from ministack.core.mysqlproxy import client_identity, read
+
+
+def handshake(plugin=b"mysql_native_password"):
+    flags = (1 << 9) | (1 << 15) | (1 << 19)
+    return (flags.to_bytes(4, "little") + b"\0" * 4 + b"\x21" + b"\0" * 23
+            + b"iam_user\0\0" + plugin + b"\0")
 
 
 @pytest.mark.parametrize("plugin", [b"mysql_native_password", b"caching_sha2_password"])

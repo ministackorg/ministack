@@ -1,4 +1,4 @@
-// SPIKE ONLY: unsafe unless MySQL is inaccessible except through the gatekeeper.
+// UNBUNDLED: unsafe unless MySQL is inaccessible except through the gatekeeper.
 #include <stddef.h>
 #include <string.h>
 #define MY_ATTRIBUTE(attributes) __attribute__(attributes)

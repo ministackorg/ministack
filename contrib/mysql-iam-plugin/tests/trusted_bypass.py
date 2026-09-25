@@ -2,7 +2,7 @@
 import socket
 import struct
 
-from relay import read, send
+from ministack.core.mysqlproxy import read, send
 
 
 def handshake(plugin=b"mysql_native_password"):

@@ -1,10 +1,10 @@
-"""SPIKE ONLY. Preserve backend auth for passwords; gate IAM auth switches.
+"""Inactive MySQL IAM adapter: relay password auth and gate IAM auth switches.
 
 Runs in MySQL's network namespace. MySQL listens on loopback only.
-No SQL/account rewriting. Fixture bootstrap supplies real IAM/RDS state.
+No SQL/account rewriting. The caller supplies resource-bound authorization.
+Not provisioned by the runtime: backend isolation is mandatory before activation.
 """
 import contextlib
-import os
 import select
 import socket
 import socketserver
@@ -25,7 +25,7 @@ def read(sock):
     header = exact(sock, 4)
     n = int.from_bytes(header[:3], "little")
     if n > 1024 * 1024:
-        raise ValueError("spike packet limit")
+        raise ValueError("adapter packet limit")
     return header[3], exact(sock, n)
 
 
@@ -34,7 +34,7 @@ def send(sock, seq, body):
 
 
 def deny(sock, seq):
-    send(sock, seq, b"\xff\x15\x04#28000Spike gate denied")
+    send(sock, seq, b"\xff\x15\x04#28000IAM gate denied")
 
 
 def limited_greeting(packet):
@@ -106,7 +106,7 @@ class Handler(socketserver.BaseRequestHandler):
                 reply = flags.to_bytes(4, "little") + reply[4:]
                 send(back, seq, reply)
                 # Encryption only on the namespace-local backend leg; server
-                # identity verification is not implemented in this spike.
+                # identity verification is not implemented by this adapter.
                 back = ssl._create_unverified_context().wrap_socket(back)
                 front = self.server.tls.wrap_socket(front, server_side=True)
                 secure = True
@@ -180,7 +180,7 @@ class Handler(socketserver.BaseRequestHandler):
                      "compression and local infile unsupported", "invalid username", "invalid auth length",
                      "secure connection capability required", "unsupported client auth method"}
             reason = str(exc) if type(exc) is ValueError and str(exc) in known else type(exc).__name__
-            print("spike rejection", phase, reason, flush=True)
+            print("MySQL adapter rejection", phase, reason, flush=True)
             with contextlib.suppress(OSError):
                 deny(front, seq + 1)
         finally:
@@ -192,15 +192,3 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
-
-
-if __name__ == "__main__":
-    from proof_authorization import bootstrap
-
-    with Server(("0.0.0.0", int(os.environ["SPIKE_PORT"])), Handler) as server:
-        server.authorize = bootstrap()
-        server.strict = os.environ.get("AUTH", "").lower() == "true"
-        server.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server.tls.minimum_version = ssl.TLSVersion.TLSv1_2
-        server.tls.load_cert_chain("/tls/cert.pem", "/tls/key.pem")
-        server.serve_forever()

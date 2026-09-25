@@ -40,12 +40,15 @@ def setup(request, tmp_path_factory):
     token = signed(secret)
     temp = tmp_path_factory.mktemp("accepting-shim")
     compiler = "ministack-spike-compiler80:local" if request.param == "8.0" else "ministack-iam-stage7-build:local"
-    run("docker", "run", "--rm", "--label", LABEL, "--entrypoint", "sh",
-        "-v", f"{SOURCE}:/src:ro", "-v", f"{temp}:/out", compiler, "-c",
-        'header=$(rpm -ql mysql-community-debugsource | grep "/include/mysql/plugin_auth.h$" | head -1); '
+    linked = run("docker", "run", "--rm", "--label", LABEL, "--entrypoint", "sh",
+        "-v", f"{SOURCE.parent}:/src:ro", "-v", f"{temp}:/out", compiler, "-c",
+        'set -e; header=$(rpm -ql mysql-community-debugsource | grep "/include/mysql/plugin_auth.h$" | head -1); '
         'g++ -Wall -Wextra -Werror -shared -fPIC -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN '
-        '-I"$(dirname "$(dirname "$header")")" /src/accepting_shim.cc -o /out/accepting_shim.so; '
-        'ldd /out/accepting_shim.so')
+        '-I"$(dirname "$(dirname "$header")")" /src/gatekeeper_shim.cc -o /out/accepting_shim.so; '
+        'g++ -Wall -Wextra -Werror -shared -fPIC -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN '
+        '-I"$(dirname "$(dirname "$header")")" /src/aws_auth_plugin.cc -o /out/rejecting_shim.so; '
+        'ldd /out/accepting_shim.so; ldd /out/rejecting_shim.so')
+    assert "libcurl" not in linked
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
         "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1",
         "-keyout", str(temp / "key.pem"), "-out", str(temp / "cert.pem"))
@@ -78,6 +81,7 @@ def setup(request, tmp_path_factory):
                 time.sleep(1)
         plugin_dir = admin("SELECT @@plugin_dir")
         run("docker", "cp", str(temp / "accepting_shim.so"), f"{db}:{plugin_dir}accepting_shim.so")
+        run("docker", "cp", str(temp / "rejecting_shim.so"), f"{db}:{plugin_dir}rejecting_shim.so")
         admin("INSTALL PLUGIN AWSAuthenticationPlugin SONAME 'accepting_shim.so';"
               "CREATE DATABASE spike; CREATE TABLE spike.visible(id INT);"
               "INSERT INTO spike.visible VALUES (7); CREATE TABLE spike.hidden(id INT);")
@@ -96,10 +100,10 @@ def setup(request, tmp_path_factory):
             run("docker", "run", "-d", "--name", proxy, "--label", LABEL,
                 "--network", "container:" + db, "--entrypoint", "python",
                 "-v", f"{SOURCE}:/src:ro", "-v", f"{temp}:/tls:ro",
-                "-v", f"{SOURCE.parents[1]}:/repo:ro", "-e", "PYTHONPATH=/repo",
+                "-v", f"{SOURCE.parents[2]}:/repo:ro", "-e", "PYTHONPATH=/repo",
                 "-e", "SPIKE_PORT=" + str(port), "-e", "AUTH=" + str(strict).lower(),
                 "-e", "SPIKE_SECRET=" + secret,
-                PYTHON_IMAGE, "/src/relay.py")
+                PYTHON_IMAGE, "/src/gatekeeper_server.py")
             containers.append(proxy)
             ports[strict] = int(run("docker", "port", db, f"{port}/tcp").split(":")[-1])
             deadline = time.monotonic() + 20
@@ -202,7 +206,8 @@ def test_backend_isolation_and_trusted_bypass(setup):
     # Deliberate negative control: inside the trusted namespace the shim DOES
     # accept arbitrary credentials. Isolation, not the shim, is the security gate.
     output = run("docker", "run", "--rm", "--label", LABEL, "--network", "container:" + setup["db"],
-                 "-v", f"{SOURCE}:/src:ro", "--entrypoint", "python", PYTHON_IMAGE, "/src/trusted_bypass.py")
+                 "-v", f"{SOURCE}:/src:ro", "-v", f"{SOURCE.parents[2]}:/repo:ro",
+                 "-e", "PYTHONPATH=/repo", "--entrypoint", "python", PYTHON_IMAGE, "/src/trusted_bypass.py")
     assert output == "backend accepted unverified login"
 
 
@@ -244,8 +249,9 @@ def test_account_changes_need_no_cached_classification(setup):
 
 
 def test_client_cannot_claim_private_auth_method(setup):
-    from relay import read, send
     from trusted_bypass import handshake
+
+    from ministack.core.mysqlproxy import read, send
 
     # Permissive mode still must not permit the client to choose classification.
     with socket.create_connection(("127.0.0.1", setup["ports"][False]), timeout=3) as sock:
@@ -283,3 +289,16 @@ def test_local_infile_stays_disabled(setup):
             assert caught.value.args[0] == 3948  # LOCAL disabled by negotiated capability
     finally:
         admin("DROP USER 'file_user'@'%'; SET GLOBAL local_infile=OFF;")
+
+
+def test_bundled_shim_stays_fail_closed(setup):
+    admin = setup["admin"]
+    admin("UNINSTALL PLUGIN AWSAuthenticationPlugin;"
+          "INSTALL PLUGIN AWSAuthenticationPlugin SONAME 'rejecting_shim.so';")
+    try:
+        for strict in (True, False):
+            with pytest.raises(pymysql.MySQLError):
+                connect(setup, strict=strict)
+    finally:
+        admin("UNINSTALL PLUGIN AWSAuthenticationPlugin;"
+              "INSTALL PLUGIN AWSAuthenticationPlugin SONAME 'accepting_shim.so';")
