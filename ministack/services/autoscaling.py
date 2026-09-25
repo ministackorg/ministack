@@ -21,6 +21,7 @@ Supports:
 import copy
 import logging
 import os
+from xml.sax.saxutils import escape
 
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -515,6 +516,103 @@ def _delete_lc(p):
 # Scaling Policy
 # ---------------------------------------------------------------------------
 
+# The typed scalars of a policy's members; every other leaf is a string.
+# DescribePolicies serializes TargetValue and the step bounds as doubles, the
+# switches as booleans (measured on AWS 2026-09-21: TargetValue 40.0,
+# MetricIntervalLowerBound 0.0, DisableScaleIn false).
+_POLICY_FLOATS = frozenset({"TargetValue", "MetricIntervalLowerBound", "MetricIntervalUpperBound"})
+_POLICY_INTS = frozenset({"ScalingAdjustment", "EstimatedInstanceWarmup",
+                          "MinAdjustmentMagnitude", "Period", "SchedulingBufferTime",
+                          "MaxCapacityBuffer"})
+_POLICY_BOOLS = frozenset({"DisableScaleIn", "ReturnData", "Enabled"})
+# The optional members a policy keeps as given, in DescribePolicies' names.
+_POLICY_OPTIONAL = ("EstimatedInstanceWarmup", "MetricAggregationType",
+                    "MinAdjustmentMagnitude", "PredictiveScalingConfiguration",
+                    "StepAdjustments", "TargetTrackingConfiguration")
+
+
+def _policy_typed(value, key=None):
+    if isinstance(value, dict):
+        return {k: _policy_typed(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_policy_typed(v) for v in value]
+    if key in _POLICY_FLOATS:
+        return float(value)
+    if key in _POLICY_INTS:
+        return int(value)
+    if key in _POLICY_BOOLS:
+        return value if isinstance(value, bool) else str(value).lower() == "true"
+    return value
+
+
+def _parse_nested(params, prefix):
+    """The query members under ``prefix`` as nested dicts, each
+    ``.member.N`` level as a list: ``Dimensions.member.1.Name`` becomes
+    ``{"Dimensions": [{"Name": ...}]}``."""
+    tree = {}
+    for key in params:
+        if not key.startswith(prefix + "."):
+            continue
+        tokens = key[len(prefix) + 1:].split(".")
+        path = []
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "member" and i + 1 < len(tokens) and tokens[i + 1].isdigit():
+                path.append(int(tokens[i + 1]))
+                i += 2
+            else:
+                path.append(tokens[i])
+                i += 1
+        node = tree
+        for step in path[:-1]:
+            node = node.setdefault(step, {})
+        node[path[-1]] = _p(params, key)
+
+    def listify(node):
+        if isinstance(node, dict):
+            if node and all(isinstance(k, int) for k in node):
+                return [listify(node[k]) for k in sorted(node)]
+            return {k: listify(v) for k, v in node.items()}
+        return node
+
+    return listify(tree)
+
+
+def _policy_record(asg_name, policy_name, arn, fields):
+    """A scaling policy as the store keeps it, from PutScalingPolicy's members
+    or an AWS::AutoScaling::ScalingPolicy's properties (the same PascalCase
+    names). Only the members the policy type has are kept, which is what
+    DescribePolicies answers on AWS: a target-tracking policy carries no
+    AdjustmentType, ScalingAdjustment or Cooldown, a step policy no
+    ScalingAdjustment or Cooldown."""
+    policy_type = fields.get("PolicyType") or "SimpleScaling"
+    record = {
+        "PolicyARN": arn,
+        "PolicyName": policy_name,
+        "AutoScalingGroupName": asg_name,
+        "PolicyType": policy_type,
+        "Enabled": _policy_typed(fields.get("Enabled", True), "Enabled"),
+    }
+    if policy_type in ("SimpleScaling", "StepScaling"):
+        record["AdjustmentType"] = fields.get("AdjustmentType") or "ChangeInCapacity"
+    if policy_type == "SimpleScaling":
+        record["ScalingAdjustment"] = int(fields.get("ScalingAdjustment") or 0)
+        record["Cooldown"] = int(fields.get("Cooldown") or 300)
+    for member in _POLICY_OPTIONAL:
+        value = fields.get(member)
+        if value not in (None, "", [], {}):
+            record[member] = _policy_typed(value, member)
+    tracking = record.get("TargetTrackingConfiguration")
+    if tracking is not None:
+        tracking.setdefault("DisableScaleIn", False)
+    predictive = record.get("PredictiveScalingConfiguration")
+    if predictive is not None:
+        # AWS answers the default when the caller leaves it out (measured
+        # 2026-09-21).
+        predictive.setdefault("MaxCapacityBreachBehavior", "HonorMaxCapacity")
+    return record
+
+
 def _put_scaling_policy(p):
     asg_name = _p(p, "AutoScalingGroupName")
     policy_name = _p(p, "PolicyName")
@@ -522,17 +620,34 @@ def _put_scaling_policy(p):
         return _error("ValidationError", "PolicyName is required")
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
-    _policies[key] = {
-        "PolicyARN": arn,
-        "PolicyName": policy_name,
-        "AutoScalingGroupName": asg_name,
-        "PolicyType": _p(p, "PolicyType") or "SimpleScaling",
-        "AdjustmentType": _p(p, "AdjustmentType") or "ChangeInCapacity",
-        "ScalingAdjustment": int(_p(p, "ScalingAdjustment") or 0),
-        "Cooldown": int(_p(p, "Cooldown") or 300),
-    }
+    fields = {k: _p(p, k) for k in ("PolicyType", "AdjustmentType", "ScalingAdjustment",
+                                    "Cooldown", "Enabled", "EstimatedInstanceWarmup",
+                                    "MetricAggregationType", "MinAdjustmentMagnitude")
+              if _p(p, k) != ""}
+    fields["StepAdjustments"] = _parse_nested(p, "StepAdjustments")
+    fields["TargetTrackingConfiguration"] = _parse_nested(p, "TargetTrackingConfiguration")
+    fields["PredictiveScalingConfiguration"] = _parse_nested(p, "PredictiveScalingConfiguration")
+    try:
+        record = _policy_record(asg_name, policy_name, arn, fields)
+    except ValueError as exc:
+        # A number member (TargetValue, a step bound, ScalingAdjustment) that
+        # does not parse is the caller's error, not a 500.
+        return _error("ValidationError", f"Invalid numeric value in the scaling policy: {escape(str(exc))}")
+    _policies[key] = record
     return _xml(200, "PutScalingPolicyResponse",
                 f"<PutScalingPolicyResult><PolicyARN>{arn}</PolicyARN></PutScalingPolicyResult>")
+
+
+def _member_xml(value):
+    """A stored member in the query protocol's XML: a dict as its members, a
+    list as ``<member>`` entries, a boolean as true/false."""
+    if isinstance(value, dict):
+        return "".join(f"<{k}>{_member_xml(v)}</{k}>" for k, v in value.items())
+    if isinstance(value, list):
+        return "".join(f"<member>{_member_xml(v)}</member>" for v in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return escape(str(value))
 
 
 def _describe_policies(p):
@@ -541,15 +656,17 @@ def _describe_policies(p):
     for key, pol in _policies.items():
         if asg_name and pol["AutoScalingGroupName"] != asg_name:
             continue
-        members += (f"<member>"
-                    f"<PolicyARN>{pol['PolicyARN']}</PolicyARN>"
-                    f"<PolicyName>{pol['PolicyName']}</PolicyName>"
-                    f"<AutoScalingGroupName>{pol['AutoScalingGroupName']}</AutoScalingGroupName>"
-                    f"<PolicyType>{pol['PolicyType']}</PolicyType>"
-                    f"<AdjustmentType>{pol.get('AdjustmentType', '')}</AdjustmentType>"
-                    f"<ScalingAdjustment>{pol.get('ScalingAdjustment', 0)}</ScalingAdjustment>"
-                    f"<Cooldown>{pol.get('Cooldown', 300)}</Cooldown>"
-                    f"</member>")
+        # The optional members were dropped here, so a target-tracking or step
+        # policy read back without its whole configuration. AWS answers the
+        # type's members only, StepAdjustments and Alarms as (empty) lists,
+        # and MinAdjustmentStep beside MinAdjustmentMagnitude.
+        body = dict(pol)
+        body.setdefault("Enabled", True)
+        body.setdefault("StepAdjustments", [])
+        body.setdefault("Alarms", [])
+        if "MinAdjustmentMagnitude" in body:
+            body["MinAdjustmentStep"] = body["MinAdjustmentMagnitude"]
+        members += f"<member>{_member_xml(body)}</member>"
     return _xml(200, "DescribePoliciesResponse",
                 f"<DescribePoliciesResult><ScalingPolicies>{members}</ScalingPolicies></DescribePoliciesResult>")
 
@@ -618,20 +735,40 @@ def _record_lifecycle_heartbeat(p):
 # Scheduled Action
 # ---------------------------------------------------------------------------
 
+def _scheduled_action_record(asg_name, action_name, arn, fields):
+    """A scheduled action as the store keeps it, from
+    PutScheduledUpdateGroupAction's members or an
+    AWS::AutoScaling::ScheduledAction's properties (the same PascalCase
+    names). A capacity the caller omitted is -1, which DescribeScheduledActions
+    leaves out; StartTime, EndTime and TimeZone are kept only when given."""
+    def capacity(member):
+        value = fields.get(member)
+        return -1 if value in (None, "") else int(value)
+
+    record = {
+        "ScheduledActionARN": arn,
+        "ScheduledActionName": action_name,
+        "AutoScalingGroupName": asg_name,
+        "Recurrence": fields.get("Recurrence") or "",
+        "MinSize": capacity("MinSize"),
+        "MaxSize": capacity("MaxSize"),
+        "DesiredCapacity": capacity("DesiredCapacity"),
+    }
+    for member in ("StartTime", "EndTime", "TimeZone"):
+        if fields.get(member):
+            record[member] = str(fields[member])
+    return record
+
+
 def _put_scheduled_action(p):
     asg_name = _p(p, "AutoScalingGroupName")
     action_name = _p(p, "ScheduledActionName")
     key = f"{asg_name}/{action_name}"
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scheduledUpdateGroupAction:{new_uuid()}:autoScalingGroupName/{asg_name}:scheduledActionName/{action_name}"
-    _scheduled_actions[key] = {
-        "ScheduledActionARN": arn,
-        "ScheduledActionName": action_name,
-        "AutoScalingGroupName": asg_name,
-        "Recurrence": _p(p, "Recurrence") or "",
-        "MinSize": int(_p(p, "MinSize") or -1),
-        "MaxSize": int(_p(p, "MaxSize") or -1),
-        "DesiredCapacity": int(_p(p, "DesiredCapacity") or -1),
-    }
+    _scheduled_actions[key] = _scheduled_action_record(asg_name, action_name, arn, {
+        member: _p(p, member) for member in (
+            "Recurrence", "MinSize", "MaxSize", "DesiredCapacity",
+            "StartTime", "EndTime", "TimeZone")})
     return _xml(200, "PutScheduledUpdateGroupActionResponse", "<PutScheduledUpdateGroupActionResult/>")
 
 
@@ -641,11 +778,29 @@ def _describe_scheduled_actions(p):
     for key, sa in _scheduled_actions.items():
         if asg_name and sa["AutoScalingGroupName"] != asg_name:
             continue
+        # Recurrence and the three capacity members are what the action is
+        # for, and PutScheduledUpdateGroupAction stores all four; leaving them
+        # out of the response made a scheduled action's whole payload
+        # unreadable. The capacities carry -1 when the caller omitted them,
+        # and AWS leaves an omitted one out rather than answering -1.
         members += (f"<member>"
                     f"<ScheduledActionARN>{sa['ScheduledActionARN']}</ScheduledActionARN>"
                     f"<ScheduledActionName>{sa['ScheduledActionName']}</ScheduledActionName>"
                     f"<AutoScalingGroupName>{sa['AutoScalingGroupName']}</AutoScalingGroupName>"
-                    f"</member>")
+                    f"<Recurrence>{escape(sa.get('Recurrence', ''))}</Recurrence>")
+        for member in ("MinSize", "MaxSize", "DesiredCapacity"):
+            value = sa.get(member, -1)
+            if value is not None and int(value) >= 0:
+                members += f"<{member}>{int(value)}</{member}>"
+        # AWS answers StartTime twice, the second time as the deprecated Time
+        # (measured 2026-09-21).
+        if sa.get("StartTime"):
+            members += (f"<StartTime>{escape(sa['StartTime'])}</StartTime>"
+                        f"<Time>{escape(sa['StartTime'])}</Time>")
+        for member in ("EndTime", "TimeZone"):
+            if sa.get(member):
+                members += f"<{member}>{escape(sa[member])}</{member}>"
+        members += "</member>"
     return _xml(200, "DescribeScheduledActionsResponse",
                 f"<DescribeScheduledActionsResult><ScheduledUpdateGroupActions>{members}</ScheduledUpdateGroupActions></DescribeScheduledActionsResult>")
 
