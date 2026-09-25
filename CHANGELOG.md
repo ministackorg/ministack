@@ -7,9 +7,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Lambda — `ReservedConcurrentExecutions=0` disables the function** — a zero reservation was treated as unset, so the function ran unbounded instead of throttling every invoke with `TooManyRequestsException`. Zero now throttles across all executors, the Docker pool, and SQS event source mappings.
 ### Added
 
 - **CloudFront — public keys and key groups** — `CreatePublicKey`, `GetPublicKey`, `GetPublicKeyConfig`, `UpdatePublicKey`, `DeletePublicKey`, `ListPublicKeys`, `CreateKeyGroup`, `GetKeyGroup`, `GetKeyGroupConfig`, `UpdateKeyGroup`, `DeleteKeyGroup`, `ListKeyGroups`, so `aws_cloudfront_public_key` / `aws_cloudfront_key_group` (and Upbound's Terraform-based `provider-aws-cloudfront`) apply instead of hitting `NoSuchResource` on every create. Key groups validate their `Items` against real public keys, `DeletePublicKey` refuses a key still referenced by a key group, and `DeleteKeyGroup` refuses a group still referenced by a distribution's trusted key groups — both ETag/`If-Match` optimistic concurrency like the other CloudFront policy families.
@@ -26,6 +23,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — `ReservedConcurrentExecutions=0` disables the function** — a zero reservation was treated as unset, so the function ran unbounded instead of throttling every invoke with `TooManyRequestsException`. Zero now throttles across all executors, the Docker pool, and SQS event source mappings. Contributed by @AdrianAcala.
 - **Step Functions — Secrets Manager binary values** — `aws-sdk:secretsmanager:getSecretValue`, `createSecret`, and `putSecretValue` now pass literal UTF-8 text in `SecretBinary`, matching the AWS SDK integration rather than exposing the HTTP API's base64 representation. Direct Secrets Manager API/SDK calls keep their existing binary encoding.
 - **Auto Scaling — scaling policies and scheduled actions keep their members** — `PutScalingPolicy` and `DescribePolicies` dropped `TargetTrackingConfiguration`, `StepAdjustments`, `PredictiveScalingConfiguration`, `EstimatedInstanceWarmup`, `MetricAggregationType` and `MinAdjustmentMagnitude`. They are stored and answered typed as on AWS, with only the members the policy type has, and `MaxCapacityBreachBehavior` defaults to `HonorMaxCapacity`. A member that is not a number gives `ValidationError` instead of a 500. `Alarms` stays empty where AWS lists the target tracking alarms. Scheduled actions keep `StartTime`, `EndTime` and `TimeZone`, and `DescribeScheduledActions` answers them with `Recurrence` and the sizes. Contributed by @iot-rocket.
 - **EC2 — subnets answer their DNS and IPv6 attributes** — `DescribeSubnets` answers `PrivateDnsNameOptionsOnLaunch`, `EnableDns64`, `Ipv6Native` and `AssignIpv6AddressOnCreation`, which it did not render, with AWS's defaults for a subnet created without them. `ModifySubnetAttribute` changes the private DNS name options. Contributed by @iot-rocket.
