@@ -7,6 +7,11 @@ CloudFormation change set handlers — Create, Describe, Execute, Delete, List c
 import copy
 import logging
 
+import ministack.services.dynamodb as _dynamodb
+import ministack.services.s3 as _s3
+import ministack.services.sns as _sns
+import ministack.services.sqs as _sqs
+import ministack.services.ssm as _ssm
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
@@ -27,6 +32,8 @@ from .helpers import (
     _request_problems,
     _resolve_template,
     _xml,
+    stack_name_problems,
+    validation_error_message,
 )
 from .stacks import (
     _add_event,
@@ -38,6 +45,241 @@ from .stacks import (
 )
 
 logger = logging.getLogger("cloudformation")
+
+
+def _extract_resources_to_import(params):
+    """``ResourcesToImport.member.N`` as a list of
+    ``{ResourceType, LogicalResourceId, ResourceIdentifier}``, the shape
+    CreateChangeSet takes for ``ChangeSetType=IMPORT``."""
+    result = []
+    i = 1
+    while True:
+        rtype = _p(params, f"ResourcesToImport.member.{i}.ResourceType")
+        logical = _p(params, f"ResourcesToImport.member.{i}.LogicalResourceId")
+        if not rtype and not logical:
+            break
+        identifier = {}
+        j = 1
+        while True:
+            key = _p(params, f"ResourcesToImport.member.{i}.ResourceIdentifier.entry.{j}.key")
+            if not key:
+                break
+            identifier[key] = _p(
+                params, f"ResourcesToImport.member.{i}.ResourceIdentifier.entry.{j}.value", "")
+            j += 1
+        result.append({
+            "ResourceType": rtype,
+            "LogicalResourceId": logical,
+            "ResourceIdentifier": identifier,
+        })
+        i += 1
+    return result
+
+
+# AWS's answer when a ResourceIdentifier names nothing, for the types that do
+# not answer with a message of their own.
+_IMPORT_NOT_FOUND = "Resource of type '{type}' with identifier '{value}' was not found."
+
+
+def _sdk_error(message, service, status, request_id=None):
+    """A service error as the import's resource handler words it in the
+    StatusReason: the service's own message, then its SDK's suffix."""
+    return (f"{message} (Service: {service}, Status Code: {status}, "
+            f"Request ID: {request_id or new_uuid()}) (SDK Attempt Count: 1)")
+
+
+def _queue_import_problem(url):
+    if not url:
+        return "QueueUrl is not found"
+    try:
+        _sqs._get_q(url)
+    except _sqs._Err:
+        return _IMPORT_NOT_FOUND.format(type="AWS::SQS::Queue", value=url)
+    return None
+
+
+def _topic_import_problem(arn):
+    elements = len(arn.split(":"))
+    if elements < 6:
+        return _sdk_error("Invalid parameter: TopicArn Reason: An ARN must have at least "
+                          f"6 elements, not {elements}", "Sns", 400)
+    if arn not in _sns._topics:
+        return _sdk_error("Topic does not exist", "Sns", 404)
+    return None
+
+
+def _bucket_import_problem(name):
+    if not name:
+        return "Unable to marshall request to JSON: Bucket cannot be empty."
+    return None if name in _s3._buckets else "Bucket not found"
+
+
+def _table_import_problem(name):
+    problems = []
+    if len(name) < 3:
+        problems.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: "
+                        "Member must have length greater than or equal to 3")
+    if not _dynamodb._TABLE_NAME_RE.match(name):
+        problems.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: "
+                        "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+    if problems:
+        # DynamoDB's request ids are 52 upper-case letters and digits.
+        request_id = (new_uuid() + new_uuid()).replace("-", "")[:52].upper()
+        return _sdk_error(validation_error_message(problems), "DynamoDb", 400, request_id)
+    return None if name in _dynamodb._tables else f"Table: {name} does not exist."
+
+
+def _parameter_import_problem(name):
+    if not name:
+        return _sdk_error(
+            "1 validation error detected: Value '[]' at 'names' failed to satisfy constraint: "
+            "Member must satisfy constraint: [Member must have length less than or equal to "
+            "2048, Member must have length greater than or equal to 1]", "Ssm", 400)
+    if _ssm._lookup_parameter(name)[1] is None:
+        return _IMPORT_NOT_FOUND.format(type="AWS::SSM::Parameter", value=name)
+    return None
+
+
+# The resource types an IMPORT change set looks up before it describes the
+# import: the one ResourceIdentifier key AWS expects, and a lookup in this
+# emulator's own store that returns the StatusReason of the FAILED change set
+# AWS leaves behind when the identifier is invalid or names nothing (each
+# measured for an existing, a missing, a blank and an empty value). Types not
+# listed are accepted without a lookup.
+_IMPORT_LOOKUPS = {
+    "AWS::SQS::Queue": ("QueueUrl", _queue_import_problem),
+    "AWS::SNS::Topic": ("TopicArn", _topic_import_problem),
+    "AWS::S3::Bucket": ("BucketName", _bucket_import_problem),
+    "AWS::DynamoDB::Table": ("TableName", _table_import_problem),
+    "AWS::SSM::Parameter": ("Name", _parameter_import_problem),
+}
+
+
+def _listed(ids):
+    return "[" + ", ".join(ids) + "]"
+
+
+def _import_changes(resources_to_import, template, diff):
+    """The Import changes of an IMPORT change set.
+
+    Raises ValueError with the message CreateChangeSet refuses the request
+    with, checking in the order AWS does where two problems meet. ``diff`` is
+    the template diff against the stack: an import may add only the resources
+    it imports, and must leave everything already in the stack untouched.
+    """
+    declared = (template or {}).get("Resources", {})
+    logicals = [entry["LogicalResourceId"] for entry in resources_to_import]
+    if len(set(logicals)) != len(logicals):
+        raise ValueError("Every resource to import must have unique LogicalResourceId")
+    undeclared = [lid for lid in logicals if lid not in declared]
+    if undeclared:
+        raise ValueError(f"The logical resource ids {_listed(undeclared)} provided in "
+                         "ResourceToImport do not exist in the template.")
+    for entry in resources_to_import:
+        logical, rtype = entry["LogicalResourceId"], entry.get("ResourceType")
+        identifier = entry.get("ResourceIdentifier") or {}
+        if rtype in _IMPORT_LOOKUPS and list(identifier) != [_IMPORT_LOOKUPS[rtype][0]]:
+            raise ValueError(f"Invalid resource identifier for resource type {rtype}. "
+                             f"Expected [{_IMPORT_LOOKUPS[rtype][0]}]")
+        if rtype != declared[logical].get("Type"):
+            raise ValueError(
+                f"Resource type of [{logical}] passed in ResourceToImport does not match with "
+                "resource type defined in the template. Resource type in ResourceToImport: "
+                f"{rtype}; Resource type in Template: {declared[logical].get('Type')}.")
+
+    touched = {}
+    for change in diff:
+        rc = change["ResourceChange"]
+        touched.setdefault(rc["Action"], []).append(rc["LogicalResourceId"])
+    added = touched.get("Add", [])
+    if not added:
+        raise ValueError("The template should contain at least one new resource to import.")
+    in_stack = [lid for lid in logicals if lid not in added]
+    if in_stack:
+        raise ValueError(f"Resources {_listed(in_stack)} passed in ResourceToImport are already "
+                         "in a stack and cannot be imported.")
+    not_imported = [lid for lid in added if lid not in logicals]
+    if not_imported:
+        raise ValueError(f"Resources {_listed(not_imported)} is missing from ResourceToImport list")
+    modified = sorted(touched.get("Modify", []) + touched.get("Remove", []))
+    if modified:
+        raise ValueError(f"You have modified resources {_listed(modified)} in your template that "
+                         "are not being imported. Update, create or delete operations cannot be "
+                         "executed during import operations.")
+    no_policy = [lid for lid in logicals if "DeletionPolicy" not in declared[lid]]
+    if no_policy:
+        raise ValueError(f"The following resources to import {_listed(no_policy)} must have "
+                         "DeletionPolicy attribute specified in the template.")
+
+    changes = []
+    for entry in resources_to_import:
+        change = {
+            "Action": "Import",
+            "LogicalResourceId": entry["LogicalResourceId"],
+            "ResourceType": entry["ResourceType"],
+            "Scope": [],
+            "Details": [],
+        }
+        # AWS reports the identifier value as the physical id (measured for the
+        # five types in _IMPORT_LOOKUPS). How it joins a multi-key identifier
+        # (AWS::IAM::RolePolicy's PolicyName + RoleName, say) is unmeasured, so
+        # none is invented for one.
+        if len(entry["ResourceIdentifier"]) == 1:
+            change["PhysicalResourceId"] = next(iter(entry["ResourceIdentifier"].values()))
+        changes.append({"ResourceChange": change})
+    return changes
+
+
+def _import_ref(rtype, value):
+    """What an import identifier and a stack's physical id are compared on:
+    a queue's account and name, since its URL's host is the endpoint it was
+    read through, and the value itself for any other type."""
+    if rtype == "AWS::SQS::Queue":
+        return _sqs._queue_ref_from_urlish(value)
+    return value
+
+
+def _import_owner(resources_to_import):
+    """The StatusReason of an import naming a resource a stack already holds,
+    or None. AWS fails the change set for it, as for a resource that does not
+    exist. Evaluate it in the stack's region."""
+    from ministack.services.cloudformation import _stacks
+    for entry in resources_to_import:
+        rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
+        if len(identifier) != 1:
+            continue
+        value = next(iter(identifier.values()))
+        ref = _import_ref(rtype, value)
+        for stack in _stacks.values():
+            if stack.get("StackStatus") == "DELETE_COMPLETE":
+                continue
+            for res in stack.get("_resources", {}).values():
+                pid = res.get("PhysicalResourceId")
+                if res.get("ResourceType") == rtype and pid and _import_ref(rtype, pid) == ref:
+                    return f"{value} already exists in stack {stack['StackId']}"
+    return None
+
+
+def _import_not_found(resources_to_import):
+    """The StatusReason of an import whose identifier is invalid or names
+    nothing, or None.
+
+    AWS accepts such a request and fails the change set once it looks the
+    resource up, so this is not a refusal. Evaluate it in the stack's region.
+    """
+    for entry in resources_to_import:
+        rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
+        if rtype in _IMPORT_LOOKUPS:
+            key, problem = _IMPORT_LOOKUPS[rtype]
+            reason = problem(identifier[key])
+            if reason:
+                return reason
+            continue
+        # A blank name can name nothing, whatever the type.
+        blank = next((value for value in identifier.values() if not value.strip()), None)
+        if blank is not None:
+            return _IMPORT_NOT_FOUND.format(type=rtype, value=blank)
+    return None
 
 
 def _find_change_set(cs_name, stack_name=""):
@@ -120,6 +362,16 @@ def _create_change_set(params):
     template_given = bool(template_body)
 
     provided_params = _extract_members(params, "Parameters")
+    resources_to_import = _extract_resources_to_import(params)
+    # The API's parameter validation: a member without a ResourceIdentifier.
+    if missing := [
+        f"Value null at 'resourcesToImport.{i}.member.resourceIdentifier' failed to satisfy "
+        "constraint: Member must not be null"
+        for i, entry in enumerate(resources_to_import, 1) if not entry["ResourceIdentifier"]
+    ]:
+        return _error("ValidationError", validation_error_message(missing))
+    if cs_type == "IMPORT" and not resources_to_import:
+        return _error("ValidationError", "Must Provide at least one resource to import")
     tags = _extract_members(params, "Tags")
     # An empty Tags list arrives as ``Tags=``: given-empty clears the stack's
     # tags on execute, an omitted Tags keeps them (as UpdateStack does).
@@ -135,7 +387,14 @@ def _create_change_set(params):
         # by stack id carries on under the name.
         stack_name = stack.get("StackName", stack_name)
 
-    if cs_type == "CREATE":
+    # An IMPORT set naming a stack that does not exist creates it in
+    # REVIEW_IN_PROGRESS, as a CREATE set does, and imports into it.
+    new_stack_import = cs_type == "IMPORT" and (
+        not stack or stack.get("StackStatus") == "DELETE_COMPLETE")
+    if new_stack_import and (problems := stack_name_problems(_p(params, "StackName"))):
+        return _error("ValidationError", validation_error_message(problems))
+
+    if cs_type == "CREATE" or new_stack_import:
         if stack and stack.get("StackStatus") not in (
             "DELETE_COMPLETE", "ROLLBACK_COMPLETE", "REVIEW_IN_PROGRESS"
         ):
@@ -153,7 +412,9 @@ def _create_change_set(params):
             "StackName": stack_name,
             "StackId": stack_id,
             "StackStatus": "REVIEW_IN_PROGRESS",
-            "StackStatusReason": "",
+            # Measured on AWS for the stack an import creates; a CREATE set's
+            # placeholder keeps the empty reason it always had.
+            "StackStatusReason": "User Initiated" if new_stack_import else "",
             "CreationTime": now_iso(),
             "LastUpdatedTime": now_iso(),
             "Description": "",
@@ -172,7 +433,7 @@ def _create_change_set(params):
         _stack_events[stack_id] = []
         _add_event(stack_id, stack_name, stack_name,
                    "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS",
-                   physical_id=stack_id)
+                   stack["StackStatusReason"], physical_id=stack_id)
     else:
         # An UPDATE change set against a deleted stack: the name no longer
         # resolves (deleted stacks are addressable only by stack ID), so this is
@@ -187,9 +448,9 @@ def _create_change_set(params):
 
     def _rejected(reason):
         # A rejected CreateChangeSet leaves no stack behind on AWS; drop the
-        # REVIEW_IN_PROGRESS placeholder created above for CREATE sets.
+        # REVIEW_IN_PROGRESS placeholder created above for a new stack.
         # ``reason`` is a ValidationError message or a ready error response.
-        if cs_type == "CREATE":
+        if cs_type == "CREATE" or new_stack_import:
             _stacks.pop(stack_name, None)
             _stack_events.pop(stack_id, None)
         if isinstance(reason, tuple):
@@ -229,19 +490,44 @@ def _create_change_set(params):
     # parameter-driven changes (the `aws cloudformation deploy
     # --parameter-overrides` pattern, e.g. a Lambda Code S3Key behind a Ref) are
     # detected instead of compared as identical raw nodes (#897).
-    old_template = stack.get("_template", {}) if cs_type == "UPDATE" else {}
-    old_params = stack.get("_resolved_params", {}) if cs_type == "UPDATE" else {}
+    # An import is checked against the stack it imports into, like an update.
+    diffs_the_stack = cs_type in ("UPDATE", "IMPORT")
+    old_template = stack.get("_template", {}) if diffs_the_stack else {}
+    old_params = stack.get("_resolved_params", {}) if diffs_the_stack else {}
     with _stack_region_context(stack, stack_id):
         old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
     changes = _diff_resources(old_resolved, new_resolved)
+    import_failure = None
+    if cs_type == "IMPORT":
+        # An import describes the resources being adopted, not the template
+        # diff, which would call each of them `Add`; the diff only decides
+        # what else the template may not do during an import.
+        try:
+            changes = _import_changes(resources_to_import, template, changes)
+        except ValueError as exc:
+            return _rejected(str(exc))
+        with _stack_region_context(stack, stack_id):
+            # AWS looks the resource up before it asks whether a stack holds
+            # it: a stack's queue deleted behind its back is "not found".
+            import_failure = (_import_not_found(resources_to_import)
+                              or _import_owner(resources_to_import))
+        if import_failure:
+            changes = []
 
     cs_id = (
         f"arn:aws:cloudformation:{_stack_region(stack, stack_id)}:{get_account_id()}:"
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
-    if changes:
+    if import_failure:
+        # AWS accepts an import of a resource that does not exist and fails
+        # the change set, with no changes, once it looks the resource up.
+        _cs_status, _cs_exec, _cs_reason = "FAILED", "UNAVAILABLE", import_failure
+    elif cs_type == "IMPORT":
+        _cs_status, _cs_exec = "CREATE_COMPLETE", "UNAVAILABLE"
+        _cs_reason = "Resource import is not supported by this emulator"
+    elif changes:
         _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
     else:
         # Real AWS: a change set with no changes ends FAILED and cannot be
@@ -324,12 +610,24 @@ def _describe_change_set(params):
                 f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
                 "</member>"
             )
+        # botocore reads an empty element as "", so a member the change does
+        # not carry (an Import's Replacement, a Remove's unknown physical id)
+        # is left out instead of written empty.
+        physical_xml = (
+            f"<PhysicalResourceId>{_esc(rc['PhysicalResourceId'])}</PhysicalResourceId>"
+            if rc.get("PhysicalResourceId") else ""
+        )
+        replacement_xml = (
+            f"<Replacement>{rc['Replacement']}</Replacement>" if "Replacement" in rc else ""
+        )
+        # "Resource" is the one ChangeType, and AWS reports it on every change.
         changes_xml += (
-            "<member><ResourceChange>"
+            "<member><Type>Resource</Type><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
+            f"{physical_xml}"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
-            f"<Replacement>{rc.get('Replacement', '')}</Replacement>"
+            f"{replacement_xml}"
             f"<Scope>{scope_xml}</Scope>"
             f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
@@ -396,6 +694,15 @@ def _execute_change_set(params):
         return _error("ChangeSetNotFound",
                       f"ChangeSet [{cs_name}] does not exist", 404)
 
+    if cs.get("ChangeSetType") == "IMPORT":
+        # The ordinary create path would recreate the imported resource and
+        # could delete the stack's existing resources when that create fails.
+        return _error(
+            "InvalidChangeSetStatus",
+            f"ChangeSet [{cs_name}] cannot be executed: resource import is not "
+            "supported by this emulator.",
+        )
+
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
@@ -422,6 +729,9 @@ def _execute_change_set(params):
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
             "_conditions": copy.deepcopy(stack.get("_conditions", {})),
+            # A rollback restores what DescribeStacks reports, parameters
+            # included, as the UpdateStack snapshot does.
+            "Parameters": copy.deepcopy(stack.get("Parameters", [])),
             "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }

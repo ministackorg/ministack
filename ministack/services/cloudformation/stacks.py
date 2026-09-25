@@ -23,6 +23,7 @@ from .provisioners import (
     _DEFERRED_PREDECESSOR_DELETES,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
+    _custom_named_replacement_error,
     _delete_resource,
     _property_recreation,
     _provision_resource,
@@ -187,13 +188,91 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
     return resolved_outputs, exports
 
 
+def _rollback_failure_reason(failed_records: dict) -> str:
+    """The StackStatusReason of a rollback that could not finish: the
+    resources whose revert failed, then those whose delete failed, in the
+    wording AWS uses for each."""
+    reverts = sorted(k for k, v in failed_records.items() if "RevertTo" in v)
+    deletes = sorted(k for k, v in failed_records.items() if "RevertTo" not in v)
+    parts = []
+    if reverts:
+        parts.append(f"The following resource(s) failed to update: [{', '.join(reverts)}].")
+    if deletes:
+        parts.append(f"The following resource(s) failed to delete: [{', '.join(deletes)}].")
+    return " ".join(parts)
+
+
+def _sends_back_failed_update(resource_type: str) -> bool:
+    """Whether the rollback sends the resource whose own update failed back to
+    its previous properties. AWS does for a custom resource (measured
+    2026-09-21: the provider that answered FAILED gets UPDATE_IN_PROGRESS /
+    UPDATE_COMPLETE in the rollback), whose provider may have changed state
+    before it failed. A resource type's own handler that failed is taken to
+    have changed nothing: AWS records a lone UPDATE_COMPLETE for it without
+    calling it again (a scaling policy refused with AlreadyExists, the same
+    day). A nested stack is sent back so its own in-place changes are undone,
+    as AWS rolls the child stack back."""
+    return (resource_type.startswith("Custom::")
+            or resource_type in ("AWS::CloudFormation::CustomResource",
+                                 "AWS::CloudFormation::Stack"))
+
+
+def _mark_rolled_back(record):
+    """A restored stack record of a resource the rollback updated reports
+    that update, as DescribeStackResources does on AWS afterwards."""
+    if record is not None:
+        record["ResourceStatus"] = "UPDATE_COMPLETE"
+        record["Timestamp"] = now_iso()
+
+
+async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
+                         applied_props, previous_props, attrs, record=None):
+    """Undo an in-place update during an update rollback: run the type's
+    update handler from the properties the update applied back to the ones
+    the stack held before it, as AWS does in UPDATE_ROLLBACK_IN_PROGRESS,
+    with the UPDATE_IN_PROGRESS / UPDATE_COMPLETE events it records for that.
+
+    ``record`` is the restored stack record of the resource; it takes the
+    attributes the handler answers now (a launch template's rollback adds a
+    version, for one). On failure the UPDATE_FAILED event is recorded and the
+    handler's exception propagates."""
+    _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
+               physical_id=physical_id)
+    try:
+        if _is_custom_resource(rtype):
+            new_pid, new_attrs = await run_reentrant(
+                _update_resource, rtype, physical_id, applied_props,
+                previous_props, stack_name, logical_id, attrs)
+        else:
+            new_pid, new_attrs = _update_resource(
+                rtype, physical_id, applied_props, previous_props,
+                stack_name, logical_id, attrs)
+    except Exception as exc:
+        logger.error("Rollback update of %s failed: %s", logical_id, exc)
+        _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_FAILED",
+                   str(exc), physical_id)
+        raise
+    if record is not None:
+        if new_pid != physical_id:
+            # The revert itself replaced the resource; the stack has to
+            # follow it or it records an id that no longer exists.
+            logger.warning("Rollback update of %s moved it from %s to %s",
+                           logical_id, physical_id, new_pid)
+            record["PhysicalResourceId"] = new_pid
+        if new_attrs:
+            record["Attributes"] = {**record.get("Attributes", {}), **new_attrs}
+    _mark_rolled_back(record)
+    _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_COMPLETE",
+               physical_id=new_pid)
+
+
 async def _continue_update_rollback_async(stack_name: str, stack_id: str,
                                           resources_to_skip):
-    """Background task for ContinueUpdateRollback: retry the deletes that
-    failed the update rollback, skipping the logical ids the caller named
-    (their status becomes UPDATE_COMPLETE and the resource stays, as on AWS),
-    and land the stack in UPDATE_ROLLBACK_COMPLETE or, if a delete fails
-    again, UPDATE_ROLLBACK_FAILED."""
+    """Background task for ContinueUpdateRollback: retry the reverts and
+    deletes that failed the update rollback, skipping the logical ids the
+    caller named (their status becomes UPDATE_COMPLETE and the resource stays
+    as it is, as on AWS), and land the stack in UPDATE_ROLLBACK_COMPLETE or,
+    if a retry fails again, UPDATE_ROLLBACK_FAILED."""
     from ministack.services.cloudformation import _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -209,6 +288,15 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
         if logical_id in resources_to_skip:
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "UPDATE_COMPLETE", "Resource rollback skipped by user", pid)
+            continue
+        if "RevertTo" in res:
+            try:
+                await _revert_update(
+                    stack_id, stack_name, logical_id, rtype, pid,
+                    res["RevertFrom"], res["RevertTo"], res.get("Attributes"),
+                    stack.get("_resources", {}).get(logical_id))
+            except Exception:
+                still_failed[logical_id] = res
             continue
         try:
             if _is_custom_resource(rtype):
@@ -227,8 +315,7 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
     await asyncio.sleep(0)
     if still_failed:
         stack["_rollback_failed"] = still_failed
-        reason = ("The following resource(s) failed to delete: "
-                  f"[{', '.join(sorted(still_failed))}].")
+        reason = _rollback_failure_reason(still_failed)
         stack["StackStatus"] = "UPDATE_ROLLBACK_FAILED"
         stack["StackStatusReason"] = reason
         _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
@@ -291,6 +378,15 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     fail_reason = ""
     cancelled = False
     replaced_resources = []
+    # The resource that failed the update, when it existed before it, as
+    # (logical id, type, physical id, applied props, previous props, attrs):
+    # a custom resource's provider may have changed state before it failed,
+    # so the rollback sends it back too (_sends_back_failed_update). The three
+    # props are None when the update never reached the handler.
+    failed_update = None
+    # The logical id of the resource whose create or update failed, which the
+    # rollback's reason names.
+    failed_logical_id = None
     stack.pop("_cancel_requested", None)
 
     for logical_id in ordered:
@@ -307,6 +403,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
         resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
         raw_props = res_def.get("Properties", {})
+        update_attempt = None
 
         try:
             # Resolve properties
@@ -374,6 +471,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     stack_name, stack_id, logical_id)
                 pending_deletes = []
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
+                if not _custom_named_replacement_error(
+                        resource_type, old_tagged, new_tagged):
+                    # Refused above the handler, the update changes nothing
+                    # and there is nothing to send back.
+                    update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
                     if _is_custom_resource(resource_type):
                         physical_id, attrs = await run_reentrant(
@@ -415,6 +517,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                        f"{status_prefix}_FAILED", str(exc))
             failed = True
             fail_reason = f"Resource {logical_id} failed: {exc}"
+            failed_logical_id = logical_id
+            if update_attempt is not None:
+                failed_update = (logical_id, resource_type, *update_attempt)
+            elif is_update and previous_stack and logical_id in previous_stack.get(
+                    "_resources", {}):
+                failed_update = (
+                    logical_id, resource_type,
+                    previous_stack["_resources"][logical_id].get(
+                        "PhysicalResourceId", logical_id),
+                    None, None, None)
             break
 
         provisioned_resources[logical_id] = {
@@ -554,34 +666,100 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         else:
             # Rollback: delete resources created in this run in reverse order
             stack["StackStatus"] = "ROLLBACK_IN_PROGRESS" if not is_update else "UPDATE_ROLLBACK_IN_PROGRESS"
+            if cancelled:
+                rollback_reason = "User Initiated"
+            elif is_update and failed_logical_id:
+                # AWS names the resource and whether it existed before the
+                # update (measured 2026-09-21), trailing space included.
+                verb = "update" if failed_update is not None else "create"
+                rollback_reason = (f"The following resource(s) failed to {verb}: "
+                                   f"[{failed_logical_id}]. ")
+            else:
+                rollback_reason = "Rollback requested"
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
-                       "User Initiated" if cancelled else "Rollback requested",
-                       stack_id)
+                       rollback_reason, stack_id)
 
-            rollback_delete_failures = []
             rollback_failed_records = {}
             previous_resources = (
                 previous_stack.get("_resources", {})
                 if is_update and previous_stack else {}
             )
             replaced_ids = {entry[0] for entry in replaced_resources}
-            for logical_id in reversed(created_in_this_run):
+
+            async def revert(logical_id, rtype, pid, applied, previous, attrs):
+                # An in-place change goes back through the update handler; one
+                # that fails is kept for ContinueUpdateRollback to retry or skip.
+                try:
+                    await _revert_update(stack_id, stack_name, logical_id, rtype,
+                                         pid, applied, previous, attrs,
+                                         previous_resources.get(logical_id))
+                except Exception:
+                    rollback_failed_records[logical_id] = {
+                        "PhysicalResourceId": pid, "ResourceType": rtype,
+                        "RevertFrom": applied, "RevertTo": previous,
+                        "Attributes": attrs,
+                    }
+
+            # AWS rolls an update back as an update to the previous template
+            # (measured 2026-09-21): what the update changed in place goes back
+            # through the update handler, in the template's dependency order,
+            # and the resource that failed comes last. What the update created
+            # is deleted after that, in the cleanup phase, in reverse order.
+            to_delete = []
+            for logical_id in created_in_this_run:
+                res = provisioned_resources.get(logical_id, {})
+                pid = res.get("PhysicalResourceId", "")
+                prev = previous_resources.get(logical_id)
+                if (prev is None or prev.get("PhysicalResourceId") != pid
+                        or logical_id in replaced_ids):
+                    to_delete.append(logical_id)
+                    continue
+                # The resource existed before this update and kept its
+                # identity (untouched, or updated in place), so it is not
+                # something this run created: it goes back to the properties
+                # it had, with the tags the forward update gave it on one side
+                # and the previous tags on the other, exactly as that update
+                # was called. An untouched one has nothing to send back.
+                rtype = res.get("ResourceType", "")
+                applied = _with_stack_tags(rtype, res.get("Properties", {}), stack_tags,
+                                           stack_name, stack_id, logical_id)
+                previous = _with_stack_tags(rtype, prev.get("Properties", {}),
+                                            previous_tags, stack_name, stack_id,
+                                            logical_id)
+                if applied != previous:
+                    await revert(logical_id, rtype, pid, applied, previous,
+                                 res.get("Attributes", {}))
+            if failed_update is not None:
+                logical_id, rtype, pid, applied, previous, attrs = failed_update
+                if (applied is not None and applied != previous
+                        and _sends_back_failed_update(rtype)):
+                    await revert(logical_id, rtype, pid, applied, previous, attrs)
+                else:
+                    # Nothing to send back: the update never reached a handler
+                    # (a custom-named replacement refused above it), or the
+                    # type's own handler refused it. AWS still records the
+                    # resource as complete.
+                    _add_event(stack_id, stack_name, logical_id, rtype,
+                               "UPDATE_COMPLETE", physical_id=pid)
+                    _mark_rolled_back(previous_resources.get(logical_id))
+            # Everything is back; what the update created goes in the cleanup
+            # phase, which AWS reports as a stack status of its own. The
+            # rollback is complete by then, so a delete that fails in it is a
+            # DELETE_FAILED event and nothing more: it cannot turn the stack
+            # into UPDATE_ROLLBACK_FAILED.
+            cleanup_phase = bool(is_update and previous_stack
+                                 and not rollback_failed_records)
+            if cleanup_phase:
+                stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS"
+                _add_event(stack_id, stack_name, stack_name,
+                           "AWS::CloudFormation::Stack", stack["StackStatus"],
+                           physical_id=stack_id)
+            for logical_id in reversed(to_delete):
                 res = provisioned_resources.get(logical_id, {})
                 rtype = res.get("ResourceType", "")
                 pid = res.get("PhysicalResourceId", "")
                 res_props = res.get("Properties", {})
-                prev = previous_resources.get(logical_id)
-                if (prev is not None and prev.get("PhysicalResourceId") == pid
-                        and logical_id not in replaced_ids):
-                    # The resource existed before this update and kept its
-                    # identity (untouched, or updated in place), so it is not
-                    # something this run created: deleting it would destroy a
-                    # resource the restored stack still records. Only new
-                    # resources and replacements are undone, a replacement
-                    # under an unchanged id by its new properties. An in-place
-                    # change is not reverted here.
-                    continue
                 policy = _resource_policy(
                     resources_defs.get(logical_id), "DeletionPolicy",
                     provisioned_resources, param_values, conditions, mappings,
@@ -594,6 +772,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                                "DELETE_SKIPPED", physical_id=pid)
                     provisioned_resources.pop(logical_id, None)
                     continue
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_IN_PROGRESS", physical_id=pid)
                 try:
                     if _is_custom_resource(rtype):
                         await run_reentrant(
@@ -609,7 +789,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                                  logical_id, del_exc)
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "DELETE_FAILED", str(del_exc), pid)
-                    rollback_delete_failures.append(logical_id)
+                    if cleanup_phase:
+                        provisioned_resources.pop(logical_id, None)
+                        continue
                     rollback_failed_records[logical_id] = {
                         "PhysicalResourceId": pid, "ResourceType": rtype,
                         "Properties": res_props,
@@ -634,16 +816,15 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
             else:
                 stack["StackStatus"] = "ROLLBACK_COMPLETE"
-            if rollback_delete_failures:
-                # A rollback that could not undo what it created must not
-                # report success — real CloudFormation lands the stack in
-                # (UPDATE_)ROLLBACK_FAILED and keeps the failure visible.
+            if rollback_failed_records:
+                # A rollback that could not undo what it created or changed
+                # must not report success — real CloudFormation lands the stack
+                # in (UPDATE_)ROLLBACK_FAILED and keeps the failure visible.
                 stack["StackStatus"] = (
                     "UPDATE_ROLLBACK_FAILED" if is_update and previous_stack
                     else "ROLLBACK_FAILED"
                 )
-                reason = ("The following resource(s) failed to delete: "
-                          f"[{', '.join(sorted(rollback_delete_failures))}].")
+                reason = _rollback_failure_reason(rollback_failed_records)
                 stack["StackStatusReason"] = reason
                 # What ContinueUpdateRollback retries (or skips).
                 stack["_rollback_failed"] = rollback_failed_records
@@ -651,9 +832,12 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                            "AWS::CloudFormation::Stack", stack["StackStatus"],
                            reason, stack_id)
                 return
+            # AWS's final UPDATE_ROLLBACK_COMPLETE carries no reason
+            # (measured 2026-09-21).
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
-                       "Rollback complete", stack_id)
+                       "" if is_update and previous_stack else "Rollback complete",
+                       stack_id)
         return
 
     # Success: publish outputs and exports
