@@ -27,6 +27,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 
 import ast
 import asyncio
+import base64
 import contextvars
 import copy
 import json
@@ -3463,6 +3464,15 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         wire_data = _convert_keys_to_camel(input_data or {})
     else:
         wire_data = input_data
+    # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
+    # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
+    # without changing the state input or guessing whether the text is base64.
+    if (service_name == "secretsmanager"
+            and pascal_action in {"CreateSecret", "PutSecretValue"}
+            and isinstance(wire_data, dict)
+            and isinstance(wire_data.get("SecretBinary"), str)):
+        wire_data = dict(wire_data)
+        wire_data["SecretBinary"] = base64.b64encode(wire_data["SecretBinary"].encode("utf-8")).decode("ascii")
     body = json.dumps(wire_data)
     headers = {
         "x-amz-target": target,
@@ -3489,6 +3499,10 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_type = result.get("__type", result.get("Error", {}).get("Code", "ServiceException"))
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(_prefix_sdk_error(service_name, error_type), error_msg)
+
+    if (service_name == "secretsmanager" and pascal_action == "GetSecretValue"
+            and isinstance(result, dict) and "SecretBinary" in result):
+        result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
     # For JSON-protocol services, only convert top-level keys to avoid
     # mangling user-defined data (e.g. DynamoDB attribute names).

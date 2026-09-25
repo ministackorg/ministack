@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lambda — `ReservedConcurrentExecutions=0` disables the function** — a zero reservation was treated as unset, so the function ran unbounded instead of throttling every invoke with `TooManyRequestsException`. Zero now throttles across all executors, the Docker pool, and SQS event source mappings.
 ### Added
 
 - **CloudFormation — AppConfig applications, environments, configuration profiles and deployment strategies update in place** — none of the four had an update handler, so any property change re-ran the create and the resource came back under a new id. The environments, configuration profiles and hosted configuration versions keyed by the old id were orphaned. Each type now updates in place what its resource reference lists as No interruption and replaces on the rest. Contributed by @iot-rocket.
@@ -22,6 +25,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Step Functions — Secrets Manager binary values** — `aws-sdk:secretsmanager:getSecretValue`, `createSecret`, and `putSecretValue` now pass literal UTF-8 text in `SecretBinary`, matching the AWS SDK integration rather than exposing the HTTP API's base64 representation. Direct Secrets Manager API/SDK calls keep their existing binary encoding.
 - **Auto Scaling — scaling policies and scheduled actions keep their members** — `PutScalingPolicy` and `DescribePolicies` dropped `TargetTrackingConfiguration`, `StepAdjustments`, `PredictiveScalingConfiguration`, `EstimatedInstanceWarmup`, `MetricAggregationType` and `MinAdjustmentMagnitude`. They are stored and answered typed as on AWS, with only the members the policy type has, and `MaxCapacityBreachBehavior` defaults to `HonorMaxCapacity`. A member that is not a number gives `ValidationError` instead of a 500. `Alarms` stays empty where AWS lists the target tracking alarms. Scheduled actions keep `StartTime`, `EndTime` and `TimeZone`, and `DescribeScheduledActions` answers them with `Recurrence` and the sizes. Contributed by @iot-rocket.
 - **EC2 — subnets answer their DNS and IPv6 attributes** — `DescribeSubnets` answers `PrivateDnsNameOptionsOnLaunch`, `EnableDns64`, `Ipv6Native` and `AssignIpv6AddressOnCreation`, which it did not render, with AWS's defaults for a subnet created without them. `ModifySubnetAttribute` changes the private DNS name options. Contributed by @iot-rocket.
 - **EC2 — launch templates answer their tags and list versions newest first** — `CreateLaunchTemplate` and `DescribeLaunchTemplates` rendered tags under `tags`, so botocore dropped them; they answer `tagSet` now. `DescribeLaunchTemplateVersions` lists the newest version first, as AWS does. Contributed by @iot-rocket.
@@ -29,6 +33,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — a failed update rolls back its in-place changes** — the rollback kept every resource that existed before the update but did not undo what the update had changed on it, the limitation 1.5.8 shipped with. Each changed resource now goes back through its type's update handler with `UPDATE_IN_PROGRESS` / `UPDATE_COMPLETE` events, before the cleanup deletes what the update created. A custom resource whose own update failed is sent back too, and a revert that fails lands the stack in `UPDATE_ROLLBACK_FAILED`, which `ContinueUpdateRollback` retries or skips. `UPDATE_ROLLBACK_IN_PROGRESS` names the failed resource, the cleanup runs in `UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS` with `DELETE_IN_PROGRESS` events, and a delete that fails there no longer fails the rollback. An executed change set that rolls back restores the stack's parameters. AWS reverts resources in parallel, the emulator one after the other. Contributed by @iot-rocket.
 - **CloudFormation — an ECS cluster reads its settings back** — `ClusterSettings`, `DefaultCapacityProviderStrategy` and `Configuration` of `AWS::ECS::Cluster` were stored in the template's PascalCase (`Configuration` not at all), so `DescribeClusters` answered `[{}]` for the settings and the strategy. All three are stored in the API's camelCase now. `DescribeClusters` answers them also without `include`, where AWS needs `SETTINGS` or `CONFIGURATIONS`. Contributed by @iot-rocket.
 - **CloudFormation — VPCs, subnets, security groups, internet gateways and route tables carry the stack's tags** — the five types carried only the template's own tags. They now also get the stack-level tags and the three `aws:cloudformation:` tags, as on AWS, and a stack tag change is applied to them in place. Contributed by @iot-rocket.
+
 ## [1.5.16] — 2026-09-23
 
 ### Added
