@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from urllib.parse import parse_qs, unquote
@@ -2709,6 +2710,7 @@ async def _handle_lifespan(scope, receive, send):
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
+            _LIFESPAN_STARTED.set()
             port = _resolve_port()
             logger.info(BANNER.format(port=port))
             # Install a larger default thread-pool executor. Lambda invocations
@@ -3131,6 +3133,8 @@ def _pid_file(port: int) -> str:
 
 # How often the MINISTACK_PARENT_PID watcher checks that the parent is alive.
 _PARENT_POLL_INTERVAL = 1.0
+# Set once hypercorn has sent lifespan.startup, i.e. after it installed its signal handlers.
+_LIFESPAN_STARTED = threading.Event()
 
 
 def _process_alive(pid: int) -> bool:
@@ -3143,46 +3147,38 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def _parent_exit_trigger():
-    """Shutdown trigger for MINISTACK_PARENT_PID, or None when it is unset.
+def _watch_parent_pid():
+    """Honour MINISTACK_PARENT_PID: once that process exits, stop as ``ministack --stop`` does.
 
-    A test runner that launches MiniStack names its own pid here. When that
-    process exits for any reason, including SIGKILL, MiniStack shuts down
-    gracefully, so the lifespan shutdown removes the containers it launched.
-    Without it an orphaned MiniStack keeps running, and keeps its containers,
-    because nothing ever signals it.
-
-    Hypercorn installs its SIGINT/SIGTERM handlers only when no trigger is
-    given, so this trigger also returns on those signals to keep them graceful.
+    A test runner that launches MiniStack names its own pid here. When the runner
+    exits for any reason, including SIGKILL, this sends SIGTERM to MiniStack, whose
+    graceful shutdown removes the containers it launched. Without it an orphaned
+    MiniStack keeps running, and keeps its containers, because nothing signals it.
+    The signal waits for lifespan startup, by when hypercorn's handlers are in place.
     """
     raw = os.environ.get("MINISTACK_PARENT_PID", "").strip()
     if not raw:
-        return None
+        return
     if os.name == "nt":
         raise SystemExit("ERROR: MINISTACK_PARENT_PID is not supported on Windows")
     try:
         pid = int(raw)
         if pid <= 0:
             raise ValueError
-        _process_alive(pid)
+        alive = _process_alive(pid)
     except (ValueError, OverflowError, OSError):
         raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a positive process id, got {raw!r}")
+    if not alive:
+        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID {pid} is not a running process")
 
-    async def _wait_for_parent_exit():
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop.set)
-        while not stop.is_set():
-            if not _process_alive(pid):
-                logger.info("Parent process %d has exited; shutting down", pid)
-                return
-            try:
-                await asyncio.wait_for(stop.wait(), _PARENT_POLL_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
+    def _watch():
+        while _process_alive(pid):
+            time.sleep(_PARENT_POLL_INTERVAL)
+        _LIFESPAN_STARTED.wait()
+        logger.info("Parent process %d has exited; shutting down", pid)
+        os.kill(os.getpid(), signal.SIGTERM)
 
-    return _wait_for_parent_exit
+    threading.Thread(target=_watch, name="ministack-parent-watch", daemon=True).start()
 
 
 def main():
@@ -3259,7 +3255,7 @@ def main():
         print("  Stop: ministack --stop")
         return
 
-    shutdown_trigger = _parent_exit_trigger()
+    _watch_parent_pid()
 
     # Foreground — write PID file and clean up on exit
     pf = _pid_file(port)
@@ -3298,7 +3294,7 @@ def main():
         if _tls.use_ssl_enabled():
             config.certfile, config.keyfile = _tls.resolve_tls_material()
 
-        asyncio.run(hypercorn_serve(app, config, shutdown_trigger=shutdown_trigger))
+        asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
 

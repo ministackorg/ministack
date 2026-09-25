@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -73,12 +74,51 @@ def test_parent_exit_shuts_ministack_down_gracefully(tmp_path):
         _stop(parent)
 
 
+def test_watcher_signals_only_once_hypercorn_handles_signals(monkeypatch):
+    """A parent that dies while MiniStack boots must not get the SIGTERM sent
+    before hypercorn installs its graceful handlers, which happens before it
+    sends lifespan.startup; the watcher waits for that message."""
+    import ministack.app as app
+
+    parent_alive = {"value": True}
+    monkeypatch.setattr(app, "_process_alive", lambda pid: parent_alive["value"])
+    monkeypatch.setattr(app, "_PARENT_POLL_INTERVAL", 0.01)
+    lifespan_started = threading.Event()
+    monkeypatch.setattr(app, "_LIFESPAN_STARTED", lifespan_started)
+    sent, fired = [], threading.Event()
+
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        fired.set()
+
+    monkeypatch.setattr(app.os, "kill", fake_kill)
+    monkeypatch.setenv("MINISTACK_PARENT_PID", "12345")
+
+    app._watch_parent_pid()
+    parent_alive["value"] = False
+    time.sleep(0.2)
+    assert sent == [], "signalled before hypercorn's handlers were in place"
+
+    lifespan_started.set()
+    assert fired.wait(5)
+    assert sent == [(os.getpid(), signal.SIGTERM)]
+
+
+def test_parent_pid_that_is_not_running_is_rejected_at_startup(tmp_path):
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(timeout=10)
+    proc = _spawn(_free_port(), str(gone.pid), tmp_path / "ministack.log")
+    try:
+        assert proc.wait(timeout=30) != 0
+        assert "is not a running process" in (tmp_path / "ministack.log").read_text()
+    finally:
+        _stop(proc)
+
+
 @pytest.mark.serial
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_signals_still_shut_down_gracefully_with_a_parent_pid(tmp_path, signum):
-    """Hypercorn only installs its signal handlers when no shutdown trigger is
-    given, so the trigger must handle SIGTERM/SIGINT itself or the lifespan
-    shutdown, which removes the containers, is skipped."""
+    """Signals keep hypercorn's own graceful handling with the variable set."""
     parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
     port = _free_port()
     log_path = tmp_path / "ministack.log"
