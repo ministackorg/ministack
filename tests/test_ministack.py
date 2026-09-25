@@ -812,7 +812,7 @@ def _docker_config(tmp_path, monkeypatch, config, home_config=None):
     None) and ``$HOME/.docker/config.json`` holds ``home_config``."""
     import importlib.metadata
 
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "7.2.0")  # the context fallback's first release
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "7.2.0")  # first with context support
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     monkeypatch.delenv("DOCKER_HOST", raising=False)
     home = tmp_path / "home"
@@ -853,8 +853,7 @@ def test_docker_context_selected(tmp_path, monkeypatch, context_env, config, hom
 
 
 def test_docker_context_ignored_before_docker_py_7_2(tmp_path, monkeypatch):
-    """docker-py only follows contexts from 7.2; before that the services dial
-    the default socket too, so a selected context changes nothing."""
+    """Before 7.2 docker-py ignores contexts, so the services dial the default socket too."""
     import importlib.metadata
 
     from ministack.app import _docker_context_selected
@@ -865,10 +864,7 @@ def test_docker_context_ignored_before_docker_py_7_2(tmp_path, monkeypatch):
 
 
 def test_reaper_reaches_the_daemon_through_the_selected_context(tmp_path, monkeypatch):
-    """Colima and Docker Desktop serve Docker on a per-user socket. The reaper
-    used to give up when /var/run/docker.sock was missing, although every
-    service reached the daemon through the context, so no container was ever
-    reaped at boot, periodically, or at shutdown."""
+    """With no /var/run/docker.sock the reaper must still find a context-selected daemon."""
     import docker
 
     from ministack.app import _reaper_docker_client

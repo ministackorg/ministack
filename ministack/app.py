@@ -2869,14 +2869,9 @@ _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
 def _docker_context_selected() -> bool:
-    """Whether docker-py will reach the daemon through a non-default CLI context.
-
-    docker-py 7.2+ falls back to the selected context when ``DOCKER_HOST`` is
-    unset (``DOCKER_CONTEXT``, then ``currentContext`` in the CLI config), so on
-    Colima, Docker Desktop, Rancher Desktop or OrbStack the daemon is on a
-    per-user socket and ``/var/run/docker.sock`` need not exist. Resolved the
-    way docker-py resolves it, without importing it.
-    """
+    """Whether docker-py 7.2+ reaches the daemon through a non-default CLI context
+    (Colima, Docker Desktop, ...), where /var/run/docker.sock need not exist.
+    Mirrors docker-py's resolution without importing it."""
     try:
         from importlib.metadata import version
 
