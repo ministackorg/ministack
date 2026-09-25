@@ -807,33 +807,58 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
 
 
-def _docker_config(tmp_path, monkeypatch, config):
+def _docker_config(tmp_path, monkeypatch, config, home_config=None):
+    """An isolated Docker CLI setup: ``DOCKER_CONFIG`` holds ``config`` (none if
+    None) and ``$HOME/.docker/config.json`` holds ``home_config``."""
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    home = tmp_path / "home"
+    (home / ".docker").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    config_dir = tmp_path / "docker-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("DOCKER_CONFIG", str(config_dir))
     if config is not None:
-        (tmp_path / "config.json").write_text(config)
+        (config_dir / "config.json").write_text(config)
+    if home_config is not None:
+        (home / ".docker" / "config.json").write_text(home_config)
+    return config_dir
 
 
 @pytest.mark.parametrize(
-    "context_env, config, selected",
+    "context_env, config, home_config, selected",
     [
-        ("colima", None, True),
-        ("default", '{"currentContext": "colima"}', False),  # the variable wins, as in the CLI
-        (None, '{"currentContext": "desktop-linux"}', True),
-        (None, '{"currentContext": "default"}', False),
-        (None, '{"auths": {}}', False),
-        (None, None, False),
-        (None, "not json", False),
+        ("colima", None, None, True),
+        ("default", '{"currentContext": "colima"}', None, False),  # the variable wins, as in the CLI
+        ("", '{"currentContext": "colima"}', None, True),  # empty means unset, as in docker-py
+        (None, '{"currentContext": "desktop-linux"}', None, True),
+        (None, '{"currentContext": "default"}', None, False),
+        (None, '{"auths": {}}', None, False),
+        (None, None, None, False),
+        (None, "not json", None, False),
+        (None, None, '{"currentContext": "colima"}', True),  # DOCKER_CONFIG without a file falls back to HOME
+        (None, '{"auths": {}}', '{"currentContext": "colima"}', False),  # the first file found is the one read
     ],
 )
-def test_docker_context_selected(tmp_path, monkeypatch, context_env, config, selected):
+def test_docker_context_selected(tmp_path, monkeypatch, context_env, config, home_config, selected):
     from ministack.app import _docker_context_selected
 
-    _docker_config(tmp_path, monkeypatch, config)
+    _docker_config(tmp_path, monkeypatch, config, home_config)
     if context_env is not None:
         monkeypatch.setenv("DOCKER_CONTEXT", context_env)
     assert _docker_context_selected() is selected
+
+
+def test_docker_context_ignored_before_docker_py_7_2(tmp_path, monkeypatch):
+    """docker-py only follows contexts from 7.2; before that the services dial
+    the default socket too, so a selected context changes nothing."""
+    import importlib.metadata
+
+    from ministack.app import _docker_context_selected
+
+    _docker_config(tmp_path, monkeypatch, '{"currentContext": "colima"}')
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "7.1.0")
+    assert _docker_context_selected() is False
 
 
 def test_reaper_reaches_the_daemon_through_the_selected_context(tmp_path, monkeypatch):
@@ -845,17 +870,18 @@ def test_reaper_reaches_the_daemon_through_the_selected_context(tmp_path, monkey
 
     from ministack.app import _reaper_docker_client
 
-    _docker_config(tmp_path, monkeypatch, '{"currentContext": "colima"}')
-    monkeypatch.setattr(os.path, "exists", lambda path: False)
+    config_dir = _docker_config(tmp_path, monkeypatch, '{"currentContext": "colima"}')
+    real_exists = os.path.exists
+    monkeypatch.setattr(os.path, "exists", lambda path: False if str(path).endswith("docker.sock") else real_exists(path))
     client = object()
     monkeypatch.setattr(docker, "from_env", lambda **kwargs: client)
     assert _reaper_docker_client() is client
 
-    (tmp_path / "config.json").write_text('{"currentContext": "default"}')
+    (config_dir / "config.json").write_text('{"currentContext": "default"}')
     assert _reaper_docker_client() is None
 
     monkeypatch.setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")  # an explicit host is authoritative
-    (tmp_path / "config.json").write_text('{"currentContext": "colima"}')
+    (config_dir / "config.json").write_text('{"currentContext": "colima"}')
     assert _reaper_docker_client() is None
 
 

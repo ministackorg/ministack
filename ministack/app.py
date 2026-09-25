@@ -2869,21 +2869,38 @@ _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
 def _docker_context_selected() -> bool:
-    """Whether a Docker CLI context other than ``default`` is selected.
+    """Whether docker-py will reach the daemon through a non-default CLI context.
 
-    docker-py follows the selected context when ``DOCKER_HOST`` is unset (the
-    ``DOCKER_CONTEXT`` variable, then ``currentContext`` in the CLI config), so
-    on Colima, Docker Desktop, Rancher Desktop or OrbStack the daemon is reached
-    through a per-user socket and ``/var/run/docker.sock`` need not exist.
+    docker-py 7.2+ falls back to the selected context when ``DOCKER_HOST`` is
+    unset (``DOCKER_CONTEXT``, then ``currentContext`` in the CLI config), so on
+    Colima, Docker Desktop, Rancher Desktop or OrbStack the daemon is on a
+    per-user socket and ``/var/run/docker.sock`` need not exist. Resolved the
+    way docker-py resolves it, without importing it.
     """
-    name = os.environ.get("DOCKER_CONTEXT")
+    try:
+        from importlib.metadata import version
+
+        major, minor = (int(part) for part in version("docker").split(".")[:2])
+    except Exception:
+        return False
+    if (major, minor) < (7, 2):
+        return False
+    name = os.environ.get("DOCKER_CONTEXT") or None
     if name is None:
-        config_dir = os.environ.get("DOCKER_CONFIG") or os.path.join(os.path.expanduser("~"), ".docker")
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(os.environ["DOCKER_CONFIG"], "config.json") if os.environ.get("DOCKER_CONFIG") else None,
+            os.path.join(home, ".docker", "config.json"),
+            os.path.join(home, ".dockercfg"),
+        ]
+        path = next((c for c in candidates if c and os.path.exists(c)), None)
+        if path is None:
+            return False
         try:
-            with open(os.path.join(config_dir, "config.json")) as f:
+            with open(path) as f:
                 name = json.load(f).get("currentContext")
         except (OSError, ValueError, AttributeError):
-            name = None
+            return False
     return bool(name) and name != "default"
 
 

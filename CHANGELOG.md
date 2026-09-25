@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Containers — reaped when Docker is reached through a CLI context** — with `DOCKER_HOST` unset and no `/var/run/docker.sock`, as on Colima, Docker Desktop, Rancher Desktop or OrbStack, the container reaper decided there was no daemon although every service reached it through the selected context, so containers were never removed at boot, periodically or at shutdown. The reaper now follows the selected context the way docker-py 7.2+ does.
+
 ## [1.5.16] — 2026-09-23
 
 ### Added
