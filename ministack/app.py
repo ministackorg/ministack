@@ -3131,9 +3131,8 @@ def _pid_file(port: int) -> str:
     return os.path.join(tempfile.gettempdir(), f"ministack-{port}.pid")
 
 
-# How often the MINISTACK_PARENT_PID watcher checks that the parent is alive.
 _PARENT_POLL_INTERVAL = 1.0
-# Set once hypercorn has sent lifespan.startup, i.e. after it installed its signal handlers.
+# Set on lifespan.startup, which hypercorn sends after installing its signal handlers.
 _LIFESPAN_STARTED = threading.Event()
 
 
@@ -3148,14 +3147,8 @@ def _process_alive(pid: int) -> bool:
 
 
 def _watch_parent_pid():
-    """Honour MINISTACK_PARENT_PID: once that process exits, stop as ``ministack --stop`` does.
-
-    A test runner that launches MiniStack names its own pid here. When the runner
-    exits for any reason, including SIGKILL, this sends SIGTERM to MiniStack, whose
-    graceful shutdown removes the containers it launched. Without it an orphaned
-    MiniStack keeps running, and keeps its containers, because nothing signals it.
-    The signal waits for lifespan startup, by when hypercorn's handlers are in place.
-    """
+    """Once MINISTACK_PARENT_PID exits, however it exits, stop as ``ministack --stop``
+    does, so an orphaned MiniStack still removes its containers."""
     raw = os.environ.get("MINISTACK_PARENT_PID", "").strip()
     if not raw:
         return

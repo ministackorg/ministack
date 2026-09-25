@@ -67,7 +67,6 @@ def test_parent_exit_shuts_ministack_down_gracefully(tmp_path):
         assert proc.wait(timeout=30) == 0
         log = log_path.read_text()
         assert "has exited; shutting down" in log
-        # The graceful path: lifespan shutdown is what removes MiniStack's containers.
         assert "MiniStack shutting down" in log
     finally:
         _stop(proc)
@@ -75,9 +74,7 @@ def test_parent_exit_shuts_ministack_down_gracefully(tmp_path):
 
 
 def test_watcher_signals_only_once_hypercorn_handles_signals(monkeypatch):
-    """A parent that dies while MiniStack boots must not get the SIGTERM sent
-    before hypercorn installs its graceful handlers, which happens before it
-    sends lifespan.startup; the watcher waits for that message."""
+    """No SIGTERM before lifespan.startup, i.e. before hypercorn handles it gracefully."""
     import ministack.app as app
 
     parent_alive = {"value": True}
