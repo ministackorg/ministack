@@ -9196,7 +9196,7 @@ def _apigw_v2_api_props(props, stack_name, logical_id):
     return {
         "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
         "routeSelectionExpression": props.get("RouteSelectionExpression", default_rse),
-        "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
+        "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),  # sadscan:disable np.twitter.1 - API route expression, not a credential.
         "disableSchemaValidation": props.get("DisableSchemaValidation", False),
         "disableExecuteApiEndpoint": props.get("DisableExecuteApiEndpoint", False),
         "version": props.get("Version", ""),
@@ -11909,7 +11909,12 @@ _RESOURCE_HANDLERS = {
         "update": _ecs_service_update,
         "delete": _ecs_service_delete,
     },
-    "AWS::EC2::LaunchTemplate": {"create": _ec2_launch_template_create, "delete": _ec2_launch_template_delete},
+    "AWS::EC2::LaunchTemplate": {
+        "create": _ec2_launch_template_create,
+        "update": _ec2_launch_template_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_launch_template_delete,
+    },
     "AWS::ElasticLoadBalancingV2::LoadBalancer": {
         "create": _elbv2_load_balancer_create,
         "update": _elbv2_load_balancer_update,
