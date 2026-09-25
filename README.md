@@ -817,7 +817,7 @@ end-to-end without any client config.
 | `MINISTACK_HOST` | `localhost` | Hostname used in response URLs and EKS cluster endpoints. Set a hostname reachable by your clients, not a wildcard bind address |
 | `MINISTACK_ACCOUNT_ID` | `000000000000` | Default AWS account ID. Overridden per-request when `AWS_ACCESS_KEY_ID` is a 12-digit number (see [Multi-Tenancy](#multi-tenancy)) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
-| `MINISTACK_PARENT_PID` | _(unset)_ | Process id to follow. When that process exits, even by `SIGKILL`, a foreground `ministack` shuts down gracefully and removes the containers it launched. For test runners that start MiniStack themselves. Not used with `--detach`; not supported on Windows |
+| `MINISTACK_PARENT_PID` | _(unset)_ | Process id to follow. When that process exits, even by `SIGKILL`, a foreground `ministack` shuts down gracefully and removes the containers it launched. For test runners that start MiniStack themselves. The process must be visible to MiniStack (same host and PID namespace, so not across a container boundary). Not used with `--detach`; not supported on Windows |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `S3_PERSIST` | `0` | Set `1` to persist S3 objects to disk |
 | `S3_DATA_DIR` | `/tmp/ministack-data/s3` | S3 persistence directory |

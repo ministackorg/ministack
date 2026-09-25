@@ -84,11 +84,11 @@ def test_watcher_signals_only_once_hypercorn_handles_signals(monkeypatch):
     monkeypatch.setattr(app, "_LIFESPAN_STARTED", lifespan_started)
     sent, fired = [], threading.Event()
 
-    def fake_kill(pid, sig):
-        sent.append((pid, sig))
+    def fake_signal_self():
+        sent.append("SIGTERM")
         fired.set()
 
-    monkeypatch.setattr(app.os, "kill", fake_kill)
+    monkeypatch.setattr(app, "_signal_self", fake_signal_self)
     monkeypatch.setenv("MINISTACK_PARENT_PID", "12345")
 
     app._watch_parent_pid()
@@ -98,7 +98,16 @@ def test_watcher_signals_only_once_hypercorn_handles_signals(monkeypatch):
 
     lifespan_started.set()
     assert fired.wait(5)
-    assert sent == [(os.getpid(), signal.SIGTERM)]
+    assert sent == ["SIGTERM"]
+
+
+def test_process_alive():
+    import ministack.app as app
+
+    assert app._process_alive(1)  # init/launchd: PermissionError for non-root, which counts as alive
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(timeout=10)
+    assert not app._process_alive(gone.pid)
 
 
 def test_parent_pid_that_is_not_running_is_rejected_at_startup(tmp_path):
