@@ -1,6 +1,6 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""MINISTACK_PARENT_PID: a foreground MiniStack stops when the named process exits."""
+"""--watch-parent-pid: a foreground MiniStack stops when the named process exits."""
 
 import os
 import signal
@@ -34,10 +34,10 @@ def _wait_health(port: int, timeout: float = 30.0) -> None:
 
 
 def _spawn(port: int, parent_pid: str, log_path) -> subprocess.Popen:
-    env = {**os.environ, "GATEWAY_PORT": str(port), "MINISTACK_PARENT_PID": parent_pid, "LOG_LEVEL": "INFO"}
+    env = {**os.environ, "GATEWAY_PORT": str(port), "LOG_LEVEL": "INFO"}
     with open(log_path, "w") as log:
         return subprocess.Popen(
-            [sys.executable, "-m", "ministack"],
+            [sys.executable, "-m", "ministack", "--watch-parent-pid", parent_pid],
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -89,9 +89,7 @@ def test_watcher_signals_only_once_hypercorn_handles_signals(monkeypatch):
         fired.set()
 
     monkeypatch.setattr(app, "_signal_self", fake_signal_self)
-    monkeypatch.setenv("MINISTACK_PARENT_PID", "12345")
-
-    app._watch_parent_pid()
+    app._watch_parent_pid(12345)
     parent_alive["value"] = False
     time.sleep(0.2)
     assert sent == [], "signalled before hypercorn's handlers were in place"
@@ -124,7 +122,7 @@ def test_parent_pid_that_is_not_running_is_rejected_at_startup(tmp_path):
 @pytest.mark.serial
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_signals_still_shut_down_gracefully_with_a_parent_pid(tmp_path, signum):
-    """Signals keep hypercorn's own graceful handling with the variable set."""
+    """Signals keep hypercorn's own graceful handling with the flag set."""
     parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
     port = _free_port()
     log_path = tmp_path / "ministack.log"
@@ -145,6 +143,40 @@ def test_invalid_parent_pid_is_rejected_at_startup(tmp_path, value):
     proc = _spawn(port, value, tmp_path / "ministack.log")
     try:
         assert proc.wait(timeout=30) != 0
-        assert "MINISTACK_PARENT_PID" in (tmp_path / "ministack.log").read_text()
+        assert "--watch-parent-pid" in (tmp_path / "ministack.log").read_text()
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.parametrize("mode", ["--detach", "--stop"])
+def test_watch_parent_pid_requires_foreground_mode(tmp_path, mode):
+    log_path = tmp_path / "ministack.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ministack", mode, "--watch-parent-pid", str(os.getpid())],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            cwd=REPO_ROOT,
+        )
+    assert proc.wait(timeout=30) != 0
+    assert "--watch-parent-pid requires foreground mode" in log_path.read_text()
+
+
+def test_old_environment_variable_does_not_enable_watcher(tmp_path):
+    port = _free_port()
+    log_path = tmp_path / "ministack.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ministack"],
+            env={**os.environ, "GATEWAY_PORT": str(port), "MINISTACK_PARENT_PID": "0"},
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            cwd=REPO_ROOT,
+        )
+    try:
+        _wait_health(port)
+        assert proc.poll() is None
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0
     finally:
         _stop(proc)

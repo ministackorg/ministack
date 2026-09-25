@@ -3150,23 +3150,20 @@ def _signal_self():
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-def _watch_parent_pid():
-    """Once MINISTACK_PARENT_PID exits, however it exits, stop as ``ministack --stop``
-    does, so an orphaned MiniStack still removes its containers."""
-    raw = os.environ.get("MINISTACK_PARENT_PID", "").strip()
-    if not raw:
+def _watch_parent_pid(pid: int | None):
+    """Stop gracefully when the explicitly watched process exits."""
+    if pid is None:
         return
     if os.name == "nt":
-        raise SystemExit("ERROR: MINISTACK_PARENT_PID is not supported on Windows")
+        raise SystemExit("ERROR: --watch-parent-pid is not supported on Windows")
     try:
-        pid = int(raw)
         if pid <= 0:
             raise ValueError
         alive = _process_alive(pid)
     except (ValueError, OverflowError, OSError):
-        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a positive process id, got {raw!r}")
+        raise SystemExit(f"ERROR: --watch-parent-pid must be a positive process id, got {pid!r}")
     if not alive:
-        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID {pid} is not a running process")
+        raise SystemExit(f"ERROR: --watch-parent-pid {pid} is not a running process")
 
     def _watch():
         while _process_alive(pid):
@@ -3185,7 +3182,15 @@ def main():
     parser = argparse.ArgumentParser(description="MiniStack — Local AWS Service Emulator")
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
     parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
+    parser.add_argument(
+        "--watch-parent-pid",
+        type=int,
+        metavar="PID",
+        help="Stop gracefully when PID exits (foreground only; same host and PID namespace)",
+    )
     args = parser.parse_args()
+    if args.watch_parent_pid is not None and (args.detach or args.stop):
+        parser.error("--watch-parent-pid requires foreground mode")
 
     port = int(_resolve_port())
     # BIND_HOST controls the bind interface; defaults to 0.0.0.0 (existing
@@ -3252,7 +3257,7 @@ def main():
         print("  Stop: ministack --stop")
         return
 
-    _watch_parent_pid()
+    _watch_parent_pid(args.watch_parent_pid)
 
     # Foreground — write PID file and clean up on exit
     pf = _pid_file(port)
