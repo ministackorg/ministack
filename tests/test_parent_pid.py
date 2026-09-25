@@ -3,6 +3,7 @@
 """MINISTACK_PARENT_PID: a foreground MiniStack stops when the named process exits."""
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -72,7 +73,27 @@ def test_parent_exit_shuts_ministack_down_gracefully(tmp_path):
         _stop(parent)
 
 
-@pytest.mark.parametrize("value", ["not-a-pid", "0", "-5"])
+@pytest.mark.serial
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_signals_still_shut_down_gracefully_with_a_parent_pid(tmp_path, signum):
+    """Hypercorn only installs its signal handlers when no shutdown trigger is
+    given, so the trigger must handle SIGTERM/SIGINT itself or the lifespan
+    shutdown, which removes the containers, is skipped."""
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    port = _free_port()
+    log_path = tmp_path / "ministack.log"
+    proc = _spawn(port, str(parent.pid), log_path)
+    try:
+        _wait_health(port)
+        proc.send_signal(signum)
+        assert proc.wait(timeout=30) == 0
+        assert "MiniStack shutting down" in log_path.read_text()
+    finally:
+        _stop(proc)
+        _stop(parent)
+
+
+@pytest.mark.parametrize("value", ["not-a-pid", "0", "-5", "3000000000"])
 def test_invalid_parent_pid_is_rejected_at_startup(tmp_path, value):
     port = _free_port()
     proc = _spawn(port, value, tmp_path / "ministack.log")

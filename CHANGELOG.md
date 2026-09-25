@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Gateway — stop with the process that launched MiniStack** — with `MINISTACK_PARENT_PID` set, a foreground `ministack` shuts down gracefully once that process exits, even by `SIGKILL`, so a killed test runner no longer leaves MiniStack and its containers running. `SIGTERM` and `SIGINT` still shut down gracefully. Not supported on Windows.
+
 ## [1.5.16] — 2026-09-23
 
 ### Added

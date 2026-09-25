@@ -3151,21 +3151,36 @@ def _parent_exit_trigger():
     gracefully, so the lifespan shutdown removes the containers it launched.
     Without it an orphaned MiniStack keeps running, and keeps its containers,
     because nothing ever signals it.
+
+    Hypercorn installs its SIGINT/SIGTERM handlers only when no trigger is
+    given, so this trigger also returns on those signals to keep them graceful.
     """
     raw = os.environ.get("MINISTACK_PARENT_PID", "").strip()
     if not raw:
         return None
+    if os.name == "nt":
+        raise SystemExit("ERROR: MINISTACK_PARENT_PID is not supported on Windows")
     try:
         pid = int(raw)
-    except ValueError:
-        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a process id, got {raw!r}")
-    if pid <= 0:
-        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a positive process id, got {pid}")
+        if pid <= 0:
+            raise ValueError
+        _process_alive(pid)
+    except (ValueError, OverflowError, OSError):
+        raise SystemExit(f"ERROR: MINISTACK_PARENT_PID must be a positive process id, got {raw!r}")
 
     async def _wait_for_parent_exit():
-        while _process_alive(pid):
-            await asyncio.sleep(_PARENT_POLL_INTERVAL)
-        logger.info("Parent process %d has exited; shutting down", pid)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+        while not stop.is_set():
+            if not _process_alive(pid):
+                logger.info("Parent process %d has exited; shutting down", pid)
+                return
+            try:
+                await asyncio.wait_for(stop.wait(), _PARENT_POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
 
     return _wait_for_parent_exit
 
@@ -3178,7 +3193,6 @@ def main():
     parser.add_argument("-d", "--detach", action="store_true", help="Run in the background (detached mode)")
     parser.add_argument("--stop", action="store_true", help="Stop a detached MiniStack server")
     args = parser.parse_args()
-    shutdown_trigger = _parent_exit_trigger()
 
     port = int(_resolve_port())
     # BIND_HOST controls the bind interface; defaults to 0.0.0.0 (existing
@@ -3244,6 +3258,8 @@ def main():
         print(f"  Logs: {log_file}")
         print("  Stop: ministack --stop")
         return
+
+    shutdown_trigger = _parent_exit_trigger()
 
     # Foreground — write PID file and clean up on exit
     pf = _pid_file(port)
