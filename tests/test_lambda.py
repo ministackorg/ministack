@@ -6664,6 +6664,26 @@ def test_function_concurrency_cap_none_is_unbounded():
     assert reason == "spawn"
 
 
+def test_function_concurrency_cap_zero_disables():
+    """ReservedConcurrentExecutions=0 → every invoke throttles, even on an empty pool."""
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=0)
+    assert entry is None
+    assert reason == "func_cap"
+
+
+def test_execution_slot_zero_reserved_throttles():
+    """ReservedConcurrentExecutions=0 → _acquire_execution_slot refuses the first slot."""
+    func = {"concurrency": 0}
+    config = {
+        "FunctionName": "cap-zero-unit",
+        "Version": "$LATEST",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:cap-zero-unit",
+    }
+    slot, limit = lsvc._acquire_execution_slot(func, config)
+    assert slot is None
+    assert limit == "function"
+
+
 def test_account_concurrency_cap_rejects(monkeypatch):
     """Global account cap: 3 in-use total → 4th is throttled as acct_cap."""
     monkeypatch.setattr(lsvc, "_ACCOUNT_CONCURRENCY_CAP", 3)
