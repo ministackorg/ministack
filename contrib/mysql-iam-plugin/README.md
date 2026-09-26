@@ -3,10 +3,60 @@
 This directory contains MiniStack's server-side compatibility plugin for
 Aurora MySQL users declared with `AWSAuthenticationPlugin`.
 
-The initial L0 implementation deliberately rejects every login, matching
-MySQL's `mysql_no_login` behavior. It supports provider workflows that create,
-alter, grant, revoke, inspect, and drop IAM-authenticated users without
-pretending that local IAM token validation exists.
+The plugin supports provider workflows that create, alter, grant, revoke,
+inspect, and drop IAM-authenticated users. Stage 7 of #1744 adds delegation to
+the internal IAM broker. Normal container provisioning does not yet configure
+the callback, so IAM logins still fail by default. Stage 8 supplies that wiring
+and the first end-to-end login tests; this change alone does not enable them.
+
+## Internal callback contract
+
+The plugin requests `mysql_clear_password` and forwards the NUL-terminated token
+with the actual MySQL username. It rejects anonymous/proxy account mismatches
+and never changes the selected SQL account or its privileges. The broker owns
+the `AUTH` gate: strict token and IAM-policy checks for `AUTH=true`, permissive
+IAM checks otherwise. Both modes still require a valid capability, a current
+resource binding, and resource IAM-auth enablement. The plugin has no local
+`AUTH` bypass and only accepts HTTP 200 with the exact body `{"allowed":true}`.
+
+Trusted container provisioning will supply these process environment values:
+
+* `MINISTACK_RDS_IAM_BROKER_HOST`: numeric IPv4 address reachable from MySQL.
+* `MINISTACK_RDS_IAM_BROKER_PORT`: broker TCP port (1–65535).
+* `MINISTACK_RDS_IAM_CAPABILITY`: the broker-issued 64-character lowercase hex capability.
+
+The path is fixed at `/_ministack/rds/iam-auth`. No account, resource, or callback
+address comes from the login request. Missing/invalid settings deny access.
+One process-level capability binds one resource endpoint; stage 8 must resolve
+cluster/member/reader endpoint routing before claiming those login paths work.
+Capabilities must be reprovisioned after broker restart or resource replacement.
+
+libcurl provides HTTP framing, a one-second connection timeout, and a three-second
+total callback timeout. Numeric addresses avoid synchronous DNS lookup delays.
+Redirects and environment proxies are disabled. Responses are capped at 1 KiB,
+tokens at 64 KiB, and JSON requests at the broker's 70 KiB limit. Errors deny
+access without logging credentials. The callback uses HTTP on a trusted internal
+network; it must not cross an untrusted network without transport protection.
+
+Stage 8 must require TLS for IAM-authenticated MySQL logins when `AUTH=true`.
+With `AUTH` unset or false, it must preserve permissive transport behavior and
+add no TLS requirement. Non-IAM users' transport requirements remain unchanged;
+do not unconditionally add `REQUIRE SSL` to IAM accounts. This callback cannot
+attest to client TLS, so stage 8 must establish that enforcement at the MySQL
+connection boundary. Protection of the plugin-to-broker transport is a separate
+concern from client-to-MySQL TLS.
+
+Existing database-user checks and SQL privileges must remain in force.
+End-to-end acceptance tests must cover TLS refusal and token expiry on new
+IAM logins with `AUTH=true`, permissive transport with `AUTH` unset or false,
+and continued use of already-established sessions.
+
+Native callback tests run offline with a C++ compiler and libcurl development
+headers/libraries (for example `g++` and `libcurl4-openssl-dev` on Debian):
+
+```bash
+uv run --extra dev pytest tests/test_rds_iam_plugin_client.py -q
+```
 
 The same C++ source is compiled separately against MySQL 8.0 and 8.4 headers.
 MySQL checks the authentication-plugin interface version when the library is
@@ -24,7 +74,8 @@ The official runtime images expose only a minimal repository. Installing
 owned by `mysql-community-server-minimal`, and it does not contain the server
 plugin header. The build therefore installs the exact-version
 `mysql-community-debugsource` package from the image's series repository and
-compiles with its server headers. Generated `mysql_version.h` and the unused
+compiles with its server headers and `libcurl-devel`. The target MySQL runtime
+must provide `libcurl.so.4`, as the supported official images do. Generated `mysql_version.h` and the unused
 server-internal headers are excluded with MySQL's `MYSQL_ABI_CHECK` compile
 mode. `MYSQL_DYNAMIC_PLUGIN` emits the three loader-facing symbols instead of
 the built-in-plugin symbol names, and the image build asserts that the interface

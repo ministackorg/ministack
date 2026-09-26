@@ -121,6 +121,13 @@ jobs:
             --shard-count "$SHARD_COUNT")
           echo "files=$FILES" >> $GITHUB_OUTPUT
 
+      # Only this shard compiles the small broker-client harness, not plugin images.
+      - name: Install native broker client test dependencies
+        if: contains(steps.shard.outputs.files, 'tests/test_rds_iam_plugin_client.py')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ libcurl4-openssl-dev
+
       - name: Run tests (${{ matrix.mode }} shard ${{ matrix.shard_index }})
         run: |
           if [ -z "${{ steps.shard.outputs.files }}" ]; then

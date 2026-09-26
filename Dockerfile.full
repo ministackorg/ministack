@@ -36,10 +36,11 @@ FROM mysql:8.0 AS plugin-build-80
 USER root
 RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
     && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
-    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf install -y gcc-c++ libcurl-devel "mysql-community-debugsource-${mysql_version}" \
     && microdnf clean all
 ARG TARGETARCH
 COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+COPY contrib/mysql-iam-plugin/broker_client.h /tmp/broker_client.h
 RUN arch="${TARGETARCH}"; \
     if [ -z "${arch}" ]; then \
       case "$(uname -m)" in \
@@ -55,7 +56,7 @@ RUN arch="${TARGETARCH}"; \
       -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
       -I"${include_dir}" \
       -o "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
-      /tmp/aws_auth_plugin.cc; \
+      /tmp/aws_auth_plugin.cc -lcurl; \
     nm -D "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
       | grep -q ' _mysql_plugin_interface_version_$'
 
@@ -63,10 +64,11 @@ FROM mysql:8.4 AS plugin-build
 USER root
 RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
     && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
-    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf install -y gcc-c++ libcurl-devel "mysql-community-debugsource-${mysql_version}" \
     && microdnf clean all
 ARG TARGETARCH
 COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+COPY contrib/mysql-iam-plugin/broker_client.h /tmp/broker_client.h
 RUN arch="${TARGETARCH}"; \
     if [ -z "${arch}" ]; then \
       case "$(uname -m)" in \
@@ -82,7 +84,7 @@ RUN arch="${TARGETARCH}"; \
       -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
       -I"${include_dir}" \
       -o "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
-      /tmp/aws_auth_plugin.cc; \
+      /tmp/aws_auth_plugin.cc -lcurl; \
     nm -D "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
       | grep -q ' _mysql_plugin_interface_version_$'
 COPY --from=plugin-build-80 /opt/ministack/mysql-plugins/8.0 /opt/ministack/mysql-plugins/8.0
