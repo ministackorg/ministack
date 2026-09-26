@@ -1275,7 +1275,7 @@ def _delete_table(data):
 
 
 def _describe_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     return json_response({"Table": _table_description(name)})
