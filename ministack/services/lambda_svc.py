@@ -4083,6 +4083,52 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
+_CONTAINER_CA_PATH = "/var/ministack/ministack-ca.pem"
+_CONTAINER_BUNDLE_PATH = "/var/ministack/ca-bundle.pem"
+_CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
+
+
+def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
+    """Resolve the host a Cognito token's `iss` names to the gateway, and trust it.
+
+    A verifier built from the pool id alone has no other way to reach us. Only
+    under USE_SSL=1: `iss` is https, so plain HTTP has nothing to resolve to.
+    """
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return
+    try:
+        cert_path, _key_path = _tls.resolve_tls_material()
+    except SystemExit:
+        return
+    run_kwargs.setdefault("extra_hosts", {}).setdefault(
+        _tls.cognito_idp_host(), "host-gateway")
+    if not os.path.exists(cert_path):
+        return
+    # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
+    bundle = _tls.ca_bundle_path(cert_path)
+    mounts.append(docker_lib.types.Mount(
+        _CONTAINER_CA_PATH, cert_path, type="bind", read_only=True))
+    container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
+    if bundle:
+        mounts.append(docker_lib.types.Mount(
+            _CONTAINER_BUNDLE_PATH, bundle, type="bind", read_only=True))
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+            container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
+    # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
+    if runtime.startswith("java"):
+        store = _tls.java_truststore_path(cert_path)
+        if store:
+            mounts.append(docker_lib.types.Mount(
+                _CONTAINER_TRUSTSTORE_PATH, store, type="bind", read_only=True))
+            container_env.setdefault("JAVA_TOOL_OPTIONS", " ".join((
+                f"-Djavax.net.ssl.trustStore={_CONTAINER_TRUSTSTORE_PATH}",
+                "-Djavax.net.ssl.trustStoreType=pkcs12",
+                f"-Djavax.net.ssl.trustStorePassword={_tls.JAVA_TRUSTSTORE_PASSWORD}",
+            )))
+
+
 def _declared_docker_platform(config: dict):
     """The linux/* platform to pin, or None when the function never declared one.
 
@@ -4458,6 +4504,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         if shim_cmd:
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
+
+    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime)
 
     if mounts:
         run_kwargs["mounts"] = mounts

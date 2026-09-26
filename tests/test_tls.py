@@ -143,3 +143,111 @@ def test_tls_partial_cert_config_rejected():
         _terminate(proc)
         pytest.fail("hypercorn should have exited when SSL cert/key were partially configured")
     assert rc != 0
+
+
+# ---------------------------------------------------------------------------
+# The Cognito issuer host: a token's `iss` names
+# cognito-idp.{region}.amazonaws.com, so the gateway certificate has to as
+# well for a client that follows it to complete a handshake.
+# ---------------------------------------------------------------------------
+
+
+def _san_of(cert_path):
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
+        capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def test_generated_cert_names_the_cognito_issuer_host(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_REGION", "eu-west-2")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    assert "DNS:cognito-idp.eu-west-2.amazonaws.com" in _san_of(cert_path)
+    assert tls.cognito_idp_host() == "cognito-idp.eu-west-2.amazonaws.com"
+
+
+def test_cached_cert_without_the_issuer_host_is_regenerated(tmp_path, monkeypatch):
+    """A cert cached by an older build, or for another region, cannot serve the
+    issuer host, so reusing it would fail the handshake."""
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    monkeypatch.setenv("MINISTACK_REGION", "eu-west-2")
+    first, _ = tls.resolve_tls_material()
+    first_bytes = open(first, "rb").read()
+
+    monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
+    second, _ = tls.resolve_tls_material()
+    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(second)
+    assert open(second, "rb").read() != first_bytes
+
+
+def test_byo_certificate_is_never_regenerated(tmp_path, monkeypatch):
+    """MINISTACK_SSL_CERT is the operator's, so the issuer host is their
+    business and we must hand it back untouched."""
+    from ministack.core import tls
+
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_text("cert"), key.write_text("key")
+    monkeypatch.setenv("MINISTACK_SSL_CERT", str(cert))
+    monkeypatch.setenv("MINISTACK_SSL_KEY", str(key))
+    assert tls.resolve_tls_material() == (str(cert), str(key))
+    assert cert.read_text() == "cert"
+
+
+def test_port_is_bindable_reports_a_taken_port():
+    from ministack.app import _port_is_bindable
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        assert _port_is_bindable("127.0.0.1", port) is False
+    assert _port_is_bindable("127.0.0.1", _free_port()) is True
+
+
+def test_ca_bundle_keeps_the_public_roots(tmp_path, monkeypatch):
+    """AWS_CA_BUNDLE and REQUESTS_CA_BUNDLE replace the trust store, so the
+    bundle we hand a container must still verify everything else it calls."""
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    bundle = tls.ca_bundle_path(cert_path)
+    assert bundle, "no system trust store to build a bundle from"
+    ctx = ssl.create_default_context(cafile=bundle)
+    assert len(ctx.get_ca_certs()) > 5
+    assert open(cert_path).read() in open(bundle).read()
+
+
+def test_java_truststore_carries_our_cert_and_the_public_roots(tmp_path, monkeypatch):
+    """A JVM reads neither AWS_CA_BUNDLE nor a PEM bundle, so a Java handler
+    gets a PKCS12 store, and it must not cost it the public roots either."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    store = tls.java_truststore_path(cert_path)
+    assert store and store.endswith(".p12")
+
+    loaded = pkcs12.load_pkcs12(
+        open(store, "rb").read(), tls.JAVA_TRUSTSTORE_PASSWORD.encode())
+    ours = x509.load_pem_x509_certificate(open(cert_path, "rb").read())
+    subjects = [entry.certificate.subject for entry in loaded.additional_certs]
+    assert ours.subject in subjects
+    assert len(subjects) > 5

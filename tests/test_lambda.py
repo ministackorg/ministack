@@ -13677,6 +13677,82 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
     assert not lambda_runtime._workers
 
 
+# ---------------------------------------------------------------------------
+# Reaching Cognito at the host its tokens name. AWS's own CognitoJwtVerifier
+# derives the expected issuer and the JWKS URL from the pool id and overrides
+# neither, so a verifying handler must find the gateway at
+# cognito-idp.{region}.amazonaws.com.
+# ---------------------------------------------------------------------------
+
+
+def _wire(monkeypatch, **env):
+    from ministack.services import lambda_svc as lsvc
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    run_kwargs, container_env, mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, mounts)
+    return run_kwargs, container_env, mounts
+
+
+def test_cognito_issuer_host_is_not_wired_without_use_ssl(monkeypatch, tmp_path):
+    """`iss` is https, so with a plain gateway there is nothing for the name to
+    usefully resolve to and the container must be left alone."""
+    monkeypatch.delenv("USE_SSL", raising=False)
+    run_kwargs, container_env, mounts = _wire(monkeypatch, TMPDIR=str(tmp_path))
+    assert (run_kwargs, container_env, mounts) == ({}, {}, [])
+
+
+def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, tmp_path):
+    from ministack.services import lambda_svc as lsvc
+
+    run_kwargs, container_env, mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    assert run_kwargs["extra_hosts"] == {
+        "cognito-idp.us-east-1.amazonaws.com": "host-gateway"}
+    # NODE_EXTRA_CA_CERTS adds to node's roots, so it takes the bare certificate.
+    assert container_env["NODE_EXTRA_CA_CERTS"] == lsvc._CONTAINER_CA_PATH
+    # The other two replace the trust store, so they take the public roots with
+    # ours appended, or the handler loses every other HTTPS endpoint.
+    for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        assert container_env[var] == lsvc._CONTAINER_BUNDLE_PATH
+    assert [(m["Target"], m["ReadOnly"]) for m in mounts] == [
+        (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
+
+
+def test_cognito_issuer_wiring_never_overrides_the_caller(monkeypatch, tmp_path):
+    """LAMBDA_DOCKER_FLAGS --add-host and a function's own env come first."""
+    from ministack.services import lambda_svc as lsvc
+
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
+    host = "cognito-idp.us-east-1.amazonaws.com"
+    run_kwargs = {"extra_hosts": {host: "10.0.0.9"}}
+    container_env = {"NODE_EXTRA_CA_CERTS": "/opt/mine.pem"}
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, [])
+    assert run_kwargs["extra_hosts"][host] == "10.0.0.9"
+    assert container_env["NODE_EXTRA_CA_CERTS"] == "/opt/mine.pem"
+
+
+def test_cognito_issuer_wiring_gives_a_java_runtime_its_own_truststore(monkeypatch, tmp_path):
+    """JAVA_TOOL_OPTIONS makes every JVM announce itself on stderr, so it is
+    set only where a JVM will read it."""
+    pytest.importorskip("cryptography")
+    from ministack.services import lambda_svc as lsvc
+
+    _rk, java_env, java_mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    java_env.clear(), java_mounts.clear()
+    lsvc._wire_cognito_issuer_host({}, java_env, java_mounts, "java21")
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in java_env["JAVA_TOOL_OPTIONS"]
+    assert "trustStoreType=pkcs12" in java_env["JAVA_TOOL_OPTIONS"]
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in [m["Target"] for m in java_mounts]
+
+    _rk2, py_env, py_mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(_rk2, py_env, py_mounts, "python3.12")
+    assert "JAVA_TOOL_OPTIONS" not in py_env
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH not in [m["Target"] for m in py_mounts]
 class _ProxyHandler(BaseHTTPRequestHandler):
     received: list[dict] = []
     response: tuple[int, bytes, dict] = (200, b'{"ok":true}', {"Content-Type": "application/json"})
