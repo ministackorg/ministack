@@ -5159,8 +5159,10 @@ from ministack.core.responses import get_account_id, get_region, set_request_acc
 def _clear_pool():
     """Fresh pool before every test; also clear after so later tests don't see residue."""
     lsvc._warm_pool.clear()
+    lsvc._spawn_locks.clear()
     yield
     lsvc._warm_pool.clear()
+    lsvc._spawn_locks.clear()
 
 
 def _mk_container(running: bool = True):
@@ -6775,6 +6777,204 @@ def test_two_accounts_get_independent_pools():
     entry, reason = lsvc._pool_acquire(k_b, max_concurrency=None)
     assert entry is None
     assert reason == "spawn"   # account B must cold-start; can't reuse A's container
+
+
+# ─────── multi-request mode: share busy containers ──────────────────────────
+# LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION=N caps warm containers per
+# function; overflow acquires share the least-loaded busy container instead
+# of spawning (issue #1816). Unset → one container per concurrent invocation.
+
+def test_sharing_cap_one_reuses_busy_container(monkeypatch):
+    """At cap=1 a second concurrent acquire shares the busy entry, not spawn."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    e1 = lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    e2, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert reason == "reused"
+    assert e2 is e1
+    assert len(lsvc._warm_pool["k"]) == 1
+    assert e1["users"] == 2
+
+
+def test_sharing_spawns_until_cap_then_shares(monkeypatch):
+    """Below the cap a busy pool still spawns; at the cap it shares."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 2)
+    lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert entry is None
+    assert reason == "spawn"
+    lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert reason == "reused"
+    assert len(lsvc._warm_pool["k"]) == 2
+
+
+def test_sharing_release_frees_only_on_last(monkeypatch):
+    """Two users on one entry: first release keeps it busy, second frees it."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    e1 = lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    e2, _ = lsvc._pool_acquire("k", max_concurrency=None)
+    assert e2 is e1
+    lsvc._pool_release(e1)
+    assert e1["in_use"] is True
+    lsvc._pool_release(e1)
+    assert e1["in_use"] is False
+    e3, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert reason == "reused"
+    assert e3 is e1
+
+
+def test_sharing_detach_drains_until_last_release(monkeypatch):
+    """Timeout/death detaches the entry but kills only after sharers leave."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    e1 = lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    e2, _ = lsvc._pool_acquire("k", max_concurrency=None)
+    assert e2 is e1
+    lsvc._pool_detach(e1)
+    assert lsvc._warm_pool.get("k", []) == []  # no new acquires land here
+    e1["container"].stop.assert_not_called()  # sharer still inside
+    lsvc._pool_release(e1)
+    e1["container"].stop.assert_called_once()
+
+
+def test_sharing_picks_least_loaded(monkeypatch):
+    """Overflow acquire shares the entry with fewest users."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 2)
+    e1 = lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    e2 = lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    first, _ = lsvc._pool_acquire("k", max_concurrency=None)
+    assert first is e1  # tie → first entry; e1 now has 2 users
+    second, _ = lsvc._pool_acquire("k", max_concurrency=None)
+    assert second is e2  # e2 still has 1
+
+
+def test_sharing_respects_function_disabled(monkeypatch):
+    """ReservedConcurrentExecutions=0 throttles even with a busy pool at the cap."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=0)
+    assert entry is None
+    assert reason == "func_cap"
+
+
+def test_sharing_disabled_when_keepalive_kills(monkeypatch):
+    """LAMBDA_KEEPALIVE_MS=0 promises a cold start per invoke — busy entries are not shared."""
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    monkeypatch.setattr(lsvc, "_KEEPALIVE_KILL_ON_RELEASE", True)
+    lsvc._pool_register("k", _mk_container(), tmpdir=None)
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert entry is None
+    assert reason == "spawn"
+
+
+def test_acquire_backfills_missing_entry_lock():
+    """Entries built without a per-entry lock get one on acquire, under the pool lock."""
+    manual = {
+        "container": _mk_container(), "tmpdir": None, "in_use": False,
+        "last_used": time.time(), "created": time.time(),
+    }
+    lsvc._warm_pool.setdefault("k", []).append(manual)
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=None)
+    assert reason == "reused"
+    assert entry is manual
+    assert entry["lock"].acquire(blocking=False)
+    entry["lock"].release()
+
+
+def test_spawn_locks_cleaned_with_pool_keys():
+    """Spawn locks share the pool keys' lifecycle — no leak on kill/clear."""
+    key = "111122223333:us-east-1:fn-locks:zip:sha-v1"
+    lsvc._spawn_lock_for(key)
+    assert key in lsvc._spawn_locks
+    lsvc._pool_kill_function("111122223333", "fn-locks")
+    assert key not in lsvc._spawn_locks
+    lsvc._spawn_lock_for(key)
+    lsvc._pool_clear_all()
+    assert key not in lsvc._spawn_locks
+
+
+def test_spawn_locks_cleaned_on_idle_evict(monkeypatch):
+    """Idle-evicted keys drop their spawn lock along with the pool entry."""
+    monkeypatch.setattr(lsvc, "_WARM_CONTAINER_TTL", 60)
+    key = "k-evict-lock"
+    lsvc._spawn_lock_for(key)
+    entry = lsvc._pool_register(key, _mk_container(), tmpdir=None)
+    lsvc._pool_release(entry)
+    entry["last_used"] = time.time() - 300  # past TTL
+    lsvc._pool_evict_idle()
+    assert key not in lsvc._warm_pool
+    assert key not in lsvc._spawn_locks
+
+
+def test_sharing_serializes_invokes_inside_one_container(monkeypatch):
+    """Sharers never overlap inside RIE: concurrent POSTs crash it (SIGSEGV)."""
+    name = f"lam-share-lock-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    spawned = []
+    inside = {"n": 0, "max": 0}
+    guard = threading.Lock()
+
+    def _fake_spawn(*_a, **_kw):
+        container = _RieFakeContainer()
+        spawned.append(container)
+        return container, None
+
+    def _fake_invoke(_container, _event, _timeout):
+        with guard:
+            inside["n"] += 1
+            inside["max"] = max(inside["max"], inside["n"])
+        try:
+            time.sleep(0.2)
+            return {"body": {"ok": True}}
+        finally:
+            with guard:
+                inside["n"] -= 1
+
+    monkeypatch.setattr(lsvc, "LAMBDA_EXECUTOR", "docker")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lsvc, "_spawn_lambda_container", _fake_spawn)
+    monkeypatch.setattr(lsvc, "_invoke_rie", _fake_invoke)
+    monkeypatch.setattr(lsvc, "_DOCKER_MAX_CONTAINERS_PER_FUNCTION", 1)
+    try:
+        import concurrent.futures
+        func = {"config": config, "code_zip": b"zip"}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(
+                lambda _: lsvc._execute_function_docker(func, {}), range(3)))
+    finally:
+        lsvc._pool_kill_function("000000000000", name)
+    assert results == [{"body": {"ok": True}}] * 3
+    assert len(spawned) == 1  # cold burst still spawns once
+    assert inside["max"] == 1  # ... and sharers run back-to-back
+
+
+def test_execution_slot_reserved_one_throttles_second():
+    """ReservedConcurrentExecutions=1 → slot accounting refuses the 2nd invoke.
+
+    Sharing caps containers, not invocations: the pool-level func_cap rarely
+    fires under sharing, so this per-invocation check is what still throttles.
+    """
+    func = {"concurrency": 1}
+    config = {
+        "FunctionName": "cap-one-unit",
+        "Version": "$LATEST",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:cap-one-unit",
+    }
+    slot, _ = lsvc._acquire_execution_slot(func, config)
+    assert slot is not None
+    try:
+        slot2, limit = lsvc._acquire_execution_slot(func, config)
+        assert slot2 is None
+        assert limit == "function"
+    finally:
+        lsvc._release_execution_slot(slot)
 
 
 def test_throttle_response_shape_matches_aws():
@@ -11484,6 +11684,44 @@ def test_lambda_reserved_concurrency_throttles_rather_than_queues(lam):
                 f"expected TooManyRequestsException, got {code!r}")
             assert reason == "ReservedFunctionConcurrentInvocationLimitExceeded", (
                 f"expected the function-limit Reason, got {reason!r}")
+    finally:
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=name)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker"
+    or os.environ.get("LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION", "") != "1",
+    reason="requires LAMBDA_EXECUTOR=docker with "
+           "LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION=1 and Docker daemon",
+)
+@pytest.mark.data_plane
+def test_docker_multi_request_concurrent_invokes_share_one_container(lam):
+    """Cap=1: concurrent docker invokes share one container (issue #1816)."""
+    import concurrent.futures
+
+    name = f"lam-multireq-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import socket, time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(2)\n"
+        "    return {'hostname': socket.gethostname(), 'id': event.get('id')}\n"
+    )
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=30,
+    )
+    try:
+        def _invoke(i):
+            resp, payload = _invoke_lambda_payload(lam, name, {"id": i})
+            assert resp.get("FunctionError", "") == "", payload
+            return payload
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_invoke, range(3)))
+
+        assert len({r["hostname"] for r in results}) == 1
+        assert sorted(r["id"] for r in results) == [0, 1, 2]  # no crossed responses
     finally:
         with contextlib.suppress(Exception):
             lam.delete_function(FunctionName=name)

@@ -3198,7 +3198,9 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
 # source and CMD differ.
 #
 # _warm_pool structure:
-#   {cache_key: [ {container, tmpdir, in_use, last_used, created}, ... ]}
+#   {cache_key: [ {container, tmpdir, in_use, users, lock, last_used, created}, ... ]}
+# `users` counts concurrent invokes inside the entry; `lock` serialises their
+# RIE POSTs (multi-request mode) — RIE segfaults on concurrent invocations.
 #
 # Cache key format keeps multi-tenancy isolation + forces cold start on
 # redeploy:
@@ -3208,10 +3210,51 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
 
 _warm_pool: dict[str, list[dict]] = {}
 _warm_pool_lock = threading.Lock()
+# Per-function spawn locks: a cold burst must not all see an empty pool and
+# every invoke spawn. One lock per pool key (same lifecycle as the pool keys).
+_spawn_locks: dict[str, threading.Lock] = {}
+_spawn_locks_guard = threading.Lock()
+
+
+def _spawn_lock_for(key: str) -> threading.Lock:
+    with _spawn_locks_guard:
+        return _spawn_locks.setdefault(key, threading.Lock())
+
+
+def _spawn_lock_discard(key: str) -> None:
+    """Drop a pool key's spawn lock once the key itself is gone.
+
+    A thread still inside the old lock object keeps its own reference and
+    finishes safely; the worst case is a transient second lock for the key
+    (one extra spawn), the same benign outcome as having no spawn lock.
+    """
+    with _spawn_locks_guard:
+        _spawn_locks.pop(key, None)
+
+
 _WARM_CONTAINER_TTL = 300  # seconds idle before eviction. AWS doesn't publish
                            # the exact idle TTL; 5 min matches community
                            # observations. Can be overridden via env var.
 _WARM_CONTAINER_TTL = int(os.environ.get("LAMBDA_WARM_TTL_SECONDS", _WARM_CONTAINER_TTL))
+
+# Multi-request mode (issue #1816): cap warm Docker containers per function.
+# At the cap, overflow acquires share the least-loaded busy container instead
+# of spawning. Unset → AWS behavior (one container per concurrent invocation).
+# AWS runtimes still run one event at a time, so sharers serialize inside the
+# container — this saves spawn cost, not wall time.
+def _parse_docker_max_containers() -> int | None:
+    raw = os.environ.get("LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION=%r is not an integer; "
+                       "sharing disabled", raw)
+        return None
+    return value if value > 0 else None
+
+_DOCKER_MAX_CONTAINERS_PER_FUNCTION = _parse_docker_max_containers()
 
 # LocalStack-compat (not an AWS behavior): LAMBDA_KEEPALIVE_MS=0 forces a cold
 # start after EVERY invocation by tearing the Docker RIE container down on
@@ -3340,6 +3383,8 @@ def _pool_acquire(key: str, max_concurrency: int | None):
 
     Returns (entry, reason):
       - (entry,  "reused")     : free live container reused; marked in_use.
+      - (entry,  "reused")     : multi-request mode at cap — busy container
+                                 shared, users incremented.
       - (None,   "spawn")      : caller should spawn a new container and _pool_register it.
       - (None,   "func_cap")   : function-level ReservedConcurrentExecutions hit → throttle.
       - (None,   "acct_cap")   : account-level cap hit → throttle.
@@ -3351,12 +3396,32 @@ def _pool_acquire(key: str, max_concurrency: int | None):
         if len(alive) != len(entries):
             _warm_pool[key] = alive
             entries = alive
+        # A disabled function (ReservedConcurrentExecutions=0) always throttles,
+        # even in multi-request mode — sharing must not resurrect it.
+        if max_concurrency == 0:
+            return None, "func_cap"
         # Reuse a free live container
         for e in entries:
             if not e["in_use"]:
                 e["in_use"] = True
+                e["users"] = 1
+                e.setdefault("lock", threading.Lock())
                 e["last_used"] = time.time()
                 return e, "reused"
+        # Multi-request mode: at the container cap, share the least-loaded busy
+        # entry instead of spawning. Before func_cap: slot accounting already
+        # throttled reserved overflows per-invocation, so the pool must not
+        # re-throttle on its (deliberately small) entry count. Disabled when
+        # LAMBDA_KEEPALIVE_MS=0, which promises a cold start after EVERY
+        # invocation — sharing a busy container would break that promise.
+        if (_DOCKER_MAX_CONTAINERS_PER_FUNCTION is not None
+                and not _KEEPALIVE_KILL_ON_RELEASE
+                and entries
+                and len(entries) >= _DOCKER_MAX_CONTAINERS_PER_FUNCTION):
+            e = min(entries, key=lambda x: x.get("users", 1))
+            e["users"] = e.get("users", 1) + 1
+            e.setdefault("lock", threading.Lock())
+            return e, "reused"
         # Function-level cap (0 disables the function — every invoke throttles)
         if max_concurrency is not None and len(entries) >= max_concurrency:
             return None, "func_cap"
@@ -3373,6 +3438,8 @@ def _pool_register(key: str, container, tmpdir) -> dict:
         "container": container,
         "tmpdir": tmpdir,
         "in_use": True,
+        "users": 1,
+        "lock": threading.Lock(),
         "last_used": time.time(),
         "created": time.time(),
     }
@@ -3382,14 +3449,17 @@ def _pool_register(key: str, container, tmpdir) -> dict:
 
 
 def _pool_release(entry: dict) -> None:
-    # LAMBDA_KEEPALIVE_MS=0: tear the container down instead of pooling it, so
-    # the next invocation is a guaranteed cold start (INIT re-runs).
-    if _KEEPALIVE_KILL_ON_RELEASE:
-        _pool_remove(entry)
-        return
     with _warm_pool_lock:
+        entry["users"] = max(entry.get("users", 1) - 1, 0)
+        if entry["users"] > 0:
+            return  # sharers still inside; the last release frees the entry
         entry["in_use"] = False
         entry["last_used"] = time.time()
+        draining = entry.pop("draining", False)
+    # LAMBDA_KEEPALIVE_MS=0: tear the container down instead of pooling it, so
+    # the next invocation is a guaranteed cold start (INIT re-runs).
+    if draining or _KEEPALIVE_KILL_ON_RELEASE:
+        _pool_remove(entry)
 
 
 def _pool_remove(entry: dict) -> None:
@@ -3402,10 +3472,32 @@ def _pool_remove(entry: dict) -> None:
     _kill_pool_entry(entry)
 
 
+def _pool_detach(entry: dict) -> None:
+    """Drop an entry from the pool; kill its container once nobody is inside.
+
+    Timeout/death path under sharing: new acquires must not land on a
+    poisoned container, but sharers still inside keep running to completion.
+    """
+    kill_now = False
+    with _warm_pool_lock:
+        for entries in _warm_pool.values():
+            if entry in entries:
+                entries.remove(entry)
+                break
+        entry["users"] = max(entry.get("users", 1) - 1, 0)
+        if entry["users"] > 0:
+            entry["draining"] = True
+        else:
+            kill_now = True
+    if kill_now:
+        _kill_pool_entry(entry)
+
+
 def _pool_evict_idle() -> None:
     """Reap idle+not-in-use containers past TTL."""
     cutoff = time.time() - _WARM_CONTAINER_TTL
     to_kill = []
+    evicted_keys = []
     with _warm_pool_lock:
         for key, entries in list(_warm_pool.items()):
             keep = []
@@ -3418,6 +3510,9 @@ def _pool_evict_idle() -> None:
                 _warm_pool[key] = keep
             else:
                 _warm_pool.pop(key, None)
+                evicted_keys.append(key)
+    for key in evicted_keys:
+        _spawn_lock_discard(key)
     for e in to_kill:
         _kill_pool_entry(e)
 
@@ -3427,6 +3522,8 @@ def _pool_clear_all() -> None:
     with _warm_pool_lock:
         all_entries = [e for lst in _warm_pool.values() for e in lst]
         _warm_pool.clear()
+    with _spawn_locks_guard:
+        _spawn_locks.clear()
     for e in all_entries:
         _kill_pool_entry(e)
 
@@ -3456,6 +3553,13 @@ def _pool_kill_function(account: str, func_name: str) -> None:
             parts = key.split(":")
             if len(parts) >= 3 and parts[0] == account and parts[2] == func_name:
                 to_kill.extend(_warm_pool.pop(key))
+    # The spawn lock follows the pool key even when the key held no entries —
+    # a cold burst may have created the lock before its spawn registered.
+    with _spawn_locks_guard:
+        for key in list(_spawn_locks.keys()):
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[0] == account and parts[2] == func_name:
+                _spawn_locks.pop(key, None)
     for e in to_kill:
         _kill_pool_entry(e)
 
@@ -4648,20 +4752,23 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     entry = None
     wait_deadline = time.time() + 5  # only used if blocked by account cap
     while True:
-        entry, reason = _pool_acquire(key, max_conc)
+        # Serialise spawn decisions per function: without this a cold burst
+        # all sees an empty pool and every invoke spawns — defeating both the
+        # container cap and ReservedConcurrentExecutions pool accounting.
+        with _spawn_lock_for(key):
+            entry, reason = _pool_acquire(key, max_conc)
+            if entry is None and reason == "spawn":
+                try:
+                    container, tmpdir = _spawn_lambda_container(config, code_zip)
+                except ValueError as exc:
+                    return {"body": {"statusCode": 200, "body": f"Mock response - {exc}"}}
+                except Exception as exc:
+                    logger.error("Lambda %s spawn error: %s", fn_name, exc)
+                    return {"body": {"errorMessage": str(exc),
+                                     "errorType": type(exc).__name__}, "error": True, "log": ""}
+                entry = _pool_register(key, container, tmpdir)
+                logger.info("Lambda %s: cold-start container added to pool", fn_name)
         if entry is not None:
-            break
-        if reason == "spawn":
-            try:
-                container, tmpdir = _spawn_lambda_container(config, code_zip)
-            except ValueError as exc:
-                return {"body": {"statusCode": 200, "body": f"Mock response - {exc}"}}
-            except Exception as exc:
-                logger.error("Lambda %s spawn error: %s", fn_name, exc)
-                return {"body": {"errorMessage": str(exc),
-                                 "errorType": type(exc).__name__}, "error": True, "log": ""}
-            entry = _pool_register(key, container, tmpdir)
-            logger.info("Lambda %s: cold-start container added to pool", fn_name)
             break
         if reason == "func_cap":
             return _throttle_response(
@@ -4678,7 +4785,11 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
         time.sleep(0.05)
 
     try:
-        result = _invoke_rie(entry["container"], event, timeout)
+        # One in-flight POST per container: concurrent /invocations POSTs
+        # crash RIE itself (ReserveFailed: AlreadyReserved → SIGSEGV in
+        # rapidcore). Sharers queue here and run back-to-back.
+        with entry["lock"]:
+            result = _invoke_rie(entry["container"], event, timeout)
         # `timeout` is _invoke_rie's internal signal to this function; pop it so
         # only the caller-facing keys survive into the invoke response.
         if result.pop("timeout", False):
@@ -4689,13 +4800,13 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             # stop (SIGTERM grace + SIGKILL) takes seconds and the caller
             # should see the timeout at the timeout mark, as on AWS.
             threading.Thread(
-                target=_pool_remove, args=(entry,), daemon=True,
+                target=_pool_detach, args=(entry,), daemon=True,
                 name="ministack-lambda-timeout-reaper",
             ).start()
             entry = None
         elif result.get("error") and not _is_container_running(entry["container"]):
             # Container died during invocation — evict so next caller doesn't pick a corpse
-            _pool_remove(entry)
+            _pool_detach(entry)
             entry = None
         return result
     except Exception as exc:
@@ -4706,7 +4817,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
         else:
             err_body = {"errorMessage": str(exc), "errorType": type(exc).__name__}
         logger.error("Lambda %s invocation error: %s", fn_name, exc)
-        _pool_remove(entry)
+        _pool_detach(entry)
         entry = None
         return {"body": err_body, "error": True, "log": ""}
     finally:

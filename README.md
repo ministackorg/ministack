@@ -853,6 +853,7 @@ end-to-end without any client config.
 | `CODEBUILD_DOCKER_FLAGS` | _(unset)_ | Extra `docker run` flags for the CodeBuild local-agent container, same syntax and parser as `LAMBDA_DOCKER_FLAGS`. On an SELinux-enforcing host the agent needs `--security-opt label=disable` to reach the Docker socket it is handed |
 | `MINISTACK_IMAGE_PREFIX` | _(unset)_ | Private-registry prefix prepended to every nested container image (RDS postgres/mysql/mariadb, ElastiCache redis/memcached, EKS k3s, Lambda runtimes). Testcontainers' `hub.image.name.prefix` is auto-forwarded into this var by the Java/Python modules |
 | `LAMBDA_WARM_TTL_SECONDS` | `300` | How long an idle warm Lambda container stays in the pool before the reaper evicts it |
+| `LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION` | _(unset)_ | Opt-in multi-request mode: cap warm Docker containers per Lambda function; overflow invokes share the least-loaded busy container (serialized, one event at a time) instead of spawning. Saves spawn cost, not wall time. Unset keeps one container per concurrent invocation |
 | `LAMBDA_ACCOUNT_CONCURRENCY` | `0` | Account-level concurrent-invocation cap (0 = unbounded). Match real AWS by setting to `1000`. Used to simulate `ConcurrentInvocationLimitExceeded` throttles |
 | `SFN_MOCK_CONFIG` | _(unset)_ | Path to JSON file for Step Functions mock testing; compatible with AWS SFN Local format. Also accepts `LOCALSTACK_SFN_MOCK_CONFIG` |
 | `ATHENA_ENGINE` | `auto` | SQL engine for Athena: `auto`, `duckdb`, `mock` |

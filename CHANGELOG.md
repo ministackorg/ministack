@@ -5,6 +5,17 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Lambda — multi-request mode caps Docker containers per function** — `LAMBDA_DOCKER_MAX_CONTAINERS_PER_FUNCTION=N` caps warm containers per function; at the cap, overflow acquires share the least-loaded busy container instead of spawning, so `1` runs every concurrent invoke in a single container with no spawn cost. AWS runtimes still run one event per environment at a time (concurrent RIE POSTs crash rapidcore), so sharers queue and run back-to-back — this saves spawn cost, not wall time — and `container.logs` may interleave across sharers. Unset keeps the AWS behavior of one container per concurrent invocation. Reported by @ankitaabad in #1816.
+
+### Fixed
+
+- **Lambda — a cold burst no longer overshoots the container pool** — concurrent cold starts all saw an empty pool and every invoke spawned, so a burst could exceed `ReservedConcurrentExecutions` at the pool level. Spawn decisions are now serialised per function.
+- **Lambda — multi-request mode respects disable and cold-start levers** — sharing is skipped when the function is disabled (`ReservedConcurrentExecutions=0` still throttles) and when `LAMBDA_KEEPALIVE_MS=0` promises a cold start after every invocation.
+
 ## [1.5.17] — 2026-09-25
 
 ### Added
