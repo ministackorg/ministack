@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **DynamoDB — `DescribeTable` accepts a table ARN** — `TableName` given as the table's ARN answered `ResourceNotFoundException`, where AWS accepts either form. It now resolves through the same ARN normalization the other table operations use, and an ARN from another account or region still answers `ResourceNotFoundException`. This unblocks OpenSearch Data Prepper's DynamoDB source, which always describes the table by ARN.
 - **STS — `GetCallerIdentity` resolves IAM-user callers** — keys created with `CreateAccessKey` returned the `root` ARN; they now return the user's ARN and ID in both XML and JSON protocols. Under `AUTH=true`, unknown and inactive keys are rejected instead of reported as root.
 
 ## [1.5.17] — 2026-09-25
