@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **STS — `GetCallerIdentity` resolves IAM-user callers** — keys created with `CreateAccessKey` returned the `root` ARN; they now return the user's ARN and ID in both XML and JSON protocols. Under `AUTH=true`, unknown and inactive keys are rejected instead of reported as root.
+
 ## [1.5.17] — 2026-09-25
 
 ### Added
