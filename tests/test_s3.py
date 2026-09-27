@@ -1831,15 +1831,11 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sqs:us-east-1:000000000001:shared-q",
-        "arn:aws:sqs:us-west-2:000000000000:shared-q",
-    ],
-)
+# A same-region queue in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fallback(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sqs as sqsmod
@@ -1850,24 +1846,22 @@ def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fal
     monkeypatch.setattr(sqsmod, "_queues", {"url/shared-q": {"messages": messages}})
     monkeypatch.setattr(sqsmod, "_ensure_msg_fields", lambda msg: None)
 
-    s3mod._deliver_event_to_sqs(target_arn, {"Records": []}, "us-east-1")
+    s3mod._deliver_event_to_sqs(
+        "arn:aws:sqs:us-west-2:000000000000:shared-q", {"Records": []}, "us-east-1")
 
     assert messages == []
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sns:us-east-1:000000000001:shared-topic",
-        "arn:aws:sns:us-west-2:000000000000:shared-topic",
-    ],
-)
+# A same-region topic in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sns_delivery_rejects_out_of_scope_arns_before_fanout(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sns as snsmod
 
+    target_arn = "arn:aws:sns:us-west-2:000000000000:shared-topic"
     fanouts = []
     monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
     monkeypatch.setattr(snsmod, "_topics", {target_arn: {"subscriptions": []}})

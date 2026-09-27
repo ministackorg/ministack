@@ -3248,7 +3248,11 @@ def _parse_notification_target_arn(target_type: str, arn: str, bucket_region: st
         return spec, f"expected {expected_service} ARN, got {spec.service}"
     if not spec.account_id:
         return spec, "destination ARN must include an account ID"
-    if spec.account_id != get_account_id():
+    if target_type == "lambda" and spec.account_id != get_account_id():
+        # SQS/SNS destinations may live in another account: real S3 delivers
+        # to them when their resource policy allows it, and the probe below
+        # verifies exactly that. Lambda stays same-account — function policies
+        # are not modeled, so a foreign function could never be verified.
         return spec, "destination account must match bucket owner account"
     if not spec.region:
         return spec, "destination ARN must include a region"
@@ -3289,7 +3293,10 @@ def _notification_destination_exists(target_type: str, arn: str, bucket_region: 
         return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
     from ministack.services import sns as _sns
 
-    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topics.get(arn) is not None
+    # The topic may belong to another account, so resolve it in its owner's
+    # scope — a current-scope lookup would reject a cross-account topic whose
+    # policy allows the delivery.
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topic_by_arn_any_scope(arn) is not None
 
 
 def _notification_destination_allows(target_type: str, arn: str,
@@ -3326,7 +3333,8 @@ def _validate_notification_configs(configs: list[dict], bucket_region: str,
     # The destination check is second: an ARN that does not parse is reported
     # as malformed before anything tries to reach what it names. A destination
     # fails the probe when it does not exist or when its resource policy does
-    # not let S3 publish — either way the whole PUT fails, like real S3.
+    # not let S3 publish — either way the whole PUT fails, like real S3. The
+    # policy half is permissive while AUTH is off, leaving the existence check.
     owner = _bucket_owner_account(bucket_name) if bucket_name else None
     unreachable = [
         cfg["arn"] for cfg in configs

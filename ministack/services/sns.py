@@ -87,14 +87,19 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
     """Gate one topic API call on the topic's resource policy.
 
     Returns an ``AuthorizationError`` (403) response tuple when denied, else
-    ``None``. Same-account callers pass unless the Policy carries an explicit
-    Deny for them; cross-account callers need an explicit Allow, like real SNS.
+    ``None``. Only under AUTH=true is anything denied; with auth disabled
+    every call passes, like the rest of the identity layer. Same-account
+    callers then pass unless the Policy carries an explicit Deny for them;
+    cross-account callers need an explicit Allow, like real SNS.
 
     Known boundary under AUTH=true: a caller with no identity Allow whose
     access comes from this Policy alone is denied by the app-level identity
     check before this resource check runs, where real SNS would allow the
     union (same caveat as the queue check).
     """
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
     from ministack.core.iam_evaluator import (
         EvalContext,
         caller_arn,
@@ -141,11 +146,15 @@ def topic_policy_allows(topic_arn: str, service: str,
 
     Used by S3 notifications, which publish as the ``s3.amazonaws.com``
     service principal with the bucket as ``aws:SourceArn``/``aws:SourceAccount``
-    (plus ``aws:SourceOwner`` for older policy samples). Every topic carries
-    the default policy, whose ``AWS:SourceOwner`` condition admits same-account
-    service deliveries; a custom Policy without an S3 statement — or no Policy
-    at all — blocks them, like real SNS.
+    (plus ``aws:SourceOwner`` for older policy samples). Only under AUTH=true
+    is the Policy consulted; with auth disabled every delivery passes. Every
+    topic carries the default policy, whose ``AWS:SourceOwner`` condition then
+    admits same-account service deliveries; a custom Policy without an S3
+    statement — or no Policy at all — blocks them, like real SNS.
     """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
     from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
     topic = _topic_by_arn_any_scope(topic_arn)

@@ -111,10 +111,11 @@ def _owner_from_queue_arn(queue_arn: str) -> tuple[str | None, str | None]:
 def _enforce_queue_policy(q: dict, iam_action: str) -> None:
     """Gate one queue API call on the queue's resource policy.
 
-    Same-account callers pass unless the Policy carries an explicit Deny for
-    them (their identity grant is checked by AUTH, or skipped when AUTH is
-    off). Cross-account callers need an explicit Allow in the Policy, exactly
-    like real SQS, which answers AccessDenied (403) otherwise.
+    Only under AUTH=true; with auth disabled every call passes, like the
+    rest of the identity layer. Same-account callers then pass unless the
+    Policy carries an explicit Deny for them. Cross-account callers need an
+    explicit Allow in the Policy, exactly like real SQS, which answers
+    AccessDenied (403) otherwise.
 
     Known boundary under AUTH=true: a caller with no identity Allow whose
     access comes from this Policy alone is denied by the app-level identity
@@ -122,6 +123,9 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
     union. Lifting that needs the identity layer to defer to the resource
     layer, which no AUTH=true server harness here can verify.
     """
+    from ministack.app import AUTH
+    if not AUTH:
+        return
     from ministack.core.iam_evaluator import (
         EvalContext,
         caller_arn,
@@ -152,11 +156,15 @@ def queue_policy_allows(queue_arn: str, service: str,
 
     Used by S3 notifications and SNS fan-out, which call SQS as the service
     principal (``s3.amazonaws.com`` / ``sns.amazonaws.com``) with the
-    producing resource as ``aws:SourceArn``/``aws:SourceAccount``. Like real
-    SQS, the delivery needs an explicit Allow in the queue Policy: a queue
-    with no Policy denies service deliveries, exactly as a queue whose Policy
-    is silent on the calling service does.
+    producing resource as ``aws:SourceArn``/``aws:SourceAccount``. Only under
+    AUTH=true does the delivery need an explicit Allow in the queue Policy;
+    with auth disabled every delivery passes. Like real SQS, a queue with no
+    Policy then denies service deliveries, exactly as a queue whose Policy is
+    silent on the calling service does.
     """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
     from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
     q = _queue_by_arn(queue_arn)
@@ -594,6 +602,11 @@ def _act_get_queue_url(data: dict, _u: str) -> dict:
     if not url:
         raise _Err("QueueDoesNotExist",
                     "The specified queue does not exist.")
+    q = _queues.get(url)
+    if q is None:
+        raise _Err("QueueDoesNotExist",
+                    "The specified queue does not exist.")
+    _enforce_queue_policy(q, "sqs:GetQueueUrl")
     return {"QueueUrl": url}
 
 
