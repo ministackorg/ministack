@@ -8,6 +8,7 @@ import zipfile
 import boto3
 import pytest
 from botocore.exceptions import ClientError
+from conftest import sqs_policy_allow_sns
 
 _ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -342,6 +343,9 @@ def test_eventbridge_same_region_sns_target_dispatches_to_topic(eb, sns, sqs):
         QueueUrl=q_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
     eb.put_rule(
         Name=rule_name,

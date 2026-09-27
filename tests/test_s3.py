@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import make_client, patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1637,6 +1637,10 @@ def test_s3_event_notification_to_sqs(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-bkt",
         NotificationConfiguration={
@@ -1659,6 +1663,10 @@ def test_s3_event_notification_filter(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-filter-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-filter-bkt",
         NotificationConfiguration={
@@ -1686,6 +1694,10 @@ def test_s3_event_notification_delete(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-del-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-del-bkt",
         NotificationConfiguration={
@@ -1709,6 +1721,10 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bkt, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
         NotificationConfiguration={
@@ -1780,7 +1796,13 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
     )
     # The destination has to exist: AWS verifies an SQS or SNS target by sending
     # it a test notification and fails the whole PUT when that does not arrive.
-    _regional_client("sqs", "us-west-2").create_queue(QueueName="s3-west-region-q")
+    _west_sqs = _regional_client("sqs", "us-west-2")
+    _west_q_url = _west_sqs.create_queue(QueueName="s3-west-region-q")["QueueUrl"]
+    _west_sqs.set_queue_attributes(
+        QueueUrl=_west_q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_s3(
+            "arn:aws:sqs:us-west-2:000000000000:s3-west-region-q",
+            bkt, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
@@ -1913,6 +1935,10 @@ def test_s3_event_notification_cross_account():
     )["Attributes"]["QueueArn"]
     # Confirm the clients really resolve to the non-default account.
     assert f":{account}:" in queue_arn
+    sqsc.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-xacct-bkt", account))})
 
     s3c.put_bucket_notification_configuration(
         Bucket="s3-evt-xacct-bkt",
@@ -4669,6 +4695,10 @@ def test_s3_event_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"]
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
@@ -6402,6 +6432,10 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "qa-s3-restore-evt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="qa-s3-restore-evt",
         NotificationConfiguration={
@@ -6931,6 +6965,10 @@ def test_s3_notification_auto_generates_a_base64_uuid_id(s3, sqs):
     queue = sqs.create_queue(QueueName=f"notif-id-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
         NotificationConfiguration={"QueueConfigurations": [
@@ -6955,6 +6993,10 @@ def test_s3_notification_keeps_an_explicit_id(s3, sqs):
     queue = sqs.create_queue(QueueName=f"notif-expl-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
         NotificationConfiguration={"QueueConfigurations": [

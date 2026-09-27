@@ -35,7 +35,7 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid, request_scope
 from ministack.services import sqs as _sqs
 
 logger = logging.getLogger("sns")
@@ -54,6 +54,123 @@ def _normalize_arn(arn: str) -> str:
     if arn and _re.match(r"arn:aws:sns:[^:]+::[^:]+", arn):
         return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
     return arn
+
+
+def _topic_by_arn_any_scope(topic_arn: str) -> dict | None:
+    """Fetch a topic by ARN, reaching into its owner's scope when foreign.
+
+    Only the account may differ: like real SNS, a topic in another region is
+    invisible no matter who asks.
+    """
+    topic = _topics.get(topic_arn)
+    if topic is not None:
+        return topic
+    try:
+        spec = parse_arn(topic_arn)
+    except ArnParseError:
+        return None
+    if not spec.account_id or not spec.region or spec.service != "sns":
+        return None
+    if spec.region != get_region() or spec.account_id == get_account_id():
+        return None
+    return _topics.get_scoped(spec.account_id, spec.region, topic_arn)
+
+
+def _topic_owner(topic: dict) -> str:
+    try:
+        return parse_arn(topic.get("arn", "")).account_id or get_account_id()
+    except ArnParseError:
+        return get_account_id()
+
+
+def _enforce_topic_policy(topic: dict, iam_action: str):
+    """Gate one topic API call on the topic's resource policy.
+
+    Returns an ``AuthorizationError`` (403) response tuple when denied, else
+    ``None``. Same-account callers pass unless the Policy carries an explicit
+    Deny for them; cross-account callers need an explicit Allow, like real SNS.
+
+    Known boundary under AUTH=true: a caller with no identity Allow whose
+    access comes from this Policy alone is denied by the app-level identity
+    check before this resource check runs, where real SNS would allow the
+    union (same caveat as the queue check).
+    """
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        caller_arn,
+        resource_policy_allows,
+    )
+
+    topic_arn = topic.get("arn", "")
+    ctx = EvalContext(
+        principal_arn=caller_arn(),
+        principal_type="Root",
+        principal_account=get_account_id(),
+        action=iam_action,
+        resource_arn=topic_arn or "*",
+        region=get_region(),
+    )
+    if resource_policy_allows(topic.get("attributes", {}).get("Policy") or "", ctx,
+                              _topic_owner(topic) == get_account_id()):
+        return None
+    return _error("AuthorizationError",
+                  f"User: {ctx.principal_arn} is not authorized to perform: "
+                  f"{iam_action} on resource: {topic_arn}", 403)
+
+
+def _get_topic(topic_arn: str, action: str | None = None):
+    """Resolve a topic by ARN, enforcing its Policy when *action* is given.
+
+    Returns ``(topic, None)`` on success or ``(None, error_tuple)`` with a
+    ``NotFound`` (404) or ``AuthorizationError`` (403) response.
+    """
+    arn = _normalize_arn(topic_arn)
+    topic = _topic_by_arn_any_scope(arn)
+    if topic is None:
+        return None, _error("NotFound", f"Topic does not exist: {arn}", 404)
+    if action is not None:
+        denied = _enforce_topic_policy(topic, action)
+        if denied is not None:
+            return None, denied
+    return topic, None
+
+
+def topic_policy_allows(topic_arn: str, service: str,
+                        source_arn: str, source_account: str) -> bool:
+    """Whether the topic's Policy lets an AWS service publish to it.
+
+    Used by S3 notifications, which publish as the ``s3.amazonaws.com``
+    service principal with the bucket as ``aws:SourceArn``/``aws:SourceAccount``
+    (plus ``aws:SourceOwner`` for older policy samples). Every topic carries
+    the default policy, whose ``AWS:SourceOwner`` condition admits same-account
+    service deliveries; a custom Policy without an S3 statement — or no Policy
+    at all — blocks them, like real SNS.
+    """
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    topic = _topic_by_arn_any_scope(topic_arn)
+    if topic is None:
+        return False
+    raw_policy = topic.get("attributes", {}).get("Policy") or ""
+    if not raw_policy:
+        return False
+    # The caller is the service itself, not an IAM principal in the source
+    # account: an account-ID grant must not authorize it (real AWS keeps the
+    # service principal distinct), while Principal "*" legitimately matches.
+    ctx = EvalContext(
+        principal_arn="*",
+        principal_type="Service",
+        principal_account="",
+        action="sns:Publish",
+        resource_arn=topic_arn,
+        region=get_region(),
+        service_context={
+            "aws:sourcearn": source_arn,
+            "aws:sourceaccount": source_account,
+            "aws:sourceowner": source_account,
+        },
+    )
+    return evaluate_resource_policy(raw_policy, ctx, service=service).decision == "Allow"
 
 
 def _sqs_queue_name_from_arn_spec(spec) -> str | None:
@@ -96,7 +213,7 @@ def _validate_subscription_endpoint(protocol: str, endpoint: str):
     return None
 
 
-def _resolve_topic_tag_arn(arn: str):
+def _resolve_topic_tag_arn(arn: str, action: str):
     arn = _normalize_arn(arn)
     try:
         spec = parse_arn(arn)
@@ -114,12 +231,15 @@ def _resolve_topic_tag_arn(arn: str):
     ):
         return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
 
-    if spec.region != get_region() or spec.account_id != get_account_id():
+    if spec.region != get_region():
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
 
-    topic = _topics.get(arn)
+    topic = _topic_by_arn_any_scope(arn)
     if not topic:
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+    denied = _enforce_topic_policy(topic, action)
+    if denied is not None:
+        return arn, None, denied
     return arn, topic, None
 
 
@@ -175,6 +295,9 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         for k, v in form_params.items():
             params[k] = v
 
+    from ministack.core.iam_evaluator import pin_request_caller
+    pin_request_caller(headers, query_params)
+
     action = _p(params, "Action")
     handlers = {
         "CreateTopic": _create_topic,
@@ -182,6 +305,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "ListTopics": _list_topics,
         "GetTopicAttributes": _get_topic_attributes,
         "SetTopicAttributes": _set_topic_attributes,
+        "AddPermission": _add_permission,
+        "RemovePermission": _remove_permission,
         "Subscribe": _subscribe,
         "ConfirmSubscription": _confirm_subscription,
         "Unsubscribe": _unsubscribe,
@@ -315,10 +440,21 @@ def _create_topic(params):
 
 def _delete_topic(params):
     arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.pop(arn, None)
-    if topic:
-        for sub in topic.get("subscriptions", []):
-            _sub_arn_to_topic.pop(sub["arn"], None)
+    topic = _topic_by_arn_any_scope(arn)
+    if topic is None:
+        # Idempotent like real SNS: deleting a missing topic still answers 200.
+        return _xml(200, "DeleteTopicResponse", "")
+    denied = _enforce_topic_policy(topic, "sns:DeleteTopic")
+    if denied is not None:
+        return denied
+    owner = _topic_owner(topic)
+    try:
+        region = parse_arn(arn).region or get_region()
+    except ArnParseError:
+        region = get_region()
+    _topics.pop_scoped(owner, region, arn, None)
+    for sub in topic.get("subscriptions", []):
+        _sub_arn_to_topic.pop(sub["arn"], None)
     return _xml(200, "DeleteTopicResponse", "")
 
 
@@ -343,10 +479,9 @@ def _list_topics(params):
 
 
 def _get_topic_attributes(params):
-    arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:GetTopicAttributes")
+    if err is not None:
+        return err
     _refresh_subscription_counts(topic)
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -357,10 +492,9 @@ def _get_topic_attributes(params):
 
 
 def _set_topic_attributes(params):
-    arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:SetTopicAttributes")
+    if err is not None:
+        return err
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
     if attr_name:
@@ -368,18 +502,104 @@ def _set_topic_attributes(params):
     return _xml(200, "SetTopicAttributesResponse", "")
 
 
+def _member_list(params, key: str) -> list:
+    """Collect a query-protocol ``<Key>.member.N`` list."""
+    out = []
+    i = 1
+    while True:
+        v = _p(params, f"{key}.member.{i}")
+        if not v:
+            break
+        out.append(v)
+        i += 1
+    return out
+
+
+def _add_permission(params):
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:AddPermission")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
+    label = _p(params, "Label")
+    if not label:
+        return _error("InvalidParameterException",
+                      "Label is required", 400)
+    account_ids = _member_list(params, "AWSAccountId")
+    actions = _member_list(params, "ActionName")
+    if not account_ids:
+        return _error("InvalidParameterException",
+                      "AWSAccountId is required", 400)
+    if not actions:
+        return _error("InvalidParameterException",
+                      "ActionName is required", 400)
+
+    raw = topic["attributes"].get("Policy") or ""
+    try:
+        policy = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        policy = {}
+    policy.setdefault("Version", "2012-10-17")
+    policy.setdefault("Id", f"{topic_arn}/SNSDefaultPolicy")
+    statements = policy.setdefault("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+        policy["Statement"] = statements
+
+    if any(s.get("Sid") == label for s in statements):
+        return _error("InvalidParameterException",
+                      f"Value {label} for parameter Label is invalid. "
+                      f"Reason: Already exists.", 400)
+
+    statements.append({
+        "Sid": label,
+        "Effect": "Allow",
+        "Principal": {"AWS": list(account_ids)},
+        "Action": [a if a.startswith("sns:") else f"sns:{a[4:]}" if a.startswith("SNS:") else f"sns:{a}" for a in actions],
+        "Resource": topic_arn,
+    })
+    topic["attributes"]["Policy"] = json.dumps(policy)
+    return _xml(200, "AddPermissionResponse", "")
+
+
+def _remove_permission(params):
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:RemovePermission")
+    if err is not None:
+        return err
+    label = _p(params, "Label")
+    if not label:
+        return _error("InvalidParameterException",
+                      "Label is required", 400)
+
+    raw = topic["attributes"].get("Policy") or ""
+    if raw:
+        try:
+            policy = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            policy = {}
+        statements = policy.get("Statement") or []
+        if isinstance(statements, dict):
+            statements = [statements]
+        remaining = [s for s in statements if s.get("Sid") != label]
+        if remaining:
+            policy["Statement"] = remaining
+            topic["attributes"]["Policy"] = json.dumps(policy)
+        else:
+            topic["attributes"].pop("Policy", None)
+    return _xml(200, "RemovePermissionResponse", "")
+
+
 # ---------------------------------------------------------------------------
 # Subscriptions
 # ---------------------------------------------------------------------------
 
 def _subscribe(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     protocol = _p(params, "Protocol")
     endpoint = _p(params, "Endpoint")
 
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:Subscribe")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
@@ -440,12 +660,15 @@ def _subscribe(params):
 
 
 def _confirm_subscription(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     token = _p(params, "Token")
 
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    # Gated on the confirmation secret, not the topic policy: the
+    # SubscribeURL GET carries no SigV4 identity, so the topic must resolve
+    # outside the caller's scope.
+    topic, err = _get_topic(_p(params, "TopicArn"))
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)
@@ -466,8 +689,8 @@ def _confirm_subscription(params):
 def _unsubscribe(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if topic_arn and topic_arn in _topics:
-        topic = _topics[topic_arn]
+    topic = _topic_by_arn_any_scope(topic_arn) if topic_arn else None
+    if topic is not None:
         topic["subscriptions"] = [s for s in topic["subscriptions"] if s["arn"] != sub_arn]
         _refresh_subscription_counts(topic)
     _sub_arn_to_topic.pop(sub_arn, None)
@@ -506,10 +729,10 @@ def _list_subscriptions(params):
 
 
 def _list_subscriptions_by_topic(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:ListSubscriptionsByTopic")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
     members = ""
     for sub in topic["subscriptions"]:
         members += (
@@ -528,7 +751,7 @@ def _list_subscriptions_by_topic(params):
 def _get_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if not topic_arn or topic_arn not in _topics:
+    if not topic_arn or _topic_by_arn_any_scope(topic_arn) is None:
         return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
@@ -546,7 +769,7 @@ def _get_subscription_attributes(params):
 def _set_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if not topic_arn or topic_arn not in _topics:
+    if not topic_arn or _topic_by_arn_any_scope(topic_arn) is None:
         return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
@@ -655,7 +878,7 @@ def publish_internal(
     the topic does not exist. Raises `SnsPublishError` for a publish AWS would
     reject — notably a FIFO topic addressed without a MessageGroupId.
     """
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if topic is None:
         return None
 
@@ -762,7 +985,8 @@ def _publish(params):
         return _error("InvalidParameterException",
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
-    if topic_arn not in _topics:
+    topic, err = _get_topic(topic_arn, "sns:Publish")
+    if err is not None:
         # Publishing directly to a mobile-push platform endpoint (TargetArn) is
         # valid in AWS — https://docs.aws.amazon.com/sns/latest/api/API_Publish.html
         # We don't deliver anything, but the call must succeed.
@@ -771,7 +995,8 @@ def _publish(params):
             logger.info("SNS platform-endpoint publish stub to %s", topic_arn)
             return _xml(200, "PublishResponse",
                         f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return err
+    topic_arn = topic["arn"]
 
     try:
         result = publish_internal(
@@ -796,8 +1021,10 @@ def _publish_batch(params):
     topic_arn = _normalize_arn(_p(params, "TopicArn"))
     if not topic_arn:
         return _error("InvalidParameterException", "TopicArn is required", 400)
-    if topic_arn not in _topics:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(topic_arn, "sns:Publish")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     entries = _parse_batch_entries(params)
     if not entries:
@@ -815,7 +1042,6 @@ def _publish_batch(params):
                           "Batch entry ids must be distinct", 400)
         ids_seen.add(eid)
 
-    topic = _topics[topic_arn]
     fifo = _is_fifo_topic(topic)
 
     successful = ""
@@ -951,9 +1177,14 @@ def _publish_batch(params):
 def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             message_structure: str = "", message_attributes: dict | None = None,
             message_group_id: str = "", message_dedup_id: str = ""):
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if not topic:
         return
+    try:
+        _spec = parse_arn(topic_arn)
+        _owner, _region = _spec.account_id, _spec.region
+    except ArnParseError:
+        _owner, _region = get_account_id(), get_region()
 
     for sub in topic["subscriptions"]:
         if not sub.get("confirmed"):
@@ -978,7 +1209,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         if protocol == "sqs":
             _deliver_to_sqs(endpoint, envelope, raw, effective_message,
                            message_group_id=message_group_id, message_dedup_id=message_dedup_id,
-                           message_attributes=message_attributes or {})
+                           message_attributes=message_attributes or {},
+                           topic_arn=topic_arn)
         elif protocol in ("http", "https"):
             _threading.Thread(
                 target=asyncio.run,
@@ -991,12 +1223,14 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             # subscriber's execution. Deliver on a background thread, mirroring
             # the http(s) path above; a slow or failing subscriber Lambda no
             # longer stalls the Publish call (or its upstream caller).
-            # The publisher's account/region contextvars must travel into the
+            # The topic owner's account/region contextvars must travel into the
             # thread: _get_func_record_for_ref rejects an ARN whose account
             # differs from get_account_id(), and a fresh thread's empty context
             # reads back the default account — dropping every delivery for a
-            # non-default tenant.
-            _sns_ctx = contextvars.copy_context()
+            # non-default tenant. After a cross-account publish the publisher's
+            # scope would hide the owner's function, so the owner's is pinned.
+            with request_scope(_owner or get_account_id(), _region or get_region()):
+                _sns_ctx = contextvars.copy_context()
             _threading.Thread(
                 target=_sns_ctx.run,
                 args=(_deliver_to_lambda, endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
@@ -1012,7 +1246,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 
 def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
                     message_group_id: str = "", message_dedup_id: str = "",
-                    message_attributes: dict | None = None):
+                    message_attributes: dict | None = None,
+                    topic_arn: str = ""):
     try:
         spec = parse_arn(endpoint)
     except ArnParseError:
@@ -1022,12 +1257,18 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
     if not queue_name:
         logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
         return
-    if spec.account_id != get_account_id():
-        logger.warning("SNS fanout: SQS queue %s is outside the current account scope", queue_name)
-        return
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("SNS fanout: SQS queue %s not found", queue_name)
+        return
+    try:
+        source_account = parse_arn(topic_arn).account_id if topic_arn else ""
+    except ArnParseError:
+        source_account = ""
+    if not _sqs.queue_policy_allows(str(spec), "sns.amazonaws.com", topic_arn,
+                                    source_account or get_account_id()):
+        logger.warning("SNS fanout: queue policy denies delivery from %s to %s",
+                       topic_arn, queue_name)
         return
 
     body = raw_message if raw else envelope
@@ -1156,7 +1397,8 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
 # ---------------------------------------------------------------------------
 
 def _list_tags_for_resource(params):
-    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                             "sns:ListTagsForResource")
     if err:
         return err
     tags_xml = ""
@@ -1167,7 +1409,8 @@ def _list_tags_for_resource(params):
 
 
 def _tag_resource(params):
-    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                              "sns:TagResource")
     if err:
         return err
     i = 1
@@ -1180,7 +1423,8 @@ def _tag_resource(params):
 
 
 def _untag_resource(params):
-    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                              "sns:UntagResource")
     if err:
         return err
     i = 1
@@ -1465,7 +1709,7 @@ def _xml_escape(text: str) -> str:
 
 
 def _find_subscription(topic_arn: str, sub_arn: str) -> dict | None:
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if not topic:
         return None
     for sub in topic["subscriptions"]:

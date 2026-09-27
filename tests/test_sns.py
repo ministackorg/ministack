@@ -13,6 +13,8 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from tests.conftest import sqs_policy_allow_sns
+
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 
@@ -201,6 +203,9 @@ def test_sns_sqs_fanout(sns, sqs):
         QueueUrl=q_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
     sns.publish(TopicArn=topic_arn, Message="fanout msg", Subject="Fan")
@@ -256,6 +261,9 @@ def test_sns_sqs_fanout_delivers_to_matching_cross_region_queue_arn(sns):
     )["Attributes"]["QueueArn"]
     assert ":us-west-2:" in q_arn
     topic_arn = sns.create_topic(Name=f"intg-sns-cross-region-ok-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    west_sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
     sns.publish(TopicArn=topic_arn, Message="cross-region-delivery")
@@ -417,6 +425,9 @@ def test_sns_sqs_fanout_raw_message_delivery(sns, sqs):
         QueueUrl=q_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(
         TopicArn=topic_arn,
@@ -580,6 +591,9 @@ def test_sns_filter_policy_blocks_non_matching(sns, sqs):
     topic_arn = sns.create_topic(Name="qa-sns-filter")["TopicArn"]
     q_url = sqs.create_queue(QueueName="qa-sns-filter-q")["QueueUrl"]
     q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)["SubscriptionArn"]
     sns.set_subscription_attributes(
         SubscriptionArn=sub_arn,
@@ -609,6 +623,9 @@ def test_sns_filter_policy_or_operator(sns, sqs):
     topic_arn = sns.create_topic(Name="qa-sns-or")["TopicArn"]
     q_url = sqs.create_queue(QueueName="qa-sns-or-q")["QueueUrl"]
     q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)["SubscriptionArn"]
     sns.set_subscription_attributes(
         SubscriptionArn=sub_arn,
@@ -647,6 +664,9 @@ def test_sns_raw_message_delivery(sns, sqs):
     topic_arn = sns.create_topic(Name="qa-sns-raw")["TopicArn"]
     q_url = sqs.create_queue(QueueName="qa-sns-raw-q")["QueueUrl"]
     q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)["SubscriptionArn"]
     sns.set_subscription_attributes(
         SubscriptionArn=sub_arn,
@@ -685,6 +705,9 @@ def test_sns_fifo_dedup_passthrough(sns, sqs):
     q_arn = sqs.get_queue_attributes(
         QueueUrl=q_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
 
@@ -716,6 +739,10 @@ def test_sns_to_sqs_fanout(sns, sqs):
     q2_url = sqs.create_queue(QueueName="intg-fanout-q2")["QueueUrl"]
     q1_arn = sqs.get_queue_attributes(QueueUrl=q1_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
     q2_arn = sqs.get_queue_attributes(QueueUrl=q2_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    for _q_url, _q_arn in ((q1_url, q1_arn), (q2_url, q2_arn)):
+        sqs.set_queue_attributes(
+            QueueUrl=_q_url,
+            Attributes={"Policy": json.dumps(sqs_policy_allow_sns(_q_arn, topic_arn))})
 
     sub1 = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q1_arn)
     sub2 = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q2_arn)
@@ -926,6 +953,9 @@ def test_sns_fifo_cbd_dedup_subscriber_gets_one_message(sns, sqs):
     q_arn = sqs.get_queue_attributes(
         QueueUrl=q_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
 
@@ -1369,6 +1399,9 @@ def test_sns_fifo_e2e_fanout_with_dedup(sns, sqs):
     q_arn = sqs.get_queue_attributes(
         QueueUrl=q_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
 
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
 

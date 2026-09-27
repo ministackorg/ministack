@@ -12,7 +12,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT, LoopProbe, concurrent_burst
+from conftest import ENDPOINT, LoopProbe, concurrent_burst, sqs_policy_allow_sns
 
 
 def _make_zip(code: str) -> bytes:
@@ -3547,6 +3547,9 @@ def test_sfn_integration_sns_publish_structured_payload(sfn, sns, sqs):
         QueueUrl=q_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
 
     definition = json.dumps(
