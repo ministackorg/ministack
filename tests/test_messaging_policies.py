@@ -28,7 +28,7 @@ from ministack.core.iam_evaluator import (
     EvalContext,
     evaluate_resource_policy,
 )
-from tests.conftest import (
+from conftest import (
     ENDPOINT,
     REGION,
     sqs_policy_allow_s3,
