@@ -4856,8 +4856,7 @@ def _inflight_key(config: dict) -> str:
         account, region = _account_region_from_function_config(config)
     except Exception:
         account, region = get_account_id(), get_region()
-    # Reserved concurrency belongs to the function, not an individual
-    # published version or alias. All versions therefore share one counter.
+    # Reserved concurrency is shared across all versions and aliases.
     return f"{account}:{region}:{config.get('FunctionName', '?')}"
 
 

@@ -244,6 +244,8 @@ _S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "retention": {"GET": "GetObjectRetention", "PUT": "PutObjectRetention"},
     "legal-hold": {"GET": "GetObjectLegalHold", "PUT": "PutObjectLegalHold"},
     "attributes": {"GET": "GetObjectAttributes"},
+    "annotation": {"GET": "GetObjectAnnotation", "PUT": "PutObjectAnnotation",
+                   "DELETE": "DeleteObjectAnnotation"},
     "select": {"POST": "GetObject"},   # SelectObjectContent reads the object
     "torrent": {"GET": "GetObject"},
 }
@@ -282,6 +284,9 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
                 break
     if action is None:
         action = _S3_ACTIONS.get((method, depth))
+    # GET ?annotation without annotationName is ListObjectAnnotations.
+    if action == "GetObjectAnnotation" and "annotationName" not in query_params:
+        action = "ListObjectAnnotations"
 
     if depth == 2 and action and _query_param(query_params, "versionId"):
         action = _S3_VERSIONED_ACTIONS.get(action, action)
@@ -290,7 +295,8 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
 
 # Operations that take x-amz-bypass-governance-retention; when the header says
 # true they also need s3:BypassGovernanceRetention on the object.
-_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention"})
+_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention",
+                                           "PutObjectAnnotation", "DeleteObjectAnnotation"})
 
 
 def _s3_source_object(headers: dict) -> tuple[str, str] | None:

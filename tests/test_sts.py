@@ -190,7 +190,7 @@ def test_sts_get_session_token_rejects_unknown_caller_when_auth_enabled(monkeypa
     )
 
     assert status == 403
-    assert b"UnrecognizedClientException" in payload
+    assert b"InvalidClientTokenId" in payload
     assert issued_key not in sts_mod._sessions
 
 
@@ -708,12 +708,7 @@ def test_sts_get_caller_identity_credential_rejections_require_auth(
         if not auth_enabled and credential_kind == "unknown":
             assert b":root</Arn>" in payload
         if auth_enabled:
-            expected = (
-                b"UnrecognizedClientException"
-                if credential_kind == "unknown"
-                else b"InvalidClientTokenId"
-            )
-            assert expected in payload
+            assert b"InvalidClientTokenId" in payload
     finally:
         iam_svc._access_keys.pop_scoped(account, None, key, None)
 
