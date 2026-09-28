@@ -66,6 +66,38 @@ def make_client(service, additional_config_kwargs=None):
     return boto3.client(service, **_default_kwargs, config=Config(**_default_config_kwargs, **additional_config_kwargs))
 
 
+def sqs_policy_allow_s3(queue_arn, bucket, account):
+    """Queue policy document letting one S3 bucket notify the queue.
+
+    The AWS shape (service principal + SourceArn/SourceAccount conditions);
+    real S3 refuses a notification config whose queue lacks it.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "s3-notify", "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {
+                "ArnLike": {"aws:SourceArn": f"arn:aws:s3:*:*:{bucket}"},
+                "StringEquals": {"aws:SourceAccount": account}}}]}
+
+
+def sqs_policy_allow_sns(queue_arn, topic_arn):
+    """Queue policy document letting one SNS topic fan out to the queue.
+
+    The AWS shape (service principal + SourceArn condition); without it SNS
+    cannot deliver, even in the same account.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "sns-fanout", "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
+
+
 _SERIAL_TESTS = {
     "tests/test_athena.py::test_athena_engine_mock_via_config",
     "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",

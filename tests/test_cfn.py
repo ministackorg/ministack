@@ -14,6 +14,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import sqs_policy_allow_s3
 
 from ministack.services import pipes as _pipes
 from ministack.services.cloudformation.provisioners import (
@@ -703,6 +704,10 @@ def test_cfn_s3_bucket_notification_configuration(cfn, s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "cfn-notif-bucket", "000000000000"))})
 
     def template(with_notif):
         props = {"BucketName": "cfn-notif-bucket"}
@@ -7635,6 +7640,24 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
                     "Endpoint": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
                 },
             },
+            "PipeQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "PipeQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "PipeTopic"}}},
+                        }],
+                    },
+                },
+            },
             "DdbToSnsPipe": {
                 "Type": "AWS::Pipes::Pipe",
                 "Properties": {
@@ -7771,6 +7794,24 @@ def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
                     "FilterPolicy": {"color": ["blue"]},
                 },
             },
+            "FilterQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "FilterQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["FilterQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "FilterTopic"}}},
+                        }],
+                    },
+                },
+            },
         },
         "Outputs": {
             "TopicArn": {"Value": {"Ref": "FilterTopic"}},
@@ -7835,6 +7876,24 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
                     "TopicArn": {"Ref": "RawTopic"},
                     "Endpoint": {"Fn::GetAtt": ["RawQueue", "Arn"]},
                     "RawMessageDelivery": True,
+                },
+            },
+            "RawQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "RawQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["RawQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "RawTopic"}}},
+                        }],
+                    },
                 },
             },
         },

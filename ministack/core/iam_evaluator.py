@@ -11,6 +11,7 @@ Evaluation order:
   3. No matching Allow → implicit DENY
 """
 
+import contextvars
 import datetime as _dt
 import hmac
 import ipaddress
@@ -576,15 +577,90 @@ def evaluate(ctx: EvalContext,
                       "No matching Allow statement")
 
 
-def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext) -> EvalResult:
-    """Evaluate a Lambda layer-version policy for the account principal in *ctx*.
+def request_caller_arn(headers: dict, query_params: dict | None = None) -> str:
+    """Best-effort principal ARN for resource-policy evaluation.
+
+    Resolves the request's access key to its IAM user/role ARN when it maps
+    to one, else the caller account's root ARN. Never raises: any failure
+    falls back to the root ARN, which is all account-ID and wildcard
+    principals (everything ``AddPermission`` can express) need.
+    """
+    from ministack.core.responses import get_account_id
+
+    fallback = f"arn:aws:iam::{get_account_id()}:root"
+    try:
+        from ministack.core.router import extract_access_key_id
+        access_key = extract_access_key_id(headers or {}, query_params or {})
+        principal = resolve_principal(access_key, get_account_id()) if access_key else None
+    except Exception:
+        return fallback
+    if (isinstance(principal, AuthError) or principal is None
+            or not getattr(principal, "arn", "")):
+        return fallback
+    return principal.arn
+
+
+_request_caller_arn: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ministack_request_caller_arn", default="")
+
+
+def pin_request_caller(headers: dict, query_params: dict | None = None) -> None:
+    """Remember the caller's principal ARN for this request's policy checks."""
+    _request_caller_arn.set(request_caller_arn(headers, query_params))
+
+
+def caller_arn() -> str:
+    """The pinned caller ARN, or the caller account's root ARN."""
+    from ministack.core.responses import get_account_id
+
+    return _request_caller_arn.get() or f"arn:aws:iam::{get_account_id()}:root"
+
+
+def resource_policy_allows(raw_policy: str | dict | None, ctx: EvalContext,
+                           same_account: bool) -> bool:
+    """Whether a direct API call passes its SQS/SNS resource policy.
+
+    Same-account callers pass unless the policy explicitly denies them;
+    cross-account callers need an explicit Allow. A missing policy allows
+    same-account callers and denies cross-account ones.
+    """
+    if not raw_policy:
+        return same_account
+    decision = evaluate_resource_policy(raw_policy, ctx).decision
+    if same_account:
+        return decision != "Deny"
+    return decision == "Allow"
+
+
+def _service_principal_matches(principal: Any, service: str) -> bool:
+    """Whether a statement Principal names the calling AWS service.
+
+    Compared case-insensitively against the full service principal
+    (``s3.amazonaws.com``), never through the trust-policy matcher, which
+    lets any ``Service`` entry match an account root.
+    """
+    if not isinstance(principal, dict):
+        return False
+    services = principal.get("Service", [])
+    if isinstance(services, str):
+        services = [services]
+    return any(s.lower() == service.lower() for s in services
+               if isinstance(s, str))
+
+
+def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
+                             service: str | None = None) -> EvalResult:
+    """Evaluate a resource-based policy for the principal in *ctx*.
 
     Such a document names the principals it applies to, so a statement counts
     only when its ``AWS`` principal (or ``*``) matches the caller; action,
     resource, conditions and deny-before-allow are then the ordinary
-    evaluation. ``Service`` principals are ignored, since the trust-policy
-    matcher lets them match any account root. A statement carrying only
-    ``NotPrincipal`` never matches, leaving that unsupported form closed."""
+    evaluation. When *service* names the calling AWS service (``s3.amazonaws.com``
+    for an S3 notification delivery), a statement whose ``Service`` principal
+    names it counts too. Without *service*, ``Service`` principals are ignored,
+    since the trust-policy matcher lets them match any account root. A statement
+    carrying only ``NotPrincipal`` never matches, leaving that unsupported form
+    closed."""
     if isinstance(doc, str):
         try:
             doc = json.loads(doc)
@@ -599,8 +675,12 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext) -> EvalRe
             continue
         principal = stmt.get("Principal", {})
         if isinstance(principal, dict):
-            principal = {"AWS": principal.get("AWS", [])}
-        if _principal_matches(principal, ctx.principal_arn):
+            if _principal_matches({"AWS": principal.get("AWS", [])},
+                                  ctx.principal_arn):
+                applicable.append(stmt)
+            elif service and _service_principal_matches(principal, service):
+                applicable.append(stmt)
+        elif _principal_matches(principal, ctx.principal_arn):
             applicable.append(stmt)
     return evaluate(ctx, [parse_policy_document({"Statement": applicable})])
 

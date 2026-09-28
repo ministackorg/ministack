@@ -2008,7 +2008,7 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if "policy" in query_params:
             return _put_bucket_policy(bucket, body)
         if "notification" in query_params:
-            return _put_bucket_notification(bucket, body)
+            return _put_bucket_notification(bucket, body, headers)
         if "tagging" in query_params:
             return _put_bucket_tagging(bucket, body)
         if "versioning" in query_params:
@@ -2869,13 +2869,18 @@ def _notification_configs_to_xml(configs, has_eventbridge: bool) -> str:
     return tostring(root, encoding="unicode")
 
 
-def _put_bucket_notification(name: str, body: bytes):
+def _put_bucket_notification(name: str, body: bytes, headers: dict | None = None):
     if name not in _buckets:
         return _no_such_bucket(name)
     raw = body.decode("utf-8", errors="replace")
     configs = _parse_notification_config_raw(raw)
     bucket_region = _notification_bucket_region(name)
-    validation_error = _validate_notification_configs(configs, bucket_region)
+    # x-amz-skip-destination-validation skips the destination probe below (the
+    # existence + policy check); malformed ARNs and out-of-scope targets are
+    # still rejected as config-shape errors.
+    skip_probe = (headers or {}).get("x-amz-skip-destination-validation", "").lower() == "true"
+    validation_error = _validate_notification_configs(
+        configs, bucket_region, name, skip_probe)
     if validation_error:
         return validation_error
     _bucket_notifications[name] = _notification_configs_to_xml(
@@ -2885,8 +2890,10 @@ def _put_bucket_notification(name: str, body: bytes):
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
     # threads, which broke multi-tenant tests). Queue and topic destinations only;
-    # AWS does not send the test event to Lambda targets.
-    _fire_s3_test_event(name)
+    # AWS does not send the test event to Lambda targets. With validation
+    # skipped there is no probe, hence no test event either.
+    if not skip_probe:
+        _fire_s3_test_event(name)
     return 200, {}, b""
 
 
@@ -3257,7 +3264,11 @@ def _parse_notification_target_arn(target_type: str, arn: str, bucket_region: st
         return spec, f"expected {expected_service} ARN, got {spec.service}"
     if not spec.account_id:
         return spec, "destination ARN must include an account ID"
-    if spec.account_id != get_account_id():
+    if target_type == "lambda" and spec.account_id != get_account_id():
+        # SQS/SNS destinations may live in another account: real S3 delivers
+        # to them when their resource policy allows it, and the probe below
+        # verifies exactly that. Lambda stays same-account — function policies
+        # are not modeled, so a foreign function could never be verified.
         return spec, "destination account must match bucket owner account"
     if not spec.region:
         return spec, "destination ARN must include a region"
@@ -3298,20 +3309,55 @@ def _notification_destination_exists(target_type: str, arn: str, bucket_region: 
         return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
     from ministack.services import sns as _sns
 
-    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topics.get(arn) is not None
+    # The topic may belong to another account, so resolve it in its owner's
+    # scope — a current-scope lookup would reject a cross-account topic whose
+    # policy allows the delivery.
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topic_by_arn_any_scope(arn) is not None
 
 
-def _validate_notification_configs(configs: list[dict], bucket_region: str) -> tuple | None:
+def _notification_destination_allows(target_type: str, arn: str,
+                                      bucket_name: str, owner: str) -> bool:
+    """Whether the destination's resource policy lets S3 publish to it.
+
+    The Put-time probe half of the AWS verification ("S3 verifies an SNS or
+    SQS destination by sending it a test notification, and if the message
+    fails, the entire PUT action will fail"): no probe message is actually
+    sent here — the delivery-time check answers the same question, and the
+    single test event goes out after the config is stored.
+    """
+    source_arn = f"arn:aws:s3:::{bucket_name}" if bucket_name else ""
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return _sqs.queue_policy_allows(arn, "s3.amazonaws.com",
+                                        source_arn, owner)
+    from ministack.services import sns as _sns
+
+    return _sns.topic_policy_allows(arn, "s3.amazonaws.com", source_arn, owner)
+
+
+def _validate_notification_configs(configs: list[dict], bucket_region: str,
+                                   bucket_name: str = "",
+                                   skip_destination_validation: bool = False,
+                                   ) -> tuple | None:
     for cfg in configs:
         error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
         if error:
             return error
+    if skip_destination_validation:
+        return None
     # The destination check is second: an ARN that does not parse is reported
-    # as malformed before anything tries to reach what it names.
+    # as malformed before anything tries to reach what it names. A destination
+    # fails the probe when it does not exist or when its resource policy does
+    # not let S3 publish — either way the whole PUT fails, like real S3. The
+    # policy half is permissive while AUTH is off, leaving the existence check.
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
     unreachable = [
         cfg["arn"] for cfg in configs
         if cfg["type"] in ("sqs", "sns")
-        and not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+        and (not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+             or not _notification_destination_allows(cfg["type"], cfg["arn"],
+                                                     bucket_name, owner or ""))
     ]
     if unreachable:
         return _invalid_notification_config(
@@ -3485,9 +3531,11 @@ def _fire_s3_event(
                 payload["Records"][0]["s3"]["configurationId"] = cfg["id"]
 
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "lambda":
                     _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
             except Exception:
@@ -3552,7 +3600,8 @@ def _parse_delivery_notification_target(target_type: str, arn: str, bucket_regio
     return spec
 
 
-def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> None:
+def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sqs as _sqs
 
     spec = _parse_delivery_notification_target("sqs", arn, bucket_region)
@@ -3565,6 +3614,14 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> 
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("S3 notification: SQS queue %s not found", queue_name)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sqs.queue_policy_allows(
+            str(spec), "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: queue policy denies delivery from %s to %s",
+                       bucket_name, queue_name)
         return
 
     body = json.dumps(event_payload)
@@ -3583,7 +3640,8 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> 
     logger.info("S3 notification → SQS %s", queue_name)
 
 
-def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str) -> None:
+def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sns as _sns
 
     spec = _parse_delivery_notification_target("sns", arn, bucket_region)
@@ -3592,9 +3650,17 @@ def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str) -> 
     if not _topic_name_from_sns_arn_spec(spec):
         logger.warning("S3 notification: invalid SNS topic ARN %s", arn)
         return
-    topic = _sns._topics.get(arn)
+    topic = _sns._topic_by_arn_any_scope(arn)
     if not topic:
         logger.warning("S3 notification: SNS topic %s not found", arn)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sns.topic_policy_allows(
+            arn, "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: topic policy denies delivery from %s to %s",
+                       bucket_name, arn)
         return
 
     message = json.dumps(event_payload)
@@ -3680,9 +3746,11 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         for cfg in configs:
             try:
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 # No lambda branch: AWS verifies Lambda destinations by checking the
                 # function's permissions, not by invoking them.
             except Exception:
