@@ -1758,6 +1758,77 @@ def test_cloudfront_managed_response_headers_policy_is_immutable(cloudfront):
 
 
 # ---------------------------------------------------------------------------
+# Monitoring subscriptions (aws_cloudfront_monitoring_subscription).
+# Wire shapes verified against botocore cloudfront service-2.json (2020-05-31)
+# and the CreateMonitoringSubscription API reference (POST, 200 response;
+# DeleteMonitoringSubscription: DELETE, 200 with an empty body).
+# ---------------------------------------------------------------------------
+
+
+def test_cloudfront_monitoring_subscription_lifecycle(cloudfront):
+    dist_id = cloudfront.create_distribution(
+        DistributionConfig=_custom_origin_distribution_config(f"mon-{_uuid_mod.uuid4().hex[:8]}")
+    )["Distribution"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMonitoringSubscription"
+
+    created = cloudfront.create_monitoring_subscription(
+        DistributionId=dist_id,
+        MonitoringSubscription={
+            "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Enabled"}
+        },
+    )
+    assert (
+        created["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Enabled"
+    )
+
+    got = cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert (
+        got["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Enabled"
+    )
+
+    # A second Create overwrites rather than erroring: terraform-provider-aws's
+    # aws_cloudfront_monitoring_subscription resource calls this same
+    # operation for both Create and Update.
+    cloudfront.create_monitoring_subscription(
+        DistributionId=dist_id,
+        MonitoringSubscription={
+            "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Disabled"}
+        },
+    )
+    got = cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert (
+        got["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Disabled"
+    )
+
+    cloudfront.delete_monitoring_subscription(DistributionId=dist_id)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMonitoringSubscription"
+
+
+def test_cloudfront_monitoring_subscription_missing_distribution(cloudfront):
+    for call in (
+        lambda: cloudfront.get_monitoring_subscription(DistributionId="ENOSUCHDIST0000000"),
+        lambda: cloudfront.delete_monitoring_subscription(DistributionId="ENOSUCHDIST0000000"),
+        lambda: cloudfront.create_monitoring_subscription(
+            DistributionId="ENOSUCHDIST0000000",
+            MonitoringSubscription={
+                "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Enabled"}
+            },
+        ),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
+
+
+# ---------------------------------------------------------------------------
 # Read-only list surface — ops previously falling through the path dispatch.
 # Shapes verified against botocore cloudfront service-2.json (2020-05-31).
 # ---------------------------------------------------------------------------

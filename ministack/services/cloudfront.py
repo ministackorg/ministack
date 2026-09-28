@@ -31,6 +31,8 @@ Supports:
                  DeleteResponseHeadersPolicy, ListResponseHeadersPolicies,
                  ListDistributionsByResponseHeadersPolicyId — includes the
                  AWS-managed policy catalog (Type=managed), immutable
+  Monitoring subscriptions: CreateMonitoringSubscription, GetMonitoringSubscription,
+                 DeleteMonitoringSubscription
   Public keys: CreatePublicKey, GetPublicKey, GetPublicKeyConfig,
                  UpdatePublicKey, DeletePublicKey, ListPublicKeys
   Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
@@ -2307,17 +2309,68 @@ def _list_policies(store, spec, query_params):
     return _xml_response(spec["list_tag"], build)
 
 
-def _get_monitoring_subscription(dist_id):
-    """MiniStack does not persist monitoring subscriptions. Real AWS returns
-    NoSuchDistribution (404) for an unknown distribution and
-    NoSuchMonitoringSubscription (404) when none is configured."""
-    if dist_id not in _distributions:
+def _build_monitoring_subscription_xml(parent, sub):
+    cfg = SubElement(parent, "RealtimeMetricsSubscriptionConfig")
+    SubElement(cfg, "RealtimeMetricsSubscriptionStatus").text = sub["RealtimeMetricsSubscriptionStatus"]
+
+
+_MONITORING_SUB_STATUSES = {"Enabled", "Disabled"}
+
+
+def _create_monitoring_subscription(dist_id, body):
+    """CreateMonitoringSubscription (POST, 200): NoSuchDistribution when the
+    distribution is unknown. terraform-provider-aws's
+    aws_cloudfront_monitoring_subscription resource wires its Update to this
+    same Create operation (UpdateWithoutTimeout: resourceMonitoringSubscriptionCreate)
+    with no AlreadyExists handling, so Create on a distribution that already
+    has a subscription must overwrite its status rather than error."""
+    dist = _distributions.get(dist_id)
+    if not dist:
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
-    return _error(
-        "NoSuchMonitoringSubscription",
-        "A monitoring subscription does not exist for the specified distribution.",
-        404,
-    )
+    el = _parse_body(body)
+    cfg_el = _find(el, "RealtimeMetricsSubscriptionConfig") if el is not None else None
+    status = _text(cfg_el, "RealtimeMetricsSubscriptionStatus") if cfg_el is not None else ""
+    if status not in _MONITORING_SUB_STATUSES:
+        return _error(
+            "InvalidArgument", "RealtimeMetricsSubscriptionStatus must be Enabled or Disabled.", 400
+        )
+    sub = {"RealtimeMetricsSubscriptionStatus": status}
+    dist["MonitoringSubscription"] = sub
+    logger.info("CreateMonitoringSubscription dist=%s status=%s", dist_id, status)
+    return _xml_response("MonitoringSubscription", lambda r: _build_monitoring_subscription_xml(r, sub))
+
+
+def _get_monitoring_subscription(dist_id):
+    """NoSuchDistribution (404) for an unknown distribution,
+    NoSuchMonitoringSubscription (404) when none is configured."""
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    sub = dist.get("MonitoringSubscription")
+    if not sub:
+        return _error(
+            "NoSuchMonitoringSubscription",
+            "A monitoring subscription does not exist for the specified distribution.",
+            404,
+        )
+    return _xml_response("MonitoringSubscription", lambda r: _build_monitoring_subscription_xml(r, sub))
+
+
+def _delete_monitoring_subscription(dist_id):
+    """DeleteMonitoringSubscription: 200 with an empty body per the API model
+    (unlike the 204-with-empty-body shape most other CloudFront deletes use)."""
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    if not dist.get("MonitoringSubscription"):
+        return _error(
+            "NoSuchMonitoringSubscription",
+            "A monitoring subscription does not exist for the specified distribution.",
+            404,
+        )
+    dist["MonitoringSubscription"] = None
+    logger.info("DeleteMonitoringSubscription dist=%s", dist_id)
+    return 200, {}, b""
 
 
 # ---------------------------------------------------------------------------
@@ -2728,8 +2781,14 @@ async def handle_request(method, path, headers, body, query_params):
         return _list_anycast_ip_lists(query_params)
 
     m = _MONITORING_SUB_RE.match(path)
-    if m and method == "GET":
-        return _get_monitoring_subscription(m.group(1))
+    if m:
+        dist_id = m.group(1)
+        if method == "GET":
+            return _get_monitoring_subscription(dist_id)
+        if method == "POST":
+            return _create_monitoring_subscription(dist_id, body)
+        if method == "DELETE":
+            return _delete_monitoring_subscription(dist_id)
 
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 
