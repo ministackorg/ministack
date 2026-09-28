@@ -3756,6 +3756,51 @@ def test_apigwv1_authorizer_cache_is_scoped_per_method_arn(apigw_v1, lam, sqs):
         _auth_delete_queue(sqs, qname)
 
 
+_AUTH_IDENTITY_REQUEST_AUTHORIZER = (
+    "def handler(event, context):\n"
+    "    identity = event['requestContext']['identity']\n"
+    "    return {\n"
+    "        'principalId': 'u1',\n"
+    "        'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+    "            {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
+    "             'Resource': event['methodArn']}]},\n"
+    "        'context': {'sourceIp': identity['sourceIp'],\n"
+    "                    'userAgent': identity['userAgent']},\n"
+    "    }\n"
+)
+
+
+def test_apigwv1_request_authorizer_event_has_identity(apigw_v1, lam):
+    """A REQUEST authorizer event carries requestContext.identity, as in the
+    AWS docs' REQUEST authorizer input example. Authorizers that read the
+    caller's sourceIp or userAgent from it must not crash."""
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(lam, "req", _AUTH_IDENTITY_REQUEST_AUTHORIZER)
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="req", type="REQUEST", authorizerUri=_auth_lambda_uri(authz),
+             identitySource="method.request.header.Authorization",
+             authorizerResultTtlInSeconds=0),
+    )
+    try:
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "test", "secure"),
+            headers={
+                "Authorization": "anything",
+                "User-Agent": "identity-test/1.0",
+                "X-Forwarded-For": "203.0.113.7, 10.0.0.1",
+            },
+        )
+        assert status == 200, body
+        authorizer = json.loads(body)
+        assert authorizer["sourceIp"] == "203.0.113.7"
+        assert authorizer["userAgent"] == "identity-test/1.0"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+
+
 def test_apigwv1_authorizer_cache_is_scoped_per_stage(apigw_v1, lam, sqs):
     """API Gateway caches authorizer results per stage: a verdict computed on
     one stage never answers the same token on another."""

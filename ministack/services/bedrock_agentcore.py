@@ -30,6 +30,8 @@ import os
 import re
 import secrets
 import string
+import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import unquote
@@ -53,6 +55,8 @@ logger = logging.getLogger("bedrock_agentcore")
 
 _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
+_containers = {}  # (account, region, runtime id) -> Docker container
+_container_lock = threading.RLock()
 
 # AgentRuntimeName / EndpointName: start with a letter, then letters/digits/_,
 # up to 48 chars total (botocore pattern ^[a-zA-Z][a-zA-Z0-9_]{0,47}$).
@@ -79,6 +83,10 @@ def _restore_state(data):
 
 
 def reset():
+    with _container_lock:
+        for container in _containers.values():
+            _remove_container(container)
+        _containers.clear()
     _runtimes.clear()
     _endpoints.clear()
 
@@ -246,6 +254,7 @@ def _update_agent_runtime(runtime_id, body):
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
         if not data.get(field):
             return _validation(f"{field} is required")
+    _stop_container(runtime_id)
     now = now_iso()
     new_version = str(int(record["agentRuntimeVersion"]) + 1)
     record["agentRuntimeVersion"] = new_version
@@ -275,6 +284,7 @@ def _delete_agent_runtime(runtime_id):
     record = _runtimes.get(runtime_id)
     if record is None:
         return _not_found(f"Agent runtime {runtime_id} not found")
+    _stop_container(runtime_id)
     _runtimes.pop(runtime_id, None)
     _endpoints.pop(runtime_id, None)
     return json_response({"status": "DELETING", "agentRuntimeId": runtime_id})
@@ -416,22 +426,13 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     session_id = (headers.get("x-amzn-bedrock-agentcore-runtime-session-id")
                   or new_uuid())
     content_type = headers.get("content-type", "application/json")
-    proxy_urls = os.environ.get("MINISTACK_AGENTCORE_PROXY_URLS")
-    if proxy_urls:
+    if os.environ.get("MINISTACK_AGENTCORE_DOCKER") == "1":
         try:
-            configured = json.loads(proxy_urls)
-            if not isinstance(configured, dict):
-                raise TypeError("proxy URL mapping must be an object")
-            key = f"{get_account_id()}:{get_region()}:{runtime['agentRuntimeName']}"
-            url = configured.get(key)
-        except (ValueError, TypeError):
-            return error_response_json("InternalServerException",
-                                       "Invalid MINISTACK_AGENTCORE_PROXY_URLS configuration", 500)
-        if url is not None:
-            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-                return error_response_json("InternalServerException",
-                                           "Invalid AgentCore proxy URL", 500)
-            return _proxy_agent_runtime(url, body, headers, content_type, session_id)
+            url = _container_invocations_url(runtime)
+        except (RuntimeError, ValueError) as error:
+            logger.warning("AgentCore runtime container failed: %s", error)
+            return error_response_json("RuntimeClientError", str(error), 424)
+        return _invoke_container(url, body, headers, content_type, session_id)
 
     # Deterministic echo: return the request payload back under a stable shape
     # so contract tests can assert Invoke request/response handling without a
@@ -460,7 +461,77 @@ _PROXY_RESPONSE_HEADERS = (
 )
 
 
-def _proxy_agent_runtime(url, body, headers, content_type, session_id):
+def _container_key(runtime_id):
+    return get_account_id(), get_region(), runtime_id
+
+
+def _remove_container(container):
+    try:
+        container.remove(force=True)
+    except Exception:
+        logger.exception("Could not remove AgentCore runtime container")
+
+
+def _stop_container(runtime_id):
+    with _container_lock:
+        container = _containers.pop(_container_key(runtime_id), None)
+        if container is not None:
+            _remove_container(container)
+
+
+def _container_invocations_url(runtime):
+    """Start the declared image once per runtime version, then use its port 8080."""
+    artifact = runtime.get("agentRuntimeArtifact", {}).get("containerConfiguration", {})
+    image = artifact.get("containerUri")
+    if not isinstance(image, str) or not image:
+        raise ValueError("Agent runtime has no containerConfiguration.containerUri")
+    key = _container_key(runtime["agentRuntimeId"])
+    with _container_lock:
+        container = _containers.get(key)
+        if container is not None:
+            try:
+                container.reload()
+                if container.status != "running":
+                    _remove_container(container)
+                    _containers.pop(key, None)
+                    container = None
+            except Exception as error:
+                raise RuntimeError(f"Could not inspect runtime container: {error}") from error
+        if container is None:
+            try:
+                import docker
+                client = docker.from_env(timeout=60)
+                container = client.containers.run(
+                    image, detach=True,
+                    ports={"8080/tcp": ("127.0.0.1", None)},
+                    environment=runtime.get("environmentVariables", {}),
+                    labels={"ministack": "agentcore", "ministack.agentcore.runtime": runtime["agentRuntimeId"]},
+                )
+                container.reload()
+                bindings = container.attrs["NetworkSettings"]["Ports"]["8080/tcp"]
+                if not bindings:
+                    raise RuntimeError("Container port 8080 was not published")
+                url = f"http://127.0.0.1:{bindings[0]['HostPort']}/invocations"
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        with urllib.request.urlopen(url.removesuffix("/invocations") + "/ping", timeout=1):
+                            break
+                    except (urllib.error.URLError, TimeoutError, ConnectionError):
+                        container.reload()
+                        if container.status == "exited" or time.monotonic() >= deadline:
+                            raise RuntimeError("Container did not become ready on port 8080")
+                        time.sleep(0.1)
+                container._ministack_invocations_url = url
+                _containers[key] = container
+            except Exception as error:
+                if container is not None:
+                    _remove_container(container)
+                raise RuntimeError(f"Could not start runtime image {image}: {error}") from error
+        return container._ministack_invocations_url
+
+
+def _invoke_container(url, body, headers, content_type, session_id):
     """Forward only invocation data, never the caller's AWS credentials."""
     forwarded_headers = {
         "Content-Type": content_type,
@@ -478,9 +549,9 @@ def _proxy_agent_runtime(url, body, headers, content_type, session_id):
         return error_response_json("RuntimeClientError",
                                    f"Received error ({error.code}) from runtime.", 424)
     except (urllib.error.URLError, TimeoutError) as error:
-        logger.warning("AgentCore proxy unavailable: %s", error)
-        return error_response_json("InternalServerException",
-                                   "Configured AgentCore proxy is unavailable", 500)
+        logger.warning("AgentCore container unavailable: %s", error)
+        return error_response_json("RuntimeClientError",
+                                   "AgentCore runtime container is unavailable", 424)
 
     out_headers = {
         "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
