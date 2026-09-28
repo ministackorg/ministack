@@ -494,6 +494,19 @@ def _resolve_port():
     return os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 
+def _port_is_bindable(host: str, port: int) -> bool:
+    """Whether `port` can be opened here: free, and permitted to this process."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as probe:
+        probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("" if host == "0.0.0.0" else host, port))
+        except OSError:
+            return False
+    return True
+
+
 if os.environ.get("LOCALSTACK_PERSISTENCE") == "1" and os.environ.get("S3_PERSIST") != "1":
     os.environ["S3_PERSIST"] = "1"
     logger.info("LOCALSTACK_PERSISTENCE=1 detected — enabling S3_PERSIST")
@@ -3239,8 +3252,19 @@ def main():
 
         if _tls.use_ssl_enabled():
             config.certfile, config.keyfile = _tls.resolve_tls_material()
+            # A Cognito token's `iss` is https with no port, so clients ask 443.
+            if port != "443" and _port_is_bindable(bind_host, 443):
+                config.bind.append(f"{bind_host}:443")
 
-        asyncio.run(hypercorn_serve(app, config))
+        try:
+            asyncio.run(hypercorn_serve(app, config))
+        except OSError:
+            if len(config.bind) == 1:
+                raise
+            config.bind = config.bind[:1]
+            logger.warning("Port 443 became unavailable; serving on %s only",
+                           config.bind[0])
+            asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
 
