@@ -40,3 +40,25 @@ def test_oversized_frame_rejected_before_reading_body():
         left.sendall((1024 * 1024 + 1).to_bytes(3, "little") + b"\0")
         with pytest.raises(ValueError):
             read(right)
+
+
+@pytest.mark.parametrize("name", [b"'iam_user'", "é".encode(), b"x" * 33, b"a b", b"a\n", b""])
+def test_ambiguous_username_rejected(name):
+    payload = handshake().replace(b"iam_user", name)
+    with pytest.raises(ValueError):
+        client_identity(payload)
+
+
+@pytest.mark.parametrize("charset", [0, 1, 28, 35, 54])
+def test_unsupported_charset_rejected(charset):
+    payload = bytearray(handshake())
+    payload[8] = charset
+    with pytest.raises(ValueError):
+        client_identity(payload)
+
+
+@pytest.mark.parametrize("charset", [8, 33, 45, 46, 255])
+def test_supported_charset_ascii_identity(charset):
+    payload = bytearray(handshake())
+    payload[8] = charset
+    assert client_identity(payload) == "iam_user"

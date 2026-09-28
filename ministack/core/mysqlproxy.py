@@ -50,19 +50,34 @@ def limited_greeting(packet):
     return bytes(packet)
 
 
-def client_identity(reply):
-    """Parse enough HandshakeResponse41 to reject private-plugin spoofing."""
-    if len(reply) < 33:
+def validate_header(reply):
+    """Accept only the explicitly supported protocol and character sets."""
+    if len(reply) < 32:
         raise ValueError("short handshake")
     flags = int.from_bytes(reply[:4], "little")
     if not flags & (1 << 19) or not flags & (1 << 9):
         raise ValueError("plugin authentication and protocol 4.1 required")
     if flags & ((1 << 5) | (1 << 26) | (1 << 7)):
         raise ValueError("compression and local infile unsupported")
+    if not flags & (1 << 15):
+        raise ValueError("secure connection capability required")
+    # latin1, utf8mb3, and the tested utf8mb4 collations share ASCII identity.
+    if reply[8] not in (8, 33, 45, 46, 255):
+        raise ValueError("unsupported handshake charset")
+
+
+def client_identity(reply):
+    """Parse enough HandshakeResponse41 to reject private-plugin spoofing."""
+    validate_header(reply)
+    flags = int.from_bytes(reply[:4], "little")
     end = reply.index(0, 32)
-    username = reply[32:end].decode()
-    if not username or len(username.encode()) > 96:
+    name = reply[32:end]
+    # MySQL normalizes quoted names and converts the declared charset. Until
+    # those forms are supported, restrict identity to unquoted printable ASCII
+    # and MySQL's 32-character limit, preventing conversion or truncation drift.
+    if not 1 <= len(name) <= 32 or any(c < 33 or c > 126 or c == 39 for c in name):
         raise ValueError("invalid username")
+    username = name.decode("ascii")
     pos = end + 1
     if flags & (1 << 21):
         size = reply[pos]
@@ -102,8 +117,10 @@ class Handler(socketserver.BaseRequestHandler):
             seq, reply = read(front)
             secure = False
             if len(reply) == 32 and int.from_bytes(reply[:4], "little") & 2048:
+                tls_header = reply
                 flags = int.from_bytes(reply[:4], "little") & ~(1 << 7)
                 reply = flags.to_bytes(4, "little") + reply[4:]
+                validate_header(reply)
                 send(back, seq, reply)
                 # Encryption only on the namespace-local backend leg; server
                 # identity verification is not implemented by this adapter.
@@ -111,6 +128,10 @@ class Handler(socketserver.BaseRequestHandler):
                 front = self.server.tls.wrap_socket(front, server_side=True)
                 secure = True
                 seq, reply = read(front)
+                # MySQL retains the SSLRequest capabilities/charset. Do not
+                # parse a different packet layout or identity on this side.
+                if len(reply) < 32 or reply[:4] != tls_header[:4] or reply[8] != tls_header[8]:
+                    raise ValueError("TLS handshake header mismatch")
             # libmysqlclient can set LOCAL_FILES even when --local-infile=0.
             # We never advertised it and must not enable it on the backend.
             if len(reply) >= 4:

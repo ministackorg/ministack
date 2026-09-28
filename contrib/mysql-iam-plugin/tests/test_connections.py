@@ -291,6 +291,50 @@ def test_local_infile_stays_disabled(setup):
         admin("DROP USER 'file_user'@'%'; SET GLOBAL local_infile=OFF;")
 
 
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("change", ["database", "auth-length", "charset"])
+def test_tls_handshake_mismatch_rejected(setup, strict, change):
+    from ministack.core.mysqlproxy import read, send
+
+    flags = (1 << 9) | (1 << 15) | (1 << 19) | (1 << 11)
+    header = flags.to_bytes(4, "little") + b"\0" * 4 + b"\x21" + b"\0" * 23
+    altered = bytearray(header)
+    if change == "charset":
+        altered[8] = 8
+    else:
+        altered[:4] = (flags | (1 << (3 if change == "database" else 21))).to_bytes(4, "little")
+    # With the database bit mismatch, MySQL sees the private method while an
+    # unchecked proxy would parse it as a database and accept the public method.
+    payload = bytes(altered) + b"iam_user\0\x01\0ministack_iam_gate_v1\0mysql_native_password\0"
+    with socket.create_connection(("127.0.0.1", setup["ports"][strict]), timeout=3) as raw:
+        read(raw)
+        send(raw, 1, header)
+        with setup["tls"].wrap_socket(raw, server_hostname="127.0.0.1") as conn:
+            send(conn, 2, payload)
+            _, packet = read(conn)
+            assert packet[:1] == b"\xff"  # Never OK or a cleartext token request.
+
+
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("name,charset", [("é".encode(), 8), (b"'iam_user'", 33)])
+def test_ambiguous_sql_identity_rejected(setup, strict, name, charset):
+    from ministack.core.mysqlproxy import read, send
+
+    setup["admin"]("SET NAMES utf8mb4; CREATE USER IF NOT EXISTS 'Ã©'@'%' IDENTIFIED WITH AWSAuthenticationPlugin;")
+    try:
+        flags = (1 << 9) | (1 << 15) | (1 << 19) | (1 << 11)
+        header = flags.to_bytes(4, "little") + b"\0" * 4 + bytes([charset]) + b"\0" * 23
+        with socket.create_connection(("127.0.0.1", setup["ports"][strict]), timeout=3) as raw:
+            read(raw)
+            send(raw, 1, header)
+            with setup["tls"].wrap_socket(raw, server_hostname="127.0.0.1") as conn:
+                send(conn, 2, header + name + b"\0\0mysql_native_password\0")
+                _, packet = read(conn)
+                assert packet[:1] == b"\xff"
+    finally:
+        setup["admin"]("SET NAMES utf8mb4; DROP USER 'Ã©'@'%';")
+
+
 def test_bundled_shim_stays_fail_closed(setup):
     admin = setup["admin"]
     admin("UNINSTALL PLUGIN AWSAuthenticationPlugin;"

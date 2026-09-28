@@ -30,6 +30,13 @@ auth switch to `mysql_clear_password`. Account creation and changes between IAM
 and password methods therefore require no cached user list. MySQL still owns
 account locks, SQL identity, grants, and password verification.
 
+The SSLRequest and subsequent login must declare identical capabilities and
+character sets. Usernames are restricted to 1–32 printable, non-space ASCII
+characters without single quotes, with handshake collation IDs 8, 33, 45, 46 or
+255. Other forms fail closed instead of risking a different identity after
+MySQL's charset conversion, quote removal or truncation. Broader username and
+encoding support is deferred; these restrictions also apply to password users.
+
 With `AUTH=true`, IAM admission requires frontend TLS before requesting a token
 and applies the existing token/policy decision. False or unset remains permissive
 for IAM credentials and transport. Valid resource capability, current binding,
