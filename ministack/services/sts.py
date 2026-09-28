@@ -151,29 +151,24 @@ async def handle_request(method, path, headers, body, query_params):
     use_json = "amz-json" in content_type
 
     if action == "GetCallerIdentity":
-        auth = headers.get("authorization", "")
-        caller_arn = f"arn:aws:iam::{get_account_id()}:root"
-        caller_user_id = get_account_id()
-        if "Credential=" in auth:
-            try:
-                access_key = auth.split("Credential=")[1].split("/")[0]
-                if access_key in _sessions:
-                    session = _sessions[access_key]
-                    if _session_expired(session):
-                        return _error(403, "ExpiredToken",
-                                      "The security token included in the request is expired",
-                                      ns="sts")
-                    caller_arn = session["Arn"]
-                    caller_user_id = session["UserId"]
-            except Exception:
-                pass
+        access_key = extract_access_key_id(headers, query_params)
+        if access_key in _sessions and _session_expired(_sessions[access_key]):
+            return _error(403, "ExpiredToken",
+                          "The security token included in the request is expired",
+                          ns="sts")
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
+        caller_arn = caller["userArn"]
+        caller_user_id = caller["userId"]
+        caller_account = caller["accountId"]
         if use_json:
-            return json_response({"Account": get_account_id(), "Arn": caller_arn, "UserId": caller_user_id})
+            return json_response({"Account": caller_account, "Arn": caller_arn, "UserId": caller_user_id})
         return _xml(200, "GetCallerIdentityResponse",
                     f"<GetCallerIdentityResult>"
                     f"<Arn>{caller_arn}</Arn>"
                     f"<UserId>{caller_user_id}</UserId>"
-                    f"<Account>{get_account_id()}</Account>"
+                    f"<Account>{caller_account}</Account>"
                     f"</GetCallerIdentityResult>",
                     ns="sts")
 

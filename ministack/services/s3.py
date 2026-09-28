@@ -9,6 +9,8 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
           DeleteObjects (batch),
           Multipart Upload (Create, UploadPart, Complete, Abort, List, ListParts),
           Object Tagging (Get, Put, Delete),
+          Object Annotations (PutObjectAnnotation, GetObjectAnnotation,
+          ListObjectAnnotations, DeleteObjectAnnotation; carried by CopyObject),
           ListObjectVersions,
           Bucket sub-resources (Policy, Versioning, Encryption, Lifecycle,
           CORS, ACL, Tagging, Notification, Logging, Accelerate, RequestPayment,
@@ -29,6 +31,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -42,6 +45,7 @@ import time
 import zlib
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
+from urllib.parse import quote_plus as _url_quote_plus
 from urllib.parse import unquote as url_unquote
 from urllib.parse import urlparse as _urlparse
 from xml.etree.ElementTree import Element, ParseError, SubElement, tostring
@@ -140,6 +144,9 @@ _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
 _object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
+# (bucket, key, version_id) -> {annotation name: {payload, size, etag, last_modified, checksums,
+# replication_status}}; version_id is None for the object without one, as for tags.
+_object_annotations = AccountScopedDict()
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
@@ -1881,6 +1888,11 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if method == "GET":
             if "uploadId" in query_params:
                 return _list_parts(bucket, key, query_params)
+            if "annotation" in query_params:
+                # One path for both: GetObjectAnnotation names an annotation, ListObjectAnnotations does not.
+                if "annotationName" in query_params:
+                    return _get_object_annotation(bucket, key, headers, query_params)
+                return _list_object_annotations(bucket, key, query_params)
             if "tagging" in query_params:
                 return _get_object_tagging(bucket, key, query_params)
             if "retention" in query_params:
@@ -1898,6 +1910,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
                 if "x-amz-copy-source" in headers:
                     return _upload_part_copy(bucket, key, query_params, headers)
                 return _upload_part(bucket, key, body, query_params, headers)
+            if "annotation" in query_params:
+                return _put_object_annotation(bucket, key, body, headers, query_params)
             if "tagging" in query_params:
                 return _put_object_tagging(bucket, key, body, query_params)
             if "retention" in query_params:
@@ -1929,6 +1943,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if method == "DELETE":
             if "uploadId" in query_params:
                 return _abort_multipart_upload(bucket, key, query_params)
+            if "annotation" in query_params:
+                return _delete_object_annotation(bucket, key, headers, query_params)
             if "tagging" in query_params:
                 return _delete_object_tagging(bucket, key, query_params)
             return _delete_object(bucket, key, headers, query_params)
@@ -2226,6 +2242,8 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _object_annotations if k[0] == name]:
+        del _object_annotations[k]
     for k in [k for k in _object_acl if k[0] == name]:
         del _object_acl[k]
     for k in [k for k in _object_retention if k[0] == name]:
@@ -3369,6 +3387,33 @@ def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str | None]:
     return detail_type, reason
 
 
+# The notification record's `sequencer`: a hexadecimal string that grows with
+# every create and delete, so "the event notification with the greater
+# `sequencer` hexadecimal value is the event that occurred later" for one key
+# (S3 User Guide, "Event message structure"). Taken when the write happens,
+# not when the background thread builds the record, so it orders the writes.
+# Seeded from the clock so values keep growing across a restart.
+_event_sequence = itertools.count(time.time_ns() // 1000)
+_EVENT_SEQUENCED_FAMILIES = ("s3:ObjectCreated:", "s3:ObjectRemoved:")
+
+
+def _next_event_sequencer(event_name: str) -> str | None:
+    """A sequencer for an object create or delete event; None for the others,
+    which the record carries no sequencer for ("only used with PUT and DELETE
+    requests")."""
+    if not event_name.startswith(_EVENT_SEQUENCED_FAMILIES):
+        return None
+    return f"{next(_event_sequence):018X}"
+
+
+def _event_object_key(key: str) -> str:
+    """The key as a notification record carries it: "The object key name value
+    is URL encoded. For example, `red flower.jpg` becomes `red+flower.jpg`"
+    (S3 User Guide, "Event message structure"); slashes are left as they are.
+    EventBridge details carry the key as stored."""
+    return _url_quote_plus(key, safe="/")
+
+
 def _fire_s3_event(
     bucket_name: str,
     key: str,
@@ -3377,8 +3422,18 @@ def _fire_s3_event(
     etag: str = "",
     deletion_type: str | None = None,
     restore_event_data: dict | None = None,
+    version_id: str | None = None,
+    sequencer: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
-    """Build and deliver an S3 event notification. Best-effort — errors are logged."""
+    """Build and deliver an S3 event notification. Best-effort — errors are logged.
+
+    `version_id` is the version the write made or removed ("null or not present
+    if the bucket isn't versioning-enabled"), `sequencer` the one taken when it
+    happened, `object_extra` fields the record's `s3.object` gains for this
+    event (`hasObjectAnnotation` on a copy), and `record_extra` fields the record
+    itself gains (`objectAnnotation` on an annotation event)."""
     try:
         configs = _parse_notification_config(bucket_name)
         raw_xml = _bucket_notifications.get(bucket_name, "")
@@ -3391,11 +3446,19 @@ def _fire_s3_event(
         event_time = now_iso()
         request_id = new_uuid()
         clean_etag = etag.strip('"')
+        event_object = {"key": _event_object_key(key), "size": size, "eTag": clean_etag}
+        if version_id:
+            event_object["versionId"] = version_id
+        if sequencer:
+            event_object["sequencer"] = sequencer
+        if object_extra:
+            event_object.update(object_extra)
 
         event_payload = {
             "Records": [
                 {
-                    "eventVersion": "2.1",
+                    # One unified version for every event type since 2.4.
+                    "eventVersion": "2.6",
                     "eventSource": "aws:s3",
                     "awsRegion": bucket_region,
                     "eventTime": event_time,
@@ -3414,16 +3477,13 @@ def _fire_s3_event(
                             "ownerIdentity": {"principalId": "EXAMPLE"},
                             "arn": f"arn:aws:s3:::{bucket_name}",
                         },
-                        "object": {
-                            "key": key,
-                            "size": size,
-                            "eTag": clean_etag,
-                            "sequencer": "0",
-                        },
+                        "object": event_object,
                     },
                 }
             ],
         }
+        if record_extra:
+            event_payload["Records"][0].update(record_extra)
         if restore_event_data:
             # glacierEventData appears only on s3:ObjectRestore:Completed.
             event_payload["Records"][0]["glacierEventData"] = {
@@ -3461,7 +3521,7 @@ def _fire_s3_event(
                     "version": "0",
                     "event-version": "1.0",
                     "bucket": {"name": bucket_name},
-                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
+                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": sequencer or "0"},
                     "request-id": request_id,
                     "requester": get_account_id(),
                     "source-ip-address": "127.0.0.1",
@@ -3590,10 +3650,14 @@ def _fire_s3_event_async(
     size: int = 0,
     etag: str = "",
     deletion_type: str | None = None,
+    version_id: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    sequencer = _next_event_sequencer(event_name)
     # threading.Thread does not copy contextvars, so without this snapshot the
     # worker runs under the default account (000000000000): the account-scoped
     # _bucket_notifications lookup comes back empty and the event is silently
@@ -3604,6 +3668,12 @@ def _fire_s3_event_async(
     t = threading.Thread(
         target=ctx.run,
         args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
+        kwargs={
+            "version_id": version_id,
+            "sequencer": sequencer,
+            "object_extra": object_extra,
+            "record_extra": record_extra,
+        },
         daemon=True,
     )
     t.start()
@@ -3696,14 +3766,16 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"])
-
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(sse_headers)
     _maybe_replicate(bucket_name, key, obj, body)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    # After the version is cut, so the record names it.
+    _fire_s3_event_async(
+        bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"], version_id=version_id
+    )
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
@@ -3941,10 +4013,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         if len(parsed) <= 10:
             pending_tags = parsed
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag)
-
     _maybe_replicate(bucket_name, key, obj, file_value)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag, version_id=version_id)
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
@@ -4359,6 +4430,7 @@ def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     """Remove the current object plus its key-level metadata and on-disk copy."""
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
     _object_acl.pop((bucket_name, key, None), None)
@@ -4493,6 +4565,13 @@ def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, o
     the current-object record the write displaced (captured before the
     overwrite), preserved as the null version when it predates versioning."""
     versioning = _bucket_versioning.get(bucket_name)
+    if versioning != "Enabled":
+        # An unversioned or suspended write replaces the object that has no
+        # version id, and "Overwriting an object replaces its annotations with
+        # whatever annotations the new version has": none, until CopyObject or
+        # PutObjectAnnotation gives it some. An Enabled write mints a new
+        # version, which has none of its own.
+        _object_annotations.pop((bucket_name, key, None), None)
     if versioning not in ("Enabled", "Suspended"):
         return None
     _persist_displaced_version(bucket_name, key, prior_obj, versioning)
@@ -4609,6 +4688,9 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
     _object_acl.pop((bucket_name, key, version_id), None)
+    # "Deleting a specific version ID deletes that version and all associated
+    # annotations." The null version's are keyed None, as its tags are read.
+    _object_annotations.pop((bucket_name, key, None if version_id == "null" else version_id), None)
 
     if not versions:
         # History is now empty — drop the index entry and the current object.
@@ -4697,7 +4779,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         if was_delete_marker:
             resp_headers["x-amz-delete-marker"] = "true"
         if _found:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", version_id=version_id)
         return 204, resp_headers, b""
 
     versioning = _bucket_versioning.get(bucket_name, "")
@@ -4707,12 +4789,21 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", deletion_type="Delete Marker Created")
+            # "s3:ObjectRemoved:DeleteMarkerCreated" is its own event type:
+            # s3:ObjectRemoved:Delete is for an object or version that is gone.
+            _fire_s3_event_async(
+                bucket_name,
+                key,
+                "s3:ObjectRemoved:DeleteMarkerCreated",
+                deletion_type="Delete Marker Created",
+                version_id=delete_marker_id,
+            )
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
     _object_acl.pop((bucket_name, key, None), None)
@@ -4855,6 +4946,19 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
+    # "CopyObject – Copies annotations from the source object by default",
+    # COPY or EXCLUDE (x-amz-object-annotation-directive, the botocore model's
+    # AnnotationDirective). A new checksum algorithm on the copy "applies to
+    # both the object and its annotations", so it must be one they can take.
+    annotation_directive = headers.get("x-amz-object-annotation-directive", "COPY").upper()
+    if annotation_directive not in ("COPY", "EXCLUDE"):
+        return _error("InvalidArgument", f"Invalid annotation directive: {annotation_directive}", 400)
+    annotation_algorithm = (
+        headers.get("x-amz-checksum-algorithm") or headers.get("x-amz-sdk-checksum-algorithm") or ""
+    ).upper()
+    if annotation_algorithm and _annotation_checksum(annotation_algorithm, b"") is None:
+        return _annotation_checksum_unsupported(annotation_algorithm)
+
     if src_version_id:
         ventry = next(
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
@@ -4980,6 +5084,21 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         if src_tags:
             pending_dest_tags = dict(src_tags)
 
+    # Annotations of the version copied, for the version the copy makes. Their
+    # checksums are the source's unless the copy names another algorithm.
+    pending_dest_annotations: dict | None = None
+    if annotation_directive == "COPY":
+        src_annotations = _object_annotations.get((src_bucket_name, src_key, src_obj.get("version_id")))
+        if src_annotations:
+            pending_dest_annotations = {}
+            for name, entry in src_annotations.items():
+                carried = {k: v for k, v in entry.items() if k != "replication_status"}
+                if annotation_algorithm:
+                    carried["checksums"] = {
+                        annotation_algorithm: _annotation_checksum(annotation_algorithm, entry["payload"].encode())
+                    }
+                pending_dest_annotations[name] = carried
+
     # --- Preserve lock / retention ---
     src_retention = _object_retention.get((src_bucket_name, src_key))
     if src_retention:
@@ -4993,14 +5112,6 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     else:
         _object_legal_hold.pop((bucket_name, dest_key), None)
 
-    _fire_s3_event_async(
-        bucket_name,
-        dest_key,
-        "s3:ObjectCreated:Copy",
-        size=dest_obj["size"],
-        etag=new_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(dest_sse)
     if copy_src_vid:
@@ -5011,8 +5122,30 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     version_id = _record_object_version(bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    _fire_s3_event_async(
+        bucket_name,
+        dest_key,
+        "s3:ObjectCreated:Copy",
+        size=dest_obj["size"],
+        etag=new_etag,
+        version_id=version_id,
+        # "If the copied object has annotations, the event includes a
+        # hasObjectAnnotation field set to true."
+        object_extra={"hasObjectAnnotation": bool(pending_dest_annotations)},
+    )
 
     dest_version_id = dest_obj.get("version_id")
+    if pending_dest_annotations:
+        _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
+        if dest_obj.get("_replica"):
+            replica_bucket, replica_version = dest_obj["_replica"]
+            _object_annotations[(replica_bucket, dest_key, replica_version)] = {
+                name: dict(entry, replication_status="REPLICA") for name, entry in pending_dest_annotations.items()
+            }
+            for entry in pending_dest_annotations.values():
+                entry["replication_status"] = "COMPLETED"
+    else:
+        _object_annotations.pop((bucket_name, dest_key, dest_version_id), None)
     if pending_dest_tags is not None:
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
         if dest_obj.get("_replica"):
@@ -5165,6 +5298,485 @@ def _delete_object_tagging(bucket_name: str, key: str, query_params: dict | None
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
     return 204, resp_headers, b""
+
+
+# ---------------------------------------------------------------------------
+# Object annotations
+# ---------------------------------------------------------------------------
+# PutObjectAnnotation, GetObjectAnnotation, ListObjectAnnotations and
+# DeleteObjectAnnotation. Evidence: the S3 API Reference pages for the four
+# operations, the S3 User Guide's "Annotating your objects", "Event
+# notification types and destinations" and "Event message structure" pages,
+# and the botocore s3 model (1.43.63). Not validated against a real AWS
+# account. Where the documentation is silent the choice is marked inference.
+#
+# An annotation belongs to one object version: a new version starts with none,
+# deleting a version deletes its annotations, and a delete marker leaves the
+# annotations of the version beneath it alone. Writing one changes nothing
+# about the object (not its ETag, not its version) and sends only the
+# s3:ObjectAnnotation:* events.
+
+_ANNOTATION_MAX_PER_VERSION = 1000
+_ANNOTATION_MAX_NAME_BYTES = 512
+_ANNOTATION_MAX_PAYLOAD = 1024 * 1024
+_ANNOTATION_NAME_PUNCTUATION = frozenset("0123456789_.-")
+# The algorithms an annotation takes. MiniStack computes all but the two
+# XXHASH3 variants, which have no stdlib or small-table implementation; like
+# PutObject's unverifiable algorithms they are refused, never stored unchecked.
+_ANNOTATION_CHECKSUM_ALGORITHMS = (
+    "CRC32",
+    "CRC32C",
+    "CRC64NVME",
+    "SHA1",
+    "SHA256",
+    "SHA512",
+    "MD5",
+    "XXHASH64",
+    "XXHASH3",
+    "XXHASH128",
+)
+
+# XXH64 (the xxHash specification, "XXH64 algorithm description"): plain
+# 64-bit arithmetic, so it stays in the stdlib. Check values in the tests:
+# xxh64(b"") == 0xEF46DB3751D8E999, xxh64(b"abc") == 0x44BC2CF5AD770999.
+_XXH64_P1 = 0x9E3779B185EBCA87
+_XXH64_P2 = 0xC2B2AE3D27D4EB4F
+_XXH64_P3 = 0x165667B19E3779F9
+_XXH64_P4 = 0x85EBCA77C2B2AE63
+_XXH64_P5 = 0x27D4EB2F165667C5
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rotl64(x: int, r: int) -> int:
+    return ((x << r) | (x >> (64 - r))) & _U64
+
+
+def _xxh64_round(acc: int, lane: int) -> int:
+    return (_rotl64((acc + lane * _XXH64_P2) & _U64, 31) * _XXH64_P1) & _U64
+
+
+def _xxh64(data: bytes, seed: int = 0) -> int:
+    n = len(data)
+    i = 0
+    if n >= 32:
+        v = [
+            (seed + _XXH64_P1 + _XXH64_P2) & _U64,
+            (seed + _XXH64_P2) & _U64,
+            seed & _U64,
+            (seed - _XXH64_P1) & _U64,
+        ]
+        while i + 32 <= n:
+            for lane in range(4):
+                v[lane] = _xxh64_round(v[lane], int.from_bytes(data[i + 8 * lane : i + 8 * lane + 8], "little"))
+            i += 32
+        h = (_rotl64(v[0], 1) + _rotl64(v[1], 7) + _rotl64(v[2], 12) + _rotl64(v[3], 18)) & _U64
+        for acc in v:
+            h = ((h ^ _xxh64_round(0, acc)) * _XXH64_P1 + _XXH64_P4) & _U64
+    else:
+        h = (seed + _XXH64_P5) & _U64
+    h = (h + n) & _U64
+    while i + 8 <= n:
+        h ^= _xxh64_round(0, int.from_bytes(data[i : i + 8], "little"))
+        h = (_rotl64(h, 27) * _XXH64_P1 + _XXH64_P4) & _U64
+        i += 8
+    if i + 4 <= n:
+        h ^= (int.from_bytes(data[i : i + 4], "little") * _XXH64_P1) & _U64
+        h = (_rotl64(h, 23) * _XXH64_P2 + _XXH64_P3) & _U64
+        i += 4
+    while i < n:
+        h ^= (data[i] * _XXH64_P5) & _U64
+        h = (_rotl64(h, 11) * _XXH64_P1) & _U64
+        i += 1
+    h ^= h >> 33
+    h = (h * _XXH64_P2) & _U64
+    h ^= h >> 29
+    h = (h * _XXH64_P3) & _U64
+    return h ^ (h >> 32)
+
+
+def _annotation_checksum(algorithm: str, data: bytes) -> str | None:
+    """Base64 checksum of an annotation payload, or None for an algorithm that
+    is not an annotation's or that MiniStack cannot compute."""
+    algo = (algorithm or "").upper().replace("_", "")
+    if algo not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return None
+    if algo == "SHA512":
+        return base64.b64encode(hashlib.sha512(data).digest()).decode()
+    if algo == "MD5":
+        return base64.b64encode(hashlib.md5(data).digest()).decode()
+    if algo == "XXHASH64":
+        return base64.b64encode(struct.pack(">Q", _xxh64(data))).decode()
+    return _compute_s3_checksum(algo, data)
+
+
+def _annotation_checksum_unsupported(algorithm: str) -> tuple:
+    supported = ", ".join(a for a in _ANNOTATION_CHECKSUM_ALGORITHMS if _annotation_checksum(a, b"") is not None)
+    return _error(
+        "InvalidRequest",
+        f"Checksum algorithm not supported: {algorithm}. Supported: {supported}.",
+        400,
+    )
+
+
+def _resolve_annotation_checksums(payload: bytes, headers: dict):
+    """The checksum stored with an annotation, and the refusal for a bad one.
+
+    One algorithm per payload: the one the client sent a value for, or named
+    in x-amz-sdk-checksum-algorithm, or else CRC64NVME ("If the annotation
+    doesn't have a specified checksum algorithm or checksum value, Amazon S3
+    uses the CRC-64/NVME algorithm"). A value sent is checked against the
+    payload (BadDigest), as PutObject checks its body; so is Content-MD5.
+    Returns ``(checksums, error_or_None)``."""
+    provided = {
+        alg: headers[f"x-amz-checksum-{alg.lower()}"]
+        for alg in _ANNOTATION_CHECKSUM_ALGORITHMS
+        if headers.get(f"x-amz-checksum-{alg.lower()}")
+    }
+    requested = (headers.get("x-amz-sdk-checksum-algorithm") or "").upper().replace("_", "")
+    if requested and requested not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return {}, _error("InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid.", 400)
+    if len(provided) > 1:
+        return {}, _error(
+            "InvalidRequest",
+            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+            400,
+        )
+    algorithm = next(iter(provided), None) or requested or "CRC64NVME"
+    if requested and provided and requested != algorithm:
+        return {}, _error(
+            "InvalidRequest",
+            f"Value for x-amz-sdk-checksum-algorithm header is invalid: {requested} does not match "
+            f"the x-amz-checksum-{algorithm.lower()} header sent.",
+            400,
+        )
+    computed = _annotation_checksum(algorithm, payload)
+    if computed is None:
+        return {}, _annotation_checksum_unsupported(algorithm)
+    if algorithm in provided and provided[algorithm] != computed:
+        return {}, _error("BadDigest", f"The {algorithm} you specified did not match the calculated checksum.", 400)
+    content_md5 = headers.get("content-md5")
+    if content_md5 and content_md5 != base64.b64encode(hashlib.md5(payload).digest()).decode():
+        return {}, _error("BadDigest", "The Content-MD5 you specified did not match what we received.", 400)
+    return {algorithm: computed}, None
+
+
+def _annotation_name_error(name: str) -> tuple | None:
+    """The annotation naming rules: 1 to 512 bytes of letters (any language),
+    digits, underscore, period and hyphen, not all whitespace, not starting
+    with "aws" or "s3" in any case (S3 User Guide, "Annotation naming rules")."""
+    if not name or not name.strip():
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    if len(name.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("AnnotationNameTooLong", "The annotation name exceeds 512 bytes.", 400)
+    if name.lower().startswith(("aws", "s3")) or not all(
+        ch.isalpha() or ch in _ANNOTATION_NAME_PUNCTUATION for ch in name
+    ):
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    return None
+
+
+def _annotation_target(bucket_name: str, key: str, query_params: dict):
+    """The object version an annotation operation acts on.
+
+    Returns ``((bucket, version_key, record), None)`` or ``(None, error)``:
+    `version_key` keys the version's annotations (None for the object without
+    a version id, as for tags) and `record` is the current-object record or
+    version entry, for its ETag and encryption. With no ``versionId`` it is
+    the current object; a key whose current version is a delete marker is
+    NoSuchKey, as a GetObject of it is. A ``versionId`` naming a delete marker
+    is refused as a read of one is (inference: the documentation is silent)."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return None, _no_such_bucket(bucket_name)
+    vid = _qp(query_params or {}, "versionId", "")
+    current = bucket["objects"].get(key)
+    if not vid:
+        if current is None:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}"
+            )
+            err_headers = dict(err_headers)
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return None, (status, err_headers, err_body)
+        return (bucket, current.get("version_id"), current), None
+    if vid == "null" and current is not None and not current.get("version_id"):
+        return (bucket, None, current), None
+    entry = next((v for v in _object_versions.get((bucket_name, key), []) if v["version_id"] == vid), None)
+    if entry is None:
+        return None, _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+    if entry.get("is_delete_marker"):
+        return None, _delete_marker_read_refused(entry)
+    return (bucket, None if vid == "null" else vid, entry), None
+
+
+def _annotation_version_header(bucket_name: str, version_key: str | None) -> dict:
+    """x-amz-object-version-id: the version annotated. The object without a
+    version id is "null" in a bucket that has had versioning; in one that
+    never has, the header is left off, as x-amz-version-id is."""
+    if version_key:
+        return {"x-amz-object-version-id": version_key}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        return {"x-amz-object-version-id": "null"}
+    return {}
+
+
+def _annotation_sse_headers(record: dict) -> dict:
+    """Annotations take the parent object's encryption: SSE-KMS and DSSE-KMS
+    with the object's key, and SSE-S3 otherwise, including for an object with
+    no server-side encryption (S3 User Guide, "Encryption")."""
+    sse = _stored_sse_headers(record)
+    out = {"x-amz-server-side-encryption": sse.get("x-amz-server-side-encryption") or "AES256"}
+    if sse.get("x-amz-server-side-encryption-aws-kms-key-id"):
+        out["x-amz-server-side-encryption-aws-kms-key-id"] = sse["x-amz-server-side-encryption-aws-kms-key-id"]
+    return out
+
+
+def _annotation_if_match(headers: dict, record: dict) -> tuple | None:
+    """x-amz-object-if-match: the operation "only succeeds if the object's ETag
+    matches the provided value"; it checks the object, never the annotation."""
+    expected = headers.get("x-amz-object-if-match")
+    if expected and expected != "*" and expected.strip('"') != (record.get("etag") or "").strip('"'):
+        return _error("PreconditionFailed", "At least one of the pre-conditions you specified did not hold", 412)
+    return None
+
+
+def _annotation_checksum_headers(entry: dict) -> dict:
+    out = {f"x-amz-checksum-{alg.lower()}": value for alg, value in (entry.get("checksums") or {}).items()}
+    if out:
+        out["x-amz-checksum-type"] = "FULL_OBJECT"
+    return out
+
+
+def _annotation_lock_error(bucket_name: str, key: str, headers: dict) -> tuple | None:
+    """Object Lock over an annotation write (put, overwrite or delete), as AWS answers it.
+
+    Observed on AWS (ap-southeast-2, 2026-09-28): governance retention refuses
+    both unless x-amz-bypass-governance-retention is true; compliance retention
+    and a legal hold refuse both whatever the header says. Each refusal is 403
+    AccessDenied, naming retention or the legal hold.
+    """
+    if _object_legal_hold.get((bucket_name, key)) == "ON":
+        return _error("AccessDenied", "Access Denied because object protected by object lock legal hold.", 403)
+    retention = _object_retention.get((bucket_name, key))
+    if not retention:
+        return None
+    retain_until = retention.get("RetainUntilDate", "")
+    if not retain_until or retain_until <= now_iso():
+        return None
+    mode = retention.get("Mode", "")
+    bypass = headers.get("x-amz-bypass-governance-retention", "").lower() == "true"
+    if mode == "COMPLIANCE" or (mode == "GOVERNANCE" and not bypass):
+        return _error("AccessDenied", "Access Denied because object protected by object lock retention.", 403)
+    return None
+
+
+def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    if _stored_sse_headers(record).get("x-amz-server-side-encryption-customer-algorithm"):
+        return _error("InvalidRequest", "Objects encrypted with SSE-C cannot have annotations.", 400)
+    payload = body or b""
+    if not payload or len(payload) > _ANNOTATION_MAX_PAYLOAD:
+        return _error("InvalidRequest", "An annotation payload must be between 1 byte and 1 MiB.", 400)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return _error("UnsupportedMediaType", "The annotation payload is not valid UTF-8 encoded text.", 415)
+    checksums, checksum_error = _resolve_annotation_checksums(payload, headers)
+    if checksum_error:
+        return checksum_error
+
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    if name not in annotations and len(annotations) >= _ANNOTATION_MAX_PER_VERSION:
+        return _error(
+            "AnnotationLimitExceeded",
+            "The request would exceed the maximum number of annotations allowed per object.",
+            400,
+        )
+    entry = {
+        "payload": text,
+        "size": len(payload),
+        "etag": f'"{md5_hash(payload)}"',
+        "last_modified": now_iso(),
+        "checksums": checksums,
+    }
+    # "If you have S3 Replication configured on your bucket, Amazon S3
+    # replicates annotations automatically": onto the replica of the version,
+    # when it is the one this bucket replicated.
+    current = bucket["objects"].get(key)
+    if current is not None and current.get("version_id") == version_key and current.get("_replica"):
+        replica_bucket, replica_version = current["_replica"]
+        replica_key = (replica_bucket, key, replica_version)
+        replica_annotations = dict(_object_annotations.get(replica_key) or {})
+        replica_annotations[name] = dict(entry, replication_status="REPLICA")
+        _object_annotations[replica_key] = replica_annotations
+        _persist_version_state(replica_bucket, key, _buckets[replica_bucket])
+        entry["replication_status"] = "COMPLETED"
+    annotations[name] = entry
+    _object_annotations[store_key] = annotations
+    _persist_version_state(bucket_name, key, bucket)
+
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectAnnotation:Put",
+        size=record.get("size", 0),
+        etag=record.get("etag", ""),
+        version_id=version_headers.get("x-amz-object-version-id"),
+        record_extra={"objectAnnotation": [{"name": name, "size": entry["size"], "eTag": entry["etag"].strip('"')}]},
+    )
+
+    resp_headers = {"Content-Type": "application/xml", "ETag": entry["etag"]}
+    resp_headers.update(version_headers)
+    resp_headers.update(_annotation_checksum_headers(entry))
+    resp_headers.update(_annotation_sse_headers(record))
+    root = Element("PutObjectAnnotationOutput", xmlns=S3_NS)
+    SubElement(root, "Key").text = key
+    SubElement(root, "AnnotationName").text = name
+    return 200, resp_headers, _xml_body(root)
+
+
+def _get_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, record = target
+    entry = (_object_annotations.get((bucket_name, key, version_key)) or {}).get(name)
+    if entry is None:
+        return _error(
+            "NoSuchAnnotation", "The specified annotation does not exist on this object.", 404, f"/{bucket_name}/{key}"
+        )
+    payload = entry["payload"].encode("utf-8")
+    resp_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(payload)),
+        "ETag": entry["etag"],
+        "Last-Modified": iso_to_rfc7231(entry["last_modified"]),
+    }
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    resp_headers.update(_annotation_sse_headers(record))
+    if entry.get("replication_status"):
+        resp_headers["x-amz-replication-status"] = entry["replication_status"]
+    # As for GetObject, stored checksums come back only when asked for.
+    if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
+        resp_headers.update(_annotation_checksum_headers(entry))
+    return 200, resp_headers, payload
+
+
+def _list_object_annotations(bucket_name: str, key: str, query_params: dict):
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, _record = target
+    prefix = _qp(query_params, "annotation-prefix", "")
+    if len(prefix.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("InvalidPrefix", "The annotation prefix you provided is invalid.", 400)
+    raw_max = _qp(query_params, "max-annotation-results", "")
+    try:
+        max_results = int(raw_max) if raw_max else _ANNOTATION_MAX_PER_VERSION
+    except ValueError:
+        max_results = 0
+    if not 1 <= max_results <= _ANNOTATION_MAX_PER_VERSION:
+        return _error("InvalidArgument", "max-annotation-results must be between 1 and 1000.", 400)
+    token = _qp(query_params, "continuation-token", "")
+    after = ""
+    if token:
+        try:
+            after = base64.urlsafe_b64decode(token.encode()).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return _error("InvalidArgument", "The continuation token provided is incorrect.", 400)
+
+    # Names in UTF-8 binary order, as S3 lists keys (inference: the operation
+    # documents no order); the token is the last name returned.
+    annotations = _object_annotations.get((bucket_name, key, version_key)) or {}
+    names = sorted(
+        (n for n in annotations if n.startswith(prefix) and (not after or n.encode() > after.encode())),
+        key=lambda n: n.encode("utf-8"),
+    )
+    page = names[:max_results]
+
+    root = Element("ListObjectAnnotationsOutput", xmlns=S3_NS)
+    listed = SubElement(root, "Annotations")
+    for name in page:
+        entry = annotations[name]
+        el = SubElement(listed, "AnnotationEntry")
+        SubElement(el, "AnnotationName").text = name
+        for alg in entry.get("checksums") or {}:
+            SubElement(el, "ChecksumAlgorithm").text = alg
+        SubElement(el, "ETag").text = entry["etag"]
+        SubElement(el, "LastModified").text = entry["last_modified"]
+        if entry.get("replication_status"):
+            SubElement(el, "ReplicationStatus").text = entry["replication_status"]
+        SubElement(el, "Size").text = str(entry["size"])
+    SubElement(root, "Bucket").text = bucket_name
+    SubElement(root, "Key").text = key
+    if prefix:
+        SubElement(root, "AnnotationPrefix").text = prefix
+    SubElement(root, "MaxAnnotationResults").text = str(max_results)
+    SubElement(root, "AnnotationCount").text = str(len(page))
+    if token:
+        SubElement(root, "ContinuationToken").text = token
+    if len(names) > max_results:
+        SubElement(root, "NextContinuationToken").text = base64.urlsafe_b64encode(page[-1].encode()).decode()
+    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    return 200, resp_headers, _xml_body(root)
+
+
+def _delete_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    # Deleting an annotation that is not there succeeds, as the operation
+    # documents no NoSuchAnnotation; only a real delete sends the event.
+    if annotations.pop(name, None) is not None:
+        if annotations:
+            _object_annotations[store_key] = annotations
+        else:
+            _object_annotations.pop(store_key, None)
+        _persist_version_state(bucket_name, key, bucket)
+        _fire_s3_event_async(
+            bucket_name,
+            key,
+            "s3:ObjectAnnotation:Delete",
+            size=record.get("size", 0),
+            etag=record.get("etag", ""),
+            version_id=version_headers.get("x-amz-object-version-id"),
+            record_extra={"objectAnnotation": [{"name": name}]},
+        )
+    return 204, version_headers, b""
 
 
 # ---------------------------------------------------------------------------
@@ -5955,17 +6567,34 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             # S3 reports the delete as successful even if the version was absent.
             _found, was_marker = _delete_object_version(bucket, bucket_name, k, version_id)
             deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+            # "notification when an object or a batch of objects is removed":
+            # each entry sends what the single-object DELETE would.
+            if _found:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete", version_id=version_id)
         elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
             # No VersionId on a versioned bucket: create a delete marker —
             # even for a key that never existed — exactly as the single-object
             # DELETE does, and report it on the Deleted entry.
+            existed = k in bucket["objects"]
             marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
             bucket["objects"].pop(k, None)
             deleted.append({"key": k, "version_id": "", "was_marker": False, "marker_created": marker_id})
+            if existed:
+                _fire_s3_event_async(
+                    bucket_name,
+                    k,
+                    "s3:ObjectRemoved:DeleteMarkerCreated",
+                    deletion_type="Delete Marker Created",
+                    version_id=marker_id,
+                )
         else:
             # No VersionId → plain delete of the current object.
+            existed = k in bucket["objects"]
+            if existed:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete")
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
+            _object_annotations.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
             _object_acl.pop((bucket_name, k, None), None)
@@ -6388,20 +7017,20 @@ def _complete_multipart_upload(
 
     del _multipart_uploads[upload_id]
 
-    _fire_s3_event_async(
-        bucket_name,
-        key,
-        "s3:ObjectCreated:CompleteMultipartUpload",
-        size=obj["size"],
-        etag=final_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
     _maybe_replicate(bucket_name, key, obj, combined)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectCreated:CompleteMultipartUpload",
+        size=obj["size"],
+        etag=final_etag,
+        version_id=version_id,
+    )
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -6711,7 +7340,7 @@ def _key_history_meta(bucket_name: str, key: str) -> dict:
     if versions:
         extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
     vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
-    for field, store in (("tags", _object_tags), ("acl", _object_acl)):
+    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
         found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
         found = {vid: value for vid, value in found.items() if value is not None}
         if found:
@@ -7031,7 +7660,7 @@ def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
     live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
     if current is not None and not current.get("version_id"):
         live.add("null")
-    for field, store in (("tags", _object_tags), ("acl", _object_acl)):
+    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
         for vid, value in (meta.get(field) or {}).items():
             if vid in live:
                 store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value
@@ -7046,7 +7675,7 @@ def reset():
     global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
-    global _object_tags, _multipart_uploads, _object_versions, _object_acl
+    global _object_tags, _multipart_uploads, _object_versions, _object_acl, _object_annotations
     global _bucket_object_lock, _bucket_replication, _object_retention, _object_legal_hold
     for d in (
         _buckets,
@@ -7064,6 +7693,7 @@ def reset():
         _bucket_request_payment_config,
         _object_tags,
         _object_acl,
+        _object_annotations,
         _multipart_uploads,
         _completed_multipart_uploads,
         _bucket_object_lock,

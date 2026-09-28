@@ -1774,6 +1774,153 @@ def test_cloudfront_get_monitoring_subscription_errors(cloudfront):
 
 
 # ---------------------------------------------------------------------------
+# Public keys and key groups (signed URLs/cookies, OAC key groups).
+# ---------------------------------------------------------------------------
+
+_DUMMY_ENCODED_KEY = (
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAMdummykeydummykeydummykeydummy\n"
+    "keydummykeydummykeydummykeydummykeydummykeydummykeydummyIDAQAB\n"
+    "-----END PUBLIC KEY-----\n"
+)
+
+
+def _public_key_config(name):
+    return {
+        "CallerReference": f"cr-{_uuid_mod.uuid4().hex[:8]}",
+        "Name": name,
+        "EncodedKey": _DUMMY_ENCODED_KEY,
+        "Comment": "test public key",
+    }
+
+
+def test_cloudfront_create_and_get_public_key(cloudfront):
+    name = f"pk-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(name))
+    assert create["ETag"]
+    pk = create["PublicKey"]
+    pk_id = pk["Id"]
+    assert pk_id
+    assert "CreatedTime" in pk
+
+    got = cloudfront.get_public_key(Id=pk_id)
+    cfg = got["PublicKey"]["PublicKeyConfig"]
+    assert got["ETag"] == create["ETag"]
+    assert cfg["Name"] == name
+    assert cfg["EncodedKey"] == _DUMMY_ENCODED_KEY
+
+    cfg_only = cloudfront.get_public_key_config(Id=pk_id)
+    assert cfg_only["ETag"] == create["ETag"]
+    assert cfg_only["PublicKeyConfig"]["Name"] == name
+
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=got["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_public_key(Id=pk_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchPublicKey"
+
+
+def test_cloudfront_update_public_key(cloudfront):
+    name = f"pk-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(name))
+    pk_id = create["PublicKey"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_public_key(PublicKeyConfig=_public_key_config(name), Id=pk_id)
+    assert exc.value.response["Error"]["Code"] == "InvalidIfMatchVersion"
+
+    updated_cfg = dict(create["PublicKey"]["PublicKeyConfig"], Comment="updated comment")
+    upd = cloudfront.update_public_key(PublicKeyConfig=updated_cfg, Id=pk_id, IfMatch=create["ETag"])
+    assert upd["ETag"] != create["ETag"]
+    assert upd["PublicKey"]["PublicKeyConfig"]["Comment"] == "updated comment"
+
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=upd["ETag"])
+
+
+def test_cloudfront_list_public_keys_round_trip(cloudfront):
+    baseline = cloudfront.list_public_keys()["PublicKeyList"]["Quantity"]
+
+    name = f"pk-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(name))
+    pk_id = create["PublicKey"]["Id"]
+
+    listed = cloudfront.list_public_keys()["PublicKeyList"]
+    assert listed["Quantity"] == baseline + 1
+    names = [s["Name"] for s in listed["Items"]]
+    assert name in names
+
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=create["ETag"])
+
+
+def test_cloudfront_create_and_get_key_group(cloudfront):
+    pk_name = f"pk-{_uuid_mod.uuid4().hex[:8]}"
+    pk = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(pk_name))
+    pk_id = pk["PublicKey"]["Id"]
+
+    kg_name = f"kg-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_key_group(
+        KeyGroupConfig={"Name": kg_name, "Items": [pk_id], "Comment": "test key group"}
+    )
+    assert create["ETag"]
+    kg = create["KeyGroup"]
+    kg_id = kg["Id"]
+    assert kg_id
+    assert "LastModifiedTime" in kg
+
+    got = cloudfront.get_key_group(Id=kg_id)
+    cfg = got["KeyGroup"]["KeyGroupConfig"]
+    assert got["ETag"] == create["ETag"]
+    assert cfg["Name"] == kg_name
+    assert cfg["Items"] == [pk_id]
+
+    cfg_only = cloudfront.get_key_group_config(Id=kg_id)
+    assert cfg_only["KeyGroupConfig"]["Items"] == [pk_id]
+
+    cloudfront.delete_key_group(Id=kg_id, IfMatch=got["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_key_group(Id=kg_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchResource"
+
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=pk["ETag"])
+
+
+def test_cloudfront_key_group_requires_existing_public_key(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_key_group(KeyGroupConfig={"Name": f"kg-{_uuid_mod.uuid4().hex[:8]}", "Items": ["KDOESNOTEXIST"]})
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_cloudfront_key_group_duplicate_name_rejected(cloudfront):
+    pk = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(f"pk-{_uuid_mod.uuid4().hex[:8]}"))
+    pk_id = pk["PublicKey"]["Id"]
+    kg_name = f"kg-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_key_group(KeyGroupConfig={"Name": kg_name, "Items": [pk_id]})
+    kg_id = create["KeyGroup"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_key_group(KeyGroupConfig={"Name": kg_name, "Items": [pk_id]})
+    assert exc.value.response["Error"]["Code"] == "KeyGroupAlreadyExists"
+
+    cloudfront.delete_key_group(Id=kg_id, IfMatch=create["ETag"])
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=pk["ETag"])
+
+
+def test_cloudfront_delete_public_key_in_use_rejected(cloudfront):
+    pk = cloudfront.create_public_key(PublicKeyConfig=_public_key_config(f"pk-{_uuid_mod.uuid4().hex[:8]}"))
+    pk_id = pk["PublicKey"]["Id"]
+    kg = cloudfront.create_key_group(
+        KeyGroupConfig={"Name": f"kg-{_uuid_mod.uuid4().hex[:8]}", "Items": [pk_id]}
+    )
+    kg_id = kg["KeyGroup"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_public_key(Id=pk_id, IfMatch=pk["ETag"])
+    assert exc.value.response["Error"]["Code"] == "PublicKeyInUse"
+
+    cloudfront.delete_key_group(Id=kg_id, IfMatch=kg["ETag"])
+    cloudfront.delete_public_key(Id=pk_id, IfMatch=pk["ETag"])
+
+
+# ---------------------------------------------------------------------------
 # CloudFront SaaS Manager — connection groups, distribution tenants, managed
 # certificates, domain verification. Shapes verified against botocore
 # cloudfront service-2.json (2020-05-31).

@@ -23,10 +23,11 @@ jobs:
       # MiniStack runs containers from images it names; it never builds one.
       # A request body must never reach a build context, so no source file may
       # call a Docker build at all. This blocks the capability, not a misuse.
+      # Exception: Lambda MicroVM images, which AWS builds from the user's Dockerfile.
       - name: Reject any Docker image build in the served source tree
         run: |
           if grep -rnE '\.images\.build\(|\bbuildx\b|docker[[:space:]]+build\b|APIClient\(.*\)\.build\(' \
-               ministack/ 2>/dev/null; then
+               --exclude=lambda_microvms.py ministack/ 2>/dev/null; then
             echo "::error::MiniStack must never build a Docker image. Run images it names instead."
             exit 1
           fi

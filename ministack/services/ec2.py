@@ -3128,14 +3128,34 @@ def _describe_vpc_classic_link_dns_support(p):
     return _xml(200, "DescribeVpcClassicLinkDnsSupportResponse", "<vpcs/>")
 
 
+def _subnet_dns_name_options(subnet):
+    """A subnet's PrivateDnsNameOptionsOnLaunch, defaulted when never set."""
+    return subnet.get("PrivateDnsNameOptionsOnLaunch") or {
+        "HostnameType": "ip-name",
+        "EnableResourceNameDnsARecord": False,
+        "EnableResourceNameDnsAAAARecord": False,
+    }
+
+
 def _modify_subnet_attribute(p):
     subnet_id = _p(p, "SubnetId")
     if subnet_id not in _subnets:
         return _error("InvalidSubnetID.NotFound",
                       f"The subnet ID '{subnet_id}' does not exist", 400)
+    subnet = _subnets[subnet_id]
     val = _p(p, "MapPublicIpOnLaunch.Value")
     if val:
-        _subnets[subnet_id]["MapPublicIpOnLaunch"] = val.lower() == "true"
+        subnet["MapPublicIpOnLaunch"] = val.lower() == "true"
+    options = dict(_subnet_dns_name_options(subnet))
+    hostname_type = _p(p, "PrivateDnsHostnameTypeOnLaunch")
+    if hostname_type:
+        options["HostnameType"] = hostname_type
+    for member in ("EnableResourceNameDnsARecord", "EnableResourceNameDnsAAAARecord"):
+        val = _p(p, f"{member}OnLaunch.Value")
+        if val:
+            options[member] = val.lower() == "true"
+    if options != _subnet_dns_name_options(subnet):
+        subnet["PrivateDnsNameOptionsOnLaunch"] = options
     return _xml(200, "ModifySubnetAttributeResponse", "<return>true</return>")
 
 
@@ -4321,6 +4341,8 @@ def _vpc_xml(vpc):
 
 
 def _subnet_fields_xml(subnet, tag="item"):
+    # No IPv6 block is modelled, so the two IPv6 members are always false.
+    dns_options = _subnet_dns_name_options(subnet)
     return f"""<{tag}>
         <subnetId>{subnet['SubnetId']}</subnetId>
         <subnetArn>arn:aws:ec2:{get_region()}:{get_account_id()}:subnet/{subnet['SubnetId']}</subnetArn>
@@ -4333,6 +4355,14 @@ def _subnet_fields_xml(subnet, tag="item"):
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
+        <assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation>
+        <enableDns64>{'true' if subnet.get('EnableDns64') else 'false'}</enableDns64>
+        <ipv6Native>false</ipv6Native>
+        <privateDnsNameOptionsOnLaunch>
+            <hostnameType>{dns_options['HostnameType']}</hostnameType>
+            <enableResourceNameDnsARecord>{'true' if dns_options['EnableResourceNameDnsARecord'] else 'false'}</enableResourceNameDnsARecord>
+            <enableResourceNameDnsAAAARecord>{'true' if dns_options['EnableResourceNameDnsAAAARecord'] else 'false'}</enableResourceNameDnsAAAARecord>
+        </privateDnsNameOptionsOnLaunch>
         {_tag_set_xml(subnet['SubnetId'])}
     </{tag}>"""
 
@@ -4358,21 +4388,33 @@ def _igw_xml(igw):
     return _igw_fields_xml(igw, tag="item")
 
 
+# The Route shape has no vpcEndpointId member; an endpoint target is a gatewayId.
+_ROUTE_MEMBERS = (
+    ("DestinationIpv6CidrBlock", "destinationIpv6CidrBlock"),
+    ("DestinationPrefixListId", "destinationPrefixListId"),
+    ("GatewayId", "gatewayId"),
+    ("VpcEndpointId", "gatewayId"),
+    ("NatGatewayId", "natGatewayId"),
+    ("InstanceId", "instanceId"),
+    ("VpcPeeringConnectionId", "vpcPeeringConnectionId"),
+    ("TransitGatewayId", "transitGatewayId"),
+    ("NetworkInterfaceId", "networkInterfaceId"),
+    ("EgressOnlyInternetGatewayId", "egressOnlyInternetGatewayId"),
+    ("CarrierGatewayId", "carrierGatewayId"),
+    ("LocalGatewayId", "localGatewayId"),
+    ("CoreNetworkArn", "coreNetworkArn"),
+    ("OdbNetworkArn", "odbNetworkArn"),
+)
+
+
 def _rtb_fields_xml(rtb, tag="item"):
     def _route_xml(r):
-        target = ""
-        if r.get("GatewayId"):
-            target = f"<gatewayId>{r['GatewayId']}</gatewayId>"
-        if r.get("NatGatewayId"):
-            target += f"<natGatewayId>{r['NatGatewayId']}</natGatewayId>"
-        if r.get("InstanceId"):
-            target += f"<instanceId>{r['InstanceId']}</instanceId>"
-        if r.get("VpcPeeringConnectionId"):
-            target += f"<vpcPeeringConnectionId>{r['VpcPeeringConnectionId']}</vpcPeeringConnectionId>"
-        if r.get("TransitGatewayId"):
-            target += f"<transitGatewayId>{r['TransitGatewayId']}</transitGatewayId>"
+        target = "".join(
+            f"<{element}>{_esc(r[key])}</{element}>"
+            for key, element in _ROUTE_MEMBERS if r.get(key))
+        if not any(r.get(key) for key in ("DestinationIpv6CidrBlock", "DestinationPrefixListId")):
+            target = f"<destinationCidrBlock>{r.get('DestinationCidrBlock', '')}</destinationCidrBlock>" + target
         return f"""<item>
-        <destinationCidrBlock>{r.get('DestinationCidrBlock','')}</destinationCidrBlock>
         {target}
         <state>{r.get('State','active')}</state>
         <origin>{r.get('Origin','')}</origin>
@@ -6666,7 +6708,7 @@ def _create_launch_template(p):
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
         <defaultVersionNumber>1</defaultVersionNumber>
         <latestVersionNumber>1</latestVersionNumber>
-        <tags>{tags_xml}</tags>
+        <tagSet>{tags_xml}</tagSet>
     </launchTemplate>""")
 
 
@@ -6741,7 +6783,7 @@ def _describe_launch_templates(p):
             <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
             <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
             <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
-            <tags>{tags_xml}</tags>
+            <tagSet>{tags_xml}</tagSet>
         </item>"""
     return _xml(200, "DescribeLaunchTemplatesResponse",
                 f"<launchTemplates>{items}</launchTemplates>")
@@ -6763,7 +6805,7 @@ def _describe_launch_template_versions(p):
                       "The specified launch template does not exist", 400)
     # Filter by version numbers
     req_versions = _parse_member_list(p, "LaunchTemplateVersion")
-    versions = lt["Versions"]
+    versions = sorted(lt["Versions"], key=lambda v: v["VersionNumber"], reverse=True)
     if req_versions:
         filtered = []
         for rv in req_versions:

@@ -17,6 +17,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           StartQuery, GetQueryResults, StopQuery,
           PutDeliverySource, GetDeliverySource, DeleteDeliverySource, DescribeDeliverySources,
           PutDeliveryDestination, GetDeliveryDestination, DeleteDeliveryDestination, DescribeDeliveryDestinations,
+          PutDeliveryDestinationPolicy, GetDeliveryDestinationPolicy, DeleteDeliveryDestinationPolicy,
           CreateDelivery, GetDelivery, DeleteDelivery, DescribeDeliveries.
 """
 
@@ -321,6 +322,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetDeliveryDestination": _get_delivery_destination,
         "DeleteDeliveryDestination": _delete_delivery_destination,
         "DescribeDeliveryDestinations": _describe_delivery_destinations,
+        "PutDeliveryDestinationPolicy": _put_delivery_destination_policy,
+        "GetDeliveryDestinationPolicy": _get_delivery_destination_policy,
+        "DeleteDeliveryDestinationPolicy": _delete_delivery_destination_policy,
         "CreateDelivery": _create_delivery,
         "GetDelivery": _get_delivery,
         "DeleteDelivery": _delete_delivery,
@@ -2313,6 +2317,47 @@ def _delete_delivery_destination(data):
 def _describe_delivery_destinations(data):
     dests = [_format_delivery_destination(d) for d in _delivery_destinations.values()]
     return json_response({"deliveryDestinations": dests})
+
+
+def _put_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    policy = data.get("deliveryDestinationPolicy")
+    if not name or not policy:
+        return error_response_json(
+            "ValidationException",
+            "deliveryDestinationName and deliveryDestinationPolicy are required.", 400,
+        )
+    dest = _delivery_destinations.get(name)
+    if not dest:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {name}", 400,
+        )
+    dest["policy"] = policy
+    return json_response({"policy": {"deliveryDestinationPolicy": policy}})
+
+
+def _get_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    return json_response({"policy": {"deliveryDestinationPolicy": dest["policy"]}})
+
+
+def _delete_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    del dest["policy"]
+    return json_response({})
 
 
 def _create_delivery(data):

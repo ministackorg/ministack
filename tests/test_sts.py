@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 
@@ -614,3 +615,156 @@ def test_sts_assume_role_foreign_arn_never_falls_back_to_caller(monkeypatch):
     assert status == 403
     assert b"AccessDenied" in payload
     iam_svc._roles.pop_scoped("111111111111", None, "Trap", None)
+
+
+@contextlib.contextmanager
+def _iam_user_key(iam, user_name):
+    """Create a user + access key, delete both on exit."""
+    user = iam.create_user(UserName=user_name)["User"]
+    key = iam.create_access_key(UserName=user_name)["AccessKey"]
+    try:
+        yield user, key
+    finally:
+        iam.delete_access_key(UserName=user_name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user(UserName=user_name)
+
+
+def test_sts_get_caller_identity_resolves_iam_user(iam):
+    """GetCallerIdentity with an IAM-user key returns the user ARN, not root."""
+    import boto3
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with _iam_user_key(iam, "caller-identity-user") as (created, source):
+        user_sts = boto3.client(
+            "sts",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=source["AccessKeyId"],
+            aws_secret_access_key=source["SecretAccessKey"],
+        )
+        identity = user_sts.get_caller_identity()
+
+        assert identity["Arn"] == "arn:aws:iam::000000000000:user/caller-identity-user"
+        assert identity["UserId"] == created["UserId"]
+        assert identity["Account"] == "000000000000"
+
+
+def test_sts_get_caller_identity_json_protocol_resolves_iam_user(iam):
+    """JSON protocol renders the resolved IAM-user identity, not root."""
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with _iam_user_key(iam, "caller-identity-json-user") as (_, source):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps({}).encode(),
+            method="POST",
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+                "Authorization": (
+                    "AWS4-HMAC-SHA256 "
+                    f"Credential={source['AccessKeyId']}/20240101/us-east-1/sts/aws4_request, "
+                    "SignedHeaders=host, Signature=fake"
+                ),
+            },
+        )
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+            data = json.loads(r.read())
+
+        assert data["Arn"] == "arn:aws:iam::000000000000:user/caller-identity-json-user"
+        assert data["Account"] == "000000000000"
+        assert data["UserId"]
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("credential_kind", ["unknown", "inactive"])
+def test_sts_get_caller_identity_credential_rejections_require_auth(
+    monkeypatch, auth_enabled, credential_kind
+):
+    import asyncio
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    key = "test-gci-mode-key"
+    account = "000000000000"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    if credential_kind == "inactive":
+        iam_svc._access_keys.set_scoped(account, None, key, {
+            "UserName": "alice", "Status": "Inactive", "SecretAccessKey": "secret",
+        })
+    try:
+        with request_scope(account, "us-east-1"):
+            status, _, payload = asyncio.run(sts_svc.handle_request(
+                "GET", "/", {
+                    "authorization": f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request",
+                }, b"", {"Action": ["GetCallerIdentity"]},
+            ))
+        assert status == (403 if auth_enabled else 200)
+        if not auth_enabled and credential_kind == "unknown":
+            assert b":root</Arn>" in payload
+        if auth_enabled:
+            expected = (
+                b"UnrecognizedClientException"
+                if credential_kind == "unknown"
+                else b"InvalidClientTokenId"
+            )
+            assert expected in payload
+    finally:
+        iam_svc._access_keys.pop_scoped(account, None, key, None)
+
+
+@pytest.mark.parametrize("signed_via", ["header", "query"])
+def test_sts_get_caller_identity_resolves_auth_iam_user(monkeypatch, signed_via):
+    """Under AUTH, an active IAM key resolves via header or query credentials."""
+    import asyncio
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    account = "000000000000"
+    user_name = "gci-auth-user"
+    key = "test-gci-auth-key"
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam_svc._users.set_scoped(account, None, user_name, {
+        "UserName": user_name,
+        "UserId": "test-gci-auth-user-id",
+        "Arn": f"arn:aws:iam::{account}:user/{user_name}",
+        "Path": "/",
+        "AttachedPolicies": [],
+    })
+    iam_svc._access_keys.set_scoped(account, None, key, {
+        "AccessKeyId": key,
+        "SecretAccessKey": "test-gci-auth-secret",
+        "Status": "Active",
+        "UserName": user_name,
+    })
+    if signed_via == "header":
+        headers = {
+            "authorization": f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request",
+        }
+        query = {"Action": ["GetCallerIdentity"]}
+    else:
+        headers = {}
+        query = {
+            "Action": ["GetCallerIdentity"],
+            "X-Amz-Credential": [f"{key}/20260911/us-east-1/sts/aws4_request"],
+        }
+    try:
+        with request_scope(account, "us-east-1"):
+            status, _, payload = asyncio.run(
+                sts_svc.handle_request("GET", "/", headers, b"", query)
+            )
+
+        assert status == 200
+        assert f"arn:aws:iam::{account}:user/{user_name}".encode() in payload
+        assert b"test-gci-auth-user-id" in payload
+    finally:
+        iam_svc._access_keys.pop_scoped(account, None, key, None)
+        iam_svc._users.pop_scoped(account, None, user_name, None)
