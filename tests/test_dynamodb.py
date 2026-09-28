@@ -110,6 +110,30 @@ def test_dynamodb_tables_are_region_isolated_by_name(ddb):
             pass
 
 
+def test_dynamodb_describe_table_accepts_table_arn(ddb):
+    """DescribeTable accepts the table ARN in TableName, as AWS does; an ARN
+    from another region still resolves to no table."""
+    name = f"arn-describe-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+        assert ddb.describe_table(TableName=arn)["Table"]["TableName"] == name
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.describe_table(TableName=other_region_arn)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
 def test_dynamodb_same_name_table_metadata_is_region_scoped(ddb):
     east = _ddb_client("us-east-1")
     west = _ddb_client("us-west-2")

@@ -3333,7 +3333,8 @@ def _pool_acquire(key: str, max_concurrency: int | None):
 
     `max_concurrency` semantics:
       - int > 0   : per-function cap (ReservedConcurrentExecutions). At cap → (None, False).
-      - None / 0  : no per-function cap. Always spawn a fresh container if no free one.
+      - 0         : function disabled (ReservedConcurrentExecutions=0). Always throttle.
+      - None      : no per-function cap. Always spawn a fresh container if no free one.
 
     Account-level cap (if `_ACCOUNT_CONCURRENCY_CAP > 0`) is enforced globally across all keys.
 
@@ -3356,8 +3357,8 @@ def _pool_acquire(key: str, max_concurrency: int | None):
                 e["in_use"] = True
                 e["last_used"] = time.time()
                 return e, "reused"
-        # Function-level cap
-        if max_concurrency and len(entries) >= max_concurrency:
+        # Function-level cap (0 disables the function — every invoke throttles)
+        if max_concurrency is not None and len(entries) >= max_concurrency:
             return None, "func_cap"
         # Account-level cap (count in-use entries across all pools)
         if _ACCOUNT_CONCURRENCY_CAP > 0:
@@ -4082,6 +4083,52 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
+_CONTAINER_CA_PATH = "/var/ministack/ministack-ca.pem"
+_CONTAINER_BUNDLE_PATH = "/var/ministack/ca-bundle.pem"
+_CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
+
+
+def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
+    """Resolve the host a Cognito token's `iss` names to the gateway, and trust it.
+
+    A verifier built from the pool id alone has no other way to reach us. Only
+    under USE_SSL=1: `iss` is https, so plain HTTP has nothing to resolve to.
+    """
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return
+    try:
+        cert_path, _key_path = _tls.resolve_tls_material()
+    except SystemExit:
+        return
+    run_kwargs.setdefault("extra_hosts", {}).setdefault(
+        _tls.cognito_idp_host(), "host-gateway")
+    if not os.path.exists(cert_path):
+        return
+    # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
+    bundle = _tls.ca_bundle_path(cert_path)
+    mounts.append(docker_lib.types.Mount(
+        _CONTAINER_CA_PATH, cert_path, type="bind", read_only=True))
+    container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
+    if bundle:
+        mounts.append(docker_lib.types.Mount(
+            _CONTAINER_BUNDLE_PATH, bundle, type="bind", read_only=True))
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+            container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
+    # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
+    if runtime.startswith("java"):
+        store = _tls.java_truststore_path(cert_path)
+        if store:
+            mounts.append(docker_lib.types.Mount(
+                _CONTAINER_TRUSTSTORE_PATH, store, type="bind", read_only=True))
+            container_env.setdefault("JAVA_TOOL_OPTIONS", " ".join((
+                f"-Djavax.net.ssl.trustStore={_CONTAINER_TRUSTSTORE_PATH}",
+                "-Djavax.net.ssl.trustStoreType=pkcs12",
+                f"-Djavax.net.ssl.trustStorePassword={_tls.JAVA_TRUSTSTORE_PASSWORD}",
+            )))
+
+
 def _declared_docker_platform(config: dict):
     """The linux/* platform to pin, or None when the function never declared one.
 
@@ -4458,6 +4505,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
 
+    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime)
+
     if mounts:
         run_kwargs["mounts"] = mounts
     if LAMBDA_DOCKER_NETWORK:
@@ -4635,7 +4684,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     reserved = func.get("concurrency")
     if isinstance(reserved, dict):
         reserved = reserved.get("ReservedConcurrentExecutions")
-    max_conc = int(reserved) if reserved else None  # None = unbounded per-function
+    # None = unbounded per-function; 0 disables the function (throttle-all).
+    max_conc = None if reserved is None else int(reserved)
 
     _ensure_reaper_thread()
     key = _warm_pool_key(fn_name, config)
@@ -4854,7 +4904,9 @@ def _inflight_key(config: dict) -> str:
         account, region = _account_region_from_function_config(config)
     except Exception:
         account, region = get_account_id(), get_region()
-    return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
+    # Reserved concurrency belongs to the function, not an individual
+    # published version or alias. All versions therefore share one counter.
+    return f"{account}:{region}:{config.get('FunctionName', '?')}"
 
 
 def _reserved_concurrency(func: dict, config: dict) -> int | None:
@@ -4881,7 +4933,7 @@ def _acquire_execution_slot(func: dict, config: dict):
     reserved = _reserved_concurrency(func, config)
     key = _inflight_key(config)
     with _inflight_lock:
-        if reserved and _inflight.get(key, 0) >= reserved:
+        if reserved is not None and _inflight.get(key, 0) >= reserved:
             return None, "function"
         if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
             return None, "account"
@@ -7089,7 +7141,7 @@ def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | 
         return 1
     limit = (esm.get("ScalingConfig") or {}).get("MaximumConcurrency") or _ESM_SQS_DEFAULT_CONCURRENCY
     reserved = _reserved_concurrency(func_rec, config)
-    return min(limit, reserved) if reserved else limit
+    return min(limit, reserved) if reserved is not None else limit
 
 
 def _dispatch_esm_batch(esm_id: str, fn, *args) -> None:

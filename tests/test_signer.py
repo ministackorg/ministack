@@ -18,7 +18,7 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT, make_client
+from conftest import ENDPOINT, make_client, sqs_policy_allow_s3
 
 _IOT_PLATFORM = "AWSIoTDeviceManagement-SHA256-ECDSA"
 _LAMBDA_PLATFORM = "AWSLambda-SHA384-ECDSA"
@@ -255,6 +255,10 @@ def test_signer_marker_write_fires_s3_object_created_notification(
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, dst, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=dst,
         NotificationConfiguration={

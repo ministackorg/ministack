@@ -329,10 +329,10 @@ def _openai_messages(messages, system):
 def _proxy_openai_chat_message(model_id: str, messages, system, inference_config,
                                tool_config=None):
     """Forward to MINISTACK_BEDROCK_PROXY_URL in OpenAI chat-completions shape
-    and return the assistant message object, or None on any failure (the caller
-    falls back to the mock)."""
+    and return the assistant message object with the proxy's (input, output)
+    token counts, or (None, None) on any failure (the caller falls back to the mock)."""
     if not _PROXY_URL:
-        return None
+        return None, None
     payload = {
         "model": model_id,
         "messages": _openai_messages(messages, system),
@@ -363,15 +363,23 @@ def _proxy_openai_chat_message(model_id: str, messages, system, inference_config
             data = json.load(resp)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         logger.debug("bedrock proxy unreachable, falling back to mock: %s", e)
-        return None
+        return None, None
     except Exception:
         logger.exception("bedrock proxy returned malformed response, falling back to mock")
-        return None
+        return None, None
     try:
         message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
-        return None
-    return message if isinstance(message, dict) else None
+        return None, None
+    if not isinstance(message, dict):
+        return None, None
+    usage = data.get("usage") if isinstance(data, dict) else None
+    counts = None
+    if isinstance(usage, dict):
+        prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        if isinstance(prompt, int) and isinstance(completion, int):
+            counts = (prompt, completion)
+    return message, counts
 
 
 def _converse_blocks_from_message(message):
@@ -407,7 +415,7 @@ def _converse_blocks_from_message(message):
 
 def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> str | None:
     """The assistant text only, for the callers that do not handle tools."""
-    message = _proxy_openai_chat_message(model_id, messages, system, inference_config)
+    message, _ = _proxy_openai_chat_message(model_id, messages, system, inference_config)
     if message is None:
         return None
     content = message.get("content")
@@ -481,7 +489,7 @@ def _converse(model_id: str, headers, body) -> tuple:
             }, json.dumps(response).encode()
 
     tool_config = body_obj.get("toolConfig")
-    message = _proxy_openai_chat_message(
+    message, counts = _proxy_openai_chat_message(
         model_id, messages, system, inference_config, tool_config)
     blocks, stop_reason = ([], "end_turn")
     if message is None:
@@ -506,6 +514,8 @@ def _converse(model_id: str, headers, body) -> tuple:
 
     response = _build_converse_response(
         model_id, messages, system, started, text,
+        input_tokens=counts[0] if counts else None,
+        output_tokens=counts[1] if counts else None,
         content_blocks=blocks or None, stop_reason=stop_reason)
     if guardrail is not None:
         if output_assessment and any(
@@ -563,7 +573,9 @@ def _es_event(event_type: str, payload: dict) -> bytes:
 
 
 def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, text: str,
-                           stop_reason: str = "end_turn", tool_uses=()) -> bytes:
+                           stop_reason: str = "end_turn", tool_uses=(),
+                           input_tokens: int | None = None,
+                           output_tokens: int | None = None) -> bytes:
     """Emit the AWS ConverseStream event sequence:
       messageStart -> contentBlockDelta* -> contentBlockStop -> messageStop -> metadata
     All events under :event-type, payload is application/json per AWS wire trace.
@@ -602,8 +614,10 @@ def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, 
         })
         stream += _es_event("contentBlockStop", {"contentBlockIndex": index})
     stream += _es_event("messageStop", {"stopReason": stop_reason})
-    input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
-    output_tokens = _estimate_tokens(text)
+    if input_tokens is None:
+        input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
+    if output_tokens is None:
+        output_tokens = _estimate_tokens(text)
     latency_ms = max(1, int(time.time() * 1000) - started_at_ms)
     stream += _es_event("metadata", {
         "usage": {
@@ -649,8 +663,9 @@ def _converse_stream(model_id: str, headers, body) -> tuple:
             guardrail = None  # no output pass on a blocked input
 
     tool_uses = []
+    counts = None
     if stop_reason is None:
-        message = _proxy_openai_chat_message(
+        message, counts = _proxy_openai_chat_message(
             model_id, messages, system, inference_config, body_obj.get("toolConfig"))
         if message is None:
             text = _mock_reply(model_id, messages, system)
@@ -672,7 +687,9 @@ def _converse_stream(model_id: str, headers, body) -> tuple:
 
     stream_bytes = _build_converse_stream(model_id, messages, system, started, text,
                                           stop_reason=stop_reason or "end_turn",
-                                          tool_uses=tool_uses)
+                                          tool_uses=tool_uses,
+                                          input_tokens=counts[0] if counts else None,
+                                          output_tokens=counts[1] if counts else None)
     resp_headers = {
         "Content-Type": "application/vnd.amazon.eventstream",
         "x-amzn-bedrock-content-type": "application/json",

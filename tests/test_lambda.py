@@ -12,6 +12,7 @@ import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
@@ -6661,6 +6662,50 @@ def test_function_concurrency_cap_none_is_unbounded():
     entry, reason = lsvc._pool_acquire("k", max_concurrency=None)
     assert entry is None
     assert reason == "spawn"
+
+
+def test_function_concurrency_cap_zero_disables():
+    """ReservedConcurrentExecutions=0 → every invoke throttles, even on an empty pool."""
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=0)
+    assert entry is None
+    assert reason == "func_cap"
+
+
+def test_execution_slot_zero_reserved_throttles():
+    """ReservedConcurrentExecutions=0 → _acquire_execution_slot refuses the first slot."""
+    func = {"concurrency": 0}
+    config = {
+        "FunctionName": "cap-zero-unit",
+        "Version": "$LATEST",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:cap-zero-unit",
+    }
+    slot, limit = lsvc._acquire_execution_slot(func, config)
+    assert slot is None
+    assert limit == "function"
+
+
+def test_execution_slot_reserved_concurrency_shared_across_versions():
+    """A published version and $LATEST share the function's reserved limit."""
+    name = f"cap-version-{_uuid_mod.uuid4().hex[:8]}"
+    func = {"concurrency": 1}
+    latest_config = {
+        "FunctionName": name,
+        "Version": "$LATEST",
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    published_config = {**latest_config, "Version": "1"}
+
+    latest_slot, limit = lsvc._acquire_execution_slot(func, latest_config)
+    assert latest_slot is not None
+    assert limit is None
+    try:
+        published_slot, limit = lsvc._acquire_execution_slot(func, published_config)
+        if published_slot is not None:
+            lsvc._release_execution_slot(published_slot)
+        assert published_slot is None
+        assert limit == "function"
+    finally:
+        lsvc._release_execution_slot(latest_slot)
 
 
 def test_account_concurrency_cap_rejects(monkeypatch):
@@ -13630,3 +13675,257 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
         result = lambda_svc._delete_function(name, {})
     assert result[0] in (200, 204)
     assert not lambda_runtime._workers
+
+
+# ---------------------------------------------------------------------------
+# Reaching Cognito at the host its tokens name. AWS's own CognitoJwtVerifier
+# derives the expected issuer and the JWKS URL from the pool id and overrides
+# neither, so a verifying handler must find the gateway at
+# cognito-idp.{region}.amazonaws.com.
+# ---------------------------------------------------------------------------
+
+
+def _wire(monkeypatch, **env):
+    from ministack.services import lambda_svc as lsvc
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    run_kwargs, container_env, mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, mounts)
+    return run_kwargs, container_env, mounts
+
+
+def test_cognito_issuer_host_is_not_wired_without_use_ssl(monkeypatch, tmp_path):
+    """`iss` is https, so with a plain gateway there is nothing for the name to
+    usefully resolve to and the container must be left alone."""
+    monkeypatch.delenv("USE_SSL", raising=False)
+    run_kwargs, container_env, mounts = _wire(monkeypatch, TMPDIR=str(tmp_path))
+    assert (run_kwargs, container_env, mounts) == ({}, {}, [])
+
+
+def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, tmp_path):
+    from ministack.services import lambda_svc as lsvc
+
+    run_kwargs, container_env, mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    assert run_kwargs["extra_hosts"] == {
+        "cognito-idp.us-east-1.amazonaws.com": "host-gateway"}
+    # NODE_EXTRA_CA_CERTS adds to node's roots, so it takes the bare certificate.
+    assert container_env["NODE_EXTRA_CA_CERTS"] == lsvc._CONTAINER_CA_PATH
+    # The other two replace the trust store, so they take the public roots with
+    # ours appended, or the handler loses every other HTTPS endpoint.
+    for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        assert container_env[var] == lsvc._CONTAINER_BUNDLE_PATH
+    assert [(m["Target"], m["ReadOnly"]) for m in mounts] == [
+        (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
+
+
+def test_cognito_issuer_wiring_never_overrides_the_caller(monkeypatch, tmp_path):
+    """LAMBDA_DOCKER_FLAGS --add-host and a function's own env come first."""
+    from ministack.services import lambda_svc as lsvc
+
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
+    host = "cognito-idp.us-east-1.amazonaws.com"
+    run_kwargs = {"extra_hosts": {host: "10.0.0.9"}}
+    container_env = {"NODE_EXTRA_CA_CERTS": "/opt/mine.pem"}
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, [])
+    assert run_kwargs["extra_hosts"][host] == "10.0.0.9"
+    assert container_env["NODE_EXTRA_CA_CERTS"] == "/opt/mine.pem"
+
+
+def test_cognito_issuer_wiring_gives_a_java_runtime_its_own_truststore(monkeypatch, tmp_path):
+    """JAVA_TOOL_OPTIONS makes every JVM announce itself on stderr, so it is
+    set only where a JVM will read it."""
+    pytest.importorskip("cryptography")
+    from ministack.services import lambda_svc as lsvc
+
+    _rk, java_env, java_mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    java_env.clear(), java_mounts.clear()
+    lsvc._wire_cognito_issuer_host({}, java_env, java_mounts, "java21")
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in java_env["JAVA_TOOL_OPTIONS"]
+    assert "trustStoreType=pkcs12" in java_env["JAVA_TOOL_OPTIONS"]
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in [m["Target"] for m in java_mounts]
+
+    _rk2, py_env, py_mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(_rk2, py_env, py_mounts, "python3.12")
+    assert "JAVA_TOOL_OPTIONS" not in py_env
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH not in [m["Target"] for m in py_mounts]
+class _ProxyHandler(BaseHTTPRequestHandler):
+    received: list[dict] = []
+    response: tuple[int, bytes, dict] = (200, b'{"ok":true}', {"Content-Type": "application/json"})
+    sleep_seconds: float = 0.0
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        type(self).received.append({
+            "path": self.path,
+            "headers": {k: v for k, v in self.headers.items()},
+            "body": body,
+        })
+        if type(self).sleep_seconds:
+            time.sleep(type(self).sleep_seconds)
+        status, payload, headers = type(self).response
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args, **_kwargs):
+        pass
+
+
+@pytest.fixture
+def proxy_server():
+    server = HTTPServer(("127.0.0.1", 0), _ProxyHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _ProxyHandler.received = []
+    _ProxyHandler.response = (200, b'{"ok":true}', {"Content-Type": "application/json"})
+    _ProxyHandler.sleep_seconds = 0.0
+    try:
+        yield port
+    finally:
+        server.shutdown()
+
+
+def _make_client():
+    return boto3.client(
+        "lambda",
+        endpoint_url=_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+
+
+def _create_proxy_function(client, name: str, url: str | None):
+    env = {"Variables": {"MINISTACK_LAMBDA_PROXY_URL": url}} if url else None
+    kwargs = dict(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/x",
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event,context):\n    return event\n")},
+    )
+    if env is not None:
+        kwargs["Environment"] = env
+    client.create_function(**kwargs)
+
+
+def test_proxy_invoke_forwards_event_and_returns_response(proxy_server):
+    name = "proxy_echo"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+
+    event = {"hello": "world", "n": 42}
+    resp = client.invoke(FunctionName=name, Payload=json.dumps(event).encode())
+    body = json.loads(resp["Payload"].read())
+
+    assert body == {"ok": True}
+    assert _ProxyHandler.received, "container never received the invocation"
+    forwarded = _ProxyHandler.received[-1]
+    assert forwarded["path"] == "/invoke"
+    assert json.loads(forwarded["body"]) == event
+    h = forwarded["headers"]
+    assert h.get("X-Amzn-Lambda-Function-Name") == name
+    assert h.get("X-Amzn-Lambda-Request-Id")
+    assert h.get("X-Amzn-Lambda-Function-Arn", "").endswith(f":function:{name}")
+
+
+def test_proxy_invoke_passes_through_response_payload(proxy_server):
+    name = "proxy_payload"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+    _ProxyHandler.response = (200, b'{"statusCode":201,"body":"created"}', {"Content-Type": "application/json"})
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    body = json.loads(resp["Payload"].read())
+    assert body == {"statusCode": 201, "body": "created"}
+
+
+def test_proxy_invoke_non_2xx_returns_lambda_error_shape(proxy_server):
+    name = "proxy_500"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+    _ProxyHandler.response = (500, b"boom", {"Content-Type": "text/plain"})
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    assert resp.get("FunctionError") == "Unhandled"
+    body = json.loads(resp["Payload"].read())
+    assert body.get("errorType") == "Runtime.HandlerError"
+    assert "HTTP 500" in body.get("errorMessage", "")
+
+
+def test_proxy_invoke_unreachable_returns_lambda_error_shape():
+    name = "proxy_unreachable"
+    client = _make_client()
+    _create_proxy_function(client, name, "http://127.0.0.1:1/invoke")
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    assert resp.get("FunctionError") == "Unhandled"
+    body = json.loads(resp["Payload"].read())
+    assert body.get("errorType") in ("Runtime.HandlerError", "Sandbox.Timedout")
+    assert "errorMessage" in body
+
+
+def test_proxy_unset_falls_back_to_normal_executor():
+    name = "proxy_unset"
+    client = _make_client()
+    _create_proxy_function(client, name, None)
+    resp = client.invoke(FunctionName=name, Payload=b'{"a":1}')
+    body = json.loads(resp["Payload"].read())
+    assert body == {"a": 1}
+
+
+def test_proxy_via_apigw_aws_proxy_integration(proxy_server):
+    """API Gateway HTTP API routes through to a proxy Lambda's container and returns its response."""
+    import urllib.request as _urlreq
+    from urllib.parse import urlparse
+
+    name = "proxy_apigw_fn"
+    lam = _make_client()
+    _create_proxy_function(lam, name, f"http://127.0.0.1:{proxy_server}/invoke")
+
+    # Container replies with a Lambda Proxy response shape, which APIGW unwraps.
+    _ProxyHandler.response = (
+        200,
+        b'{"statusCode":200,"headers":{"Content-Type":"application/json"},"body":"{\\"hi\\":\\"from-php\\"}"}',
+        {"Content-Type": "application/json"},
+    )
+
+    apigw = boto3.client(
+        "apigatewayv2",
+        endpoint_url=_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    api_id = apigw.create_api(Name=f"proxy-api-{name}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    port = urlparse(_endpoint).port or 4566
+    url = f"http://{api_id}.execute-api.localhost:{port}/$default/hello"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{port}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"hi": "from-php"}
+
+    # The container should have received an APIGW v2 event JSON, not a raw HTTP request.
+    forwarded = json.loads(_ProxyHandler.received[-1]["body"])
+    assert forwarded.get("rawPath") == "/hello"
+    assert forwarded.get("requestContext", {}).get("http", {}).get("method") == "GET"
