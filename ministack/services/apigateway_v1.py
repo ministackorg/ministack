@@ -1945,6 +1945,11 @@ async def _authorize_request_v1(
                 "httpMethod": method,
                 "apiId": api_id,
                 "accountId": owner_account_id,
+                # Same caller fields the AWS_PROXY event reports.
+                "identity": {
+                    "sourceIp": (_header_ci(headers, "x-forwarded-for") or "127.0.0.1").split(",")[0].strip(),
+                    "userAgent": _header_ci(headers, "user-agent") or "",
+                },
             },
         }
 
