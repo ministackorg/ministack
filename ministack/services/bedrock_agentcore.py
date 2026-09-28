@@ -21,13 +21,17 @@ Shapes, HTTP methods, URIs, ARN/ID patterns, and status enums are verified
 against botocore ``bedrock-agentcore-control`` / ``bedrock-agentcore``
 service-2.json.
 """
+import asyncio
 import copy
 import datetime
 import json
 import logging
+import os
 import re
 import secrets
 import string
+import urllib.error
+import urllib.request
 from urllib.parse import unquote
 
 from ministack.core.responses import (
@@ -411,6 +415,23 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     session_id = (headers.get("x-amzn-bedrock-agentcore-runtime-session-id")
                   or new_uuid())
     content_type = headers.get("content-type", "application/json")
+    proxy_urls = os.environ.get("MINISTACK_AGENTCORE_PROXY_URLS")
+    if proxy_urls:
+        try:
+            configured = json.loads(proxy_urls)
+            if not isinstance(configured, dict):
+                raise TypeError("proxy URL mapping must be an object")
+            key = f"{get_account_id()}:{get_region()}:{runtime['agentRuntimeName']}"
+            url = configured.get(key)
+        except (ValueError, TypeError):
+            return error_response_json("InternalServerException",
+                                       "Invalid MINISTACK_AGENTCORE_PROXY_URLS configuration", 500)
+        if url is not None:
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                return error_response_json("InternalServerException",
+                                           "Invalid AgentCore proxy URL", 500)
+            return _proxy_agent_runtime(url, body, content_type, session_id)
+
     # Deterministic echo: return the request payload back under a stable shape
     # so contract tests can assert Invoke request/response handling without a
     # real model. No inference is performed.
@@ -430,6 +451,32 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     return 200, out_headers, out_body
 
 
+def _proxy_agent_runtime(url, body, content_type, session_id):
+    """Forward only invocation data, never the caller's AWS credentials."""
+    request = urllib.request.Request(
+        url, data=body or b"", method="POST",
+        headers={
+            "Content-Type": content_type,
+            "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, {
+                "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
+                "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
+            }, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, {
+            "Content-Type": error.headers.get("Content-Type", "application/octet-stream"),
+            "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
+        }, error.read()
+    except (urllib.error.URLError, TimeoutError) as error:
+        logger.warning("AgentCore proxy unavailable: %s", error)
+        return error_response_json("InternalServerException",
+                                   "Configured AgentCore proxy is unavailable", 500)
+
+
 # ---------------------------------------------------------------------------
 # Router — dispatch by rest-json HTTP method + path
 # ---------------------------------------------------------------------------
@@ -442,7 +489,7 @@ async def handle_request(method, path, headers, body, query_params):
     if (method == "POST" and inner.startswith("runtimes/")
             and inner.endswith("/invocations")):
         arn = inner[len("runtimes/"):-len("/invocations")]
-        return _invoke_agent_runtime(unquote(arn), headers, body)
+        return await asyncio.to_thread(_invoke_agent_runtime, unquote(arn), headers, body)
 
     parts = [p for p in inner.split("/") if p]
     # All remaining AgentCore paths are rooted at /runtimes.
@@ -467,7 +514,7 @@ async def handle_request(method, path, headers, body, query_params):
     elif n == 3:
         seg = parts[2]
         if seg == "invocations" and method == "POST":
-            return _invoke_agent_runtime(unquote(parts[1]), headers, body)
+            return await asyncio.to_thread(_invoke_agent_runtime, unquote(parts[1]), headers, body)
         runtime_id = unquote(parts[1])
         if seg == "versions" and method == "POST":
             return _list_agent_runtime_versions(runtime_id, body)
