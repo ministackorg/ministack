@@ -426,7 +426,8 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     session_id = (headers.get("x-amzn-bedrock-agentcore-runtime-session-id")
                   or new_uuid())
     content_type = headers.get("content-type", "application/json")
-    if os.environ.get("MINISTACK_AGENTCORE_DOCKER") == "1":
+    artifact = runtime.get("agentRuntimeArtifact", {}).get("containerConfiguration", {})
+    if artifact.get("containerUri") and _docker_client() is not None:
         try:
             url = _container_invocations_url(runtime)
         except (RuntimeError, ValueError) as error:
@@ -466,6 +467,23 @@ _LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _local_open(request, *, timeout):
     """Reach the local Docker endpoint without inheriting HTTP proxy settings."""
     return _LOCAL_HTTP.open(request, timeout=timeout)
+
+
+_docker = None
+
+
+def _docker_client():
+    """A Docker client when the SDK is installed and the daemon answers, else None."""
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            client = docker.from_env(timeout=60)
+            client.ping()
+            _docker = client
+        except Exception:
+            return None
+    return _docker
 
 
 def _container_key(runtime_id):
@@ -519,13 +537,15 @@ def _container_invocations_url(runtime):
                 raise RuntimeError(f"Could not inspect runtime container: {error}") from error
         if container is None:
             client = None
-            labels = {"ministack": "agentcore",
-                      "ministack.agentcore.runtime": runtime["agentRuntimeId"],
-                      "ministack.agentcore.account": key[0],
-                      "ministack.agentcore.region": key[1]}
+            from ministack.core.container_reaper import own_labels
+
+            labels = own_labels("agentcore", **{
+                "ministack.agentcore.runtime": runtime["agentRuntimeId"],
+                "ministack.agentcore.account": key[0],
+                "ministack.agentcore.region": key[1]})
             try:
                 import docker
-                client = docker.from_env(timeout=60)
+                client = _docker_client() or docker.from_env(timeout=60)
                 run_kwargs = {
                     "environment": runtime.get("environmentVariables", {}),
                     "labels": labels,
