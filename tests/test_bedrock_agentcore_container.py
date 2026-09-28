@@ -30,13 +30,16 @@ def _invoke(arn, headers=None, body=b"{}"):
     ))
 
 
-def _fake_docker(monkeypatch, port, *, fail=False):
+def _fake_docker(monkeypatch, port, *, fail=False, network=None):
     started = []
     removed = []
 
     class Container:
         status = "running"
-        attrs = {"NetworkSettings": {"Ports": {"8080/tcp": [{"HostPort": str(port)}]}}}
+        attrs = {"NetworkSettings": {
+            "Ports": {"8080/tcp": [{"HostPort": str(port)}]},
+            "Networks": {network: {"IPAddress": "127.0.0.1"}} if network else {},
+        }}
 
         def reload(self):
             pass
@@ -45,6 +48,11 @@ def _fake_docker(monkeypatch, port, *, fail=False):
             removed.append(force)
 
     class Containers:
+        def get(self, _name):
+            if not network:
+                raise RuntimeError("MiniStack is not in Docker")
+            return Container()
+
         def run(self, image, **kwargs):
             if fail:
                 raise RuntimeError("image unavailable")
@@ -123,6 +131,26 @@ def test_container_image_invoked_and_removed(monkeypatch):
         server.server_close()
         thread.join()
     assert removed == [True]
+
+
+def test_container_joins_ministack_network(monkeypatch):
+    started, _ = _fake_docker(monkeypatch, 8080, network="ministack-net")
+    class Healthy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(agentcore, "_local_open", lambda *_args, **_kwargs: Healthy())
+    runtime = _runtime("network_test")
+    try:
+        url = agentcore._container_invocations_url(agentcore._runtimes[runtime["agentRuntimeId"]])
+        assert url == "http://127.0.0.1:8080/invocations"
+        assert started[0][1]["network"] == "ministack-net"
+        assert "ports" not in started[0][1]
+    finally:
+        agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
 
 
 def test_worker_error_is_runtime_client_error(monkeypatch):

@@ -453,12 +453,19 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     return 200, out_headers, out_body
 
 
-_PROXY_REQUEST_HEADERS = (
+_WORKER_REQUEST_HEADERS = (
     "accept", "x-amzn-trace-id", "traceparent", "tracestate", "baggage",
 )
-_PROXY_RESPONSE_HEADERS = (
+_WORKER_RESPONSE_HEADERS = (
     "x-amzn-trace-id", "traceparent", "tracestate", "baggage",
 )
+
+_LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _local_open(request, *, timeout):
+    """Reach the local Docker endpoint without inheriting HTTP proxy settings."""
+    return _LOCAL_HTTP.open(request, timeout=timeout)
 
 
 def _container_key(runtime_id):
@@ -501,21 +508,40 @@ def _container_invocations_url(runtime):
             try:
                 import docker
                 client = docker.from_env(timeout=60)
-                container = client.containers.run(
-                    image, detach=True,
-                    ports={"8080/tcp": ("127.0.0.1", None)},
-                    environment=runtime.get("environmentVariables", {}),
-                    labels={"ministack": "agentcore", "ministack.agentcore.runtime": runtime["agentRuntimeId"]},
-                )
+                run_kwargs = {
+                    "detach": True,
+                    "environment": runtime.get("environmentVariables", {}),
+                    "labels": {"ministack": "agentcore",
+                               "ministack.agentcore.runtime": runtime["agentRuntimeId"]},
+                }
+                network = None
+                try:
+                    self_container = client.containers.get(os.environ.get("HOSTNAME", ""))
+                    self_container.reload()
+                    networks = self_container.attrs["NetworkSettings"]["Networks"]
+                    network = next(iter(networks), None)
+                except Exception:
+                    pass  # MiniStack is running directly on the host.
+                if network:
+                    run_kwargs["network"] = network
+                else:
+                    run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
+                container = client.containers.run(image, **run_kwargs)
                 container.reload()
-                bindings = container.attrs["NetworkSettings"]["Ports"]["8080/tcp"]
-                if not bindings:
-                    raise RuntimeError("Container port 8080 was not published")
-                url = f"http://127.0.0.1:{bindings[0]['HostPort']}/invocations"
+                if network:
+                    address = container.attrs["NetworkSettings"]["Networks"][network]["IPAddress"]
+                    if not address:
+                        raise RuntimeError("Container has no address on MiniStack's network")
+                    url = f"http://{address}:8080/invocations"
+                else:
+                    bindings = container.attrs["NetworkSettings"]["Ports"]["8080/tcp"]
+                    if not bindings:
+                        raise RuntimeError("Container port 8080 was not published")
+                    url = f"http://127.0.0.1:{bindings[0]['HostPort']}/invocations"
                 deadline = time.monotonic() + 30
                 while True:
                     try:
-                        with urllib.request.urlopen(url.removesuffix("/invocations") + "/ping", timeout=1):
+                        with _local_open(url.removesuffix("/invocations") + "/ping", timeout=1):
                             break
                     except (urllib.error.URLError, TimeoutError, ConnectionError):
                         container.reload()
@@ -537,13 +563,13 @@ def _invoke_container(url, body, headers, content_type, session_id):
         "Content-Type": content_type,
         "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
     }
-    forwarded_headers.update({name: headers[name] for name in _PROXY_REQUEST_HEADERS if name in headers})
+    forwarded_headers.update({name: headers[name] for name in _WORKER_REQUEST_HEADERS if name in headers})
     request = urllib.request.Request(
         url, data=body or b"", method="POST",
         headers=forwarded_headers,
     )
     try:
-        response = urllib.request.urlopen(request, timeout=30)
+        response = _local_open(request, timeout=30)
     except urllib.error.HTTPError as error:
         error.close()
         return error_response_json("RuntimeClientError",
@@ -557,7 +583,7 @@ def _invoke_container(url, body, headers, content_type, session_id):
         "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
         "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
     }
-    out_headers.update({name: response.headers[name] for name in _PROXY_RESPONSE_HEADERS
+    out_headers.update({name: response.headers[name] for name in _WORKER_RESPONSE_HEADERS
                         if name in response.headers})
     if "Content-Length" in response.headers:
         out_headers["Content-Length"] = response.headers["Content-Length"]
@@ -567,7 +593,7 @@ def _invoke_container(url, body, headers, content_type, session_id):
             while chunk := await asyncio.to_thread(response.read1, 64 * 1024):
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
         except Exception:
-            logger.exception("AgentCore proxy response stream failed")
+            logger.exception("AgentCore container response stream failed")
         else:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         finally:
