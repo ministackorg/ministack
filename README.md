@@ -875,6 +875,25 @@ end-to-end without any client config.
 
 API Gateway v1/v2 HTTP proxy forwarding uses non-blocking event-loop semantics by offloading the upstream socket call to a worker thread. This preserves AWS-compatible response behavior while preventing long-running proxy calls from stalling unrelated requests (for example, parallel DynamoDB operations). The same non-blocking path is used for JWT **JWKS** fetches. Tune wall-clock limits with `MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS` and `MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS` at the bottom of the [Configuration](#configuration) table above.
 
+### Cognito OIDC discovery (`USE_SSL=1`)
+
+A Cognito token's `iss` is `https://cognito-idp.<region>.amazonaws.com/<poolId>`, exactly as on AWS. To let an unmodified client (Spring, Vault, `aws-jwt-verify`) follow it to MiniStack:
+
+```bash
+docker run -d --name ministack -p 443:4566 -p 4566:4566 -e USE_SSL=1 ministackorg/ministack
+docker cp ministack:/tmp/ministack-tls/server.crt ./ministack-ca.pem
+```
+
+Then point the issuer host at MiniStack in `/etc/hosts` (`127.0.0.1 cognito-idp.us-east-1.amazonaws.com`) and trust `ministack-ca.pem` in your client's runtime. The OS keychain is not enough for these:
+
+| Runtime | Trust step |
+|---|---|
+| Java | `keytool -importcert -file ministack-ca.pem -alias ministack -cacerts -storepass changeit` |
+| Node | `NODE_EXTRA_CA_CERTS=./ministack-ca.pem` |
+| Python (`requests`, boto3) | `REQUESTS_CA_BUNDLE` / `AWS_CA_BUNDLE` pointing at a bundle of your system roots plus `ministack-ca.pem` |
+
+The generated certificate covers every region's issuer host. Lambda containers MiniStack starts get the hosts entries and the trust settings automatically. Remove the `/etc/hosts` line before calling the real Cognito.
+
 ### Startup Scripts
 
 MiniStack supports two types of init scripts, with LocalStack-compatible paths:

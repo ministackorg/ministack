@@ -167,13 +167,31 @@ def test_generated_cert_names_the_cognito_issuer_host(tmp_path, monkeypatch):
     monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
     monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
     cert_path, _key = tls.resolve_tls_material()
-    assert "DNS:cognito-idp.eu-west-2.amazonaws.com" in _san_of(cert_path)
+    san = _san_of(cert_path)
+    assert "DNS:cognito-idp.eu-west-2.amazonaws.com" in san
+    assert "DNS:cognito-idp.ap-southeast-2.amazonaws.com" in san
     assert tls.cognito_idp_host() == "cognito-idp.eu-west-2.amazonaws.com"
 
 
-def test_cached_cert_without_the_issuer_host_is_regenerated(tmp_path, monkeypatch):
-    """A cert cached by an older build, or for another region, cannot serve the
-    issuer host, so reusing it would fail the handshake."""
+def test_cached_cert_without_the_issuer_hosts_is_regenerated(tmp_path, monkeypatch):
+    """A cert cached by an older build lacks the issuer hosts and is replaced."""
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "subjectAltName=DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(cert)
+
+
+def test_cached_cert_is_reused_across_regions(tmp_path, monkeypatch):
     from ministack.core import tls
 
     monkeypatch.setenv("TMPDIR", str(tmp_path))
@@ -182,11 +200,9 @@ def test_cached_cert_without_the_issuer_host_is_regenerated(tmp_path, monkeypatc
     monkeypatch.setenv("MINISTACK_REGION", "eu-west-2")
     first, _ = tls.resolve_tls_material()
     first_bytes = open(first, "rb").read()
-
     monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
     second, _ = tls.resolve_tls_material()
-    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(second)
-    assert open(second, "rb").read() != first_bytes
+    assert open(second, "rb").read() == first_bytes
 
 
 def test_byo_certificate_is_never_regenerated(tmp_path, monkeypatch):

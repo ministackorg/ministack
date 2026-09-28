@@ -15,11 +15,7 @@ import tempfile
 
 
 def _write_atomic(path: str, data: bytes) -> "str | None":
-    """Write `data` to `path` via a rename, or None on failure.
-
-    Containers spawn concurrently and mount these files, so a reader must never
-    see a half-written one.
-    """
+    """Write `data` to `path` via an atomic rename; None on failure."""
     try:
         handle, staging = tempfile.mkstemp(dir=os.path.dirname(path))
         with os.fdopen(handle, "wb") as out:
@@ -40,12 +36,16 @@ def cognito_idp_host() -> str:
     return f"cognito-idp.{region}.amazonaws.com"
 
 
-def ca_bundle_path(cert_path: str) -> "str | None":
-    """Public roots plus `cert_path`, or None.
+def cognito_idp_hosts() -> "list[str]":
+    """Every region's Cognito issuer host, so a pool in any region validates."""
+    from ministack.services.account import _REGIONS_LIST
 
-    AWS_CA_BUNDLE and REQUESTS_CA_BUNDLE replace the trust store rather than
-    adding to it, so ours alone would cost the caller every other endpoint.
-    """
+    hosts = [cognito_idp_host()] + [f"cognito-idp.{r}.amazonaws.com" for r in _REGIONS_LIST]
+    return list(dict.fromkeys(hosts))
+
+
+def ca_bundle_path(cert_path: str) -> "str | None":
+    """System roots plus `cert_path` (the *_CA_BUNDLE vars replace the store), or None."""
     import ssl
 
     paths = ssl.get_default_verify_paths()
@@ -63,10 +63,7 @@ JAVA_TRUSTSTORE_PASSWORD = "changeit"
 
 
 def java_truststore_path(cert_path: str) -> "str | None":
-    """The same trust as `ca_bundle_path` in the PKCS12 a JVM reads, or None.
-
-    Written here rather than with `keytool` so no JDK is needed on this side.
-    """
+    """The same trust as a PKCS12 truststore for the JVM, or None."""
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives.serialization import (
@@ -98,8 +95,8 @@ def java_truststore_path(cert_path: str) -> "str | None":
     return _write_atomic(os.path.join(os.path.dirname(cert_path), "truststore.p12"), blob)
 
 
-def _cert_names(cert_path: str, name: str) -> bool:
-    """Whether the certificate at `cert_path` carries `name` as a SAN."""
+def _cert_names(cert_path: str, names: "list[str]") -> bool:
+    """Whether the certificate at `cert_path` carries every name in `names` as a SAN."""
     try:
         out = subprocess.run(
             ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
@@ -107,7 +104,7 @@ def _cert_names(cert_path: str, name: str) -> bool:
         )
     except OSError:
         return True  # No openssl to check with; leave the cached cert alone.
-    return name in (out.stdout or "")
+    return all(f"DNS:{name}" in (out.stdout or "") for name in names)
 
 
 def resolve_tls_material() -> "tuple[str, str]":
@@ -135,8 +132,8 @@ def resolve_tls_material() -> "tuple[str, str]":
     cert_path = os.path.join(tls_dir, "server.crt")
     key_path = os.path.join(tls_dir, "server.key")
     if (os.path.exists(cert_path) and os.path.exists(key_path)
-            and not _cert_names(cert_path, cognito_idp_host())):
-        # Cached by an older build or another region: cannot serve that name.
+            and not _cert_names(cert_path, cognito_idp_hosts())):
+        # Cached by an older build: regenerate so every issuer host is covered.
         os.remove(cert_path)
         os.remove(key_path)
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
@@ -147,7 +144,8 @@ def resolve_tls_material() -> "tuple[str, str]":
             "-subj", "/CN=ministack-local/O=MiniStack",
             "-addext",
             "subjectAltName=DNS:localhost,DNS:ministack,"
-            f"DNS:{cognito_idp_host()},IP:127.0.0.1,IP:0:0:0:0:0:0:0:1",
+            + "".join(f"DNS:{host}," for host in cognito_idp_hosts())
+            + "IP:127.0.0.1,IP:0:0:0:0:0:0:0:1",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.chmod(cert_path, 0o600)
         os.chmod(key_path, 0o600)

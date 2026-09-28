@@ -4089,11 +4089,7 @@ _CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
 
 
 def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
-    """Resolve the host a Cognito token's `iss` names to the gateway, and trust it.
-
-    A verifier built from the pool id alone has no other way to reach us. Only
-    under USE_SSL=1: `iss` is https, so plain HTTP has nothing to resolve to.
-    """
+    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert."""
     from ministack.core import tls as _tls
 
     if not _tls.use_ssl_enabled():
@@ -4102,8 +4098,9 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
         cert_path, _key_path = _tls.resolve_tls_material()
     except SystemExit:
         return
-    run_kwargs.setdefault("extra_hosts", {}).setdefault(
-        _tls.cognito_idp_host(), "host-gateway")
+    extra_hosts = run_kwargs.setdefault("extra_hosts", {})
+    for host in _tls.cognito_idp_hosts():
+        extra_hosts.setdefault(host, "host-gateway")
     if not os.path.exists(cert_path):
         return
     # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
