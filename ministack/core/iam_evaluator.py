@@ -606,6 +606,9 @@ _request_caller_arn: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 def pin_request_caller(headers: dict, query_params: dict | None = None) -> None:
     """Remember the caller's principal ARN for this request's policy checks."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return
     _request_caller_arn.set(request_caller_arn(headers, query_params))
 
 
