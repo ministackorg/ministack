@@ -16,18 +16,27 @@ Supports: CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters,
           DescribeCacheEngineVersions,
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
           CreateSnapshot, DeleteSnapshot, DescribeSnapshots,
+          CreateServerlessCache, DescribeServerlessCaches, ModifyServerlessCache,
+          DeleteServerlessCache,
           DescribeEvents.
 
 When Docker is available, CreateCacheCluster spins up a real Redis/Valkey/Memcached
 container. Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
+A serverless cache gets its own Valkey/Redis container that, like AWS's, only
+speaks TLS; its certificate chains to the CA served at
+``GET /_ministack/elasticache/ca.pem``.
 """
 
 import contextvars
 import copy
+import io
+import ipaddress
 import logging
 import os
+import tarfile
 import time
 from urllib.parse import parse_qs
+from xml.sax.saxutils import escape as xml_escape
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
@@ -90,6 +99,7 @@ _tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}, ...]
 _snapshots = AccountRegionScopedDict()
 _users = AccountRegionScopedDict()
 _user_groups = AccountRegionScopedDict()
+_serverless_caches = AccountRegionScopedDict()
 # Per-account+region event log under key "entries" so the list manipulation
 # stays simple and DescribeEvents never leaks cross-tenant or cross-region rows.
 _events = AccountRegionScopedDict()
@@ -127,6 +137,10 @@ def get_state():
         "user_groups": copy.deepcopy(_user_groups),
         "events": copy.deepcopy(_events),
         "port_counter": _port_counter[0],
+        "serverless_ca": (
+            {"ca_cert_pem": _serverless_ca[0], "ca_key_pem": _serverless_ca[1]}
+            if _serverless_ca else {}
+        ),
     }
     clusters = AccountRegionScopedDict()
     for (account_id, region, name), cl in _clusters.all_items():
@@ -134,6 +148,12 @@ def get_state():
         c.pop("_docker_container_id", None)
         clusters.set_scoped(account_id, region, name, c)
     state["clusters"] = clusters
+    serverless = AccountRegionScopedDict()
+    for (account_id, region, name), cache in _serverless_caches.all_items():
+        c = copy.deepcopy(cache)
+        c.pop("_docker_container_id", None)
+        serverless.set_scoped(account_id, region, name, c)
+    state["serverless_caches"] = serverless
     return state
 
 
@@ -147,6 +167,7 @@ def get_state():
 # container is healthy by the time the SDK reaches the endpoint.
 _pending_cluster_respawn: set = set()
 _pending_rg_respawn: set = set()
+_pending_serverless_respawn: set = set()
 # Serialize lazy respawn so two concurrent first-requests after restart
 # don't both spawn a container for the same cluster.
 import threading as _threading
@@ -209,11 +230,21 @@ def _restore_clusters(incoming):
         _pending_cluster_respawn.add((account_id, region, name))
 
 
+def _restore_serverless_caches(incoming):
+    restored = _as_region_scoped(incoming)
+    for (account_id, region, name), cache in restored.all_items():
+        record = copy.deepcopy(cache)
+        record["_docker_container_id"] = None
+        _serverless_caches.set_scoped(account_id, region, name, record)
+        _pending_serverless_respawn.add((account_id, region, name))
+
+
 def load_persisted_state(data):
     return _restore_state(data)
 
 
 def _restore_state(data):
+    global _serverless_ca
     if not data:
         return
     _restore_replication_groups(data.get("replication_groups", {}))
@@ -227,7 +258,12 @@ def _restore_state(data):
     _events.update(data.get("events", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
+    ca_data = data.get("serverless_ca")
+    if ca_data and ca_data.get("ca_cert_pem") and ca_data.get("ca_key_pem"):
+        with _serverless_ca_lock:
+            _serverless_ca = (ca_data["ca_cert_pem"], ca_data["ca_key_pem"])
     _restore_clusters(data.get("clusters", {}))
+    _restore_serverless_caches(data.get("serverless_caches", {}))
     default_state()
 
 
@@ -239,11 +275,11 @@ def _ensure_live_containers():
     but the endpoint won't be reachable (matches the old behavior, just no
     longer silent)."""
     # Cheap fast path — no lock needed when nothing's pending.
-    if not (_pending_cluster_respawn or _pending_rg_respawn):
+    if not (_pending_cluster_respawn or _pending_rg_respawn or _pending_serverless_respawn):
         return
     # Serialize concurrent first-requests so we don't double-spawn.
     with _respawn_lock:
-        if not (_pending_cluster_respawn or _pending_rg_respawn):
+        if not (_pending_cluster_respawn or _pending_rg_respawn or _pending_serverless_respawn):
             return
         _ensure_live_containers_locked()
 
@@ -308,6 +344,19 @@ def _ensure_live_containers_locked():
             log.warning(
                 "elasticache: failed to respawn containers for replication group %s "
                 "on restart; endpoint will be unreachable", rg_id, exc_info=True)
+    for pending in list(_pending_serverless_respawn):
+        account_id, region, name = pending
+        _pending_serverless_respawn.discard(pending)
+        cache = _serverless_caches.get_scoped(account_id, region, name)
+        if cache is None or _get_docker() is None:
+            continue
+        try:
+            _start_serverless_container(cache, account_id, region, wait=False)
+            log.info("elasticache: respawned container for serverless cache %s after restart", name)
+        except Exception:
+            log.warning(
+                "elasticache: failed to respawn container for serverless cache %s on restart; "
+                "endpoint will be unreachable", name, exc_info=True)
 
 
 # ── Seed default ElastiCache parameter groups ─────────────────
@@ -413,6 +462,7 @@ _DOCKER_BACKED_ACTIONS = {
     "RebootCacheCluster", "CreateReplicationGroup", "DeleteReplicationGroup",
     "ModifyReplicationGroup", "IncreaseReplicaCount", "DecreaseReplicaCount",
     "DescribeCacheClusters", "DescribeReplicationGroups",
+    "CreateServerlessCache", "DeleteServerlessCache", "ModifyServerlessCache",
 }
 
 
@@ -567,12 +617,16 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels):
         return None, None, None
 
 
-def _wait_redis_ready(container, timeout=15):
-    """Poll PING via docker exec until the node responds, up to ``timeout`` s."""
+def _wait_redis_ready(container, timeout=15, cli_args=()):
+    """Poll PING via docker exec until the node responds, up to ``timeout`` s.
+
+    ``cli_args`` go before the command, e.g. the ``--tls`` flags a TLS-only
+    server needs.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            result = container.exec_run(["redis-cli", "-p", "6379", "PING"])
+            result = container.exec_run(["redis-cli", *cli_args, "-p", "6379", "PING"])
             if result.exit_code == 0 and b"PONG" in result.output:
                 return True
         except Exception:
@@ -822,6 +876,12 @@ def _resolve_taggable_elasticache_arn(arn):
         "snapshot": (_snapshots, "SnapshotNotFoundFault", f"Snapshot {name} not found", "ARN"),
         "user": (_users, "UserNotFoundFault", f"User {name} not found", "ARN"),
         "usergroup": (_user_groups, "UserGroupNotFoundFault", f"User group {name} not found", "ARN"),
+        "serverlesscache": (
+            _serverless_caches,
+            "ServerlessCacheNotFoundFault",
+            f"Serverless cache {name} not found.",
+            "ARN",
+        ),
     }
     entry = resources.get(resource_type)
     if not entry:
@@ -896,6 +956,10 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateSnapshot": _create_snapshot,
         "DeleteSnapshot": _delete_snapshot,
         "DescribeSnapshots": _describe_snapshots,
+        "CreateServerlessCache": _create_serverless_cache,
+        "DescribeServerlessCaches": _describe_serverless_caches,
+        "ModifyServerlessCache": _modify_serverless_cache,
+        "DeleteServerlessCache": _delete_serverless_cache,
         "DescribeEvents": _describe_events,
     }
 
@@ -2041,6 +2105,469 @@ def _describe_snapshots(p):
         f"<DescribeSnapshotsResult><Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
 
 
+# ---- Serverless Caches ----
+
+# AWS pins only the major version of a serverless cache and reports the minor it
+# runs as FullEngineVersion; the container runs that minor's image.
+_SERVERLESS_ENGINE_VERSIONS = {
+    "valkey": {"7": "7.2", "8": "8.1", "9": "9.0"},
+    "redis": {"7": "7.1"},
+}
+_SERVERLESS_DEFAULT_MAJOR = {"valkey": "8", "redis": "7"}
+_SERVERLESS_TLS_DIR = "/ministack-elasticache-tls"
+_SERVERLESS_TLS_CLI_ARGS = ("--tls", "--cacert", f"{_SERVERLESS_TLS_DIR}/ca.crt", "-h", "127.0.0.1")
+# The certificate has to name the container's address, which is only known once
+# it runs, so the server waits for the material; `ready` is the archive's last
+# member. The image's entrypoint then drops to the uid that owns /data.
+_SERVERLESS_TLS_WRAPPER = (
+    f"d={_SERVERLESS_TLS_DIR}; "
+    'while [ ! -e "$d/ready" ]; do sleep 0.1; done; '
+    'chown -R "$(stat -c %u:%g /data)" "$d"; '
+    'exec docker-entrypoint.sh "$@"'
+)
+_serverless_ca_lock = _threading.Lock()
+_serverless_ca = None
+
+
+def serverless_ca_cert_pem() -> str:
+    """The CA that signs serverless cache certificates, minted on first use."""
+    return _ensure_serverless_ca()[0]
+
+
+def _ensure_serverless_ca():
+    global _serverless_ca
+    if _serverless_ca is None:
+        with _serverless_ca_lock:
+            if _serverless_ca is None:
+                from ministack.core.x509_utils import generate_ca
+                _serverless_ca = generate_ca(org_name="MiniStack",
+                                             common_name="MiniStack ElastiCache Root CA")
+    return _serverless_ca
+
+
+def _arn_serverless_cache(name):
+    return f"arn:aws:elasticache:{get_region()}:{get_account_id()}:serverlesscache:{name}"
+
+
+def _serverless_container_name(account_id, region, name):
+    return f"ministack-elasticache-serverless-{account_id}-{region}-{name}"
+
+
+def _is_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _serverless_tls_archive(ca_pem, cert_pem, key_pem):
+    root = _SERVERLESS_TLS_DIR.lstrip("/")
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as bundle:
+        entry = tarfile.TarInfo(root)
+        entry.type = tarfile.DIRTYPE
+        entry.mode = 0o755
+        bundle.addfile(entry)
+        for filename, content, mode in (("ca.crt", ca_pem, 0o644), ("server.crt", cert_pem, 0o644),
+                                        ("server.key", key_pem, 0o600), ("ready", "", 0o644)):
+            data = content.encode()
+            entry = tarfile.TarInfo(f"{root}/{filename}")
+            entry.mode = mode
+            entry.size = len(data)
+            bundle.addfile(entry, io.BytesIO(data))
+    return archive.getvalue()
+
+
+def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True):
+    """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
+
+    Raises on any failure, after removing what it started: a serverless cache
+    has no plaintext listener, so there is no degraded endpoint to fall back to.
+    """
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    docker_client = _get_docker()
+    if docker_client is None:
+        raise RuntimeError("Docker is not available")
+    image, container_port = _engine_image_and_port(engine, full_version)
+    run_kwargs = dict(
+        image=image, detach=True, name=name, labels=labels,
+        ports={f"{container_port}/tcp": host_port},
+        entrypoint=["sh", "-c", _SERVERLESS_TLS_WRAPPER, "ministack-elasticache-tls"],
+        command=[
+            "--port", "0", "--tls-port", str(container_port),
+            "--tls-cert-file", f"{_SERVERLESS_TLS_DIR}/server.crt",
+            "--tls-key-file", f"{_SERVERLESS_TLS_DIR}/server.key",
+            "--tls-ca-cert-file", f"{_SERVERLESS_TLS_DIR}/ca.crt",
+            "--tls-auth-clients", "no",
+            "--protected-mode", "no",
+        ],
+    )
+    if DOCKER_NETWORK:
+        run_kwargs["network"] = DOCKER_NETWORK
+    container = docker_client.containers.run(**run_kwargs)
+    try:
+        address, port, container_ip = _MINISTACK_HOST, host_port, ""
+        if DOCKER_NETWORK:
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
+            if container_ip:
+                address, port = container_ip, container_port
+        candidates = ("localhost", _MINISTACK_HOST, name, "127.0.0.1", "::1", container_ip)
+        dns_names = [n for n in dict.fromkeys(candidates) if n and not _is_ip(n)]
+        ips = [n for n in dict.fromkeys(candidates) if n and _is_ip(n)]
+        ca_pem, ca_key = _ensure_serverless_ca()
+        cert_pem, key_pem, _public = sign_leaf_certificate(
+            ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
+        if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem)):
+            raise RuntimeError("Docker rejected the TLS material")
+        if wait and not _wait_redis_ready(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            raise RuntimeError(f"{engine} in {name} never answered a TLS PING")
+    except Exception:
+        _teardown_containers(docker_client, [container.id])
+        raise
+    logger.info("ElastiCache: started serverless %s container %s at %s:%s (TLS)",
+                engine, name, address, port)
+    return address, port, container.id
+
+
+def _start_serverless_container(record, account_id, region, wait=True):
+    """Start ``record``'s container and publish its endpoint, unless the cache
+    was deleted meanwhile — then the container is removed instead."""
+    name = record["ServerlessCacheName"]
+    address, port, cid = _spawn_serverless_container(
+        name=_serverless_container_name(account_id, region, name),
+        engine=record["Engine"],
+        full_version=record["FullEngineVersion"],
+        host_port=record["_host_port"],
+        labels={
+            **container_reaper.own_labels("elasticache"),
+            "serverless_cache": name,
+            "account_id": account_id,
+            "region": region,
+        },
+        wait=wait,
+    )
+    with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
+        orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
+        if not orphaned:
+            record["_docker_container_id"] = cid
+            record["Endpoint"] = {"Address": address, "Port": port}
+            record["ReaderEndpoint"] = {"Address": address, "Port": port}
+            record["Status"] = "available"
+    if orphaned:
+        _teardown_containers(_get_docker(), [cid])
+
+
+def _provision_serverless_cache(record, account_id, region, replaced_container_id=None):
+    if replaced_container_id:
+        _teardown_containers(_get_docker(), [replaced_container_id])
+    try:
+        _start_serverless_container(record, account_id, region)
+    except Exception:
+        logger.warning("ElastiCache: serverless cache %s failed to start",
+                       record["ServerlessCacheName"], exc_info=True)
+        with resource_lock("elasticache-serverless",
+                           f"{account_id}/{region}/{record['ServerlessCacheName']}"):
+            if _serverless_caches.get_scoped(account_id, region, record["ServerlessCacheName"]) is record:
+                record["Status"] = "create-failed"
+
+
+def _provision_in_background(record, replaced_container_id=None):
+    record["Status"] = "creating" if replaced_container_id is None else "modifying"
+    record["_docker_container_id"] = None
+    spawn_background(_provision_serverless_cache, record, get_account_id(), get_region(),
+                     replaced_container_id,
+                     thread_name=f"ministack-elasticache-serverless-{record['ServerlessCacheName']}")
+
+
+def _optional_int(p, key):
+    value = _p(p, key)
+    return int(value) if value != "" else None
+
+
+def _extract_cache_usage_limits(p):
+    limits = {}
+    data_storage = {k: _optional_int(p, f"CacheUsageLimits.DataStorage.{k}") for k in ("Maximum", "Minimum")}
+    data_storage = {k: v for k, v in data_storage.items() if v is not None}
+    unit = _p(p, "CacheUsageLimits.DataStorage.Unit")
+    if data_storage or unit:
+        limits["DataStorage"] = {**data_storage, **({"Unit": unit} if unit else {})}
+    ecpu = {k: _optional_int(p, f"CacheUsageLimits.ECPUPerSecond.{k}") for k in ("Maximum", "Minimum")}
+    ecpu = {k: v for k, v in ecpu.items() if v is not None}
+    if ecpu:
+        limits["ECPUPerSecond"] = ecpu
+    return limits
+
+
+def _resolve_serverless_engine(engine, major):
+    """Return ``(engine, major, full_version)`` or an error response."""
+    engine = (engine or "").lower()
+    versions = _SERVERLESS_ENGINE_VERSIONS.get(engine)
+    if versions is None:
+        return None, _error("InvalidParameterValue",
+                            f"Engine {engine or '(empty)'} is not supported for serverless caches "
+                            f"in MiniStack; use valkey or redis.", 400)
+    major = major or _SERVERLESS_DEFAULT_MAJOR[engine]
+    if major not in versions:
+        return None, _error("InvalidParameterValue",
+                            f"Invalid major engine version {major} for engine {engine}.", 400)
+    return (engine, major, versions[major]), None
+
+
+def _validate_serverless_engine_change(cur_engine, cur_major, new_engine, new_major):
+    """AWS allows only a same-engine major upgrade, a redis-to-valkey move (any
+    supported valkey major), or valkey 7 -> redis 7 — the one documented
+    rollback ("ElastiCache only supports rolling back from Valkey 7.2 to
+    Redis OSS 7.1", AWS ElastiCache version-management guide). Anything else,
+    including a same-engine downgrade or valkey 8/9 -> redis, is rejected."""
+    if new_engine == cur_engine:
+        if int(new_major) > int(cur_major):
+            return None
+    elif cur_engine == "redis" and new_engine == "valkey":
+        return None
+    elif cur_engine == "valkey" and new_engine == "redis" and cur_major == "7" and new_major == "7":
+        return None
+    return _error("InvalidParameterCombination",
+                  f"Cannot change a serverless cache from {cur_engine} {cur_major} to "
+                  f"{new_engine} {new_major}.", 400)
+
+
+def _create_serverless_cache(p):
+    name = _p(p, "ServerlessCacheName")
+    if not name:
+        return _error("InvalidParameterValue", "ServerlessCacheName is required.", 400)
+    name = name.lower()
+    resolved, err = _resolve_serverless_engine(_p(p, "Engine"), _p(p, "MajorEngineVersion"))
+    if err:
+        return err
+    engine, major, full_version = resolved
+    if name in _serverless_caches:
+        return _error("ServerlessCacheAlreadyExistsFault",
+                      f"Serverless cache {name} already exists.", 400)
+    user_group_id = _p(p, "UserGroupId")
+    if user_group_id and user_group_id not in _user_groups:
+        return _error("UserGroupNotFound", "The user group was not found or does not exist", 404)
+    if _extract_configs(p, "SnapshotArnsToRestore", ("SnapshotArn", "member")):
+        return _error("InvalidParameterValue",
+                      "MiniStack has no serverless cache snapshots to restore from.", 400)
+    try:
+        limits = _extract_cache_usage_limits(p)
+        retention = _optional_int(p, "SnapshotRetentionLimit")
+    except ValueError:
+        return _error("InvalidParameterValue", "Invalid numeric parameter value.", 400)
+
+    arn = _arn_serverless_cache(name)
+    host_port = _port_counter[0]
+    _port_counter[0] += 1
+    record = {
+        "ServerlessCacheName": name,
+        "Description": _p(p, "Description"),
+        "CreateTime": time.time(),
+        "Status": "creating",
+        "Engine": engine,
+        "MajorEngineVersion": major,
+        "FullEngineVersion": full_version,
+        "CacheUsageLimits": limits,
+        "KmsKeyId": _p(p, "KmsKeyId"),
+        "SecurityGroupIds": _extract_configs(p, "SecurityGroupIds", ("SecurityGroupId", "member")),
+        "SubnetIds": _extract_configs(p, "SubnetIds", ("SubnetId", "member")),
+        "ARN": arn,
+        "UserGroupId": user_group_id,
+        "SnapshotRetentionLimit": retention or 0,
+        "DailySnapshotTime": _p(p, "DailySnapshotTime"),
+        "NetworkType": _p(p, "NetworkType") or "ipv4",
+        "_host_port": host_port,
+        "_docker_container_id": None,
+    }
+    _serverless_caches[name] = record
+    _tags[arn] = _extract_tags(p)
+    if _get_docker() is None:
+        # Same fallback as every other ElastiCache resource: the shared sidecar,
+        # which is plaintext — there is nothing to terminate TLS without Docker.
+        logger.warning("ElastiCache: Docker unavailable; serverless cache %s points at the "
+                       "plaintext sidecar %s:%s", name, REDIS_DEFAULT_HOST, REDIS_DEFAULT_PORT)
+        endpoint = {"Address": REDIS_DEFAULT_HOST, "Port": REDIS_DEFAULT_PORT}
+        record["Endpoint"] = dict(endpoint)
+        record["ReaderEndpoint"] = dict(endpoint)
+        record["Status"] = "available"
+    else:
+        _provision_in_background(record)
+    _record_event(name, "serverless-cache", "Serverless cache created")
+    return _xml(200, "CreateServerlessCacheResponse",
+                f"<CreateServerlessCacheResult><ServerlessCache>{_serverless_cache_xml(record)}"
+                f"</ServerlessCache></CreateServerlessCacheResult>")
+
+
+def _describe_serverless_caches(p):
+    name = _p(p, "ServerlessCacheName").lower()
+    if name:
+        cache = _serverless_caches.get(name)
+        if not cache:
+            return _error("ServerlessCacheNotFoundFault", f"Serverless cache {name} not found.", 404)
+        caches = [cache]
+    else:
+        caches = list(_serverless_caches.values())
+    try:
+        max_results = int(_p(p, "MaxResults") or "50")
+        start = int(_p(p, "NextToken") or "0")
+    except ValueError:
+        return _error("InvalidParameterValue", "Invalid MaxResults or NextToken.", 400)
+    page = caches[start:start + max_results]
+    token = ""
+    if start + max_results < len(caches):
+        token = f"<NextToken>{start + max_results}</NextToken>"
+    members = "".join(f"<member>{_serverless_cache_xml(c)}</member>" for c in page)
+    return _xml(200, "DescribeServerlessCachesResponse",
+                f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{members}</ServerlessCaches>"
+                f"</DescribeServerlessCachesResult>")
+
+
+def _modify_serverless_cache(p):
+    name = _p(p, "ServerlessCacheName").lower()
+    cache = _serverless_caches.get(name)
+    if not cache:
+        return _error("ServerlessCacheNotFoundFault", f"Serverless cache {name} not found.", 404)
+    if cache["Status"] != "available":
+        return _error("InvalidServerlessCacheStateFault",
+                      f"Serverless cache {name} is not in available state.", 400)
+    remove_user_group = _p(p, "RemoveUserGroup").lower() == "true"
+    user_group_id = _p(p, "UserGroupId")
+    if remove_user_group and user_group_id:
+        return _error("InvalidParameterCombination",
+                      "RemoveUserGroup and UserGroupId cannot be specified together.", 400)
+    if user_group_id and user_group_id not in _user_groups:
+        return _error("UserGroupNotFound", "The user group was not found or does not exist", 404)
+    engine_change = None
+    if _p(p, "Engine") or _p(p, "MajorEngineVersion"):
+        engine = _p(p, "Engine") or cache["Engine"]
+        major = _p(p, "MajorEngineVersion")
+        if not major and engine == cache["Engine"]:
+            major = cache["MajorEngineVersion"]
+        resolved, err = _resolve_serverless_engine(engine, major)
+        if err:
+            return err
+        if resolved[:2] != (cache["Engine"], cache["MajorEngineVersion"]):
+            err = _validate_serverless_engine_change(
+                cache["Engine"], cache["MajorEngineVersion"], resolved[0], resolved[1])
+            if err:
+                return err
+            engine_change = resolved
+    try:
+        limits = _extract_cache_usage_limits(p)
+        retention = _optional_int(p, "SnapshotRetentionLimit")
+    except ValueError:
+        return _error("InvalidParameterValue", "Invalid numeric parameter value.", 400)
+    security_group_ids = _extract_configs(p, "SecurityGroupIds", ("SecurityGroupId", "member"))
+
+    changes = {}
+    if "Description" in p:
+        changes["Description"] = _p(p, "Description")
+    if limits:
+        # All-zero limits remove them (AWS "Pre-Scaling" guide).
+        values = [v for part in limits.values() for k, v in part.items() if k != "Unit"]
+        changes["CacheUsageLimits"] = {} if values and not any(values) else limits
+    if retention is not None:
+        changes["SnapshotRetentionLimit"] = retention
+    if _p(p, "DailySnapshotTime"):
+        changes["DailySnapshotTime"] = _p(p, "DailySnapshotTime")
+    if security_group_ids:
+        changes["SecurityGroupIds"] = security_group_ids
+    if user_group_id:
+        changes["UserGroupId"] = user_group_id
+    if remove_user_group:
+        changes["UserGroupId"] = ""
+    if not changes and engine_change is None:
+        return _error("InvalidParameterCombination", "No modifications were requested", 400)
+
+    cache.update(changes)
+    if engine_change is not None:
+        cache["Engine"], cache["MajorEngineVersion"], cache["FullEngineVersion"] = engine_change
+        if cache.get("_docker_container_id") or _get_docker() is not None:
+            # A different engine is a different image: replace the container on
+            # the same host port so the endpoint a client holds stays valid.
+            _provision_in_background(cache, replaced_container_id=cache.get("_docker_container_id") or "")
+    _record_event(name, "serverless-cache", "Serverless cache modified")
+    return _xml(200, "ModifyServerlessCacheResponse",
+                f"<ModifyServerlessCacheResult><ServerlessCache>{_serverless_cache_xml(cache)}"
+                f"</ServerlessCache></ModifyServerlessCacheResult>")
+
+
+def _delete_serverless_cache(p):
+    name = _p(p, "ServerlessCacheName").lower()
+    if _p(p, "FinalSnapshotName"):
+        return _error("InvalidParameterValue",
+                      "MiniStack does not take serverless cache snapshots; omit FinalSnapshotName.", 400)
+    account_id, region = get_account_id(), get_region()
+    with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
+        cache = _serverless_caches.get(name)
+        if not cache:
+            return _error("ServerlessCacheNotFoundFault", f"Serverless cache {name} not found.", 404)
+        del _serverless_caches[name]
+        cache["Status"] = "deleting"
+    docker_client = _get_docker()
+    if docker_client:
+        # By id and by name: a delete during provisioning has no id to go on yet.
+        ids = [cache["_docker_container_id"]] if cache.get("_docker_container_id") else []
+        try:
+            ids.append(docker_client.containers.get(
+                _serverless_container_name(account_id, region, name)).id)
+        except Exception:
+            pass
+        _teardown_containers(docker_client, list(dict.fromkeys(ids)))
+    _tags.pop(cache["ARN"], None)
+    _record_event(name, "serverless-cache", "Serverless cache deleted")
+    return _xml(200, "DeleteServerlessCacheResponse",
+                f"<DeleteServerlessCacheResult><ServerlessCache>{_serverless_cache_xml(cache)}"
+                f"</ServerlessCache></DeleteServerlessCacheResult>")
+
+
+def _serverless_cache_xml(c):
+    def endpoint(tag):
+        e = c.get(tag)
+        if not e:
+            return ""
+        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{e['Port']}</Port></{tag}>"
+
+    def optional(tag, value):
+        return f"<{tag}>{xml_escape(str(value))}</{tag}>" if value not in (None, "") else ""
+
+    limits = c.get("CacheUsageLimits") or {}
+    limits_xml = ""
+    if limits:
+        parts = "".join(
+            f"<{part}>" + "".join(optional(k, v) for k, v in limits[part].items()) + f"</{part}>"
+            for part in ("DataStorage", "ECPUPerSecond") if part in limits)
+        limits_xml = f"<CacheUsageLimits>{parts}</CacheUsageLimits>"
+    created = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(c["CreateTime"]))
+    security_groups = "".join(f"<SecurityGroupId>{xml_escape(g)}</SecurityGroupId>"
+                              for g in c.get("SecurityGroupIds") or [])
+    subnets = "".join(f"<SubnetId>{xml_escape(s)}</SubnetId>" for s in c.get("SubnetIds") or [])
+    return (
+        f"<ServerlessCacheName>{xml_escape(c['ServerlessCacheName'])}</ServerlessCacheName>"
+        f"{optional('Description', c.get('Description'))}"
+        f"<CreateTime>{created}</CreateTime>"
+        f"<Status>{c['Status']}</Status>"
+        f"<Engine>{c['Engine']}</Engine>"
+        f"<MajorEngineVersion>{c['MajorEngineVersion']}</MajorEngineVersion>"
+        f"<FullEngineVersion>{c['FullEngineVersion']}</FullEngineVersion>"
+        f"{limits_xml}"
+        f"{optional('KmsKeyId', c.get('KmsKeyId'))}"
+        f"<StorageEncryptionType>{'sse-kms' if c.get('KmsKeyId') else 'sse-elasticache'}</StorageEncryptionType>"
+        f"<SecurityGroupIds>{security_groups}</SecurityGroupIds>"
+        f"{endpoint('Endpoint')}"
+        f"{endpoint('ReaderEndpoint')}"
+        f"<ARN>{c['ARN']}</ARN>"
+        f"{optional('UserGroupId', c.get('UserGroupId'))}"
+        f"<SubnetIds>{subnets}</SubnetIds>"
+        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
+        f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
+        f"<NetworkType>{c.get('NetworkType', 'ipv4')}</NetworkType>"
+    )
+
+
 # ---- Events ----
 
 def _describe_events(p):
@@ -2532,6 +3059,9 @@ def reset():
                     c.remove(v=True)
                 except Exception as e:
                     logger.warning("reset: failed to stop/remove RG container %s: %s", cid, e)
+        _teardown_containers(docker_client, [
+            c["_docker_container_id"] for c in _serverless_caches.all_values()
+            if c.get("_docker_container_id")])
     _clusters.clear()
     _replication_groups.clear()
     _subnet_groups.clear()
@@ -2540,10 +3070,12 @@ def reset():
     _snapshots.clear()
     _users.clear()
     _user_groups.clear()
+    _serverless_caches.clear()
     _events.clear()
     _tags.clear()   # was missing from reset() — HIGH-severity gap from audit
     _pending_cluster_respawn.clear()
     _pending_rg_respawn.clear()
+    _pending_serverless_respawn.clear()
     _port_counter[0] = BASE_PORT
     default_state()
 
@@ -2559,6 +3091,9 @@ def _live_container_ids():
     for _key, rg in _replication_groups.all_items():
         for cid2 in rg.get("_docker_container_ids") or []:
             ids.add(cid2)
+    for _key, cache in _serverless_caches.all_items():
+        if cache.get("_docker_container_id"):
+            ids.add(cache["_docker_container_id"])
     return ids
 
 

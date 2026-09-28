@@ -1223,7 +1223,29 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_elasticache_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_elasticache_ca_request(method: str, path: str):
+    """`GET /_ministack/elasticache/ca.pem` returns the CA that signs serverless
+    cache certificates; a client trusts it to connect with TLS."""
+    if path != "/_ministack/elasticache/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import elasticache
+
+        cert_pem = elasticache.serverless_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, cert_pem.encode())
 
 
 def _handle_rds_ca_request(method: str, path: str):
