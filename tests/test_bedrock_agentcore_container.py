@@ -30,9 +30,15 @@ def _invoke(arn, headers=None, body=b"{}"):
     ))
 
 
-def _fake_docker(monkeypatch, port, *, fail=False, network=None):
+def _fake_docker(monkeypatch, port, *, fail=False, network=None,
+                 fail_on_start=False, fail_after_create=False, missing_image=False):
     started = []
     removed = []
+    created = []
+    pulled = []
+
+    class ImageNotFound(Exception):
+        pass
 
     class Container:
         status = "running"
@@ -44,6 +50,10 @@ def _fake_docker(monkeypatch, port, *, fail=False, network=None):
         def reload(self):
             pass
 
+        def start(self):
+            if fail_on_start:
+                raise TimeoutError("Docker start timed out")
+
         def remove(self, force=False):
             removed.append(force)
 
@@ -53,14 +63,29 @@ def _fake_docker(monkeypatch, port, *, fail=False, network=None):
                 raise RuntimeError("MiniStack is not in Docker")
             return Container()
 
-        def run(self, image, **kwargs):
+        def create(self, image, **kwargs):
             if fail:
                 raise RuntimeError("image unavailable")
+            if missing_image and not pulled:
+                raise ImageNotFound(image)
             started.append((image, kwargs))
-            return Container()
+            container = Container()
+            created.append(container)
+            if fail_after_create:
+                raise TimeoutError("Docker create timed out after allocation")
+            return container
 
-    monkeypatch.setitem(sys.modules, "docker", types.SimpleNamespace(
-        from_env=lambda **_kwargs: types.SimpleNamespace(containers=Containers())))
+        def list(self, **_kwargs):
+            return created
+
+    fake_docker = types.SimpleNamespace(
+        errors=types.SimpleNamespace(ImageNotFound=ImageNotFound),
+        from_env=lambda **_kwargs: types.SimpleNamespace(
+            containers=Containers(),
+            images=types.SimpleNamespace(pull=lambda image: pulled.append(image)),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
     monkeypatch.setenv("MINISTACK_AGENTCORE_DOCKER", "1")
     return started, removed
 
@@ -179,6 +204,93 @@ def test_container_start_failure_is_not_echo(monkeypatch):
         assert b"image unavailable" in body
     finally:
         agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+
+
+def test_container_is_removed_if_start_times_out(monkeypatch):
+    _, removed = _fake_docker(monkeypatch, 1, fail_on_start=True)
+    runtime = _runtime("start_timeout")
+    try:
+        status, _, _ = _invoke(runtime["agentRuntimeArn"])
+        assert status == 424
+        assert removed == [True]
+    finally:
+        agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+
+
+def test_missing_image_is_pulled_then_started(monkeypatch):
+    server, thread, _ = _worker()
+    started, _ = _fake_docker(monkeypatch, server.server_port, missing_image=True)
+    runtime = _runtime("pull_image")
+    try:
+        status, _, response = _invoke(runtime["agentRuntimeArn"])
+        assert status == 200
+        asyncio.run(response.runner(_discard, None))
+        assert [image for image, _ in started] == ["example.local/worker:1"]
+    finally:
+        agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_orphan_is_removed_if_create_times_out(monkeypatch):
+    _, removed = _fake_docker(monkeypatch, 1, fail_after_create=True)
+    runtime = _runtime("create_timeout")
+    try:
+        status, _, _ = _invoke(runtime["agentRuntimeArn"])
+        assert status == 424
+        assert removed == [True]
+    finally:
+        agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+
+
+def test_connection_reset_maps_to_runtime_client_error(monkeypatch):
+    server, thread, _ = _worker()
+    _fake_docker(monkeypatch, server.server_port)
+    runtime = _runtime("connection_reset")
+    try:
+        agentcore._container_invocations_url(agentcore._runtimes[runtime["agentRuntimeId"]])
+        monkeypatch.setattr(agentcore, "_local_open", lambda *_args, **_kwargs:
+                            (_ for _ in ()).throw(ConnectionResetError("peer reset")))
+        status, headers, _ = _invoke(runtime["agentRuntimeArn"])
+        assert status == 424
+        assert headers["x-amzn-errortype"] == "RuntimeClientError"
+    finally:
+        agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_stream_failure_leaves_response_truncated(monkeypatch):
+    class BrokenResponse:
+        status = 200
+        headers = {"Content-Type": "text/event-stream"}
+        closed = False
+        reads = 0
+
+        def read1(self, _size):
+            self.reads += 1
+            if self.reads == 1:
+                return b"first\n"
+            raise ConnectionResetError("stream interrupted")
+
+        def close(self):
+            self.closed = True
+
+    response = BrokenResponse()
+    monkeypatch.setattr(agentcore, "_local_open", lambda *_args, **_kwargs: response)
+    status, _, stream = agentcore._invoke_container(
+        "http://127.0.0.1:8080/invocations", b"{}", {}, "application/json", "session-1")
+    assert status == 200
+    frames = []
+
+    async def send(frame):
+        frames.append(frame)
+
+    asyncio.run(stream.runner(send, None))
+    assert frames == [{"type": "http.response.body", "body": b"first\n", "more_body": True}]
+    assert response.closed
 
 
 def test_update_restarts_image(monkeypatch):

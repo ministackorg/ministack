@@ -479,6 +479,19 @@ def _remove_container(container):
         logger.exception("Could not remove AgentCore runtime container")
 
 
+def _remove_orphan_containers(client, labels):
+    """Recover a container created just before a Docker API timeout."""
+    try:
+        matches = client.containers.list(
+            all=True,
+            filters={"label": [f"{name}={value}" for name, value in labels.items()]},
+        )
+        for match in matches:
+            _remove_container(match)
+    except Exception:
+        logger.exception("Could not inspect orphaned AgentCore runtime containers")
+
+
 def _stop_container(runtime_id):
     with _container_lock:
         container = _containers.pop(_container_key(runtime_id), None)
@@ -505,14 +518,17 @@ def _container_invocations_url(runtime):
             except Exception as error:
                 raise RuntimeError(f"Could not inspect runtime container: {error}") from error
         if container is None:
+            client = None
+            labels = {"ministack": "agentcore",
+                      "ministack.agentcore.runtime": runtime["agentRuntimeId"],
+                      "ministack.agentcore.account": key[0],
+                      "ministack.agentcore.region": key[1]}
             try:
                 import docker
                 client = docker.from_env(timeout=60)
                 run_kwargs = {
-                    "detach": True,
                     "environment": runtime.get("environmentVariables", {}),
-                    "labels": {"ministack": "agentcore",
-                               "ministack.agentcore.runtime": runtime["agentRuntimeId"]},
+                    "labels": labels,
                 }
                 network = None
                 try:
@@ -526,7 +542,12 @@ def _container_invocations_url(runtime):
                     run_kwargs["network"] = network
                 else:
                     run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
-                container = client.containers.run(image, **run_kwargs)
+                try:
+                    container = client.containers.create(image, **run_kwargs)
+                except docker.errors.ImageNotFound:
+                    client.images.pull(image)
+                    container = client.containers.create(image, **run_kwargs)
+                container.start()
                 container.reload()
                 if network:
                     address = container.attrs["NetworkSettings"]["Networks"][network]["IPAddress"]
@@ -553,6 +574,8 @@ def _container_invocations_url(runtime):
             except Exception as error:
                 if container is not None:
                     _remove_container(container)
+                elif client is not None:
+                    _remove_orphan_containers(client, labels)
                 raise RuntimeError(f"Could not start runtime image {image}: {error}") from error
         return container._ministack_invocations_url
 
@@ -574,7 +597,7 @@ def _invoke_container(url, body, headers, content_type, session_id):
         error.close()
         return error_response_json("RuntimeClientError",
                                    f"Received error ({error.code}) from runtime.", 424)
-    except (urllib.error.URLError, TimeoutError) as error:
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
         logger.warning("AgentCore container unavailable: %s", error)
         return error_response_json("RuntimeClientError",
                                    "AgentCore runtime container is unavailable", 424)
