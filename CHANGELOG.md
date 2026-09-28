@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **RDS — `DescribeDBClusterSnapshotAttributes`** — was unimplemented (`InvalidAction: Unknown RDS action`), so Terraform's `aws_db_cluster_snapshot` resource failed on read (`reading RDS DB Cluster Snapshot … attribute`) after creating the snapshot. Returns the `restore` attribute with no shared accounts (the manual-snapshot default); `ModifyDBClusterSnapshotAttribute` is not implemented. Unknown snapshot ids answer `DBClusterSnapshotNotFoundFault`.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
