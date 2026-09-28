@@ -36,6 +36,7 @@ from urllib.parse import unquote
 
 from ministack.core.responses import (
     AccountRegionScopedDict,
+    StreamingResponse,
     error_response_json,
     get_account_id,
     get_region,
@@ -430,7 +431,7 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 return error_response_json("InternalServerException",
                                            "Invalid AgentCore proxy URL", 500)
-            return _proxy_agent_runtime(url, body, content_type, session_id)
+            return _proxy_agent_runtime(url, body, headers, content_type, session_id)
 
     # Deterministic echo: return the request payload back under a stable shape
     # so contract tests can assert Invoke request/response handling without a
@@ -451,30 +452,57 @@ def _invoke_agent_runtime(runtime_arn, headers, body):
     return 200, out_headers, out_body
 
 
-def _proxy_agent_runtime(url, body, content_type, session_id):
+_PROXY_REQUEST_HEADERS = (
+    "accept", "x-amzn-trace-id", "traceparent", "tracestate", "baggage",
+)
+_PROXY_RESPONSE_HEADERS = (
+    "x-amzn-trace-id", "traceparent", "tracestate", "baggage",
+)
+
+
+def _proxy_agent_runtime(url, body, headers, content_type, session_id):
     """Forward only invocation data, never the caller's AWS credentials."""
+    forwarded_headers = {
+        "Content-Type": content_type,
+        "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
+    }
+    forwarded_headers.update({name: headers[name] for name in _PROXY_REQUEST_HEADERS if name in headers})
     request = urllib.request.Request(
         url, data=body or b"", method="POST",
-        headers={
-            "Content-Type": content_type,
-            "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
-        },
+        headers=forwarded_headers,
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, {
-                "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
-                "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
-            }, response.read()
+        response = urllib.request.urlopen(request, timeout=30)
     except urllib.error.HTTPError as error:
-        return error.code, {
-            "Content-Type": error.headers.get("Content-Type", "application/octet-stream"),
-            "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
-        }, error.read()
+        error.close()
+        return error_response_json("RuntimeClientError",
+                                   f"Received error ({error.code}) from runtime.", 424)
     except (urllib.error.URLError, TimeoutError) as error:
         logger.warning("AgentCore proxy unavailable: %s", error)
         return error_response_json("InternalServerException",
                                    "Configured AgentCore proxy is unavailable", 500)
+
+    out_headers = {
+        "Content-Type": response.headers.get("Content-Type", "application/octet-stream"),
+        "x-amzn-bedrock-agentcore-runtime-session-id": session_id,
+    }
+    out_headers.update({name: response.headers[name] for name in _PROXY_RESPONSE_HEADERS
+                        if name in response.headers})
+    if "Content-Length" in response.headers:
+        out_headers["Content-Length"] = response.headers["Content-Length"]
+
+    async def _stream(send, receive):
+        try:
+            while chunk := await asyncio.to_thread(response.read1, 64 * 1024):
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        except Exception:
+            logger.exception("AgentCore proxy response stream failed")
+        else:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            response.close()
+
+    return response.status, out_headers, StreamingResponse(_stream)
 
 
 # ---------------------------------------------------------------------------
