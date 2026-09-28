@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import make_client, patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1637,6 +1637,10 @@ def test_s3_event_notification_to_sqs(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-bkt",
         NotificationConfiguration={
@@ -1659,6 +1663,10 @@ def test_s3_event_notification_filter(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-filter-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-filter-bkt",
         NotificationConfiguration={
@@ -1686,6 +1694,10 @@ def test_s3_event_notification_delete(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-del-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-del-bkt",
         NotificationConfiguration={
@@ -1709,6 +1721,10 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bkt, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
         NotificationConfiguration={
@@ -1780,7 +1796,13 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
     )
     # The destination has to exist: AWS verifies an SQS or SNS target by sending
     # it a test notification and fails the whole PUT when that does not arrive.
-    _regional_client("sqs", "us-west-2").create_queue(QueueName="s3-west-region-q")
+    _west_sqs = _regional_client("sqs", "us-west-2")
+    _west_q_url = _west_sqs.create_queue(QueueName="s3-west-region-q")["QueueUrl"]
+    _west_sqs.set_queue_attributes(
+        QueueUrl=_west_q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_s3(
+            "arn:aws:sqs:us-west-2:000000000000:s3-west-region-q",
+            bkt, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
@@ -1809,15 +1831,11 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sqs:us-east-1:000000000001:shared-q",
-        "arn:aws:sqs:us-west-2:000000000000:shared-q",
-    ],
-)
+# A same-region queue in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fallback(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sqs as sqsmod
@@ -1828,24 +1846,22 @@ def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fal
     monkeypatch.setattr(sqsmod, "_queues", {"url/shared-q": {"messages": messages}})
     monkeypatch.setattr(sqsmod, "_ensure_msg_fields", lambda msg: None)
 
-    s3mod._deliver_event_to_sqs(target_arn, {"Records": []}, "us-east-1")
+    s3mod._deliver_event_to_sqs(
+        "arn:aws:sqs:us-west-2:000000000000:shared-q", {"Records": []}, "us-east-1")
 
     assert messages == []
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sns:us-east-1:000000000001:shared-topic",
-        "arn:aws:sns:us-west-2:000000000000:shared-topic",
-    ],
-)
+# A same-region topic in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sns_delivery_rejects_out_of_scope_arns_before_fanout(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sns as snsmod
 
+    target_arn = "arn:aws:sns:us-west-2:000000000000:shared-topic"
     fanouts = []
     monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
     monkeypatch.setattr(snsmod, "_topics", {target_arn: {"subscriptions": []}})
@@ -1913,6 +1929,10 @@ def test_s3_event_notification_cross_account():
     )["Attributes"]["QueueArn"]
     # Confirm the clients really resolve to the non-default account.
     assert f":{account}:" in queue_arn
+    sqsc.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-xacct-bkt", account))})
 
     s3c.put_bucket_notification_configuration(
         Bucket="s3-evt-xacct-bkt",
@@ -3571,6 +3591,231 @@ def test_s3_delete_bucket_removes_persisted_dir(tmp_path, monkeypatch):
         s3mod._buckets._data.pop(("000000000000", "issue824-delete"), None)
 
 
+# ---------------------------------------------------------------------------
+# Delete-marker persistence (S3_PERSIST)
+#
+# A delete marker has no body, so the data file left on disk belongs to the
+# version it hides. Persisting the marker to the key's .meta.json sidecar is
+# what stops a restart from reloading that file as a live object.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def s3_persist(tmp_path, monkeypatch):
+    """Point S3 at a throwaway DATA_DIR with persistence on, default account."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+
+    buckets_before = set(s3mod._buckets._data)
+    versions_before = set(s3mod._object_versions._data)
+    versioning_before = set(s3mod._bucket_versioning._data)
+    yield s3mod
+    for store, before in (
+        (s3mod._buckets._data, buckets_before),
+        (s3mod._object_versions._data, versions_before),
+        (s3mod._bucket_versioning._data, versioning_before),
+    ):
+        for key in set(store) - before:
+            store.pop(key, None)
+
+
+def _reload_bucket(s3mod, tmp_path, bucket, account="000000000000"):
+    """Drop one bucket from memory and reload it from disk (a restart)."""
+    s3mod._buckets._data.pop((account, bucket), None)
+    for vkey in [k for k in s3mod._object_versions._data
+                 if k[0] == account and k[1][0] == bucket]:
+        s3mod._object_versions._data.pop(vkey, None)
+    s3mod._load_persisted_bucket(
+        account, bucket, os.path.join(str(tmp_path), account, bucket))
+
+
+def test_s3_delete_marker_survives_restart(s3_persist, tmp_path):
+    """A versioned delete persists its marker; a restart keeps the key hidden
+    instead of reloading the object's still-present data file as current."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "gone.txt", b"payload", {})
+
+    status, del_headers, _ = s3mod._delete_object(bucket, "gone.txt")
+    assert status == 204
+    assert del_headers["x-amz-delete-marker"] == "true"
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "gone.txt.meta.json")
+    with open(meta_path) as mf:
+        meta = json.load(mf)
+    assert meta["is_delete_marker"] is True
+    assert meta["version_id"] == del_headers["x-amz-version-id"]
+    assert meta["versions"][0]["etag"]
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert "gone.txt" not in restored["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "gone.txt"))]
+    assert versions[-1]["is_delete_marker"] is True
+    assert versions[-1]["is_latest"] is True
+
+    # GetObject on the hidden key reports the miss as a delete marker.
+    status, get_headers, _ = s3mod._get_object(bucket, "gone.txt", {})
+    assert status == 404
+    assert get_headers.get("x-amz-delete-marker") == "true"
+
+
+def test_s3_delete_marker_restores_previous_version_metadata(s3_persist, tmp_path):
+    """The version a marker displaced is rebuilt below it, so
+    ListObjectVersions does not lose it across a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-prev"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+
+    s3mod._delete_object(bucket, "k")
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [bool(v.get("is_delete_marker")) for v in versions] == [False, True]
+    assert versions[0]["version_id"] == version_id
+    assert versions[0]["etag"] == put_headers["ETag"]
+    assert versions[0]["is_latest"] is False
+    assert versions[1]["is_latest"] is True
+
+
+def test_s3_lone_delete_marker_sidecar_restores_without_data_file(s3_persist, tmp_path):
+    """A marker whose data file is gone (key never had a body, or the version
+    was purged) still survives as a lone .meta.json sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-lone"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+    s3mod._delete_object(bucket, "k")
+
+    os.remove(os.path.join(str(tmp_path), "000000000000", bucket, "k"))
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_purging_delete_marker_restores_object_after_restart(s3_persist, tmp_path):
+    """Deleting the marker by version id un-hides the object, and the sidecar
+    must be rewritten so a restart does not keep it hidden."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-undelete"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+    _, del_headers, _ = s3mod._delete_object(bucket, "k")
+    marker_id = del_headers["x-amz-version-id"]
+
+    status, _, _ = s3mod._delete_object(bucket, "k", query_params={"versionId": marker_id})
+    assert status == 204
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert restored["objects"]["k"]["version_id"] == version_id
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert not versions[-1].get("is_delete_marker")
+
+
+def test_s3_put_after_delete_marker_clears_marker_on_disk(s3_persist, tmp_path):
+    """A write over a delete marker replaces the marker sidecar, so the new
+    object is visible again after a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-reput"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"one", {})
+    s3mod._delete_object(bucket, "k")
+    s3mod._put_object(bucket, "k", b"two", {})
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "k.meta.json")
+    with open(meta_path) as mf:
+        assert "is_delete_marker" not in json.load(mf)
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert s3mod._read_body(bucket, "k", restored["objects"]["k"]) == b"two"
+
+
+def test_s3_batch_delete_objects_persists_delete_marker(s3_persist, tmp_path):
+    """DeleteObjects on a versioned bucket creates a marker via the same path
+    as DeleteObject, so it must persist too."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-batch-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    body = (
+        b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Object><Key>k</Key></Object></Delete>"
+    )
+    status, _, _ = s3mod._delete_objects(bucket, body)
+    assert status == 200
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_noncurrent_versions_keep_bytes_tags_and_acls_across_restart(s3_persist, tmp_path):
+    """Every version comes back with its own bytes, tags and ACL, including
+    after a noncurrent version is purged under a delete marker."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-history"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    vids = [s3mod._put_object(bucket, "k", body, {"x-amz-tagging": f"n={body.decode()}"})[1]["x-amz-version-id"]
+            for body in (b"one", b"two", b"three")]
+    s3mod._put_object_acl(bucket, "k", b"", {"x-amz-acl": "public-read"}, {"versionId": [vids[0]]})
+    s3mod._delete_object(bucket, "k")
+    s3mod._delete_object(bucket, "k", query_params={"versionId": vids[2]})
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [v["version_id"] for v in versions[:-1]] == vids[:2]
+    assert versions[-1]["is_delete_marker"] and versions[-1]["is_latest"]
+    assert [s3mod._get_object_data(bucket, "k", version_id=v) for v in vids[:2]] == [b"one", b"two"]
+    assert [s3mod._object_tags[(bucket, "k", v)] for v in vids[:2]] == [{"n": "one"}, {"n": "two"}]
+    assert "AllUsers" in s3mod._object_acl[(bucket, "k", vids[0])]
+
+
+def test_s3_unversioned_delete_removes_persisted_files(s3_persist, tmp_path):
+    """Regression guard: a plain delete on an unversioned bucket still removes
+    both the data file and its sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-unversioned"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    data_path = os.path.join(str(tmp_path), "000000000000", bucket, "k")
+    assert os.path.isfile(data_path)
+
+    s3mod._delete_object(bucket, "k")
+    assert not os.path.exists(data_path)
+    assert not os.path.exists(data_path + ".meta.json")
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    assert s3mod._buckets._data.get(("000000000000", bucket), {}).get("objects", {}) == {}
+
+
 def test_s3_copy_object_propagates_storage_class(s3):
     """CopyObject with explicit StorageClass overrides the source's class (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc-copy")
@@ -4444,6 +4689,10 @@ def test_s3_event_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"]
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
@@ -6177,6 +6426,10 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "qa-s3-restore-evt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="qa-s3-restore-evt",
         NotificationConfiguration={
@@ -6706,6 +6959,10 @@ def test_s3_notification_auto_generates_a_base64_uuid_id(s3, sqs):
     queue = sqs.create_queue(QueueName=f"notif-id-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
         NotificationConfiguration={"QueueConfigurations": [
@@ -6730,6 +6987,10 @@ def test_s3_notification_keeps_an_explicit_id(s3, sqs):
     queue = sqs.create_queue(QueueName=f"notif-expl-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
         NotificationConfiguration={"QueueConfigurations": [

@@ -1960,6 +1960,37 @@ def test_bedrock_converse_stream_emits_the_tool_use_event_sequence():
     assert dict(events)["messageStop"] == {"stopReason": "tool_use"}
 
 
+def test_bedrock_converse_tool_call_reports_the_proxy_token_usage(monkeypatch):
+    """A tool-call turn has no text to estimate from; the proxy's own usage is
+    the model's token count, tool schema and tool call included."""
+    import io
+
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    reply = {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_abc", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]}}],
+        "usage": {"prompt_tokens": 158, "completion_tokens": 20, "total_tokens": 178}}
+    monkeypatch.setattr(br, "_PROXY_URL", "http://proxy.invalid")
+    monkeypatch.setattr(br.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps(reply).encode()))
+
+    message, counts = br._proxy_openai_chat_message(
+        "m", [{"role": "user", "content": [{"text": "weather?"}]}], [], None)
+    assert message["tool_calls"][0]["id"] == "call_abc"
+    assert counts == (158, 20)
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "weather?"}]}], [], 0, "",
+        stop_reason="tool_use", input_tokens=158, output_tokens=20)
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    metadata = [json.loads(e.payload) for e in buffer if e.headers.get(":event-type") == "metadata"][0]
+    assert metadata["usage"] == {"inputTokens": 158, "outputTokens": 20, "totalTokens": 178}
+
+
 def test_bedrock_converse_stream_without_tools_is_unchanged():
     from botocore.eventstream import EventStreamBuffer
 

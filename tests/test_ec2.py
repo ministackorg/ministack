@@ -1217,6 +1217,10 @@ def test_ec2_elastic_ip_crud(ec2):
     assert alloc_id.startswith("eipalloc-")
     assert "PublicIp" in alloc
 
+    ec2.create_tags(Resources=[alloc_id], Tags=[{"Key": "Name", "Value": "nat-eip"}])
+    tagged = ec2.describe_addresses(AllocationIds=[alloc_id])["Addresses"][0]
+    assert tagged["Tags"] == [{"Key": "Name", "Value": "nat-eip"}]
+
     resp = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1)
     iid = resp["Instances"][0]["InstanceId"]
 
@@ -1374,6 +1378,38 @@ def test_ec2_modify_vpc_attribute(ec2):
     ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
     ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
     ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_subnet_dns_and_ipv6_attributes_read_back(ec2):
+    """DescribeSubnets answers the DNS and IPv6 attributes; ModifySubnetAttribute sets the DNS options."""
+    vpc_id = subnet_id = None
+    try:
+        vpc_id = ec2.create_vpc(CidrBlock="10.61.0.0/16")["Vpc"]["VpcId"]
+        subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.61.1.0/24")["Subnet"]["SubnetId"]
+
+        def attributes():
+            subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+            return {key: subnet.get(key) for key in (
+                "PrivateDnsNameOptionsOnLaunch", "EnableDns64", "Ipv6Native",
+                "AssignIpv6AddressOnCreation")}
+
+        assert attributes() == {
+            "PrivateDnsNameOptionsOnLaunch": {
+                "HostnameType": "ip-name", "EnableResourceNameDnsARecord": False,
+                "EnableResourceNameDnsAAAARecord": False},
+            "EnableDns64": False, "Ipv6Native": False, "AssignIpv6AddressOnCreation": False}
+        ec2.modify_subnet_attribute(SubnetId=subnet_id, PrivateDnsHostnameTypeOnLaunch="resource-name")
+        ec2.modify_subnet_attribute(SubnetId=subnet_id,
+                                    EnableResourceNameDnsARecordOnLaunch={"Value": True})
+        assert attributes()["PrivateDnsNameOptionsOnLaunch"] == {
+            "HostnameType": "resource-name", "EnableResourceNameDnsARecord": True,
+            "EnableResourceNameDnsAAAARecord": False}
+    finally:
+        if subnet_id:
+            ec2.delete_subnet(SubnetId=subnet_id)
+        if vpc_id:
+            ec2.delete_vpc(VpcId=vpc_id)
+
 
 def test_ec2_modify_subnet_attribute(ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.11.0.0/16")["Vpc"]["VpcId"]
@@ -1639,6 +1675,36 @@ def test_ec2_network_acl_replace_entry(ec2):
     entries = desc["NetworkAcls"][0]["Entries"]
     assert len(entries) == 1
     assert entries[0]["RuleAction"] == "allow"
+
+
+def test_ec2_network_acl_ipv6_entry(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.105.0.0/16")["Vpc"]["VpcId"]
+    try:
+        acl_id = ec2.create_network_acl(VpcId=vpc_id)["NetworkAcl"]["NetworkAclId"]
+        ec2.create_network_acl_entry(
+            NetworkAclId=acl_id,
+            RuleNumber=101,
+            Protocol="-1",
+            RuleAction="allow",
+            Egress=True,
+            Ipv6CidrBlock="::/0",
+        )
+        ec2.replace_network_acl_entry(
+            NetworkAclId=acl_id,
+            RuleNumber=101,
+            Protocol="-1",
+            RuleAction="allow",
+            Egress=True,
+            Ipv6CidrBlock="2001:db8::/32",
+        )
+
+        entries = ec2.describe_network_acls(NetworkAclIds=[acl_id])["NetworkAcls"][0]["Entries"]
+        ipv6_entry = next(entry for entry in entries if entry["RuleNumber"] == 101)
+        assert ipv6_entry["Ipv6CidrBlock"] == "2001:db8::/32"
+        assert "CidrBlock" not in ipv6_entry
+    finally:
+        ec2.delete_network_acl(NetworkAclId=acl_id)
+        ec2.delete_vpc(VpcId=vpc_id)
 
 def test_ec2_flow_logs_crud(ec2):
     vpc = ec2.create_vpc(CidrBlock="10.104.0.0/16")
@@ -2560,6 +2626,43 @@ def test_ec2_launch_template_crud(ec2):
     ec2.delete_launch_template(LaunchTemplateId=lt_id)
     desc3 = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])
     assert len(desc3["LaunchTemplates"]) == 0
+
+
+def test_ec2_launch_template_versions_newest_first(ec2):
+    """DescribeLaunchTemplateVersions lists newest first."""
+    name = f"qa-lt-order-{_uuid_mod.uuid4().hex[:8]}"
+    lt_id = ec2.create_launch_template(
+        LaunchTemplateName=name, LaunchTemplateData={"InstanceType": "t3.micro"},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        for instance_type in ("t3.small", "t3.medium"):
+            ec2.create_launch_template_version(
+                LaunchTemplateId=lt_id, LaunchTemplateData={"InstanceType": instance_type})
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=lt_id)["LaunchTemplateVersions"]
+        assert [v["VersionNumber"] for v in versions] == [3, 2, 1]
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_ec2_launch_template_tags_read_back(ec2):
+    """Launch template tags read back through tagSet."""
+    name = f"qa-lt-tags-{_uuid_mod.uuid4().hex[:8]}"
+    resp = ec2.create_launch_template(
+        LaunchTemplateName=name,
+        LaunchTemplateData={"InstanceType": "t3.micro", "ImageId": "ami-12345678"},
+        TagSpecifications=[{"ResourceType": "launch-template",
+                            "Tags": [{"Key": "team", "Value": "qa"}]}],
+    )
+    lt_id = resp["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        assert resp["LaunchTemplate"]["Tags"] == [{"Key": "team", "Value": "qa"}]
+        ec2.create_tags(Resources=[lt_id], Tags=[{"Key": "added", "Value": "later"}])
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert sorted((t["Key"], t["Value"]) for t in described["Tags"]) == [
+            ("added", "later"), ("team", "qa")]
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
 
 
 def test_ec2_launch_template_duplicate_name(ec2):

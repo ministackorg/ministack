@@ -373,9 +373,44 @@ def resolve_parameter_value(name_or_arn, version=None, decrypt=False):
     return param.get("Value")
 
 
+def _split_selector(name_or_arn):
+    """Split a trailing ":version" / ":label"; parameter names cannot contain ":"."""
+    if not name_or_arn:
+        return name_or_arn, None
+    base_colons = 5 if name_or_arn.startswith("arn:") else 0
+    if name_or_arn.count(":") <= base_colons:
+        return name_or_arn, None
+    base, selector = name_or_arn.rsplit(":", 1)
+    return base, selector
+
+
+def _select_parameter(name_or_arn):
+    """(param, error) for GetParameter / GetParameters, honouring name:version and name:label."""
+    base, selector = _split_selector(name_or_arn)
+    name, param = _lookup_parameter(base)
+    if not param:
+        return None, "ParameterNotFound"
+    if selector is None:
+        return param, None
+    history = _parameter_history.get(name) or []
+    if selector.isdigit():
+        entry = next((h for h in history if str(h.get("Version")) == selector), None)
+    else:
+        entry = next((h for h in history if selector in (h.get("Labels") or [])), None)
+    if entry is None:
+        return None, "ParameterVersionNotFound"
+    return {**entry, "Name": param["Name"], "ARN": param["ARN"], "Selector": f":{selector}"}, None
+
+
 def _get_parameter(data):
     name = data.get("Name")
-    _, param = _lookup_parameter(name)
+    param, error = _select_parameter(name)
+    if error == "ParameterVersionNotFound":
+        return error_response_json(
+            "ParameterVersionNotFound",
+            f"Systems Manager could not find version {_split_selector(name)[1]} of {_split_selector(name)[0]}.",
+            400,
+        )
     if not param:
         return error_response_json("ParameterNotFound", f"Parameter {name} not found", 400)
     with_decryption = data.get("WithDecryption", False)
@@ -388,7 +423,7 @@ def _get_parameters(data):
     params = []
     invalid = []
     for name in names:
-        _, p = _lookup_parameter(name)
+        p, _ = _select_parameter(name)
         if p:
             params.append(_param_out(p, with_decryption))
         else:

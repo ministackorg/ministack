@@ -5,6 +5,68 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **SNS — `AddPermission` and `RemovePermission`** — they append to and prune the topic's `Policy` attribute with the AWS statement shape (bare account ids, lowercase `sns:` actions), mirroring the long-standing SQS pair, and a duplicate label is `InvalidParameterException`.
+
+### Fixed
+
+- **SQS/SNS — queue and topic policies are enforced under `AUTH=true`** — the `Policy` attributes were stored but never evaluated, so S3→SQS and SNS→SQS deliveries landed and cross-account send/publish failed regardless of the policy. Same-account calls now pass unless the policy carries an explicit Deny; cross-account calls need an explicit Allow (`AccessDenied` for SQS, `AuthorizationError` for SNS); S3 and SNS deliveries are dropped unless the destination policy Allows the calling service with its `aws:SourceArn`/`aws:SourceAccount` conditions, exactly like real AWS — including queues and topics with no policy at all. With auth disabled every path stays permissive. `GetQueueUrl` accepts `QueueOwnerAWSAccountId`.
+- **S3 — notification destinations are validated at PUT time** — configuring an SQS/SNS target whose policy does not let S3 publish now fails the whole `PutBucketNotificationConfiguration` with `InvalidArgument` ("Unable to validate the following destination configurations"), like real S3, when `AUTH=true`; with auth disabled the probe checks existence only. SQS/SNS targets may live in another account when their policy allows the delivery. The `SkipDestinationValidation` option skips the probe (and the test event).
+- **Bedrock AgentCore — opt-in Docker runtime** — set `MINISTACK_AGENTCORE_DOCKER=1` to start the declared `containerConfiguration.containerUri` image on first invocation, connect via a localhost port when MiniStack runs on the host or via MiniStack's Docker network when containerized, call `/ping`, and forward `InvokeAgentRuntime` to `/invocations` on port 8080. The container is reused and removed on update, delete, or reset. Container and worker HTTP errors become `RuntimeClientError` (424); caller credentials are not forwarded. Without Docker mode, the existing deterministic echo remains for SDK tests. This covers HTTP only and does not emulate AWS IAM/VPC isolation or model inference.
+- **CloudWatch Logs — delivery destination policy** — `PutDeliveryDestinationPolicy`, `GetDeliveryDestinationPolicy`, `DeleteDeliveryDestinationPolicy`. Required by an operator that authorizes `delivery.logs.amazonaws.com` to create deliveries to a `DeliveryDestination` (e.g. CloudFront access-log delivery to a log group) — `PutDeliveryDestinationPolicy` previously had no route, blocking the delivery from ever being created. Contributed by @fabio-andre-rodrigues.
+- **S3 — object annotations** — `PutObjectAnnotation`, `GetObjectAnnotation`, `ListObjectAnnotations` (prefix, `max-annotation-results`, continuation tokens) and `DeleteObjectAnnotation`: named UTF-8 payloads of 1 byte to 1 MiB, up to 1,000 per object version, with S3's naming rules (`InvalidAnnotationName`, `AnnotationNameTooLong`), `AnnotationLimitExceeded`, `UnsupportedMediaType` and `x-amz-object-if-match`. Each belongs to one object version: a new version starts with none, deleting a version deletes its annotations, a delete marker keeps them, and an unversioned overwrite or delete drops them; writing one changes neither the object's ETag nor its version. `CopyObject` carries them unless `x-amz-object-annotation-directive: EXCLUDE`, and recomputes their checksums when the copy names a new algorithm. Payload checksums are verified (`BadDigest`) and default to CRC64NVME; CRC32, CRC32C, CRC64NVME, SHA1, SHA256, SHA512, MD5 and XXHASH64 are computed, while XXHASH3 and XXHASH128 are refused rather than stored unverified. Annotations take the object's encryption and are refused on SSE-C objects, replicate with the object (`COMPLETED` / `REPLICA`), respect Object Lock on every write (governance retention needs `x-amz-bypass-governance-retention` to put, overwrite or delete one; compliance retention and a legal hold refuse all three, bypass or not, each as 403 `AccessDenied` naming retention or the legal hold, as observed on AWS), persist per version with `S3_PERSIST=1`, and send `s3:ObjectAnnotation:Put` / `s3:ObjectAnnotation:Delete` events with the record's `objectAnnotation` block; a `CopyObject` event reports `hasObjectAnnotation`. Previously a `PUT ?annotation` fell through to `PutObject` and replaced the object with the payload. The S3 Metadata annotation table (`UpdateBucketMetadataAnnotationTableConfiguration`) is not included: MiniStack has no S3 Metadata configuration for it to belong to. Checked against the S3 API Reference, the S3 User Guide's "Annotating your objects" page and the botocore model; the Object Lock behaviour was validated against AWS (ap-southeast-2).
+
+### Fixed
+
+- **API Gateway v1 — REQUEST authorizer events carry `requestContext.identity`** — the event sent to a REQUEST Lambda authorizer had no `identity` block, so an authorizer reading `event.requestContext.identity.sourceIp` or `.userAgent` crashed and every request answered 500 or its own fallback Deny. It now reports `sourceIp` (first `X-Forwarded-For` hop) and `userAgent`, the same values the `AWS_PROXY` integration event already carries. Checked against the API Gateway Developer Guide ("Input to an API Gateway Lambda authorizer", whose REQUEST example includes `requestContext.identity.sourceIp`, and the `$context.identity.userAgent` context variable); a production REQUEST authorizer that reads `identity.userAgent` works on AWS. Not validated against a captured AWS event.
+- **DynamoDB — `DescribeTable` accepts a table ARN** — `TableName` given as the table's ARN answered `ResourceNotFoundException`, where AWS accepts either form. It now resolves through the same ARN normalization the other table operations use, and an ARN from another account or region still answers `ResourceNotFoundException`. This unblocks OpenSearch Data Prepper's DynamoDB source, which always describes the table by ARN.
+- **S3 — event notification records match S3's** — the object block carries the key URL-encoded (`red flower.jpg` → `red+flower.jpg`), the `versionId` the write made or removed, and a `sequencer` that grows with every create and delete (it was always `"0"`); records are `eventVersion` `2.6`. A delete that leaves a delete marker is `ObjectRemoved:DeleteMarkerCreated` (it was `ObjectRemoved:Delete`, so a subscription to permanent deletes received markers), and `DeleteObjects` sends an event for each object it removes (it sent none). Checked against the S3 User Guide's "Event message structure" and "Event notification types and destinations" pages; not validated against a real AWS account.
+- **STS — `GetCallerIdentity` resolves IAM-user callers** — keys created with `CreateAccessKey` returned the `root` ARN; they now return the user's ARN and ID in both XML and JSON protocols. Under `AUTH=true`, unknown and inactive keys are rejected instead of reported as root.
+
+## [1.5.17] — 2026-09-25
+
+### Added
+
+- **Lambda MicroVMs — images build and run in Docker** — with Docker available, `CreateMicrovmImage` / `UpdateMicrovmImage` build the `codeArtifact` Dockerfile (`CREATING` → `CREATED` / `CREATE_FAILED`), call the `/ready` and `/validate` hooks, and `RunMicrovm` runs the image. Only the disk is snapshotted. Contributed by @edersonbrilhante.
+- **CloudFront — public keys and key groups** — `CreatePublicKey`, `GetPublicKey`, `GetPublicKeyConfig`, `UpdatePublicKey`, `DeletePublicKey`, `ListPublicKeys` and the same six for key groups, with `PublicKeyInUse` / `ResourceInUse` on delete. Contributed by @fabio-andre-rodrigues.
+- **Step Functions — execution history pagination** — `GetExecutionHistory` pages with `nextToken`, and `includeExecutionData=false` drops input and output. Contributed by @jayjanssen.
+- **CloudFormation — more types update in place** — AppConfig, AppSync GraphQL APIs and API keys, Auto Scaling groups, policies and scheduled actions, VPCs, subnets, security groups, launch templates, internet gateways, route tables and routes keep their id on a No interruption change instead of being recreated. Contributed by @iot-rocket.
+
+### Fixed
+
+- **CloudFormation — import change sets are validated and refused** — `IMPORT` change sets are validated and listed as `Import` changes; executing one is refused. Every change carries `Type: Resource`. Contributed by @iot-rocket.
+- **SSM — `GetParameter` reads `name:version` and `name:label`** — they answered `ParameterNotFound`; a missing version or label is `ParameterVersionNotFound`. Reported by @lobodpav.
+- **Lambda — `ReservedConcurrentExecutions=0` throttles every invoke** — zero was treated as unset. Contributed by @AdrianAcala.
+- **Step Functions — Secrets Manager `SecretBinary`** — the SDK integration passes literal text instead of base64. Contributed by @jayjanssen.
+- **Auto Scaling — scaling policies and scheduled actions keep their members** — target tracking, step and predictive settings, `StartTime`, `EndTime` and `TimeZone` were dropped. Contributed by @iot-rocket.
+- **EC2 — subnets, launch templates and route tables answer their attributes** — subnet DNS and IPv6 attributes, launch template `tagSet` and newest-first versions, and every route destination and target. Contributed by @iot-rocket.
+- **CloudFormation — a failed update rolls back its in-place changes** — changed resources are reverted, and a failed revert lands in `UPDATE_ROLLBACK_FAILED`. Contributed by @iot-rocket.
+- **CloudFormation — ECS cluster settings and stack tags** — `ClusterSettings`, `DefaultCapacityProviderStrategy` and `Configuration` read back, and EC2 network resources carry the stack's tags. Contributed by @iot-rocket.
+
+## [1.5.16] — 2026-09-23
+
+### Added
+
+- **Organizations — member accounts, service control policies and attachments** — `CreateAccount`, `DescribeCreateAccountStatus`, `MoveAccount`, `CloseAccount`, `CreatePolicy`, `DescribePolicy`, `UpdatePolicy`, `DeletePolicy`, `ListPolicies`, `AttachPolicy`, `DetachPolicy`, `ListPoliciesForTarget`, `ListTargetsForPolicy`, `EnablePolicyType` and `DisablePolicyType`, so `aws_organizations_account`, `aws_organizations_policy` and `aws_organizations_policy_attachment` apply. `CreateAccount` answers with a `CreateAccountStatus` whose id the provider reads back through `DescribeCreateAccountStatus`, as on AWS. A root carries `SERVICE_CONTROL_POLICY` enabled and the AWS-managed `p-FullAWSAccess`, attaching a policy whose type the root has disabled is `PolicyTypeNotEnabledException`, and deleting an attached policy is `PolicyInUseException`. Reported by @rv0lt.
+- **SNS — direct-to-phone publishes can be read back** — a `Publish` with a `PhoneNumber` and no `TopicArn` is recorded and served at `GET /_ministack/sns/sms-messages`, filterable by `account`, `region` and `phoneNumber`. Contributed by @himangshuj.
+- **Lambda MicroVMs — image lifecycle** — `ListMicrovmImages`, `GetMicrovmImage`, `GetMicrovmImageVersion` and `UpdateMicrovmImage`. Contributed by @edersonbrilhante.
+
+### Fixed
+
+- **S3 — a versioned object keeps its history across a restart** — with `S3_PERSIST=1` a delete marker was lost on restart, so a deleted object came back. Every version and delete marker now persists with the object on disk, each version keeps its own bytes, tags and ACL, and object tags and ACLs survive a restart for unversioned objects too. Contributed by @pauloRohling.
+- **ECS — service deployments track task health and roll back** — a completed deployment drains the previous task definition's tasks, `deploymentCircuitBreaker` fails a deployment whose tasks keep stopping and, with `rollback`, restores the previous one, and replacement stays within `maximumPercent` while keeping `minimumHealthyPercent` of `desiredCount` running. Contributed by @jgrumboe.
+- **CloudFormation — change sets report which property edits replace a resource** — every property edit answered `Replacement: Conditional` and `RequiresRecreation: Conditionally`. For 21 resource types a create-only property is now `Always` with `Replacement: True`, a conditionally create-only one stays `Conditionally`, and every other property is `Never`. Contributed by @iot-rocket.
+- **EC2 — Elastic IP tags and IPv6 network ACL entries survive a read** — `DescribeAddresses` omitted EIP tags, so Terraform repeatedly planned `tags` and `tags_all`; network ACL entries always stored and returned an IPv4 CIDR, so an IPv6 rule was read back as a changed IPv4 rule on every plan. Tags and `Ipv6CidrBlock` now round-trip through the EC2 API, and `ReleaseAddress` drops the address's tags. Contributed by @edersonbrilhante.
+- **Bedrock — a proxied tool-call turn reports its real token usage** — with `MINISTACK_BEDROCK_PROXY_URL` set, `Converse` and `ConverseStream` estimated usage from the reply text, so a turn that returned only a `toolUse` block reported `outputTokens: 0`, and `inputTokens` ignored the `toolConfig`. Usage now comes from the proxy's own `prompt_tokens` and `completion_tokens`, with the estimate kept for a proxy that sends none. Reported by @Vidminas.
+
+### Internal
+
+- **CI — one Docker preview comment per PR** — the preview-image workflow updates a single comment instead of posting one per push. Contributed by @jgrumboe.
+- **Tests** — split test files folded into their service's file.
+
 ## [1.5.15] — 2026-09-22
 
 ### Added

@@ -31,7 +31,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import patch_endpoint_dns
+from conftest import patch_endpoint_dns, sqs_policy_allow_sns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -1112,6 +1112,9 @@ def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"]
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(queue_arn, topic_arn))})
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
 
     rule = _unique("snsrule").replace("-", "_")
