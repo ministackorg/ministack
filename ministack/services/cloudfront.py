@@ -18,13 +18,19 @@ Supports:
   KeyValueStore: CreateKeyValueStore, DescribeKeyValueStore, ListKeyValueStores,
                  UpdateKeyValueStore, DeleteKeyValueStore
   Cache policies: CreateCachePolicy, GetCachePolicy, GetCachePolicyConfig,
-                 UpdateCachePolicy, DeleteCachePolicy, ListDistributionsByCachePolicyId
+                 UpdateCachePolicy, DeleteCachePolicy, ListCachePolicies,
+                 ListDistributionsByCachePolicyId — includes the fixed catalog
+                 of AWS-managed policies (Type=managed), which are immutable
   Origin request policies: CreateOriginRequestPolicy, GetOriginRequestPolicy,
                  GetOriginRequestPolicyConfig, UpdateOriginRequestPolicy,
-                 DeleteOriginRequestPolicy, ListDistributionsByOriginRequestPolicyId
+                 DeleteOriginRequestPolicy, ListOriginRequestPolicies,
+                 ListDistributionsByOriginRequestPolicyId — includes the
+                 AWS-managed policy catalog (Type=managed), immutable
   Response headers policies: CreateResponseHeadersPolicy, GetResponseHeadersPolicy,
                  GetResponseHeadersPolicyConfig, UpdateResponseHeadersPolicy,
-                 DeleteResponseHeadersPolicy, ListDistributionsByResponseHeadersPolicyId
+                 DeleteResponseHeadersPolicy, ListResponseHeadersPolicies,
+                 ListDistributionsByResponseHeadersPolicyId — includes the
+                 AWS-managed policy catalog (Type=managed), immutable
   Public keys: CreatePublicKey, GetPublicKey, GetPublicKeyConfig,
                  UpdatePublicKey, DeletePublicKey, ListPublicKeys
   Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
@@ -52,6 +58,7 @@ import logging
 import random
 import re
 import string
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -1069,6 +1076,110 @@ def _build_cache_policy_xml(parent, policy):
     _build_cache_policy_config_xml(cfg_el, policy["Config"])
 
 
+# ---------------------------------------------------------------------------
+# AWS-managed policies (cache / origin request / response headers).
+#
+# Real CloudFront ships a fixed catalog of these under every account; Terraform
+# modules reference them by name (e.g. "Managed-CachingDisabled") via the
+# aws_cloudfront_cache_policy/aws_cloudfront_origin_request_policy/
+# aws_cloudfront_response_headers_policy data sources, and ListCachePolicies
+# et al. must report them with Type=managed. They are immutable (Update/Delete
+# error) and identical for every account, so they are seeded once as module
+# constants rather than per-account state — nothing resets or persists them
+# because nothing ever mutates them.
+#
+# Evidence: AWS docs — "Use managed cache policies", "Use managed origin
+# request policies", "Use managed response headers policies" (CloudFront
+# Developer Guide) for names/ids/configs. The literal "Managed-" Name prefix
+# (docs show only the short console name) is confirmed by ops-v2's
+# modules/cloudfront-api, which already looks policies up by e.g.
+# "Managed-CachingDisabled". LastModifiedTime below is a stable placeholder,
+# not an AWS-observed value.
+# ---------------------------------------------------------------------------
+
+_MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:29:32.290Z"
+
+
+def _managed_etag(policy_id: str) -> str:
+    """A stable, unique ETag for a managed policy (real AWS ETags are opaque)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-managed-policy/{policy_id}"))
+
+
+def _managed_policy(policy_id: str, config: dict) -> dict:
+    return {
+        "Id": policy_id,
+        "ETag": _managed_etag(policy_id),
+        "LastModifiedTime": _MANAGED_POLICY_LAST_MODIFIED,
+        "Config": config,
+    }
+
+
+def _cache_params(gzip, brotli, header_behavior, headers, cookie_behavior, cookies, qs_behavior, qs):
+    return {
+        "EnableAcceptEncodingGzip": gzip,
+        "EnableAcceptEncodingBrotli": brotli,
+        "HeaderBehavior": header_behavior, "Headers": list(headers),
+        "CookieBehavior": cookie_behavior, "Cookies": list(cookies),
+        "QueryStringBehavior": qs_behavior, "QueryStrings": list(qs),
+    }
+
+
+_MANAGED_CACHE_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "2e54312d-136d-493c-8eb9-b001f22f67d2": {
+            "Name": "Managed-Amplify", "Comment": "", "MinTTL": 2, "DefaultTTL": 2, "MaxTTL": 600,
+            "Parameters": _cache_params(
+                True, True, "whitelist", ["Authorization", "CloudFront-Viewer-Country", "Host"],
+                "all", [], "all", [],
+            ),
+        },
+        "4135ea2d-6df8-44a3-9df3-4b5a84be39ad": {
+            "Name": "Managed-CachingDisabled", "Comment": "", "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+            "Parameters": _cache_params(False, False, "none", [], "none", [], "none", []),
+        },
+        "658327ea-f89d-4fab-a63d-7e88639e58f6": {
+            "Name": "Managed-CachingOptimized", "Comment": "", "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(True, True, "none", [], "none", [], "none", []),
+        },
+        "b2884449-e4de-46a7-ac36-70bc7f1ddd6d": {
+            "Name": "Managed-CachingOptimizedForUncompressedObjects", "Comment": "",
+            "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(False, False, "none", [], "none", [], "none", []),
+        },
+        "08627262-05a9-4f76-9ded-b50ca2e3a84f": {
+            "Name": "Managed-Elemental-MediaPackage", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, False, "whitelist", ["Origin"], "none", [],
+                "whitelist", ["aws.manifestfilter", "start", "end", "m"],
+            ),
+        },
+        "83da9c7e-98b4-4e11-a168-04f0df8e2c65": {
+            "Name": "Managed-UseOriginCacheControlHeaders", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, True, "whitelist",
+                ["Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"],
+                "all", [], "none", [],
+            ),
+        },
+        "4cc15a8a-d715-48a4-82b8-cc0b614638fe": {
+            "Name": "Managed-UseOriginCacheControlHeaders-QueryStrings", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, True, "whitelist",
+                ["Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"],
+                "all", [], "all", [],
+            ),
+        },
+    }.items()
+}
+
+_ILLEGAL_UPDATE_MSG = "The specified CloudFront managed policy cannot be updated."
+_ILLEGAL_DELETE_MSG = "The specified CloudFront managed policy cannot be deleted."
+
+
 def _value_contains(obj, target):
     """Best-effort recursive search for a policy Id anywhere in a distribution record."""
     if isinstance(obj, str):
@@ -1091,7 +1202,7 @@ def _create_cache_policy(body):
     cfg, err = _parse_cache_policy_config(el)
     if err is not None:
         return err
-    for existing in _cache_policies.values():
+    for existing in (*_cache_policies.values(), *_MANAGED_CACHE_POLICIES.values()):
         if existing["Config"]["Name"] == cfg["Name"]:
             return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
     policy_id = new_uuid()
@@ -1110,7 +1221,7 @@ def _create_cache_policy(body):
 
 
 def _get_cache_policy(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -1121,7 +1232,7 @@ def _get_cache_policy(policy_id):
 
 
 def _get_cache_policy_config(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -1132,6 +1243,8 @@ def _get_cache_policy_config(policy_id):
 
 
 def _update_cache_policy(policy_id, headers, body):
+    if policy_id in _MANAGED_CACHE_POLICIES:
+        return _error("IllegalUpdate", _ILLEGAL_UPDATE_MSG, 400)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1150,7 +1263,7 @@ def _update_cache_policy(policy_id, headers, body):
     cfg, err = _parse_cache_policy_config(el)
     if err is not None:
         return err
-    for existing in _cache_policies.values():
+    for existing in (*_cache_policies.values(), *_MANAGED_CACHE_POLICIES.values()):
         if existing["Id"] != policy_id and existing["Config"]["Name"] == cfg["Name"]:
             return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
     new_etag = new_uuid()
@@ -1166,6 +1279,8 @@ def _update_cache_policy(policy_id, headers, body):
 
 
 def _delete_cache_policy(policy_id, headers):
+    if policy_id in _MANAGED_CACHE_POLICIES:
+        return _error("IllegalDelete", _ILLEGAL_DELETE_MSG, 400)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1190,7 +1305,7 @@ def _delete_cache_policy(policy_id, headers):
 
 
 def _list_distributions_by_cache_policy(policy_id):
-    if not _cache_policies.get(policy_id):
+    if not _cache_policies.get(policy_id) and policy_id not in _MANAGED_CACHE_POLICIES:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
     dist_ids = _distributions_using_cache_policy(policy_id)
 
@@ -1279,6 +1394,11 @@ def _policy_precheck_if_match(headers, policy):
     return None
 
 
+def _policy_lookup(store, spec, pid):
+    """Custom store first, then the type's AWS-managed catalog."""
+    return store.get(pid) or spec["managed"].get(pid)
+
+
 def _policy_create(store, spec, body):
     el = _parse_body(body)
     if el is None:
@@ -1286,7 +1406,7 @@ def _policy_create(store, spec, body):
     cfg, err = spec["parse"](el)
     if err is not None:
         return err
-    for existing in store.values():
+    for existing in (*store.values(), *spec["managed"].values()):
         if existing["Config"]["Name"] == cfg["Name"]:
             return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
     pid = new_uuid()
@@ -1301,7 +1421,7 @@ def _policy_create(store, spec, body):
 
 
 def _policy_get(store, spec, pid):
-    policy = store.get(pid)
+    policy = _policy_lookup(store, spec, pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
@@ -1309,7 +1429,7 @@ def _policy_get(store, spec, pid):
 
 
 def _policy_get_config(store, spec, pid):
-    policy = store.get(pid)
+    policy = _policy_lookup(store, spec, pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["config_tag"], lambda r: spec["build_config"](r, policy["Config"]),
@@ -1317,6 +1437,8 @@ def _policy_get_config(store, spec, pid):
 
 
 def _policy_update(store, spec, pid, headers, body):
+    if pid in spec["managed"]:
+        return _error("IllegalUpdate", _ILLEGAL_UPDATE_MSG, 400)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1329,7 +1451,7 @@ def _policy_update(store, spec, pid, headers, body):
     cfg, err = spec["parse"](el)
     if err is not None:
         return err
-    for existing in store.values():
+    for existing in (*store.values(), *spec["managed"].values()):
         if existing["Id"] != pid and existing["Config"]["Name"] == cfg["Name"]:
             return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
     new_etag = new_uuid()
@@ -1341,6 +1463,8 @@ def _policy_update(store, spec, pid, headers, body):
 
 
 def _policy_delete(store, spec, pid, headers):
+    if pid in spec["managed"]:
+        return _error("IllegalDelete", _ILLEGAL_DELETE_MSG, 400)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1357,7 +1481,7 @@ def _policy_delete(store, spec, pid, headers):
 
 
 def _policy_list_distributions(store, spec, pid):
-    if not store.get(pid):
+    if not _policy_lookup(store, spec, pid):
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     dist_ids = _distributions_using_policy(pid)
 
@@ -1429,6 +1553,65 @@ def _build_orp_xml(parent, policy):
     _build_orp_config_xml(cfg_el, policy["Config"])
 
 
+def _orp_cfg(name, header_behavior, headers=(), cookie_behavior="none", qs_behavior="none", qs=()):
+    return {
+        "Name": name, "Comment": "",
+        "HeaderBehavior": header_behavior, "Headers": list(headers),
+        "CookieBehavior": cookie_behavior, "Cookies": [],
+        "QueryStringBehavior": qs_behavior, "QueryStrings": list(qs),
+    }
+
+
+# Evidence: AWS docs "Use managed origin request policies" (CloudFront
+# Developer Guide) for names/ids/behaviors; see the catalog note above
+# _MANAGED_CACHE_POLICIES for the "Managed-" Name-prefix evidence.
+_MANAGED_ORIGIN_REQUEST_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "216adef6-5c7f-47e4-b989-5492eafa07d3": _orp_cfg(
+            "Managed-AllViewer", "allViewer", cookie_behavior="all", qs_behavior="all",
+        ),
+        "33f36d7e-f396-46d9-90e0-52428a34d9dc": _orp_cfg(
+            "Managed-AllViewerAndCloudFrontHeaders-2022-06", "allViewerAndWhitelistCloudFront",
+            headers=[
+                "CloudFront-Forwarded-Proto", "CloudFront-Is-Android-Viewer", "CloudFront-Is-Desktop-Viewer",
+                "CloudFront-Is-IOS-Viewer", "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-SmartTV-Viewer",
+                "CloudFront-Is-Tablet-Viewer", "CloudFront-Viewer-Address", "CloudFront-Viewer-ASN",
+                "CloudFront-Viewer-City", "CloudFront-Viewer-Country", "CloudFront-Viewer-Country-Name",
+                "CloudFront-Viewer-Country-Region", "CloudFront-Viewer-Country-Region-Name",
+                "CloudFront-Viewer-Http-Version", "CloudFront-Viewer-Latitude", "CloudFront-Viewer-Longitude",
+                "CloudFront-Viewer-Metro-Code", "CloudFront-Viewer-Postal-Code", "CloudFront-Viewer-Time-Zone",
+                "CloudFront-Viewer-TLS",
+            ],
+            cookie_behavior="all", qs_behavior="all",
+        ),
+        "b689b0a8-53d0-40ab-baf2-68738e2966ac": _orp_cfg(
+            "Managed-AllViewerExceptHostHeader", "allExcept", headers=["Host"],
+            cookie_behavior="all", qs_behavior="all",
+        ),
+        "59781a5b-3903-41f3-afcb-af62929ccde1": _orp_cfg(
+            "Managed-CORS-CustomOrigin", "whitelist", headers=["Origin"],
+        ),
+        "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf": _orp_cfg(
+            "Managed-CORS-S3Origin", "whitelist",
+            headers=["Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method"],
+        ),
+        "775133bc-15f2-49f9-abea-afb2e0bf67d2": _orp_cfg(
+            "Managed-Elemental-MediaTailor-PersonalizedManifests", "whitelist",
+            headers=["Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method",
+                     "User-Agent", "X-Forwarded-For"],
+            qs_behavior="all",
+        ),
+        "bf0718e1-ba1e-49d1-88b1-f726733018ae": _orp_cfg(
+            "Managed-HostHeaderOnly", "whitelist", headers=["Host"],
+        ),
+        "acba4595-bd28-49b8-b9fe-13317c0390fa": _orp_cfg(
+            "Managed-UserAgentRefererHeaders", "whitelist", headers=["User-Agent", "Referer"],
+        ),
+    }.items()
+}
+
+
 _ORP_SPEC = {
     "label": "origin request policy", "resource_tag": "OriginRequestPolicy",
     "config_tag": "OriginRequestPolicyConfig", "path": "/2020-05-31/origin-request-policy",
@@ -1436,6 +1619,7 @@ _ORP_SPEC = {
     "missing": "NoSuchOriginRequestPolicy", "dup": "OriginRequestPolicyAlreadyExists",
     "in_use": "OriginRequestPolicyInUse", "parse": _parse_orp_config,
     "build_resource": _build_orp_xml, "build_config": _build_orp_config_xml,
+    "managed": _MANAGED_ORIGIN_REQUEST_POLICIES,
 }
 
 
@@ -1629,6 +1813,69 @@ def _build_rhp_xml(parent, policy):
     _build_rhp_config_xml(cfg_el, policy["Config"])
 
 
+def _rhp_managed_cors(allow_methods=(), expose_headers=None):
+    return {
+        "AllowOrigins": ["*"], "AllowHeaders": [], "AllowMethods": list(allow_methods),
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": expose_headers, "MaxAgeSec": None,
+    }
+
+
+# The full security-headers set shared by SecurityHeadersPolicy and both
+# combined CORS+security managed policies (identical settings per AWS docs).
+_RHP_MANAGED_SECURITY = {
+    "XSSProtection": {"Override": False, "Protection": True, "ModeBlock": True, "ReportUri": None},
+    "FrameOptions": {"Override": False, "FrameOption": "SAMEORIGIN"},
+    "ReferrerPolicy": {"Override": False, "ReferrerPolicy": "strict-origin-when-cross-origin"},
+    "ContentTypeOptions": {"Override": True},
+    "StrictTransportSecurity": {
+        "Override": False, "IncludeSubdomains": None, "Preload": None, "AccessControlMaxAgeSec": 31536000,
+    },
+}
+
+
+def _rhp_cfg(name, cors=None, security=None):
+    return {
+        "Name": name, "Comment": "", "Cors": cors, "Security": security,
+        "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": [],
+    }
+
+
+# Evidence: AWS docs "Use managed response headers policies" (CloudFront
+# Developer Guide) for names/ids/CORS+security settings; see the catalog note
+# above _MANAGED_CACHE_POLICIES for the "Managed-" Name-prefix evidence.
+_MANAGED_RESPONSE_HEADERS_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "e61eb60c-9c35-4d20-a928-2b84e02af89c": _rhp_cfg(
+            "Managed-CORS-and-SecurityHeadersPolicy",
+            cors=_rhp_managed_cors(), security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "5cc3b908-e619-4b99-88e5-2cf7f45965bd": _rhp_cfg(
+            "Managed-CORS-With-Preflight",
+            cors=_rhp_managed_cors(
+                allow_methods=["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                expose_headers=["*"],
+            ),
+        ),
+        "eaab4381-ed33-4a86-88ca-d9558dc6cd63": _rhp_cfg(
+            "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+            cors=_rhp_managed_cors(
+                allow_methods=["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                expose_headers=["*"],
+            ),
+            security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "67f7725c-6f97-4210-82d7-5512b31e9d03": _rhp_cfg(
+            "Managed-SecurityHeadersPolicy", security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "60669652-455b-4ae9-85a4-c4c02393f86c": _rhp_cfg(
+            "Managed-SimpleCORS", cors=_rhp_managed_cors(),
+        ),
+    }.items()
+}
+
+
 _RHP_SPEC = {
     "label": "response headers policy", "resource_tag": "ResponseHeadersPolicy",
     "config_tag": "ResponseHeadersPolicyConfig", "path": "/2020-05-31/response-headers-policy",
@@ -1636,6 +1883,7 @@ _RHP_SPEC = {
     "missing": "NoSuchResponseHeadersPolicy", "dup": "ResponseHeadersPolicyAlreadyExists",
     "in_use": "ResponseHeadersPolicyInUse", "parse": _parse_rhp_config,
     "build_resource": _build_rhp_xml, "build_config": _build_rhp_config_xml,
+    "managed": _MANAGED_RESPONSE_HEADERS_POLICIES,
 }
 
 
@@ -2003,18 +2251,27 @@ def _list_anycast_ip_lists(query_params):
 
 
 def _list_cache_policies(query_params):
-    """CachePolicyList wrapping stored custom cache policies (Type=custom)."""
+    """CachePolicyList: managed policies plus stored custom ones.
+
+    ``Type`` optionally filters to ``managed`` or ``custom``; omitted, AWS
+    returns both (ListCachePolicies API reference).
+    """
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(_cache_policies.values())
+    type_filter = _qval(query_params, "Type", "")
+    entries = []
+    if type_filter in ("", "managed"):
+        entries.extend(("managed", p) for p in _MANAGED_CACHE_POLICIES.values())
+    if type_filter in ("", "custom"):
+        entries.extend(("custom", p) for p in _cache_policies.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, "CachePolicySummary")
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 cp = SubElement(summary, "CachePolicy")
                 _build_cache_policy_xml(cp, policy)
 
@@ -2022,22 +2279,28 @@ def _list_cache_policies(query_params):
 
 
 def _list_policies(store, spec, query_params):
-    """Generic ``*PolicyList`` wrapping stored custom policies (Type=custom).
+    """Generic ``*PolicyList``: managed policies plus stored custom ones.
 
     Shared by origin request policies and response headers policies; the
-    summary member and resource tag come from ``spec``.
+    summary member and resource tag come from ``spec``. ``Type`` optionally
+    filters to ``managed`` or ``custom``; omitted, AWS returns both.
     """
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(store.values())
+    type_filter = _qval(query_params, "Type", "")
+    entries = []
+    if type_filter in ("", "managed"):
+        entries.extend(("managed", p) for p in spec["managed"].values())
+    if type_filter in ("", "custom"):
+        entries.extend(("custom", p) for p in store.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, spec["summary_tag"])
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 res = SubElement(summary, spec["resource_tag"])
                 spec["build_resource"](res, policy)
 
