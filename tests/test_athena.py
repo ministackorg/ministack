@@ -4,9 +4,92 @@ import time
 import uuid as _uuid_mod
 
 import boto3
+import duckdb
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def test_athena_glue_parquet_scoped_history_with_late_event(
+    athena, glue, s3, monkeypatch, tmp_path,
+):
+    """Exercise the S3 -> Glue -> Athena path used by scoped incident tools."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket = f"athena-history-{suffix}"
+    database = f"history_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    request = urllib.request.Request(
+        f"{endpoint}/_ministack/config",
+        data=json.dumps({"athena.ATHENA_DATA_DIR": str(tmp_path)}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(request, timeout=5).close()
+
+    rows = [
+        ("err-ar", "argentina", "111111111111", 128, 1790605800000, 1790606160000),
+        ("err-mx", "mexico", "222222222222", 0, 1790605800000, 1790606160000),
+        ("err-cl", "chile", "333333333333", 0, 1790605800000, 1790606160000),
+        ("event-ar-late", "argentina", "111111111111", 0, 1790605920000, 1790607000000),
+    ]
+    parquet = tmp_path / "history.parquet"
+    with duckdb.connect() as connection:
+        connection.execute(
+            "CREATE TABLE history (evidence_id VARCHAR, domain VARCHAR, "
+            "account_id VARCHAR, http_5xx INTEGER, event_time_ms BIGINT, "
+            "ingested_time_ms BIGINT)"
+        )
+        connection.executemany("INSERT INTO history VALUES (?, ?, ?, ?, ?, ?)", rows)
+        connection.execute(f"COPY history TO '{parquet}' (FORMAT PARQUET)")
+    s3mod._persist_object(bucket, "data/history.parquet", parquet.read_bytes())
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "history",
+        "StorageDescriptor": {
+            "Location": f"s3://{bucket}/data/",
+            "Columns": [
+                {"Name": "evidence_id", "Type": "string"},
+                {"Name": "domain", "Type": "string"},
+                {"Name": "account_id", "Type": "string"},
+                {"Name": "http_5xx", "Type": "int"},
+                {"Name": "event_time_ms", "Type": "bigint"},
+                {"Name": "ingested_time_ms", "Type": "bigint"},
+            ],
+        },
+        "Parameters": {"classification": "parquet"},
+    })
+    def query_ids(account_id, as_of_ms):
+        query_id = athena.start_query_execution(
+            QueryString=(
+                f"SELECT evidence_id FROM {database}.history "
+                f"WHERE account_id = '{account_id}' "
+                "AND event_time_ms < 1790606400000 "
+                f"AND ingested_time_ms <= {as_of_ms} "
+                "ORDER BY evidence_id LIMIT 51"
+            ),
+            QueryExecutionContext={"Database": database},
+            ResultConfiguration={"OutputLocation": f"s3://{bucket}/results/"},
+        )["QueryExecutionId"]
+        for _ in range(30):
+            execution = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]
+            if execution["Status"]["State"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(0.1)
+        assert execution["Status"]["State"] == "SUCCEEDED", execution["Status"]
+        result_rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+        return [row["Data"][0]["VarCharValue"] for row in result_rows[1:]]
+
+    assert query_ids("111111111111", 1790606400000) == ["err-ar"]
+    assert query_ids("222222222222", 1790606400000) == ["err-mx"]
+    assert query_ids("333333333333", 1790606400000) == ["err-cl"]
+    assert query_ids("111111111111", 1790607000000) == ["err-ar", "event-ar-late"]
 
 
 def _client(region):
