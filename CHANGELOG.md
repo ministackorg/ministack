@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — `AWS::SQS::Queue` applies every queue property** — `RedrivePolicy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled`, `DeduplicationScope` and `FifoThroughputLimit` were dropped on create and update, so a dead-letter queue declared in a template never received messages, and a value SQS refuses now fails the resource instead of being stored. Contributed by @iot-rocket.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 
