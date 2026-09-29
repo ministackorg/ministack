@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — change set members follow the action** — `Add` and `Remove` changes carried `Replacement: False`, a `Remove` had no physical id, `PolicyAction` was never sent and a `Metadata` or policy detail had no `RequiresRecreation`. `Remove` and `Modify` now name the physical resource, a `Remove` answers `PolicyAction: Delete` and a replacing `Modify` `ReplaceAndDelete` unless the resource retains or snapshots, and attribute details answer `Never`. Contributed by @iot-rocket.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 
