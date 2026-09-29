@@ -25,6 +25,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **API Gateway v2 (HTTP API) — a request no stage or route matches answers AWS's exact 404 body** — an unmatched route answered `{"message": "No route found"}` and an unknown stage `{"message": "Stage '…' not found"}`; both now answer `{"message":"Not Found"}` (compact JSON), as AWS does. Contributed by @skialpine.
 - **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`. Contributed by @skialpine.
 
+- **SSM — parameter tag actions authorize the parameter named by `ResourceId`** — with `AUTH=true`, `AddTagsToResource`, `RemoveTagsFromResource`, and `ListTagsForResource` checked `Name` instead, so an exact ARN allow could fail and an exact ARN deny could be missed under a broad allow. Accepted parameter-name and ARN aliases now use the canonical parameter ARN for the IAM check. Tag authorization denials now match AWS's HTTP 400 JSON 1.1 response, including the canonical resource and explicit-deny reason.
 
 ## [1.5.19] — 2026-09-30
 
