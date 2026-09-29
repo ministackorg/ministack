@@ -1476,6 +1476,9 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         "SubnetIds": [f"subnet-{suffix}"],
         "SecurityGroupIds": [f"sg-{suffix}"],
     }
+    # This dispatch test uses an uncreated subnet. Lambda cannot resolve its
+    # VPC, so the response has the empty read-only VpcId field.
+    response_vpc_config = {**vpc_config, "VpcId": ""}
     create_zip = _make_zip_b64("def handler(e, c): return {'version': 1}")
     update_zip = _make_zip_b64("def handler(e, c): return {'version': 2}")
     sm_arn = None
@@ -1589,7 +1592,7 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         assert output["createResult"]["FunctionArn"] == function_arn
         assert output["createResult"]["Version"] == "1"
         assert output["createResult"]["KmsKeyArn"] == kms_key_arn
-        assert output["createResult"]["VpcConfig"] == vpc_config
+        assert output["createResult"]["VpcConfig"] == response_vpc_config
         assert output["updateConfigurationResult"]["Timeout"] == 30
         assert output["publishedFunction"]["FunctionArn"] == function_arn
         assert output["publishedFunction"]["Version"] == "2"
@@ -1602,7 +1605,7 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         assert output["config"]["State"] == "Active"
         assert output["config"]["LastUpdateStatus"] == "Successful"
         assert output["config"]["KmsKeyArn"] == kms_key_arn
-        assert output["config"]["VpcConfig"] == vpc_config
+        assert output["config"]["VpcConfig"] == response_vpc_config
     finally:
         if sm_arn:
             sfn_sync.delete_state_machine(stateMachineArn=sm_arn)

@@ -2450,3 +2450,255 @@ def test_kms_list_grants(kms_client):
         with pytest.raises(ClientError) as exc:
             kms_client.list_grants(KeyId=missing)
         assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def _new_grant_key(kms_client, **kwargs):
+    return kms_client.create_key(**kwargs)["KeyMetadata"]
+
+
+def test_kms_create_grant_is_listed(kms_client):
+    meta = _new_grant_key(kms_client)
+    grantee = "arn:aws:iam::000000000000:role/grant-reader"
+    resp = kms_client.create_grant(
+        KeyId=meta["KeyId"],
+        GranteePrincipal=grantee,
+        RetiringPrincipal="arn:aws:iam::000000000000:role/grant-retirer",
+        Operations=["Encrypt", "Decrypt"],
+        Constraints={"EncryptionContextSubset": {"app": "billing"}},
+    )
+    assert resp["GrantId"] and resp["GrantToken"]
+
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        grants = kms_client.list_grants(KeyId=key_ref)["Grants"]
+        assert len(grants) == 1
+        grant = grants[0]
+        assert grant["GrantId"] == resp["GrantId"]
+        assert grant["KeyId"] == meta["Arn"]
+        assert grant["GranteePrincipal"] == grantee
+        assert grant["RetiringPrincipal"] == "arn:aws:iam::000000000000:role/grant-retirer"
+        assert grant["Operations"] == ["Encrypt", "Decrypt"]
+        assert grant["Constraints"] == {"EncryptionContextSubset": {"app": "billing"}}
+        assert grant["IssuingAccount"].startswith("arn:aws:iam::")
+        assert isinstance(grant["CreationDate"], _dt.datetime)
+        assert "GrantToken" not in grant
+
+
+def test_kms_list_grants_filters(kms_client):
+    meta = _new_grant_key(kms_client)
+    first = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+    kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b", Operations=["Decrypt"])
+    other = _new_grant_key(kms_client)
+    kms_client.create_grant(KeyId=other["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 2
+    by_id = kms_client.list_grants(KeyId=meta["KeyId"], GrantId=first["GrantId"])["Grants"]
+    assert [g["GrantId"] for g in by_id] == [first["GrantId"]]
+    by_grantee = kms_client.list_grants(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b")["Grants"]
+    assert [g["GranteePrincipal"] for g in by_grantee] == ["arn:aws:iam::000000000000:role/b"]
+
+
+def test_kms_list_grants_paginates(kms_client):
+    meta = _new_grant_key(kms_client)
+    created = {
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal=f"arn:aws:iam::000000000000:role/p{i}", Operations=["Encrypt"])["GrantId"]
+        for i in range(5)
+    }
+    seen, marker = [], None
+    while True:
+        kwargs = {"KeyId": meta["KeyId"], "Limit": 2}
+        if marker:
+            kwargs["Marker"] = marker
+        page = kms_client.list_grants(**kwargs)
+        assert len(page["Grants"]) <= 2
+        seen += [g["GrantId"] for g in page["Grants"]]
+        if not page["Truncated"]:
+            assert "NextMarker" not in page
+            break
+        marker = page["NextMarker"]
+    assert len(seen) == len(set(seen)) == 5
+    assert set(seen) == created
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.list_grants(KeyId=meta["KeyId"], Marker="not-a-marker")
+    assert exc.value.response["Error"]["Code"] == "InvalidMarkerException"
+
+
+def test_kms_create_grant_with_name_is_idempotent(kms_client):
+    meta = _new_grant_key(kms_client)
+    params = {"KeyId": meta["KeyId"], "GranteePrincipal": "arn:aws:iam::000000000000:role/n", "Operations": ["Encrypt"], "Name": "retry-safe"}
+    first = kms_client.create_grant(**params)
+    again = kms_client.create_grant(**params)
+    assert again["GrantId"] == first["GrantId"]
+    assert again["GrantToken"] != first["GrantToken"]
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+    changed = kms_client.create_grant(**{**params, "Operations": ["Decrypt"]})
+    assert changed["GrantId"] != first["GrantId"]
+
+    unnamed = {k: v for k, v in params.items() if k != "Name"}
+    assert kms_client.create_grant(**unnamed)["GrantId"] != kms_client.create_grant(**unnamed)["GrantId"]
+
+
+def test_kms_revoke_grant(kms_client):
+    meta = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    kms_client.revoke_grant(KeyId=meta["Arn"], GrantId=grant_id)
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_revoke_grant_checks_the_key(kms_client):
+    meta = _new_grant_key(kms_client)
+    other = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=other["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_retire_grant_by_token_and_by_id(kms_client):
+    meta = _new_grant_key(kms_client)
+    by_token = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/t", Operations=["Encrypt"])
+    by_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/i", Operations=["Encrypt"])
+
+    kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    kms_client.retire_grant(KeyId=meta["Arn"], GrantId=by_id["GrantId"])
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    assert exc.value.response["Error"]["Code"] == "InvalidGrantTokenException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantId=by_id["GrantId"])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_create_grant_rejects_operations_the_key_cannot_do(kms_client):
+    symmetric = _new_grant_key(kms_client)
+    signing = _new_grant_key(kms_client, KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    for key, operation in ((symmetric, "Sign"), (symmetric, "GenerateMac"), (signing, "GenerateDataKey")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=[operation])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.create_grant(KeyId=signing["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=["Sign", "Verify"])["GrantId"]
+
+
+def test_kms_create_grant_key_states(kms_client):
+    disabled = _new_grant_key(kms_client)
+    kms_client.disable_key(KeyId=disabled["KeyId"])
+    pending = _new_grant_key(kms_client)
+    kms_client.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    for meta, code in ((disabled, "DisabledException"), (pending, "KMSInvalidStateException")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/s", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == code
+        assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+
+def test_kms_grant_operations_reject_unknown_key_and_alias(kms_client):
+    meta = _new_grant_key(kms_client)
+    alias = f"alias/grant-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    try:
+        for key_ref in ("00000000-0000-0000-0000-000000000000", alias):
+            with pytest.raises(ClientError) as exc:
+                kms_client.create_grant(KeyId=key_ref, GranteePrincipal="arn:aws:iam::000000000000:role/x", Operations=["Encrypt"])
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+            with pytest.raises(ClientError) as exc:
+                kms_client.revoke_grant(KeyId=key_ref, GrantId="0" * 64)
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_grant_dry_run_changes_nothing(kms_client):
+    meta = _new_grant_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"], DryRun=True)
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    grant = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"])
+    for call in (
+        lambda: kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant["GrantId"], DryRun=True),
+        lambda: kms_client.retire_grant(GrantToken=grant["GrantToken"], DryRun=True),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_grants_survive_persistence(monkeypatch, tmp_path):
+    from ministack.core import persistence
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        _status, _headers, body = _kms._create_key({})
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        _status, _headers, body = _kms._create_grant({
+            "KeyId": key_id,
+            "GranteePrincipal": "arn:aws:iam::000000000000:role/persisted",
+            "Operations": ["Encrypt"],
+            "Name": "persisted",
+        })
+        created = json.loads(body)
+
+        persistence.save_state("kms", _kms.get_state())
+        _kms.reset()
+        _kms.load_persisted_state(persistence.load_state("kms"))
+
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert [g["GrantId"] for g in json.loads(body)["Grants"]] == [created["GrantId"]]
+        status, _headers, _body = _kms._retire_grant({"GrantToken": created["GrantToken"]})
+        assert status == 200
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert json.loads(body)["Grants"] == []
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_create_grant_on_hmac_key_allows_only_mac_operations(kms_client):
+    hmac_key = _new_grant_key(kms_client, KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    for operations in (["Encrypt"], ["Sign"], ["GenerateDataKey"], ["GetPublicKey"], ["GenerateMac", "Decrypt"]):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=operations)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"] == []
+
+    allowed = ["GenerateMac", "VerifyMac", "DescribeKey", "CreateGrant", "RetireGrant"]
+    kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=allowed)
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"][0]["Operations"] == allowed
+
+
+def test_kms_create_grant_rejects_primary_pending_replica_deletion():
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    try:
+        assert east.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)["KeyState"] == "PendingReplicaDeletion"
+        with pytest.raises(ClientError) as exc:
+            east.create_grant(KeyId=key_id, GranteePrincipal="arn:aws:iam::000000000000:role/m", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+        assert east.list_grants(KeyId=key_id)["Grants"] == []
+    finally:
+        west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
