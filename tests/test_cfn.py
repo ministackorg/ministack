@@ -22603,6 +22603,59 @@ def test_cfn_nested_stack_child_reads_its_own_update_replace_policy(monkeypatch)
             _ssm._parameters.pop(name, None)
 
 
+@pytest.mark.parametrize("updated, status, kept, gone", [
+    (["Keep"], "UPDATE_COMPLETE", ["Keep"], "Drop"),
+    (["Keep", "Drop", "New", "Bad"], "UPDATE_ROLLBACK_COMPLETE", ["Drop", "Keep"], "New"),
+], ids=["dropped", "rolled-back"])
+def test_cfn_nested_stack_update_deletes_what_the_child_no_longer_has(
+        cfn, s3, ssm, updated, status, kept, gone):
+    """A child resource the nested stack's update drops or rolls back is deleted and unlisted."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-nested-prune-{suffix}"
+    names = {lid: f"/cfn-nested-prune-{suffix}/{lid}" for lid in ("Keep", "Drop", "New")}
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+    def child(ids):
+        return json.dumps({"Resources": {
+            lid: {**_FAILING_RESOURCE, "DependsOn": "New"} if lid == "Bad" else {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": names[lid], "Type": "String", "Value": "v"}}
+            for lid in ids}})
+
+    def parent(key):
+        return json.dumps({
+            "Resources": {"Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{key}"}}},
+            "Outputs": {"NestedId": {"Value": {"Ref": "Nested"}}},
+        })
+
+    stack_name = f"cfn-nested-prune-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="v1.json", Body=child(["Keep", "Drop"]).encode())
+        s3.put_object(Bucket=bucket, Key="v2.json", Body=child(updated).encode())
+        cfn.create_stack(StackName=stack_name, TemplateBody=parent("v1.json"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        nested_id = _output(stack, "NestedId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=parent("v2.json"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == status, stack.get("StackStatusReason")
+        listed = cfn.describe_stack_resources(StackName=nested_id)["StackResources"]
+        assert sorted(r["LogicalResourceId"] for r in listed) == kept
+        for lid in kept:
+            ssm.get_parameter(Name=names[lid])
+        with pytest.raises(ClientError, match="ParameterNotFound"):
+            ssm.get_parameter(Name=names[gone])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for key in ("v1.json", "v2.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
 def test_cfn_apigw_api_key_rename_replaces_it(cfn, apigw_v1):
     """Name is Replacement on AWS::ApiGateway::ApiKey: the renamed key is
     created before the old one is removed, so Ref moves to a new key id and

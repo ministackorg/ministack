@@ -4022,8 +4022,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
     if is_update:
-        for stale_id in set(prev_resources) - set(provisioned):
+        for stale_id in set(prev_resources) - set(ordered):
             old = prev_resources[stale_id]
+            provisioned.pop(stale_id, None)
             try:
                 _delete_resource(old.get("ResourceType", ""),
                                  old.get("PhysicalResourceId", ""),
