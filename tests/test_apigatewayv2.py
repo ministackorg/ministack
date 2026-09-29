@@ -4165,6 +4165,59 @@ def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, s
         _v2_auth_delete_queue(sqs, qname)
 
 
+def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw, lam, sqs):
+    """A declared identity source missing from the request is a 401 without
+    invoking the Lambda, even with caching disabled (``AuthorizerResultTtlInSeconds=0``).
+
+    AWS applies this identity-source short circuit independent of caching;
+    it is not only a caching optimization. The body matches AWS's own
+    compact-JSON gateway response exactly (no space after the colon).
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url)  # no Authorization header sent
+        assert status == 401
+        assert body == b'{"message":"Unauthorized"}'
+        assert _v2_auth_count(sqs, qname) == 0, "the authorizer Lambda must not be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs):
+    """A $context.* identity source, which MiniStack does not model, is not a missing source: uncached, the
+    authorizer is still invoked."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$context.identity.sourceIp"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+        assert status != 401
+        assert _v2_auth_count(sqs, qname) == 1, "the authorizer Lambda must be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
 def test_apigwv2_authorizer_cache_is_bounded():
     """The result cache is keyed on caller-supplied identity values, so it is
     capped rather than left to grow for the life of the process. Expired entries
