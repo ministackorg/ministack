@@ -1231,11 +1231,22 @@ def _generate_data_key(data):
     if rec is None:
         # result is an error response tuple
         return result
-    return json_response({
+
+    response = {
         "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(data_key).decode(),
         "CiphertextBlob": base64.b64encode(result).decode(),
-    })
+    }
+    if "Recipient" not in data:
+        # Derive an emulator identifier from the wrapping material and key ID.
+        # Both survive persistence and are shared by multi-Region replicas.
+        response["KeyMaterialId"] = hmac.new(
+            rec["_symmetric_key"],
+            b"ministack:kms:key-material-id:" + rec["KeyId"].encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    return json_response(response)
 
 
 def _generate_data_key_pair_common(data, action):
