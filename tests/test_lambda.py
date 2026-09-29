@@ -13708,8 +13708,8 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
 
     run_kwargs, container_env, mounts = _wire(
         monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
-    assert run_kwargs["extra_hosts"] == {
-        "cognito-idp.us-east-1.amazonaws.com": "host-gateway"}
+    assert run_kwargs["extra_hosts"]["cognito-idp.us-east-1.amazonaws.com"] == "host-gateway"
+    assert run_kwargs["extra_hosts"]["cognito-idp.eu-west-2.amazonaws.com"] == "host-gateway"
     # NODE_EXTRA_CA_CERTS adds to node's roots, so it takes the bare certificate.
     assert container_env["NODE_EXTRA_CA_CERTS"] == lsvc._CONTAINER_CA_PATH
     # The other two replace the trust store, so they take the public roots with

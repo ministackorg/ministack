@@ -12,7 +12,6 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-
 from conftest import sqs_policy_allow_sns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")

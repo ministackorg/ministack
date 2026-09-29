@@ -172,8 +172,10 @@ def test_athena_workgroups_isolated_per_account():
         assert wg not in names_b, \
             f"CRITICAL: Athena workgroup leaking cross-account; B saw: {names_b}"
     finally:
-        try: a.delete_work_group(WorkGroup=wg)
-        except Exception: pass
+        try:
+            a.delete_work_group(WorkGroup=wg)
+        except Exception:
+            pass
 
 
 def test_ses_sent_emails_isolated_per_account():
@@ -229,8 +231,10 @@ def test_apigateway_v1_stages_isolated_per_account():
         assert all(api["id"] != a_api for api in apis_b), \
             f"CRITICAL: APIGW v1 REST api leaking cross-account; B saw: {apis_b}"
     finally:
-        try: a.delete_rest_api(restApiId=a_api)
-        except Exception: pass
+        try:
+            a.delete_rest_api(restApiId=a_api)
+        except Exception:
+            pass
 
 def test_post_object_uses_the_account_from_the_form_credentials():
     import requests

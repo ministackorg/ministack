@@ -92,7 +92,8 @@ def _caller_identity(
 
 
 def _credential_error_response(error: CredentialResolutionError):
-    code = "ExpiredToken" if error.code == "ExpiredTokenException" else error.code
+    code = {"ExpiredTokenException": "ExpiredToken",
+            "UnrecognizedClientException": "InvalidClientTokenId"}.get(error.code, error.code)
     return _error(403, code, error.message, ns="sts")
 
 

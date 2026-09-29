@@ -2421,3 +2421,32 @@ def test_kms_delete_imported_material_clears_the_asymmetric_key():
     with pytest.raises(ClientError) as exc:
         kms.get_public_key(KeyId=key_id)
     assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_alias_carries_creation_and_last_updated_dates(kms_client):
+    first = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    second = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    alias = f"alias/dates-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=first)
+    try:
+        entry = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert isinstance(entry["CreationDate"], _dt.datetime)
+        assert entry["LastUpdatedDate"] == entry["CreationDate"]
+        time.sleep(1.1)
+        kms_client.update_alias(AliasName=alias, TargetKeyId=second)
+        updated = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert updated["CreationDate"] == entry["CreationDate"]
+        assert updated["LastUpdatedDate"] > entry["LastUpdatedDate"]
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_list_grants(kms_client):
+    meta = kms_client.create_key()["KeyMetadata"]
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        resp = kms_client.list_grants(KeyId=key_ref)
+        assert resp["Grants"] == [] and resp["Truncated"] is False
+    for missing in ("00000000-0000-0000-0000-000000000000", "alias/does-not-matter"):
+        with pytest.raises(ClientError) as exc:
+            kms_client.list_grants(KeyId=missing)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"

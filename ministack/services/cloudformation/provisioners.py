@@ -6844,6 +6844,7 @@ def _kms_alias_create(logical_id, props, stack_name):
     if not target_key:
         raise ValueError("AWS::KMS::Alias requires TargetKeyId")
     _kms._aliases[_kms._alias_arn(alias_name)] = _kms_alias_target(target_key)
+    _kms._stamp_alias(_kms._alias_arn(alias_name), created=True)
     return alias_name, {}
 
 
@@ -6866,11 +6867,13 @@ def _kms_alias_update(physical_id, old_props, new_props, stack_name, logical_id=
     if not target_key:
         raise ValueError("AWS::KMS::Alias requires TargetKeyId")
     _kms._aliases[_kms._alias_arn(physical_id)] = _kms_alias_target(target_key)
+    _kms._stamp_alias(_kms._alias_arn(physical_id), created=False)
     return physical_id, {}
 
 
 def _kms_alias_delete(physical_id, props):
     _kms._aliases.pop(_kms._alias_arn(physical_id), None)
+    _kms._alias_dates.pop(_kms._alias_arn(physical_id), None)
 
 
 # --- EC2 resource provisioners ---

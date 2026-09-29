@@ -531,15 +531,15 @@ def _add_permission(params):
     topic_arn = topic["arn"]
     label = _p(params, "Label")
     if not label:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "Label is required", 400)
     account_ids = _member_list(params, "AWSAccountId")
     actions = _member_list(params, "ActionName")
     if not account_ids:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "AWSAccountId is required", 400)
     if not actions:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "ActionName is required", 400)
 
     raw = topic["attributes"].get("Policy") or ""
@@ -555,7 +555,7 @@ def _add_permission(params):
         policy["Statement"] = statements
 
     if any(s.get("Sid") == label for s in statements):
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       f"Value {label} for parameter Label is invalid. "
                       f"Reason: Already exists.", 400)
 
@@ -576,7 +576,7 @@ def _remove_permission(params):
         return err
     label = _p(params, "Label")
     if not label:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "Label is required", 400)
 
     raw = topic["attributes"].get("Policy") or ""

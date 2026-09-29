@@ -3239,6 +3239,16 @@ def main():
 
         logging.getLogger("hypercorn.access").addFilter(_HealthLogFilter())
 
+        # Raise the soft fd limit to the hard one so connection bursts don't hit 1024.
+        try:
+            import resource
+
+            _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if _soft < _hard:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+        except (ImportError, ValueError, OSError):
+            pass
+
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75

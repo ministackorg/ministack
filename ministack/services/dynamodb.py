@@ -938,6 +938,8 @@ def _validate_data_plane_table_name(name) -> tuple | None:
     if len(name) < 1:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if name.startswith("arn:"):
+        return None  # A table ARN not in this account and region answers ResourceNotFoundException.
     if len(name) > 255:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
@@ -1257,7 +1259,7 @@ def _create_table(data):
 
 
 def _delete_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     if _tables[name].get("DeletionProtectionEnabled"):
@@ -1295,7 +1297,7 @@ def _list_tables(data):
 
 
 def _update_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     table = _tables[name]
@@ -1636,7 +1638,7 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 
 def _put_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1706,7 +1708,7 @@ def _put_item(data):
 
 
 def _get_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1746,7 +1748,7 @@ def _get_item(data):
 
 
 def _delete_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1806,7 +1808,7 @@ def _key_attribute_update_error(table, updated_attrs):
 
 
 def _update_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1947,7 +1949,7 @@ def _update_item(data):
 # ---------------------------------------------------------------------------
 
 def _query(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -2246,7 +2248,7 @@ def _query(data):
 
 
 def _scan(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -3854,7 +3856,7 @@ def _batch_write_item(data):
     # in a single BatchWriteItem call.
     seen_keys = set()
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3895,7 +3897,7 @@ def _batch_write_item(data):
             seen_keys.add(key_repr)
     unprocessed = {}
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3914,7 +3916,7 @@ def _batch_write_item(data):
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
                 table["items"][pk_val][sk_val] = item
-                _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+                _emit_stream_event(_normalize_table_name(table_name), "MODIFY" if old_item else "INSERT", old_item, item)
                 _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
@@ -3924,7 +3926,7 @@ def _batch_write_item(data):
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
                 table["items"].get(pk_val, {}).pop(sk_val, None)
                 if old_item:
-                    _emit_stream_event(table_name, "REMOVE", old_item, None)
+                    _emit_stream_event(_normalize_table_name(table_name), "REMOVE", old_item, None)
                 _accumulate_write_capacity(cap, table, old_item, None)
         _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
@@ -3961,12 +3963,12 @@ def _batch_get_item(data):
                 f"1 validation error detected: Value at 'RequestItems.{_bg_table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
-        if table_name not in _tables:
+        if _normalize_table_name(table_name) not in _tables:
             return error_response_json("ResourceNotFoundException",
                 "Requested resource not found", 400)
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
-        table = _tables[table_name]
+        table = _tables[_normalize_table_name(table_name)]
         seen = set()
         for key in cfg.get("Keys", []):
             key_repr = (
@@ -3980,7 +3982,7 @@ def _batch_get_item(data):
     responses = {}
     unprocessed = {}
     for table_name, config in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             unprocessed[table_name] = config
             continue
@@ -4011,6 +4013,10 @@ def _batch_get_item(data):
 
 def _transact_write_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4270,6 +4276,10 @@ _txn_idempotency = AccountRegionScopedDict()
 
 def _transact_get_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4415,7 +4425,7 @@ def _transact_cancel_response(total, failures):
 # ---------------------------------------------------------------------------
 
 def _describe_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     setting = _ttl_settings.get(name, {"TimeToLiveStatus": "DISABLED"})
@@ -4426,7 +4436,7 @@ def _describe_ttl(data):
 
 
 def _update_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("TimeToLiveSpecification", {})
@@ -4447,7 +4457,7 @@ def _update_ttl(data):
 # ---------------------------------------------------------------------------
 
 def _describe_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     pitr_enabled = _pitr_settings.get(name, False)
@@ -4470,7 +4480,7 @@ def _describe_continuous_backups(data):
 
 
 def _update_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("PointInTimeRecoverySpecification", {})
@@ -4589,7 +4599,7 @@ _VALID_PRECISIONS = {"MILLISECOND", "MICROSECOND"}
 
 
 def _validate_kinesis_destination_request(data: dict) -> tuple[str | None, str | None, dict | None]:
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     stream_arn = data.get("StreamArn")
     if not table_name:
         return None, None, error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
@@ -4700,7 +4710,7 @@ def _disable_kinesis_streaming_destination(data):
 
 
 def _describe_kinesis_streaming_destination(data):
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     if not table_name:
         return error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
     if table_name not in _tables:

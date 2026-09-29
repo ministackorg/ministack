@@ -134,6 +134,51 @@ def test_dynamodb_describe_table_accepts_table_arn(ddb):
             pass
 
 
+def test_dynamodb_table_arn_accepted_by_every_table_name_operation(ddb):
+    """Every operation whose TableName is a TableArn in the model takes the ARN;
+    batch responses keep the caller's key form, and a foreign ARN is not found."""
+    name = f"arn-ops-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+    key = {"pk": {"S": "a"}}
+    try:
+        ddb.put_item(TableName=arn, Item={"pk": {"S": "a"}, "v": {"S": "1"}})
+        assert ddb.get_item(TableName=arn, Key=key)["Item"]["v"] == {"S": "1"}
+        ddb.update_item(TableName=arn, Key=key, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"S": "2"}})
+        assert ddb.query(TableName=arn, KeyConditionExpression="pk = :p",
+                         ExpressionAttributeValues={":p": {"S": "a"}})["Count"] == 1
+        assert ddb.scan(TableName=arn)["Count"] == 1
+        got = ddb.batch_get_item(RequestItems={arn: {"Keys": [key]}})
+        assert list(got["Responses"]) == [arn]
+        ddb.batch_write_item(RequestItems={arn: [{"PutRequest": {"Item": {"pk": {"S": "b"}}}}]})
+        ddb.transact_write_items(TransactItems=[{"Put": {"TableName": arn, "Item": {"pk": {"S": "c"}}}}])
+        items = ddb.transact_get_items(TransactItems=[{"Get": {"TableName": arn, "Key": {"pk": {"S": "c"}}}}])
+        assert items["Responses"][0]["Item"]["pk"] == {"S": "c"}
+        ddb.delete_item(TableName=arn, Key=key)
+        ddb.update_time_to_live(TableName=arn, TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+        assert ddb.describe_time_to_live(TableName=arn)["TimeToLiveDescription"]["AttributeName"] == "ttl"
+        ddb.update_continuous_backups(TableName=arn, PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
+        assert ddb.describe_continuous_backups(TableName=arn)["ContinuousBackupsDescription"]
+        assert ddb.describe_kinesis_streaming_destination(TableName=arn)["TableName"] == name
+        ddb.update_table(TableName=arn, BillingMode="PAY_PER_REQUEST")
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(TableName=other_region_arn, Key=key)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        ddb.delete_table(TableName=arn)
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
 def test_dynamodb_same_name_table_metadata_is_region_scoped(ddb):
     east = _ddb_client("us-east-1")
     west = _ddb_client("us-west-2")
@@ -2574,8 +2619,10 @@ def test_ddb_sse_description_shape_matches_aws(ddb, kms_client):
     key_id = kms_client.create_key(Description="ddb-sse-t")["KeyMetadata"]["KeyId"]
     key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{key_id}"
     tname = "t-sse-shape"
-    try: ddb.delete_table(TableName=tname)
-    except Exception: pass
+    try:
+        ddb.delete_table(TableName=tname)
+    except Exception:
+        pass
 
     ddb.create_table(
         TableName=tname,

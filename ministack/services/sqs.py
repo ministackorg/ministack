@@ -146,8 +146,7 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
     if not resource_policy_allows(q["attributes"].get("Policy") or "", ctx,
                                   owner is None or owner == caller):
         raise _Err("AccessDenied",
-                   f"User: {ctx.principal_arn} is not authorized to perform: "
-                   f"{iam_action} on resource: {queue_arn}", 403)
+                   f"Access to the resource https://sqs.{get_region()}.amazonaws.com/ is denied.", 403)
 
 
 def queue_policy_allows(queue_arn: str, service: str,

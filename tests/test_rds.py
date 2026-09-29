@@ -1,8 +1,8 @@
 import asyncio
 import contextlib
 import datetime
-import ipaddress
 import io
+import ipaddress
 import json
 import os
 import socket
@@ -13736,6 +13736,7 @@ def test_rds_pg_two_replicating_readers_provision_source_once(monkeypatch):
         assert _poll_until(
             lambda: reader1["DBInstanceStatus"] == "available"
             and reader2["DBInstanceStatus"] == "available",
+            timeout=30,
         )
         assert cluster["_pg_replication_source_ready"] is True
         # Replication provisioning ran exactly once on the shared (writer)

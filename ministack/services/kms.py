@@ -60,6 +60,7 @@ _keys = AccountRegionScopedDict()
 #     _hmac_key (bytes, HMAC_* only),
 # }
 _aliases = AccountRegionScopedDict()  # alias ARN -> key_id
+_alias_dates = AccountRegionScopedDict()  # alias ARN -> {CreationDate, LastUpdatedDate}
 
 _HMAC_KEY_SPECS = {
     "HMAC_224": ("HMAC_SHA_224", 28),
@@ -138,7 +139,7 @@ def get_state():
             except Exception:
                 pass
         serializable_keys._data[scoped_key] = entry
-    return {"keys": serializable_keys, "aliases": _aliases}
+    return {"keys": serializable_keys, "aliases": _aliases, "alias_dates": _alias_dates}
 
 
 def load_persisted_state(data):
@@ -224,6 +225,9 @@ def _restore_state(data):
         else:
             for alias_key, target_id in aliases_data.items():
                 _store_alias(get_account_id(), alias_key, target_id)
+        alias_dates = data.get("alias_dates")
+        if isinstance(alias_dates, AccountRegionScopedDict):
+            _alias_dates.update(alias_dates)
 
 
 
@@ -1395,6 +1399,7 @@ def _create_alias(data):
     if alias_arn in _aliases:
         return error_response_json("AlreadyExistsException", f"Alias {alias_name} already exists", 400)
     _aliases[alias_arn] = rec["KeyId"]
+    _stamp_alias(alias_arn, created=True)
     logger.info("Created alias %s -> %s", alias_name, rec["KeyId"])
     return json_response({})
 
@@ -1405,6 +1410,7 @@ def _delete_alias(data):
     if alias_arn not in _aliases:
         return error_response_json("NotFoundException", f"Alias {alias_name} not found", 400)
     del _aliases[alias_arn]
+    _alias_dates.pop(alias_arn, None)
     return json_response({})
 
 
@@ -1422,10 +1428,13 @@ def _list_aliases(data):
             rec = _resolve_key(key_id)
             if not rec or rec["KeyId"] != target_id:
                 continue
+        dates = _alias_dates.get(alias_arn) or _stamp_alias(alias_arn, created=True)
         items.append({
             "AliasName": spec.resource,
             "AliasArn": alias_arn,
             "TargetKeyId": target_id,
+            "CreationDate": dates["CreationDate"],
+            "LastUpdatedDate": dates["LastUpdatedDate"],
         })
     return json_response({"Aliases": items, "Truncated": False})
 
@@ -1440,7 +1449,27 @@ def _update_alias(data):
     if not rec:
         return error_response_json("NotFoundException", f"Key {target_key_id} not found", 400)
     _aliases[alias_arn] = rec["KeyId"]
+    _stamp_alias(alias_arn, created=False)
     return json_response({})
+
+
+def _stamp_alias(alias_arn, created):
+    """Record an alias's CreationDate (kept on update) and LastUpdatedDate."""
+    now = int(time.time())
+    previous = None if created else _alias_dates.get(alias_arn)
+    dates = {"CreationDate": (previous or {}).get("CreationDate", now), "LastUpdatedDate": now}
+    _alias_dates[alias_arn] = dates
+    return dates
+
+
+def _list_grants(data):
+    # KeyId takes a key ID or key ARN only, not an alias. Grants are not
+    # modelled, so a key that exists has none.
+    key_id = data.get("KeyId", "")
+    rec = None if "alias/" in key_id else _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    return json_response({"Grants": [], "Truncated": False})
 
 
 # ---- Key Rotation ----
@@ -2011,6 +2040,7 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateAlias": _create_alias,
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
+        "ListGrants": _list_grants,
         "UpdateAlias": _update_alias,
         "EnableKeyRotation": _enable_key_rotation,
         "DisableKeyRotation": _disable_key_rotation,
@@ -2043,3 +2073,4 @@ async def handle_request(method, path, headers, body, query_params):
 def reset():
     _keys.clear()
     _aliases.clear()
+    _alias_dates.clear()
