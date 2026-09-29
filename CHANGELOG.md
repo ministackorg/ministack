@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lambda — Docker executor under `USE_SSL=1` when MiniStack runs in a container** — the gateway certificate, CA bundle and Java truststore were bind-mounted into every Lambda container from MiniStack's own filesystem (`MINISTACK_SSL_CERT`, or the generated `ministack-tls/server.crt` under the temp directory), paths the host Docker daemon cannot see, so every invocation failed with `bind source path does not exist`. In a container they are now copied into the Lambda container, as function code already is.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
