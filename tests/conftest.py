@@ -99,7 +99,7 @@ def sqs_policy_allow_sns(queue_arn, topic_arn):
 
 
 _SERIAL_TESTS = {
-    "tests/test_athena.py::test_athena_glue_backed_parquet_scoped_history_with_late_event",
+    "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
     "tests/test_rds.py::test_rds_pg_two_replicating_readers_provision_source_once",
     "tests/test_athena.py::test_athena_engine_mock_via_config",
     "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
