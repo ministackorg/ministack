@@ -336,6 +336,31 @@ def test_rds_modify_instance_v2(rds):
     assert inst["DBInstanceClass"] == "db.t3.small"
     assert inst["AllocatedStorage"] == 50
 
+
+def test_rds_modify_instance_iam_database_authentication(rds):
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+    )
+    inst = rds.modify_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        EnableIAMDatabaseAuthentication=True,
+    )["DBInstance"]
+    assert inst["IAMDatabaseAuthenticationEnabled"] is False
+    assert inst["PendingModifiedValues"] == {"IAMDatabaseAuthenticationEnabled": True}
+    rds.modify_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        EnableIAMDatabaseAuthentication=True,
+        ApplyImmediately=True,
+    )
+    inst = rds.describe_db_instances(DBInstanceIdentifier="rds-mod-iam")["DBInstances"][0]
+    assert inst["IAMDatabaseAuthenticationEnabled"] is True
+
+
 def test_rds_create_instance_honors_preferred_maintenance_window(rds):
     # Regression: CreateDBInstance previously hardcoded
     # PreferredMaintenanceWindow to "sun:05:00-sun:06:00", silently
@@ -8155,9 +8180,9 @@ def test_aurora_user_and_grant_are_visible_through_reader(rds):
         "8",
     ],
 )
-def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
+def test_aurora_mysql_iam_plugin_ddl_and_login(rds, engine_version):
     with _live_cluster(rds, engine_version=engine_version) as (
-        _cid, _wid, _rid, writer, _reader, _cluster,
+        cluster_id, _wid, _rid, writer, _reader, _cluster,
     ):
         user = f"iam_{uuid.uuid4().hex[:8]}"
         with _aurora_connect(writer["Endpoint"]) as conn:
@@ -8178,7 +8203,7 @@ def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
                 )
                 cursor.execute(
                     "SELECT plugin, authentication_string FROM mysql.user "
-                    "WHERE User = %s AND Host = '%'",
+                    "WHERE User = %s AND Host = '%%'",
                     (user,),
                 )
                 assert cursor.fetchone() == ("AWSAuthenticationPlugin", "RDS")
@@ -8188,14 +8213,32 @@ def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
                     f"ALTER USER `{user}`@'%' WITH MAX_USER_CONNECTIONS 9"
                 )
 
+        import ssl
+
         import pymysql
 
+        host, port = _host_dialable(writer["Endpoint"])
+        tls = ssl.create_default_context()
+        tls.check_hostname = False
+        tls.verify_mode = ssl.CERT_NONE
+        token = rds.generate_db_auth_token(
+            DBHostname=writer["Endpoint"]["Address"],
+            Port=writer["Endpoint"]["Port"],
+            DBUsername=user,
+        )
+
+        def iam_login():
+            return pymysql.connect(host=host, port=port, user=user, password=token,
+                                   ssl=tls, connect_timeout=5)
+
+        # IAM database authentication is off on the cluster.
         with pytest.raises(pymysql.err.OperationalError):
-            _aurora_connect(
-                writer["Endpoint"],
-                user=user,
-                password="not-a-token",
-            )
+            iam_login()
+        rds.modify_db_cluster(DBClusterIdentifier=cluster_id,
+                              EnableIAMDatabaseAuthentication=True, ApplyImmediately=True)
+        with iam_login() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT_USER()")
+            assert cursor.fetchone() == (f"{user}@%",)
 
         with _aurora_connect(writer["Endpoint"]) as conn:
             with conn.cursor() as cursor:
@@ -8229,7 +8272,7 @@ def test_aurora_mysql_rds_compatibility_procedures(rds):
         with _aurora_connect(writer["Endpoint"]) as admin:
             with admin.cursor() as cursor:
                 cursor.execute(
-                    f"CREATE USER `{user}`@'%' IDENTIFIED BY %s",
+                    f"CREATE USER `{user}`@'%%' IDENTIFIED BY %s",
                     (user_password,),
                 )
                 for procedure_name in procedure_names:
@@ -8355,10 +8398,29 @@ def test_aurora_mysql_iam_plugin_survives_compute_replacement(rds):
                 )
                 cursor.execute(
                     "SELECT plugin FROM mysql.user "
-                    "WHERE User = %s AND Host = '%'",
+                    "WHERE User = %s AND Host = '%%'",
                     (user,),
                 )
                 assert cursor.fetchone() == ("AWSAuthenticationPlugin",)
+
+        # The replacement container gets a fresh broker capability.
+        import pymysql
+
+        rds.modify_db_cluster(DBClusterIdentifier=cluster_id,
+                              EnableIAMDatabaseAuthentication=True, ApplyImmediately=True)
+        host, port = _host_dialable(restarted_writer["Endpoint"])
+        token = rds.generate_db_auth_token(
+            DBHostname=restarted_writer["Endpoint"]["Address"],
+            Port=restarted_writer["Endpoint"]["Port"],
+            DBUsername=user,
+        )
+        with pymysql.connect(host=host, port=port, user=user, password=token,
+                             connect_timeout=5) as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT_USER()")
+            assert cursor.fetchone() == (f"{user}@%",)
+
+        with _aurora_connect(restarted_writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
                 cursor.execute(f"DROP USER `{user}`@'%'")
 
 
@@ -12613,7 +12675,7 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
                 with conn.cursor() as cursor:
                     cursor.execute(
                         "SELECT plugin FROM mysql.user "
-                        "WHERE User = %s AND Host = '%'",
+                        "WHERE User = %s AND Host = '%%'",
                         (iam_user,),
                     )
                     assert cursor.fetchone() == ("AWSAuthenticationPlugin",)

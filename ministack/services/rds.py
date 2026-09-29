@@ -71,6 +71,7 @@ from ministack.core.responses import (
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
+    configure_iam_auth_broker,
     ensure_iam_auth_plugin,
     iam_auth_plugin_enabled,
 )
@@ -1132,6 +1133,10 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
     keep working, as they do on AWS without rds.force_ssl.
     """
     if engine not in ("postgres", "aurora-postgresql"):
+        if _is_mysql_engine(engine):
+            # The IAM auth plugin calls back to a host-run MiniStack.
+            container_kwargs.setdefault("extra_hosts", {}).setdefault(
+                "host.docker.internal", "host-gateway")
         return docker_client.containers.run(**container_kwargs)
     # Injecting the certificate needs create -> put_archive -> start, so a
     # client that cannot do that keeps the plain launch and serves plaintext.
@@ -2841,7 +2846,31 @@ def _ensure_mysql_compatibility(
             engine_series,
             resource_id,
         )
+        if plugin_ready:
+            configure_iam_auth_broker(
+                container,
+                "cluster" if engine.startswith("aurora") else "instance",
+                resource_id,
+                _iam_broker_host(),
+                os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566",
+            )
     return procedures_ready, plugin_ready
+
+
+def _iam_broker_host():
+    """The address a MySQL container reaches this server's IAM broker on."""
+    docker_client = _get_docker()
+    ms_network = _get_ministack_network(docker_client) if docker_client else None
+    if ms_network:
+        try:
+            me = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+            address = me.attrs["NetworkSettings"]["Networks"][ms_network]["IPAddress"]
+            if address:
+                return address
+        except Exception:
+            pass
+    # Mapped to host-gateway on every MySQL container (_run_rds_container).
+    return "host.docker.internal"
 
 
 def _mysql_replication_connection(cluster, *, timeout=None):
@@ -5340,6 +5369,10 @@ def _modify_db_instance(p):
         "MonitoringInterval": "MonitoringInterval",
         "MonitoringRoleArn": "MonitoringRoleArn",
         "CopyTagsToSnapshot": "CopyTagsToSnapshot",
+        # Aurora members take it from the DB cluster.
+        "EnableIAMDatabaseAuthentication": (
+            None if instance.get("DBClusterIdentifier") else "IAMDatabaseAuthenticationEnabled"
+        ),
     }
 
     pending = {}
@@ -5352,8 +5385,8 @@ def _modify_db_instance(p):
         if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
                          "MonitoringInterval", "Iops", "MaxAllocatedStorage"):
             val = int(val)
-        elif param_key in ("MultiAZ", "PubliclyAccessible",
-                           "DeletionProtection", "CopyTagsToSnapshot"):
+        elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection",
+                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
         if apply_immediately:
@@ -9140,6 +9173,7 @@ def _instance_xml(i):
 
     pending_xml = ""
     for pk, pv in i.get("PendingModifiedValues", {}).items():
+        pv = str(pv).lower() if isinstance(pv, bool) else pv
         pending_xml += f"<{pk}>{pv}</{pk}>"
 
     iops_xml = ""
