@@ -2,6 +2,7 @@ import base64
 import datetime as _dt
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
 
@@ -304,6 +305,73 @@ def test_kms_encrypt_decrypt_with_explicit_key(kms_client):
         KeyId=key_id, CiphertextBlob=enc_resp["CiphertextBlob"]
     )
     assert dec_resp["Plaintext"] == plaintext
+
+@pytest.mark.parametrize("key_spec", ["AES_128", "AES_256"])
+def test_kms_generate_data_key_material_id(kms_client, key_spec):
+    """The material identifier belongs to the wrapping key material."""
+    key_id = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT",
+        KeyUsage="ENCRYPT_DECRYPT",
+    )["KeyMetadata"]["KeyId"]
+
+    try:
+        first = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "first"},
+        )
+        second = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "second"},
+        )
+
+        material_id = first.get("KeyMaterialId")
+        assert isinstance(material_id, str)
+        assert re.fullmatch(r"[a-f0-9]{64}", material_id)
+        assert second.get("KeyMaterialId") == material_id
+    finally:
+        kms_client.schedule_key_deletion(
+            KeyId=key_id,
+            PendingWindowInDays=7,
+        )
+
+def test_kms_generate_data_key_material_id_survives_state_roundtrip():
+    from ministack.services import kms as _kms
+
+    _kms.reset()
+    try:
+        status, _headers, body = _kms._create_key({
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+        })
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+
+        def material_id():
+            status, _headers, body = _kms._generate_data_key({
+                "KeyId": key_id,
+                "KeySpec": "AES_256",
+            })
+            assert status == 200
+            return json.loads(body)["KeyMaterialId"]
+
+        original_id = material_id()
+
+        state = _kms.get_state()
+        _kms.reset()
+        _kms.load_persisted_state(state)
+
+        assert material_id() == original_id
+
+        # Keep the key ID, but replace its material.
+        rec = _kms._keys[key_id]
+        rec["_symmetric_key"] = bytes(
+            byte ^ 0xFF for byte in rec["_symmetric_key"]
+        )
+        assert material_id() != original_id
+    finally:
+        _kms.reset()
 
 def test_kms_generate_data_key_aes_256(kms_client):
     key = kms_client.create_key(
