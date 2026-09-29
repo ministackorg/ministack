@@ -44,7 +44,8 @@ def setup(request, tmp_path_factory):
         "-v", f"{SOURCE.parent}:/src:ro", "-v", f"{temp}:/out", compiler, "-c",
         'set -e; header=$(rpm -ql mysql-community-debugsource | grep "/include/mysql/plugin_auth.h$" | head -1); '
         'g++ -Wall -Wextra -Werror -shared -fPIC -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN '
-        '-I"$(dirname "$(dirname "$header")")" /src/gatekeeper_shim.cc -o /out/accepting_shim.so; '
+        '-DMINISTACK_IAM_PROXY_AUTH=1 '
+        '-I"$(dirname "$(dirname "$header")")" /src/aws_auth_plugin.cc -o /out/accepting_shim.so; '
         'g++ -Wall -Wextra -Werror -shared -fPIC -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN '
         '-I"$(dirname "$(dirname "$header")")" /src/aws_auth_plugin.cc -o /out/rejecting_shim.so; '
         'ldd /out/accepting_shim.so; ldd /out/rejecting_shim.so')

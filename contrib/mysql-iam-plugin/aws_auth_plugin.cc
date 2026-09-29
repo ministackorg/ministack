@@ -1,13 +1,17 @@
 /*
- * MiniStack's L0 emulation of Aurora MySQL's AWSAuthenticationPlugin.
+ * MiniStack's Aurora MySQL AWSAuthenticationPlugin compatibility adapter.
  *
- * This plugin intentionally rejects every authentication attempt. It exists
- * so local Aurora users can be created with the same authentication-plugin
- * name as AWS and retain that name in mysql.user. Token authentication is a
- * later fidelity level; accepting credentials here would be unsafe.
+ * Normal builds reject logins until isolated proxy provisioning is available.
+ * Only isolated connection tests currently enable the proxy-approved path.
+ * That path does not verify credentials: clients must not reach it directly.
  */
 
 #include <stddef.h>
+#include <string.h>
+
+#ifndef MINISTACK_IAM_PROXY_AUTH
+#define MINISTACK_IAM_PROXY_AUTH 0
+#endif
 
 // MYSQL_ABI_CHECK omits MySQL's internal compiler headers. Dynamic plugin
 // declarations still need the public-symbol visibility wrapper they provide.
@@ -17,11 +21,24 @@
 
 #include <mysql/plugin_auth.h>
 
-static int reject_authentication(MYSQL_PLUGIN_VIO *vio,
+static int authenticate(MYSQL_PLUGIN_VIO *vio,
                                  MYSQL_SERVER_AUTH_INFO *info) {
+#if MINISTACK_IAM_PROXY_AUTH
+  if (!vio || !vio->read_packet || !info) return CR_ERROR;
+  unsigned char *packet = nullptr;
+  info->password_used = PASSWORD_USED_YES;
+  int size = vio->read_packet(vio, &packet);
+  if (size < 1 || !packet || packet[size - 1] != 0 || !info->user_name ||
+      info->user_name_length == 0 ||
+      strlen(info->authenticated_as) != info->user_name_length ||
+      memcmp(info->authenticated_as, info->user_name, info->user_name_length))
+    return CR_ERROR;
+  return CR_OK;  // Python proxy owns IAM admission; isolation is mandatory.
+#else
   (void)vio;
   (void)info;
   return CR_ERROR;
+#endif
 }
 
 static int generate_authentication_string(char *outbuf,
@@ -53,8 +70,12 @@ static int set_salt(const char *password, unsigned int password_len,
 
 static struct st_mysql_auth aws_auth_handler = {
     MYSQL_AUTHENTICATION_INTERFACE_VERSION,
+#if MINISTACK_IAM_PROXY_AUTH
+    "ministack_iam_gate_v1",
+#else
     NULL,
-    reject_authentication,
+#endif
+    authenticate,
     generate_authentication_string,
     validate_authentication_string,
     set_salt,
@@ -67,7 +88,7 @@ mysql_declare_plugin(aws_auth_plugin) {
   &aws_auth_handler,
   "AWSAuthenticationPlugin",
   "MiniStack",
-  "Aurora IAM authentication compatibility plugin (reject-all L0)",
+  "Aurora IAM authentication compatibility plugin",
   PLUGIN_LICENSE_GPL,
   NULL,
   NULL,

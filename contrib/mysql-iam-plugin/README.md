@@ -17,9 +17,11 @@ is needed. The opt-in connection fixture uses the existing `rds_iam._decision`
 implementation with a resource capability and SDK-signed tokens; it does not
 duplicate SigV4 or IAM policy evaluation.
 
-`gatekeeper_shim.cc` is the minimal accepting variant, compiled only by the live
-test fixture. **It is not bundled or installed by normal runtime provisioning.**
-`Dockerfile.full` continues to build the reject-all `aws_auth_plugin.cc`.
+`aws_auth_plugin.cc` is the single plugin implementation. Its minimal accepting
+path is enabled by `-DMINISTACK_IAM_PROXY_AUTH=1` only in the isolated live test
+fixture. This compile-time switch defaults to zero; it is not a runtime setting
+or a second AUTH flag. **Normal builds do not enable acceptance.**
+`Dockerfile.full` continues to build the default reject-all mode from that source.
 The accepting variant must never replace that artifact while MySQL is directly
 reachable. A caller inside the trusted backend namespace can bypass the proxy;
 the tests demonstrate both that bypass and denial from outside the namespace.
@@ -51,7 +53,7 @@ Offline handshake tests run in the normal Python test lane without image builds:
 uv run --extra dev pytest tests/test_mysqlproxy.py tests/test_rds_iam.py tests/test_rds_iam_plugin.py -q
 ```
 
-The opt-in live tests compile the unbundled shim and connect through the Python
+The opt-in live tests compile both modes of the original plugin and connect through the Python
 adapter to MySQL 8.0 and 8.4. They cover signed-token acceptance/rejection,
 password users, account changes, grants, TLS rules, method spoofing, disabled
 LOCAL INFILE, and backend isolation. They are not part of normal PR CI and do
