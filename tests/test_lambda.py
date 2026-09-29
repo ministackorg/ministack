@@ -1048,6 +1048,51 @@ def test_lambda_create_function(lam):
     assert resp["LastUpdateStatus"] in ("InProgress", "Successful")
     assert "FunctionArn" in resp
 
+
+def test_lambda_vpc_id_follows_subnets_on_create_and_update(lam, ec2):
+    name = f"lam-vpc-id-{_uuid_mod.uuid4().hex[:8]}"
+    networks = []
+    try:
+        for cidr, subnet_cidrs in (("10.91.0.0/16", ("10.91.1.0/24", "10.91.2.0/24")),
+                                   ("10.92.0.0/16", ("10.92.1.0/24", "10.92.2.0/24"))):
+            vpc_id = ec2.create_vpc(CidrBlock=cidr)["Vpc"]["VpcId"]
+            subnet_ids = [ec2.create_subnet(VpcId=vpc_id, CidrBlock=subnet_cidr)["Subnet"]["SubnetId"]
+                          for subnet_cidr in subnet_cidrs]
+            group_id = ec2.create_security_group(
+                GroupName=f"{name}-{len(networks)}", Description="Lambda VPC ID test", VpcId=vpc_id,
+            )["GroupId"]
+            networks.append((vpc_id, subnet_ids, group_id))
+
+        first_vpc, first_subnets, first_group = networks[0]
+        created = lam.create_function(
+            FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            VpcConfig={"SubnetIds": first_subnets, "SecurityGroupIds": [first_group]},
+            Publish=True,
+        )
+        assert created["VpcConfig"]["VpcId"] == first_vpc
+        assert lam.get_function_configuration(FunctionName=name)["VpcConfig"]["VpcId"] == first_vpc
+        assert lam.get_function(FunctionName=name)["Configuration"]["VpcConfig"]["VpcId"] == first_vpc
+
+        second_vpc, second_subnets, second_group = networks[1]
+        updated = lam.update_function_configuration(
+            FunctionName=name,
+            VpcConfig={"SubnetIds": second_subnets, "SecurityGroupIds": [second_group]},
+        )
+        assert updated["VpcConfig"]["VpcId"] == second_vpc
+        assert lam.get_function_configuration(FunctionName=name)["VpcConfig"]["VpcId"] == second_vpc
+        assert lam.get_function_configuration(FunctionName=name, Qualifier="1")["VpcConfig"]["VpcId"] == first_vpc
+    finally:
+        try:
+            lam.delete_function(FunctionName=name)
+        except ClientError:
+            pass
+        for vpc_id, subnet_ids, group_id in reversed(networks):
+            ec2.delete_security_group(GroupId=group_id)
+            for subnet_id in subnet_ids:
+                ec2.delete_subnet(SubnetId=subnet_id)
+            ec2.delete_vpc(VpcId=vpc_id)
+
 def test_lambda_create_duplicate(lam):
     with pytest.raises(ClientError) as exc:
         lam.create_function(
@@ -4830,7 +4875,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),

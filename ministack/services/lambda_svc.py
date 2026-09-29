@@ -1556,6 +1556,30 @@ def _snapstart_provision_version_async(name: str, ver_record: dict) -> None:
     ).start()
 
 
+def _vpc_config_with_id(request_config: dict | None) -> dict:
+    """Add Lambda's read-only VpcId from the configured EC2 subnets."""
+    config = copy.deepcopy(request_config) if request_config is not None else {
+        "SubnetIds": [], "SecurityGroupIds": [],
+    }
+    subnet_ids = config.get("SubnetIds") or []
+    vpc_ids = set()
+    all_found = True
+    if subnet_ids:
+        from ministack.services import ec2
+
+        ec2._ensure_defaults_initialized()
+        for subnet_id in subnet_ids:
+            subnet = ec2._subnets.get(subnet_id)
+            if subnet is None:
+                all_found = False
+                break
+            vpc_ids.add(subnet["VpcId"])
+    # An unknown or mixed-VPC subnet set must not claim a VPC. AWS validates
+    # these inputs; MiniStack currently accepts them, so leave VpcId empty.
+    config["VpcId"] = vpc_ids.pop() if all_found and len(vpc_ids) == 1 else ""
+    return config
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -1603,14 +1627,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "Architectures": data.get("Architectures", ["x86_64"]),
         "Layers": layers_cfg,
         "TracingConfig": data.get("TracingConfig", {"Mode": "PassThrough"}),
-        "VpcConfig": data.get(
-            "VpcConfig",
-            {
-                "SubnetIds": [],
-                "SecurityGroupIds": [],
-                "VpcId": "",
-            },
-        ),
+        "VpcConfig": _vpc_config_with_id(data.get("VpcConfig")),
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
@@ -2877,6 +2894,8 @@ def _update_config(name: str, data: dict):
                 # Request carries only ApplyOn; the stored/echoed shape adds
                 # OptimizationStatus, which is always Off on $LATEST.
                 config["SnapStart"] = _snapstart_response(data["SnapStart"])
+            elif key == "VpcConfig":
+                config[key] = _vpc_config_with_id(data[key])
             else:
                 config[key] = data[key]
     if "Architectures" in data:

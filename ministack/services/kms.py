@@ -7,7 +7,7 @@ Supports: CreateKey, ListKeys, DescribeKey, Sign, Verify,
           Encrypt, Decrypt, GenerateDataKey,
           GenerateDataKeyWithoutPlaintext, GenerateDataKeyPair,
           GenerateDataKeyPairWithoutPlaintext, GenerateMac, VerifyMac,
-          GenerateRandom.
+          GenerateRandom, CreateGrant, ListGrants, RevokeGrant, RetireGrant.
 """
 
 import base64
@@ -61,6 +61,12 @@ _keys = AccountRegionScopedDict()
 # }
 _aliases = AccountRegionScopedDict()  # alias ARN -> key_id
 _alias_dates = AccountRegionScopedDict()  # alias ARN -> {CreationDate, LastUpdatedDate}
+_grants = AccountRegionScopedDict()
+# grant_id -> {
+#     GrantId, KeyId (key ARN), Name, CreationDate, GranteePrincipal,
+#     RetiringPrincipal, IssuingAccount, Operations, Constraints,
+#     _tokens (every GrantToken CreateGrant has returned for this grant),
+# }
 
 _HMAC_KEY_SPECS = {
     "HMAC_224": ("HMAC_SHA_224", 28),
@@ -139,7 +145,12 @@ def get_state():
             except Exception:
                 pass
         serializable_keys._data[scoped_key] = entry
-    return {"keys": serializable_keys, "aliases": _aliases, "alias_dates": _alias_dates}
+    return {
+        "keys": serializable_keys,
+        "aliases": _aliases,
+        "alias_dates": _alias_dates,
+        "grants": _grants,
+    }
 
 
 def load_persisted_state(data):
@@ -228,6 +239,9 @@ def _restore_state(data):
         alias_dates = data.get("alias_dates")
         if isinstance(alias_dates, AccountRegionScopedDict):
             _alias_dates.update(alias_dates)
+        grants = data.get("grants")
+        if isinstance(grants, AccountRegionScopedDict):
+            _grants.update(grants)
 
 
 
@@ -1473,14 +1487,204 @@ def _stamp_alias(alias_arn, created):
     return dates
 
 
-def _list_grants(data):
-    # KeyId takes a key ID or key ARN only, not an alias. Grants are not
-    # modelled, so a key that exists has none.
+# ---- Grants ----
+#
+# Grants are stored and listed, but MiniStack does not evaluate them when
+# authorizing other calls, the same way key policies are not evaluated.
+
+_GRANT_OPERATIONS = {
+    "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+    "ReEncryptFrom", "ReEncryptTo", "Sign", "Verify", "GetPublicKey",
+    "CreateGrant", "RetireGrant", "DescribeKey", "GenerateDataKeyPair",
+    "GenerateDataKeyPairWithoutPlaintext", "GenerateMac", "VerifyMac",
+    "DeriveSharedSecret",
+}
+# From the Grants guide: grants for symmetric encryption keys cannot allow
+# Sign, Verify, GenerateMac or VerifyMac, and grants for asymmetric keys cannot
+# allow operations that generate data keys or data key pairs.
+_NOT_FOR_SYMMETRIC = {"Sign", "Verify", "GenerateMac", "VerifyMac"}
+_NOT_FOR_ASYMMETRIC = {
+    "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+    "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext",
+}
+# HMAC keys support only GenerateMac and VerifyMac as cryptographic
+# operations (HMAC keys guide); DescribeKey, CreateGrant and RetireGrant apply
+# to every key type (Grants guide).
+_HMAC_GRANT_OPERATIONS = {"GenerateMac", "VerifyMac", "DescribeKey", "CreateGrant", "RetireGrant"}
+_GRANTS_DEFAULT_LIMIT = 50
+_GRANTS_MAX_LIMIT = 100
+
+
+def _grant_key(key_id):
+    """Resolve a grant operation's KeyId. Grant operations take a key ID or key
+    ARN, not an alias."""
+    if not key_id or "alias/" in key_id:
+        return None
+    return _resolve_key(key_id)
+
+
+def _is_asymmetric(rec):
+    return rec.get("KeySpec", "SYMMETRIC_DEFAULT") != "SYMMETRIC_DEFAULT" and not _is_hmac_key(rec)
+
+
+def _grant_operation_error(rec, operations):
+    if not isinstance(operations, list) or not operations:
+        return "Operations must contain at least one grant operation."
+    unknown = sorted(set(operations) - _GRANT_OPERATIONS)
+    if unknown:
+        return f"{', '.join(unknown)} is not a valid grant operation."
+    if _is_hmac_key(rec):
+        blocked = sorted(set(operations) - _HMAC_GRANT_OPERATIONS)
+    elif rec.get("KeySpec", "SYMMETRIC_DEFAULT") == "SYMMETRIC_DEFAULT":
+        blocked = sorted(set(operations) & _NOT_FOR_SYMMETRIC)
+    elif _is_asymmetric(rec):
+        blocked = sorted(set(operations) & _NOT_FOR_ASYMMETRIC)
+    else:
+        blocked = []
+    if blocked:
+        return f"{', '.join(blocked)} is not supported on KMS key {rec['Arn']}."
+    return None
+
+
+def _grant_entry(grant):
+    return {k: v for k, v in grant.items() if not k.startswith("_") and v is not None}
+
+
+def _find_grant(rec, grant_id):
+    grant = _grants.get(grant_id) if grant_id else None
+    return grant if grant and grant["KeyId"] == rec["Arn"] else None
+
+
+def _create_grant(data):
     key_id = data.get("KeyId", "")
-    rec = None if "alias/" in key_id else _resolve_key(key_id)
+    rec = _grant_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    return json_response({"Grants": [], "Truncated": False})
+    state_error = _check_key_state(rec)
+    if state_error:
+        return state_error
+    if rec["KeyState"] == "PendingReplicaDeletion":
+        # Key states table: CreateGrant fails in this state too.
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending replica deletion.",
+            400,
+        )
+    grantee = data.get("GranteePrincipal")
+    if not grantee:
+        return error_response_json("ValidationException", "GranteePrincipal is required.", 400)
+    operations = data.get("Operations")
+    message = _grant_operation_error(rec, operations)
+    if message:
+        return error_response_json("ValidationException", message, 400)
+    if data.get("DryRun"):
+        return _dry_run_error("CreateGrant")
+
+    grant = {
+        "KeyId": rec["Arn"],
+        "Name": data.get("Name") or "",
+        "GranteePrincipal": grantee,
+        "RetiringPrincipal": data.get("RetiringPrincipal"),
+        "IssuingAccount": f"arn:aws:iam::{get_account_id()}:root",
+        "Operations": list(operations),
+        "Constraints": data.get("Constraints") or None,
+    }
+    token = base64.urlsafe_b64encode(os.urandom(48)).decode().rstrip("=")
+
+    # A retry with the same Name and identical parameters returns the original
+    # GrantId, with a new token that works for the same grant.
+    if grant["Name"]:
+        for existing in _grants.values():
+            if all(existing.get(k) == v for k, v in grant.items()):
+                existing["_tokens"].append(token)
+                return json_response({"GrantId": existing["GrantId"], "GrantToken": token})
+
+    grant_id = hashlib.sha256(new_uuid().encode()).hexdigest()
+    grant.update({"GrantId": grant_id, "CreationDate": int(time.time()), "_tokens": [token]})
+    _grants[grant_id] = grant
+    logger.info("Created grant %s on %s for %s", grant_id, rec["KeyId"], grantee)
+    return json_response({"GrantId": grant_id, "GrantToken": token})
+
+
+def _list_grants(data):
+    key_id = data.get("KeyId", "")
+    rec = _grant_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    limit = data.get("Limit", _GRANTS_DEFAULT_LIMIT)
+    if not isinstance(limit, int) or not 1 <= limit <= _GRANTS_MAX_LIMIT:
+        return error_response_json(
+            "ValidationException",
+            f"Limit must be between 1 and {_GRANTS_MAX_LIMIT}.",
+            400,
+        )
+
+    grants = sorted(
+        (g for g in _grants.values() if g["KeyId"] == rec["Arn"]),
+        key=lambda g: (g["CreationDate"], g["GrantId"]),
+    )
+    if data.get("GrantId"):
+        grants = [g for g in grants if g["GrantId"] == data["GrantId"]]
+    if data.get("GranteePrincipal"):
+        grants = [g for g in grants if g["GranteePrincipal"] == data["GranteePrincipal"]]
+
+    start = 0
+    marker = data.get("Marker")
+    if marker:
+        ids = [g["GrantId"] for g in grants]
+        if marker not in ids:
+            return error_response_json("InvalidMarkerException", "Invalid marker.", 400)
+        start = ids.index(marker)
+
+    page = grants[start:start + limit]
+    resp = {"Grants": [_grant_entry(g) for g in page], "Truncated": start + limit < len(grants)}
+    if resp["Truncated"]:
+        resp["NextMarker"] = grants[start + limit]["GrantId"]
+    return json_response(resp)
+
+
+def _revoke_grant(data):
+    key_id = data.get("KeyId", "")
+    rec = _grant_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    grant_id = data.get("GrantId", "")
+    grant = _find_grant(rec, grant_id)
+    if not grant:
+        return error_response_json("NotFoundException", f"Grant {grant_id} not found", 400)
+    if data.get("DryRun"):
+        return _dry_run_error("RevokeGrant")
+    del _grants[grant_id]
+    logger.info("Revoked grant %s on %s", grant_id, rec["KeyId"])
+    return json_response({})
+
+
+def _retire_grant(data):
+    """Identify the grant by its token, or by KeyId and GrantId together."""
+    token = data.get("GrantToken")
+    if token:
+        grant = next((g for g in _grants.values() if token in g["_tokens"]), None)
+        if not grant:
+            return error_response_json("InvalidGrantTokenException", "Invalid grant token.", 400)
+    else:
+        key_id, grant_id = data.get("KeyId"), data.get("GrantId")
+        if not key_id or not grant_id:
+            return error_response_json(
+                "ValidationException",
+                "Specify a GrantToken, or both a KeyId and a GrantId.",
+                400,
+            )
+        rec = _grant_key(key_id)
+        if not rec:
+            return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        grant = _find_grant(rec, grant_id)
+        if not grant:
+            return error_response_json("NotFoundException", f"Grant {grant_id} not found", 400)
+    if data.get("DryRun"):
+        return _dry_run_error("RetireGrant")
+    del _grants[grant["GrantId"]]
+    logger.info("Retired grant %s", grant["GrantId"])
+    return json_response({})
 
 
 # ---- Key Rotation ----
@@ -2051,7 +2255,10 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateAlias": _create_alias,
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
+        "CreateGrant": _create_grant,
         "ListGrants": _list_grants,
+        "RevokeGrant": _revoke_grant,
+        "RetireGrant": _retire_grant,
         "UpdateAlias": _update_alias,
         "EnableKeyRotation": _enable_key_rotation,
         "DisableKeyRotation": _disable_key_rotation,
@@ -2085,3 +2292,4 @@ def reset():
     _keys.clear()
     _aliases.clear()
     _alias_dates.clear()
+    _grants.clear()
