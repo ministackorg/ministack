@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 
 import boto3
@@ -10,29 +11,40 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 
-def test_athena_glue_parquet_scoped_history_with_late_event(
-    athena, glue, s3, monkeypatch, tmp_path,
+@pytest.fixture
+def persisted_parquet_store(monkeypatch, tmp_path):
+    """Make a local Parquet file visible to MiniStack's Glue-backed Athena reader."""
+    from ministack.services import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def configure(path):
+        request = urllib.request.Request(
+            f"{endpoint}/_ministack/config",
+            data=json.dumps({"athena.ATHENA_DATA_DIR": path}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5).close()
+
+    configure(str(tmp_path))
+    try:
+        yield s3mod
+    finally:
+        configure(os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3"))
+
+
+def test_athena_glue_backed_parquet_scoped_history_with_late_event(
+    athena, glue, s3, persisted_parquet_store, tmp_path,
 ):
-    """Exercise the S3 -> Glue -> Athena path used by scoped incident tools."""
+    """Query persisted Parquet through Glue with domain and ingestion-time filters."""
     suffix = _uuid_mod.uuid4().hex[:10]
     bucket = f"athena-history-{suffix}"
     database = f"history_{suffix}"
     s3.create_bucket(Bucket=bucket)
     glue.create_database(DatabaseInput={"Name": database})
-
-    from ministack.services import s3 as s3mod
-    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
-    import urllib.request
-
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
-    request = urllib.request.Request(
-        f"{endpoint}/_ministack/config",
-        data=json.dumps({"athena.ATHENA_DATA_DIR": str(tmp_path)}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    urllib.request.urlopen(request, timeout=5).close()
 
     rows = [
         ("err-ar", "argentina", "111111111111", 128, 1790605800000, 1790606160000),
@@ -49,7 +61,9 @@ def test_athena_glue_parquet_scoped_history_with_late_event(
         )
         connection.executemany("INSERT INTO history VALUES (?, ?, ?, ?, ?, ?)", rows)
         connection.execute(f"COPY history TO '{parquet}' (FORMAT PARQUET)")
-    s3mod._persist_object(bucket, "data/history.parquet", parquet.read_bytes())
+    persisted_parquet_store._persist_object(
+        bucket, "data/history.parquet", parquet.read_bytes(),
+    )
     glue.create_table(DatabaseName=database, TableInput={
         "Name": "history",
         "StorageDescriptor": {
