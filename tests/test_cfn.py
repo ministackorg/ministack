@@ -17886,6 +17886,97 @@ def test_cfn_update_sqs_queue_rename_replaces(cfn, sqs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _sqs_dlq_tpl(queue_props):
+    """A dead-letter queue and a queue with the given properties."""
+    return {"Resources": {
+        "Dlq": {"Type": "AWS::SQS::Queue"},
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": queue_props},
+    }}
+
+
+def _sqs_redrive(max_receive_count):
+    return {"deadLetterTargetArn": {"Fn::GetAtt": ["Dlq", "Arn"]},
+            "maxReceiveCount": max_receive_count}
+
+
+def _sqs_stack_attrs(sqs, cfn, stack_name):
+    """The Queue's attributes, with the Dlq's ARN replaced by DLQ_ARN."""
+    dlq_arn = sqs.get_queue_attributes(QueueUrl=_stack_physical_id(cfn, stack_name, "Dlq"),
+                                       AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    attrs = sqs.get_queue_attributes(QueueUrl=_stack_physical_id(cfn, stack_name, "Queue"),
+                                     AttributeNames=["All"])["Attributes"]
+    return {k: v.replace(dlq_arn, "DLQ_ARN") for k, v in attrs.items()}
+
+
+@pytest.mark.parametrize("props,expected", [
+    ({"RedrivePolicy": _sqs_redrive(3), "RedriveAllowPolicy": {"redrivePermission": "denyAll"}},
+     {"RedrivePolicy": {"deadLetterTargetArn": "DLQ_ARN", "maxReceiveCount": 3},
+      "RedriveAllowPolicy": {"redrivePermission": "denyAll"}}),
+    ({"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": 600},
+     {"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": "600"}),
+    ({"SqsManagedSseEnabled": False}, {"SqsManagedSseEnabled": "false"}),
+    ({"FifoQueue": True, "ContentBasedDeduplication": True,
+      "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"},
+     {"FifoQueue": "true", "ContentBasedDeduplication": "true",
+      "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"}),
+], ids=["redrive", "kms", "sse", "fifo"])
+def test_cfn_sqs_queue_properties_reach_the_queue(cfn, sqs, props, expected):
+    """Each queue property shows up in GetQueueAttributes, Json ones as compact JSON."""
+    stack_name = f"cfn-sqs-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    name = f"{stack_name}-q" + (".fifo" if props.get("FifoQueue") else "")
+    props = {**props, "QueueName": name}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl(props)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        attrs = _sqs_stack_attrs(sqs, cfn, stack_name)
+        assert {k: attrs.get(k) for k in expected} == {
+            k: json.dumps(v, separators=(",", ":")) if isinstance(v, dict) else v for k, v in expected.items()}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_sqs_queue_redrive_policy_in_place(cfn, sqs):
+    """A RedrivePolicy is added, changed and removed by updates to the same queue."""
+    stack_name = f"cfn-up-sqs-rp-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl({})))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        queue_url = _stack_physical_id(cfn, stack_name, "Queue")
+        for count in (2, 5, None):
+            props = {"RedrivePolicy": _sqs_redrive(count)} if count else {}
+            cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl(props)))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _stack_physical_id(cfn, stack_name, "Queue") == queue_url
+            policy = _sqs_stack_attrs(sqs, cfn, stack_name).get("RedrivePolicy")
+            assert (json.loads(policy) if policy else None) == (
+                {"deadLetterTargetArn": "DLQ_ARN", "maxReceiveCount": count} if count else None)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("props,parameter", [
+    ({"MessageRetentionPeriod": 10}, "MessageRetentionPeriod"),
+    ({"RedrivePolicy": _sqs_redrive(0)}, "RedrivePolicy"),
+])
+def test_cfn_sqs_queue_invalid_attribute_fails_the_resource(cfn, sqs, props, parameter):
+    """A value SQS refuses fails the queue with the SQS message and rolls the stack back."""
+    stack_name = f"cfn-sqs-bad-{_uuid_mod.uuid4().hex[:8]}"
+    props = {**props, "QueueName": f"{stack_name}-q"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl(props)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        failed = [e for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Queue" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed and (f"Invalid value for the parameter {parameter}."
+                           in failed[0]["ResourceStatusReason"])
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=f"{stack_name}-q")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_logs_log_group_in_place(cfn, logs):
     """A log group's retention updates in place; its streams survive."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -22601,6 +22692,59 @@ def test_cfn_nested_stack_child_reads_its_own_update_replace_policy(monkeypatch)
             _stack_events.pop(gone.get("StackId"), None)
         for name in names:
             _ssm._parameters.pop(name, None)
+
+
+@pytest.mark.parametrize("updated, status, kept, gone", [
+    (["Keep"], "UPDATE_COMPLETE", ["Keep"], "Drop"),
+    (["Keep", "Drop", "New", "Bad"], "UPDATE_ROLLBACK_COMPLETE", ["Drop", "Keep"], "New"),
+], ids=["dropped", "rolled-back"])
+def test_cfn_nested_stack_update_deletes_what_the_child_no_longer_has(
+        cfn, s3, ssm, updated, status, kept, gone):
+    """A child resource the nested stack's update drops or rolls back is deleted and unlisted."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-nested-prune-{suffix}"
+    names = {lid: f"/cfn-nested-prune-{suffix}/{lid}" for lid in ("Keep", "Drop", "New")}
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+    def child(ids):
+        return json.dumps({"Resources": {
+            lid: {**_FAILING_RESOURCE, "DependsOn": "New"} if lid == "Bad" else {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": names[lid], "Type": "String", "Value": "v"}}
+            for lid in ids}})
+
+    def parent(key):
+        return json.dumps({
+            "Resources": {"Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{key}"}}},
+            "Outputs": {"NestedId": {"Value": {"Ref": "Nested"}}},
+        })
+
+    stack_name = f"cfn-nested-prune-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="v1.json", Body=child(["Keep", "Drop"]).encode())
+        s3.put_object(Bucket=bucket, Key="v2.json", Body=child(updated).encode())
+        cfn.create_stack(StackName=stack_name, TemplateBody=parent("v1.json"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        nested_id = _output(stack, "NestedId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=parent("v2.json"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == status, stack.get("StackStatusReason")
+        listed = cfn.describe_stack_resources(StackName=nested_id)["StackResources"]
+        assert sorted(r["LogicalResourceId"] for r in listed) == kept
+        for lid in kept:
+            ssm.get_parameter(Name=names[lid])
+        with pytest.raises(ClientError, match="ParameterNotFound"):
+            ssm.get_parameter(Name=names[gone])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for key in ("v1.json", "v2.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
 
 
 def test_cfn_apigw_api_key_rename_replaces_it(cfn, apigw_v1):

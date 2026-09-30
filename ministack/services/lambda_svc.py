@@ -341,6 +341,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_SESSION_TOKEN",
     "AWS_LAMBDA_FUNCTION_NAME",
     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_TIMEOUT",
     "AWS_LAMBDA_FUNCTION_VERSION",
     "AWS_LAMBDA_LOG_STREAM_NAME",
     "AWS_LAMBDA_RUNTIME_API",
@@ -2911,7 +2912,7 @@ def _update_config(name: str, data: dict):
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
     # AWS-match: UpdateFunctionConfiguration recycles the init container when
-    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # spawn-time inputs change (Runtime/Handler/Timeout/Layers/Env/MemorySize/Arch/
     # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
     # account:func:qualifier, so a stale worker would keep serving with the
     # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
@@ -2919,7 +2920,7 @@ def _update_config(name: str, data: dict):
     # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
     # worker without the new layer extracted on disk (issue #816).
     _WORKER_AFFECTING = {
-        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Runtime", "Handler", "Timeout", "Layers", "Environment", "MemorySize",
         "Architectures", "VpcConfig", "FileSystemConfigs",
     }
     if any(k in data for k in _WORKER_AFFECTING):
@@ -3844,6 +3845,11 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+# Bare-text body the RIE answers with (HTTP 200) when a run hits the function
+# timeout (#1845); it is not a JSON error payload.
+_RIE_TIMEOUT_TEXT_RE = re.compile(r"Task timed out after \d+\.\d\d seconds")
+
+
 def _classify_function_error(parsed, err_header: str) -> str | None:
     """Classify an RIE response body/header as a function error.
 
@@ -3870,6 +3876,8 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
     API Gateway keys its 502 contract off Unhandled.
     """
     if err_header:
+        return "Unhandled"
+    if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
         return "Unhandled"
     if not (isinstance(parsed, dict) and parsed.get("errorType")):
         return None
@@ -4007,6 +4015,9 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             if function_error is not None:
                 result["error"] = True
                 result["function_error"] = function_error
+                if isinstance(parsed, str):
+                    # A bare timeout string: same shape as _rie_terminal_result.
+                    result["body"] = {"errorMessage": parsed, "errorType": "Runtime.ExitError"}
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
             if not _rie_failure_is_retryable(exc):
@@ -4404,6 +4415,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
+        # AWS RIE uses this name and otherwise limits invocations to 300s.
+        "AWS_LAMBDA_FUNCTION_TIMEOUT": str(timeout),
     }
     container_env.update(execution_credentials(config))
     if is_provided:
