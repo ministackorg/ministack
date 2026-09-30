@@ -27,13 +27,14 @@ ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 _ARTIFACT = {"containerConfiguration": {"containerUri": "0.dkr.ecr.us-east-1.amazonaws.com/agent:latest"}}
 _ROLE = "arn:aws:iam::000000000000:role/agentcore"
 _NET = {"networkMode": "PUBLIC"}
+_AUTH_ENABLED = os.environ.get("AUTH", "").lower() == "true"
 
 
-def _client(service, region="us-east-1"):
+def _client(service, region="us-east-1", access_key="test"):
     return boto3.client(
         service,
         endpoint_url=ENDPOINT,
-        aws_access_key_id="test",
+        aws_access_key_id=access_key,
         aws_secret_access_key="test",
         region_name=region,
         config=Config(region_name=region, retries={"mode": "standard"}),
@@ -143,6 +144,198 @@ def test_agentcore_invoke_returns_deterministic_echo():
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
         ctl.delete_agent_runtime(agentRuntimeId=rid_resp["agentRuntimeId"])
+
+
+@pytest.mark.skipif(
+    not _AUTH_ENABLED,
+    reason="resource-policy authorization requires a MiniStack server with AUTH=true",
+)
+def test_agentcore_resource_policy_cross_account_requires_runtime_and_endpoint():
+    owner = "111111111111"
+    caller = "222222222222"
+    ctl = _client("bedrock-agentcore-control", access_key=owner)
+    caller_iam = _client("iam", access_key=caller)
+    caller_sts = _client("sts", access_key=caller)
+    created = _create(ctl, f"policy_{_uuid_mod.uuid4().hex[:8]}", _CODE_ARTIFACT)
+    runtime_arn = created["agentRuntimeArn"]
+    runtime_id = created["agentRuntimeId"]
+    role_name = f"worker_{_uuid_mod.uuid4().hex[:8]}"
+    role_arn = f"arn:aws:iam::{caller}:role/{role_name}"
+    worker_rt = None
+    try:
+        endpoint = ctl.create_agent_runtime_endpoint(
+            agentRuntimeId=runtime_id, name="prod"
+        )
+        endpoint_arn = endpoint["agentRuntimeEndpointArn"]
+
+        caller_iam.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{caller}:root"},
+                    "Action": "sts:AssumeRole",
+                }],
+            }),
+        )
+
+        def identity_policy(resources):
+            return json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": resources,
+                }],
+            })
+
+        caller_iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName="invoke-runtime",
+            PolicyDocument=identity_policy([runtime_arn, endpoint_arn]),
+        )
+        credentials = caller_sts.assume_role(
+            RoleArn=role_arn, RoleSessionName="investigator"
+        )["Credentials"]
+        worker_rt = boto3.client(
+            "bedrock-agentcore",
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+            region_name="us-east-1",
+            config=Config(region_name="us-east-1", retries={"mode": "standard"}),
+        )
+
+        def policy(resource):
+            return json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": role_arn},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": resource,
+                }],
+            })
+
+        assert ctl.put_resource_policy(
+            resourceArn=runtime_arn, policy=policy(runtime_arn)
+        )["policy"] == policy(runtime_arn)
+        ctl.put_resource_policy(
+            resourceArn=endpoint_arn, policy=policy(endpoint_arn)
+        )
+
+        response = worker_rt.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            qualifier="prod",
+            payload=b"{}",
+        )
+        assert json.loads(response["response"].read())["agentRuntimeArn"] == runtime_arn
+
+        ctl.delete_resource_policy(resourceArn=endpoint_arn)
+        with pytest.raises(ClientError) as exc:
+            worker_rt.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn, qualifier="prod", payload=b"{}"
+            )
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+        ctl.put_resource_policy(
+            resourceArn=endpoint_arn, policy=policy(endpoint_arn)
+        )
+        caller_iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName="invoke-runtime",
+            PolicyDocument=identity_policy([runtime_arn]),
+        )
+        with pytest.raises(ClientError) as exc:
+            worker_rt.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn, qualifier="prod", payload=b"{}"
+            )
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        caller_iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName="invoke-runtime",
+            PolicyDocument=identity_policy([runtime_arn, endpoint_arn]),
+        )
+        assert ctl.get_resource_policy(resourceArn=runtime_arn)["policy"]
+        ctl.delete_resource_policy(resourceArn=runtime_arn)
+        with pytest.raises(ClientError) as exc:
+            worker_rt.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn, qualifier="prod", payload=b"{}"
+            )
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    finally:
+        for resource_arn in (
+            locals().get("endpoint_arn"),
+            locals().get("runtime_arn"),
+        ):
+            if resource_arn:
+                try:
+                    ctl.delete_resource_policy(resourceArn=resource_arn)
+                except ClientError:
+                    pass
+        try:
+            caller_iam.delete_role_policy(
+                RoleName=role_name, PolicyName="invoke-runtime"
+            )
+            caller_iam.delete_role(RoleName=role_name)
+        except ClientError:
+            pass
+        ctl.delete_agent_runtime(agentRuntimeId=runtime_id)
+
+
+@pytest.mark.skipif(
+    not _AUTH_ENABLED,
+    reason="resource-policy authorization requires a MiniStack server with AUTH=true",
+)
+def test_agentcore_resource_policy_rejects_wildcard_resource():
+    ctl = _client("bedrock-agentcore-control")
+    created = _create(ctl, f"invalid_policy_{_uuid_mod.uuid4().hex[:8]}", _CODE_ARTIFACT)
+    runtime_arn = created["agentRuntimeArn"]
+    try:
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                "Resource": "*",
+            }],
+        })
+        with pytest.raises(ClientError) as exc:
+            ctl.put_resource_policy(resourceArn=runtime_arn, policy=policy)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ctl.delete_agent_runtime(agentRuntimeId=created["agentRuntimeId"])
+
+
+@pytest.mark.skipif(
+    not _AUTH_ENABLED,
+    reason="resource-policy authorization requires a MiniStack server with AUTH=true",
+)
+def test_agentcore_resource_policy_explicit_deny_overrides_identity_allow():
+    ctl = _client("bedrock-agentcore-control")
+    rt = _client("bedrock-agentcore")
+    created = _create(ctl, f"deny_policy_{_uuid_mod.uuid4().hex[:8]}", _CODE_ARTIFACT)
+    runtime_arn = created["agentRuntimeArn"]
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+            "Resource": runtime_arn,
+        }],
+    })
+    try:
+        ctl.put_resource_policy(resourceArn=runtime_arn, policy=policy)
+        with pytest.raises(ClientError) as exc:
+            rt.invoke_agent_runtime(agentRuntimeArn=runtime_arn, payload=b"{}")
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    finally:
+        ctl.delete_resource_policy(resourceArn=runtime_arn)
+        ctl.delete_agent_runtime(agentRuntimeId=created["agentRuntimeId"])
 
 
 def test_agentcore_runtimes_are_region_scoped():
