@@ -16170,15 +16170,28 @@ class _FailedSelfLookup:
             raise Exception("no such container")
 
 
-def test_rds_public_endpoint_containerised_ministack_joins_its_network(monkeypatch):
+class _FoundSelfLookup:
+    """MiniStack's own container, found by HOSTNAME, on the network `ms_net`."""
+
+    class containers:
+        @staticmethod
+        def get(_identifier):
+            return types.SimpleNamespace(attrs={"NetworkSettings": {"Networks": {"ms_net": {}}}})
+
+
+@pytest.mark.parametrize("docker_network, client, expected", [
+    ("compose_default", _FailedSelfLookup(), "compose_default"),
+    ("", _FoundSelfLookup(), "ms_net"),
+])
+def test_rds_public_endpoint_containerised_ministack_joins_its_network(monkeypatch, docker_network, client, expected):
     """#1884: the database container must stay reachable from a containerised MiniStack."""
     from ministack.services import rds as m
 
     monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
-    monkeypatch.setattr(m, "DOCKER_NETWORK", "compose_default")
+    monkeypatch.setattr(m, "DOCKER_NETWORK", docker_network)
     monkeypatch.setattr(m, "_ministack_network", None)
     monkeypatch.setattr(m, "_in_container", lambda: True)
-    assert m._get_ministack_network(_FailedSelfLookup()) == "compose_default"
+    assert m._get_ministack_network(client) == expected
 
 
 def test_rds_public_endpoint_host_run_ministack_stays_off_network(monkeypatch):
