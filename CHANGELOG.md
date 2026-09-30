@@ -11,6 +11,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `Capabilities` check without `AUTH`** — `CFN_ENFORCE_CAPABILITIES=1` refuses a template whose IAM resources or macros the request does not acknowledge also without `AUTH=true`, as AWS always does.
 
+### Fixed
+
+- **CloudFormation — nested stack with a `Transform`** — where `Capabilities` are checked, a nested stack whose template declares a `Transform` or calls `Fn::Transform` fails with `Requires capabilities : [CAPABILITY_AUTO_EXPAND]` unless the parent acknowledged `CAPABILITY_AUTO_EXPAND`, as on AWS.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

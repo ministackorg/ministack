@@ -3839,20 +3839,22 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
     using-cfn-nested-stacks), so the set the parent stored covers the child
     and, through the child's own record, every level below it. Like the
-    parent's check it runs under AUTH=true or CFN_ENFORCE_CAPABILITIES=1, and
-    it reads the IAM rule alone: whether a child template's own Transform
-    needs CAPABILITY_AUTO_EXPAND on the parent is not modelled here.
+    parent's check it runs under AUTH=true or CFN_ENFORCE_CAPABILITIES=1. A
+    child template with a macro needs CAPABILITY_AUTO_EXPAND on the parent.
     """
     from ministack.services.cloudformation.handlers import (
         _capabilities_enforced,
         _insufficient_capabilities_message,
         _missing_capabilities,
         _required_iam_capabilities,
+        _uses_macro,
     )
     if not _capabilities_enforced():
         return
-    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)),
-                                    _required_iam_capabilities(template))
+    required = _required_iam_capabilities(template)
+    if _uses_macro(template):
+        required.append("CAPABILITY_AUTO_EXPAND")
+    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)), required)
     if missing:
         raise ValueError(_insufficient_capabilities_message(missing))
 

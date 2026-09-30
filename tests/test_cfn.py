@@ -3211,6 +3211,27 @@ def test_cfn_capabilities_setting_turns_the_check_on(monkeypatch, auth, setting)
         _forget_nested_test_stacks(f"{stack_name}-p")
 
 
+def test_cfn_nested_stack_macro_needs_auto_expand_on_the_parent(monkeypatch):
+    """A child template with a Transform fails the nested stack unless the
+    parent acknowledged CAPABILITY_AUTO_EXPAND."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-macro-{uid}"
+    url = "http://localhost:4566/tpl/macro.json"
+    templates = {url: {"Transform": "AWS::LanguageExtensions",
+                       "Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}}
+    try:
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_AUTO_EXPAND\]"):
+            _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], templates, url)
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_AUTO_EXPAND"], templates, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _forget_nested_test_stacks(parent)
+
+
 def test_cfn_create_stack_refuses_missing_capabilities_under_auth(monkeypatch):
     import ministack.app as app_mod
     from ministack.services.cloudformation import _stack_events, _stacks
