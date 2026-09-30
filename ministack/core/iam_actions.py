@@ -1868,6 +1868,10 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
         ("AuthorizationHeaderMalformed", 400, "The authorization header is malformed; Invalid credential date. "
                                               "Date is not the same as X-Amz-Date."),
     ),
+    "RequestTimeTooSkewed": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("RequestTimeTooSkewed", 403, "The difference between the request time and the current time is too large."),
+    ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,
 }

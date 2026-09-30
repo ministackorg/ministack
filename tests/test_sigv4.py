@@ -11,6 +11,7 @@ from ministack.core.sigv4 import (
     derive_signing_key,
     parse_header_signature,
     presigned_request_is_expired,
+    request_time_failure,
     signatures_match,
     uri_encode,
 )
@@ -195,3 +196,27 @@ def test_parse_header_signature_takes_the_date_header_when_x_amz_date_is_absent(
 
     assert (parsed.access_key_id, parsed.service, parsed.amz_date) == (
         "AKIAIOSFODNN7EXAMPLE", "sts", "20260930T120000Z")
+
+
+@pytest.mark.parametrize(
+    "service, amz_date, expected",
+    [
+        ("kms", "20260930T120500Z", None),
+        ("kms", "20260930T120501Z", "Signature not yet current: 20260930T120501Z is still later than "
+                                    "20260930T120500Z (20260930T120000Z + 5 min.)"),
+        ("sts", "20260930T114500Z", None),
+        ("sts", "20260930T114459Z", "Signature expired: 20260930T114459Z is now earlier than "
+                                    "20260930T114500Z (20260930T120000Z - 15 min.)"),
+    ],
+)
+def test_request_time_failure_uses_the_services_window(service, amz_date, expected):
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{amz_date[:8]}/us-east-1/{service}/aws4_request, "
+                         "SignedHeaders=host;x-amz-date, Signature=abc",
+        "x-amz-date": amz_date,
+    }
+    now = dt.datetime(2026, 9, 30, 12, 0, tzinfo=dt.timezone.utc)
+
+    failure = request_time_failure(parse_header_signature(headers), now=now)
+
+    assert failure == (expected and ("RequestTimeTooSkewed", expected))

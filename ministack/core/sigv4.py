@@ -198,6 +198,47 @@ def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tupl
     return HeaderSignature(*scope[:4], fields["SignedHeaders"], fields["Signature"], amz_date)
 
 
+# Services that accept a request signed up to 15 minutes from their clock; the others allow 5.
+_FIFTEEN_MINUTE_SERVICES = frozenset({"dynamodb", "ecr", "elasticache", "iam", "rds", "s3", "sns", "sqs", "sts"})
+
+
+def _amz_datetime(value: str) -> dt.datetime | None:
+    """Parse ``YYYYMMDDTHHMMSSZ`` by slicing; strptime is slow on the request path."""
+    digits = value[:8] + value[9:15]
+    if len(value) != 16 or value[8] != "T" or value[15] != "Z" or not (digits.isascii() and digits.isdigit()):
+        return None
+    try:
+        return dt.datetime(int(value[:4]), int(value[4:6]), int(value[6:8]), int(value[9:11]), int(value[11:13]),
+                           int(value[13:15]), tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def request_time_failure(signature: HeaderSignature, *, now: dt.datetime | None = None) -> tuple[str, str] | None:
+    """Refuse a request signed further from the current time than its service allows."""
+    signed_at = _amz_datetime(signature.amz_date)
+    if signed_at is None:
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    minutes = 15 if signature.service in _FIFTEEN_MINUTE_SERVICES else 5
+    window = dt.timedelta(minutes=minutes)
+
+    def stamp(value: dt.datetime) -> str:
+        return value.strftime("%Y%m%dT%H%M%SZ")
+
+    if signed_at < now - window:
+        return "RequestTimeTooSkewed", (
+            f"Signature expired: {signature.amz_date} is now earlier than {stamp(now - window)} "
+            f"({stamp(now)} - {minutes} min.)"
+        )
+    if signed_at > now + window:
+        return "RequestTimeTooSkewed", (
+            f"Signature not yet current: {signature.amz_date} is still later than {stamp(now + window)} "
+            f"({stamp(now)} + {minutes} min.)"
+        )
+    return None
+
+
 def _remove_dot_segments(path: str) -> str:
     segments = []
     for segment in path.split("/"):

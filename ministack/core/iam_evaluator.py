@@ -1119,9 +1119,9 @@ def pin_signed_body(body: bytes) -> None:
 
 
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
-    """Check the pinned request's session token and signature: its credential, a failure, or None."""
+    """Check the pinned request's time, session token and signature: its credential, a failure, or None."""
     from ministack.core.responses import _account_from_sts_session
-    from ministack.core.sigv4 import header_signature_failure, parse_header_signature
+    from ministack.core.sigv4 import header_signature_failure, parse_header_signature, request_time_failure
 
     request = _signed_request.get()
     if request is None or request.access_key_id != access_key_id:
@@ -1130,6 +1130,9 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     signature = parse_header_signature(request.headers)
     if isinstance(signature, tuple):
         return AuthError(*signature)
+    skewed = request_time_failure(signature)
+    if skewed:
+        return AuthError(*skewed)
     token = request.headers.get("x-amz-security-token", "")
     credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
     if isinstance(credential, CredentialResolutionError):

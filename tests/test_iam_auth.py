@@ -11,6 +11,7 @@ the MiniStack server and work with AUTH=false.
 """
 
 import asyncio
+import contextlib
 import io
 import json
 import re
@@ -4553,6 +4554,59 @@ class TestSessionTokens:
 
         monkeypatch.setattr(app_mod, "AUTH", False)
         _local_client("dynamodb", session["AccessKeyId"], session["SecretAccessKey"]).list_tables()
+
+
+@contextlib.contextmanager
+def _signing_clock(seconds):
+    """Sign as if the client clock ran ``seconds`` ahead."""
+    import datetime as dt
+    from unittest import mock
+
+    import botocore.auth
+
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=seconds)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        yield
+
+
+class TestClockSkew:
+    @pytest.mark.parametrize("service,minutes,code,status", [
+        ("sts", 15, "SignatureDoesNotMatch", 403),
+        ("dynamodb", 15, "InvalidSignatureException", 400),
+        ("s3", 15, "RequestTimeTooSkewed", 403),
+        ("lambda", 5, "InvalidSignatureException", 403),
+        ("ec2", 5, "AuthFailure", 401),
+    ])
+    def test_request_outside_the_services_window_is_refused(self, user_key, service, minutes, code, status):
+        call = _LIST_CALLS.get(service) or (lambda c: c.get_caller_identity())
+        client = _local_client(service, *user_key)
+        with _signing_clock(minutes * 60 - 60):
+            call(client)
+        with _signing_clock(-(minutes * 60 - 60)):
+            call(client)
+        with _signing_clock(minutes * 60 + 60):
+            assert _failure(lambda: call(client)) == (code, status)
+        with _signing_clock(-(minutes * 60 + 60)):
+            assert _failure(lambda: call(client)) == (code, status)
+
+    def test_message_names_both_times(self, user_key):
+        with _signing_clock(-1200), pytest.raises(ClientError) as exc:
+            _local_client("dynamodb", *user_key).list_tables()
+        assert re.fullmatch(r"Signature expired: \d{8}T\d{6}Z is now earlier than \d{8}T\d{6}Z "
+                            r"\(\d{8}T\d{6}Z - 15 min\.\)", exc.value.response["Error"]["Message"])
+
+    def test_skew_is_reported_before_an_unknown_key(self, user_key):
+        with _signing_clock(1200):
+            client = _local_client("dynamodb", "AKIAUNKNOWNKEY000001", "secret")
+            assert _failure(client.list_tables) == ("InvalidSignatureException", 400)
+
+    def test_root_key_and_auth_off_ignore_the_clock(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        with _signing_clock(1200):
+            _local_client("dynamodb").list_tables()
+            monkeypatch.setattr(app_mod, "AUTH", False)
+            _local_client("dynamodb", *user_key).list_tables()
 
 
 # ---------------------------------------------------------------------------
