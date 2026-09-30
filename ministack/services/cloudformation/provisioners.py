@@ -9577,6 +9577,8 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     route_id = new_uuid()[:8]
     route = {"routeId": route_id, **_apigw_v2_route_props(props)}
+    if message := _apigw_v2._ws_route_authorization_message(api_id, route["routeKey"], route["authorizationType"]):
+        raise ValueError(message)
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
     return physical_id, {"RouteId": route_id}
@@ -9630,6 +9632,8 @@ def _apigw_v2_authorizer_create(logical_id, props, stack_name):
     .Issuer are translated here rather than passed through PascalCase.
     """
     api_id = props.get("ApiId", "")
+    if message := _apigw_v2._ws_authorizer_type_message(api_id, props.get("AuthorizerType", "JWT")):
+        raise ValueError(message)
     auth_id = new_uuid()[:8]
     jwt_cfg = props.get("JwtConfiguration") or {}
     authorizer = {
@@ -9669,6 +9673,8 @@ def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
     authorizer = authorizers.get(physical_id)
     if not authorizer:
         return _apigw_v2_authorizer_create(physical_id, new_props, stack_name)
+    if message := _apigw_v2._ws_authorizer_type_message(api_id, new_props.get("AuthorizerType", "JWT")):
+        raise ValueError(message)
     jwt_cfg = new_props.get("JwtConfiguration") or {}
     authorizer.update({
         "authorizerType": new_props.get("AuthorizerType", "JWT"),

@@ -3184,51 +3184,70 @@ def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
     }
 
 
-def test_ws_connect_jwt_authorizer_rejects_missing_token(apigw, lam, cognito_idp):
-    """$connect with a JWT authorizer rejects connections that lack a valid token (#1074)."""
+@pytest.mark.parametrize("resource, message", [
+    ({"Type": "AWS::ApiGatewayV2::Authorizer", "Properties": {
+        "AuthorizerType": "JWT", "Name": "jwt", "IdentitySource": ["route.request.querystring.token"],
+        "JwtConfiguration": {"Audience": ["client"], "Issuer": "https://issuer.example.com"}}},
+     "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "$connect", "AuthorizationType": "JWT"}},
+     "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "send", "AuthorizationType": "CUSTOM"}},
+     "Currently, authorization is restricted to the $connect route only"),
+], ids=["jwt-authorizer", "jwt-route", "custom-on-send"])
+def test_ws_cfn_refuses_route_authorization_a_websocket_api_does_not_support(cfn, resource, message):
+    """A template fails the stack where CreateAuthorizer or CreateRoute would answer BadRequestException."""
+    stack = f"ws-cfnauth-{uuid.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+        "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {
+            "Name": stack, "ProtocolType": "WEBSOCKET", "RouteSelectionExpression": "$request.body.action"}},
+        "Refused": {"Type": resource["Type"], "Properties": {"ApiId": {"Ref": "Api"}, **resource["Properties"]}},
+    }}))
+    try:
+        for _ in range(60):
+            status = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+            if not status.endswith("_IN_PROGRESS"):
+                break
+            time.sleep(1)
+        assert status == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Refused"]
+        assert any(message in r for r in reasons), reasons
+    finally:
+        cfn.delete_stack(StackName=stack)
 
-    pool_id = cognito_idp.create_user_pool(PoolName=f"ws-jwt-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
-    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
-    api = apigw.create_api(Name=f"ws-jwt-deny-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")
-    api_id = api["ApiId"]
 
-    fn_name = f"ws-jwt-con-{_uuid_mod.uuid4().hex[:6]}"
-    arn = _make_fn(lam, fn_name, _ECHO_CODE)
-    integ = apigw.create_integration(
-        ApiId=api_id, IntegrationType="AWS_PROXY",
-        IntegrationUri=arn, IntegrationMethod="POST",
-    )
+def test_ws_route_authorization_limited_to_connect_and_request_authorizers(apigw):
+    """A WebSocket API takes REQUEST authorizers only, and route authorization on $connect only, never JWT."""
+    api_id = apigw.create_api(Name=f"ws-auth-rules-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")["ApiId"]
+
+    def refused(message, call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(ApiId=api_id, **kwargs)
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == message
+
+    refused("Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis.",
+            apigw.create_authorizer, AuthorizerType="JWT", Name="jwt",
+            IdentitySource=["route.request.header.Auth"],
+            JwtConfiguration={"Audience": ["client"], "Issuer": "https://issuer.example.com"})
     auth_id = apigw.create_authorizer(
-        ApiId=api_id, AuthorizerType="JWT", Name="ws-jwt",
-        IdentitySource=["$request.querystring.token"],
-        JwtConfiguration={"Audience": ["ws-client"], "Issuer": issuer},
+        ApiId=api_id, AuthorizerType="REQUEST", Name="request", IdentitySource=["route.request.header.Auth"],
+        AuthorizerUri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                      "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations",
     )["AuthorizerId"]
-    apigw.create_route(
-        ApiId=api_id, RouteKey="$connect",
-        Target=f"integrations/{integ['IntegrationId']}",
-        AuthorizationType="JWT", AuthorizerId=auth_id,
-    )
-    apigw.create_route(
-        ApiId=api_id, RouteKey="$default",
-        Target=f"integrations/{integ['IntegrationId']}",
-    )
-    apigw.create_stage(ApiId=api_id, StageName="prod")
+    jwt_refused = "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    refused(jwt_refused, apigw.create_route, RouteKey="$connect", AuthorizationType="JWT", AuthorizerId=auth_id)
+    connect_id = apigw.create_route(ApiId=api_id, RouteKey="$connect")["RouteId"]
+    refused(jwt_refused, apigw.update_route, RouteId=connect_id, AuthorizationType="JWT", AuthorizerId=auth_id)
+    assert apigw.update_route(
+        ApiId=api_id, RouteId=connect_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+    )["AuthorizationType"] == "CUSTOM"
 
-    # Without a token → connection must be rejected (close code 1008).
-    with pytest.raises(Exception):
-        _WSClient("localhost", _EXECUTE_PORT, "/prod",
-                  headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
-
-    # With a valid token → connection must be accepted.
-    now = int(time.time())
-    token = _make_signed_token({
-        "sub": "ws-user", "iss": issuer, "aud": "ws-client",
-        "iat": now, "nbf": now - 1, "exp": now + 3600,
-    })
-    ws = _WSClient("localhost", _EXECUTE_PORT, f"/prod?token={token}",
-                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
-    ws.close()
-    cognito_idp.delete_user_pool(UserPoolId=pool_id)
+    connect_only = "Currently, authorization is restricted to the $connect route only"
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="AWS_IAM")
+    message_id = apigw.create_route(ApiId=api_id, RouteKey="sendMessage")["RouteId"]
+    refused(connect_only, apigw.update_route, RouteId=message_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id)
 
 
 def test_apigwv1_path_based_restapi_legacy_user_request(apigw_v1, lam):

@@ -1907,9 +1907,40 @@ def _delete_cors_configuration(api_id):
 
 # ---- Control plane: Routes ----
 
+_WS_AUTHORIZER_TYPE_MESSAGE = (
+    "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."
+)
+
+
+def _ws_authorizer_type_message(api_id, authorizer_type):
+    """The BadRequestException message a WebSocket API answers for an authorizer type it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") == "WEBSOCKET" and authorizer_type != "REQUEST":
+        return _WS_AUTHORIZER_TYPE_MESSAGE
+    return None
+
+
+def _ws_route_authorization_message(api_id, route_key, authorization_type):
+    """The BadRequestException message a WebSocket API answers for route authorization it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") != "WEBSOCKET" or (authorization_type or "NONE") == "NONE":
+        return None
+    if route_key != "$connect":
+        return "Currently, authorization is restricted to the $connect route only"
+    if authorization_type == "JWT":
+        return "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    return None
+
+
+def _ws_route_authorization_error(api_id, route_key, authorization_type):
+    """The BadRequestException a WebSocket API answers for route authorization it does not support."""
+    message = _ws_route_authorization_message(api_id, route_key, authorization_type)
+    return _apigw_error("BadRequestException", message, 400) if message else None
+
+
 def _create_route(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
+    if err := _ws_route_authorization_error(api_id, data.get("routeKey", "$default"), data.get("authorizationType")):
+        return err
     route_id = new_uuid()[:8]
     route = {
         "routeId": route_id,
@@ -1952,6 +1983,10 @@ def _update_route(api_id, route_id, data):
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
+    if err := _ws_route_authorization_error(
+        api_id, data.get("routeKey", route["routeKey"]), data.get("authorizationType", route.get("authorizationType")),
+    ):
+        return err
     for k in (
         "routeKey",
         "target",
@@ -2274,6 +2309,8 @@ def _untag_resource(resource_arn: str, tag_keys: list):
 def _create_authorizer(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
+    if message := _ws_authorizer_type_message(api_id, data.get("authorizerType")):
+        return _apigw_error("BadRequestException", message, 400)
     auth_id = new_uuid()[:8]
     authorizer = {
         "authorizerId": auth_id,
@@ -2674,14 +2711,6 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
     }
     if event_type == "CONNECT":
         event.update(_ws_connect_fields(headers, query_params))
-        authorizer_claims = kwargs.get("authorizer_claims")
-        if authorizer_claims is not None:
-            request_context["authorizer"] = {
-                "jwt": {
-                    "claims": authorizer_claims,
-                    "scopes": kwargs.get("authorizer_scopes") or [],
-                }
-            }
 
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
@@ -2836,8 +2865,6 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
         authorizer_context = None
         if connect_route is not None:
             auth_type = (connect_route.get("authorizationType") or "NONE").upper()
-            ws_authorizer_claims = None
-            ws_authorizer_scopes = []
             connect_request_id = new_uuid()
             refusal = None
             if auth_type == "CUSTOM":
@@ -2847,31 +2874,21 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                                         connect_request_id, source_ip, headers),
                     headers, query_params, account_id, owner_region,
                 )
+            elif auth_type == "JWT":
+                # only a route restored from state saved before the route checks existed
+                logger.warning(
+                    "WebSocket API %s: JWT authorization on $connect is not supported, refusing the handshake",
+                    api_id,
+                )
+                refusal = (500, "")
             if refusal:
                 await _refuse_ws_handshake(scope, send, *refusal, connection_id, connect_request_id)
                 return
-            # JWT authorizer validation (mirrors the HTTP API path).
-            if auth_type == "JWT":
-                authorizer_id = connect_route.get("authorizerId")
-                authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
-                if not authorizer:
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                claims, scopes, auth_error = await _validate_jwt_authorizer(
-                    connect_route, authorizer, headers, query_params or {},
-                )
-                if auth_error:
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                ws_authorizer_claims = claims or {}
-                ws_authorizer_scopes = scopes or []
 
             resp = await _invoke_ws_lambda(
                 api_id, account_id, owner_region, connect_route, stage, connection_id,
                 "CONNECT", connect_request_id, "", source_ip, headers,
                 query_params=query_params,
-                authorizer_claims=ws_authorizer_claims,
-                authorizer_scopes=ws_authorizer_scopes,
                 authorizer=authorizer_context,
             )
             status = int((resp or {}).get("statusCode", 200))
