@@ -3698,6 +3698,15 @@ def _lambda_version_create(logical_id, props, stack_name):
     return ver_arn, {"Version": "1"}
 
 
+def _lambda_version_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """FunctionScalingConfig updates in place; every other property publishes a new version."""
+    if ({k: v for k, v in old_props.items() if k != "FunctionScalingConfig"}
+            != {k: v for k, v in new_props.items() if k != "FunctionScalingConfig"}):
+        return _lambda_version_create(logical_id or physical_id, new_props, stack_name)
+    _lambda_version_function(new_props)
+    return physical_id, {"Version": physical_id.rsplit(":", 1)[-1]}
+
+
 def _lambda_version_delete(physical_id, props):
     """Remove the published version, as DeleteFunction with a qualifier does.
 
@@ -11413,7 +11422,12 @@ _RESOURCE_HANDLERS = {
         "delete": _lambda_permission_delete,
         "delete_with_logical_id": True,
     },
-    "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
+    "AWS::Lambda::Version": {
+        "create": _lambda_version_create,
+        "update": _lambda_version_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_version_delete,
+    },
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {

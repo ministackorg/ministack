@@ -17374,6 +17374,37 @@ def _cfn_lambda_version_update(cfn, stack_name, template, status):
     assert stack["StackStatus"] == status, stack.get("StackStatusReason")
 
 
+def test_cfn_lambda_version_scaling_config_updates_in_place(cfn, lam):
+    """A FunctionScalingConfig change keeps the version, also when the update rolls back."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = fn = f"cfn-ver-fsc-{suffix}"
+
+    def scaling(high):
+        return {"Description": "one", "FunctionScalingConfig": {
+            "MinExecutionEnvironments": 1, "MaxExecutionEnvironments": high}}
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_lambda_version_template(
+            fn, version=scaling(1), capacity_provider=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        physical_id = _stack_physical_id(cfn, stack_name, "V")
+        assert physical_id.endswith(f":function:{fn}:1")
+
+        _cfn_lambda_version_update(cfn, stack_name, _cfn_lambda_version_template(
+            fn, version=scaling(2), capacity_provider=True), "UPDATE_COMPLETE")
+        assert _stack_physical_id(cfn, stack_name, "V") == physical_id
+        assert _cfn_lambda_versions(lam, fn) == [("1", "one")]
+
+        _cfn_lambda_version_update(cfn, stack_name, _cfn_with_failing_resource(
+            _cfn_lambda_version_template(fn, version=scaling(3), capacity_provider=True), "V"),
+            "UPDATE_ROLLBACK_COMPLETE")
+        assert _stack_physical_id(cfn, stack_name, "V") == physical_id
+        assert _cfn_lambda_versions(lam, fn) == [("1", "one")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_lambda_version_of_an_unchanged_function_is_refused(cfn, lam):
     """A Description change alone fails; with a code change it publishes the next version."""
     suffix = _uuid_mod.uuid4().hex[:8]
