@@ -1189,6 +1189,53 @@ def test_cognito_refresh_token_alias(cognito_idp):
     assert "AccessToken" in refresh["AuthenticationResult"]
     assert "RefreshToken" not in refresh["AuthenticationResult"]
 
+@pytest.mark.parametrize("case", ["garbage", "access_token", "other_pool", "other_client", "deleted_user"])
+@pytest.mark.parametrize("api", ["initiate_auth", "admin_initiate_auth", "get_tokens_from_refresh_token"])
+def test_cognito_refresh_token_not_issued_to_client_refused(cognito_idp, api, case):
+    """A refresh token this pool and client did not issue mints no tokens for another user."""
+    flows = ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+    pid, other_pid = (cognito_idp.create_user_pool(PoolName=f"RefreshRefused{n}")["UserPool"]["Id"] for n in "AB")
+    cid, cid2, other_cid = (
+        cognito_idp.create_user_pool_client(UserPoolId=p, ClientName="app", ExplicitAuthFlows=flows)
+        ["UserPoolClient"]["ClientId"] for p in (pid, pid, other_pid)
+    )
+    for p, name in [(pid, "first"), (pid, "second"), (other_pid, "other")]:
+        cognito_idp.admin_create_user(UserPoolId=p, Username=name)
+        cognito_idp.admin_set_user_password(UserPoolId=p, Username=name, Password="RefreshPass1!", Permanent=True)
+
+    def login(client_id, username):
+        return cognito_idp.initiate_auth(
+            ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": username, "PASSWORD": "RefreshPass1!"},
+        )["AuthenticationResult"]
+
+    tokens = login(cid, "second")
+    client_id, token = {
+        "garbage": (cid, "not-a-refresh-token"),
+        "access_token": (cid, tokens["AccessToken"]),
+        "other_pool": (cid, login(other_cid, "other")["RefreshToken"]),
+        "other_client": (cid2, tokens["RefreshToken"]),
+        "deleted_user": (cid, tokens["RefreshToken"]),
+    }[case]
+    if case == "deleted_user":
+        cognito_idp.admin_delete_user(UserPoolId=pid, Username="second")
+    calls = {
+        "initiate_auth": lambda: cognito_idp.initiate_auth(
+            ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": token}),
+        "admin_initiate_auth": lambda: cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": token}),
+        "get_tokens_from_refresh_token": lambda: cognito_idp.get_tokens_from_refresh_token(
+            ClientId=client_id, RefreshToken=token),
+    }
+    with pytest.raises(ClientError) as exc:
+        calls[api]()
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert exc.value.response["Error"]["Message"] == {
+        "other_client": "Refresh Token has different Client",
+        "deleted_user": "The user has been deleted for the associated refresh token",
+    }.get(case, "Invalid Refresh Token")
+
 def test_cognito_respond_to_auth_challenge_new_password(cognito_idp):
     """RespondToAuthChallenge with NEW_PASSWORD_REQUIRED confirms the user."""
     pid = cognito_idp.create_user_pool(PoolName="ChallengePool")["UserPool"]["Id"]
@@ -2163,6 +2210,7 @@ def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
 def test_cognito_saml_full_flow(cognito_idp):
     """Full SAML flow: authorize → SAML response → token exchange → user created."""
     pid, cid = _setup_saml_pool(cognito_idp)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="local-first", MessageAction="SUPPRESS")
 
     # Step 1: GET /oauth2/authorize → extract RelayState from redirect Location
     url = (
@@ -2240,6 +2288,12 @@ def test_cognito_saml_full_flow(cognito_idp):
     attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
     assert attrs.get("email") == "john@example.com"
     assert attrs.get("name") == "John Doe"
+
+    # Step 5: the federated refresh token refreshes the federated user's session
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": tokens["refresh_token"]},
+    )["AuthenticationResult"]
+    assert cognito_idp.get_user(AccessToken=refreshed["AccessToken"])["Username"] == "TestSAML_john@example.com"
 
 
 def test_cognito_saml_presignup_lambda_rejects_unauthorized_user(cognito_idp, lam):
