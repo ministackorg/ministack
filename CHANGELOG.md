@@ -26,6 +26,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — mTLS trusts every registered device certificate** — the listener no longer fails the TLS handshake for an ACTIVE certificate whose CA was deactivated or deleted before its first connect, or that was registered without a CA; as on AWS, only the certificate's own status refuses it.
 - **SES v2 — `ListEmailIdentities` and `ListConfigurationSets` answer the routes newer SDKs use** — botocore 1.43.106 sends them as `POST /v2/email/list-identities` and `POST /v2/email/list-configuration-sets` with `NextToken`, `PageSize` and `Filter` in the body; those paths answered `NotFoundException`. Both forms page, and the `Filter` keys are applied.
 - **Kinesis — `ApproximateArrivalTimestamp` keeps milliseconds** — it was truncated to whole seconds, so an `AT_TIMESTAMP` iterator from an SDK that sends fractional seconds skipped records written earlier in the same second.
 - **CloudFormation — an empty `Capabilities` list is accepted** — botocore sends it as a bare `Capabilities=`, which was read as one empty value and refused, so `aws cloudformation deploy` without `--capabilities` and `Capabilities=[]` from an SDK failed with a `ValidationError` since 1.5.11.
