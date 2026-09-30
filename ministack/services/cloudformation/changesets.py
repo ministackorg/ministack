@@ -45,6 +45,7 @@ from .stacks import (
     _diff_resources,
     _stack_region,
     _stack_region_context,
+    _stack_tags_changed,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -511,8 +512,10 @@ def _create_change_set(params):
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
     changed_params = {k for k, v in param_values.items()
                       if old_params.get(k, {}).get("Value") != v.get("Value")}
+    retag = (stack.get("_resources", {}) if cs_type == "UPDATE"
+             and _stack_tags_changed(stack, tags, tags_given) else ())
     changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"),
-                              template, changed_params)
+                              template, changed_params, retag)
     import_failure = None
     if cs_type == "IMPORT":
         # An import describes the resources being adopted, not the template
@@ -623,11 +626,15 @@ def _describe_change_set(params):
                 f"<CausingEntity>{_esc(d['CausingEntity'])}</CausingEntity>"
                 if d.get("CausingEntity") else ""
             )
+            source_xml = (
+                f"<ChangeSource>{_esc(d['ChangeSource'])}</ChangeSource>"
+                if d.get("ChangeSource") else ""
+            )
             details_xml += (
                 "<member>"
                 f"<Target>{target_xml}</Target>"
                 f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
-                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                f"{source_xml}"
                 f"{causing_xml}"
                 "</member>"
             )

@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — a change set with only new stack tags lists them** — it ended `FAILED` with "didn't contain changes"; it now lists each resource the stack holds, other than a custom resource or wait condition, as a `Modify` with `Scope: Tags`, and stack tags given in another order are no change for a change set or `UpdateStack`. Contributed by @iot-rocket.
 - **CloudFormation — change sets list what a change reaches** — a resource that references a replaced resource, an attribute of a modified resource or a changed parameter is now listed as a `Modify` whose detail names the cause (`ChangeSource` `ResourceReference`, `ResourceAttribute` or `ParameterReference`, with `CausingEntity`). Contributed by @iot-rocket.
 
 ## [1.5.20] — 2026-10-01

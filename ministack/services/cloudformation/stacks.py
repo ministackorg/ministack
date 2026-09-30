@@ -31,6 +31,7 @@ from .provisioners import (
     _property_recreation,
     _provision_resource,
     _snapshot_resource,
+    _tag_map,
     _update_resource,
     _with_stack_tags,
 )
@@ -1079,6 +1080,19 @@ _DIFFED_ATTRIBUTES = (
     "UpdateReplacePolicy",
 )
 
+# The types a stack-tag change leaves out of a change set; every other
+# resource the stack holds, taggable or not, is a Modify with Scope Tags.
+_UNTAGGED_TYPES = (
+    "AWS::CloudFormation::CustomResource",
+    "AWS::CloudFormation::WaitCondition",
+    "AWS::CloudFormation::WaitConditionHandle",
+)
+
+
+def _stack_tags_changed(stack: dict, tags: list, tags_given: bool) -> bool:
+    """True when a request's stack tags differ from the stack's, order aside."""
+    return bool(tags or tags_given) and _tag_map(tags) != _tag_map(stack.get("Tags"))
+
 
 _POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
                    "Snapshot": "Snapshot"}
@@ -1128,7 +1142,7 @@ def _reference_details(res_def: dict, replacements: dict, changed_params) -> dic
 
 
 def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None,
-                    template: dict | None = None, changed_params=()) -> list:
+                    template: dict | None = None, changed_params=(), retag=()) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
@@ -1140,6 +1154,8 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
     template, ``new_template`` by default) gets a detail naming that cause.
     ``resources`` are the stack's provisioned resources, whose physical ids a
     ``Remove`` or ``Modify`` reports.
+    Each resource in ``retag`` (the stack's resources when its tags change)
+    outside ``_UNTAGGED_TYPES`` also gets a ``Tags`` entry.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
@@ -1209,12 +1225,25 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     **_policy_action(old_res[key], "DeletionPolicy"),
                 }
             })
-        elif key in replacements:
+        else:
+            rtype = new_res[key].get("Type", "")
+            retagged = key in retag and not (
+                rtype.startswith("Custom::") or rtype in _UNTAGGED_TYPES)
+            if key not in replacements and not retagged:
+                continue
             scope = []
             for d in details[key]:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            replacement = replacements[key]
+            replacement = replacements.get(key, "False")
+            if retagged:
+                # Tags comes before the template's own changes in Details, last in
+                # Scope, and has no ChangeSource.
+                details[key].insert(0, {
+                    "Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
+                    "Evaluation": "Static",
+                })
+                scope.append("Tags")
             changes.append({
                 "ResourceChange": {
                     "Action": "Modify",

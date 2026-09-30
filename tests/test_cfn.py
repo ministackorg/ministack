@@ -9881,6 +9881,66 @@ def test_cfn_change_set_tags_replace_the_previous_stack_tags(cfn, sqs):
         _delete_cfn_test_stack(cfn, name)
 
 
+def test_cfn_change_set_with_only_new_stack_tags(cfn, sqs):
+    """New stack tags alone make a change set: each resource the stack holds
+    but a wait condition handle is a Modify with Scope Tags, and the execution
+    retags the queue. The same tags in another order, or no Tags, are no
+    change, for a change set and for UpdateStack; an empty list clears them."""
+    name = f"cfn-cs-tags-only-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Conditions": {"Never": {"Fn::Equals": ["a", "b"]}},
+        "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue"},
+            "Off": {"Type": "AWS::SQS::Queue", "Condition": "Never"},
+            "Policy": {"Type": "AWS::SQS::QueuePolicy", "Properties": {
+                "Queues": [{"Ref": "Queue"}],
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Deny", "Principal": "*", "Action": "sqs:SendMessage",
+                    "Resource": "*"}]}}},
+            "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+        },
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Queue"}}},
+    })
+    tags = [{"Key": "team", "Value": "a"}, {"Key": "env", "Value": "dev"}]
+    retagged = [{"Key": "team", "Value": "b"}, {"Key": "env", "Value": "dev"}]
+
+    def change_set(cs_name, **kwargs):
+        cfn.create_change_set(StackName=name, ChangeSetName=cs_name,
+                              UsePreviousTemplate=True, **kwargs)
+        return cfn.describe_change_set(ChangeSetName=cs_name, StackName=name)
+
+    cfn.create_stack(StackName=name, TemplateBody=template, Tags=tags)
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError, match="No updates are to be performed"):
+            cfn.update_stack(StackName=name, UsePreviousTemplate=True, Tags=tags[::-1])
+        for cs_name, kwargs in (("omitted", {}), ("reordered", {"Tags": tags[::-1]})):
+            described = change_set(cs_name, **kwargs)
+            assert described["Status"] == "FAILED", cs_name
+            assert "didn't contain changes" in described["StatusReason"]
+
+        tag_detail = {"Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
+                      "Evaluation": "Static"}
+        for cs_name, new_tags in (("cleared", []), ("retag", retagged)):
+            described = change_set(cs_name, Tags=new_tags)
+            assert (described["Status"], described["ExecutionStatus"]) == (
+                "CREATE_COMPLETE", "AVAILABLE"), described.get("StatusReason")
+            assert [(c["ResourceChange"]["LogicalResourceId"], c["ResourceChange"]["Action"],
+                     c["ResourceChange"]["Replacement"], c["ResourceChange"]["Scope"],
+                     c["ResourceChange"]["Details"]) for c in described["Changes"]] == [
+                (lid, "Modify", "False", ["Tags"], [tag_detail]) for lid in ("Policy", "Queue")]
+
+        cfn.execute_change_set(ChangeSetName="retag", StackName=name)
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Tags"] == retagged
+        tags_now = sqs.list_queue_tags(QueueUrl=_output(stack, "QueueUrl"))["Tags"]
+        assert (tags_now["team"], tags_now["env"]) == ("b", "dev")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_stack_update_keeps_foreign_tags_on_table_and_project(cfn, ddb, codebuild, apigw_v1):
     """Tags set outside the stack on a table (TagResource) and on a CodeBuild
     project (UpdateProject) survive a stack-tag change, which also reaches a
@@ -25856,6 +25916,32 @@ def test_policy_only_edit_does_not_replace():
     change = _diff_resources(old, new)[0]["ResourceChange"]
     assert change["Replacement"] == "False"
     assert change["Scope"] == ["UpdateReplacePolicy"]
+
+
+# Measured: a stack-tag change lists every resource the stack holds but
+# custom resources and wait conditions, whether or not the type takes tags.
+@pytest.mark.parametrize("rtype,listed", [
+    ("AWS::SQS::QueuePolicy", True),
+    ("AWS::CDK::Metadata", True),
+    ("AWS::CloudFormation::Stack", True),
+    ("Custom::Echo", False),
+    ("AWS::CloudFormation::CustomResource", False),
+    ("AWS::CloudFormation::WaitCondition", False),
+    ("AWS::CloudFormation::WaitConditionHandle", False),
+])
+def test_stack_tag_change_lists_each_kept_resource(rtype, listed):
+    template = _template(rtype, {})
+    changes = _diff_resources(template, template, retag={"R"})
+    assert [c["ResourceChange"]["Scope"] for c in changes] == ([["Tags"]] if listed else [])
+
+
+def test_stack_tag_change_joins_a_property_change():
+    change = _diff_resources(_template("AWS::SQS::Queue", {"DelaySeconds": 0}),
+                             _template("AWS::SQS::Queue", {"DelaySeconds": 5}),
+                             retag={"R"})[0]["ResourceChange"]
+    assert change["Scope"] == ["Properties", "Tags"]
+    assert [d["Target"]["Attribute"] for d in change["Details"]] == ["Tags", "Properties"]
+    assert change["Replacement"] == "False"
 
 
 def test_reporting_tables_are_consistent():
