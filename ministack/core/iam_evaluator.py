@@ -732,10 +732,12 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
 
 
 def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
-                            policy: str | dict | None, owner_account: str | None) -> EvalResult:
+                            policy: str | dict | None, owner_account: str | None,
+                            required: bool = False) -> EvalResult:
     """Combine an identity decision with the resource's own policy: a Deny in either wins."""
     # In the owner's account an Allow in either suffices, but a resource statement naming
     # only the account delegates to identity policies; across accounts both must allow.
+    # With *required* (a KMS key policy) the resource policy must allow in the owner's account too.
     if identity.decision == "Deny":
         return identity
     resource = evaluate_resource_policy(policy, ctx)
@@ -743,7 +745,8 @@ def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
         resource.resource_policy_arn = ctx.resource_arn
         return resource
     same_account = owner_account in (None, ctx.principal_account)
-    if identity.decision == "Allow" and (same_account or resource.decision == "Allow"):
+    if identity.decision == "Allow" and (
+            resource.decision == "Allow" or (same_account and not required)):
         return identity
     if same_account and resource.decision == "Allow":
         named = evaluate_resource_policy(policy, ctx, named_only=True)
@@ -761,7 +764,11 @@ _RESOURCE_POLICY_LOOKUPS = {
     "lambda": ("lambda_svc", "function_policy_for_arn"),
     "secretsmanager": ("secretsmanager", "secret_policy_for_arn"),
     "ecr": ("ecr", "repository_policy_for_arn"),
+    "kms": ("kms", "key_policy_for_arn"),
 }
+
+# A key policy must allow even the owner's own users and roles.
+_POLICY_REQUIRED = frozenset({"kms"})
 
 
 def _resource_policy(service: str, resource_arn: str) -> tuple | None:
@@ -1318,7 +1325,7 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     result = evaluate(ctx, principal.policies)
     found = _resource_policy(service, resource_arn)
     if found is not None:
-        result = combine_resource_policy(result, ctx, *found)
+        result = combine_resource_policy(result, ctx, *found, required=service in _POLICY_REQUIRED)
 
     if result.decision == "Allow":
         return None
