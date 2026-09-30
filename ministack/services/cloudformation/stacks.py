@@ -933,13 +933,22 @@ _DIFFED_ATTRIBUTES = (
 )
 
 
-def _diff_resources(old_template: dict, new_template: dict) -> list:
+def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
+    """The PolicyAction member of a change that deletes the old resource, else none."""
+    if res_def.get(attribute, _default_resource_policy(res_def, attribute)) != "Delete":
+        return {}
+    return {"PolicyAction": prefix + "Delete"}
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    ``resources`` are the stack's provisioned resources, whose physical ids a
+    ``Remove`` or ``Modify`` reports.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
@@ -947,13 +956,14 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
 
     all_keys = old_res.keys() | new_res.keys()
     for key in sorted(all_keys):
+        pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
+        physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
             changes.append({
                 "ResourceChange": {
                     "Action": "Add",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
-                    "Replacement": "False",
                 }
             })
         elif key not in new_res:
@@ -962,8 +972,8 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                     "Action": "Remove",
                     "LogicalResourceId": key,
                     "ResourceType": old_res[key].get("Type", ""),
-                    "PhysicalResourceId": "",
-                    "Replacement": "False",
+                    **physical,
+                    **_policy_action(old_res[key], "DeletionPolicy"),
                 }
             })
         else:
@@ -984,7 +994,7 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
             for attr in _DIFFED_ATTRIBUTES:
                 if old_res[key].get(attr) != new_res[key].get(attr):
                     details.append({
-                        "Target": {"Attribute": attr},
+                        "Target": {"Attribute": attr, "RequiresRecreation": "Never"},
                         "Evaluation": "Static",
                         "ChangeSource": "DirectModification",
                     })
@@ -1007,7 +1017,10 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                     "Action": "Modify",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
+                    **physical,
                     "Replacement": replacement,
+                    **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
+                       if replacement == "True" else {}),
                     "Scope": scope,
                     "Details": details,
                 }

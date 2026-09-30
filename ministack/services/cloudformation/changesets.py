@@ -497,7 +497,7 @@ def _create_change_set(params):
     with _stack_region_context(stack, stack_id):
         old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
-    changes = _diff_resources(old_resolved, new_resolved)
+    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"))
     import_failure = None
     if cs_type == "IMPORT":
         # An import describes the resources being adopted, not the template
@@ -611,14 +611,17 @@ def _describe_change_set(params):
                 "</member>"
             )
         # botocore reads an empty element as "", so a member the change does
-        # not carry (an Import's Replacement, a Remove's unknown physical id)
-        # is left out instead of written empty.
+        # not carry (an Import's Replacement, an Add's physical id) is left
+        # out instead of written empty.
         physical_xml = (
             f"<PhysicalResourceId>{_esc(rc['PhysicalResourceId'])}</PhysicalResourceId>"
             if rc.get("PhysicalResourceId") else ""
         )
         replacement_xml = (
             f"<Replacement>{rc['Replacement']}</Replacement>" if "Replacement" in rc else ""
+        )
+        policy_xml = (
+            f"<PolicyAction>{rc['PolicyAction']}</PolicyAction>" if "PolicyAction" in rc else ""
         )
         # "Resource" is the one ChangeType, and AWS reports it on every change.
         changes_xml += (
@@ -628,6 +631,7 @@ def _describe_change_set(params):
             f"{physical_xml}"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"{replacement_xml}"
+            f"{policy_xml}"
             f"<Scope>{scope_xml}</Scope>"
             f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"

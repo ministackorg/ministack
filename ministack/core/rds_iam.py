@@ -1,15 +1,11 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""Strict verification of SDK-generated RDS IAM database tokens.
+"""RDS IAM database authentication for the MySQL AWSAuthenticationPlugin.
 
-This module has no runtime callers and does not consult AUTH. Later integration
-must explicitly gate authentication/authorization at the call site and define
-the AUTH=false behavior; adding this primitive changes no existing request path.
-Resource enablement, rds-db:connect policies, and TLS are separate checks.
-
-The broker half serves POST /_ministack/rds/iam-auth for the MySQL plugin.
-Capabilities are process-local, never persisted, never issued over HTTP; AUTH
-gates IAM enforcement only, not capability checks or resource enablement.
+The plugin POSTs each IAM login to /_ministack/rds/iam-auth with its
+container's capability. Resource enablement is always required; AUTH=true
+also verifies the token and evaluates rds-db:connect. Capabilities are
+process-local, never persisted, never issued over HTTP.
 """
 
 import asyncio
@@ -397,15 +393,24 @@ def _decision(capability, payload, auth_enabled):
             return False
         if not auth_enabled:
             return True
-        result = authorize_rds_iam_token(
-            payload["token"], account_id=binding.account_id, region=binding.region,
-            resource_kind=binding.resource_kind, resource_identifier=binding.resource_identifier,
-            reader_endpoint=binding.reader_endpoint, db_user=payload["username"],
-        )
-        # RDS lifecycle workers do not hold the broker lock. Authorization
-        # looks up state independently, so discard its result if the resource
-        # or its owner was replaced or disabled while that lookup ran.
-        return isinstance(result, AuthorizedRdsConnection) and _binding_current(binding)
+        targets = [(binding.resource_kind, binding.resource_identifier, binding.reader_endpoint)]
+        if binding.resource_kind == "cluster":
+            # One container serves the writer, reader and member endpoints.
+            targets.append(("cluster", binding.resource_identifier, not binding.reader_endpoint))
+            targets += [("instance", m.get("DBInstanceIdentifier"), False)
+                        for m in binding.owner.get("DBClusterMembers", [])]
+        for kind, identifier, reader in targets:
+            result = authorize_rds_iam_token(
+                payload["token"], account_id=binding.account_id, region=binding.region,
+                resource_kind=kind, resource_identifier=identifier,
+                reader_endpoint=reader, db_user=payload["username"],
+            )
+            # RDS lifecycle workers do not hold the broker lock. Authorization
+            # looks up state independently, so discard its result if the resource
+            # or its owner was replaced or disabled while that lookup ran.
+            if isinstance(result, AuthorizedRdsConnection):
+                return _binding_current(binding)
+        return False
 
 
 def _unique_object(pairs):
