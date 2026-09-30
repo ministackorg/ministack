@@ -2152,6 +2152,140 @@ class TestActionExtraction:
         assert extract_iam_action("iot", "PUT", "/jobs/rollout-2024", {}, b"", {}) == "iot:CreateJob"
         assert extract_iam_action("iot-data", "POST", "/topics/a/b/c", {}, b"", {}) == "iot:Publish"
 
+    def test_agentcore_invoke_resolves_through_the_router(self):
+        """The AgentCore signing scope and InvokeAgentRuntime path are recognized."""
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        from ministack.core.router import detect_service
+
+        headers = _sigv4_headers(
+            "bedrock-agentcore", "bedrock-agentcore.us-east-1.amazonaws.com"
+        )
+        path = (
+            "/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A"
+            "000000000000%3Aruntime%2Frt-example/invocations"
+        )
+        service = detect_service("POST", path, headers, {})
+        assert service == "bedrock-agentcore"
+        assert extract_iam_action(service, "POST", path, headers, b"{}", {}) == (
+            "bedrock-agentcore:InvokeAgentRuntime"
+        )
+        decoded_path = (
+            "/runtimes/arn:aws:bedrock-agentcore:us-east-1:000000000000:"
+            "runtime/rt-example/invocations"
+        )
+        assert extract_iam_action(service, "POST", decoded_path, headers, b"{}", {}) == (
+            "bedrock-agentcore:InvokeAgentRuntime"
+        )
+        assert extract_resource_arn(
+            service, "POST", path, headers, b"{}", {}, "us-east-1", "000000000000"
+        ) == "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
+        assert extract_resource_arn(
+            service, "POST", decoded_path, headers, b"{}", {}, "us-east-1", "000000000000"
+        ) == "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
+        assert extract_iam_action(service, "GET", decoded_path, headers, b"{}", {}) is None
+        assert extract_iam_action(
+            service, "POST", "/runtimes//invocations", headers, b"{}", {}
+        ) is None
+
+
+class TestBedrockAgentCoreAuthorization:
+    _RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
+    _OTHER_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-other"
+
+    @staticmethod
+    def _invoke(path, monkeypatch, policy, query=None):
+        import asyncio
+
+        import ministack.app as app_mod
+        from ministack.core import iam_evaluator
+
+        statements = parse_policy_document(policy)
+        seen = []
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
+            seen.append((iam_action, service, region, resource_arn))
+            result = evaluate(_ctx(action=iam_action, resource=resource_arn), [statements])
+            if result.decision == "Allow":
+                return None
+            result.principal_arn = "arn:aws:iam::000000000000:user/testuser"
+            return result
+
+        async def invoke_handler(method, request_path, headers, body, query):
+            return 200, {"Content-Type": "application/json"}, b"{}"
+
+        monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        monkeypatch.setitem(app_mod.SERVICE_HANDLERS, "bedrock-agentcore", invoke_handler)
+        headers = {
+            **_sigv4_headers(
+                "bedrock-agentcore", "bedrock-agentcore.us-east-1.amazonaws.com"
+            ),
+            "host": "bedrock-agentcore.us-east-1.amazonaws.com",
+        }
+        headers["authorization"] = headers["authorization"].replace(
+            "20260101/eu-central-1/", "20260101/us-east-1/"
+        )
+        response = asyncio.run(
+            app_mod._dispatch_service_request("POST", path, headers, b"{}", query or {}, "req-agentcore")
+        )
+        return response, seen
+
+    def test_invoke_allows_the_exact_runtime_resource(self, monkeypatch):
+        path = "/runtimes/" + self._RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"
+        endpoint = self._RUNTIME_ARN + "/runtime-endpoint/DEFAULT"
+        response, seen = self._invoke(
+            path,
+            monkeypatch,
+            {"Statement": [{
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                "Resource": [self._RUNTIME_ARN, endpoint],
+            }]},
+        )
+
+        assert response[0] == 200
+        assert [arn for *_, arn in seen] == [self._RUNTIME_ARN, endpoint]
+
+    @pytest.mark.parametrize("query,endpoint_name", [({}, "DEFAULT"), ({"qualifier": ["prod"]}, "prod")])
+    def test_invoke_also_needs_the_runtime_endpoint(self, monkeypatch, query, endpoint_name):
+        """runtime and runtime-endpoint are both required resources of InvokeAgentRuntime."""
+        path = "/runtimes/" + self._RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"
+        response, seen = self._invoke(
+            path,
+            monkeypatch,
+            {"Statement": [{
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                "Resource": self._RUNTIME_ARN,
+            }]},
+            query,
+        )
+
+        assert response[0] == 403
+        assert seen[-1][3] == f"{self._RUNTIME_ARN}/runtime-endpoint/{endpoint_name}"
+
+    def test_invoke_denies_a_different_runtime_resource(self, monkeypatch):
+        path = "/runtimes/" + self._OTHER_RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"
+        response, seen = self._invoke(
+            path,
+            monkeypatch,
+            {"Statement": [{
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                "Resource": self._RUNTIME_ARN,
+            }]},
+        )
+
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert seen == [(
+            "bedrock-agentcore:InvokeAgentRuntime",
+            "bedrock-agentcore",
+            "us-east-1",
+            self._OTHER_RUNTIME_ARN,
+        )]
+
     @pytest.mark.parametrize("granted,decision", [
         ("iot:*", "ImplicitDeny"),
         ("iotjobsdata:UpdateJobExecution", "Allow"),
