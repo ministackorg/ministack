@@ -155,6 +155,7 @@ def _extract_s3_vhost_bucket(host: str):
 
 _S3_VHOST_EXCLUDE_RE = re.compile(
     r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\."
+    r"|^(docdb|documentdb)\."
 )
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
@@ -184,6 +185,8 @@ _NON_S3_VHOST_NAMES = frozenset(
         "ecs",
         "rds",
         "rds-data",
+        "docdb",
+        "documentdb",
         "elasticache",
         "glue",
         "athena",
@@ -381,6 +384,7 @@ SERVICE_REGISTRY = {
     "ecs": {"module": "ecs"},
     "ecs-metadata": {"module": "ecs_metadata"},
     "eks": {"module": "eks"},
+    "documentdb": {"module": "documentdb"},
     "elasticache": {"module": "elasticache"},
     "elasticfilesystem": {"module": "efs"},
     "elasticloadbalancing": {"module": "alb", "aliases": ("elbv2", "elb")},
