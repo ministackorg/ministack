@@ -4980,6 +4980,97 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def _plan_key(apigw_v1, api_id, **plan_kwargs):
+    """The value of a new key in a new usage plan on stage p."""
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+    stage = {"apiId": api_id, "stage": "p"}
+    if "method_throttle" in plan_kwargs:
+        stage["throttle"] = plan_kwargs.pop("method_throttle")
+    plan = apigw_v1.create_usage_plan(name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+                                      apiStages=[stage], **plan_kwargs)["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+    return [("x-api-key", key["value"])]
+
+
+def test_apigwv1_usage_plan_throttle_answers_429(apigw_v1):
+    """The plan limit applies to every method the key calls, stage limits too."""
+    api_id, root = _gw_api(apigw_v1, f"gwplthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part, required in (("a", True), ("open", False)):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=required)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+            {"op": "replace", "path": "/*/*/throttling/rateLimit", "value": "1000"},
+            {"op": "replace", "path": "/*/*/throttling/burstLimit", "value": "500"},
+        ])
+        closed = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0, "burstLimit": 0})
+        tiny = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0.01, "burstLimit": 1})
+        free = _plan_key(apigw_v1, api_id)
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed) == throttled
+        assert _stage_call(api_id, "/open", headers=closed) == throttled
+        assert _stage_call(api_id, "/open") == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=free) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=tiny) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/open", headers=tiny) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_adds_to_the_plan_limit(apigw_v1):
+    """A per-method plan limit throttles that method and never lifts the plan limit."""
+    api_id, root = _gw_api(apigw_v1, f"gwplmthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part in ("a", "b"):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        closed_a = _plan_key(apigw_v1, api_id,
+                             throttle={"rateLimit": 1000, "burstLimit": 500},
+                             method_throttle={"/a/GET": {"rateLimit": 0, "burstLimit": 0}})
+        open_a = _plan_key(apigw_v1, api_id,
+                           throttle={"rateLimit": 0, "burstLimit": 0},
+                           method_throttle={"/a/GET": {"rateLimit": 1000, "burstLimit": 500}})
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed_a) == throttled
+        assert _stage_call(api_id, "/b", headers=closed_a) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=open_a) == throttled
+        assert _stage_call(api_id, "/b", headers=open_a) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_is_per_api_stage(apigw_v1):
+    """The same method on two API stages of one plan has two buckets."""
+    apis = [_gw_api(apigw_v1, f"gwplstg-{_uuid_mod.uuid4().hex[:8]}") for _ in range(2)]
+    try:
+        for api_id, root in apis:
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart="a")["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+            apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+        limits = {"/a/GET": {"rateLimit": 0.01, "burstLimit": 1}}
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p", "throttle": limits} for api_id, _ in apis])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+        headers = [("x-api-key", key["value"])]
+        first, second = (api_id for api_id, _ in apis)
+
+        assert _stage_call(first, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(second, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(first, "/a", headers=headers) == (429, '{"message":"Too Many Requests"}')
+    finally:
+        for api_id, _ in apis:
+            apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
     """BAD_REQUEST_PARAMETERS and BAD_REQUEST_BODY."""
     api_id, root = _gw_api(apigw_v1, f"gwval-{_uuid_mod.uuid4().hex[:8]}")
