@@ -286,6 +286,128 @@ def test_kinesis_register_deregister_consumer(kin):
     kin.delete_stream(StreamName=sname)
 
 
+def _subscribe_setup(kin, shards=1):
+    sname = f"intg-sub-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=sname, ShardCount=shards)
+    stream_arn = kin.describe_stream(StreamName=sname)["StreamDescription"]["StreamARN"]
+    consumer_arn = kin.register_stream_consumer(
+        StreamARN=stream_arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    return sname, consumer_arn
+
+
+def test_kinesis_subscribe_to_shard_pushes_backlog_then_new_records(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    first = [kin.put_record(StreamName=sname, Data=f"r{i}".encode(), PartitionKey="k")["SequenceNumber"]
+             for i in range(2)]
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    event = next(events)["SubscribeToShardEvent"]
+    assert [r["Data"] for r in event["Records"]] == [b"r0", b"r1"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == first
+    assert event["ContinuationSequenceNumber"] == first[-1]
+    assert event["MillisBehindLatest"] == 0
+
+    third = kin.put_record(StreamName=sname, Data=b"r2", PartitionKey="k")["SequenceNumber"]
+    event = next(events)["SubscribeToShardEvent"]
+    assert [(r["Data"], r["PartitionKey"]) for r in event["Records"]] == [(b"r2", "k")]
+    assert event["ContinuationSequenceNumber"] == third
+    resp["EventStream"].close()
+
+    resumed = kin.subscribe_to_shard(
+        ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+        StartingPosition={"Type": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": first[0]})
+    with pytest.raises(ClientError) as exc:  # refused within 5 s of the first call
+        kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                               StartingPosition={"Type": "LATEST"})
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    event = next(iter(resumed["EventStream"]))["SubscribeToShardEvent"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == [first[1], third]
+    resumed["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_latest_starts_empty_and_takeover_ends_the_old_stream(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"old", PartitionKey="k")
+    old = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    old_events = iter(old["EventStream"])
+    event = next(old_events)["SubscribeToShardEvent"]
+    assert event["Records"] == [] and event["ContinuationSequenceNumber"]
+
+    time.sleep(5.2)
+    new = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    with pytest.raises(ClientError) as exc:
+        for _ in old_events:
+            pass
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    assert next(iter(new["EventStream"]))["SubscribeToShardEvent"]["Records"] == []
+    new["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_ends_with_child_shards_after_a_split(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    assert "ChildShards" not in next(events)["SubscribeToShardEvent"]
+    kin.split_shard(StreamName=sname, ShardToSplit="shardId-000000000000",
+                    NewStartingHashKey=str(2**127))
+    last = [e["SubscribeToShardEvent"] for e in events][-1]
+    assert sorted(c["ShardId"] for c in last["ChildShards"]) == [
+        "shardId-000000000001", "shardId-000000000002"]
+    assert all(c["ParentShards"] == ["shardId-000000000000"] for c in last["ChildShards"])
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_errors(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    cases = [
+        (dict(ConsumerARN=consumer_arn + "0", ShardId="shardId-000000000000",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000009",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+              StartingPosition={"Type": "AT_SEQUENCE_NUMBER"}), "InvalidArgumentException"),
+    ]
+    for kwargs, code in cases:
+        with pytest.raises(ClientError) as exc:
+            kin.subscribe_to_shard(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_cbor_events(kin):
+    import urllib.request
+
+    import cbor2
+    from botocore.eventstream import EventStreamBuffer
+
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"\x00\x01", PartitionKey="k")
+    request = urllib.request.Request(
+        kin.meta.endpoint_url, method="POST",
+        data=cbor2.dumps({"ConsumerARN": consumer_arn, "ShardId": "shardId-000000000000",
+                          "StartingPosition": {"Type": "TRIM_HORIZON"}}),
+        headers={"Content-Type": "application/x-amz-cbor-1.1",
+                 "X-Amz-Target": "Kinesis_20131202.SubscribeToShard",
+                 "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/kinesis/aws4_request"})
+    buffer, messages = EventStreamBuffer(), []
+    with urllib.request.urlopen(request, timeout=10) as response:
+        while len(messages) < 2:
+            buffer.add_data(response.read1(65536))
+            messages.extend(buffer)
+    assert messages[0].headers[":event-type"] == "initial-response"
+    event = messages[1]
+    assert event.headers[":content-type"] == "application/x-amz-cbor-1.1"
+    record = cbor2.loads(event.payload)["Records"][0]
+    assert record["Data"] == b"\x00\x01"
+    kin.delete_stream(StreamName=sname)
+
+
 def test_kinesis_consumer_arns_reject_foreign_region_without_exact_key_fallback(kin):
     """ConsumerARN paths must not resolve a consumer owned by another request region."""
     west = _regional_kin("us-west-2")
