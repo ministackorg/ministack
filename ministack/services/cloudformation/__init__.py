@@ -61,7 +61,27 @@ async def handle_request(method: str, path: str, headers: dict,
     if not handler:
         from .helpers import _error
         return _error("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(params)
+    if action not in _TOKEN_ACTIONS:
+        return handler(params)
+    from .helpers import _error, client_request_token_problems, validation_error_message
+    from .stacks import CLIENT_REQUEST_TOKEN
+    token = _p(params, "ClientRequestToken")
+    if token and (problems := client_request_token_problems(token)):
+        return _error("ValidationError", validation_error_message(problems))
+    # The events the operation records, now and from the task it schedules
+    # (which copies this context), carry the token.
+    scope = CLIENT_REQUEST_TOKEN.set(token)
+    try:
+        return handler(params)
+    finally:
+        CLIENT_REQUEST_TOKEN.reset(scope)
+
+
+# The stack operations that take a ClientRequestToken and record stack events.
+_TOKEN_ACTIONS = frozenset({
+    "CreateStack", "UpdateStack", "DeleteStack", "ExecuteChangeSet",
+    "ContinueUpdateRollback", "CancelUpdateStack",
+})
 
 
 def reset():

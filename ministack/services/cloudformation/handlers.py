@@ -31,6 +31,9 @@ from .engine import (
     validate_template_support,
 )
 from .helpers import (
+    DELETION_MODE_VALUES,
+    ON_FAILURE_VALUES,
+    TEMPLATE_STAGE_VALUES,
     _error,
     _esc,
     _extract_members,
@@ -41,11 +44,15 @@ from .helpers import (
     _request_problems,
     _resolve_template,
     _xml,
+    enum_problems,
+    validation_error_message,
 )
 from .stacks import (
+    CLIENT_REQUEST_TOKEN,
     _add_event,
     _continue_update_rollback_async,
     _create_stack_task_in_region,
+    _create_then_delete_on_failure,
     _delete_stack_async,
     _deploy_stack_async,
     _stack_region_context,
@@ -253,6 +260,14 @@ def _create_stack(params):
     # The request-level constraints, joined into one message as the API does.
     if request_error := _request_problems(params, stack_name):
         return request_error
+    if problems := enum_problems(params, "OnFailure", "onFailure", ON_FAILURE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
+    on_failure = _p(params, "OnFailure")
+    # "You can specify either OnFailure or DisableRollback, but not both"
+    # (API_CreateStack); the error wording is not measured.
+    if on_failure and "DisableRollback" in params:
+        return _error("ValidationError",
+                      "You can specify either DisableRollback or OnFailure, but not both.")
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
@@ -275,7 +290,10 @@ def _create_stack(params):
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
     tags = _extract_members(params, "Tags")
-    disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    # OnFailure=DO_NOTHING is DisableRollback=true; DELETE rolls back and then
+    # deletes the stack; ROLLBACK is the default.
+    disable_rollback = (_p(params, "DisableRollback", "false").lower() == "true"
+                        or on_failure == "DO_NOTHING")
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
     from .helpers import _validate_stack_tags
     tags_error = _validate_stack_tags(tags)
@@ -348,13 +366,12 @@ def _create_stack(params):
                "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
                physical_id=stack_id)
 
-    _create_stack_task_in_region(
-        _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags,
-                            retain_except_on_create=retain_except_on_create),
-        stack,
-        stack_id,
-    )
+    deploy = _deploy_stack_async(stack_name, stack_id, template,
+                                 param_values, disable_rollback, tags,
+                                 retain_except_on_create=retain_except_on_create)
+    if on_failure == "DELETE":
+        deploy = _create_then_delete_on_failure(stack_name, stack_id, deploy)
+    _create_stack_task_in_region(deploy, stack, stack_id)
 
     return _xml(200, "CreateStackResponse",
                 f"<CreateStackResult><StackId>{stack_id}</StackId></CreateStackResult>")
@@ -456,6 +473,8 @@ def _describe_stacks(params):
 
         caps_xml = "".join(
             f"<member>{_esc(c)}</member>" for c in s.get("Capabilities", []))
+        deletion_mode_xml = (f"<DeletionMode>{s['DeletionMode']}</DeletionMode>"
+                             if s.get("DeletionMode") else "")
 
         members += (
             "<member>"
@@ -470,6 +489,7 @@ def _describe_stacks(params):
             "<EnableTerminationProtection>"
             f"{str(s.get('EnableTerminationProtection', False)).lower()}"
             "</EnableTerminationProtection>"
+            f"{deletion_mode_xml}"
             f"<Capabilities>{caps_xml}</Capabilities>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
@@ -547,6 +567,8 @@ def _describe_stack_events(params):
 
     members = ""
     for e in events_sorted:
+        token_xml = (f"<ClientRequestToken>{_esc(e['ClientRequestToken'])}</ClientRequestToken>"
+                     if e.get("ClientRequestToken") else "")
         members += (
             "<member>"
             f"<StackId>{_esc(e.get('StackId', ''))}</StackId>"
@@ -558,6 +580,7 @@ def _describe_stack_events(params):
             f"<ResourceStatus>{e.get('ResourceStatus', '')}</ResourceStatus>"
             f"<ResourceStatusReason>{_esc(e.get('ResourceStatusReason', ''))}</ResourceStatusReason>"
             f"<Timestamp>{e.get('Timestamp', '')}</Timestamp>"
+            f"{token_xml}"
             "</member>"
         )
 
@@ -715,18 +738,64 @@ def _list_stack_resources(params):
 
 # --- GetTemplate ---
 
+def _processed_template_body(record):
+    """The ``Processed`` stage of a stack's or change set's template: the
+    template after its transforms (SAM, ``AWS::LanguageExtensions``,
+    ``AWS::Include``) as JSON. A template that declares no transform is
+    returned as it was sent: "If the template doesn't include transforms,
+    Original and Processed return the same template" (API_GetTemplate)."""
+    body = record.get("_template_body") or "{}"
+    try:
+        uses_transform = _uses_macro(_parse_template(body))
+    except Exception:
+        uses_transform = False
+    if not uses_transform or not record.get("_template"):
+        return body
+    return json.dumps(record["_template"], default=str)
+
+
 def _get_template(params):
+    from .changesets import _find_change_set
+    if problems := enum_problems(params, "TemplateStage", "templateStage",
+                                 TEMPLATE_STAGE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
     stack_name = _p(params, "StackName")
+    cs_name = _p(params, "ChangeSetName")
 
-    stack = _resolve_stack(stack_name)
-    if not stack:
-        return _error("ValidationError",
-                      f"Stack [{stack_name}] does not exist")
+    if cs_name:
+        # "If you specify a name, you must also specify the StackName"
+        # (API_GetTemplate); the error wording is not measured.
+        if not stack_name and not cs_name.startswith("arn:"):
+            return _error("ValidationError",
+                          "StackName must be specified if ChangeSetName is not specified as an ARN.")
+        stack = _resolve_stack(stack_name) if stack_name else None
+        _, record = _find_change_set(
+            cs_name, stack.get("StackName", stack_name) if stack else stack_name)
+        if not record:
+            return _error("ChangeSetNotFound",
+                          f"ChangeSet [{cs_name}] does not exist", 404)
+    else:
+        record = _resolve_stack(stack_name)
+        if not record:
+            return _error("ValidationError",
+                          f"Stack [{stack_name}] does not exist")
 
-    template_body = stack.get("_template_body", "{}")
+    # The API reference defaults TemplateStage to Processed; Original stays the
+    # default here, which is what GetTemplate has always answered and what the
+    # tests of transform templates expect. For a template without a transform
+    # the two stages are the same.
+    if _p(params, "TemplateStage") == "Processed":
+        template_body = _processed_template_body(record)
+    else:
+        template_body = record.get("_template_body") or "{}"
+    # Both stages of a stack are always available; a change set's Processed
+    # stage is available once it is created, which CreateChangeSet finishes
+    # before it answers.
+    stages_xml = "".join(f"<member>{s}</member>" for s in TEMPLATE_STAGE_VALUES)
     return _xml(200, "GetTemplateResponse",
                 f"<GetTemplateResult>"
                 f"<TemplateBody>{_esc(template_body)}</TemplateBody>"
+                f"<StagesAvailable>{stages_xml}</StagesAvailable>"
                 f"</GetTemplateResult>")
 
 
@@ -773,6 +842,9 @@ def _delete_stack(params):
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
+    if problems := enum_problems(params, "DeletionMode", "deletionMode", DELETION_MODE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
+    force = _p(params, "DeletionMode") == "FORCE_DELETE_STACK"
 
     stack = _resolve_stack(stack_name)
     if not stack:
@@ -811,6 +883,15 @@ def _delete_stack(params):
 
     stack_id = stack["StackId"]
 
+    # FORCE_DELETE_STACK: only for a DELETE_FAILED stack. The wording is the
+    # one a third party recorded from AWS (DevelopersIO, ap-northeast-3),
+    # not measured here.
+    if force and stack.get("StackStatus") != "DELETE_FAILED":
+        return _error("ValidationError",
+                      f"Invalid operation on stack [{stack_id}]. You can activate "
+                      "DeletionMode FORCE_DELETE_STACK in a delete stack operation only "
+                      "when the stack is in the DELETE_FAILED state.")
+
     # RetainResources: only for a DELETE_FAILED stack, only its own resources.
     retain = _extract_string_members(params, "RetainResources")
     if retain:
@@ -832,8 +913,11 @@ def _delete_stack(params):
                  if v.get("StackId") == stack_id]:
         _change_sets.pop(_cid, None)
 
+    if _p(params, "DeletionMode"):
+        stack["DeletionMode"] = _p(params, "DeletionMode")
+
     _create_stack_task_in_region(
-        _delete_stack_async(stack_name, stack_id, frozenset(retain)),
+        _delete_stack_async(stack_name, stack_id, frozenset(retain), force=force),
         stack,
         stack_id,
     )
@@ -1252,8 +1336,10 @@ def _cancel_update_stack(params):
     if stack.get("StackStatus") != "UPDATE_IN_PROGRESS":
         return _error("ValidationError",
                       "CancelUpdateStack cannot be called from current stack status")
-    # The running update checks the flag before each resource and rolls back.
+    # The running update checks the flag before each resource and rolls back;
+    # the rollback events carry the cancel's ClientRequestToken.
     stack["_cancel_requested"] = True
+    stack["_cancel_token"] = CLIENT_REQUEST_TOKEN.get()
     return _xml(200, "CancelUpdateStackResponse", "")
 
 
