@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import iot_test_ca
 
 
 def _unique(prefix: str) -> str:
@@ -5177,8 +5178,10 @@ def test_connectivity_is_not_persisted_and_cannot_restore_as_connected():
 # ---------------------------------------------------------------------------
 
 
-def _generate_ca_and_leaves(count: int = 1) -> tuple[str, list[str]]:
-    """A fresh CA PEM and ``count`` leaf certificate PEMs signed by it.
+def _generate_ca_and_leaves(
+    registration_code: str, count: int = 1
+) -> tuple[str, str, list[str]]:
+    """A fresh CA PEM, its verification certificate and ``count`` leaf certificate PEMs signed by it.
 
     Leaves have to be signed by the CA they are registered under —
     ``RegisterCertificate`` verifies the ``caCertificatePem`` claim — so a test
@@ -5186,9 +5189,11 @@ def _generate_ca_and_leaves(count: int = 1) -> tuple[str, list[str]]:
     same CA key, not from two independent ``_generate_ca_and_leaf`` calls.
     """
     pytest.importorskip("cryptography")
-    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+    from ministack.core.x509_utils import sign_leaf_certificate
 
-    ca_pem, ca_key_pem = generate_ca(common_name=_unique("jitr-test-ca"))
+    ca_pem, ca_key_pem, verification_pem = iot_test_ca(
+        registration_code, _unique("jitr-test-ca")
+    )
     leaves = [
         sign_leaf_certificate(
             ca_cert_pem=ca_pem,
@@ -5197,16 +5202,23 @@ def _generate_ca_and_leaves(count: int = 1) -> tuple[str, list[str]]:
         )[0]
         for _ in range(count)
     ]
-    return ca_pem, leaves
+    return ca_pem, verification_pem, leaves
 
 
-def _generate_ca_and_leaf() -> tuple[str, str]:
-    """A fresh CA PEM and a leaf certificate PEM signed by it."""
-    ca_pem, leaves = _generate_ca_and_leaves()
-    return ca_pem, leaves[0]
+def _generate_ca_and_leaf(registration_code: str) -> tuple[str, str, str]:
+    """A fresh CA PEM, its verification certificate and a leaf certificate PEM signed by it."""
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(registration_code)
+    return ca_pem, verification_pem, leaves[0]
 
 
-def test_iot_registration_code_stable_until_deleted(iot_client):
+def _registration_code(iot_client) -> str:
+    return iot_client.get_registration_code()["registrationCode"]
+
+
+def test_iot_registration_code_stable_until_deleted():
+    # An account of its own: rotating the shared account's code would refuse
+    # concurrent CA registrations.
+    iot_client = _iot_client_for_fresh_account()
     code = iot_client.get_registration_code()["registrationCode"]
     assert len(code) == 64
     int(code, 16)  # sha256 hex
@@ -5220,9 +5232,10 @@ def test_iot_registration_code_stable_until_deleted(iot_client):
 
 
 def test_iot_ca_certificate_lifecycle(iot_client):
-    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
     resp = iot_client.register_ca_certificate(
-        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        setAsActive=True, allowAutoRegistration=True,
     )
     ca_id = resp["certificateId"]
     assert resp["certificateArn"].endswith(":cacert/" + ca_id)
@@ -5265,10 +5278,14 @@ def test_iot_ca_certificate_lifecycle(iot_client):
 
 
 def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
-    ca_pem, _leaf = _generate_ca_and_leaf()
-    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
     with pytest.raises(ClientError) as ei:
-        iot_client.register_ca_certificate(caCertificate=ca_pem)
+        iot_client.register_ca_certificate(
+            caCertificate=ca_pem, verificationCertificate=verification_pem
+        )
     err = ei.value.response
     assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
     assert err["resourceId"] == ca_id
@@ -5277,7 +5294,7 @@ def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
 
 
 def test_iot_register_ca_certificate_mode_round_trip(iot_client):
-    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
 
     # An invalid mode is rejected up front — nothing is registered.
     with pytest.raises(ClientError) as ei:
@@ -5296,7 +5313,9 @@ def test_iot_register_ca_certificate_mode_round_trip(iot_client):
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
     # An omitted mode reports AWS's default.
-    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
     desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
         "certificateDescription"
     ]
@@ -5304,14 +5323,64 @@ def test_iot_register_ca_certificate_mode_round_trip(iot_client):
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+_VERIFICATION_ERRORS = {
+    "missing": ("InvalidRequestException",
+                "Need to provide verification certificate for registering CA Certificates in DEFAULT mode"),
+    "sni-only": ("InvalidRequestException",
+                 "Cannot provide verification certificate for registering CA Certificates in SNI_ONLY mode"),
+    "not-a-pem": ("InvalidRequestException", "Contents of the Verification Certificate are not correct"),
+    "wrong-cn": ("RegistrationCodeValidationException",
+                 "Registration code provided in the CN field of verification certificate is invalid."),
+    "other-ca": ("CertificateValidationException",
+                 "The issuer of the certificate did not match the subject of the provided CA certificate."),
+    "other-key": ("CertificateValidationException",
+                  "The signature of the certificate failed verification against the provided CA certificate."),
+}
+
+
+@pytest.mark.parametrize("case", list(_VERIFICATION_ERRORS))
+def test_iot_register_ca_certificate_verification_certificate(iot_client, case):
+    """DEFAULT mode needs a verification certificate signed by the CA with the registration code as CN; SNI_ONLY refuses one."""
+    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+
+    code = _registration_code(iot_client)
+    common_name = _unique("verify-ca")
+    ca_pem, ca_key_pem, verification_pem = iot_test_ca(code, common_name)
+    kwargs = {"caCertificate": ca_pem, "verificationCertificate": verification_pem}
+    if case == "missing":
+        del kwargs["verificationCertificate"]
+    elif case == "sni-only":
+        kwargs["certificateMode"] = "SNI_ONLY"
+    elif case == "not-a-pem":
+        kwargs["verificationCertificate"] = "not a certificate"
+    elif case == "wrong-cn":
+        kwargs["verificationCertificate"] = sign_leaf_certificate(ca_pem, ca_key_pem, common_name="0" * 64)[0]
+    elif case == "other-ca":
+        other_pem, other_key_pem, _ = iot_test_ca(code, _unique("verify-other-ca"))
+        kwargs["verificationCertificate"] = sign_leaf_certificate(other_pem, other_key_pem, common_name=code)[0]
+    else:
+        # Same subject as the CA, different key: only the signature tells them apart.
+        twin_pem, twin_key_pem = generate_ca(common_name=common_name)
+        kwargs["verificationCertificate"] = sign_leaf_certificate(twin_pem, twin_key_pem, common_name=code)[0]
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(**kwargs)
+    err = ei.value.response
+    assert (err["Error"]["Code"], err["Error"]["Message"]) == _VERIFICATION_ERRORS[case]
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_ca_certificate(certificateId=get_certificate_id(ca_pem))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_iot_ca_certificate_registration_config_round_trip(iot_client):
     """registrationConfig rides Register and Update and comes back as
     DescribeCACertificate's top-level member — the JITR provisioning config."""
-    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
     cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr",
            "templateName": "jitr-template"}
     ca_id = iot_client.register_ca_certificate(
-        caCertificate=ca_pem, allowAutoRegistration=True, registrationConfig=cfg
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        allowAutoRegistration=True, registrationConfig=cfg,
     )["certificateId"]
 
     got = iot_client.describe_ca_certificate(certificateId=ca_id)
@@ -5331,7 +5400,9 @@ def test_iot_ca_certificate_registration_config_round_trip(iot_client):
 
     # A CA registered without a config omits the member entirely.
     iot_client.delete_ca_certificate(certificateId=ca_id)
-    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
     assert "registrationConfig" not in iot_client.describe_ca_certificate(
         certificateId=ca_id)
     iot_client.delete_ca_certificate(certificateId=ca_id)
@@ -5340,18 +5411,27 @@ def test_iot_ca_certificate_registration_config_round_trip(iot_client):
 _JITR_ACCOUNT = "123456789012"
 
 
-async def _jitr_scope_with_ca(iot_module, ca_pem: str, received: list, allow_auto=True) -> str:
-    """Pin the JITR test scope, register ``ca_pem`` ACTIVE and collect every
-    registered event into ``received``. Returns the CA id."""
+def _jitr_registration_code(iot_module) -> str:
+    """Pin the JITR test scope and return its registration code."""
     from ministack.core.responses import set_request_account_id, set_request_region
 
     set_request_account_id(_JITR_ACCOUNT)
     set_request_region(_TEST_REGION)
+    return json.loads(iot_module._handle_registration_code("GET")[2])["registrationCode"]
+
+
+async def _jitr_scope_with_ca(
+    iot_module, ca_pem: str, verification_pem: str, received: list, allow_auto=True
+) -> str:
+    """Pin the JITR test scope, register ``ca_pem`` ACTIVE and collect every
+    registered event into ``received``. Returns the CA id."""
+    _jitr_registration_code(iot_module)
     qp = {"setAsActive": "true"}
     if allow_auto:
         qp["allowAutoRegistration"] = "true"
+    body = {"caCertificate": ca_pem, "verificationCertificate": verification_pem}
     status, _, body = await iot_module.handle_request(
-        "POST", "/cacertificate", {}, json.dumps({"caCertificate": ca_pem}).encode(), qp
+        "POST", "/cacertificate", {}, json.dumps(body).encode(), qp
     )
     assert status == 200
 
@@ -5373,11 +5453,13 @@ def test_iot_register_certificate_publishes_no_registered_event(status, without_
     RegisterCertificateWithoutCA as well (measured)."""
     from ministack.services import iot as iot_module
 
-    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_pem, verification_pem, leaf_pem = _generate_ca_and_leaf(
+        _jitr_registration_code(iot_module)
+    )
     received: list = []
 
     async def _run():
-        await _jitr_scope_with_ca(iot_module, ca_pem, received)
+        await _jitr_scope_with_ca(iot_module, ca_pem, verification_pem, received)
         payload = {"certificatePem": leaf_pem, "status": status}
         if not without_ca:
             payload["caCertificatePem"] = ca_pem
@@ -5418,8 +5500,9 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
 
     from ministack.services import iot as iot_module
 
-    ca_pem, leaf_pem = _generate_ca_and_leaf()
-    off_ca_pem, off_leaf_pem = _generate_ca_and_leaf()
+    code = _jitr_registration_code(iot_module)
+    ca_pem, verification_pem, leaf_pem = _generate_ca_and_leaf(code)
+    off_ca_pem, off_verification_pem, off_leaf_pem = _generate_ca_and_leaf(code)
     cert_id = iot_module.get_certificate_id(leaf_pem)
     peer = ("192.0.2.10", 50000)
     received: list = []
@@ -5428,8 +5511,10 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
         raise RuntimeError("broker down")
 
     async def _run():
-        ca_id = await _jitr_scope_with_ca(iot_module, ca_pem, received)
-        await _jitr_scope_with_ca(iot_module, off_ca_pem, [], allow_auto=False)
+        ca_id = await _jitr_scope_with_ca(iot_module, ca_pem, verification_pem, received)
+        await _jitr_scope_with_ca(
+            iot_module, off_ca_pem, off_verification_pem, [], allow_auto=False
+        )
         der = ssl.PEM_cert_to_DER_cert(leaf_pem)
 
         assert await iot_module._mtls_auto_register(der, peer)
@@ -5652,9 +5737,10 @@ def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
     """The headline JITR flow over the wire: register a CA, register a device
     certificate under it, and DescribeCertificate resolves the signing CA —
     through the router, botocore serialization and all."""
-    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_pem, verification_pem, leaf_pem = _generate_ca_and_leaf(_registration_code(iot_client))
     ca_id = iot_client.register_ca_certificate(
-        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        setAsActive=True, allowAutoRegistration=True,
     )["certificateId"]
     try:
         cert_id = iot_client.register_certificate(
@@ -5679,7 +5765,7 @@ def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
     that does not exist."""
     from ministack.core.x509_utils import get_certificate_id
 
-    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_pem, _verification, leaf_pem = _generate_ca_and_leaf("never-registered")
     with pytest.raises(ClientError) as ei:
         iot_client.register_certificate(
             certificatePem=leaf_pem, caCertificatePem=ca_pem
@@ -5700,13 +5786,16 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
     The same leaf under its real CA still registers."""
     from ministack.core.x509_utils import get_certificate_id
 
-    ca_x_pem, leaf_pem = _generate_ca_and_leaf()
-    ca_y_pem, _leaf_y = _generate_ca_and_leaf()
+    code = _registration_code(iot_client)
+    ca_x_pem, verification_x_pem, leaf_pem = _generate_ca_and_leaf(code)
+    ca_y_pem, verification_y_pem, _leaf_y = _generate_ca_and_leaf(code)
     ca_x_id = iot_client.register_ca_certificate(
-        caCertificate=ca_x_pem, setAsActive=True, allowAutoRegistration=True
+        caCertificate=ca_x_pem, verificationCertificate=verification_x_pem,
+        setAsActive=True, allowAutoRegistration=True,
     )["certificateId"]
     ca_y_id = iot_client.register_ca_certificate(
-        caCertificate=ca_y_pem, setAsActive=True, allowAutoRegistration=True
+        caCertificate=ca_y_pem, verificationCertificate=verification_y_pem,
+        setAsActive=True, allowAutoRegistration=True,
     )["certificateId"]
     try:
         with pytest.raises(ClientError) as ei:
@@ -5740,8 +5829,10 @@ def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):
     import os
     import urllib.request
 
-    ca_pem, _leaf = _generate_ca_and_leaf()
-    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
     try:
         assert (
             iot_client.describe_ca_certificate(certificateId=ca_id)[
@@ -5788,8 +5879,10 @@ def test_iot_update_ca_certificate_rejects_invalid_enum_values(iot_client):
     import urllib.error
     import urllib.request
 
-    ca_pem, _leaf = _generate_ca_and_leaf()
-    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    ca_pem, verification_pem, _leaf = _generate_ca_and_leaf(_registration_code(iot_client))
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     try:
         for payload, wanted in (
