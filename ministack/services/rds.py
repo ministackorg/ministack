@@ -7748,8 +7748,10 @@ def _describe_global_clusters(p):
             snapshots.append(snapshot)
         gcs = snapshots
 
+    # The list member is named GlobalClusterMember in the service model, like
+    # the items of GlobalClusterMembers inside each cluster.
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
