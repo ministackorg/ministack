@@ -1493,12 +1493,14 @@ def _gateway_error_response(error, request):
     message = error.message
     message_string = "null" if message is None else json.dumps(message)
     rendered_type = response_type
-    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR"):
-        # AWS renders the messageString of both types with a leading space, and
-        # $context.error.responseType of an authorizer configuration error as
-        # API_CONFIGURATION_ERROR, while the response entry, its status and
-        # x-amzn-ErrorType stay those of AUTHORIZER_CONFIGURATION_ERROR (measured).
+    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR",
+                         "BAD_REQUEST_BODY", "BAD_REQUEST_PARAMETERS"):
+        # AWS renders the messageString of these types with a leading space (measured).
         message_string = " " + message_string
+    if response_type == "AUTHORIZER_CONFIGURATION_ERROR":
+        # $context.error.responseType renders as API_CONFIGURATION_ERROR, while the
+        # response entry, its status and x-amzn-ErrorType stay those of
+        # AUTHORIZER_CONFIGURATION_ERROR (measured).
         rendered_type = "API_CONFIGURATION_ERROR"
     variables = {
         "context.error.message": "" if message is None else message,

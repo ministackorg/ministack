@@ -5001,15 +5001,22 @@ def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
         json_header = [("Content-Type", "application/json")]
 
         assert _stage_call(api_id, "/val", "POST", '{"name":"x"}', json_header) == (
-            400, '{"message":"Missing required request parameters: [q]"}')
+            400, '{"message": "Missing required request parameters: [q]"}')
         assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", "not json", json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", '{"name":123}', json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", '{"name":"x"}',
                            json_header) == (200, '{"ok":true}')
+        apigw_v1.put_gateway_response(
+            restApiId=api_id, responseType="BAD_REQUEST_BODY", responseTemplates={
+                "application/json":
+                    '{"m":$context.error.messageString,"e":"$context.error.message"}'})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
+            400, '{"m": "Invalid request body","e":"Invalid request body"}')
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
 
