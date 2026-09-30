@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — registry events** — with a type enabled through `UpdateEventConfigurations`, the thing, thing type, thing type association, thing group, thing group hierarchy and thing group membership operations publish the AWS payload to `$aws/events/...`, where MQTT subscribers and topic rules receive it.
+
 ### Fixed
 
 - **EventBridge — `PutEvents` refuses `aws.*` sources** — an entry whose `Source` starts with `aws.` now fails with `NotAuthorizedForSourceException` in its result entry and counts in `FailedEntryCount`, while the other entries of the batch are still delivered; previously it was dispatched to rules and archives like a custom event.
