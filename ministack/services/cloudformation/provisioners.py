@@ -7598,8 +7598,8 @@ def _ecs_service_create(logical_id, props, stack_name):
         "taskDefinition": props.get("TaskDefinition", ""),
         "desiredCount": props.get("DesiredCount", 1),
         "launchType": props.get("LaunchType", "EC2"),
-        "loadBalancers": props.get("LoadBalancers", []),
-        "networkConfiguration": props.get("NetworkConfiguration", {}),
+        "loadBalancers": _pascal_to_camel(props.get("LoadBalancers") or []),
+        "networkConfiguration": _pascal_to_camel(props.get("NetworkConfiguration") or {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     }
     deployment_configuration = _ecs_deployment_configuration(props)
@@ -7626,7 +7626,7 @@ def _ecs_service_update(physical_id, old_props, new_props, stack_name):
     }
     for cf_property, ecs_property in property_map.items():
         if new_props.get(cf_property) != old_props.get(cf_property):
-            request[ecs_property] = new_props.get(cf_property)
+            request[ecs_property] = _pascal_to_camel(new_props.get(cf_property))
 
     if (new_props.get("DeploymentConfiguration")
             != old_props.get("DeploymentConfiguration")):
