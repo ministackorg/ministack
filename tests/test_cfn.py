@@ -9047,6 +9047,60 @@ def test_cfn_scheduler_schedule(cfn):
     assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
+def test_cfn_update_schedule_group_tags_in_place(cfn, scheduler):
+    """A schedule group's template and stack tags change in place and TagResource tags stay."""
+    name = f"cfn-sched-group-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(team):
+        return json.dumps({
+            "Resources": {"Group": {"Type": "AWS::Scheduler::ScheduleGroup", "Properties": {
+                "Name": name, "Tags": [{"Key": "team", "Value": team}]}}},
+            "Outputs": {"GroupArn": {"Value": {"Fn::GetAtt": ["Group", "Arn"]}}},
+        })
+
+    def group_tags(arn):
+        return {t["Key"]: t["Value"]
+                for t in scheduler.list_tags_for_resource(ResourceArn=arn)["Tags"]}
+
+    cfn.create_stack(StackName=name, TemplateBody=template("a"),
+                     Tags=[{"Key": "owner", "Value": "team-a"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "GroupArn")
+        created = scheduler.get_schedule_group(Name=name)["CreationDate"]
+        scheduler.tag_resource(ResourceArn=arn, Tags=[{"Key": "manual", "Value": "kept"}])
+
+        cfn.update_stack(StackName=name, TemplateBody=template("b"),
+                         Tags=[{"Key": "owner", "Value": "team-a"}])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupArn") == arn
+        assert scheduler.get_schedule_group(Name=name)["CreationDate"] == created
+        assert group_tags(arn) == {
+            "team": "b", "manual": "kept", "owner": "team-a", **_system_tags(stack, "Group")}
+
+        cfn.update_stack(StackName=name, UsePreviousTemplate=True,
+                         Tags=[{"Key": "owner", "Value": "team-b"}])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert group_tags(arn)["owner"] == "team-b"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_schedule_group_change_set_reports_name_as_replacement():
+    """A Name change replaces a schedule group and a Tags change is in place, as its schema says."""
+    rtype = "AWS::Scheduler::ScheduleGroup"
+    renamed = _diff_resources(_template(rtype, {"Name": "a"}), _template(rtype, {"Name": "b"}))
+    retagged = _diff_resources(
+        _template(rtype, {"Name": "a", "Tags": [{"Key": "team", "Value": "a"}]}),
+        _template(rtype, {"Name": "a", "Tags": [{"Key": "team", "Value": "b"}]}))
+    name, tags = renamed[0]["ResourceChange"], retagged[0]["ResourceChange"]
+    assert (_requirements(name), name["Replacement"]) == ({"Name": "Always"}, "True")
+    assert (_requirements(tags), tags["Replacement"]) == ({"Tags": "Never"}, "False")
+
+
 def test_cfn_location_tracker(cfn, location):
     """AWS::Location::Tracker provisions through the location service (so it is
     readable back through the real API) and the stack tags reach its Tags;
@@ -9727,19 +9781,24 @@ def test_cfn_change_set_keeps_tagged_resources_without_update_handler(cfn, sqs):
         _delete_cfn_test_stack(cfn, name)
 
 
-def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn, scheduler):
-    """A stack-tag change is an update; a tagged type without an update
-    handler (a schedule group) keeps its physical id instead of being
-    re-created."""
+def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn):
+    """A stack-tag change keeps the physical id of a tagged type without an update handler."""
     name = f"cfn-tag-only-{_uuid_mod.uuid4().hex[:8]}"
+    app = {"ApplicationId": {"Ref": "App"}}
     template = json.dumps({
         "Resources": {
-            "Group": {
-                "Type": "AWS::Scheduler::ScheduleGroup",
-                "Properties": {"Name": name},
-            },
+            "App": {"Type": "AWS::AppConfig::Application", "Properties": {"Name": name}},
+            "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {**app, "Name": name}},
+            "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                **app, "Name": name, "LocationUri": "hosted"}},
+            "Strategy": {"Type": "AWS::AppConfig::DeploymentStrategy", "Properties": {
+                "Name": name, "DeploymentDurationInMinutes": 0, "GrowthFactor": 100,
+                "ReplicateTo": "NONE"}},
+            "Deploy": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                **app, "EnvironmentId": {"Ref": "Env"},
+                "ConfigurationProfileId": {"Ref": "Profile"},
+                "DeploymentStrategyId": {"Ref": "Strategy"}, "ConfigurationVersion": "1"}},
         },
-        "Outputs": {"GroupArn": {"Value": {"Fn::GetAtt": ["Group", "Arn"]}}},
     })
     cfn.create_stack(
         StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
@@ -9747,22 +9806,15 @@ def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn, sched
     try:
         stack = _wait_stack(cfn, name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        arn = _output(stack, "GroupArn")
         cfn.update_stack(
             StackName=name, UsePreviousTemplate=True,
             Tags=[{"Key": "owner", "Value": "team-b"}],
         )
         stack = _wait_stack(cfn, name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "GroupArn") == arn
         assert stack["Tags"] == [{"Key": "owner", "Value": "team-b"}]
-        detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Group")
-        assert detail["StackResourceDetail"]["PhysicalResourceId"] == name
-        # Without an update handler the group keeps the tags it was created
-        # with; the changed stack tag does not reach it.
-        group_tags = {t["Key"]: t["Value"]
-                      for t in scheduler.list_tags_for_resource(ResourceArn=arn)["Tags"]}
-        assert group_tags == {"owner": "team-a", **_system_tags(stack, "Group")}
+        detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Deploy")
+        assert detail["StackResourceDetail"]["PhysicalResourceId"] == "1"
     finally:
         _delete_cfn_test_stack(cfn, name)
 

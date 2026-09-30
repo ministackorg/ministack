@@ -9,7 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **CloudFormation — `AWS::Pipes::Pipe` updates in place** — a pipe keeps its stream position and `CreationTime` when `Description`, `Target`, `RoleArn`, `DesiredState` or `Tags` change, gets `Description` and `Tags` on create, and refuses a create-only source change under an explicit `Name`.
+- **CloudFormation — `AWS::Pipes::Pipe` and `AWS::Scheduler::ScheduleGroup` update in place** — a pipe keeps its stream position and `CreationTime` when `Description`, `Target`, `RoleArn`, `DesiredState` or `Tags` change, gets `Description` and `Tags` on create and refuses a create-only source change under an explicit `Name`, and a schedule group takes template and stack tag changes while keeping tags added through `TagResource`.
 
 ## [1.5.20] — 2026-10-01
 
