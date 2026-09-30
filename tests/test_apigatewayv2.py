@@ -3054,6 +3054,31 @@ def test_apigwv2_path_based_websocket(apigw, lam):
         ws.close()
 
 
+_WS_CONTEXT_CODE = """
+import json
+def handler(event, context):
+    rc = event['requestContext']
+    return {'statusCode': 200, 'body': json.dumps({'stage': rc['stage'], 'authorizer': rc.get('authorizer')})}
+"""
+
+
+@pytest.mark.parametrize("path_based", [False, True], ids=["host", "path"])
+def test_ws_request_context_names_the_stage(apigw, lam, path_based):
+    """requestContext.stage is the stage named in the connection URL."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"stage-{uuid.uuid4().hex[:6]}",
+                             default_code=_WS_CONTEXT_CODE)
+    if path_based:
+        path, host = f"/_aws/execute-api/{api_id}/prod", f"localhost:{_EXECUTE_PORT}"
+    else:
+        path, host = "/prod", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    ws = _WSClient("localhost", _EXECUTE_PORT, path, headers={"Host": host})
+    try:
+        ws.send(json.dumps({"action": "x"}))
+        assert json.loads(ws.recv())["stage"] == "prod"
+    finally:
+        ws.close()
+
+
 def test_ws_connect_jwt_authorizer_rejects_missing_token(apigw, lam, cognito_idp):
     """$connect with a JWT authorizer rejects connections that lack a valid token (#1074)."""
 

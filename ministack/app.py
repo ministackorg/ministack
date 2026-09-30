@@ -2609,13 +2609,13 @@ async def app(scope, receive, send):
             return
         try:
             if parsed:
-                ws_api_id, _stage, _execute_path = parsed
+                ws_api_id, ws_stage, ws_execute_path = parsed
                 await _get_module("apigateway").handle_websocket(
                     scope,
                     receive,
                     send,
                     ws_api_id,
-                    path_override=_execute_path,
+                    path_override=f"/{ws_stage}{ws_execute_path}",
                 )
             elif appsync_rt_m:
                 await _get_module("appsync_events").handle_websocket(scope, receive, send, appsync_rt_m.group(1))
