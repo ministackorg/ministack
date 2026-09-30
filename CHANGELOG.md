@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito Identity — `GetOpenIdToken` claims** — the token was a user-pool ID token with an empty audience; it is now issued by `https://cognito-identity.amazonaws.com` with the identity pool id as `aud`, the identity id as `sub`, an `amr` list naming the login providers and the user-pool sign-in, the pool ARN in `https://cognito-identity.amazonaws.com/identity-pool-arn` and a 10-minute lifetime. An identity id that no pool knows gets `ResourceNotFoundException` instead of a token. Contributed by @iot-rocket.
+
 ## [1.5.26] — 2026-10-11
 
 ### Fixed
