@@ -26,6 +26,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **AutoScaling — target tracking alarms** — `PutScalingPolicy` with `TargetTrackingScaling` creates the `TargetTracking-<group>-AlarmHigh-<uuid>` alarm and, unless `DisableScaleIn` is set, the `AlarmLow` one on the tracked metric, lists them in `Alarms` of `PutScalingPolicy` and `DescribePolicies`, replaces them when the policy is updated and deletes them with the policy or its group. An `AWS::AutoScaling::ScalingPolicy` in a template does the same.
 - **SES v2 — `ListEmailIdentities` and `ListConfigurationSets` answer the routes newer SDKs use** — botocore 1.43.106 sends them as `POST /v2/email/list-identities` and `POST /v2/email/list-configuration-sets` with `NextToken`, `PageSize` and `Filter` in the body; those paths answered `NotFoundException`. Both forms page, and the `Filter` keys are applied.
 - **Kinesis — `ApproximateArrivalTimestamp` keeps milliseconds** — it was truncated to whole seconds, so an `AT_TIMESTAMP` iterator from an SDK that sends fractional seconds skipped records written earlier in the same second.
 - **CloudFormation — an empty `Capabilities` list is accepted** — botocore sends it as a bare `Capabilities=`, which was read as one empty value and refused, so `aws cloudformation deploy` without `--capabilities` and `Capabilities=[]` from an SDK failed with a `ValidationError` since 1.5.11.
