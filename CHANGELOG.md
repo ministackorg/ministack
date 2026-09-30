@@ -26,6 +26,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway — throttled response header** — a throttled REST API request carries `x-amzn-ErrorType: TooManyRequestsException`.
 - **API Gateway — usage plan throttling** — a REST API request carrying an API key from a usage plan on the stage is throttled with `429 Too Many Requests` by the plan's `throttle` and its per-method `apiStages[].throttle`, in addition to the stage's method settings.
 - **SES v2 — `ListEmailIdentities` and `ListConfigurationSets` answer the routes newer SDKs use** — botocore 1.43.106 sends them as `POST /v2/email/list-identities` and `POST /v2/email/list-configuration-sets` with `NextToken`, `PageSize` and `Filter` in the body; those paths answered `NotFoundException`. Both forms page, and the `Filter` keys are applied.
 - **Kinesis — `ApproximateArrivalTimestamp` keeps milliseconds** — it was truncated to whole seconds, so an `AT_TIMESTAMP` iterator from an SDK that sends fractional seconds skipped records written earlier in the same second.

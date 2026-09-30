@@ -222,6 +222,7 @@ _GATEWAY_RESPONSE_ERROR_TYPES = {
     "AUTHORIZER_FAILURE": "AuthorizerConfigurationException",
     "AUTHORIZER_CONFIGURATION_ERROR": "AuthorizerConfigurationException",
     "API_CONFIGURATION_ERROR": "InternalServerErrorException",
+    "THROTTLED": "TooManyRequestsException",
 }
 
 _GATEWAY_TEMPLATE_VARIABLE = re.compile(

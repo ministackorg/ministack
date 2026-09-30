@@ -4951,7 +4951,7 @@ def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
 
 
 def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
-    """A 0/0 limit refuses everything; a real limit does not."""
+    """A 0/0 limit refuses everything with TooManyRequestsException; a real limit does not."""
     api_id, root = _gw_api(apigw_v1, f"gwthr-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
@@ -4970,6 +4970,8 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
 
         throttle("/~1thr/GET", 0, 0)
         assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+        assert _gwresp_call(api_id, "thr", stage="p")[1].get(
+            "x-amzn-errortype") == "TooManyRequestsException"
         throttle("/~1thr/GET", 100, 50)
         assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
         apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
