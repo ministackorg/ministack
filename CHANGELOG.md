@@ -20,6 +20,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — a nested stack's update deletes the resources its template drops** — a resource removed from the child template, or created by a failed child update that was rolled back, stayed in its service and in the nested stack's resource list. Contributed by @iot-rocket.
 ### Added
 
+- **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS.
 - **RDS — IAM database authentication for MySQL and Aurora MySQL** — users created `IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'` log in with an SDK-generated token over `mysql_clear_password`, as on AWS. The instance or cluster must have `IAMDatabaseAuthenticationEnabled`; with `AUTH=true` the token and the `rds-db:connect` policy are verified too. `ModifyDBInstance` accepts `EnableIAMDatabaseAuthentication`. Contributed by @Areson.
 - **KMS — grants** — `CreateGrant`, `RevokeGrant` and `RetireGrant`; `ListGrants` now returns the grants they create, filtered by `GrantId` / `GranteePrincipal` and paged with `Limit` / `Marker`. `CreateGrant` follows the key state, rejects operations the key type cannot perform, and is idempotent for a named grant. Grants persist with the key and are not evaluated for authorization. Contributed by @DaviReisVieira.
 
