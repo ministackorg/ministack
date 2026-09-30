@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — `AWS::RDS::DBCluster` and `AWS::RDS::DBInstance` update in place** — a stack update re-ran the create, which gave the resource a new endpoint, resource id and create time and emptied the cluster's member list; the properties the create stores now change on the existing record, a create-only or `Engine` change replaces the resource or, under a custom identifier, is refused, a cluster `MasterUsername` change leaves the cluster as it is, change sets report which properties replace, and a stack-created cluster can now be described and answers `Fn::GetAtt DBClusterResourceId`. Contributed by @iot-rocket.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
