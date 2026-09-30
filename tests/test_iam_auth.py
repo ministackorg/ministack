@@ -11,6 +11,7 @@ the MiniStack server and work with AUTH=false.
 """
 
 import asyncio
+import io
 import json
 import time
 import xml.etree.ElementTree as ET
@@ -3151,7 +3152,7 @@ class TestAccessDeniedResponse:
 
     def test_custom_error_code_preserved(self):
         from ministack.core.iam_actions import access_denied_response
-        s, h, b = access_denied_response("s3", "s3:PutObject", "", "r1",
+        s, h, b = access_denied_response("dynamodb", "dynamodb:PutItem", "", "r1",
                                           error_code="ExpiredTokenException",
                                           message="Token expired")
         assert b"ExpiredTokenException" in b
@@ -4162,6 +4163,142 @@ def test_http_iam_routing_respects_auth_mode(monkeypatch, auth_enabled, ambiguou
     finally:
         for account in accounts:
             iam_svc._access_keys.pop_scoped(account, None, key, None)
+
+
+# ---------------------------------------------------------------------------
+# Credential checks over HTTP: boto3 clients whose transport is the app itself
+# ---------------------------------------------------------------------------
+
+class _Body(io.BytesIO):
+    def stream(self, **_):
+        yield self.getvalue()
+
+
+def _asgi_send(request, **_):
+    """Serve a botocore request with the in-process app instead of the network."""
+    from urllib.parse import unquote, urlsplit
+
+    from botocore.awsrequest import AWSResponse
+
+    from ministack import app as app_mod
+
+    url = urlsplit(request.url)
+    body = request.body.read() if hasattr(request.body, "read") else request.body or b""
+    body = body.encode() if isinstance(body, str) else body
+    headers = {"host": url.netloc.encode()}
+    headers.update((k.lower(), v if isinstance(v, bytes) else str(v).encode("latin-1"))
+                   for k, v in request.headers.items())
+    scope = {"type": "http", "method": request.method, "path": unquote(url.path) or "/",
+             "raw_path": url.path.encode(), "query_string": url.query.encode(),
+             "headers": [(k.encode("latin-1"), v) for k, v in headers.items()]}
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app(scope, receive, send))
+    response_headers = {k.decode(): v.decode() for k, v in sent[0].get("headers", [])}
+    return AWSResponse(request.url, sent[0]["status"], response_headers,
+                       _Body(b"".join(m.get("body", b"") for m in sent[1:])))
+
+
+def _local_client(service, key="test", secret="test", token=None):
+    import boto3
+    from botocore.config import Config
+
+    client = boto3.client(
+        service, endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret, aws_session_token=token,
+        config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}),
+    )
+    client.meta.events.register("before-send", _asgi_send)
+    return client
+
+
+def _failure(call):
+    with pytest.raises(ClientError) as exc:
+        call()
+    return exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+
+_LIST_CALLS = {
+    "iam": lambda c: c.list_users(),
+    "sqs": lambda c: c.list_queues(),
+    "dynamodb": lambda c: c.list_tables(),
+    "lambda": lambda c: c.list_functions(),
+    "s3": lambda c: c.list_buckets(),
+    "ec2": lambda c: c.describe_regions(),
+    "ssm": lambda c: c.describe_parameters(),
+    "logs": lambda c: c.describe_log_groups(),
+}
+
+
+class TestCredentialErrors:
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "InvalidClientTokenId", 403),
+        ("sqs", "InvalidClientTokenId", 403),
+        ("dynamodb", "UnrecognizedClientException", 400),
+        ("lambda", "UnrecognizedClientException", 403),
+        ("s3", "InvalidAccessKeyId", 403),
+        ("ec2", "AuthFailure", 401),
+        ("ssm", "UnrecognizedClientException", 400),
+        ("logs", "UnrecognizedClientException", 400),
+    ])
+    def test_unknown_key_answers_the_protocols_code(self, monkeypatch, service, code, status):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        client = _local_client(service, "AKIAUNKNOWNKEY000001", "secret")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    @pytest.mark.parametrize("service,content_type", [
+        ("iam", "text/xml"),
+        ("sqs", "application/x-amz-json-1.0"),
+        ("dynamodb", "application/x-amz-json-1.0"),
+        ("lambda", "application/json"),
+        ("s3", "application/xml"),
+        ("ec2", "text/xml;charset=UTF-8"),
+        ("ssm", "application/x-amz-json-1.1"),
+        ("logs", "application/x-amz-json-1.1"),
+    ])
+    def test_unknown_key_answers_the_protocols_content_type(self, monkeypatch, service, content_type):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        client = _local_client(service, "AKIAUNKNOWNKEY000001", "secret")
+        with pytest.raises(ClientError) as exc:
+            _LIST_CALLS[service](client)
+        assert exc.value.response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == content_type
+
+    def test_unknown_key_is_ignored_without_auth(self, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        client = _local_client("dynamodb", "AKIAUNKNOWNKEY000001", "secret")
+        assert client.list_tables()["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "ExpiredToken", 403),
+        ("dynamodb", "ExpiredTokenException", 400),
+        ("lambda", "ExpiredTokenException", 403),
+        ("s3", "ExpiredToken", 400),
+        ("ec2", "RequestExpired", 400),
+    ])
+    def test_expired_session_answers_the_protocols_code(self, monkeypatch, service, code, status):
+        from ministack import app as app_mod
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        monkeypatch.setitem(sts_svc._sessions, "ASIAEXPIREDSESSION01", {
+            "Arn": "arn:aws:iam::000000000000:user/alice", "UserId": "AIDAALICE",
+            "SecretAccessKey": "session-secret", "SessionToken": "session-token",
+            "Expiration": time.time() - 1, "AccountId": "000000000000", "PrincipalType": "User",
+        })
+        client = _local_client(service, "ASIAEXPIREDSESSION01", "session-secret", "session-token")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
 
 
 # ---------------------------------------------------------------------------

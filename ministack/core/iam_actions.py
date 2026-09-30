@@ -1835,6 +1835,43 @@ def dynamodb_service_context(body: bytes) -> dict:
     return context
 
 
+# Authentication failures by the evaluator's code: the Query API code and
+# status (also REST-XML and the query-compatible JSON services), the JSON code,
+# and S3's code, status and message.
+_UNKNOWN_KEY = (
+    "InvalidClientTokenId", 403, "UnrecognizedClientException",
+    ("InvalidAccessKeyId", 403, "The AWS Access Key Id you provided does not exist in our records."),
+)
+_AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
+    "UnrecognizedClientException": _UNKNOWN_KEY,
+    "InvalidClientTokenId": _UNKNOWN_KEY,
+    "ExpiredTokenException": (
+        "ExpiredToken", 403, "ExpiredTokenException",
+        ("ExpiredToken", 400, "The provided token has expired."),
+    ),
+}
+
+_QUERY_COMPATIBLE = frozenset({"sqs"})
+
+_EC2_AUTH_FAILURE = ("AuthFailure", 401, "AWS was not able to validate the provided access credentials")
+_EC2_FAILURES = {"ExpiredTokenException": ("RequestExpired", 400, "Request has expired.")}
+
+
+def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple[str, int, str]:
+    """The code, status and message a service answers for a failed authentication."""
+    query_code, query_status, json_code, s3_failure = _AUTH_FAILURES[code]
+    protocol = _SERVICE_PROTOCOL.get(service)
+    if service == "s3":
+        return s3_failure
+    if service == "ec2":
+        return _EC2_FAILURES.get(code, _EC2_AUTH_FAILURE)
+    if protocol == "rest-xml":
+        return query_code, 403, message
+    if protocol or service in _QUERY_COMPATIBLE:
+        return query_code, query_status, message
+    return json_code, 400 if headers.get("x-amz-target") else 403, message
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
@@ -1868,6 +1905,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         )
         message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
     code = error_code or "AccessDenied"
+    status = 403
+    if code in _AUTH_FAILURES:
+        code, status, message = _auth_failure(service, code, message, headers or {})
     protocol = _SERVICE_PROTOCOL.get(service, "json")
     if service in _CBOR_CAPABLE:
         # CloudWatch answers the legacy Query API in XML but botocore 1.42+
@@ -1885,7 +1925,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         json_type = code if code != "AccessDenied" else "AccessDeniedException"
         try:
             import cbor2
-            return (403,
+            return (status,
                     {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"},
                     cbor2.dumps({"__type": json_type, "message": message}))
         except ImportError:
@@ -1902,7 +1942,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             f"<Message>{_esc_msg}</Message>"
             f"<RequestId>{_esc_rid}</RequestId></Error>"
         )
-        return 403, {"Content-Type": "application/xml"}, body.encode()
+        return status, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "ec2-xml":
         ec2_code = "UnauthorizedOperation" if code == "AccessDenied" else _esc_code
@@ -1914,7 +1954,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             f"</Error></Errors>"
             f"<RequestID>{_esc_rid}</RequestID></Response>"
         )
-        return 403, {"Content-Type": "application/xml"}, body.encode()
+        return status, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "query-xml":
         ns = _QUERY_XML_NS.get(service, "https://iam.amazonaws.com/doc/2010-05-08/")
@@ -1925,7 +1965,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             f"<Message>{_esc_msg}</Message></Error>"
             f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"
         )
-        return 403, {"Content-Type": "text/xml"}, body.encode()
+        return status, {"Content-Type": "text/xml"}, body.encode()
 
     # JSON protocol (DynamoDB, Lambda, KMS, Logs, Glue, etc.)
     json_type = code if code != "AccessDenied" else "AccessDeniedException"
@@ -1934,7 +1974,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         "message": message,
     })
     return (
-        403,
+        status,
         {
             "Content-Type": "application/x-amz-json-1.0",
             "x-amzn-errortype": json_type,

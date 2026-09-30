@@ -2437,7 +2437,7 @@ def test_invalid_tag_arn_precedes_policy_denial_but_preserves_credential_errors(
     assert b"x-amzn-errortype" not in headers
     _iam_svc._access_keys.get_scoped(account, None, "AKIALOGSTAGCONTEXT")["Status"] = "Inactive"
     status, body = call("UntagResource", resourceArn=arn + ":*", tagKeys=["protect"])
-    assert status == 403 and body["__type"] == "InvalidClientTokenId"
+    assert status == 400 and body["__type"] == "UnrecognizedClientException"
 
 
 @pytest.mark.parametrize("auth", [False, True])

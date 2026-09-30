@@ -2186,6 +2186,17 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     return status, headers, body
 
 
+def _credential_failure(service: str, iam_action: str, request_id: str, denied, headers: dict):
+    """A failed authentication in the service's protocol, with the Content-Type AWS sends."""
+    from ministack.core.iam_actions import access_denied_response
+
+    status, resp_headers, body = access_denied_response(
+        service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
+    )
+    fix_error_content_type(service, status, resp_headers)
+    return status, resp_headers, body
+
+
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
     service_context: dict | None = None,
@@ -2206,9 +2217,7 @@ def _enforce_data_plane(
                      resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
-            return access_denied_response(
-                service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
-            )
+            return _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
                                       explicit_deny=denied.decision == "Deny")
     return None
@@ -2690,15 +2699,7 @@ async def _dispatch_service_request(
                     denied = None
             if denied:
                 if isinstance(denied, AuthError):
-                    return access_denied_response(
-                        service,
-                        iam_action,
-                        "",
-                        request_id,
-                        error_code=denied.code,
-                        message=denied.message,
-                        headers=headers,
-                    )
+                    return _credential_failure(service, iam_action, request_id, denied, headers)
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",

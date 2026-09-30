@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Auth — credential failures in the service's protocol** — under `AUTH=true` an unknown, inactive or expired access key answered `UnrecognizedClientException` 403 from every service; it now gets the code, status and `Content-Type` AWS sends for the service's protocol, for example `InvalidClientTokenId` 403 from IAM and SQS, `UnrecognizedClientException` 400 from DynamoDB, `InvalidAccessKeyId` 403 from S3 and `AuthFailure` 401 from EC2. Contributed by @iot-rocket.
+
 ## [1.5.26] — 2026-10-11
 
 ### Fixed
