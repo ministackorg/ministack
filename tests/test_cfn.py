@@ -17915,11 +17915,12 @@ def _sqs_stack_attrs(sqs, cfn, stack_name):
     ({"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": 600},
      {"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": "600"}),
     ({"SqsManagedSseEnabled": False}, {"SqsManagedSseEnabled": "false"}),
+    ({}, {"SqsManagedSseEnabled": "true", "MaximumMessageSize": "1048576"}),
     ({"FifoQueue": True, "ContentBasedDeduplication": True,
       "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"},
      {"FifoQueue": "true", "ContentBasedDeduplication": "true",
       "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"}),
-], ids=["redrive", "kms", "sse", "fifo"])
+], ids=["redrive", "kms", "sse", "defaults", "fifo"])
 def test_cfn_sqs_queue_properties_reach_the_queue(cfn, sqs, props, expected):
     """Each queue property shows up in GetQueueAttributes, Json ones as compact JSON."""
     stack_name = f"cfn-sqs-attrs-{_uuid_mod.uuid4().hex[:8]}"
@@ -22742,6 +22743,45 @@ def test_cfn_nested_stack_update_deletes_what_the_child_no_longer_has(
             ssm.get_parameter(Name=names[gone])
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+        for key in ("v1.json", "v2.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_nested_stack_update_keeps_a_retained_resource_it_drops(cfn, s3, ssm):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-nested-retain-{suffix}"
+    name = f"/cfn-nested-retain-{suffix}/Kept"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    keep = {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-nested-retain-{suffix}/Keep", "Type": "String", "Value": "v"}}
+    kept = {"Type": "AWS::SSM::Parameter", "DeletionPolicy": "Retain",
+            "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+
+    def parent(key):
+        return json.dumps({
+            "Resources": {"Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{key}"}}},
+            "Outputs": {"NestedId": {"Value": {"Ref": "Nested"}}},
+        })
+
+    stack_name = f"cfn-nested-retain-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="v1.json",
+                      Body=json.dumps({"Resources": {"Keep": keep, "Kept": kept}}).encode())
+        s3.put_object(Bucket=bucket, Key="v2.json", Body=json.dumps({"Resources": {"Keep": keep}}).encode())
+        cfn.create_stack(StackName=stack_name, TemplateBody=parent("v1.json"))
+        nested_id = _output(_wait_stack(cfn, stack_name), "NestedId")
+        cfn.update_stack(StackName=stack_name, TemplateBody=parent("v2.json"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        listed = cfn.describe_stack_resources(StackName=nested_id)["StackResources"]
+        assert [r["LogicalResourceId"] for r in listed] == ["Keep"]
+        ssm.get_parameter(Name=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ssm.delete_parameter(Name=name)
         for key in ("v1.json", "v2.json"):
             s3.delete_object(Bucket=bucket, Key=key)
         s3.delete_bucket(Bucket=bucket)

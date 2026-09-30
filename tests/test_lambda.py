@@ -14119,6 +14119,7 @@ def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
         "errorMessage": "Task timed out after 300.00 seconds",
         "errorType": "Runtime.ExitError",
     }
+    assert result["timeout"] is True
 
 
 def test_classify_function_error_bare_timeout_string_is_unhandled():
