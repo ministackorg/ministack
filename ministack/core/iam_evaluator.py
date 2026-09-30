@@ -1119,7 +1119,7 @@ def pin_signed_body(body: bytes) -> None:
 
 
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
-    """Verify the pinned signature of the request's key: its credential, a failure, or None if nothing is pinned."""
+    """Check the pinned request's session token and signature: its credential, a failure, or None."""
     from ministack.core.responses import _account_from_sts_session
     from ministack.core.sigv4 import header_signature_failure, parse_header_signature
 
@@ -1130,8 +1130,14 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     signature = parse_header_signature(request.headers)
     if isinstance(signature, tuple):
         return AuthError(*signature)
-    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id)
+    token = request.headers.get("x-amz-security-token", "")
+    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
     if isinstance(credential, CredentialResolutionError):
+        if credential.code == "InvalidToken":
+            # AWS treats a session key without its token as unknown, and any other token as invalid.
+            if token:
+                return AuthError("InvalidToken", "The security token included in the request is invalid")
+            credential = _unknown_access_key()
         return AuthError(credential.code, credential.message)
     failure = header_signature_failure(
         signature, credential.secret_access_key, request.method, request.raw_path,

@@ -1854,6 +1854,10 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
         "ExpiredToken", 403, "ExpiredTokenException",
         ("ExpiredToken", 400, "The provided token has expired."),
     ),
+    "InvalidToken": (
+        "InvalidClientTokenId", 403, "UnrecognizedClientException",
+        ("InvalidToken", 400, "The provided token is malformed or otherwise invalid."),
+    ),
     "SignatureDoesNotMatch": (
         "SignatureDoesNotMatch", 403, "InvalidSignatureException",
         ("SignatureDoesNotMatch", 403, "The request signature we calculated does not match the signature "

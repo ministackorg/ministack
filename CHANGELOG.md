@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Auth — the session token of a header-signed request is checked** — under `AUTH=true` an STS session key sent without its token was accepted and now answers as an unknown key, and a wrong token, or a token with an IAM user key, answers `InvalidClientTokenId` (`UnrecognizedClientException` from JSON services, `InvalidToken` 400 from S3), as on AWS. Contributed by @iot-rocket.
 - **Auth — header signatures are verified for IAM user and STS session keys** — under `AUTH=true` a request signed with such a key and the wrong secret, or changed after signing, was served; it now answers `SignatureDoesNotMatch` (or the service's `InvalidSignatureException`), an `Authorization` header without its `Signature` or `SignedHeaders` answers `IncompleteSignature` (Lambda `MissingAuthenticationTokenException`, S3 `AuthorizationHeaderMalformed`) and a credential date other than the request date `SignatureDoesNotMatch` (S3 `AuthorizationHeaderMalformed`), S3 unsigned, streaming and signed-chunk payloads are checked the same way, and the root key still accepts any secret. Contributed by @iot-rocket.
 
 ### Fixed

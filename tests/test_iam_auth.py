@@ -4520,6 +4520,41 @@ class TestHeaderSignatures:
         _local_client("dynamodb", user_key[0], "wrong-secret").list_tables()
 
 
+class TestSessionTokens:
+    @pytest.fixture
+    def session(self, user_key):
+        return _local_client("sts", *user_key).get_session_token()["Credentials"]
+
+    @pytest.mark.parametrize("service,missing,wrong", [
+        ("sqs", ("InvalidClientTokenId", 403), ("InvalidClientTokenId", 403)),
+        ("dynamodb", ("UnrecognizedClientException", 400), ("UnrecognizedClientException", 400)),
+        ("lambda", ("UnrecognizedClientException", 403), ("UnrecognizedClientException", 403)),
+        ("s3", ("InvalidAccessKeyId", 403), ("InvalidToken", 400)),
+        ("ec2", ("AuthFailure", 401), ("AuthFailure", 401)),
+    ])
+    def test_session_key_needs_its_own_token(self, session, service, missing, wrong):
+        key, secret, token = session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"]
+        _LIST_CALLS[service](_local_client(service, key, secret, token))
+        assert _failure(lambda: _LIST_CALLS[service](_local_client(service, key, secret))) == missing
+        assert _failure(lambda: _LIST_CALLS[service](_local_client(service, key, secret, token + "x"))) == wrong
+
+    def test_wrong_token_message_has_no_full_stop(self, session):
+        client = _local_client("dynamodb", session["AccessKeyId"], session["SecretAccessKey"], "other")
+        with pytest.raises(ClientError) as exc:
+            client.list_tables()
+        assert exc.value.response["Error"]["Message"] == "The security token included in the request is invalid"
+
+    def test_long_term_key_refuses_a_token(self, user_key, session):
+        client = _local_client("iam", *user_key, session["SessionToken"])
+        assert _failure(client.list_users) == ("InvalidClientTokenId", 403)
+
+    def test_tokens_are_not_checked_without_auth(self, session, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        _local_client("dynamodb", session["AccessKeyId"], session["SecretAccessKey"]).list_tables()
+
+
 # ---------------------------------------------------------------------------
 # AssumeRole trust policy: matching denies and STS request conditions (AUTH=true)
 # ---------------------------------------------------------------------------
