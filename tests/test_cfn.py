@@ -14,7 +14,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import sqs_policy_allow_s3
+from conftest import iot_test_ca, sqs_policy_allow_s3
 
 from ministack.services import pipes as _pipes
 from ministack.services.cloudformation.provisioners import (
@@ -1177,16 +1177,19 @@ def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_c
     exists rather than adopting one the stack never created — and the
     out-of-band registration survives, untouched by the rollback."""
     pytest.importorskip("cryptography")
-    from ministack.core.x509_utils import generate_ca
-
-    ca_pem, _ca_key = generate_ca(common_name="cfn-adopt-ca")
+    ca_pem, _ca_key, verification_pem = iot_test_ca(
+        iot_client.get_registration_code()["registrationCode"], "cfn-adopt-ca"
+    )
     # Registered out of band: INACTIVE, auto-registration DISABLE.
-    pre_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    pre_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem
+    )["certificateId"]
 
     template = json.dumps({
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
             "CACertificatePem": ca_pem,
+            "VerificationCertificatePem": verification_pem,
             "Status": "ACTIVE",
             "AutoRegistrationStatus": "ENABLE",
         }}},
@@ -1206,6 +1209,32 @@ def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_c
     # And it survives the failed stack's deletion too.
     assert iot_client.describe_ca_certificate(certificateId=pre_id)
     iot_client.delete_ca_certificate(certificateId=pre_id)
+
+
+def test_cfn_iot_ca_certificate_default_mode_requires_verification_certificate(cfn, iot_client):
+    """A DEFAULT-mode CACertificate without VerificationCertificatePem fails the resource and registers nothing."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, get_certificate_id
+
+    ca_pem, _ca_key = generate_ca(common_name="cfn-ca-no-verification")
+    name = "cfn-iot-ca-no-verification"
+    template = json.dumps({"Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+        "CACertificatePem": ca_pem, "Status": "INACTIVE"}}}})
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        events = cfn.describe_stack_events(StackName=name)["StackEvents"]
+        failed = [e for e in events if e["LogicalResourceId"] == "CA"
+                  and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed and (
+            "Need to provide verification certificate for registering CA Certificates in DEFAULT mode"
+            in failed[0]["ResourceStatusReason"])
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_ca_certificate(certificateId=get_certificate_id(ca_pem))
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
 
 
 def test_cfn_iot_ca_certificate_registration_config_and_mode_immutability(cfn, iot_client):
@@ -1278,27 +1307,27 @@ def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
     certificate registered under the old one). The original registration
     survives untouched."""
     pytest.importorskip("cryptography")
-    from ministack.core.x509_utils import generate_ca
+    code = iot_client.get_registration_code()["registrationCode"]
+    pem_a, _key_a, verification_a = iot_test_ca(code, "cfn-ca-pem-a")
+    pem_b, _key_b, verification_b = iot_test_ca(code, "cfn-ca-pem-b")
 
-    pem_a, _key_a = generate_ca(common_name="cfn-ca-pem-a")
-    pem_b, _key_b = generate_ca(common_name="cfn-ca-pem-b")
-
-    def template(pem):
+    def template(pem, verification_pem):
         return json.dumps({
             "AWSTemplateFormatVersion": "2010-09-09",
             "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
                 "CACertificatePem": pem,
+                "VerificationCertificatePem": verification_pem,
                 "Status": "INACTIVE",
             }}},
             "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
         })
 
-    cfn.create_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_a))
+    cfn.create_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_a, verification_a))
     stack = _wait_stack(cfn, "cfn-iot-ca-pem")
     assert stack["StackStatus"] == "CREATE_COMPLETE"
     ca_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["CaId"]
 
-    cfn.update_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_b))
+    cfn.update_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_b, verification_b))
     stack = _wait_stack(cfn, "cfn-iot-ca-pem")
     assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
 

@@ -31,7 +31,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import patch_endpoint_dns, sqs_policy_allow_sns
+from conftest import iot_test_ca, patch_endpoint_dns, sqs_policy_allow_sns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -3539,13 +3539,15 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
     registered long after the listener bound is trusted without a restart, and
     only an ACTIVE one is.
     """
-    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+    from ministack.core.x509_utils import sign_leaf_certificate
 
     iot = broker.client("iot")
-    ca_pem, ca_key = generate_ca(common_name="Registered Device CA")
-    ca_id = iot.register_ca_certificate(caCertificate=ca_pem, setAsActive=False)[
-        "certificateId"
-    ]
+    ca_pem, ca_key, verification_pem = iot_test_ca(
+        iot.get_registration_code()["registrationCode"], "Registered Device CA"
+    )
+    ca_id = iot.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=False
+    )["certificateId"]
     leaf_pem, leaf_key, _public = sign_leaf_certificate(
         ca_pem, ca_key, common_name="registered-ca-device"
     )
@@ -3577,12 +3579,15 @@ def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_pa
     handshake that sends no CONNECT registers nothing (AWS registers on the
     packet, not on the handshake). With auto-registration disabled the refusal
     stays CONNACK 5 and nothing is created."""
-    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+    from ministack.core.x509_utils import get_certificate_id, sign_leaf_certificate
 
     iot = broker.client("iot")
-    ca_pem, ca_key = generate_ca(common_name=_unique("jitr-ca"))
+    ca_pem, ca_key, verification_pem = iot_test_ca(
+        iot.get_registration_code()["registrationCode"], _unique("jitr-ca")
+    )
     ca_id = iot.register_ca_certificate(
-        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        setAsActive=True, allowAutoRegistration=True,
     )["certificateId"]
     leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name="jitr-device")
     cert_id = get_certificate_id(leaf_pem)
