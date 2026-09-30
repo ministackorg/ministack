@@ -4875,7 +4875,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
@@ -14119,6 +14119,7 @@ def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
         "errorMessage": "Task timed out after 300.00 seconds",
         "errorType": "Runtime.ExitError",
     }
+    assert result["timeout"] is True
 
 
 def test_classify_function_error_bare_timeout_string_is_unhandled():

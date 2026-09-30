@@ -336,6 +336,32 @@ def test_kms_generate_data_key_material_id(kms_client, key_spec):
             PendingWindowInDays=7,
         )
 
+def test_kms_key_material_id_is_the_same_across_operations(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]
+    try:
+        material_id = key["CurrentKeyMaterialId"]
+        assert re.fullmatch(r"[a-f0-9]{64}", material_id)
+        assert kms_client.describe_key(KeyId=key["KeyId"])["KeyMetadata"]["CurrentKeyMaterialId"] == material_id
+        generated = kms_client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+        assert generated["KeyMaterialId"] == material_id
+        without = kms_client.generate_data_key_without_plaintext(KeyId=key["KeyId"], KeySpec="AES_256")
+        assert without["KeyMaterialId"] == material_id
+        pair = kms_client.generate_data_key_pair(KeyId=key["KeyId"], KeyPairSpec="ECC_NIST_P256")
+        assert pair["KeyMaterialId"] == material_id
+        decrypted = kms_client.decrypt(CiphertextBlob=generated["CiphertextBlob"])
+        assert decrypted["KeyMaterialId"] == material_id
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key["KeyId"], PendingWindowInDays=7)
+
+
+def test_kms_key_material_id_absent_for_asymmetric_keys(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]
+    try:
+        assert "CurrentKeyMaterialId" not in key
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key["KeyId"], PendingWindowInDays=7)
+
+
 def test_kms_generate_data_key_material_id_survives_state_roundtrip():
     from ministack.services import kms as _kms
 

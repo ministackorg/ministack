@@ -693,6 +693,26 @@ def test_aurora_parent_flag_and_replacement(ep_state, monkeypatch):
     assert request(cap)[0] == 403
 
 
+@pytest.mark.parametrize("host,allowed", [
+    ("writer.example.com", True), ("reader.example.com", True), (AUTHZ_HOST, True), ("other.example.com", False),
+])
+def test_cluster_capability_accepts_every_endpoint_of_its_container(ep_state, monkeypatch, host, allowed):
+    monkeypatch.setattr(app_module, "AUTH", True)
+    ep_state.update(Engine="aurora-mysql", DBClusterIdentifier="cluster")
+    rds._clusters.set_scoped(ACCOUNT, REGION, "cluster", {
+        "Engine": "aurora-mysql", "DbClusterResourceId": "cluster-TEST", "IAMDatabaseAuthenticationEnabled": True,
+        "Endpoint": "writer.example.com", "ReaderEndpoint": "reader.example.com", "Port": 3306,
+        "DBClusterMembers": [{"DBInstanceIdentifier": "database"}],
+    })
+    iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {"connect": _authz_policy(
+        resource=f"arn:aws:rds-db:{REGION}:{ACCOUNT}:dbuser:cluster-TEST/{AUTHZ_USER}")})
+    cap = rds_iam.issue_capability(account_id=ACCOUNT, region=REGION, resource_kind="cluster",
+                                   resource_identifier="cluster")
+    assert request(cap, payload={"username": AUTHZ_USER, "token": _authz_token(host=host)}) == (
+        200 if allowed else 403, {"allowed": allowed},
+    )
+
+
 @pytest.mark.parametrize("auth", [False, True])
 def test_policy_denial_only_enforced_when_auth_enabled(ep_state, monkeypatch, auth):
     monkeypatch.setattr(app_module, "AUTH", auth)

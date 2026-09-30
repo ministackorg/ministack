@@ -1352,7 +1352,7 @@ def _s3_delete(physical_id, props):
 
 _SQS_QUEUE_DEFAULTS = {
     "VisibilityTimeout": "30",
-    "MaximumMessageSize": "262144",
+    "MaximumMessageSize": "1048576",
     "MessageRetentionPeriod": "345600",
     "DelaySeconds": "0",
     "ReceiveMessageWaitTimeSeconds": "0",
@@ -1375,6 +1375,8 @@ def _sqs_queue_fields(props, is_fifo):
             fields[key] = str(value).lower()
         elif value is not None:
             fields[key] = str(value)
+    if "KmsMasterKeyId" not in fields and "SqsManagedSseEnabled" not in fields:
+        fields["SqsManagedSseEnabled"] = "true"  # SSE-SQS unless the template sets encryption
     if "RedrivePolicy" in fields:
         _sqs._validate_redrive_policy(fields["RedrivePolicy"])
     _sqs._validate_numeric_attrs(fields)
@@ -4033,10 +4035,35 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
     if is_update:
-        for stale_id in set(prev_resources) - set(ordered):
+        snapshot = previous_stack_snapshot or {}
+        old_template = snapshot.get("_template", {}) or {}
+        old_defs = old_template.get("Resources", {}) or {}
+        old_conditions = snapshot.get("_conditions", conditions)
+        stale_ids = set(prev_resources) - set(ordered)
+        # Dependents first, as the top-level update removes them.
+        try:
+            removal_order = [lid for lid in _topological_sort(old_defs, old_conditions)
+                             if lid in stale_ids]
+        except ValueError:
+            removal_order = []
+        removal_order += [lid for lid in stale_ids if lid not in removal_order]
+        for stale_id in reversed(removal_order):
             old = prev_resources[stale_id]
             provisioned.pop(stale_id, None)
+            policy = _resource_policy(
+                old_defs.get(stale_id), "DeletionPolicy", provisioned,
+                snapshot.get("_resolved_params", {}), old_conditions,
+                old_template.get("Mappings", {}), child_name, child_stack_id,
+            )
+            if policy in _RETAINING_POLICIES:
+                _add_event(child_stack_id, child_name, stale_id, old.get("ResourceType", ""),
+                           "DELETE_SKIPPED", physical_id=old.get("PhysicalResourceId", ""))
+                continue
             try:
+                if policy == "Snapshot":
+                    _snapshot_resource(old.get("ResourceType", ""),
+                                       old.get("PhysicalResourceId", ""),
+                                       old.get("Properties", {}))
                 _delete_resource(old.get("ResourceType", ""),
                                  old.get("PhysicalResourceId", ""),
                                  old.get("Properties", {}),
