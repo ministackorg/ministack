@@ -336,6 +336,31 @@ def test_rds_modify_instance_v2(rds):
     assert inst["DBInstanceClass"] == "db.t3.small"
     assert inst["AllocatedStorage"] == 50
 
+
+def test_rds_modify_instance_iam_database_authentication(rds):
+    rds.create_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="pass",
+        AllocatedStorage=20,
+    )
+    inst = rds.modify_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        EnableIAMDatabaseAuthentication=True,
+    )["DBInstance"]
+    assert inst["IAMDatabaseAuthenticationEnabled"] is False
+    assert inst["PendingModifiedValues"] == {"IAMDatabaseAuthenticationEnabled": True}
+    rds.modify_db_instance(
+        DBInstanceIdentifier="rds-mod-iam",
+        EnableIAMDatabaseAuthentication=True,
+        ApplyImmediately=True,
+    )
+    inst = rds.describe_db_instances(DBInstanceIdentifier="rds-mod-iam")["DBInstances"][0]
+    assert inst["IAMDatabaseAuthenticationEnabled"] is True
+
+
 def test_rds_create_instance_honors_preferred_maintenance_window(rds):
     # Regression: CreateDBInstance previously hardcoded
     # PreferredMaintenanceWindow to "sun:05:00-sun:06:00", silently
@@ -8155,9 +8180,9 @@ def test_aurora_user_and_grant_are_visible_through_reader(rds):
         "8",
     ],
 )
-def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
+def test_aurora_mysql_iam_plugin_ddl_and_login(rds, engine_version):
     with _live_cluster(rds, engine_version=engine_version) as (
-        _cid, _wid, _rid, writer, _reader, _cluster,
+        cluster_id, _wid, _rid, writer, _reader, _cluster,
     ):
         user = f"iam_{uuid.uuid4().hex[:8]}"
         with _aurora_connect(writer["Endpoint"]) as conn:
@@ -8178,7 +8203,7 @@ def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
                 )
                 cursor.execute(
                     "SELECT plugin, authentication_string FROM mysql.user "
-                    "WHERE User = %s AND Host = '%'",
+                    "WHERE User = %s AND Host = '%%'",
                     (user,),
                 )
                 assert cursor.fetchone() == ("AWSAuthenticationPlugin", "RDS")
@@ -8188,14 +8213,32 @@ def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
                     f"ALTER USER `{user}`@'%' WITH MAX_USER_CONNECTIONS 9"
                 )
 
+        import ssl
+
         import pymysql
 
+        host, port = _host_dialable(writer["Endpoint"])
+        tls = ssl.create_default_context()
+        tls.check_hostname = False
+        tls.verify_mode = ssl.CERT_NONE
+        token = rds.generate_db_auth_token(
+            DBHostname=writer["Endpoint"]["Address"],
+            Port=writer["Endpoint"]["Port"],
+            DBUsername=user,
+        )
+
+        def iam_login():
+            return pymysql.connect(host=host, port=port, user=user, password=token,
+                                   ssl=tls, connect_timeout=5)
+
+        # IAM database authentication is off on the cluster.
         with pytest.raises(pymysql.err.OperationalError):
-            _aurora_connect(
-                writer["Endpoint"],
-                user=user,
-                password="not-a-token",
-            )
+            iam_login()
+        rds.modify_db_cluster(DBClusterIdentifier=cluster_id,
+                              EnableIAMDatabaseAuthentication=True, ApplyImmediately=True)
+        with iam_login() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT_USER()")
+            assert cursor.fetchone() == (f"{user}@%",)
 
         with _aurora_connect(writer["Endpoint"]) as conn:
             with conn.cursor() as cursor:
@@ -8229,7 +8272,7 @@ def test_aurora_mysql_rds_compatibility_procedures(rds):
         with _aurora_connect(writer["Endpoint"]) as admin:
             with admin.cursor() as cursor:
                 cursor.execute(
-                    f"CREATE USER `{user}`@'%' IDENTIFIED BY %s",
+                    f"CREATE USER `{user}`@'%%' IDENTIFIED BY %s",
                     (user_password,),
                 )
                 for procedure_name in procedure_names:
@@ -8355,10 +8398,29 @@ def test_aurora_mysql_iam_plugin_survives_compute_replacement(rds):
                 )
                 cursor.execute(
                     "SELECT plugin FROM mysql.user "
-                    "WHERE User = %s AND Host = '%'",
+                    "WHERE User = %s AND Host = '%%'",
                     (user,),
                 )
                 assert cursor.fetchone() == ("AWSAuthenticationPlugin",)
+
+        # The replacement container gets a fresh broker capability.
+        import pymysql
+
+        rds.modify_db_cluster(DBClusterIdentifier=cluster_id,
+                              EnableIAMDatabaseAuthentication=True, ApplyImmediately=True)
+        host, port = _host_dialable(restarted_writer["Endpoint"])
+        token = rds.generate_db_auth_token(
+            DBHostname=restarted_writer["Endpoint"]["Address"],
+            Port=restarted_writer["Endpoint"]["Port"],
+            DBUsername=user,
+        )
+        with pymysql.connect(host=host, port=port, user=user, password=token,
+                             connect_timeout=5) as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT_USER()")
+            assert cursor.fetchone() == (f"{user}@%",)
+
+        with _aurora_connect(restarted_writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
                 cursor.execute(f"DROP USER `{user}`@'%'")
 
 
@@ -12613,7 +12675,7 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
                 with conn.cursor() as cursor:
                     cursor.execute(
                         "SELECT plugin FROM mysql.user "
-                        "WHERE User = %s AND Host = '%'",
+                        "WHERE User = %s AND Host = '%%'",
                         (iam_user,),
                     )
                     assert cursor.fetchone() == ("AWSAuthenticationPlugin",)
@@ -12744,6 +12806,93 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
                     (4, "while-secondary-headless"),
                     (5, "detached-secondary"),
                 )
+    finally:
+        if secondary_arn:
+            _remove_global_member(east, global_id, secondary_arn)
+        if primary_arn:
+            _remove_global_member(east, global_id, primary_arn)
+        _delete_instance(west, secondary_instance_id)
+        _delete_instance(east, primary_instance_id)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+        _delete_global_cluster(east, global_id)
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora global replication",
+)
+def test_aurora_mysql_global_secondary_iam_login():
+    import pymysql
+
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:10]
+    global_id = f"global-iam-{suffix}"
+    primary_id = f"global-iam-primary-{suffix}"
+    primary_instance_id = f"{primary_id}-writer"
+    secondary_id = f"global-iam-secondary-{suffix}"
+    secondary_instance_id = f"{secondary_id}-reader"
+    engine_version = "8.0.mysql_aurora.3.10.3"
+    user = f"iam_{suffix}"
+    primary_arn = secondary_arn = None
+    try:
+        primary_arn = east.create_db_cluster(
+            DBClusterIdentifier=primary_id, Engine="aurora-mysql", EngineVersion=engine_version,
+            MasterUsername="admin", MasterUserPassword=PASSWORD, DatabaseName=DATABASE,
+            EnableIAMDatabaseAuthentication=True,
+        )["DBCluster"]["DBClusterArn"]
+        east.create_db_instance(
+            DBInstanceIdentifier=primary_instance_id, DBClusterIdentifier=primary_id,
+            DBInstanceClass="db.r6g.large", Engine="aurora-mysql",
+        )
+        primary_instance = _wait_for_instance(east, primary_instance_id)
+        east.create_global_cluster(GlobalClusterIdentifier=global_id, SourceDBClusterIdentifier=primary_arn)
+        secondary_arn = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id, Engine="aurora-mysql", EngineVersion=engine_version,
+            GlobalClusterIdentifier=global_id, MasterUsername="admin", MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE, EnableIAMDatabaseAuthentication=True,
+        )["DBCluster"]["DBClusterArn"]
+        west.create_db_instance(
+            DBInstanceIdentifier=secondary_instance_id, DBClusterIdentifier=secondary_id,
+            DBInstanceClass="db.r6g.large", Engine="aurora-mysql",
+        )
+        secondary_instance = _wait_for_instance(west, secondary_instance_id)
+        with _aurora_connect(primary_instance["Endpoint"]) as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+            )
+            if cursor.fetchone()[0] == 0:
+                pytest.skip("matching AWSAuthenticationPlugin artifact is absent")
+            # Created on the primary; replication carries it to the secondary.
+            cursor.execute(f"CREATE USER `{user}`@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'")
+
+        endpoint = secondary_instance["Endpoint"]
+        host, port = _host_dialable(endpoint)
+        token = west.generate_db_auth_token(
+            DBHostname=endpoint["Address"], Port=endpoint["Port"], DBUsername=user,
+        )
+
+        def iam_login():
+            return pymysql.connect(host=host, port=port, user=user, password=token, connect_timeout=5)
+
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                with iam_login() as conn, conn.cursor() as cursor:
+                    cursor.execute("SELECT CURRENT_USER()")
+                    assert cursor.fetchone() == (f"{user}@%",)
+                break
+            except pymysql.MySQLError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
+        west.modify_db_cluster(DBClusterIdentifier=secondary_id,
+                               EnableIAMDatabaseAuthentication=False, ApplyImmediately=True)
+        with pytest.raises(pymysql.err.OperationalError):
+            iam_login()
     finally:
         if secondary_arn:
             _remove_global_member(east, global_id, secondary_arn)

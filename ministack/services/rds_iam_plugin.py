@@ -4,6 +4,7 @@
 
 import io
 import logging
+import os
 import tarfile
 from pathlib import Path
 
@@ -12,6 +13,8 @@ logger = logging.getLogger("rds")
 PLUGIN_NAME = "AWSAuthenticationPlugin"
 PLUGIN_FILE = "aws_auth_plugin.so"
 DEFAULT_ARTIFACT_ROOT = "/opt/ministack/mysql-plugins"
+# Read by aws_auth_plugin.cc on every IAM login.
+CONFIG_PATH = "/etc/ministack/rds-iam.conf"
 
 
 def iam_auth_plugin_enabled(engine_series=None):
@@ -152,6 +155,38 @@ def ensure_iam_auth_plugin(
                 connection.close()
             except Exception:
                 pass
+
+
+def configure_iam_auth_broker(container, resource_kind, resource_identifier, broker_host, broker_port):
+    """Point the loaded plugin at MiniStack's broker with a fresh capability.
+
+    Re-issuing rotates the capability, so every ready path calls this again.
+    """
+    from ministack.core import rds_iam
+    from ministack.core.responses import get_account_id, get_region
+
+    try:
+        capability = rds_iam.issue_capability(
+            account_id=get_account_id(), region=get_region(),
+            resource_kind=resource_kind, resource_identifier=resource_identifier,
+        )
+        config = f"{broker_host} {broker_port} {capability}\n".encode()
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            directory = tarfile.TarInfo(os.path.dirname(CONFIG_PATH).lstrip("/"))
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            archive.addfile(directory)
+            member = tarfile.TarInfo(CONFIG_PATH.lstrip("/"))
+            member.mode = 0o644
+            member.size = len(config)
+            archive.addfile(member, io.BytesIO(config))
+        if not container.put_archive("/", stream.getvalue()):
+            raise RuntimeError("Docker rejected the plugin config")
+        return True
+    except Exception as e:
+        logger.warning("RDS: failed to configure %s for %s: %s", PLUGIN_NAME, resource_identifier, e)
+        return False
 
 
 def get_state() -> dict:
