@@ -780,11 +780,7 @@ def _get_template(params):
             return _error("ValidationError",
                           f"Stack [{stack_name}] does not exist")
 
-    # The API reference defaults TemplateStage to Processed; Original stays the
-    # default here, which is what GetTemplate has always answered and what the
-    # tests of transform templates expect. For a template without a transform
-    # the two stages are the same.
-    if _p(params, "TemplateStage") == "Processed":
+    if _p(params, "TemplateStage", "Processed") == "Processed":
         template_body = _processed_template_body(record)
     else:
         template_body = record.get("_template_body") or "{}"

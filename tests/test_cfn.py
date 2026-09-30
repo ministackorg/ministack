@@ -24354,7 +24354,7 @@ def _include_transform(cfn, s3, ssm, uid, bucket, name):
     assert _output(stack, "IncludedOutput") == handle_url
     # The stored template is the one the caller sent: the include is not
     # baked into it.
-    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    stored = cfn.get_template(StackName=name, TemplateStage="Original")["TemplateBody"]
     assert "Fn::Transform" in stored["Resources"] and "Included" not in stored["Resources"]
 
     # A snippet edited in S3 after the deploy is not picked up by an update
@@ -24541,7 +24541,7 @@ def _language_extensions(cfn, ssm, prefix, name):
     assert _output(stack, "PairxName") == prefix + "/pair-x"
     assert _output(stack, "PairxLiteral") == "&{Id}-${Id}"
 
-    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    stored = cfn.get_template(StackName=name, TemplateStage="Original")["TemplateBody"]
     assert "Fn::ForEach::Addresses" in stored["Resources"]
 
     parameters = [{"ParameterKey": "Addresses", "ParameterValue": "10.1,10.2,10.3"}]
@@ -28105,11 +28105,11 @@ def test_cfn_get_template_stages(cfn):
 
         default = cfn.get_template(StackName=stack_name)
         assert default["StagesAvailable"] == ["Original", "Processed"]
-        assert "Fn::ForEach::Topics" in default["TemplateBody"]["Resources"]
+        assert sorted(default["TemplateBody"]["Resources"]) == ["TopicA", "TopicB"]
         original = cfn.get_template(StackName=stack_name, TemplateStage="Original")
-        assert original["TemplateBody"] == default["TemplateBody"]
+        assert "Fn::ForEach::Topics" in original["TemplateBody"]["Resources"]
         processed = cfn.get_template(StackName=stack_name, TemplateStage="Processed")
-        assert sorted(processed["TemplateBody"]["Resources"]) == ["TopicA", "TopicB"]
+        assert processed["TemplateBody"] == default["TemplateBody"]
         assert processed["StagesAvailable"] == ["Original", "Processed"]
 
         assert (cfn.get_template(StackName=plain_name, TemplateStage="Processed")["TemplateBody"]
@@ -28123,7 +28123,8 @@ def test_cfn_get_template_stages(cfn):
         cs_id = cfn.create_change_set(StackName=stack_name, ChangeSetName="more",
                                       TemplateBody=json.dumps(more))["Id"]
         assert _wait_change_set(cfn, stack_name, "more")["Status"] == "CREATE_COMPLETE"
-        cs_original = cfn.get_template(StackName=stack_name, ChangeSetName="more")
+        cs_original = cfn.get_template(StackName=stack_name, ChangeSetName="more",
+                                       TemplateStage="Original")
         assert cs_original["TemplateBody"]["Resources"]["Fn::ForEach::Topics"][1] == [
             "A", "B", "C"]
         cs_processed = cfn.get_template(ChangeSetName=cs_id, TemplateStage="Processed")
