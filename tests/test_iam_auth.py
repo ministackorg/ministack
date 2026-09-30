@@ -1276,7 +1276,7 @@ def _capture_enforced_arn(monkeypatch) -> dict:
     seen: dict[str, str] = {}
 
     def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
-                 service_context=None):
+                 service_context=None, auth_error_response=None):
         seen["action"] = iam_action
         seen["arn"] = resource_arn
         seen["context"] = service_context
@@ -4607,6 +4607,71 @@ class TestClockSkew:
             _local_client("dynamodb").list_tables()
             monkeypatch.setattr(app_mod, "AUTH", False)
             _local_client("dynamodb", *user_key).list_tables()
+
+
+class TestExecuteApiAuthentication:
+    @pytest.fixture
+    def invoke(self, user_key):
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        apigw = _local_client("apigateway")
+        api = apigw.create_rest_api(name="iam-auth")["id"]
+        root = apigw.get_resources(restApiId=api)["items"][0]["id"]
+        method = {"restApiId": api, "resourceId": root, "httpMethod": "GET"}
+        apigw.put_method(**method, authorizationType="AWS_IAM")
+        apigw.put_integration(**method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+        apigw.put_method_response(**method, statusCode="200")
+        apigw.put_integration_response(**method, statusCode="200", responseTemplates={"application/json": '{"ok": 1}'})
+        for response_type in ("INVALID_SIGNATURE", "EXPIRED_TOKEN", "DEFAULT_4XX"):
+            apigw.put_gateway_response(restApiId=api, responseType=response_type, responseParameters={
+                "gatewayresponse.header.x-type": f"'{response_type}'"})
+        apigw.create_deployment(restApiId=api, stageName="p")
+
+        def call(key, secret, seconds=0, authorization=None, token=None):
+            request = AWSRequest(method="GET", url=f"http://{api}.execute-api.localhost:4566/p/")
+            with _signing_clock(seconds):
+                SigV4Auth(Credentials(key, secret, token), "execute-api", "us-east-1").add_auth(request)
+            if authorization:
+                request.headers.replace_header("Authorization", authorization(request.headers["Authorization"]))
+            response = _asgi_send(request.prepare())
+            return (response.status_code, response.headers.get("x-type"), response.headers.get("x-amzn-ErrorType"),
+                    json.loads(response.content).get("message"))
+
+        yield call
+        apigw.delete_rest_api(restApiId=api)
+
+    def test_aws_iam_failures_answer_through_gateway_responses(self, user_key, invoke):
+        assert invoke(*user_key)[0] == 200
+        assert invoke(user_key[0], "wrong-secret")[:3] == (403, "INVALID_SIGNATURE", "InvalidSignatureException")
+        status, response_type, error_type, message = invoke(*user_key, seconds=-1200)
+        assert (status, response_type, error_type) == (403, "INVALID_SIGNATURE", "InvalidSignatureException")
+        assert message.startswith("Signature expired: ") and message.endswith(" - 5 min.)")
+        assert invoke("AKIAUNKNOWNKEY000001", "secret") == (
+            403, "DEFAULT_4XX", "UnrecognizedClientException", "The security token included in the request is invalid.")
+        assert invoke(*user_key, authorization=lambda value: value.split(", Signature=")[0])[:3] == (
+            403, "DEFAULT_4XX", "IncompleteSignatureException")
+        assert invoke(*user_key, authorization=lambda value: re.sub(r"/\d{8}/", "/20200101/", value, count=1))[:3] == (
+            403, "INVALID_SIGNATURE", "InvalidSignatureException")
+
+    def test_expired_session_answers_through_expired_token(self, invoke, monkeypatch):
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setitem(sts_svc._sessions, "ASIAEXPIREDSESSION01", {
+            "Arn": "arn:aws:iam::000000000000:user/alice", "UserId": "AIDAALICE",
+            "SecretAccessKey": "session-secret", "SessionToken": "session-token",
+            "Expiration": time.time() - 1, "AccountId": "000000000000", "PrincipalType": "User",
+        })
+        assert invoke("ASIAEXPIREDSESSION01", "session-secret", token="session-token") == (
+            403, "EXPIRED_TOKEN", "ExpiredTokenException", "The security token included in the request is expired")
+
+    def test_root_key_and_auth_off_are_unchanged(self, user_key, invoke, monkeypatch):
+        from ministack import app as app_mod
+
+        assert invoke("test", "anything")[0] == 200
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert invoke(user_key[0], "wrong-secret")[0] == 200
 
 
 # ---------------------------------------------------------------------------

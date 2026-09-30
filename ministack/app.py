@@ -1777,6 +1777,8 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
             extract_region(headers, query_params), get_account_id(),
             api_id, stage, method, execute_path,
         ),
+        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+            api_id, stage, error, headers, query_params),
     )
 
 
@@ -2203,7 +2205,7 @@ def _credential_failure(service: str, iam_action: str, request_id: str, denied, 
 
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
-    service_context: dict | None = None,
+    service_context: dict | None = None, auth_error_response=None,
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
@@ -2221,7 +2223,8 @@ def _enforce_data_plane(
                      resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
-            return _credential_failure(service, iam_action, request_id, denied, headers)
+            response = auth_error_response(denied) if auth_error_response else None
+            return response or _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
                                       explicit_deny=denied.decision == "Deny")
     return None

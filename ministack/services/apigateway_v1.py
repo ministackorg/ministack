@@ -1416,9 +1416,10 @@ class _GatewayError:
     of ``response_type`` in the stage's deployment (see
     :func:`_gateway_error_response`)."""
 
-    def __init__(self, response_type, message):
+    def __init__(self, response_type, message, error_type=None):
         self.response_type = response_type
         self.message = message
+        self.error_type = error_type
 
 
 def _gw_error(response_type, message):
@@ -1493,7 +1494,7 @@ def _gateway_error_response(error, request):
         value = _gateway_request_value(source, request)
         if value is not None:
             headers[dest[len("gatewayresponse.header."):]] = value
-    error_type = _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
+    error_type = error.error_type or _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
     if error_type:
         headers["x-amzn-ErrorType"] = error_type
     headers["x-amzn-requestid"] = request["request_id"]
@@ -1521,7 +1522,35 @@ def _gateway_error_response(error, request):
     body = _GATEWAY_TEMPLATE_VARIABLE.sub(
         lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
     )
-    return int(response.get("statusCode") or 500), headers, body.encode("utf-8")
+    status = response.get("statusCode") or (403 if response_type == "DEFAULT_4XX" else 500)
+    return int(status), headers, body.encode("utf-8")
+
+
+# A failed SigV4 authentication of an execute-api caller: the gateway response and x-amzn-ErrorType.
+_AUTHENTICATION_GATEWAY_ERRORS = {
+    "SignatureDoesNotMatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "RequestTimeTooSkewed": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "ExpiredTokenException": ("EXPIRED_TOKEN", "ExpiredTokenException"),
+    "CredentialDateMismatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "IncompleteSignature": ("DEFAULT_4XX", "IncompleteSignatureException"),
+    "MissingAuthorizationParameter": ("DEFAULT_4XX", "IncompleteSignatureException"),
+}
+
+
+def authentication_error_response(api_id, stage_name, error, headers, query_params):
+    """Answer a failed SigV4 authentication through a REST API stage's gateway responses, or None."""
+    scope = find_api_scope(api_id)
+    stage = stages_for_api(api_id).get(stage_name)
+    if scope is None or stage is None:
+        return None
+    response_type, error_type = _AUTHENTICATION_GATEWAY_ERRORS.get(
+        error.code, ("DEFAULT_4XX", "UnrecognizedClientException"))
+    request = {
+        "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+        "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+    }
+    with request_scope(*scope):
+        return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
 
 
 def _arn_matches(pattern, arn):
@@ -1865,8 +1894,8 @@ async def _authorize_request_v1(
     if auth_type in ("", "NONE"):
         return None, None
     if auth_type == "AWS_IAM":
-        # We do not verify SigV4 signatures; match AWS only to the extent that a
-        # request with no Authorization header is rejected as unauthenticated.
+        # Signatures are verified only under AUTH; here match AWS only to the extent
+        # that a request with no Authorization header is rejected as unauthenticated.
         if not _header_ci(headers, "authorization"):
             return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
         return None, None
