@@ -456,9 +456,11 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    # InvokeAgentRuntime is mapped explicitly below so AUTH works even with
-    # Botocore versions that predate the AgentCore service model.
-    "bedrock-agentcore": [],
+    # Both the control and data-plane clients sign with the same
+    # ``bedrock-agentcore`` name.  The control model supplies the REST routes
+    # for resource-policy CRUD; InvokeAgentRuntime remains explicit below so
+    # older Botocore installations still authorize it.
+    "bedrock-agentcore": ["bedrock-agentcore-control"],
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -699,6 +701,21 @@ def extract_iam_action(service: str, method: str, path: str,
         if _agentcore_runtime_arn(path):
             return "bedrock-agentcore:InvokeAgentRuntime"
 
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        policy_action = {
+            "PUT": "PutResourcePolicy",
+            "GET": "GetResourcePolicy",
+            "DELETE": "DeleteResourcePolicy",
+        }.get(method)
+        if policy_action:
+            return f"bedrock-agentcore:{policy_action}"
+
+    # The control-plane model also declares ``GET /runtimes/{id}``. Its
+    # permissive ARN route would otherwise misclassify an invalid GET against
+    # the data-plane invocation path as GetAgentRuntime.
+    if service == "bedrock-agentcore" and "/invocations" in unquote(path):
+        return None
+
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
@@ -858,6 +875,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         if resources:
             return resources[0]
         return "*"
+
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        return unquote(path[len("/resourcepolicy/"):]) or "*"
 
     if service == "bedrock-agentcore" and method == "POST":
         return _agentcore_runtime_arn(path) or "*"

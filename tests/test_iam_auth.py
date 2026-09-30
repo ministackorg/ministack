@@ -2139,6 +2139,28 @@ class TestActionExtraction:
             service, "POST", "/runtimes//invocations", headers, b"{}", {}
         ) is None
 
+    def test_agentcore_resource_policy_routes_use_control_plane_actions(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+
+        headers = _sigv4_headers(
+            "bedrock-agentcore", "bedrock-agentcore.us-east-1.amazonaws.com"
+        )
+        resource = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
+        path = "/resourcepolicy/" + resource.replace(":", "%3A").replace("/", "%2F")
+        assert extract_iam_action("bedrock-agentcore", "PUT", path, headers, b"{}", {}) == (
+            "bedrock-agentcore:PutResourcePolicy"
+        )
+        assert extract_iam_action("bedrock-agentcore", "GET", path, headers, b"", {}) == (
+            "bedrock-agentcore:GetResourcePolicy"
+        )
+        assert extract_iam_action("bedrock-agentcore", "DELETE", path, headers, b"", {}) == (
+            "bedrock-agentcore:DeleteResourcePolicy"
+        )
+        assert extract_resource_arn(
+            "bedrock-agentcore", "PUT", path, headers, b"{}", {},
+            "us-east-1", "000000000000",
+        ) == resource
+
 
 class TestBedrockAgentCoreAuthorization:
     _RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
