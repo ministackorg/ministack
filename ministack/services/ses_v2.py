@@ -22,7 +22,6 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -60,7 +59,11 @@ def get_state() -> dict:
     })
 
 
-def restore_state(data: dict):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_config_sets, data.get("_config_sets", {}))
     _restore_tag_store(data.get("_ses_tags", {}))
@@ -98,15 +101,6 @@ def _legacy_resource_arn_for_region(resource_arn, account_id, region):
     return f"arn:aws:ses:{region}:{account_id}:{spec.resource}"
 
 
-try:
-    _restored = load_state("ses_v2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _json_err(code, message, status=400):
@@ -280,8 +274,12 @@ def _local_ses_v2_resource_arn(arn):
 
 
 async def handle_request(method, path, headers, body, query_params):
-    # Strip /v2/email prefix
-    sub = path[len("/v2/email"):]
+    # The SES dispatcher also accepts unprefixed REST paths when selected by
+    # a SESv2 target header. Preserve those paths and trailing-slash handling
+    # from its former inline v2 implementation.
+    sub = path.rstrip("/")
+    if sub.startswith("/v2/email"):
+        sub = sub[len("/v2/email"):]
 
     try:
         data = json.loads(body) if body else {}
@@ -312,7 +310,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # POST /v2/email/outbound-emails  (SendEmail)
     if sub == "/outbound-emails" and method == "POST":
-        msg_id = f"ministack-{new_uuid()}"
+        msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
@@ -415,7 +413,7 @@ async def handle_request(method, path, headers, body, query_params):
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
             body_html = rendered.get("Html", "")
-            msg_id = f"ministack-{new_uuid()}"
+            msg_id = f"{new_uuid()}@email.amazonses.com"
 
             all_addrs = to_addrs + cc_addrs + bcc_addrs
             if source and all_addrs:

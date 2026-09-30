@@ -39,7 +39,6 @@ from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("sqs")
@@ -70,7 +69,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
         _queue_name_to_url.clear()
@@ -92,6 +95,101 @@ _CANONICAL_NETLOC = f"{DEFAULT_HOST}:{DEFAULT_PORT}"
 _HOST_SANITY_RE = re.compile(r"^[A-Za-z0-9.\-\[\]:_]+$")
 _request_host: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_request_host", default="")
+
+
+def _owner_from_queue_arn(queue_arn: str) -> tuple[str | None, str | None]:
+    """Owner (account, region) parsed from a QueueArn, or (None, None)."""
+    try:
+        spec = parse_arn(queue_arn)
+    except ArnParseError:
+        return None, None
+    if not _ACCOUNT_ID_RE.match(spec.account_id or ""):
+        return None, None
+    return spec.account_id, spec.region or None
+
+
+def _enforce_queue_policy(q: dict, iam_action: str) -> None:
+    """Gate one queue API call on the queue's resource policy.
+
+    Only under AUTH=true; with auth disabled every call passes, like the
+    rest of the identity layer. Same-account callers then pass unless the
+    Policy carries an explicit Deny for them. Cross-account callers need an
+    explicit Allow in the Policy, exactly like real SQS, which answers
+    AccessDenied (403) otherwise.
+
+    Known boundary under AUTH=true: a caller with no identity Allow whose
+    access comes from this Policy alone is denied by the app-level identity
+    check before this resource check runs, where real SQS would allow the
+    union. Lifting that needs the identity layer to defer to the resource
+    layer, which no AUTH=true server harness here can verify.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        caller_arn,
+        resource_policy_allows,
+    )
+
+    queue_arn = q["attributes"].get("QueueArn", "")
+    owner, _region = _owner_from_queue_arn(queue_arn)
+    caller = get_account_id()
+    ctx = EvalContext(
+        principal_arn=caller_arn(),
+        principal_type="Root",
+        principal_account=caller,
+        action=iam_action,
+        resource_arn=queue_arn or "*",
+        region=get_region(),
+    )
+    if not resource_policy_allows(q["attributes"].get("Policy") or "", ctx,
+                                  owner is None or owner == caller):
+        raise _Err("AccessDenied",
+                   f"Access to the resource https://sqs.{get_region()}.amazonaws.com/ is denied.", 403)
+
+
+def queue_policy_allows(queue_arn: str, service: str,
+                        source_arn: str, source_account: str) -> bool:
+    """Whether the queue's Policy lets an AWS service deliver to it.
+
+    Used by S3 notifications and SNS fan-out, which call SQS as the service
+    principal (``s3.amazonaws.com`` / ``sns.amazonaws.com``) with the
+    producing resource as ``aws:SourceArn``/``aws:SourceAccount``. Only under
+    AUTH=true does the delivery need an explicit Allow in the queue Policy;
+    with auth disabled every delivery passes. Like real SQS, a queue with no
+    Policy then denies service deliveries, exactly as a queue whose Policy is
+    silent on the calling service does.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    q = _queue_by_arn(queue_arn)
+    if q is None:
+        return False
+    raw_policy = q["attributes"].get("Policy") or ""
+    if not raw_policy:
+        return False
+    # The caller is the service itself, not an IAM principal in the source
+    # account: an account-ID grant must not authorize it (real AWS keeps the
+    # service principal distinct), while Principal "*" legitimately matches.
+    ctx = EvalContext(
+        principal_arn="*",
+        principal_type="Service",
+        principal_account="",
+        action="sqs:SendMessage",
+        resource_arn=queue_arn,
+        region=get_region(),
+        service_context={
+            "aws:sourcearn": source_arn,
+            "aws:sourceaccount": source_account,
+            # Older S3/SNS policy samples condition on AWS:SourceOwner.
+            "aws:sourceowner": source_account,
+        },
+    )
+    return evaluate_resource_policy(raw_policy, ctx, service=service).decision == "Allow"
 
 
 def _externalize_url(url: str) -> str:
@@ -237,21 +335,6 @@ def _rebuild_queue_name_index() -> None:
         _queue_name_to_url.set_scoped(account_id, region, name, url)
 
 
-# Import-time state restore. MUST run after restore_state AND every symbol it
-# references (here _rebuild_queue_name_index, defined just above) are bound —
-# otherwise the import-time call NameErrors, the bare except swallows it, and all
-# persisted SQS state is silently dropped on restart (the #492/#494 pattern).
-try:
-    _restored = load_state("sqs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
-
-
 # ────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ────────────────────────────────────────────────────────────
@@ -262,6 +345,8 @@ async def handle_request(method: str, path: str, headers: dict,
     # Record how the caller reached us so responses can echo that host in
     # queue URLs (see _externalize_url). Header keys are lowercased upstream.
     _request_host.set(headers.get("host", ""))
+    from ministack.core.iam_evaluator import pin_request_caller
+    pin_request_caller(headers, query_params)
     target = headers.get("x-amz-target", "")
 
     # JSON protocol  (X-Amz-Target: AmazonSQS.*)
@@ -378,7 +463,7 @@ def _validate_redrive_policy(rp_str: str) -> None:
 # CreateQueue/SetQueueAttributes time with InvalidAttributeValue (400).
 _NUMERIC_ATTR_RANGES = {
     "VisibilityTimeout":            (0, 43200),       # 0 .. 12 h
-    "MaximumMessageSize":           (1024, 262144),   # 1 KB .. 256 KB
+    "MaximumMessageSize":           (1024, 1048576),  # 1 KiB .. 1 MiB (captured default)
     "MessageRetentionPeriod":       (60, 1209600),    # 1 min .. 14 days
     "DelaySeconds":                 (0, 900),         # 0 .. 15 min
     "ReceiveMessageWaitTimeSeconds":(0, 20),          # 0 .. 20 s
@@ -440,7 +525,7 @@ def _act_create_queue(data: dict, _u: str) -> dict:
             "CreatedTimestamp": ts,
             "LastModifiedTimestamp": ts,
             "VisibilityTimeout": "30",
-            "MaximumMessageSize": "262144",
+            "MaximumMessageSize": "1048576",
             "MessageRetentionPeriod": "345600",
             "DelaySeconds": "0",
             "ReceiveMessageWaitTimeSeconds": "0",
@@ -471,9 +556,12 @@ def _act_create_queue(data: dict, _u: str) -> dict:
 
 def _act_delete_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
-    canonical_url = _queue_name_to_url.pop(q["name"], url)
-    _queues.pop(canonical_url, None)
+    q = _get_q(url, "sqs:DeleteQueue")
+    owner, region = _owner_from_queue_arn(q["attributes"].get("QueueArn", ""))
+    owner = owner or get_account_id()
+    region = region or get_region()
+    canonical_url = _queue_name_to_url.pop_scoped(owner, region, q["name"], url)
+    _queues.pop_scoped(owner, region, canonical_url, None)
     return {}
 
 
@@ -497,10 +585,27 @@ def _act_list_queues(data: dict, _u: str) -> dict:
 
 def _act_get_queue_url(data: dict, _u: str) -> dict:
     name = data.get("QueueName", "")
+    owner = data.get("QueueOwnerAWSAccountId") or ""
+    if owner and _ACCOUNT_ID_RE.match(owner) and owner != get_account_id():
+        url = _queue_name_to_url.get_scoped(owner, get_region(), name)
+        if not url:
+            raise _Err("QueueDoesNotExist",
+                        "The specified queue does not exist.")
+        q = _queues.get_scoped(owner, get_region(), url)
+        if q is None:
+            raise _Err("QueueDoesNotExist",
+                        "The specified queue does not exist.")
+        _enforce_queue_policy(q, "sqs:GetQueueUrl")
+        return {"QueueUrl": url}
     url = _queue_name_to_url.get(name)
     if not url:
         raise _Err("QueueDoesNotExist",
                     "The specified queue does not exist.")
+    q = _queues.get(url)
+    if q is None:
+        raise _Err("QueueDoesNotExist",
+                    "The specified queue does not exist.")
+    _enforce_queue_policy(q, "sqs:GetQueueUrl")
     return {"QueueUrl": url}
 
 
@@ -508,7 +613,7 @@ def _act_get_queue_url(data: dict, _u: str) -> dict:
 
 def _act_send_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:SendMessage")
 
     body_text = data.get("MessageBody", "")
     if not body_text:
@@ -521,12 +626,12 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         )
 
     # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
-    # (default 262144 bytes; configurable up to 1 MiB / 1048576). Real AWS error
+    # (default 1048576 bytes / 1 MiB, captured eu-north-1 2026-09-19). Real AWS error
     # is InvalidParameterValue (400) with the queue-configured limit in the message.
     try:
-        max_size = int(q["attributes"].get("MaximumMessageSize", "262144"))
+        max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
     except (TypeError, ValueError):
-        max_size = 262144
+        max_size = 1048576
     body_bytes = len(body_text.encode("utf-8"))
     if body_bytes > max_size:
         raise _Err(
@@ -618,7 +723,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
 
 async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:ReceiveMessage")
 
     max_n = min(int(data.get("MaxNumberOfMessages", 1)), 10)
     # An explicit request value wins even when it is 0 — a supplied
@@ -668,7 +773,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
 
 def _act_delete_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:DeleteMessage")
     rh = data.get("ReceiptHandle", "")
     if not rh:
         raise _Err("MissingParameter",
@@ -700,7 +805,7 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
 
 def _act_change_visibility(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:ChangeMessageVisibility")
     rh = data.get("ReceiptHandle", "")
     vt = int(data.get("VisibilityTimeout", 30))
     found = False
@@ -714,14 +819,55 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
     return {}
 
 
+# ── Batch request validation ───────────────────────────────
+
+_BATCH_MAX_ENTRIES = 10
+_BATCH_ENTRY_ID_MAX_LENGTH = 80
+_BATCH_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_batch_entries(entries: list, entry_name: str) -> None:
+    """Run the checks AWS applies to a batch request before it looks at any entry.
+
+    Each of these fails the whole request rather than a single entry, which is what
+    separates them from the per-entry results the batch actions return. The codes are
+    the JSON protocol shape names; _QUERY_COMPAT_CODES already carries their legacy
+    Query spellings, so callers see AWS.SimpleQueueService.EmptyBatchRequest and the
+    rest. SendMessageBatch, DeleteMessageBatch and ChangeMessageVisibilityBatch each
+    declare all four in the SQS model.
+    See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+    """
+    if not entries:
+        raise _Err("EmptyBatchRequest",
+                   f"There should be at least one {entry_name} in the request.")
+
+    if len(entries) > _BATCH_MAX_ENTRIES:
+        raise _Err("TooManyEntriesInBatchRequest",
+                   "Too many messages in a batch request. A maximum of 10 messages are allowed.")
+
+    seen: set = set()
+    for entry in entries:
+        entry_id = entry.get("Id") or ""
+        if (len(entry_id) > _BATCH_ENTRY_ID_MAX_LENGTH
+                or not _BATCH_ENTRY_ID_RE.match(entry_id)):
+            raise _Err("InvalidBatchEntryId",
+                       "A batch entry id can only contain alphanumeric characters, "
+                       "hyphens and underscores. It can be at most 80 letters long.")
+        if entry_id in seen:
+            raise _Err("BatchEntryIdsNotDistinct", f"Id {entry_id} repeated.")
+        seen.add(entry_id)
+
+
 # ── ChangeMessageVisibilityBatch ───────────────────────────
 
 def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:ChangeMessageVisibility")
+    entries = data.get("Entries", [])
+    _validate_batch_entries(entries, "ChangeMessageVisibilityBatchRequestEntry")
     ok: list = []
     fail: list = []
-    for e in data.get("Entries", []):
+    for e in entries:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
         vt = int(e.get("VisibilityTimeout", 30))
@@ -747,7 +893,7 @@ def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
 
 def _act_get_queue_attributes(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:GetQueueAttributes")
     _refresh_counts(q)
     names = data.get("AttributeNames") or ["All"]
     want_all = "All" in names
@@ -762,7 +908,7 @@ def _act_get_queue_attributes(data: dict, qurl: str) -> dict:
 
 def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:SetQueueAttributes")
     incoming = data.get("Attributes") or {}
     if "RedrivePolicy" in incoming:
         _validate_redrive_policy(str(incoming["RedrivePolicy"]))
@@ -785,7 +931,7 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
 
 def _act_add_permission(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:AddPermission")
     label = data.get("Label") or ""
     if not label:
         raise _Err("MissingParameter",
@@ -840,7 +986,7 @@ def _act_add_permission(data: dict, qurl: str) -> dict:
 
 def _act_remove_permission(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:RemovePermission")
     label = data.get("Label") or ""
     if not label:
         raise _Err("MissingParameter",
@@ -873,7 +1019,7 @@ def _act_remove_permission(data: dict, qurl: str) -> dict:
 
 def _act_purge_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:PurgeQueue")
     q["messages"].clear()
     return {}
 
@@ -882,11 +1028,9 @@ def _act_purge_queue(data: dict, qurl: str) -> dict:
 
 def _act_send_message_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    _get_q(url)
+    _get_q(url, "sqs:SendMessage")
     entries = data.get("Entries", [])
-    if len(entries) > 10:
-        raise _Err("TooManyEntriesInBatchRequest",
-                   "Too many messages in a batch request. A maximum of 10 messages are allowed.")
+    _validate_batch_entries(entries, "SendMessageBatchRequestEntry")
 
     # AWS rule: "The maximum allowed individual message size and the maximum
     # total payload size (the sum of the individual lengths of all of the
@@ -930,10 +1074,12 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
 
 def _act_delete_message_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:DeleteMessage")
+    entries = data.get("Entries", [])
+    _validate_batch_entries(entries, "DeleteMessageBatchRequestEntry")
     ok: list = []
     fail: list = []
-    for e in data.get("Entries", []):
+    for e in entries:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
         before = len(q["messages"])
@@ -962,13 +1108,13 @@ def _act_delete_message_batch(data: dict, qurl: str) -> dict:
 
 def _act_list_queue_tags(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:ListQueueTags")
     return {"Tags": dict(q.get("tags", {}))}
 
 
 def _act_tag_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:TagQueue")
     raw_tags = data.get("Tags") or {}
     # Real AWS rejects null tag VALUES (a JSON null in the wire payload) with
     # InvalidParameterValue (400). boto3's Python client blocks this at the
@@ -991,7 +1137,7 @@ def _act_tag_queue(data: dict, qurl: str) -> dict:
 
 def _act_untag_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    q = _get_q(url)
+    q = _get_q(url, "sqs:UntagQueue")
     for k in data.get("TagKeys", []):
         q.get("tags", {}).pop(k, None)
     return {}
@@ -1026,7 +1172,7 @@ _HANDLERS.update({
 #  QUEUE / MESSAGE HELPERS
 # ────────────────────────────────────────────────────────────
 
-def _get_q(url: str) -> dict:
+def _get_q(url: str, action: str | None = None) -> dict:
     q = _queues.get(url)
     if q is None:
         # Fallback: extract queue name from URL and look up by name.
@@ -1035,14 +1181,21 @@ def _get_q(url: str) -> dict:
         # is passed instead of a full URL (supported by AWS and some SDKs).
         account_id, name = _queue_ref_from_urlish(url)
         if account_id and _ACCOUNT_ID_RE.match(account_id) and account_id != get_account_id():
-            raise _Err("QueueDoesNotExist",
-                        "The specified queue does not exist for this wsdl version.")
-        canonical_url = _queue_name_to_url.get(name)
-        if canonical_url:
-            q = _queues.get(canonical_url)
+            # A QueueUrl naming another account addresses that account's queue,
+            # like real SQS — resolved here and gated on the queue Policy below
+            # instead of answering NonExistentQueue unconditionally.
+            canonical_url = _queue_name_to_url.get_scoped(account_id, get_region(), name)
+            if canonical_url:
+                q = _queues.get_scoped(account_id, get_region(), canonical_url)
+        else:
+            canonical_url = _queue_name_to_url.get(name)
+            if canonical_url:
+                q = _queues.get(canonical_url)
     if q is None:
         raise _Err("QueueDoesNotExist",
                     "The specified queue does not exist for this wsdl version.")
+    if action is not None:
+        _enforce_queue_policy(q, action)
     return q
 
 
@@ -1581,6 +1734,7 @@ def _normalise(action: str, params: dict) -> dict:
     for key in ("QueueName", "QueueUrl", "MessageBody", "ReceiptHandle",
                 "VisibilityTimeout", "DelaySeconds", "WaitTimeSeconds",
                 "MaxNumberOfMessages", "MaxResults", "QueueNamePrefix",
+                "QueueOwnerAWSAccountId",
                 "NextToken", "MessageGroupId", "MessageDeduplicationId",
                 "ReceiveRequestAttemptId"):
         v = _p(params, key)

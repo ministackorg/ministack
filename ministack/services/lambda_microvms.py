@@ -8,29 +8,48 @@ There is no real VM behind a MicroVM here — a RunMicrovm goes straight to
 RUNNING and an image build straight to CREATED, which is what a client polling
 GetMicrovm / GetMicrovmImage needs to proceed.
 
+With Docker, images are built from the codeArtifact Dockerfile like AWS.
+
 Shapes verified against the AWS Lambda MicroVM API reference (2025-09-09):
 RunMicrovm, GetMicrovm, ListMicrovms, SuspendMicrovm, ResumeMicrovm,
-TerminateMicrovm, CreateMicrovmImage, CreateMicrovmAuthToken,
-CreateMicrovmShellAuthToken.
+TerminateMicrovm, ListMicrovmImages, CreateMicrovmImage, CreateMicrovmAuthToken,
+CreateMicrovmShellAuthToken, GetMicrovmImage, GetMicrovmImageVersion,
+UpdateMicrovmImage.
 """
 
 import copy
+import io
 import json
 import logging
+import os
+import pathlib
 import secrets
+import stat
+import tempfile
+import threading
 import time
-from urllib.parse import unquote
+import urllib.error
+import urllib.request
+import zipfile
+from urllib.parse import unquote, urlparse
 
-from ministack.core.persistence import load_state
+from ministack.core import container_reaper
 from ministack.core.responses import (
     AccountRegionScopedDict,
+    apply_image_prefix,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
+    request_scope,
 )
 
 logger = logging.getLogger("lambda_microvms")
+
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+_docker = None
+_docker_in_use = False
 
 # MicroVM lifecycle states (AWS enum).
 _MICROVM_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED",
@@ -51,7 +70,11 @@ def get_state():
     return copy.deepcopy({"microvms": _microvms, "images": _images})
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _microvms.clear()
@@ -59,16 +82,20 @@ def restore_state(data):
     _microvms.update(data.get("microvms", {}))
     _images.update(data.get("images", {}))
 
-
-try:
-    _persisted = load_state("lambda_microvms")
-    if _persisted:
-        restore_state(_persisted)
-except Exception:  # pragma: no cover - best-effort restore
-    pass
+    # Workloads do not survive a restart.
+    for record in _microvms.values():
+        if record.get("backend") == "docker" and record.get("state") not in (
+            "TERMINATED", "TERMINATING"
+        ):
+            record["state"] = "TERMINATED"
+            record["terminatedAt"] = record.get("terminatedAt") or _now()
+            record.pop("_container_id", None)
+            record.pop("_container_name", None)
+            record.pop("_container_ip", None)
 
 
 def reset():
+    _sweep_containers()
     _microvms.clear()
     _images.clear()
 
@@ -128,6 +155,447 @@ def _resolve_image_arn(image_identifier: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Optional Docker-backed workload
+# ---------------------------------------------------------------------------
+
+def _docker_enabled() -> bool:
+    return _get_docker() is not None
+
+
+def _get_docker():
+    """Return a lazily-created Docker client, or None when unavailable."""
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
+        except Exception as exc:
+            logger.debug("MicroVM: no Docker client available: %s", exc)
+    return _docker
+
+
+def _get_ministack_network(client):
+    """Use the configured MiniStack network when one is available."""
+    if DOCKER_NETWORK:
+        return DOCKER_NETWORK
+    try:
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return None
+        own_container = client.containers.get(hostname)
+        networks = own_container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        return next(iter(networks), None)
+    except Exception:
+        return None
+
+
+def _valid_container_image(value) -> bool:
+    """Reject values that cannot be a Docker image reference."""
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 512
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+        and not any(char.isspace() for char in value)
+    )
+
+
+def _hook_config(record):
+    return record.get("hooks") or {}
+
+
+def _hook_enabled(record, group, name):
+    return (_hook_config(record).get(group) or {}).get(name) == "ENABLED"
+
+
+def _hook_port(record):
+    try:
+        port = int(_hook_config(record).get("port"))
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _hook_timeout(record, group, name, default=30):
+    raw = (_hook_config(record).get(group) or {}).get(f"{name}TimeoutInSeconds")
+    try:
+        return max(1, min(3600, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _s3_artifact_bytes(uri):
+    """Read a code-artifact ZIP from MiniStack's account-scoped S3 service."""
+    if not isinstance(uri, str) or not uri.startswith("s3://"):
+        raise ValueError("codeArtifact.uri must be an s3:// URI")
+    parsed = urlparse(uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    if not bucket or not key:
+        raise ValueError("codeArtifact.uri must include an S3 bucket and key")
+    from ministack.services import s3
+
+    data = s3._get_object_data(bucket, key)
+    if data is None:
+        raise FileNotFoundError(f"code artifact not found: {uri}")
+    return data
+
+
+def _safe_extract_artifact(data, destination):
+    """Extract an artifact without allowing ZIP path traversal or symlinks."""
+    root = pathlib.Path(destination).resolve()
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        for member in archive.infolist():
+            relative = pathlib.PurePosixPath(member.filename)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"unsafe path in code artifact: {member.filename}")
+            mode = (member.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                raise ValueError(f"symlinks are not allowed in code artifacts: {member.filename}")
+            target = (root / pathlib.Path(*relative.parts)).resolve()
+            if root != target and root not in target.parents:
+                raise ValueError(f"unsafe path in code artifact: {member.filename}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member, "r") as source, target.open("wb") as output:
+                output.write(source.read())
+
+
+def _container_ip(container, network):
+    container.reload()
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+    if network and network in networks:
+        ip = networks[network].get("IPAddress")
+    else:
+        ip = next(iter(networks.values()), {}).get("IPAddress")
+    if not ip:
+        raise RuntimeError("Docker workload has no reachable network address")
+    return ip
+
+
+def _hook_path(name):
+    return f"/aws/lambda-microvms/runtime/v1/{name}"
+
+
+def _hooks_missing_port(hooks):
+    hooks = hooks or {}
+    configured = any(
+        value == "ENABLED"
+        for group in ("microvmHooks", "microvmImageHooks")
+        for value in (hooks.get(group) or {}).values()
+    )
+    return configured and not _hook_port({"hooks": hooks})
+
+
+def _workload_kwargs(record):
+    kwargs = {}
+    env = record.get("environmentVariables")
+    if isinstance(env, dict) and env:
+        kwargs["environment"] = {str(k): str(v) for k, v in env.items()}
+    if record.get("additionalOsCapabilities") == ["ALL"]:
+        kwargs["cap_add"] = ["ALL"]
+    port = _hook_port(record)
+    client = _get_docker()
+    if port and client is not None and not _get_ministack_network(client):
+        kwargs["ports"] = {f"{port}/tcp": ("127.0.0.1", None)}
+    return kwargs
+
+
+def _call_hook(record, container, name, *, image_phase=False, payload=None, retry=False):
+    """POST one MicroVM hook and require a 2xx response."""
+    port = _hook_port(record)
+    if not port:
+        raise RuntimeError("MicroVM hook port is not configured")
+    client = _get_docker()
+    network = _get_ministack_network(client) if client else None
+    if network:
+        host = _container_ip(container, network)
+    else:
+        # Host-run MiniStack reaches the hook via the loopback-published port.
+        container.reload()
+        bindings = (container.attrs.get("NetworkSettings", {}).get("Ports") or {}).get(f"{port}/tcp")
+        if not bindings:
+            raise RuntimeError("MicroVM hook port is not published")
+        host, port = "127.0.0.1", int(bindings[0]["HostPort"])
+    group = "microvmImageHooks" if image_phase else "microvmHooks"
+    timeout = _hook_timeout(record, group, name)
+    deadline = time.monotonic() + timeout if retry else None
+    body = json.dumps(payload or {}).encode("utf-8")
+    url = f"http://{host}:{port}{_hook_path(name)}"
+
+    while True:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = response.status
+            if 200 <= status < 300:
+                return
+            error = RuntimeError(f"MicroVM hook {name} returned HTTP {status}")
+        except urllib.error.HTTPError as exc:
+            error = RuntimeError(f"MicroVM hook {name} returned HTTP {exc.code}")
+            status = exc.code
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            error = RuntimeError(f"MicroVM hook {name} was unreachable: {exc}")
+            status = None
+        if not retry or time.monotonic() >= deadline or status not in (None, 503):
+            raise error
+        time.sleep(0.1)
+
+
+def _image_has_entrypoint(client, image_ref):
+    """Pull the image if needed and inspect whether it has a start command."""
+    try:
+        image = client.images.get(image_ref)
+    except Exception:
+        image = client.images.pull(image_ref)
+        if isinstance(image, list):
+            image = image[0]
+    config = image.attrs.get("Config") or {}
+    return bool(config.get("Entrypoint") or config.get("Cmd"))
+
+
+def _build_docker_image(record):
+    """Build the image from the code-artifact ZIP\'s root Dockerfile."""
+    client = _get_docker()
+    if client is None:
+        raise RuntimeError("no Docker daemon available")
+    artifact = (record.get("codeArtifact") or {}).get("uri")
+    data = _s3_artifact_bytes(artifact)
+    image_ref = f"ministack-microvm:{secrets.token_hex(12)}"
+
+    with tempfile.TemporaryDirectory(prefix="ministack-microvm-build-") as context:
+        _safe_extract_artifact(data, context)
+        if not os.path.isfile(os.path.join(context, "Dockerfile")):
+            raise ValueError("code artifact must contain a Dockerfile at its root")
+        client.images.build(path=context, tag=image_ref, rm=True, forcerm=True)
+
+    network = _get_ministack_network(client)
+    global _docker_in_use
+    _docker_in_use = True
+    build_kwargs = {
+        "detach": True,
+        "init": True,
+        "labels": container_reaper.own_labels("lambda-microvm-build"),
+        **_workload_kwargs(record),
+    }
+    if network:
+        build_kwargs["network"] = network
+    # Snapshot is disk-only: Docker cannot checkpoint memory without CRIU.
+    def _drop(container, what):
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            logger.warning("MicroVM: could not remove image %s container: %s", what, exc)
+
+    build_container = client.containers.run(image_ref, **build_kwargs)
+    try:
+        if _hook_enabled(record, "microvmImageHooks", "ready"):
+            _call_hook(record, build_container, "ready", image_phase=True, retry=True)
+        snapshot = f"ministack-microvm:{secrets.token_hex(12)}"
+        repository, tag = snapshot.split(":", 1)
+        build_container.commit(repository=repository, tag=tag)
+    finally:
+        _drop(build_container, "build")
+    if _hook_enabled(record, "microvmImageHooks", "validate"):
+        validate_container = client.containers.run(snapshot, **build_kwargs)
+        try:
+            _call_hook(record, validate_container, "validate", image_phase=True, retry=True)
+        finally:
+            _drop(validate_container, "validate")
+    return snapshot
+
+
+def _build_in_background(record, success_state, failed_state, version):
+    account_id, region = get_account_id(), get_region()
+
+    def _run():
+        with request_scope(account_id, region):
+            try:
+                image_ref = _build_docker_image(record)
+            except Exception as exc:
+                logger.warning("MicroVM: image build failed for %s: %s", record.get("name"), exc)
+                record.update({
+                    "state": failed_state,
+                    "latestFailedImageVersion": version,
+                    "updatedAt": _now(),
+                })
+                return
+            record.update({
+                "_docker_image": image_ref,
+                "state": success_state,
+                "imageVersion": version,
+                "latestActiveImageVersion": version,
+                "updatedAt": _now(),
+            })
+
+    threading.Thread(target=_run, daemon=True, name=f"microvm-build-{record.get('name')}").start()
+
+
+def _container_name(microvm_id: str) -> str:
+    return f"microvm-{microvm_id}"
+
+
+def _container_for(record):
+    client = _get_docker()
+    if client is None:
+        return None
+    for reference in (
+        record.get("_container_id"),
+        record.get("_container_name"),
+        _container_name(record["microvmId"]),
+    ):
+        if not reference:
+            continue
+        try:
+            return client.containers.get(reference)
+        except Exception:
+            continue
+    return None
+
+
+def _remove_container(record):
+    container = _container_for(record)
+    if container is not None:
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            logger.warning(
+                "MicroVM: could not remove container for %s: %s",
+                record.get("microvmId"),
+                exc,
+            )
+    record.pop("_container_id", None)
+    record.pop("_container_name", None)
+    record.pop("_container_ip", None)
+
+
+def _start_container(record, image_ref):
+    client = _get_docker()
+    if client is None:
+        raise RuntimeError("no Docker daemon available")
+    if not _valid_container_image(image_ref):
+        raise ValueError("containerImage is not a valid Docker image reference")
+
+    network = _get_ministack_network(client)
+    name = _container_name(record["microvmId"])
+    try:
+        client.containers.get(name).remove(force=True)
+    except Exception:
+        pass
+
+    image_ref = apply_image_prefix(image_ref)
+    kwargs = {
+        "name": name,
+        "detach": True,
+        "init": True,
+        "labels": {
+            **container_reaper.own_labels("lambda-microvm"),
+            "microvm_id": record["microvmId"],
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
+        **_workload_kwargs(record),
+    }
+    if not _image_has_entrypoint(client, image_ref):
+        # Keep an image with no ENTRYPOINT/CMD alive.
+        kwargs["command"] = ["sleep", "infinity"]
+    if network:
+        kwargs["network"] = network
+
+    container = client.containers.run(image_ref, **kwargs)
+    global _docker_in_use
+    _docker_in_use = True
+    record["_container_id"] = container.id
+    record["_container_name"] = name
+    record["backend"] = "docker"
+    if _hook_enabled(record, "microvmHooks", "run"):
+        try:
+            _call_hook(
+                record,
+                container,
+                "run",
+                payload={
+                    "microvmId": record["microvmId"],
+                    "runHookPayload": record.get("runHookPayload"),
+                },
+                retry=True,
+            )
+        except Exception:
+            _remove_container(record)
+            raise
+    return container
+
+
+def _container_image_for(record):
+    image = _find_microvm_image(record.get("imageArn"))
+    if not image:
+        return None
+    return image.get("_docker_image")
+
+
+def _reconcile_microvm(record):
+    """Turn a Docker-backed record into TERMINATED when its workload is gone."""
+    if record.get("backend") != "docker" or record.get("state") != "RUNNING":
+        return
+    container = _container_for(record)
+    if container is None:
+        record["state"] = "TERMINATED"
+        record["terminatedAt"] = record.get("terminatedAt") or _now()
+        record.pop("_container_id", None)
+        record.pop("_container_name", None)
+        return
+    try:
+        container.reload()
+    except Exception:
+        return
+    if getattr(container, "status", "") in ("dead", "exited"):
+        record["state"] = "TERMINATED"
+        record["terminatedAt"] = record.get("terminatedAt") or _now()
+        record.pop("_container_id", None)
+        record.pop("_container_name", None)
+
+
+def _live_container_ids():
+    return {
+        record.get("_container_id")
+        for record in _microvms.values()
+        if record.get("_container_id")
+    }
+
+
+container_reaper.register_live_ids("lambda-microvm", _live_container_ids)
+
+
+def _sweep_containers():
+    if not _docker_in_use:
+        return
+    client = _get_docker()
+    if client is None:
+        return
+    try:
+        containers = client.containers.list(
+            all=True,
+            filters={
+                "label": [
+                    "ministack=lambda-microvm",
+                    f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+                ]
+            },
+        )
+    except Exception as exc:
+        logger.warning("MicroVM: reset container sweep failed: %s", exc)
+        return
+    container_reaper.drop_containers(containers, force=True)
+
+
+# ---------------------------------------------------------------------------
 # MicroVM views
 # ---------------------------------------------------------------------------
 
@@ -178,8 +646,32 @@ def _run_microvm(body):
         "egressNetworkConnectors": data.get("egressNetworkConnectors"),
         "ingressNetworkConnectors": data.get("ingressNetworkConnectors"),
         "maximumDurationInSeconds": data.get("maximumDurationInSeconds"),
+        "runHookPayload": data.get("runHookPayload"),
     }
+    image_record = _find_microvm_image(record["imageArn"])
+    if image_record:
+        for field in ("hooks", "environmentVariables", "additionalOsCapabilities"):
+            record[field] = image_record.get(field)
     _microvms[microvm_id] = record
+
+    # With Docker available a MicroVM must come from a successfully built image.
+    if _docker_enabled():
+        image_ref = _container_image_for(record)
+        if not image_ref:
+            _microvms.pop(microvm_id, None)
+            return _not_found(
+                f"MicroVM image {image_identifier} has no successful Docker build"
+            )
+        try:
+            _start_container(record, image_ref)
+        except Exception as exc:
+            _microvms.pop(microvm_id, None)
+            logger.warning("MicroVM: could not boot %s: %s", image_ref, exc)
+            return error_response_json(
+                "InternalError",
+                f"failed to start MicroVM workload: {exc}",
+                500,
+            )
     return json_response(_microvm_view(record))
 
 
@@ -187,6 +679,7 @@ def _get_microvm(microvm_id):
     record = _microvms.get(microvm_id)
     if not record:
         return _not_found(f"MicroVM {microvm_id} not found")
+    _reconcile_microvm(record)
     return json_response(_microvm_view(record))
 
 
@@ -201,6 +694,7 @@ def _list_microvms(query_params):
     version_filter = _qp("imageVersion")
     items = []
     for record in _microvms.values():
+        _reconcile_microvm(record)
         if image_filter and image_filter not in (
             record.get("imageArn"), record.get("imageIdentifier")
         ):
@@ -215,6 +709,17 @@ def _suspend_microvm(microvm_id):
     record = _microvms.get(microvm_id)
     if not record:
         return _not_found(f"MicroVM {microvm_id} not found")
+    _reconcile_microvm(record)
+    if record.get("backend") == "docker":
+        container = _container_for(record)
+        if container is None:
+            return _not_found(f"MicroVM {microvm_id} workload is no longer running")
+        try:
+            if _hook_enabled(record, "microvmHooks", "suspend"):
+                _call_hook(record, container, "suspend")
+            container.pause()
+        except Exception as exc:
+            return error_response_json("InternalError", f"could not suspend MicroVM: {exc}", 500)
     record["state"] = "SUSPENDED"
     return _empty_ok()
 
@@ -223,6 +728,22 @@ def _resume_microvm(microvm_id):
     record = _microvms.get(microvm_id)
     if not record:
         return _not_found(f"MicroVM {microvm_id} not found")
+    if record.get("backend") == "docker":
+        container = _container_for(record)
+        if container is None:
+            record["state"] = "TERMINATED"
+            record["terminatedAt"] = record.get("terminatedAt") or _now()
+            return _not_found(f"MicroVM {microvm_id} workload is no longer available")
+        try:
+            container.unpause()
+            if _hook_enabled(record, "microvmHooks", "resume"):
+                _call_hook(record, container, "resume")
+        except Exception as exc:
+            try:
+                container.pause()
+            except Exception:
+                pass
+            return error_response_json("InternalError", f"could not resume MicroVM: {exc}", 500)
     record["state"] = "RUNNING"
     return _empty_ok()
 
@@ -231,6 +752,14 @@ def _terminate_microvm(microvm_id):
     record = _microvms.get(microvm_id)
     if not record:
         return _not_found(f"MicroVM {microvm_id} not found")
+    if record.get("backend") == "docker":
+        container = _container_for(record)
+        if container is not None and _hook_enabled(record, "microvmHooks", "terminate"):
+            try:
+                _call_hook(record, container, "terminate")
+            except Exception as exc:
+                logger.warning("MicroVM: terminate hook failed for %s: %s", microvm_id, exc)
+        _remove_container(record)
     # Idempotent: terminating an already-terminated MicroVM succeeds.
     record["state"] = "TERMINATED"
     record["terminatedAt"] = record.get("terminatedAt") or _now()
@@ -266,6 +795,8 @@ def _create_microvm_image(body):
     for field in ("baseImageArn", "buildRoleArn", "name", "codeArtifact"):
         if not data.get(field):
             return _validation(f"{field} is required")
+    if _hooks_missing_port(data.get("hooks")):
+        return _validation("hooks.port is required when hooks are configured")
     name = data["name"]
     now = _now()
     record = {
@@ -291,8 +822,148 @@ def _create_microvm_image(body):
         "tags": data.get("tags"),
     }
     _images[name] = record
-    view = {k: v for k, v in record.items() if v is not None}
+    if _docker_enabled():
+        record["state"] = "CREATING"
+        record.pop("latestActiveImageVersion", None)
+        _build_in_background(record, "CREATED", "CREATE_FAILED", "1")
+    view = {k: v for k, v in record.items() if v is not None and not k.startswith("_")}
     return json_response(view, 201)
+
+
+def _microvm_image_item(record: dict) -> dict:
+    """Summary item for ListMicrovmImages."""
+    fields = (
+        "imageArn", "name", "state", "latestActiveImageVersion",
+        "latestFailedImageVersion", "createdAt",
+    )
+    return {k: record[k] for k in fields if record.get(k) is not None}
+
+
+def _list_microvm_images(query_params):
+    def _qp(name):
+        val = query_params.get(name) if query_params else None
+        if isinstance(val, (list, tuple)):
+            return val[0] if val else None
+        return val
+
+    name_filter = _qp("nameFilter")
+    images = [
+        record for record in _images.values()
+        if not name_filter or name_filter in record.get("name", "")
+    ]
+    images.sort(key=lambda record: record.get("name", ""))
+
+    raw_max_results = _qp("maxResults")
+    if raw_max_results is None:
+        max_results = len(images) or 1
+    else:
+        try:
+            max_results = int(raw_max_results)
+        except (TypeError, ValueError):
+            return _validation("maxResults must be an integer")
+        if max_results < 1 or max_results > 50:
+            return _validation("maxResults must be between 1 and 50")
+
+    raw_next_token = _qp("nextToken")
+    try:
+        start = int(raw_next_token) if raw_next_token else 0
+    except (TypeError, ValueError):
+        return _validation("nextToken is invalid")
+    if start < 0:
+        return _validation("nextToken is invalid")
+
+    end = min(start + max_results, len(images))
+    response = {
+        "items": [_microvm_image_item(record) for record in images[start:end]],
+    }
+    if end < len(images):
+        response["nextToken"] = str(end)
+    return json_response(response)
+
+
+def _find_microvm_image(image_identifier):
+    image_identifier = unquote(image_identifier)
+    for record in _images.values():
+        if image_identifier in (record.get("name"), record.get("imageArn")):
+            return record
+        # AWS examples also use the colon-delimited ARN form while the local
+        # image ARN uses a slash before the image name.
+        if image_identifier.rsplit(":", 1)[-1] == record.get("name"):
+            return record
+    return None
+
+
+def _get_microvm_image_version(image_identifier, image_version):
+    record = _find_microvm_image(image_identifier)
+    if not record or record.get("imageVersion") != image_version:
+        return _not_found(
+            f"MicroVM image version {image_identifier}/{image_version} not found")
+
+    fields = (
+        "baseImageArn", "baseImageVersion", "buildRoleArn", "description",
+        "codeArtifact", "logging", "egressNetworkConnectors",
+        "cpuConfigurations", "resources", "additionalOsCapabilities", "hooks",
+        "environmentVariables", "imageArn", "imageVersion", "createdAt",
+        "updatedAt", "tags",
+    )
+    view = {k: record[k] for k in fields if record.get(k) is not None}
+    # A completed MiniStack image represents a successful, active version.
+    view.update({"state": "SUCCESSFUL", "status": "ACTIVE"})
+    return json_response(view)
+
+
+def _microvm_image_view(record: dict) -> dict:
+    fields = (
+        "createdAt", "imageArn", "latestActiveImageVersion",
+        "latestFailedImageVersion", "name", "state", "tags", "updatedAt",
+    )
+    return {k: record[k] for k in fields if record.get(k) is not None}
+
+
+def _get_microvm_image(image_identifier):
+    record = _find_microvm_image(image_identifier)
+    if not record:
+        return _not_found(f"MicroVM image {image_identifier} not found")
+    return json_response(_microvm_image_view(record))
+
+
+def _update_microvm_image(image_identifier, body):
+    record = _find_microvm_image(image_identifier)
+    if not record:
+        return _not_found(f"MicroVM image {image_identifier} not found")
+
+    data = _parse_body(body)
+    for field in ("baseImageArn", "buildRoleArn", "codeArtifact"):
+        if not data.get(field):
+            return _validation(f"{field} is required")
+    if _hooks_missing_port(data["hooks"] if "hooks" in data else record.get("hooks")):
+        return _validation("hooks.port is required when hooks are configured")
+
+    version = str(int(record.get("imageVersion", "0")) + 1)
+    for field in (
+        "baseImageArn", "baseImageVersion", "buildRoleArn", "codeArtifact",
+        "cpuConfigurations", "description", "egressNetworkConnectors",
+        "environmentVariables", "hooks", "logging", "resources", "additionalOsCapabilities",
+    ):
+        if field in data:
+            record[field] = data[field]
+    if _docker_enabled():
+        record.update({"state": "UPDATING", "updatedAt": _now()})
+        _build_in_background(record, "UPDATED", "UPDATE_FAILED", version)
+        return json_response({
+            **{k: v for k, v in record.items() if v is not None and not k.startswith("_")},
+            "imageVersion": version,
+        })
+    record.update({
+        "imageVersion": version,
+        "latestActiveImageVersion": version,
+        "state": "UPDATED",
+        "updatedAt": _now(),
+    })
+    return json_response({
+        **{k: v for k, v in record.items() if v is not None and not k.startswith("_")},
+        "imageVersion": version,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +985,18 @@ async def handle_request(method, path, headers, body, query_params):
     n = len(segments)
 
     if root == "microvm-images":
+        if n >= 4 and segments[-2] == "versions" and method == "GET":
+            image_identifier = "/".join(segments[1:-2])
+            image_version = unquote(segments[-1])
+            return _get_microvm_image_version(image_identifier, image_version)
+        if n >= 2:
+            image_identifier = "/".join(segments[1:])
+            if method == "GET":
+                return _get_microvm_image(image_identifier)
+            if method == "PUT":
+                return _update_microvm_image(image_identifier, body)
+        if n == 1 and method == "GET":
+            return _list_microvm_images(query_params)
         if n == 1 and method == "POST":
             return _create_microvm_image(body)
 

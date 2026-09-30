@@ -72,7 +72,6 @@ import xml.etree.ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -199,7 +198,7 @@ def get_state():
     return copy.deepcopy({"jobs": _jobs, "client_tokens": _client_tokens})
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _jobs.clear()
@@ -217,7 +216,7 @@ def restore_state(data):
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
 def _fail_orphaned_jobs():
@@ -232,12 +231,6 @@ def _fail_orphaned_jobs():
             job["EndTime"] = int(time.time())
 
 
-try:
-    _restored = load_state("translate")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted Translate state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------

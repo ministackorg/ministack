@@ -180,3 +180,15 @@ def ensure_rds_compatibility_procedures(
                 connection.close()
             except Exception:
                 pass
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass
+
+
+def reset() -> None:
+    pass

@@ -28,6 +28,7 @@ Container execution: if Docker socket is available, RunTask actually runs contai
 import copy
 import json
 import logging
+import math
 import os
 import secrets
 import threading
@@ -35,8 +36,7 @@ import time
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import resource_lock, run_reentrant
-from ministack.core.persistence import load_state
+from ministack.core.concurrency import resource_lock, run_reentrant, spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -70,12 +70,20 @@ _tasks = AccountRegionScopedDict()
 _tags = AccountScopedDict()
 _account_settings = AccountRegionScopedDict()
 _capacity_providers = AccountRegionScopedDict()
-# `_attributes` was originally declared next to its handler block much
-# further down the file. Moved up here so the import-time `load_state`
-# block (which calls `restore_state` and references `_attributes`) sees
-# it defined; otherwise warm-boot fires NameError, the surrounding
-# try/except swallows it, and ALL ECS state silently fails to restore.
 _attributes = AccountRegionScopedDict()
+
+
+def _bump_task_version(task):
+    """Count one observable change on the task.
+
+    The Task reference calls ``version`` the counter a consumer compares against
+    the version an event carries, to tell a stale copy of the record from the
+    current one. A real task counts its whole lifecycle: a Fargate task polled
+    through DescribeTasks reported 1 at PROVISIONING, 2 at PENDING, 3 at
+    RUNNING, 4 when StopTask set desiredStatus, 5 at DEPROVISIONING, 6 at
+    STOPPED. The emulator counts the states it has.
+    """
+    task["version"] = int(task.get("version") or 1) + 1
 
 _docker = None
 
@@ -90,15 +98,19 @@ _ECS_REAP_INTERVAL = int(os.environ.get("ECS_REAP_INTERVAL_SECONDS", "60"))
 # containers for restored services.
 _ECS_RESTORE_RECONCILE_DELAY = float(
     os.environ.get("ECS_RESTORE_RECONCILE_DELAY_SECONDS", "2"))
+# A container that merely reaches RUNNING is not immediately a steady service
+# deployment: it can exit during its process startup.  Keep a short window
+# before completing a rollout so the lifecycle watcher can report that exit.
+_ECS_DEPLOYMENT_STEADY_DELAY = 1.0
 _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
-# A task that is registered but not stopped, in task-lifecycle order. A
-# PENDING or ACTIVATING task already counts against a service's desired
-# capacity, so reconciliation must not launch a second one while its images
-# are still pulling.
-_PRE_STOP_STATUSES = ("PENDING", "ACTIVATING", "RUNNING")
+# A task that is registered but not stopped, in task-lifecycle order. A task in
+# any starting state already counts against a service's desired capacity, so
+# reconciliation must not launch a second one while its images are still
+# pulling.
+_PRE_STOP_STATUSES = ("PROVISIONING", "PENDING", "ACTIVATING", "RUNNING")
 
 
 def _live_container_ids():
@@ -164,6 +176,8 @@ def get_state():
         t = copy.deepcopy(task)
         t.pop("_docker_ids", None)
         t.pop("_metadata_tokens", None)
+        # The container is gone with the process; its address must not outlive it.
+        t.pop("_container_ip", None)
         tasks._data[scoped_key] = t
     state["tasks"] = tasks
     return state
@@ -220,7 +234,13 @@ def _restore_task_def_latest(latest_data):
             _task_def_latest.set_scoped(account_id, region, family, revision)
 
 
-def restore_state(data):
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    if _services.has_any():
+        _start_restored_service_reconciler()
+
+
+def _restore_state(data):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -236,12 +256,16 @@ def restore_state(data):
         for scoped_key, task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             _tasks._data[scoped_key] = restored_task
     elif isinstance(tasks_data, AccountScopedDict):
         for (account_id, arn), task in tasks_data._data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(account_id, region, arn, restored_task)
@@ -249,6 +273,8 @@ def restore_state(data):
         for arn, task in tasks_data.items():
             restored_task = copy.deepcopy(task)
             restored_task["_docker_ids"] = []
+            if restored_task.get("lastStatus") != "STOPPED":
+                _bump_task_version(restored_task)
             restored_task["lastStatus"] = "STOPPED"
             region = _tasks._region_for_legacy_value(arn, restored_task)
             _tasks.set_scoped(get_account_id(), region, arn, restored_task)
@@ -257,7 +283,7 @@ def restore_state(data):
 def _reconcile_restored_services():
     """Relaunch the tasks of every ACTIVE service after a restore.
 
-    restore_state marks each restored task STOPPED — its container went with the
+    _restore_state marks each restored task STOPPED — its container went with the
     process that ran it. Without this the service still reports its persisted
     runningCount while nothing is running, and any load balancer in front of it
     keeps forwarding to addresses nothing is listening on. Real ECS relaunches:
@@ -284,11 +310,10 @@ def _reconcile_restored_services():
 
 
 def _start_restored_service_reconciler():
-    """Run the reconcile off the import path.
+    """Reconcile restored services on a daemon thread.
 
-    restore_state runs at import; pulling images and starting containers there
-    would block startup behind the Docker daemon, so this happens on a daemon
-    thread once the process is up.
+    Pulling images and starting containers synchronously would block the
+    central persistence loader behind the Docker daemon.
     """
     def _run():
         time.sleep(_ECS_RESTORE_RECONCILE_DELAY)
@@ -302,16 +327,6 @@ def _start_restored_service_reconciler():
     ).start()
 
 
-try:
-    _restored = load_state("ecs")
-    if _restored:
-        restore_state(_restored)
-        _start_restored_service_reconciler()
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _get_docker():
@@ -717,29 +732,78 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
     }
 
 
-def _record_task_ip(task, container, ecs_network):
-    """Store the container's address on the task as an ENI attachment.
+def _requested_subnet(data):
+    """The first subnet of a RunTask/CreateService awsvpcConfiguration, if any.
 
-    Real awsvpc tasks expose it as attachments[].details[privateIPv4Address], which
-    is where an ALB target group and DescribeTasks both look for it.
+    Nothing else read the request's network configuration until now, so this
+    cannot assume the shape the SDK would have sent: a body that names it as
+    anything but the documented object has no subnet to report.
+
+    Both casings are read. A service created through CloudFormation keeps the
+    template's `NetworkConfiguration` verbatim (provisioners.py, the
+    AWS::ECS::Service handler) and replays it here, so the camelCase lookup
+    alone would miss every CFN-defined service.
     """
-    if task.get("attachments"):
-        return
+    network = data.get("networkConfiguration")
+    if not isinstance(network, dict):
+        return None
+    config = network.get("awsvpcConfiguration") or network.get("AwsvpcConfiguration")
+    if not isinstance(config, dict):
+        return None
+    subnets = config.get("subnets") or config.get("Subnets")
+    if not isinstance(subnets, list) or not subnets:
+        return None
+    return subnets[0] if isinstance(subnets[0], str) else None
+
+
+def _container_ip(container, ecs_network):
     try:
         container.reload()
         nets = container.attrs["NetworkSettings"]["Networks"]
-        ip = (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
+        return (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
     except Exception:
-        ip = None
+        return None
+
+
+def _record_task_ip(task, container, ecs_network):
+    """Store the container's address on the task.
+
+    The Task reference calls `attachments` "The Elastic Network Adapter that's
+    associated with the task if the task uses the `awsvpc` network mode", so a
+    bridge or host task has none: its ports are published on the container
+    instance and that is where a consumer reads its address. Only an awsvpc task
+    gets the attachment, and it carries the subnet the request placed it in
+    alongside the address, two of the four members the Attachment reference
+    names for an elastic network interface.
+
+    The address is kept on the task in either mode, under an internal key, for
+    the target-group sync. The first container to report one owns it: a
+    two-container task on AWS reports one attachment and both containers name
+    that one address, so the sync must not follow a sidecar around. Each
+    container calls this from its own thread, so the guard and the write it
+    protects share the task lock; the docker round trip stays outside it.
+    """
+    if task.get("_container_ip") or task.get("attachments"):
+        return
+    ip = _container_ip(container, ecs_network)
     if not ip:
         return
-    task["attachments"] = [{
-        "id": new_uuid(),
-        "type": "ElasticNetworkInterface",
-        "status": "ATTACHED",
-        "details": [{"name": "privateIPv4Address", "value": ip}],
-    }]
-    task["attachmentsStatus"] = "ATTACHED"
+    with resource_lock("ecs-task", task.get("taskArn", "")):
+        if task.get("_container_ip") or task.get("attachments"):
+            return
+        task["_container_ip"] = ip
+        if task.get("_network_mode") != "awsvpc":
+            return
+        details = [{"name": "privateIPv4Address", "value": ip}]
+        subnet = task.get("_subnet")
+        if subnet:
+            details.insert(0, {"name": "subnetId", "value": subnet})
+        task["attachments"] = [{
+            "id": new_uuid(),
+            "type": "ElasticNetworkInterface",
+            "status": "ATTACHED",
+            "details": details,
+        }]
 
 
 def _task_ip(task):
@@ -747,7 +811,7 @@ def _task_ip(task):
         for d in att.get("details") or []:
             if d.get("name") == "privateIPv4Address":
                 return d.get("value")
-    return None
+    return task.get("_container_ip")
 
 
 def _sync_service_targets(cluster_name, svc):
@@ -820,19 +884,266 @@ def _refresh_service_state(cluster_name, group):
     cluster_arn = svc.get("clusterArn", "")
     running = 0
     pending = 0
+    deployment_counts = {
+        dep["id"]: {"running": 0, "pending": 0}
+        for dep in svc.get("deployments", [])
+    }
     for task in _tasks.values():
         if task.get("group") != group or task.get("clusterArn") != cluster_arn:
             continue
         if task.get("lastStatus") == "RUNNING":
             running += 1
+            state = "running"
         elif task.get("lastStatus") == "PENDING":
             pending += 1
+            state = "pending"
+        else:
+            continue
+        deployment_id = task.get("_deployment_id")
+        if deployment_id in deployment_counts:
+            deployment_counts[deployment_id][state] += 1
     svc["runningCount"] = running
     svc["pendingCount"] = pending
-    if svc.get("deployments"):
-        svc["deployments"][0]["runningCount"] = running
-        svc["deployments"][0]["pendingCount"] = pending
+    for dep in svc.get("deployments", []):
+        counts = deployment_counts.get(dep["id"], {})
+        dep["runningCount"] = counts.get("running", 0)
+        dep["pendingCount"] = counts.get("pending", 0)
+    primary = _primary_deployment(svc)
+    if primary and primary.get("rolloutState") == "COMPLETED":
+        # A nested _stop_task refresh runs while a successful rollout is
+        # draining its old tasks.  Collapse old deployments here as well as in
+        # the completion path so the final response cannot retain a drained
+        # ACTIVE deployment merely because that nested refresh won the race.
+        svc["deployments"] = [
+            dep for dep in svc.get("deployments", [])
+            if dep.get("status") == "PRIMARY"
+            or dep.get("rolloutState") == "FAILED"
+            or deployment_counts.get(dep.get("id"), {}).get("running", 0)
+            or deployment_counts.get(dep.get("id"), {}).get("pending", 0)
+        ]
     _sync_service_targets(cluster_name, svc)
+
+
+def _primary_deployment(svc):
+    return next(
+        (dep for dep in svc.get("deployments", [])
+         if dep.get("status") == "PRIMARY"),
+        None,
+    )
+
+
+def _deployment_for_task(svc, task):
+    deployment_id = task.get("_deployment_id")
+    if deployment_id:
+        return next(
+            (dep for dep in svc.get("deployments", [])
+             if dep.get("id") == deployment_id),
+            None,
+        )
+    # Tasks persisted before deployment IDs were recorded still need to be
+    # attributed when they stop after a restart.
+    return next(
+        (dep for dep in svc.get("deployments", [])
+         if dep.get("taskDefinition") == task.get("taskDefinitionArn")),
+        None,
+    )
+
+
+def _circuit_breaker_threshold(svc):
+    """Return the ECS failure threshold for the service's current size."""
+    breaker = (svc.get("deploymentConfiguration") or {}).get(
+        "deploymentCircuitBreaker") or {}
+    config = breaker.get("thresholdConfiguration") or {}
+    threshold_type = config.get("type", "BOUNDED_PERCENT")
+    value = config.get("value", 50)
+    if threshold_type == "COUNT":
+        return max(1, int(value))
+    calculated = math.ceil(float(value) * int(svc.get("desiredCount", 0)) / 100)
+    if threshold_type == "UNBOUNDED_PERCENT":
+        return max(1, calculated)
+    return min(200, max(3, calculated))
+
+
+def _complete_service_deployment(cluster_name, svc_key):
+    """Complete a stable PRIMARY rollout, then drain its old deployment.
+
+    A completed deployment is the rollback point.  Therefore old tasks stay
+    alive while the new deployment is IN_PROGRESS; only a stable new deployment
+    drains them.  This is also what makes a circuit-breaker rollback able to
+    restore the previous revision rather than re-create deleted deployment data.
+    """
+    svc = _services.get(svc_key)
+    if not svc or svc.get("status") != "ACTIVE":
+        return
+
+    svc_name = svc["serviceName"]
+    with resource_lock("ecs-service", svc_key):
+        primary = _primary_deployment(svc)
+        if (not primary or primary.get("rolloutState") != "IN_PROGRESS"
+                or primary.get("runningCount", 0) < svc.get("desiredCount", 0)):
+            return
+        primary["rolloutState"] = "COMPLETED"
+        primary["rolloutStateReason"] = "ECS deployment completed."
+        primary["updatedAt"] = _iso()
+        stale_task_arns = [
+            arn for arn, task in _tasks.items()
+            if task.get("group") == f"service:{svc['serviceName']}"
+            and task.get("clusterArn") == svc.get("clusterArn")
+            and task.get("_deployment_id") != primary.get("id")
+            and task.get("lastStatus") in _PRE_STOP_STATUSES
+        ]
+
+    for task_arn in stale_task_arns:
+        _stop_task({"task": task_arn, "cluster": cluster_name,
+                    "reason": "Deployment completed"})
+
+    with resource_lock("ecs-service", svc_key):
+        # ECS no longer returns a deployment once it has no live tasks.  Keep
+        # a FAILED deployment, however: callers need its failure diagnostics.
+        svc = _services.get(svc_key)
+        if svc:
+            svc["deployments"] = [
+                dep for dep in svc.get("deployments", [])
+                if dep.get("status") == "PRIMARY"
+                or dep.get("rolloutState") == "FAILED"
+                or any(task.get("_deployment_id") == dep.get("id")
+                       and task.get("lastStatus") in _PRE_STOP_STATUSES
+                       for task in _tasks.values())
+            ]
+    _refresh_service_state(cluster_name, f"service:{svc_name}")
+
+
+def _record_service_task_healthy(svc_key, task):
+    """Apply ``resetOnHealthyTask`` after a task survives startup.
+
+    A Docker container can report RUNNING and then exit a few milliseconds
+    later, so RUNNING by itself is not the circuit breaker's healthy signal in
+    MiniStack.  The caller invokes this only after the same stability window
+    used to complete a rollout.
+    """
+    with resource_lock("ecs-service", svc_key):
+        svc = _services.get(svc_key)
+        if not svc:
+            return
+        deployment = _deployment_for_task(svc, task)
+        primary = _primary_deployment(svc)
+        breaker = (svc.get("deploymentConfiguration") or {}).get(
+            "deploymentCircuitBreaker") or {}
+        if (deployment is primary and deployment
+                and deployment.get("rolloutState") == "IN_PROGRESS"
+                and breaker.get("enable", False)
+                and breaker.get("resetOnHealthyTask", True)):
+            deployment["failedTasks"] = 0
+            deployment["updatedAt"] = _iso()
+
+
+def _schedule_service_deployment_completion(
+        cluster_name, svc_key, account_id, region, healthy_task=None):
+    """Check a Docker-backed service rollout after its startup grace window."""
+    if not cluster_name or "/" not in svc_key:
+        return
+    group = f"service:{svc_key.split('/', 1)[1]}"
+
+    def _check():
+        time.sleep(_ECS_DEPLOYMENT_STEADY_DELAY)
+        with request_scope(account_id, region):
+            if _services.get(svc_key, {}).get("status") == "ACTIVE":
+                if (healthy_task and healthy_task.get("lastStatus") == "RUNNING"):
+                    _record_service_task_healthy(svc_key, healthy_task)
+                _refresh_service_state(cluster_name, group)
+                _complete_service_deployment(cluster_name, svc_key)
+
+    spawn_background(
+        _check,
+        thread_name=("ministack-ecs-deployment-"
+                     f"{svc_key.rsplit('/', 1)[-1][:8]}"),
+    )
+
+
+def _record_service_task_failure(task):
+    """Feed a natural task/startup failure into its deployment circuit breaker."""
+    group = task.get("group", "")
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if not cluster_name or not group.startswith("service:"):
+        return
+    svc_key = f"{cluster_name}/{group.split(':', 1)[1]}"
+    should_reconcile = False
+    schedule_completion = False
+
+    with resource_lock("ecs-service", svc_key):
+        svc = _services.get(svc_key)
+        if not svc or svc.get("status") != "ACTIVE":
+            return
+        deployment = _deployment_for_task(svc, task)
+        primary = _primary_deployment(svc)
+        breaker = (svc.get("deploymentConfiguration") or {}).get(
+            "deploymentCircuitBreaker") or {}
+        is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
+
+        # Only the deployment being evaluated is allowed to accumulate task
+        # failures.  An old task stopped during a successful drain must never
+        # poison the replacement deployment.
+        if (deployment is not primary
+                or not deployment
+                or deployment.get("rolloutState") != "IN_PROGRESS"
+                or not is_rolling
+                or not breaker.get("enable", False)):
+            should_reconcile = deployment is primary and bool(deployment)
+        else:
+            deployment["failedTasks"] = int(deployment.get("failedTasks", 0)) + 1
+            deployment["updatedAt"] = _iso()
+            if deployment["failedTasks"] < _circuit_breaker_threshold(svc):
+                should_reconcile = True
+            else:
+                deployment["rolloutState"] = "FAILED"
+                deployment["rolloutStateReason"] = (
+                    "ECS deployment circuit breaker was triggered after "
+                    f"{deployment['failedTasks']} consecutive task failures."
+                )
+                deployment["desiredCount"] = 0
+                deployment["updatedAt"] = _iso()
+                svc["events"].insert(0, {
+                    "id": new_uuid(),
+                    "createdAt": _iso(),
+                    "message": (
+                        f"(service {svc['serviceName']}) deployment failed: "
+                        "deployment circuit breaker was triggered."
+                    ),
+                })
+
+                if breaker.get("rollback", False):
+                    rollback = next(
+                        (candidate for candidate in svc.get("deployments", [])
+                         if candidate is not deployment
+                         and candidate.get("rolloutState") == "COMPLETED"),
+                        None,
+                    )
+                    if rollback:
+                        deployment["status"] = "ACTIVE"
+                        rollback["status"] = "PRIMARY"
+                        rollback["desiredCount"] = svc.get("desiredCount", 0)
+                        rollback["rolloutState"] = "IN_PROGRESS"
+                        rollback["rolloutStateReason"] = (
+                            "ECS deployment rollback in progress."
+                        )
+                        rollback["updatedAt"] = _iso()
+                        svc["taskDefinition"] = rollback["taskDefinition"]
+                        schedule_completion = True
+                        svc["events"].insert(0, {
+                            "id": new_uuid(),
+                            "createdAt": _iso(),
+                            "message": (
+                                f"(service {svc['serviceName']}) rolled back to "
+                                "the last completed deployment."
+                            ),
+                        })
+                should_reconcile = True
+
+    if should_reconcile:
+        _reconcile_service_tasks(cluster_name, svc_key)
+    if schedule_completion:
+        _schedule_service_deployment_completion(
+            cluster_name, svc_key, get_account_id(), get_region())
 
 
 def _reconcile_service_tasks(cluster_name, svc_key):
@@ -867,29 +1178,59 @@ def _reconcile_service_tasks(cluster_name, svc_key):
             else:
                 stale_tasks.append((arn, t))
 
-    # Stop tasks running on a stale task definition
-    for task_arn, _ in stale_tasks:
-        _stop_task({"task": task_arn, "cluster": cluster_name,
-                     "reason": "Task definition updated"})
+    primary = _primary_deployment(svc)
+    # Keep old tasks alive while a replacement deployment establishes itself.
+    # They are drained by _complete_service_deployment after the replacement is
+    # stable, or retained for _rollback_failed_deployment if it fails.
+    drain_stale = not primary or primary.get("rolloutState") != "IN_PROGRESS"
+    if drain_stale:
+        for task_arn, _ in stale_tasks:
+            _stop_task({"task": task_arn, "cluster": cluster_name,
+                        "reason": "Task definition updated"})
 
     # Scale up: spawn tasks to reach desiredCount
     to_spawn = desired - len(current_tasks)
+    if primary and primary.get("rolloutState") == "FAILED":
+        # A failed deployment must not keep launching replacements.  With
+        # rollback enabled _record_service_task_failure makes the old
+        # deployment primary before reconciliation reaches this branch.
+        to_spawn = 0
     if to_spawn > 0:
         if not td:
             svc["runningCount"] = desired
             if svc["deployments"]:
                 svc["deployments"][0]["runningCount"] = desired
             return
-        _run_task({
-            "cluster": cluster_name,
-            "taskDefinition": td_arn,
-            "count": to_spawn,
-            "group": f"service:{svc_name}",
-            "startedBy": svc_name,
-            "launchType": launch_type,
-            "networkConfiguration": network_cfg,
-            "enableExecuteCommand": svc.get("enableExecuteCommand", False),
-        })
+        # Replacements fit under maximumPercent; stale tasks are stopped for
+        # room only while minimumHealthyPercent stays RUNNING.
+        deployment_config = svc.get("deploymentConfiguration") or {}
+        maximum_percent = int(deployment_config.get("maximumPercent", 200))
+        minimum_percent = int(deployment_config.get("minimumHealthyPercent", 100))
+        max_running = max(1, desired * maximum_percent // 100)
+        min_running = -(-desired * minimum_percent // 100)
+        running = sum(1 for _, t in current_tasks + stale_tasks if t.get("lastStatus") == "RUNNING")
+        capacity = max_running - len(current_tasks) - len(stale_tasks)
+        if capacity < to_spawn:
+            to_stop = min(to_spawn - max(0, capacity), max(0, running - min_running), len(stale_tasks))
+            for task_arn, _ in stale_tasks[:to_stop]:
+                _stop_task({
+                    "task": task_arn,
+                    "cluster": cluster_name,
+                    "reason": "Deployment capacity limit",
+                })
+            to_spawn = max(0, capacity) + to_stop
+        if to_spawn > 0:
+            _run_task({
+                "cluster": cluster_name,
+                "taskDefinition": td_arn,
+                "count": to_spawn,
+                "group": f"service:{svc_name}",
+                "startedBy": svc_name,
+                "launchType": launch_type,
+                "networkConfiguration": network_cfg,
+                "enableExecuteCommand": svc.get("enableExecuteCommand", False),
+                "_deploymentId": primary.get("id") if primary else None,
+            })
     elif to_spawn < 0:
         # Scale down: stop newest tasks first
         excess = -to_spawn
@@ -900,6 +1241,11 @@ def _reconcile_service_tasks(cluster_name, svc_key):
 
     _refresh_service_state(cluster_name, f"service:{svc_name}")
     _recount_cluster(cluster_name)
+
+    # In the no-Docker fallback tasks are already RUNNING when registered, so
+    # there is no lifecycle watcher to schedule the steady-state transition.
+    if primary and primary.get("rolloutState") == "IN_PROGRESS" and not _get_docker():
+        _complete_service_deployment(cluster_name, svc_key)
 
 
 def _create_service(data):
@@ -1093,6 +1439,12 @@ def _update_service(data):
                 if dep["status"] == "PRIMARY":
                     dep["status"] = "ACTIVE"
             new_dep = _make_deployment(td_arn, svc["desiredCount"])
+            # Creation's first deployment is immediately PRIMARY/COMPLETED for
+            # compatibility with the existing service shape.  A replacement,
+            # however, must remain observable as IN_PROGRESS until its tasks
+            # are stable (or its circuit breaker fails it).
+            new_dep["rolloutState"] = "IN_PROGRESS"
+            new_dep["rolloutStateReason"] = ""
             svc["deployments"].insert(0, new_dep)
             svc["taskDefinition"] = td_arn
             changed = True
@@ -1208,6 +1560,12 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
     env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = f"http://{host}:{port}/v2/credentials/{new_uuid()}"
     env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secrets.token_urlsafe(32)
     env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
+    # Seeded from the record, not a literal: the task is not RUNNING yet here.
+    # Later transitions are pushed by _mark_task_activating/_running/_stopped.
+    desired, known, per_container = (
+        _task_status_snapshot(task_arn) or ("RUNNING", "PENDING", {})
+    )
+    container_known = per_container.get(cdef["name"]) or known
     ecs_metadata.register_container(
         token,
         task_arn,
@@ -1216,8 +1574,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
             "TaskARN": task_arn,
             "Family": td.get("family", ""),
             "Revision": str(td.get("revision", 1)),
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": known,
             "AvailabilityZone": f"{get_region()}a",
             "LaunchType": launch_type,
         },
@@ -1232,8 +1590,8 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
                 "com.amazonaws.ecs.task-definition-version": str(td.get("revision", 1)),
                 "com.amazonaws.ecs.cluster": cluster_arn,
             },
-            "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "DesiredStatus": desired,
+            "KnownStatus": container_known,
             "Type": "NORMAL",
         },
     )
@@ -1333,6 +1691,104 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     return kwargs
 
 
+def _awslogs_config(cdef, task_id, container_id):
+    log_config = cdef.get("logConfiguration") or {}
+    if log_config.get("logDriver") != "awslogs":
+        return None
+
+    options = log_config.get("options") or {}
+    group_name = options.get("awslogs-group")
+    if not group_name:
+        return None
+
+    stream_prefix = options.get("awslogs-stream-prefix")
+    if stream_prefix:
+        stream_name = f"{stream_prefix}/{cdef.get('name', 'container')}/{task_id}"
+    else:
+        # Without a prefix AWS names the stream after the Docker container id.
+        stream_name = container_id
+
+    return {
+        "group": group_name,
+        "stream": stream_name,
+        "region": options.get("awslogs-region"),
+        "create_group": str(options.get("awslogs-create-group", "")).lower() == "true",
+    }
+
+
+def _ensure_awslogs_stream(config):
+    from ministack.services import cloudwatch_logs as _cwl
+
+    group_name = config["group"]
+    stream_name = config["stream"]
+
+    if group_name not in _cwl._log_groups:
+        if not config["create_group"]:
+            logger.warning(
+                "ECS: awslogs group %s does not exist; container output is not forwarded",
+                group_name,
+            )
+            return False
+        status, _, _ = _cwl._create_log_group({"logGroupName": group_name})
+        if status >= 400 and group_name not in _cwl._log_groups:
+            return False
+
+    if stream_name not in _cwl._log_groups[group_name]["streams"]:
+        status, _, _ = _cwl._create_log_stream({
+            "logGroupName": group_name,
+            "logStreamName": stream_name,
+        })
+        if status >= 400 and stream_name not in _cwl._log_groups[group_name]["streams"]:
+            return False
+
+    return True
+
+
+def _emit_awslogs_event(config, message):
+    from ministack.services import cloudwatch_logs as _cwl
+
+    _cwl._put_log_events({
+        "logGroupName": config["group"],
+        "logStreamName": config["stream"],
+        "logEvents": [{
+            "timestamp": int(time.time() * 1000),
+            "message": message,
+        }],
+    })
+
+
+def _forward_awslogs(container, config, account_id, region):
+    with request_scope(account_id, region):
+        if not _ensure_awslogs_stream(config):
+            return
+        try:
+            for chunk in container.logs(
+                    stream=True, follow=True, stdout=True, stderr=True):
+                if not chunk:
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                for line in text.splitlines():
+                    _emit_awslogs_event(config, line)
+        except Exception as exc:
+            logger.debug("ECS: awslogs forwarding stopped: %s", exc)
+
+
+def _start_awslogs_forwarder(container, cdef, task_id):
+    config = _awslogs_config(cdef, task_id, container.id)
+    if not config:
+        return
+    account_id = get_account_id()
+    # awslogs-region is where the driver ships the logs, not where the task ran.
+    region = config["region"] or get_region()
+    thread = threading.Thread(
+        target=_forward_awslogs,
+        args=(container, config, account_id, region),
+        daemon=True,
+        name=f"ministack-ecs-awslogs-{task_id[:8]}-{cdef.get('name', 'container')}",
+    )
+    thread.start()
+
+
 class _SecretResolutionError(Exception):
     """A container secret's ``valueFrom`` could not be resolved.
 
@@ -1382,6 +1838,31 @@ def _resolve_container_secrets(cdef):
                     f"{value_from} for environment variable {name}")
         resolved[name] = str(value)
     return resolved
+
+
+def _task_status_snapshot(task_arn):
+    """``(desiredStatus, lastStatus, {container name: lastStatus})``, or None.
+
+    Seeds the metadata payloads at registration. Scoped by the ARN's account and
+    region, not the request's: the endpoint is reached with a path token and no
+    SigV4, so the request resolves under the defaults.
+    """
+    try:
+        spec = parse_arn(task_arn)
+    except ArnParseError:
+        return None
+    task = _tasks.get_scoped(spec.account_id, spec.region, task_arn)
+    if task is None:
+        return None
+    return (
+        task.get("desiredStatus") or "RUNNING",
+        task.get("lastStatus") or "PENDING",
+        {
+            c["name"]: c.get("lastStatus")
+            for c in task.get("containers", [])
+            if c.get("name")
+        },
+    )
 
 
 def _task_is_active(task_arn, task):
@@ -1437,21 +1918,70 @@ def _cleanup_task_resources(task, docker_client, extra_container=None):
             _remove_docker_container(docker_client, docker_id)
 
 
+# The downward half of the lifecycle, and whether each state raises an event.
+# A Fargate task polled through DescribeTasks read 4 with lastStatus still
+# RUNNING and desiredStatus STOPPED, 5 at DEPROVISIONING and 6 at STOPPED, so
+# DEACTIVATING and STOPPING pass through without moving the counter.
+_STOP_SEQUENCE = (("DEACTIVATING", False), ("STOPPING", False),
+                  ("DEPROVISIONING", True), ("STOPPED", True))
+
+
 def _mark_task_stopped(task_arn, task, reason, stop_code, exit_code=None):
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
-        task["lastStatus"] = "STOPPED"
+        # desiredStatus flips first and counts, while lastStatus is still what
+        # it was: that is the change a consumer polls for to learn the task is
+        # being shut down.
+        _bump_task_version(task)
         task["desiredStatus"] = "STOPPED"
         task["stoppingAt"] = task.get("stoppingAt") or now
+        for state, counts in _STOP_SEQUENCE:
+            if counts:
+                _bump_task_version(task)
+            task["lastStatus"] = state
         task["stoppedAt"] = now
+        # "The Unix timestamp for the time when the task execution stopped" —
+        # the containers stop before the task reaches STOPPED, so it is set here
+        # and never later than stoppedAt.
+        task["executionStoppedAt"] = task.get("executionStoppedAt") or now
         task["stoppedReason"] = reason
         task["stopCode"] = stop_code
         for container in task.get("containers", []):
             container["lastStatus"] = "STOPPED"
-            if exit_code is not None:
+            if exit_code is not None and container.get("exitCode") is None:
                 container["exitCode"] = exit_code
+
+    ecs_metadata.set_task_status(
+        task_arn, known_status="STOPPED", desired_status="STOPPED"
+    )
+    ecs_metadata.set_all_container_status(task_arn, "STOPPED")
+
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name:
+        _recount_cluster(cluster_name)
+        _refresh_service_state(cluster_name, task.get("group", ""))
+    if stop_code in ("EssentialContainerExited", "TaskFailedToStart"):
+        _record_service_task_failure(task)
+    return True
+
+
+def _mark_task_pending(task_arn, task):
+    """Move a registered task to PENDING, where it waits on the agent.
+
+    "PENDING: This is a transition state where Amazon ECS is waiting on the
+    container agent to take further action" (task-lifecycle): the state between
+    PROVISIONING, where the task is placed, and ACTIVATING, where its images
+    are pulled.
+    """
+    with resource_lock("ecs-task", task_arn):
+        if not _task_is_active(task_arn, task):
+            return False
+        _bump_task_version(task)
+        task["lastStatus"] = "PENDING"
+
+    ecs_metadata.set_task_status(task_arn, known_status="PENDING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1467,14 +1997,18 @@ def _mark_task_activating(task_arn, task):
     additional steps after the task is launched but before the task can
     transition to the RUNNING state. This is the state where Amazon ECS pulls
     the container images, creates the containers, configures the task
-    networking, registers load balancer target groups" (task-lifecycle). The
-    task sits PENDING only until its worker picks it up.
+    networking, registers load balancer target groups" (task-lifecycle).
     """
     with resource_lock("ecs-task", task_arn):
         if not _task_is_active(task_arn, task):
             return False
+        # No version bump: a real task polled through DescribeTasks reads 1 at
+        # PROVISIONING, 2 at PENDING and 3 at RUNNING, so ACTIVATING raises no
+        # state-change event of its own.
         task["lastStatus"] = "ACTIVATING"
         task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
+
+    ecs_metadata.set_task_status(task_arn, known_status="ACTIVATING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1491,9 +2025,12 @@ def _mark_task_running(task_arn, task):
         if not _task_is_active(task_arn, task):
             return False
         now = _iso()
+        _bump_task_version(task)
         task["lastStatus"] = "RUNNING"
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
+
+    ecs_metadata.set_task_status(task_arn, known_status="RUNNING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1514,6 +2051,8 @@ def _attach_started_container(task, container, index, metadata_token, ecs_networ
             task["containers"][index]["lastStatus"] = "RUNNING"
 
     ecs_metadata.set_docker_id(metadata_token, container_id)
+    # The container's own KnownStatus, not the task's: AWS reports them apart.
+    ecs_metadata.set_container_status(metadata_token, "RUNNING")
     _record_task_ip(task, container, ecs_network)
     logger.info("ECS: started container %s for task %s", container_id, task_arn[:8])
     return True
@@ -1586,6 +2125,8 @@ def _start_task_worker(task, td, container_overrides, docker_client):
     cluster_arn = task["clusterArn"]
     launch_type = task.get("launchType", "EC2")
 
+    if not _mark_task_pending(task_arn, task):
+        return
     if not _mark_task_activating(task_arn, task):
         return
 
@@ -1663,6 +2204,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
                 task, container, i, metadata_token, ecs_network):
             _cleanup_task_resources(task, docker_client, container)
             return
+        _start_awslogs_forwarder(container, effective_cdef, task_id)
 
     if not _mark_task_running(task_arn, task):
         _cleanup_task_resources(task, docker_client)
@@ -1672,6 +2214,8 @@ def _run_task_worker(task, td, container_overrides, docker_client, account_id, r
     with request_scope(account_id, region):
         try:
             _start_task_worker(task, td, container_overrides, docker_client)
+            if task.get("lastStatus") == "RUNNING":
+                _watch_task_lifecycle(task, docker_client, account_id, region)
         except _SecretResolutionError as exc:
             _fail_task_start(
                 task, docker_client,
@@ -1686,6 +2230,38 @@ def _run_task_worker(task, td, container_overrides, docker_client, account_id, r
                 "ResourceInitializationError: unable to pull image or start "
                 "container: " + str(exc),
             )
+
+
+def _watch_task_lifecycle(task, docker_client, account_id, region):
+    """Watch real Docker containers after launch, independent of API polls.
+
+    The older on-demand inspection in DescribeTasks/ListTasks is retained as a
+    recovery path, but a service scheduler cannot depend on a client polling a
+    task that it owns.  This lightweight inspect loop gives a natural exit the
+    same task/service transition path as an explicit StopTask.
+    """
+    task_arn = task["taskArn"]
+
+    def _watch():
+        with request_scope(account_id, region):
+            while _task_is_active(task_arn, task):
+                _maybe_mark_stopped(task, docker_client)
+                if task.get("lastStatus") == "STOPPED":
+                    return
+                time.sleep(0.1)
+
+    spawn_background(
+        _watch,
+        thread_name=("ministack-ecs-watch-"
+                     f"{task_arn.rsplit('/', 1)[-1][:8]}"),
+    )
+    group = task.get("group", "")
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if cluster_name and group.startswith("service:"):
+        _schedule_service_deployment_completion(
+            cluster_name, f"{cluster_name}/{group.split(':', 1)[1]}",
+            account_id, region, healthy_task=task,
+        )
 
 
 def _run_task(data):
@@ -1714,9 +2290,15 @@ def _run_task(data):
     started_by = data.get("startedBy", "")
     enable_exec = data.get("enableExecuteCommand", False)
     req_tags = data.get("tags", [])
+    deployment_id = data.get("_deploymentId")
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
-    initial_status = "PENDING" if docker_backed else "RUNNING"
+    # Read when the container comes up, so both ride on the record until then.
+    network_mode = td.get("networkMode")
+    subnet = _requested_subnet(data)
+    # "PROVISIONING: Amazon ECS has to perform additional steps before the task
+    # is launched" (task-lifecycle), for every task, whatever its network mode.
+    initial_status = "PROVISIONING" if docker_backed else "RUNNING"
 
     tasks = []
     failures = []
@@ -1767,6 +2349,8 @@ def _run_task(data):
             "group": group,
             "startedBy": started_by,
             "version": 1,
+            "_network_mode": network_mode,
+            "_subnet": subnet,
             "containers": containers,
             "attachments": [],
             "availabilityZone": f"{region}a",
@@ -1775,6 +2359,11 @@ def _run_task(data):
             "healthStatus": "UNKNOWN",
             "ephemeralStorage": td.get("ephemeralStorage", {"sizeInGiB": 20}),
             "_docker_ids": [],
+            "_deployment_id": deployment_id,
+            "_container_essentials": [
+                bool(container.get("essential", True))
+                for container in td.get("containerDefinitions", [])
+            ],
         }
 
         _tasks[task_arn] = task
@@ -1855,8 +2444,14 @@ def _describe_tasks(data):
     return json_response({"tasks": result, "failures": failures})
 
 
-def _maybe_mark_stopped(task):
-    """Check Docker containers and transition task to STOPPED if all have exited."""
+def _maybe_mark_stopped(task, docker_client=None):
+    """Reflect an essential container exit in the task lifecycle.
+
+    ECS stops the task when an essential container exits; a non-essential
+    container can exit without taking its task down.  Docker has no ECS task
+    primitive, so inspect each container and map that outcome back to the ECS
+    task and container fields.
+    """
     task_arn = task.get("taskArn", "")
     with resource_lock("ecs-task", task_arn):
         if (not _task_is_active(task_arn, task)
@@ -1864,14 +2459,17 @@ def _maybe_mark_stopped(task):
                 or not task.get("_docker_ids")):
             return
         docker_ids = list(task["_docker_ids"])
+        essentials = list(task.get("_container_essentials") or [])
 
-    docker_client = _get_docker()
+    docker_client = docker_client or _get_docker()
     if not docker_client:
         return
 
     all_stopped = True
     exit_code = 0
-    for docker_id in docker_ids:
+    essential_exited = False
+    for index, docker_id in enumerate(docker_ids):
+        container_exit_code = None
         try:
             container = docker_client.containers.get(docker_id)
             # docker SDK caches status; refresh before checking lifecycle
@@ -1881,14 +2479,26 @@ def _maybe_mark_stopped(task):
                 pass
             if getattr(container, "status", None) != "exited":
                 all_stopped = False
-                break
+                continue
             result = container.wait()
-            exit_code = max(exit_code, result.get("StatusCode", 0))
+            container_exit_code = result.get("StatusCode", 0)
         except Exception:
-            # Container removed or unreachable — treat as stopped
-            pass
+            # An inspect failure (daemon unavailable, transient transport
+            # error) is not evidence that the process exited.  Keep the ECS
+            # task live until Docker positively reports an exit; otherwise a
+            # temporary Docker outage would manufacture task failures.
+            all_stopped = False
+            continue
 
-    if not all_stopped:
+        exit_code = max(exit_code, container_exit_code or 0)
+        with resource_lock("ecs-task", task_arn):
+            if index < len(task.get("containers", [])):
+                task["containers"][index]["lastStatus"] = "STOPPED"
+                task["containers"][index]["exitCode"] = container_exit_code
+        if index >= len(essentials) or essentials[index]:
+            essential_exited = True
+
+    if not essential_exited and not all_stopped:
         return
 
     stopped = _mark_task_stopped(

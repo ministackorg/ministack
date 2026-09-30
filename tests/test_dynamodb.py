@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -105,6 +106,75 @@ def test_dynamodb_tables_are_region_isolated_by_name(ddb):
     finally:
         try:
             east.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
+def test_dynamodb_describe_table_accepts_table_arn(ddb):
+    """DescribeTable accepts the table ARN in TableName, as AWS does; an ARN
+    from another region still resolves to no table."""
+    name = f"arn-describe-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+        assert ddb.describe_table(TableName=arn)["Table"]["TableName"] == name
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.describe_table(TableName=other_region_arn)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
+def test_dynamodb_table_arn_accepted_by_every_table_name_operation(ddb):
+    """Every operation whose TableName is a TableArn in the model takes the ARN;
+    batch responses keep the caller's key form, and a foreign ARN is not found."""
+    name = f"arn-ops-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+    key = {"pk": {"S": "a"}}
+    try:
+        ddb.put_item(TableName=arn, Item={"pk": {"S": "a"}, "v": {"S": "1"}})
+        assert ddb.get_item(TableName=arn, Key=key)["Item"]["v"] == {"S": "1"}
+        ddb.update_item(TableName=arn, Key=key, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"S": "2"}})
+        assert ddb.query(TableName=arn, KeyConditionExpression="pk = :p",
+                         ExpressionAttributeValues={":p": {"S": "a"}})["Count"] == 1
+        assert ddb.scan(TableName=arn)["Count"] == 1
+        got = ddb.batch_get_item(RequestItems={arn: {"Keys": [key]}})
+        assert list(got["Responses"]) == [arn]
+        ddb.batch_write_item(RequestItems={arn: [{"PutRequest": {"Item": {"pk": {"S": "b"}}}}]})
+        ddb.transact_write_items(TransactItems=[{"Put": {"TableName": arn, "Item": {"pk": {"S": "c"}}}}])
+        items = ddb.transact_get_items(TransactItems=[{"Get": {"TableName": arn, "Key": {"pk": {"S": "c"}}}}])
+        assert items["Responses"][0]["Item"]["pk"] == {"S": "c"}
+        ddb.delete_item(TableName=arn, Key=key)
+        ddb.update_time_to_live(TableName=arn, TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+        assert ddb.describe_time_to_live(TableName=arn)["TimeToLiveDescription"]["AttributeName"] == "ttl"
+        ddb.update_continuous_backups(TableName=arn, PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
+        assert ddb.describe_continuous_backups(TableName=arn)["ContinuousBackupsDescription"]
+        assert ddb.describe_kinesis_streaming_destination(TableName=arn)["TableName"] == name
+        ddb.update_table(TableName=arn, BillingMode="PAY_PER_REQUEST")
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(TableName=other_region_arn, Key=key)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        ddb.delete_table(TableName=arn)
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
         except ClientError:
             pass
 
@@ -289,7 +359,7 @@ def test_dynamodb_restore_legacy_table_name_metadata_uses_table_arn_region():
     }
 
     try:
-        ddb_service.restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "pitr_settings": pitr_settings,
@@ -359,7 +429,7 @@ def test_dynamodb_restore_ambiguous_legacy_metadata_uses_value_arn_region():
     ]
 
     try:
-        ddb_service.restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "kinesis_destinations": kinesis_destinations,
@@ -2549,8 +2619,10 @@ def test_ddb_sse_description_shape_matches_aws(ddb, kms_client):
     key_id = kms_client.create_key(Description="ddb-sse-t")["KeyMetadata"]["KeyId"]
     key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{key_id}"
     tname = "t-sse-shape"
-    try: ddb.delete_table(TableName=tname)
-    except Exception: pass
+    try:
+        ddb.delete_table(TableName=tname)
+    except Exception:
+        pass
 
     ddb.create_table(
         TableName=tname,
@@ -3781,6 +3853,88 @@ def test_dynamodb_import_table(ddb):
         assert arn in arns
     finally:
         ddb.delete_table(TableName=name)
+
+
+def _await_import(ddb, arn, attempts=40):
+    for _ in range(attempts):
+        desc = ddb.describe_import(ImportArn=arn)["ImportTableDescription"]
+        if desc["ImportStatus"] != "IN_PROGRESS":
+            return desc
+        time.sleep(0.3)
+    raise AssertionError(f"import {arn} never left IN_PROGRESS")
+
+
+def test_dynamodb_import_table_csv_writes_the_rows(ddb, s3):
+    """The rows of the CSV source reach the table.
+
+    The submit response reports zeros while the import is IN_PROGRESS, and the
+    counters land with the terminal status. A key column takes the type its
+    AttributeDefinition declares; every other column is imported as a string.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, name = f"imp-csv-{suffix}", f"imp-csv-table-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="rows/data.csv", Body=b"ID,name\n1,Alice\n2,Bob\n")
+    try:
+        submitted = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": "rows/"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "ID", "AttributeType": "N"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]
+        assert (submitted["ImportStatus"], submitted["ProcessedItemCount"],
+                submitted["ImportedItemCount"]) == ("IN_PROGRESS", 0, 0)
+
+        desc = _await_import(ddb, submitted["ImportArn"])
+        assert desc["ImportStatus"] == "COMPLETED"
+        assert (desc["ProcessedItemCount"], desc["ImportedItemCount"],
+                desc["ErrorCount"]) == (2, 2, 0)
+        assert desc["ProcessedSizeBytes"] == 22
+
+        items = sorted(ddb.scan(TableName=name)["Items"], key=lambda i: i["ID"]["N"])
+        assert items == [
+            {"ID": {"N": "1"}, "name": {"S": "Alice"}},
+            {"ID": {"N": "2"}, "name": {"S": "Bob"}},
+        ]
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_import_table_missing_source_fails(ddb):
+    """A source that is not there fails the import instead of completing it.
+
+    "Since the error was caught before the data was imported into the table, a
+    new DynamoDB table is not created" — so the destination goes with it.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"imp-missing-{suffix}"
+    try:
+        arn = ddb.import_table(
+            S3BucketSource={"S3Bucket": f"no-such-bucket-{suffix}"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]["ImportArn"]
+
+        desc = _await_import(ddb, arn)
+        assert desc["ImportStatus"] == "FAILED"
+        assert desc["FailureCode"] == "S3NoSuchBucket"
+        assert desc["ImportedItemCount"] == 0
+        with pytest.raises(ClientError) as exc:
+            ddb.describe_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
 
 
 def test_dynamodb_describe_import_not_found(ddb):
@@ -7111,3 +7265,83 @@ def test_contributor_insights_last_update_is_int_epoch(ddb):
             assert isinstance(lud, int), f"expected int epoch, got {type(lud).__name__}: {lud}"
     finally:
         ddb.delete_table(TableName=table)
+
+def test_dynamodb_restore_rebuilds_item_store_for_every_account_and_region():
+    import asyncio
+    from collections import defaultdict
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        request_scope,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import dynamodb as ddb_service
+
+    table_name = f"restore-scope-{_uuid_mod.uuid4().hex[:8]}"
+    scopes = (("000000000000", "us-east-1"), ("111111111111", "eu-west-1"))
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ddb_service.reset()
+    tables = AccountRegionScopedDict()
+    for account_id, region in scopes:
+        tables.set_scoped(
+            account_id,
+            region,
+            table_name,
+            {
+                "TableName": table_name,
+                "TableArn": f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "pk_name": "pk",
+                "sk_name": None,
+                "TableStatus": "ACTIVE",
+                # Plain dicts - returned directly from JSON decoder
+                "items": {"existing": {"__no_sort__": {"pk": {"S": "existing"}}}},
+            },
+        )
+
+    def _call(action, payload):
+        headers = {
+            "x-amz-target": f"DynamoDB_20120810.{action}",
+            "content-type": "application/x-amz-json-1.0",
+        }
+        status, _, body = asyncio.run(
+            ddb_service.handle_request("POST", "/", headers, json.dumps(payload).encode(), {})
+        )
+        return status, json.loads(body)
+
+    try:
+        ddb_service.load_persisted_state({"tables": tables})
+
+        for account_id, region in scopes:
+            items = ddb_service._tables.get_scoped(account_id, region, table_name)["items"]
+            assert isinstance(items, defaultdict), (account_id, region)
+
+            with request_scope(account_id, region):
+                status, body = _call("UpdateItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "new-after-restart"}},
+                    "UpdateExpression": "SET attr = :v",
+                    "ExpressionAttributeValues": {":v": {"S": "value"}},
+                    "ReturnValues": "ALL_NEW",
+                })
+                assert status == 200, (account_id, region, body)
+                assert body["Attributes"]["attr"] == {"S": "value"}
+
+                status, body = _call("PutItem", {
+                    "TableName": table_name,
+                    "Item": {"pk": {"S": "another-after-restart"}},
+                })
+                assert status == 200, (account_id, region, body)
+
+                status, body = _call("GetItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "existing"}},
+                })
+                assert status == 200
+                assert body["Item"] == {"pk": {"S": "existing"}}
+    finally:
+        ddb_service.reset()

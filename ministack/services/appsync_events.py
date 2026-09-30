@@ -29,7 +29,6 @@ import re
 import time
 
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -114,7 +113,11 @@ def _restore_api_child_store(
         store.set_scoped(account_id, region, api_id, value)
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _apis.update(data.get("apis", {}))
@@ -125,15 +128,9 @@ def restore_state(data):
 
 
 # Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = restore_state
+load_persisted_state = _restore_state
 
 
-try:
-    _restored = load_state("appsync_events")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore AppSync Events state")
 
 
 def reset():

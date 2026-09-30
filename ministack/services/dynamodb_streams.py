@@ -415,7 +415,11 @@ def get_state():
     return {}
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     pass
 
 

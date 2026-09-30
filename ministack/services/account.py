@@ -125,3 +125,11 @@ async def handle_request(method, path, headers, body, query_params):
 
 def reset():
     pass
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

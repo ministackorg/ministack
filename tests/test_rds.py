@@ -2,8 +2,11 @@ import asyncio
 import contextlib
 import datetime
 import io
+import ipaddress
 import json
 import os
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -736,7 +739,7 @@ def test_rds_modify_legacy_subnet_group_adopts_resolved_vpc():
         persisted_groups = rds_service.get_state()["subnet_groups"]
         persisted_groups[group_name]["VpcId"] = "vpc-00000000"
         rds_service._subnet_groups.clear()
-        rds_service.restore_state({"subnet_groups": persisted_groups})
+        rds_service.load_persisted_state({"subnet_groups": persisted_groups})
 
         status, _, _ = rds_service._modify_subnet_group({
             "DBSubnetGroupName": group_name,
@@ -2404,7 +2407,7 @@ def test_rds_restored_initialized_storage_defers_password_rotation(monkeypatch):
         assert persisted_cluster["_shared_storage_initialized"] is True
 
         m._clusters.clear()
-        m.restore_state(persisted)
+        m.load_persisted_state(persisted)
         restored = m._clusters["restored-password-cluster"]
         assert restored["_shared_container_id"] is None
 
@@ -2665,6 +2668,147 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
         m._clusters.clear()
 
 
+def test_rds_stop_start_cluster_keeps_dns_endpoint(monkeypatch):
+    """Stop/start must not rewrite the cluster's DNS endpoint to a raw IP.
+
+    The shared container carries the cluster endpoint as a Docker network
+    alias, so the DNS name advertised at create time keeps resolving after
+    a StopDBCluster/StartDBCluster cycle. StartDBCluster must keep
+    reporting that name while refreshing the internal address that the
+    readiness probe actually dials.
+    """
+    from ministack.services import rds as m
+
+    container_ip = "172.31.77.42"
+    restarted_ip = "172.31.77.43"
+    network_name = "regression-net"
+
+    class FakeContainer:
+        id = "dns-endpoint-shared-container"
+        attrs = {
+            "NetworkSettings": {
+                "Networks": {
+                    network_name: {"IPAddress": container_ip},
+                },
+            },
+        }
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+            # A real restart lands on a fresh DHCP lease; simulate the
+            # address change so the test proves the internal wiring is
+            # refreshed rather than accidentally reusing the old value.
+            self.attrs["NetworkSettings"]["Networks"][network_name][
+                "IPAddress"
+            ] = restarted_ip
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            container.status = "running"
+            return container
+
+        def get(self, identifier):
+            if identifier in (
+                container.id,
+                m._rds_cluster_docker_name("dns-endpoint-cluster"),
+            ):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    readiness_dials = []
+
+    def _fake_wait_ready(host, port, *_args, **_kwargs):
+        readiness_dials.append((host, port))
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: network_name)
+    monkeypatch.setattr(m, "_next_port", lambda: 16071)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _fake_wait_ready)
+    monkeypatch.setattr(
+        m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    def _wait_for_member_status(db_id, expected, timeout=2):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if m._instances.get(db_id, {}).get("DBInstanceStatus") == expected:
+                return
+            time.sleep(0.01)
+        pytest.fail(
+            f"instance {db_id} never reached {expected}; last status: "
+            f"{m._instances.get(db_id, {}).get('DBInstanceStatus')}",
+        )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "dns-endpoint-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "dns-endpoint-writer",
+            "DBClusterIdentifier": "dns-endpoint-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        _wait_for_member_status("dns-endpoint-writer", "available")
+        cluster = m._clusters.get("dns-endpoint-cluster")
+        assert cluster["Status"] == "available"
+
+        # Creation must publish the DNS name, not the container IP.
+        create_address = cluster["_shared_endpoint"]["Address"]
+        assert create_address.endswith(".rds.amazonaws.com")
+        assert create_address != container_ip
+
+        m._stop_db_cluster({"DBClusterIdentifier": "dns-endpoint-cluster"})
+        m._start_db_cluster({"DBClusterIdentifier": "dns-endpoint-cluster"})
+        _wait_for_member_status("dns-endpoint-writer", "available")
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+
+        # The public endpoint survives the restart unchanged.
+        assert cluster["_shared_endpoint"]["Address"] == create_address
+        assert cluster["Endpoint"] == create_address
+        # Internal wiring is refreshed to the restarted container's NEW
+        # address (the fake moves the IP in stop()), not the stale one.
+        assert cluster["_shared_internal_address"] == restarted_ip
+        # The readiness probe dials the new address directly, on the
+        # container port — never the public name or the old IP.
+        assert (restarted_ip, cluster["_shared_internal_port"]) in readiness_dials
+
+        member = m._instances.get("dns-endpoint-writer")
+        assert member["Endpoint"]["Address"] == create_address
+        assert member["_internal_address"] == restarted_ip
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_restore_keeps_stopped_cluster_compute_stopped(monkeypatch):
     """Warm boot must not revive compute for a cluster stopped via the API."""
     from ministack.services import rds as m
@@ -2700,7 +2844,7 @@ def test_rds_restore_keeps_stopped_cluster_compute_stopped(monkeypatch):
         m._instances.clear()
         m._clusters.clear()
         started_calls.clear()
-        m.restore_state(persisted)
+        m.load_persisted_state(persisted)
 
         # restore_state marks every instance ``creating`` before spawning the
         # cluster runner; the runner's stopped branch flips members back to
@@ -5010,7 +5154,7 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -5361,7 +5505,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
 
         monkeypatch.setattr(m.threading, "Thread", TrackedThread)
 
-        m.restore_state({
+        m.load_persisted_state({
             "instances": instances,
             "clusters": clusters,
             "subnet_groups": {},
@@ -5681,7 +5825,7 @@ def test_rds_restored_empty_cluster_cleanup_recovers_container_by_name(
         })
         persisted = m.get_state()
         m._clusters.clear()
-        m.restore_state(persisted)
+        m.load_persisted_state(persisted)
 
         restored = m._clusters.get(cluster_id)
         assert restored["DBClusterMembers"] == []
@@ -6004,7 +6148,7 @@ def test_rds_restore_migrates_legacy_instance_name_before_cluster_claims_it(
     m._instances.clear()
     m._clusters.clear()
     try:
-        m.restore_state({
+        m.load_persisted_state({
             "instances": instances,
             "clusters": clusters,
             "subnet_groups": {},
@@ -6097,7 +6241,7 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted)
+    m.load_persisted_state(persisted)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6168,7 +6312,7 @@ def test_rds_restore_state_preserves_legacy_persistent_volume_name(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted)
+    m.load_persisted_state(persisted)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6242,7 +6386,7 @@ def test_rds_respawn_does_not_bind_engine_port_on_host(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6343,7 +6487,7 @@ def test_rds_respawn_falls_back_when_persisted_host_port_taken(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and not runs:
@@ -6424,7 +6568,7 @@ def test_rds_respawn_force_removes_stale_created_container(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    m.load_persisted_state(persisted_state)
 
     deadline = time.time() + 5
     while time.time() < deadline and m._instances.get(db_id, {}).get("DBInstanceStatus") not in ("available", "failed"):
@@ -6482,6 +6626,7 @@ def _wait_for_rds(rds_client, db_id, timeout=120):
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- skipping network connectivity test",
 )
+@pytest.mark.data_plane
 def test_rds_lambda_network_connectivity(rds, lam):
     """Prove that Lambda containers can TCP-connect to an RDS container."""
     db_id = "net-test-pg"
@@ -6909,7 +7054,7 @@ def test_rds_legacy_instance_restore_preserves_arn_region(monkeypatch):
 
     try:
         rds.reset()
-        rds.restore_state({"instances": legacy})
+        rds.load_persisted_state({"instances": legacy})
 
         assert rds._instances.get_scoped("000000000000", "us-east-1", instance_id) is None
         restored = rds._instances.get_scoped("000000000000", "us-west-2", instance_id)
@@ -7876,12 +8021,40 @@ def _wait_for_instance(rds, db_id, timeout=120):
     raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
 
 
+def _host_dialable(endpoint):
+    """Map an advertised endpoint onto an address this process can reach.
+
+    A cluster endpoint is a Docker network alias resolvable only by containers
+    on that network; pytest runs on the host, so dial the published port of the
+    container carrying the alias.
+    """
+    address, port = endpoint["Address"], int(endpoint["Port"])
+    try:
+        socket.getaddrinfo(address, port)
+        return address, port
+    except socket.gaierror:
+        pass
+    import docker
+
+    for container in docker.from_env().containers.list(
+        filters={"label": "ministack=rds"},
+    ):
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if not any(address in (n.get("Aliases") or []) for n in networks.values()):
+            continue
+        published = container.attrs["NetworkSettings"]["Ports"].get(f"{port}/tcp") or []
+        if published:
+            return "127.0.0.1", int(published[0]["HostPort"])
+    raise AssertionError(f"no container publishes {address}:{port}")
+
+
 def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
     import pymysql
 
+    host, port = _host_dialable(endpoint)
     return pymysql.connect(
-        host=endpoint["Address"],
-        port=int(endpoint["Port"]),
+        host=host,
+        port=port,
         user=user,
         password=password,
         database=database,
@@ -7939,7 +8112,7 @@ def _live_cluster(rds, engine_version=None):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-
+@pytest.mark.data_plane
 @pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
 def test_aurora_writer_data_is_visible_through_reader(rds):
     with _live_cluster(rds) as (_cid, _wid, _rid, writer, reader, _cluster):
@@ -9427,7 +9600,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
         )
         monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configure)
 
-        m.restore_state({
+        m.load_persisted_state({
             "instances": AccountRegionScopedDict(),
             "clusters": clusters,
             "global_clusters": global_clusters,
@@ -10096,7 +10269,7 @@ def test_rds_restore_syncs_stale_secondary_credentials_from_global_writer(
     m._clusters.clear()
     m._global_clusters.clear()
     try:
-        m.restore_state({
+        m.load_persisted_state({
             "instances": AccountRegionScopedDict(),
             "clusters": clusters,
             "global_clusters": global_clusters,
@@ -10609,7 +10782,7 @@ def test_rds_mysql_writer_switch_state_round_trip_requires_repair():
         persisted = m.get_state()
         m._global_clusters.clear()
 
-        m.restore_state({
+        m.load_persisted_state({
             "instances": {},
             "clusters": {},
             "global_clusters": persisted["global_clusters"],
@@ -12106,7 +12279,7 @@ def _wait_for_gtid(
         f"result={result!r}, gtid={executed!r}"
     )
 
-
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- live Aurora",
@@ -13353,7 +13526,10 @@ def test_rds_pg_replicating_reader_lifecycle(monkeypatch):
         assert cluster["_shared_container_id"] not in removed
         assert _poll_until(lambda: cluster["Status"] == "available")
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The restarted shared container keeps the DNS alias it launched
+        # with; the raw container address stays internal.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"].endswith(".rds.amazonaws.com")
 
         # Deleting the reader removes only its own compute; the
         # ReaderEndpoint falls back to the writer. The fake derives
@@ -13560,6 +13736,7 @@ def test_rds_pg_two_replicating_readers_provision_source_once(monkeypatch):
         assert _poll_until(
             lambda: reader1["DBInstanceStatus"] == "available"
             and reader2["DBInstanceStatus"] == "available",
+            timeout=30,
         )
         assert cluster["_pg_replication_source_ready"] is True
         # Replication provisioning ran exactly once on the shared (writer)
@@ -13732,7 +13909,7 @@ def test_rds_restore_state_without_docker_demotes_pg_standby(monkeypatch):
             "_pg_standby": True,
             "_docker_container_id": "dead-reader-container",
         }
-        m.restore_state({"clusters": clusters, "instances": instances})
+        m.load_persisted_state({"clusters": clusters, "instances": instances})
 
         reader = m._instances.get("warm-pg-reader")
         assert reader is not None
@@ -13815,7 +13992,7 @@ def test_rds_restore_state_revives_pg_standby(monkeypatch):
             "_docker_container_id": "dead-reader-container",
             "_docker_volume_name": reader_volume,
         }
-        m.restore_state({"clusters": clusters, "instances": instances})
+        m.load_persisted_state({"clusters": clusters, "instances": instances})
 
         reader = m._instances.get("warm-pgr-reader")
         writer = m._instances.get("warm-pgr-writer")
@@ -14518,7 +14695,10 @@ def test_rds_pg_two_readers_survive_stop_start(monkeypatch):
         assert _poll_until(lambda: cluster["Status"] == "available")
         # Member order (reader1 first) still decides the ReaderEndpoint.
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The restarted shared container keeps the DNS alias it launched
+        # with; the raw container address stays internal.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"].endswith(".rds.amazonaws.com")
         # The two racing revival workers did not re-provision the writer:
         # replication access was provisioned exactly once, at creation.
         shared_execs = [
@@ -14607,9 +14787,10 @@ _PG_REPLICATION_LIVE = (
 def _pg_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
     import psycopg2
 
+    host, port = _host_dialable(endpoint)
     return psycopg2.connect(
-        host=endpoint["Address"],
-        port=int(endpoint["Port"]),
+        host=host,
+        port=port,
         user=user,
         password=password,
         dbname=database,
@@ -14663,7 +14844,7 @@ def _live_pg_cluster(rds):
             if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
                 raise
 
-
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not _PG_REPLICATION_LIVE,
     reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
@@ -14719,6 +14900,7 @@ def test_aurora_pg_replicating_reader_live(rds):
         assert excinfo.value.pgcode == "25006"
 
 
+@pytest.mark.data_plane
 @pytest.mark.skipif(
     not _PG_REPLICATION_LIVE,
     reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
@@ -15624,3 +15806,207 @@ def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
     assert rds_service._cluster_endpoint_aliases(
         {"Endpoint": name, "Engine": "aurora-mysql"}) == [
         name, "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"]
+
+
+def _rds_ca_pem(tmp_path):
+    """The CA that signs DB server certificates, written where libpq can read it."""
+    import urllib.request
+    path = tmp_path / "ministack-rds-ca.pem"
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/rds/ca.pem", timeout=10) as response:
+        assert response.status == 200
+        path.write_bytes(response.read())
+    return str(path)
+
+
+@pytest.mark.data_plane
+@pytest.mark.parametrize("engine", ("postgres", "aurora-postgresql"))
+def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
+    """AWS installs the DB server certificate itself and every instance we
+    report carries CACertificateIdentifier, so TLS is on without asking: a
+    client using our CA connects, and plaintext still works as it does on AWS
+    without rds.force_ssl."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    db_id = f"tls-{engine.split('-')[-1]}-{_uuid_mod.uuid4().hex[:8]}"
+    cluster_id = f"{db_id}-c"
+    try:
+        if engine == "aurora-postgresql":
+            rds.create_db_cluster(
+                DBClusterIdentifier=cluster_id, Engine=engine,
+                MasterUsername="admin", MasterUserPassword="password",
+                DatabaseName="appdb",
+            )
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large", Engine=engine,
+            )
+        else:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
+                Engine="postgres", MasterUsername="admin",
+                MasterUserPassword="password", DBName="appdb",
+                AllocatedStorage=20,
+            )
+        endpoint = None
+        for _ in range(90):
+            detail = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+            if detail["DBInstanceStatus"] == "available" and detail.get("Endpoint"):
+                endpoint = detail["Endpoint"]
+                break
+            time.sleep(2)
+        if endpoint is None:
+            pytest.skip("no backing container available in this environment")
+        assert detail["CACertificateIdentifier"] == "rds-ca-rsa2048-g1"
+
+        ca = _rds_ca_pem(tmp_path)
+
+        def connect(sslmode):
+            host = endpoint["Address"]
+            dial_host, dial_port = _host_dialable(endpoint)
+            connect_kwargs = {
+                "host": host,
+                "port": dial_port,
+                "user": "admin",
+                "password": "password",
+                "dbname": "appdb",
+                "sslmode": sslmode,
+                "sslrootcert": ca,
+                "connect_timeout": 15,
+            }
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                if dial_host != host:
+                    connect_kwargs["hostaddr"] = dial_host
+            else:
+                connect_kwargs["hostaddr"] = host
+                connect_kwargs["host"] = "localhost"
+            connection = psycopg2.connect(**connect_kwargs)
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                return cursor.fetchone()[0]
+            finally:
+                connection.close()
+
+        # verify-full also pins the hostname, so the SAN has to cover the
+        # endpoint the API advertises.
+        for sslmode in ("require", "verify-ca", "verify-full"):
+            assert connect(sslmode) is True, sslmode
+        assert connect("disable") is False
+    finally:
+        try:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        if engine == "aurora-postgresql":
+            try:
+                rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
+
+
+def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
+    """The CA is minted once and served as PEM, the local stand-in for AWS's
+    certificate bundle."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+
+    again = tmp_path / "again"
+    again.mkdir()
+    first = open(_rds_ca_pem(tmp_path), "rb").read()
+    second = open(_rds_ca_pem(again), "rb").read()
+    assert first == second, "the CA must not be re-minted per request"
+    cert = x509.load_pem_x509_certificate(first)
+    assert cert.issuer == cert.subject
+    assert "Root CA RSA2048 G1" in cert.subject.rfc4514_string()
+
+
+def _tls_handshake(ca_pem, cert_pem, key_pem, hostname, tmp_path):
+    """A real verifying handshake, both ends in memory, SAN matching only."""
+    import ssl
+
+    chain = tmp_path / "server.pem"
+    chain.write_text(cert_pem + key_pem)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(chain)
+    client_context = ssl.create_default_context(cadata=ca_pem)
+    client_context.verify_flags |= ssl.VERIFY_X509_STRICT
+    client_context.hostname_checks_common_name = False
+    client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = client_context.wrap_bio(client_in, client_out, server_hostname=hostname)
+    server = server_context.wrap_bio(server_in, server_out, server_side=True)
+    done = set()
+    for _ in range(10):
+        for endpoint in (client, server):
+            if endpoint not in done:
+                try:
+                    endpoint.do_handshake()
+                    done.add(endpoint)
+                except ssl.SSLWantReadError:
+                    pass
+        server_in.write(client_out.read())
+        client_in.write(server_out.read())
+        if len(done) == 2:
+            return
+    pytest.fail("TLS handshake did not complete")
+
+
+def _fresh_pg_ca(monkeypatch):
+    from ministack.services import rds as rds_service
+
+    monkeypatch.setattr(rds_service, "_pg_ca", None)
+    return rds_service.pg_ca_cert_pem()
+
+
+@pytest.mark.parametrize("hostname", [
+    "db.example.test",
+    "db-" + "a" * 37 + ".cluster-abcdefghijkl.us-east-1.rds.amazonaws.com",
+])
+def test_rds_server_certificate_carries_every_endpoint_as_a_san(hostname, monkeypatch, tmp_path):
+    """An endpoint longer than the 64-byte CN limit must still get a certificate,
+    and every name it is reached by has to verify."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    from ministack.services import rds as rds_service
+
+    ca_pem = _fresh_pg_ca(monkeypatch)
+    names = [hostname, "reader." + hostname, "localhost"]
+    ips = ["127.0.0.1", "::1"]
+    cert_pem, key_pem = rds_service._pg_server_material(names, ips)
+
+    cert = x509.load_pem_x509_certificate(cert_pem.encode())
+    cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    assert cn == hostname
+    sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert sans.get_values_for_type(x509.DNSName) == names
+    assert sans.get_values_for_type(x509.IPAddress) == [
+        ipaddress.ip_address(ip) for ip in ips]
+
+    for name in names + ips:
+        _tls_handshake(ca_pem, cert_pem, key_pem, name, tmp_path)
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _tls_handshake(ca_pem, cert_pem, key_pem, "unlisted.example.test", tmp_path)
+
+
+def test_rds_server_certificate_without_dns_names_verifies_its_ip(monkeypatch, tmp_path):
+    from ministack.services import rds as rds_service
+
+    pytest.importorskip("cryptography")
+    ca_pem = _fresh_pg_ca(monkeypatch)
+    cert_pem, key_pem = rds_service._pg_server_material([], ["127.0.0.1"])
+    _tls_handshake(ca_pem, cert_pem, key_pem, "127.0.0.1", tmp_path)
+
+
+def test_rds_server_certificate_without_cryptography_raises(monkeypatch):
+    pytest.importorskip("cryptography")
+    from ministack.core import x509_utils
+    from ministack.services import rds as rds_service
+
+    _fresh_pg_ca(monkeypatch)
+    monkeypatch.setattr(x509_utils, "HAS_CRYPTO", False)
+    with pytest.raises(RuntimeError, match="requires the `cryptography` package"):
+        rds_service._pg_server_material(["localhost"], [])

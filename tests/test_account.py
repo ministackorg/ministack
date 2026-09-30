@@ -2,9 +2,8 @@ import json
 import os
 import urllib.request
 
-import pytest
-
 import boto3
+import pytest
 
 _ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 

@@ -210,7 +210,9 @@ def test_ses_v2_send_email(sesv2):
             }
         },
     )
-    assert resp["MessageId"].startswith("ministack-")
+    # Same shape the six v1 send paths return; nothing an AWS client sees
+    # should be prefixed with the emulator's name.
+    assert resp["MessageId"].endswith("@email.amazonses.com")
 
 def test_ses_v2_email_identity_crud(sesv2):
     sesv2.create_email_identity(EmailIdentity="test-domain.com")
@@ -870,7 +872,7 @@ def test_ses_restore_legacy_state_maps_unregionalized_values_to_boot_region():
 
     service.reset()
     try:
-        service.restore_state(legacy_state)
+        service.load_persisted_state(legacy_state)
         for state_key, (resource_key, value) in values.items():
             store = getattr(service, state_key)
             assert store.get_scoped(account_id, boot_region, resource_key) == value
@@ -915,7 +917,7 @@ def test_ses_v2_restore_legacy_state_maps_unregionalized_values_to_boot_region()
 
     service.reset()
     try:
-        service.restore_state(legacy_state)
+        service.load_persisted_state(legacy_state)
         for state_key, (resource_key, value) in values.items():
             store = getattr(service, state_key)
             expected_key = resource_key

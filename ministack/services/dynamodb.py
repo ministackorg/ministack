@@ -19,6 +19,9 @@ Uses X-Amz-Target header for action routing (JSON API).
 import base64
 import binascii
 import copy
+import csv
+import gzip
+import io
 import json
 import logging
 import os
@@ -29,6 +32,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -64,14 +68,20 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _DDB_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
 _DDB_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 _DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+# CsvOptions.Delimiter: {"max": 1, "min": 1, "pattern": "[,;:|\\t ]"}.
+_CSV_DELIMITER_RE = re.compile(r"[,;:|\t ]")
 
 # Real AWS reports Export/Import as IN_PROGRESS at submit time; the flip to
 # COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
 # on the first DescribeExport/DescribeImport calls within this grace window.
 _EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
-_IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
+_IMPORT_COMPLETE_AFTER_SEC = 1.0
+# "The log group name is /aws-dynamodb/imports. The error log stream name is
+# import-id/error."
+_IMPORT_LOG_GROUP = "/aws-dynamodb/imports"
+# "DynamoDB Import from Amazon S3 can support up to 50 concurrent import jobs".
+_IMPORT_CONCURRENCY_LIMIT = 50
 
-from ministack.core.persistence import load_state
 
 # Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
 # keying made name lookups find cross-region tables while ARN ops (which
@@ -187,11 +197,15 @@ def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
                 store.set_scoped(account_id, region, original_key, copy.deepcopy(value))
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
         # Restore items as defaultdict(dict) — JSON deserializes as plain dict
-        for tbl in _tables.values():
+        for tbl in _tables.all_values():
             if isinstance(tbl.get("items"), dict) and not isinstance(tbl["items"], defaultdict):
                 tbl["items"] = defaultdict(dict, tbl["items"])
             # Migrate legacy SSEDescription shape (pre-#411): convert
@@ -208,17 +222,12 @@ def restore_state(data):
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
         _imports.update(data.get("imports", {}))
+        # No worker on this side of the restart; DescribeImport closes it out.
+        for _desc in _imports._data.values():
+            if isinstance(_desc, dict) and _desc.get("ImportStatus") == "IN_PROGRESS":
+                _desc["_orphaned"] = True
 
 
-try:
-    _restored = load_state("dynamodb")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +938,8 @@ def _validate_data_plane_table_name(name) -> tuple | None:
     if len(name) < 1:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if name.startswith("arn:"):
+        return None  # A table ARN not in this account and region answers ResourceNotFoundException.
     if len(name) > 255:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
@@ -1248,7 +1259,7 @@ def _create_table(data):
 
 
 def _delete_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     if _tables[name].get("DeletionProtectionEnabled"):
@@ -1266,7 +1277,7 @@ def _delete_table(data):
 
 
 def _describe_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     return json_response({"Table": _table_description(name)})
@@ -1286,7 +1297,7 @@ def _list_tables(data):
 
 
 def _update_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     table = _tables[name]
@@ -1627,7 +1638,7 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 
 def _put_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1697,7 +1708,7 @@ def _put_item(data):
 
 
 def _get_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1737,7 +1748,7 @@ def _get_item(data):
 
 
 def _delete_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1797,7 +1808,7 @@ def _key_attribute_update_error(table, updated_attrs):
 
 
 def _update_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1938,7 +1949,7 @@ def _update_item(data):
 # ---------------------------------------------------------------------------
 
 def _query(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -2237,7 +2248,7 @@ def _query(data):
 
 
 def _scan(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -3845,7 +3856,7 @@ def _batch_write_item(data):
     # in a single BatchWriteItem call.
     seen_keys = set()
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3886,7 +3897,7 @@ def _batch_write_item(data):
             seen_keys.add(key_repr)
     unprocessed = {}
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3905,7 +3916,7 @@ def _batch_write_item(data):
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
                 table["items"][pk_val][sk_val] = item
-                _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+                _emit_stream_event(_normalize_table_name(table_name), "MODIFY" if old_item else "INSERT", old_item, item)
                 _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
@@ -3915,7 +3926,7 @@ def _batch_write_item(data):
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
                 table["items"].get(pk_val, {}).pop(sk_val, None)
                 if old_item:
-                    _emit_stream_event(table_name, "REMOVE", old_item, None)
+                    _emit_stream_event(_normalize_table_name(table_name), "REMOVE", old_item, None)
                 _accumulate_write_capacity(cap, table, old_item, None)
         _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
@@ -3952,12 +3963,12 @@ def _batch_get_item(data):
                 f"1 validation error detected: Value at 'RequestItems.{_bg_table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
-        if table_name not in _tables:
+        if _normalize_table_name(table_name) not in _tables:
             return error_response_json("ResourceNotFoundException",
                 "Requested resource not found", 400)
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
-        table = _tables[table_name]
+        table = _tables[_normalize_table_name(table_name)]
         seen = set()
         for key in cfg.get("Keys", []):
             key_repr = (
@@ -3971,7 +3982,7 @@ def _batch_get_item(data):
     responses = {}
     unprocessed = {}
     for table_name, config in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             unprocessed[table_name] = config
             continue
@@ -4002,6 +4013,10 @@ def _batch_get_item(data):
 
 def _transact_write_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4261,6 +4276,10 @@ _txn_idempotency = AccountRegionScopedDict()
 
 def _transact_get_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4406,7 +4425,7 @@ def _transact_cancel_response(total, failures):
 # ---------------------------------------------------------------------------
 
 def _describe_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     setting = _ttl_settings.get(name, {"TimeToLiveStatus": "DISABLED"})
@@ -4417,7 +4436,7 @@ def _describe_ttl(data):
 
 
 def _update_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("TimeToLiveSpecification", {})
@@ -4438,7 +4457,7 @@ def _update_ttl(data):
 # ---------------------------------------------------------------------------
 
 def _describe_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     pitr_enabled = _pitr_settings.get(name, False)
@@ -4461,7 +4480,7 @@ def _describe_continuous_backups(data):
 
 
 def _update_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("PointInTimeRecoverySpecification", {})
@@ -4580,7 +4599,7 @@ _VALID_PRECISIONS = {"MILLISECOND", "MICROSECOND"}
 
 
 def _validate_kinesis_destination_request(data: dict) -> tuple[str | None, str | None, dict | None]:
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     stream_arn = data.get("StreamArn")
     if not table_name:
         return None, None, error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
@@ -4691,7 +4710,7 @@ def _disable_kinesis_streaming_destination(data):
 
 
 def _describe_kinesis_streaming_destination(data):
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     if not table_name:
         return error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
     if table_name not in _tables:
@@ -5012,11 +5031,11 @@ def _export_arn(table_arn: str) -> str:
     return f"{table_arn}/export/{int(time.time() * 1000)}-{new_uuid()[:8]}"
 
 
-def _import_arn() -> str:
-    return (
-        f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:import/"
-        f"{int(time.time() * 1000)}-{new_uuid()[:8]}"
-    )
+def _import_arn(table_arn: str) -> str:
+    """``<table arn>/import/<epoch millis>-<8 hex>``, the documented shape:
+    ``arn:aws:dynamodb:us-east-1:ACCOUNT:table/target-table/import/01658528578619-c4d4e311``.
+    """
+    return f"{table_arn}/import/{int(time.time() * 1000):014d}-{new_uuid()[:8]}"
 
 
 def _export_table_to_point_in_time(data):
@@ -5114,6 +5133,314 @@ def _list_exports(data):
     return json_response(resp)
 
 
+def _validate_csv_import_options(data):
+    """``InputFormatOptions.Csv`` as the model bounds it.
+
+    ``Delimiter`` is ``{"max": 1, "min": 1, "pattern": "[,;:|\\t ]"}``, and
+    ``HeaderList`` names the attributes each column carries, so a blank or a
+    repeat has no reading.
+    """
+    options = (data.get("InputFormatOptions") or {}).get("Csv")
+    if not isinstance(options, dict):
+        return None
+    delimiter = options.get("Delimiter")
+    if delimiter is not None and not _CSV_DELIMITER_RE.fullmatch(str(delimiter)):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{delimiter}' at "
+            "'inputFormatOptions.csv.delimiter' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [,;:|\\t ]", 400)
+    header = options.get("HeaderList")
+    if header is None:
+        return None
+    if (not isinstance(header, list) or not header
+            or any(not isinstance(name, str) or not name for name in header)
+            or len(set(header)) != len(header)):
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'inputFormatOptions.csv.headerList' "
+            "failed to satisfy constraint: Member must contain distinct non-empty "
+            "attribute names", 400)
+    return None
+
+
+def _import_description(desc):
+    """The stored import without the result the grace window still holds back."""
+    return {k: v for k, v in desc.items() if not k.startswith("_")}
+
+
+class _ImportFailed(Exception):
+    """An import that cannot run, carrying the ``FailureCode`` it reports."""
+
+    def __init__(self, code, message, *, table_created=True):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        # "Since the error was caught before the data was imported into the
+        # table, a new DynamoDB table is not created."
+        self.table_created = table_created
+
+
+def _import_log_stream(import_arn):
+    """The error stream of one import: log group ``/aws-dynamodb/imports``,
+    stream ``<import id>/error`` where "The import ID is the last path element
+    of the ImportArn field"."""
+    from ministack.services import cloudwatch_logs as _cwl
+
+    now_ms = int(time.time() * 1000)
+    if _IMPORT_LOG_GROUP not in _cwl._log_groups:
+        _cwl._log_groups[_IMPORT_LOG_GROUP] = {
+            "arn": _cwl._make_group_arn(_IMPORT_LOG_GROUP),
+            "creationTime": now_ms,
+            "retentionInDays": None,
+            "tags": {},
+            "subscriptionFilters": {},
+            "streams": {},
+        }
+    group = _cwl._log_groups[_IMPORT_LOG_GROUP]
+    stream_name = f"{import_arn.rsplit('/', 1)[-1]}/error"
+    if stream_name not in group["streams"]:
+        group["streams"][stream_name] = {
+            "events": [],
+            "uploadSequenceToken": "1",
+            "creationTime": now_ms,
+            "firstEventTimestamp": None,
+            "lastEventTimestamp": None,
+            "lastIngestionTime": None,
+        }
+    return group["streams"][stream_name]
+
+
+def _log_import_error(import_arn, bucket, key, item_index, message):
+    """One item-level error, in the shape the documented log event carries:
+    ``{"itemS3Pointer": {...}, "importArn": ..., "errorMessages": [...]}``."""
+    try:
+        stream = _import_log_stream(import_arn)
+    except Exception:
+        logger.debug("DynamoDB import %s: error log unavailable", import_arn, exc_info=True)
+        return
+    ts = int(time.time() * 1000)
+    stream["events"].append({
+        "timestamp": ts,
+        "message": json.dumps({
+            "itemS3Pointer": {"bucket": bucket, "key": key, "itemIndex": item_index},
+            "importArn": import_arn,
+            "errorMessages": [message],
+        }),
+        "ingestionTime": ts,
+    })
+    if stream["firstEventTimestamp"] is None:
+        stream["firstEventTimestamp"] = ts
+    stream["lastEventTimestamp"] = ts
+    stream["lastIngestionTime"] = ts
+
+
+def _import_source_objects(s3_source, compression):
+    """``(key, bytes)`` for every object under the source prefix, key order.
+
+    ``ProcessedSizeBytes`` counts what the import reads, and pricing "is based
+    on the uncompressed size of the source data", so the caller measures the
+    decompressed blob.
+    """
+    from ministack.services import s3 as s3_svc
+
+    bucket_name = (s3_source or {}).get("S3Bucket")
+    bucket = s3_svc._buckets.get(bucket_name)
+    if bucket is None:
+        raise _ImportFailed(
+            "S3NoSuchBucket",
+            "The specified bucket does not exist (Service: Amazon S3; Status Code: 404; "
+            "Error Code: NoSuchBucket)",
+            table_created=False)
+    prefix = (s3_source or {}).get("S3KeyPrefix") or ""
+    keys = sorted(key for key in bucket["objects"]
+                  if key.startswith(prefix) and not key.endswith("/"))
+    if not keys:
+        raise _ImportFailed(
+            "S3NoSuchKey",
+            f"No objects were found under s3://{bucket_name}/{prefix}",
+            table_created=False)
+    objects = []
+    for key in keys:
+        raw = s3_svc._get_object_data(bucket_name, key)
+        if raw is None:
+            continue
+        if compression == "GZIP":
+            try:
+                raw = gzip.decompress(raw)
+            except OSError as exc:
+                raise _ImportFailed("InputFormatError",
+                                    f"{key} is not valid GZIP data: {exc}") from None
+        objects.append((key, raw))
+    return bucket_name, objects
+
+
+def _import_csv_items(blob, options, attribute_types):
+    """``(items, malformed_row_count)`` for one CSV object.
+
+    "If this field is specified then the first line of each CSV file is treated
+    as data instead of the header. If this field is not specified the the first
+    line of each CSV file is treated as the header" (CsvOptions.HeaderList).
+    A key column takes the type its AttributeDefinition declares; every other
+    column is imported as a string, and an empty one is left off the item.
+    """
+    delimiter = options.get("Delimiter") or ","
+    header = options.get("HeaderList")
+    try:
+        # utf-8-sig: a BOM would otherwise become part of the first header,
+        # and every item would carry an attribute nothing can query.
+        rows = list(csv.reader(io.StringIO(blob.decode("utf-8-sig")), delimiter=delimiter))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise _ImportFailed("InputFormatError", f"The CSV source is malformed: {exc}") from None
+    if not header:
+        if not rows:
+            return [], []
+        header, rows = rows[0], rows[1:]
+    items, malformed = [], []
+    for index, row in enumerate(rows):
+        if not any(cell.strip() for cell in row):
+            continue
+        if len(row) != len(header):
+            malformed.append((index, f"CSV row has {len(row)} columns but the header "
+                                     f"has {len(header)} columns"))
+            continue
+        item = {}
+        for column, value in zip(header, row):
+            if value == "":
+                continue
+            item[column] = {attribute_types.get(column, "S"): value}
+        items.append((index, item))
+    return items, malformed
+
+
+def _import_dynamodb_json_items(blob):
+    """``(items, malformed)`` for one DYNAMODB_JSON object: one
+    ``{"Item": {...}}`` per line."""
+    items, malformed = [], []
+    for index, line in enumerate(blob.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            malformed.append((index, f"The item is not valid JSON: {exc}"))
+            continue
+        item = record.get("Item") if isinstance(record, dict) else None
+        if isinstance(item, dict):
+            items.append((index, item))
+        else:
+            malformed.append((index, "The item is not in DYNAMODB_JSON format"))
+    return items, malformed
+
+
+def _drop_import_table(table_name):
+    """Undo the table a failed import created, through the service's own path."""
+    try:
+        _delete_table({"TableName": table_name})
+    except Exception:
+        logger.debug("DynamoDB import: could not drop %s", table_name, exc_info=True)
+
+
+def _run_import(import_arn, table_name):
+    """Read the source and write its items, updating the description as it goes.
+
+    Runs on a background thread with the submitting request's account and
+    region snapshotted, so ``DescribeImport`` reports the counters climbing
+    the way a real import does.
+    """
+    if _IMPORT_COMPLETE_AFTER_SEC > 0:
+        time.sleep(_IMPORT_COMPLETE_AFTER_SEC)
+    desc = _imports.get(import_arn)
+    if not desc or desc.get("ImportStatus") != "IN_PROGRESS":
+        return
+    compression = desc.get("InputCompressionType") or "NONE"
+    try:
+        if compression not in ("NONE", "GZIP"):
+            raise _ImportFailed(
+                "InputCompressionTypeNotSupported",
+                f"{compression} decompression needs a library MiniStack does not ship; "
+                "use NONE or GZIP", table_created=False)
+        if desc["InputFormat"] == "ION":
+            raise _ImportFailed(
+                "InputFormatNotSupported",
+                "ION parsing needs a library MiniStack does not ship; "
+                "use CSV or DYNAMODB_JSON", table_created=False)
+        attribute_types = {
+            defn.get("AttributeName"): defn.get("AttributeType", "S")
+            for defn in (desc.get("TableCreationParameters") or {}).get(
+                "AttributeDefinitions", [])
+            if defn.get("AttributeName")
+        }
+        options = (desc.get("InputFormatOptions") or {}).get("Csv") or {}
+        bucket_name, objects = _import_source_objects(desc.get("S3BucketSource"), compression)
+        for key, blob in objects:
+            desc["ProcessedSizeBytes"] += len(blob)
+            try:
+                if desc["InputFormat"] == "CSV":
+                    items, malformed = _import_csv_items(blob, options, attribute_types)
+                else:
+                    items, malformed = _import_dynamodb_json_items(blob)
+            except _ImportFailed as unreadable:
+                # "If the Amazon S3 object itself is malformed ... we may skip
+                # processing the remaining portion of the object."
+                desc["ErrorCount"] += 1
+                _log_import_error(import_arn, bucket_name, key, 0, unreadable.message)
+                continue
+            for index, reason in malformed:
+                desc["ProcessedItemCount"] += 1
+                desc["ErrorCount"] += 1
+                _log_import_error(import_arn, bucket_name, key, index, reason)
+            for index, item in items:
+                desc["ProcessedItemCount"] += 1
+                status, _headers, body = _put_item({"TableName": table_name, "Item": item})
+                if status == 200:
+                    # Counts loads, not the table's ItemCount: "the number of
+                    # items processed in the import table description will not
+                    # match the number of items in the target table".
+                    desc["ImportedItemCount"] += 1
+                else:
+                    desc["ErrorCount"] += 1
+                    _log_import_error(import_arn, bucket_name, key, index,
+                                      _import_error_message(body))
+    except _ImportFailed as failure:
+        if not failure.table_created:
+            _drop_import_table(table_name)
+        _finish_import(desc, "FAILED", failure.code, failure.message)
+        return
+    except Exception:
+        logger.exception("DynamoDB import %s crashed", import_arn)
+        _finish_import(desc, "FAILED", "InternalServerError",
+                       "Internal Failure. Please try your request again.")
+        return
+
+    if desc["ErrorCount"]:
+        # "At the end of job, the import status is set to FAILED with a
+        # FailureCode, ItemValidationError and the FailureMessage ..."
+        _finish_import(
+            desc, "FAILED", "ItemValidationError",
+            "Some of the items failed validation checks and were not imported. "
+            "Please check CloudWatch error logs for more details.")
+        return
+    _finish_import(desc, "COMPLETED")
+
+
+def _import_error_message(body):
+    """The message of the error response ``_put_item`` answered."""
+    try:
+        return json.loads(body.decode("utf-8")).get("message", "")
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+
+
+def _finish_import(desc, status, failure_code=None, failure_message=None):
+    desc["ImportStatus"] = status
+    desc["EndTime"] = int(time.time())
+    if failure_code:
+        desc["FailureCode"] = failure_code
+        desc["FailureMessage"] = failure_message
+
+
 def _import_table(data):
     s3_source = data.get("S3BucketSource")
     fmt = data.get("InputFormat")
@@ -5127,6 +5454,10 @@ def _import_table(data):
     if fmt not in ("CSV", "DYNAMODB_JSON", "ION"):
         return error_response_json("ValidationException",
             f"Invalid InputFormat: {fmt}. Valid values: CSV, DYNAMODB_JSON, ION", 400)
+    if fmt == "CSV":
+        err = _validate_csv_import_options(data)
+        if err:
+            return err
     if not table_params:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableCreationParameters' failed to satisfy constraint: Member must not be null", 400)
@@ -5141,7 +5472,14 @@ def _import_table(data):
     if client_token:
         for desc in _imports.values():
             if desc.get("ClientToken") == client_token:
-                return json_response({"ImportTableDescription": desc})
+                return json_response({"ImportTableDescription": _import_description(desc)})
+    running = sum(1 for desc in _imports.values()
+                  if desc.get("ImportStatus") == "IN_PROGRESS")
+    if running >= _IMPORT_CONCURRENCY_LIMIT:
+        return error_response_json(
+            "LimitExceededException",
+            f"Subscriber limit exceeded: There is a limit of "
+            f"{_IMPORT_CONCURRENCY_LIMIT} concurrent import jobs per account", 400)
     # Create the destination table from TableCreationParameters.
     create_req = dict(table_params)
     status, _, body = _create_table(create_req)
@@ -5149,15 +5487,18 @@ def _import_table(data):
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     table_arn = _tables[table_name]["TableArn"]
     table_id = _tables[table_name].get("TableId")
-    arn = _import_arn()
-    now = time.time()
+    arn = _import_arn(table_arn)
+    now = int(time.time())
     desc = {
         "ImportArn": arn,
         "ImportStatus": "IN_PROGRESS",
         "TableArn": table_arn,
         "TableId": table_id,
         "S3BucketSource": s3_source,
+        "CloudWatchLogGroupArn": (
+            f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{_IMPORT_LOG_GROUP}:*"),
         "InputFormat": fmt,
+        "InputCompressionType": data.get("InputCompressionType") or "NONE",
         "StartTime": now,
         "ProcessedSizeBytes": 0,
         "ProcessedItemCount": 0,
@@ -5167,12 +5508,12 @@ def _import_table(data):
     }
     if data.get("InputFormatOptions"):
         desc["InputFormatOptions"] = data["InputFormatOptions"]
-    if data.get("InputCompressionType"):
-        desc["InputCompressionType"] = data["InputCompressionType"]
     if client_token:
         desc["ClientToken"] = client_token
     _imports[arn] = desc
-    return json_response({"ImportTableDescription": desc})
+    # spawn_background snapshots this request's account and region.
+    spawn_background(_run_import, arn, table_name, thread_name="ministack-ddb-import")
+    return json_response({"ImportTableDescription": _import_description(desc)})
 
 
 def _describe_import(data):
@@ -5184,10 +5525,12 @@ def _describe_import(data):
     if not desc:
         return error_response_json("ImportNotFoundException",
             f"Import not found: {arn}", 400)
-    if desc.get("ImportStatus") == "IN_PROGRESS" and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC:
-        desc["ImportStatus"] = "COMPLETED"
-        desc["EndTime"] = time.time()
-    return json_response({"ImportTableDescription": desc})
+    # An import restored from a snapshot has no worker behind it.
+    if (desc.get("ImportStatus") == "IN_PROGRESS" and desc.get("_orphaned")
+            and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC):
+        _finish_import(desc, "FAILED", "InternalServerError",
+                       "Internal Failure. Please try your request again.")
+    return json_response({"ImportTableDescription": _import_description(desc)})
 
 
 def _list_imports(data):

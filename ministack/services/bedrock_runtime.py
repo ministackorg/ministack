@@ -49,7 +49,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -219,7 +218,9 @@ def _mock_reply(model_id: str, messages, system) -> str:
 
 def _build_converse_response(model_id: str, messages, system, started_at_ms: int, text: str,
                               input_tokens: int | None = None,
-                              output_tokens: int | None = None) -> dict:
+                              output_tokens: int | None = None,
+                              content_blocks=None,
+                              stop_reason: str = "end_turn") -> dict:
     if input_tokens is None:
         input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
     if output_tokens is None:
@@ -229,10 +230,10 @@ def _build_converse_response(model_id: str, messages, system, started_at_ms: int
         "output": {
             "message": {
                 "role": "assistant",
-                "content": [{"text": text}],
+                "content": content_blocks if content_blocks else [{"text": text}],
             }
         },
-        "stopReason": "end_turn",
+        "stopReason": stop_reason,
         "usage": {
             "inputTokens": input_tokens,
             "outputTokens": output_tokens,
@@ -247,29 +248,101 @@ def _build_converse_response(model_id: str, messages, system, started_at_ms: int
 # ---------------------------------------------------------------------------
 
 
-def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> str | None:
-    """Forward to MINISTACK_BEDROCK_PROXY_URL using OpenAI chat-completions
-    shape. Returns assistant text on success, None on any failure (caller falls
-    back to mock)."""
+def _openai_tools(tool_config):
+    """The Converse toolConfig as OpenAI function tools, the shape Ollama's
+    OpenAI-compatible endpoint takes. toolSpec.inputSchema.json is already a
+    JSON Schema, which is what `parameters` wants."""
+    tools = []
+    for entry in (tool_config or {}).get("tools") or []:
+        spec = (entry or {}).get("toolSpec")
+        if not isinstance(spec, dict) or not spec.get("name"):
+            continue
+        function = {"name": spec["name"],
+                    "parameters": (spec.get("inputSchema") or {}).get("json") or {}}
+        if spec.get("description"):
+            function["description"] = spec["description"]
+        tools.append({"type": "function", "function": function})
+    choice = (tool_config or {}).get("toolChoice") or {}
+    if "any" in choice:
+        tool_choice = "required"
+    elif "tool" in choice:
+        tool_choice = {"type": "function",
+                       "function": {"name": (choice["tool"] or {}).get("name", "")}}
+    elif "auto" in choice:
+        tool_choice = "auto"
+    else:
+        tool_choice = None
+    return tools, tool_choice
+
+
+def _openai_messages(messages, system):
+    """Converse messages as OpenAI chat messages.
+
+    A toolUse block becomes an assistant tool_call and a toolResult block
+    becomes a role "tool" message, so a tool-calling loop survives the round
+    trip instead of losing its history.
+    """
+    out = []
+    for entry in system or []:
+        if isinstance(entry, dict) and "text" in entry:
+            out.append({"role": "system", "content": entry["text"]})
+    for message in messages or []:
+        role = message.get("role", "user")
+        parts, tool_calls, tool_results = [], [], []
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if "text" in block:
+                parts.append(block["text"])
+            elif "toolUse" in block:
+                use = block["toolUse"] or {}
+                tool_calls.append({
+                    "id": use.get("toolUseId", ""),
+                    "type": "function",
+                    "function": {"name": use.get("name", ""),
+                                 "arguments": json.dumps(use.get("input") or {})},
+                })
+            elif "toolResult" in block:
+                result = block["toolResult"] or {}
+                texts = []
+                for item in result.get("content") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if "text" in item:
+                        texts.append(item["text"])
+                    elif "json" in item:
+                        texts.append(json.dumps(item["json"]))
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": result.get("toolUseId", ""),
+                    "content": "\n".join(texts),
+                })
+        if tool_calls:
+            out.append({"role": "assistant", "content": "\n".join(parts) or None,
+                        "tool_calls": tool_calls})
+        elif parts:
+            out.append({"role": role, "content": "\n".join(parts)})
+        out.extend(tool_results)
+    return out
+
+
+def _proxy_openai_chat_message(model_id: str, messages, system, inference_config,
+                               tool_config=None):
+    """Forward to MINISTACK_BEDROCK_PROXY_URL in OpenAI chat-completions shape
+    and return the assistant message object with the proxy's (input, output)
+    token counts, or (None, None) on any failure (the caller falls back to the mock)."""
     if not _PROXY_URL:
-        return None
-    openai_messages = []
-    for s in system or []:
-        if isinstance(s, dict) and "text" in s:
-            openai_messages.append({"role": "system", "content": s["text"]})
-    for m in messages or []:
-        role = m.get("role", "user")
-        parts = []
-        for c in m.get("content") or []:
-            if isinstance(c, dict) and "text" in c:
-                parts.append(c["text"])
-        if parts:
-            openai_messages.append({"role": role, "content": "\n".join(parts)})
+        return None, None
     payload = {
         "model": model_id,
-        "messages": openai_messages,
+        "messages": _openai_messages(messages, system),
         "stream": False,
     }
+    tools, tool_choice = _openai_tools(tool_config)
+    if tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
     if inference_config:
         if "maxTokens" in inference_config:
             payload["max_tokens"] = inference_config["maxTokens"]
@@ -279,9 +352,8 @@ def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> 
             payload["top_p"] = inference_config["topP"]
         if "stopSequences" in inference_config:
             payload["stop"] = inference_config["stopSequences"]
-    url = f"{_PROXY_URL}/v1/chat/completions"
     req = urllib.request.Request(
-        url,
+        f"{_PROXY_URL}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -291,14 +363,63 @@ def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> 
             data = json.load(resp)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         logger.debug("bedrock proxy unreachable, falling back to mock: %s", e)
-        return None
+        return None, None
     except Exception:
         logger.exception("bedrock proxy returned malformed response, falling back to mock")
-        return None
+        return None, None
     try:
-        return data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
+        return None, None
+    if not isinstance(message, dict):
+        return None, None
+    usage = data.get("usage") if isinstance(data, dict) else None
+    counts = None
+    if isinstance(usage, dict):
+        prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        if isinstance(prompt, int) and isinstance(completion, int):
+            counts = (prompt, completion)
+    return message, counts
+
+
+def _converse_blocks_from_message(message):
+    """The assistant content blocks for an OpenAI message, plus the stop reason.
+
+    An OpenAI tool_call becomes a Converse toolUse block; a model that asked for
+    a tool stops with tool_use rather than end_turn.
+    """
+    blocks, stop_reason = [], "end_turn"
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        blocks.append({"text": text})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = (call or {}).get("function") or {}
+        raw = function.get("arguments")
+        if isinstance(raw, str):
+            try:
+                arguments = json.loads(raw or "{}")
+            except ValueError:
+                # A model that emits unparseable arguments is a documented
+                # Converse outcome, not a proxy failure.
+                return blocks, "malformed_tool_use"
+        else:
+            arguments = raw or {}
+        blocks.append({"toolUse": {
+            "toolUseId": call.get("id") or f"tooluse_{index}",
+            "name": function.get("name", ""),
+            "input": arguments,
+        }})
+        stop_reason = "tool_use"
+    return blocks, stop_reason
+
+
+def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> str | None:
+    """The assistant text only, for the callers that do not handle tools."""
+    message, _ = _proxy_openai_chat_message(model_id, messages, system, inference_config)
+    if message is None:
         return None
+    content = message.get("content")
+    return content if isinstance(content, str) else None
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +488,15 @@ def _converse(model_id: str, headers, body) -> tuple:
                 "x-amzn-bedrock-output-token-count": str(response["usage"]["outputTokens"]),
             }, json.dumps(response).encode()
 
-    text = _proxy_to_openai_chat(model_id, messages, system, inference_config)
-    if text is None:
+    tool_config = body_obj.get("toolConfig")
+    message, counts = _proxy_openai_chat_message(
+        model_id, messages, system, inference_config, tool_config)
+    blocks, stop_reason = ([], "end_turn")
+    if message is None:
         text = _mock_reply(model_id, messages, system)
+    else:
+        blocks, stop_reason = _converse_blocks_from_message(message)
+        text = "".join(b["text"] for b in blocks if "text" in b)
 
     output_assessment = None
     if guardrail is not None:
@@ -377,10 +504,19 @@ def _converse(model_id: str, headers, body) -> tuple:
         output_assessment = output_result["assessment"]
         if output_result["blocked"]:
             text = guardrail.get("BlockedOutputsMessaging") or "Blocked by guardrail."
+            # A blocked output replaces the turn, tool calls included: serving
+            # the original blocks would hand back what the guardrail refused.
+            blocks, stop_reason = [], "end_turn"
         elif output_result["anonymized"]:
             text = output_result["masked_text"]
+            blocks = ([{"text": text}]
+                      + [b for b in blocks if "toolUse" in b])
 
-    response = _build_converse_response(model_id, messages, system, started, text)
+    response = _build_converse_response(
+        model_id, messages, system, started, text,
+        input_tokens=counts[0] if counts else None,
+        output_tokens=counts[1] if counts else None,
+        content_blocks=blocks or None, stop_reason=stop_reason)
     if guardrail is not None:
         if output_assessment and any(
             f.get("action") == "BLOCKED"
@@ -437,10 +573,16 @@ def _es_event(event_type: str, payload: dict) -> bytes:
 
 
 def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, text: str,
-                           stop_reason: str = "end_turn") -> bytes:
+                           stop_reason: str = "end_turn", tool_uses=(),
+                           input_tokens: int | None = None,
+                           output_tokens: int | None = None) -> bytes:
     """Emit the AWS ConverseStream event sequence:
       messageStart -> contentBlockDelta* -> contentBlockStop -> messageStop -> metadata
     All events under :event-type, payload is application/json per AWS wire trace.
+
+    A tool call adds its own block after the text one: contentBlockStart carries
+    toolUseId and name, and the input arrives as a contentBlockDelta whose
+    toolUse.input is a JSON string, per ToolUseBlockStart / ToolUseBlockDelta.
     """
     stream = b""
     stream += _es_event("messageStart", {"role": "assistant"})
@@ -460,9 +602,22 @@ def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, 
             "delta": {"text": ""},
         })
     stream += _es_event("contentBlockStop", {"contentBlockIndex": 0})
+    for offset, use in enumerate(tool_uses or ()):
+        index = offset + 1
+        stream += _es_event("contentBlockStart", {
+            "contentBlockIndex": index,
+            "start": {"toolUse": {"toolUseId": use["toolUseId"], "name": use["name"]}},
+        })
+        stream += _es_event("contentBlockDelta", {
+            "contentBlockIndex": index,
+            "delta": {"toolUse": {"input": json.dumps(use.get("input") or {})}},
+        })
+        stream += _es_event("contentBlockStop", {"contentBlockIndex": index})
     stream += _es_event("messageStop", {"stopReason": stop_reason})
-    input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
-    output_tokens = _estimate_tokens(text)
+    if input_tokens is None:
+        input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
+    if output_tokens is None:
+        output_tokens = _estimate_tokens(text)
     latency_ms = max(1, int(time.time() * 1000) - started_at_ms)
     stream += _es_event("metadata", {
         "usage": {
@@ -507,20 +662,34 @@ def _converse_stream(model_id: str, headers, body) -> tuple:
             stop_reason = "guardrail_intervened"
             guardrail = None  # no output pass on a blocked input
 
+    tool_uses = []
+    counts = None
     if stop_reason is None:
-        text = _proxy_to_openai_chat(model_id, messages, system, inference_config)
-        if text is None:
+        message, counts = _proxy_openai_chat_message(
+            model_id, messages, system, inference_config, body_obj.get("toolConfig"))
+        if message is None:
             text = _mock_reply(model_id, messages, system)
+        else:
+            blocks, proxied_stop = _converse_blocks_from_message(message)
+            text = "".join(b["text"] for b in blocks if "text" in b)
+            tool_uses = [b["toolUse"] for b in blocks if "toolUse" in b]
+            if proxied_stop != "end_turn":
+                stop_reason = proxied_stop
         if guardrail is not None:
             output_result = _evaluate_guardrail(guardrail, "OUTPUT", text)
             if output_result["blocked"]:
                 text = guardrail.get("BlockedOutputsMessaging") or "Blocked by guardrail."
                 stop_reason = "guardrail_intervened"
+                # A blocked output withholds the tool calls with the text.
+                tool_uses = []
             elif output_result["anonymized"]:
                 text = output_result["masked_text"]
 
     stream_bytes = _build_converse_stream(model_id, messages, system, started, text,
-                                          stop_reason=stop_reason or "end_turn")
+                                          stop_reason=stop_reason or "end_turn",
+                                          tool_uses=tool_uses,
+                                          input_tokens=counts[0] if counts else None,
+                                          output_tokens=counts[1] if counts else None)
     resp_headers = {
         "Content-Type": "application/vnd.amazon.eventstream",
         "x-amzn-bedrock-content-type": "application/json",
@@ -1043,12 +1212,6 @@ def _apply_guardrail(guardrail_id: str, version: str, body) -> tuple:
 _async_invokes = AccountRegionScopedDict()  # invocationArn -> dict
 
 
-try:
-    _restored = load_state("bedrock_runtime")
-    if _restored:
-        _async_invokes.update(_restored.get("async_invokes", {}))
-except Exception:
-    logger.exception("Failed to restore bedrock_runtime state; continuing fresh")
 
 
 def _invocation_arn(invocation_id: str) -> str:
@@ -1319,7 +1482,11 @@ def get_state():
     return copy.deepcopy({"async_invokes": _async_invokes})
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _async_invokes.update(data.get("async_invokes", {}))

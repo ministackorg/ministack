@@ -575,10 +575,14 @@ def test_firehose_lambda_processor_transforms_record(fh, s3, lam):
         body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
         assert body == b"HELLO", body
     finally:
-        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
-        except Exception: pass
-        try: lam.delete_function(FunctionName=fn)
-        except Exception: pass
+        try:
+            fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
 
 
 def test_firehose_lambda_processor_dropped_record_not_written(fh, s3, lam):
@@ -603,10 +607,14 @@ def test_firehose_lambda_processor_dropped_record_not_written(fh, s3, lam):
         objs = s3.list_objects_v2(Bucket=bucket, Prefix="out/").get("Contents", [])
         assert objs == [], f"expected no S3 objects, got {objs}"
     finally:
-        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
-        except Exception: pass
-        try: lam.delete_function(FunctionName=fn)
-        except Exception: pass
+        try:
+            fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
 
 
 def test_firehose_lambda_processor_not_found_passes_through(fh, s3):
@@ -632,8 +640,10 @@ def test_firehose_lambda_processor_not_found_passes_through(fh, s3):
         body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
         assert body == b"untouched"
     finally:
-        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
-        except Exception: pass
+        try:
+            fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception:
+            pass
 
 
 def test_firehose_kinesis_source_with_lambda_processor(fh, s3, lam, kin):
@@ -682,12 +692,18 @@ def test_firehose_kinesis_source_with_lambda_processor(fh, s3, lam, kin):
         body = s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read()
         assert body == b"proc:payload", body
     finally:
-        try: fh.delete_delivery_stream(DeliveryStreamName=delivery)
-        except Exception: pass
-        try: lam.delete_function(FunctionName=fn)
-        except Exception: pass
-        try: kin.delete_stream(StreamName=stream)
-        except Exception: pass
+        try:
+            fh.delete_delivery_stream(DeliveryStreamName=delivery)
+        except Exception:
+            pass
+        try:
+            lam.delete_function(FunctionName=fn)
+        except Exception:
+            pass
+        try:
+            kin.delete_stream(StreamName=stream)
+        except Exception:
+            pass
 
 
 def test_firehose_same_name_streams_are_region_scoped(fh):
@@ -769,7 +785,7 @@ def test_firehose_restore_legacy_account_scoped_state_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        _fh.restore_state({"_streams": legacy_streams})
+        _fh.load_persisted_state({"_streams": legacy_streams})
 
         # The legacy stream lands in the region carried by its ARN, not the
         # active request region.

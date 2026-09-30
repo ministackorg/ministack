@@ -89,7 +89,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import ministack.services.s3 as s3_svc
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
@@ -108,6 +107,7 @@ logger = logging.getLogger("signer")
 _jobs = AccountRegionScopedDict()      # jobId -> job record (camelCase fields)
 _profiles = AccountRegionScopedDict()  # profileName -> profile record
 _tokens = AccountRegionScopedDict()    # clientRequestToken -> first StartSigningJob response
+_TOKEN_CACHE_MAX = 1024                # same bound apigateway_v1 uses for its authorizer cache
 
 
 def reset():
@@ -124,7 +124,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _jobs.update(data.get("jobs", {}))
@@ -132,12 +136,6 @@ def restore_state(data):
     _tokens.update(data.get("tokens", {}))
 
 
-try:
-    _restored = load_state("signer")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted signer state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------
@@ -547,8 +545,23 @@ def _start_signing_job(body, headers=None):
     }
     response = {"jobId": job_id, "jobOwner": account}
     if token:
-        _tokens[token] = dict(response)
+        _remember_token(token, response)
     return json_response(response)
+
+
+def _remember_token(token: str, response: dict) -> None:
+    """Record a clientRequestToken's first response so a replay returns it.
+
+    Bounded like ``_AUTHORIZER_CACHE_MAX`` in ``apigateway_v1``: the key is the
+    caller's, so an unbounded map grows with every distinct token and is
+    persisted with the rest of the service state. The oldest entries go first;
+    replaying a token older than the bound re-runs the job, which is the same
+    outcome as never having sent one.
+    """
+    if len(_tokens) >= _TOKEN_CACHE_MAX:
+        for stale in list(_tokens)[: len(_tokens) - _TOKEN_CACHE_MAX + 1]:
+            _tokens.pop(stale, None)
+    _tokens[token] = dict(response)
 
 
 def _describe_signing_job(job_id):

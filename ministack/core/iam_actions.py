@@ -72,7 +72,11 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "inspector2": "inspector2",
     "iot": "iot",
     "iot-data": "iot",
-    "iot-jobs-data": "iot",
+    # The jobs data plane has its own IAM namespace. AWS authorizes the four
+    # HTTP job-execution operations as iotjobsdata:..., and a grant of the
+    # same operation name under iot: does not carry them. The
+    # fifth operation in that model is the exception below.
+    "iot-jobs-data": "iotjobsdata",
     "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
@@ -112,6 +116,18 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "waf": "waf",
     "waf-regional": "waf-regional",
     "wafv2": "wafv2",
+}
+
+
+# The map above is keyed by service, so it moves every operation the service's
+# botocore model declares. Where AWS does not, the pair belongs here.
+# StartCommandExecution rides the jobs data-plane endpoint and model, but its
+# own API reference derives the permission from iot:StartCommandExecution, and
+# the Service Authorization Reference lists only the four job-execution
+# operations under iotjobsdata. Read by the generic REST route matcher only,
+# the tier every rest-json operation resolves through.
+_IAM_NAMESPACE_BY_OPERATION: dict[tuple[str, str], str] = {
+    ("iot-jobs-data", "StartCommandExecution"): "iot",
 }
 
 
@@ -228,6 +244,8 @@ _S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "retention": {"GET": "GetObjectRetention", "PUT": "PutObjectRetention"},
     "legal-hold": {"GET": "GetObjectLegalHold", "PUT": "PutObjectLegalHold"},
     "attributes": {"GET": "GetObjectAttributes"},
+    "annotation": {"GET": "GetObjectAnnotation", "PUT": "PutObjectAnnotation",
+                   "DELETE": "DeleteObjectAnnotation"},
     "select": {"POST": "GetObject"},   # SelectObjectContent reads the object
     "torrent": {"GET": "GetObject"},
 }
@@ -266,6 +284,9 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
                 break
     if action is None:
         action = _S3_ACTIONS.get((method, depth))
+    # GET ?annotation without annotationName is ListObjectAnnotations.
+    if action == "GetObjectAnnotation" and "annotationName" not in query_params:
+        action = "ListObjectAnnotations"
 
     if depth == 2 and action and _query_param(query_params, "versionId"):
         action = _S3_VERSIONED_ACTIONS.get(action, action)
@@ -274,7 +295,8 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
 
 # Operations that take x-amz-bypass-governance-retention; when the header says
 # true they also need s3:BypassGovernanceRetention on the object.
-_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention"})
+_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention",
+                                           "PutObjectAnnotation", "DeleteObjectAnnotation"})
 
 
 def _s3_source_object(headers: dict) -> tuple[str, str] | None:
@@ -501,7 +523,15 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
         if seg.startswith("{") and seg.endswith("+}"):
             regex_parts.append(".+")
         elif seg.startswith("{") and seg.endswith("}"):
-            regex_parts.append("[^/]+")
+            # Lazy, not single-segment. A botocore label is non-greedy because
+            # the SDK percent-encodes any "/" the value carries, so it stays one
+            # segment on the wire; we match the decoded path, where those are
+            # separators again. Every ARN-valued label is in this position, as
+            # is an MQTT topic, so "[^/]+" resolves no action at all and the
+            # request authorizes against "*". The pattern is anchored and the
+            # literal segments around a label still bound it, and a route with
+            # more literals outscores one with fewer.
+            regex_parts.append(".+?")
         else:
             regex_parts.append(re.escape(seg))
             specificity += 1
@@ -660,7 +690,7 @@ def extract_iam_action(service: str, method: str, path: str,
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
-        return f"{namespace}:{action_name}"
+        return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -787,7 +817,12 @@ def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
                          account_id: str) -> str:
-    """Construct the resource ARN for the request, or '*' if unknown."""
+    """Construct the resource ARN for the request, or '*' if unknown.
+
+    ``query_params`` is the router's params dict, which for a query-protocol
+    POST carries the form-encoded body merged underneath the query string
+    (``app._routing_params``). The branches below read it directly.
+    """
 
     if service == "s3":
         parts = [p for p in path.split("/") if p]
@@ -886,6 +921,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         if not secret_id:
             secret_id = _safe_json_field(body, "Name")
         if secret_id:
+            # AWS evaluates against the stored ARN, whose six random characters
+            # the request need not carry. The handlers' own lookup reads them;
+            # a miss keeps the name-derived ARN.
+            from ministack.services import secretsmanager as secretsmanager_svc
+
+            _, secret = secretsmanager_svc._resolve(secret_id)
+            if secret:
+                return secret["ARN"]
             if secret_id.startswith("arn:"):
                 return secret_id
             return f"arn:aws:secretsmanager:{region}:{account_id}:secret:{secret_id}"
@@ -1397,8 +1440,20 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     # --- IoT (REST path-based, multiple resource types) ---
 
-    if service == "iot":
+    # Both data planes carry iot: actions on iot: ARNs, and their paths are the
+    # ones the map below already names: a publish is /topics/{topic}, a shadow
+    # and a job execution are /things/{thingName}/... . Routed by credential
+    # scope, they arrive here as their own service keys.
+    if service in ("iot", "iot-data", "iot-jobs-data"):
         parts = [p for p in path.split("/") if p]
+        # Publish and the retained-message calls take everything after the
+        # prefix as the topic, and a topic is multi-level: the ARN is
+        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
+        # percent-encoded from the SDK, which is why iot_data._publish unquotes
+        # as well.
+        if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
+            topic = unquote("/".join(parts[1:]))
+            return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1406,15 +1461,14 @@ def extract_resource_arn(service: str, method: str, path: str,
             "policies": "policy",
             "certificates": "cert",
             "rules": "rule",
+            "jobs": "job",
+            "provisioning-templates": "provisioningtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
                 si = parts.index(segment)
                 if si + 1 < len(parts):
-                    name = parts[si + 1]
-                    if rtype == "cert":
-                        return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
-                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{parts[si + 1]}"
         return "*"
 
     # --- API Gateway (REST path-based) ---

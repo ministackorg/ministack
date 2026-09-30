@@ -14,8 +14,15 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import sqs_policy_allow_s3
 
 from ministack.services import pipes as _pipes
+from ministack.services.cloudformation.provisioners import (
+    _CONDITIONALLY_REPLACING_PROPERTIES,
+    _REPLACING_PROPERTIES,
+    _RESOURCE_HANDLERS,
+)
+from ministack.services.cloudformation.stacks import _diff_resources
 
 
 def _cfn_iceberg_json(path):
@@ -47,6 +54,13 @@ _FAILING_RESOURCE = {
         "ServiceToken": "arn:aws:lambda:us-east-1:000000000000:function:cfn-does-not-exist",
     },
 }
+
+
+def _cfn_with_failing_resource(body, depends_on):
+    """The template plus _FAILING_RESOURCE after ``depends_on``."""
+    template = json.loads(body)
+    template["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": depends_on}
+    return json.dumps(template)
 
 
 def _wait_stack(cfn, name, timeout=30):
@@ -690,6 +704,10 @@ def test_cfn_s3_bucket_notification_configuration(cfn, s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "cfn-notif-bucket", "000000000000"))})
 
     def template(with_notif):
         props = {"BucketName": "cfn-notif-bucket"}
@@ -1613,6 +1631,34 @@ def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
         cfn.delete_stack(StackName=S)
 
 
+def test_cfn_change_set_changes_carry_their_type(cfn):
+    """Every entry of a change set's Changes carries Type "Resource", the one
+    ChangeType there is; measured on AWS for Add, Modify, Remove and Import."""
+    S = f"cfn-change-type-{_uuid_mod.uuid4().hex[:8]}"
+
+    def param(suffix, value="v"):
+        return {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/{S}/{suffix}", "Type": "String", "Value": value}}
+
+    cfn.create_change_set(StackName=S, ChangeSetName="create", ChangeSetType="CREATE",
+                          TemplateBody=json.dumps({"Resources": {"X": param("x"), "Y": param("y")}}))
+    try:
+        created = cfn.describe_change_set(ChangeSetName="create", StackName=S)["Changes"]
+        assert [(c.get("Type"), c["ResourceChange"]["Action"]) for c in created] == [
+            ("Resource", "Add"), ("Resource", "Add")]
+        cfn.execute_change_set(ChangeSetName="create", StackName=S)
+        _wait_stack(cfn, S)
+        cfn.create_change_set(StackName=S, ChangeSetName="update", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {
+                                  "X": param("x", "w"), "Z": param("z")}}))
+        updated = cfn.describe_change_set(ChangeSetName="update", StackName=S)["Changes"]
+        assert sorted((c.get("Type"), c["ResourceChange"]["Action"]) for c in updated) == [
+            ("Resource", "Add"), ("Resource", "Modify"), ("Resource", "Remove")]
+    finally:
+        cfn.delete_stack(StackName=S)
+        _wait_stack(cfn, S)
+
+
 def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
     """A change set lists a resource whose DeletionPolicy, UpdateReplacePolicy
     or Metadata changed and nothing else: Modify, Replacement False, the
@@ -1679,7 +1725,7 @@ def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
         change = described["Changes"][0]["ResourceChange"]
         assert change["Scope"] == ["Properties"]
         assert [d["Target"]["Name"] for d in change["Details"]] == ["QueueName"]
-        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Conditionally"
+        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Always"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -2557,7 +2603,7 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
     (Transform: {Name: ...}) is the form that used to be reported and not
     applied."""
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
         declared_transforms,
     )
 
@@ -2571,13 +2617,38 @@ def test_cfn_declared_transforms_drive_the_sam_transform(monkeypatch):
                      ["AWS::Serverless-2016-10-31"]):
         template = json.loads(json.dumps(dict(sam, Transform=declared)))
         assert declared_transforms(template) == ["AWS::Serverless-2016-10-31"]
-        out = _apply_sam_transform_if_applicable(template)
+        out = _apply_transforms(template)
         types = {res.get("Type") for res in out["Resources"].values()}
         assert "AWS::Serverless::Function" not in types
         assert "AWS::Lambda::Function" in types
     # Entries the section cannot name are dropped rather than reported.
     assert declared_transforms({"Transform": [{"Parameters": {}}, 5]}) == []
     assert declared_transforms({}) == []
+
+
+def test_cfn_language_extensions_runs_before_the_sam_transform():
+    """"If you're using both the AWS::LanguageExtensions and AWS::Serverless
+    transforms, the AWS::LanguageExtensions transform must come before the
+    AWS::Serverless transform in the list" (transform-aws-languageextensions).
+    A loop over AWS::Serverless::Function resources therefore reaches SAM
+    expanded: in the other order SAM is handed an Fn::ForEach key it does not
+    know, and the copies the loop produces are never translated."""
+    from ministack.services.cloudformation.engine import _apply_transforms
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": ["AWS::LanguageExtensions", "AWS::Serverless-2016-10-31"],
+        "Resources": {"Fn::ForEach::Functions": ["Id", ["A", "B"], {
+            "Fn${Id}": {"Type": "AWS::Serverless::Function", "Properties": {
+                "Runtime": "python3.12", "Handler": "index.handler",
+                "CodeUri": "s3://b/k"}}}]},
+    }
+    out = _apply_transforms(json.loads(json.dumps(template)))
+    types = {name: res.get("Type") for name, res in out["Resources"].items()}
+    assert types["FnA"] == "AWS::Lambda::Function"
+    assert types["FnB"] == "AWS::Lambda::Function"
+    # Both transforms are spent, so the processed template declares neither.
+    assert "Transform" not in out
 
 
 def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
@@ -5310,7 +5381,8 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             },
         },
         "Outputs": {
-            "AclId": {"Value": {"Ref": "Acl"}},
+            "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
         },
     }
@@ -5324,6 +5396,8 @@ def test_cfn_wafv2_web_acl_uses_canonical_arn(
             f"arn:aws:wafv2:{arn_region}:000000000000:"
             f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
         )
+        # Ref is name|id|scope, not the bare id.
+        assert outputs["AclRef"] == f"{acl_name}|{outputs['AclId']}|{scope}"
         acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
         assert outputs["AclArn"] in {acl["ARN"] for acl in acls}
         tags = wafv2.list_tags_for_resource(ResourceARN=outputs["AclArn"])
@@ -5498,6 +5572,152 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
     assert "cdk-assets-v44" in repos
 
     cfn.delete_stack(StackName="CDKToolkit-v44")
+
+
+def _cfn_ecr_template(name, *, v2=False, policies=True, empty_on_delete=None):
+    props = {
+        "RepositoryName": name,
+        "ImageTagMutability": "MUTABLE" if v2 else "IMMUTABLE",
+        "ImageScanningConfiguration": {"ScanOnPush": not v2},
+        "EncryptionConfiguration": {"EncryptionType": "AES256"},
+        "Tags": [{"Key": "stage", "Value": "v2" if v2 else "v1"}]
+        + ([] if v2 else [{"Key": "dropme", "Value": "x"}]),
+    }
+    if policies:
+        props["LifecyclePolicy"] = {"LifecyclePolicyText": json.dumps({"rules": [{
+            "rulePriority": 1, "selection": {
+                "tagStatus": "untagged", "countType": "sinceImagePushed",
+                "countUnit": "days", "countNumber": 30 if v2 else 14},
+            "action": {"type": "expire"}}]})}
+        props["RepositoryPolicyText"] = {"Version": "2012-10-17", "Statement": [{
+            "Sid": "pull", "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+            "Action": ["ecr:BatchGetImage"]}]}
+    if empty_on_delete is not None:
+        props["EmptyOnDelete"] = empty_on_delete
+    return json.dumps({"Resources": {"Repo": {"Type": "AWS::ECR::Repository",
+                                              "Properties": props}}})
+
+
+def _ecr_lifecycle_days(ecr, name):
+    text = ecr.get_lifecycle_policy(repositoryName=name)["lifecyclePolicyText"]
+    return json.loads(text)["rules"][0]["selection"]["countNumber"]
+
+
+def test_cfn_ecr_repository_reads_back_and_updates_in_place(cfn, ecr):
+    """Every property reads back through the ECR API as the API writes it:
+    the scanning and encryption settings in camelCase, the lifecycle and
+    repository policies from their own calls, the tags with the three
+    aws:cloudformation tags. An update applies all but the encryption in
+    place, keeps createdAt, removes a dropped tag and a dropped policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-ecr-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(name))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        repo = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
+        assert repo["imageTagMutability"] == "IMMUTABLE"
+        assert repo["imageScanningConfiguration"] == {"scanOnPush": True}
+        assert repo["encryptionConfiguration"] == {"encryptionType": "AES256"}
+        assert _ecr_lifecycle_days(ecr, name) == 14
+        policy = json.loads(ecr.get_repository_policy(repositoryName=name)["policyText"])
+        assert policy["Statement"][0]["Sid"] == "pull"
+        tags = {t["Key"]: t["Value"] for t in ecr.list_tags_for_resource(
+            resourceArn=repo["repositoryArn"])["tags"]}
+        assert tags == {"stage": "v1", "dropme": "x", **_system_tags(stack, "Repo")}
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_ecr_template(name, v2=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        after = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
+        assert after["createdAt"] == repo["createdAt"]
+        assert after["imageTagMutability"] == "MUTABLE"
+        assert after["imageScanningConfiguration"] == {"scanOnPush": False}
+        assert _ecr_lifecycle_days(ecr, name) == 30
+        tags = {t["Key"]: t["Value"] for t in ecr.list_tags_for_resource(
+            resourceArn=repo["repositoryArn"])["tags"]}
+        assert tags == {"stage": "v2", **_system_tags(stack, "Repo")}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(
+            name, v2=True, policies=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError, match="LifecyclePolicyNotFoundException"):
+            ecr.get_lifecycle_policy(repositoryName=name)
+        with pytest.raises(ClientError, match="RepositoryPolicyNotFoundException"):
+            ecr.get_repository_policy(repositoryName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("empty_on_delete", [None, True])
+def test_cfn_ecr_repository_takes_images_and_deletes_like_the_api(
+        cfn, ecr, empty_on_delete):
+    """A stack's repository accepts PutImage. Deleting the stack goes through
+    DeleteRepository: a repository with images fails the delete unless
+    EmptyOnDelete is true, and a deleted one leaves no images or policies
+    behind for a repository created later under the same name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-ecr-del-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(
+        name, empty_on_delete=empty_on_delete))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ecr.put_image(repositoryName=name, imageTag="v1",
+                      imageManifest='{"schemaVersion": 2}')
+        assert len(ecr.describe_images(repositoryName=name)["imageDetails"]) == 1
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        if empty_on_delete is None:
+            assert stack["StackStatus"] == "DELETE_FAILED"
+            assert f"The repository with name '{name}' is not empty" in \
+                _stack_event_reasons(cfn, stack_name)
+            assert len(ecr.describe_images(repositoryName=name)["imageDetails"]) == 1
+            ecr.delete_repository(repositoryName=name, force=True)
+            return
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        ecr.create_repository(repositoryName=name)
+        try:
+            assert ecr.describe_images(repositoryName=name)["imageDetails"] == []
+            with pytest.raises(ClientError, match="LifecyclePolicyNotFoundException"):
+                ecr.get_lifecycle_policy(repositoryName=name)
+            with pytest.raises(ClientError, match="RepositoryPolicyNotFoundException"):
+                ecr.get_repository_policy(repositoryName=name)
+        finally:
+            ecr.delete_repository(repositoryName=name, force=True)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ecr_repository_rename_deletes_the_old_repository(cfn, ecr):
+    """RepositoryName is create-only: a new name creates the new repository
+    and deletes the old one through DeleteRepository once the update succeeds."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecr-ren-{uid}"
+    old_name, new_name = f"cfn-ecr-old-{uid}", f"cfn-ecr-new-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(old_name))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ecr_template(new_name))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        names = {r["repositoryName"] for r in ecr.describe_repositories()["repositories"]}
+        assert new_name in names and old_name not in names
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (old_name, new_name):
+            try:
+                ecr.delete_repository(repositoryName=name, force=True)
+            except ClientError:
+                pass
+
 
 def test_cfn_ec2_launch_template(cfn, ec2):
     """CloudFormation should provision and delete an EC2 LaunchTemplate."""
@@ -6036,6 +6256,1019 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
 
 
+# ---------------------------------------------------------------------------
+# Update handlers, batch 5: the twelve types of #1601 C1 whose stack update
+# fell through to the create handler and lost what the resource was holding.
+# ---------------------------------------------------------------------------
+
+def _cfn_elbv2_template(uid, *, health_path="/a", idle_timeout="60",
+                        priority=10, scheme="internet-facing", name=None,
+                        tg_port=80, listener_port=80, listener_protocol="HTTP",
+                        listener_actions=None, listener_lb="LB",
+                        second_lb=False):
+    resources = {
+        "LB": {
+            "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            "Properties": {
+                "Name": name or f"cfn-lb-{uid}",
+                "Type": "application",
+                "Scheme": scheme,
+                "LoadBalancerAttributes": [
+                    {"Key": "idle_timeout.timeout_seconds", "Value": idle_timeout},
+                ],
+            },
+        },
+        "TG": {
+            "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+            "Properties": {
+                "Name": f"cfn-tg-{uid}",
+                "Port": tg_port,
+                "Protocol": "HTTP",
+                "TargetType": "ip",
+                "HealthCheckPath": health_path,
+                "Tags": [{"Key": "team", "Value": "ops"}],
+            },
+        },
+        "L": {
+            "Type": "AWS::ElasticLoadBalancingV2::Listener",
+            "Properties": {
+                "LoadBalancerArn": {"Ref": listener_lb},
+                "Port": listener_port,
+                "Protocol": listener_protocol,
+                "DefaultActions": listener_actions or [
+                    {"Type": "forward", "TargetGroupArn": {"Ref": "TG"}},
+                ],
+            },
+        },
+        "R": {
+            "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+            "Properties": {
+                "ListenerArn": {"Ref": "L"},
+                "Priority": priority,
+                "Conditions": [
+                    {"Field": "path-pattern", "Values": [f"{health_path}*"]},
+                ],
+                "Actions": [{"Type": "forward", "TargetGroupArn": {"Ref": "TG"}}],
+            },
+        },
+    }
+    if second_lb:
+        resources["LB2"] = {
+            "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            "Properties": {"Name": f"cfn-lb2-{uid}", "Type": "application"},
+        }
+    return json.dumps({
+        "Resources": resources,
+        "Outputs": {
+            "LbRef": {"Value": {"Ref": "LB"}},
+            "LbDns": {"Value": {"Fn::GetAtt": ["LB", "DNSName"]}},
+            "TgRef": {"Value": {"Ref": "TG"}},
+            "ListenerRef": {"Value": {"Ref": "L"}},
+            "RuleRef": {"Value": {"Ref": "R"}},
+            **({"Lb2Ref": {"Value": {"Ref": "LB2"}}} if second_lb else {}),
+        },
+    })
+
+
+def test_cfn_elbv2_update_keeps_the_arns_and_the_registered_targets(cfn, elbv2):
+    """The load balancer attributes, the health-check path and a rule's
+    priority are all No interruption on the resource reference, so the four
+    ELBv2 resources keep their ARNs, the load balancer keeps its DNS name and
+    the target registered in the group survives. Without update handlers each
+    of the four was re-created under a fresh ARN and the registration went
+    with the old target group."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-upd-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        lb_arn = _output(stack, "LbRef")
+        dns = _output(stack, "LbDns")
+        tg_arn = _output(stack, "TgRef")
+        listener_arn = _output(stack, "ListenerRef")
+        rule_arn = _output(stack, "RuleRef")
+        elbv2.register_targets(TargetGroupArn=tg_arn,
+                               Targets=[{"Id": "10.0.0.5", "Port": 80}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(
+            uid, health_path="/b", idle_timeout="90", priority=20))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "LbRef") == lb_arn
+        assert _output(stack, "LbDns") == dns
+        assert _output(stack, "TgRef") == tg_arn
+        assert _output(stack, "ListenerRef") == listener_arn
+        assert _output(stack, "RuleRef") == rule_arn
+
+        health = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+        assert [t["Target"]["Id"] for t in health["TargetHealthDescriptions"]] \
+            == ["10.0.0.5"]
+        tg = elbv2.describe_target_groups(TargetGroupArns=[tg_arn])["TargetGroups"][0]
+        assert tg["HealthCheckPath"] == "/b"
+        attrs = {a["Key"]: a["Value"] for a in elbv2.describe_load_balancer_attributes(
+            LoadBalancerArn=lb_arn)["Attributes"]}
+        assert attrs["idle_timeout.timeout_seconds"] == "90"
+        rules = {r["RuleArn"]: r for r in elbv2.describe_rules(
+            ListenerArn=listener_arn)["Rules"]}
+        assert rules[rule_arn]["Priority"] == "20"
+        assert rules[rule_arn]["Conditions"][0]["Values"] == ["/b*"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_elbv2_listener_update_changes_port_protocol_and_actions(cfn, elbv2):
+    """Port, Protocol and DefaultActions are all "Update requires: No
+    interruption" on the Listener resource reference, so a change to any of
+    them updates the listener in place under the same ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-listener-upd-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        listener_arn = _output(stack, "ListenerRef")
+
+        new_actions = [{
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+                "StatusCode": "404",
+                "ContentType": "application/json",
+                "MessageBody": '{"status":404}',
+            },
+        }]
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(
+            uid, listener_port=8443, listener_protocol="HTTPS",
+            listener_actions=new_actions))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ListenerRef") == listener_arn
+
+        listener = elbv2.describe_listeners(
+            ListenerArns=[listener_arn])["Listeners"][0]
+        assert listener["Port"] == 8443
+        assert listener["Protocol"] == "HTTPS"
+        assert listener["DefaultActions"][0]["Type"] == "fixed-response"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_elbv2_listener_moved_to_another_load_balancer_is_replaced(cfn, elbv2):
+    """LoadBalancerArn is the listener's one replacing property and a
+    listener ARN carries its load balancer, so the move comes back under a
+    new ARN. The rule's ListenerArn follows the Ref and replaces the rule the
+    same way, and the old load balancer is left without a listener."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-move-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_elbv2_template(uid, listener_lb="LB2",
+                                                   second_lb=True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_listener = _output(stack, "ListenerRef")
+        old_rule = _output(stack, "RuleRef")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_elbv2_template(uid, second_lb=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        listener_arn = _output(stack, "ListenerRef")
+        rule_arn = _output(stack, "RuleRef")
+        assert listener_arn != old_listener
+        assert rule_arn != old_rule
+        listeners = elbv2.describe_listeners(LoadBalancerArn=_output(stack, "LbRef"))
+        assert [lst["ListenerArn"] for lst in listeners["Listeners"]] == [listener_arn]
+        assert rule_arn in {r["RuleArn"] for r in elbv2.describe_rules(
+            ListenerArn=listener_arn)["Rules"]}
+        assert elbv2.describe_listeners(
+            LoadBalancerArn=_output(stack, "Lb2Ref"))["Listeners"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_elbv2_target_group_tags_read_through_describe_tags(cfn, elbv2):
+    """The ALB tag store holds a list of {Key, Value} per ARN, which is what
+    DescribeTags iterates. The target group create wrote a map there, so the
+    call raised for any CloudFormation-created group."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-tags-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        tg_arn = _output(stack, "TgRef")
+        tags = elbv2.describe_tags(ResourceArns=[tg_arn])["TagDescriptions"][0]["Tags"]
+        assert {"Key": "team", "Value": "ops"} in tags
+        assert {t["Key"] for t in tags} >= {"team", "aws:cloudformation:stack-name"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_hosted_zone_template(uid, comment, name=None):
+    return json.dumps({
+        "Resources": {
+            "Zone": {
+                "Type": "AWS::Route53::HostedZone",
+                "Properties": {
+                    "Name": name or f"cfn-{uid}.example.com.",
+                    "HostedZoneConfig": {"Comment": comment},
+                },
+            },
+        },
+        "Outputs": {"ZoneRef": {"Value": {"Ref": "Zone"}}},
+    })
+
+
+def test_cfn_route53_hosted_zone_update_keeps_its_id_and_records(cfn, r53):
+    """HostedZoneConfig is No interruption, so a comment change leaves the
+    zone where it is. Without an update handler the create minted a second
+    zone with a fresh id and only the default NS and SOA records, which
+    orphaned every record set created in the first one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-r53-upd-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_hosted_zone_template(uid, "before"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        zone_id = _output(stack, "ZoneRef")
+        r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={
+            "Changes": [{
+                "Action": "CREATE",
+                "ResourceRecordSet": {
+                    "Name": f"www.cfn-{uid}.example.com.", "Type": "A", "TTL": 60,
+                    "ResourceRecords": [{"Value": "10.0.0.1"}],
+                },
+            }],
+        })
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_hosted_zone_template(uid, "after"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ZoneRef") == zone_id
+        records = r53.list_resource_record_sets(HostedZoneId=zone_id)
+        assert [r["Name"] for r in records["ResourceRecordSets"]
+                if r["Type"] == "A"] == [f"www.cfn-{uid}.example.com."]
+        zone = r53.get_hosted_zone(Id=zone_id)["HostedZone"]
+        assert zone["Config"]["Comment"] == "after"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_route53_hosted_zone_rename_replaces_the_zone(cfn, r53):
+    """Name requires replacement and a hosted-zone name is not unique, so the
+    rename goes through: a new zone id, and the old zone is gone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-r53-rename-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_hosted_zone_template(uid, "same"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_zone = _output(stack, "ZoneRef")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_hosted_zone_template(
+            uid, "same", name=f"cfn-{uid}-moved.example.com."))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_zone = _output(stack, "ZoneRef")
+        assert new_zone != old_zone
+        assert r53.get_hosted_zone(Id=new_zone)["HostedZone"]["Name"] \
+            == f"cfn-{uid}-moved.example.com."
+        with pytest.raises(ClientError):
+            r53.get_hosted_zone(Id=old_zone)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_web_acl_template(uid, description, scope="REGIONAL", metric="cfnacl"):
+    return json.dumps({
+        "Resources": {
+            "Acl": {
+                "Type": "AWS::WAFv2::WebACL",
+                "Properties": {
+                    "Name": f"cfn-acl-{uid}",
+                    "Scope": scope,
+                    "Description": description,
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {
+                        "SampledRequestsEnabled": True,
+                        "CloudWatchMetricsEnabled": True,
+                        "MetricName": metric,
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
+            "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
+        },
+    })
+
+
+def test_cfn_wafv2_web_acl_update_keeps_its_id_and_arn(cfn, wafv2):
+    """Description and VisibilityConfig are No interruption, so the web ACL
+    keeps the id and ARN that a WebACLAssociation points at. Without an
+    update handler the create minted a second ACL under a fresh id and the
+    engine deleted the first."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-waf-upd-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_web_acl_template(uid, "before"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        acl_id = _output(stack, "AclId")
+        acl_ref = _output(stack, "AclRef")
+        acl_arn = _output(stack, "AclArn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_web_acl_template(
+            uid, "after", metric="cfnaclrenamed"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AclRef") == acl_ref
+        assert _output(stack, "AclId") == acl_id
+        assert _output(stack, "AclArn") == acl_arn
+        acl = wafv2.get_web_acl(Name=f"cfn-acl-{uid}", Scope="REGIONAL",
+                                Id=acl_id)["WebACL"]
+        assert acl["Description"] == "after"
+        assert acl["VisibilityConfig"]["MetricName"] == "cfnaclrenamed"
+        assert [a["Id"] for a in wafv2.list_web_acls(Scope="REGIONAL")["WebACLs"]
+                if a["Name"] == f"cfn-acl-{uid}"] == [acl_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_backup_template(uid, hour, tag, encryption_key_arn=None):
+    vault_props = {
+        "BackupVaultName": f"cfn-vault-{uid}",
+        "BackupVaultTags": {"team": tag},
+    }
+    if encryption_key_arn is not None:
+        vault_props["EncryptionKeyArn"] = encryption_key_arn
+    return json.dumps({
+        "Resources": {
+            "Vault": {
+                "Type": "AWS::Backup::BackupVault",
+                "Properties": vault_props,
+            },
+            "Plan": {
+                "Type": "AWS::Backup::BackupPlan",
+                "DependsOn": "Vault",
+                "Properties": {
+                    "BackupPlan": {
+                        "BackupPlanName": f"cfn-plan-{uid}",
+                        "BackupPlanRule": [{
+                            "RuleName": "daily",
+                            "TargetBackupVault": f"cfn-vault-{uid}",
+                            "ScheduleExpression": f"cron(0 {hour} * * ? *)",
+                        }],
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "VaultRef": {"Value": {"Ref": "Vault"}},
+            "VaultArn": {"Value": {"Fn::GetAtt": ["Vault", "BackupVaultArn"]}},
+            "PlanRef": {"Value": {"Ref": "Plan"}},
+        },
+    })
+
+
+def test_cfn_backup_plan_update_keeps_its_id_and_reads_back_its_rules(cfn, backup):
+    """Both properties of AWS::Backup::BackupPlan are No interruption, so the
+    plan keeps the id a BackupSelection references while its rule changes;
+    the create minted a second plan and the engine deleted the first. The
+    rules read back at all only because the create now translates the
+    template's BackupPlanRule into the Rules the API serves."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-backup-plan-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_backup_template(uid, 1, "a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        plan_id = _output(stack, "PlanRef")
+        plan = backup.get_backup_plan(BackupPlanId=plan_id)
+        assert [r["RuleName"] for r in plan["BackupPlan"]["Rules"]] == ["daily"]
+        assert plan["BackupPlan"]["Rules"][0]["TargetBackupVaultName"] \
+            == f"cfn-vault-{uid}"
+        assert plan["BackupPlan"]["Rules"][0]["ScheduleExpression"] == "cron(0 1 * * ? *)"
+        version = plan["VersionId"]
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_backup_template(uid, 5, "a"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PlanRef") == plan_id
+        plan = backup.get_backup_plan(BackupPlanId=plan_id)
+        assert plan["BackupPlan"]["Rules"][0]["ScheduleExpression"] == "cron(0 5 * * ? *)"
+        assert plan["VersionId"] != version
+        assert [p["BackupPlanId"] for p in backup.list_backup_plans()["BackupPlansList"]
+                if p["BackupPlanName"] == f"cfn-plan-{uid}"] == [plan_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_backup_vault_tags_update_in_place(cfn, backup):
+    """BackupVaultTags is No interruption. The vault keeps its creation date
+    and the tags set through TagResource, and the changed template tag
+    reaches it: the create handler ran into AlreadyExistsException and
+    dropped the change."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-backup-vault-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_backup_template(uid, 1, "a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        vault_arn = _output(stack, "VaultArn")
+        created = backup.describe_backup_vault(
+            BackupVaultName=f"cfn-vault-{uid}")["CreationDate"]
+        backup.tag_resource(ResourceArn=vault_arn, Tags={"owner": "ops"})
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_backup_template(uid, 1, "b"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "VaultArn") == vault_arn
+        vault = backup.describe_backup_vault(BackupVaultName=f"cfn-vault-{uid}")
+        assert vault["CreationDate"] == created
+        tags = backup.list_tags(ResourceArn=vault_arn)["Tags"]
+        assert tags["team"] == "b"
+        assert tags["owner"] == "ops"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_certificate_template(uid, tag, domain=None):
+    return json.dumps({
+        "Resources": {
+            "Cert": {
+                "Type": "AWS::CertificateManager::Certificate",
+                "Properties": {
+                    "DomainName": domain or f"cfn-{uid}.example.com",
+                    "ValidationMethod": "DNS",
+                    "Tags": [{"Key": "team", "Value": tag}],
+                },
+            },
+        },
+        "Outputs": {"CertRef": {"Value": {"Ref": "Cert"}}},
+    })
+
+
+def test_cfn_acm_certificate_tag_update_does_not_reissue_it(cfn, acm_client):
+    """Tags is No interruption, so the certificate keeps its ARN, its
+    validity window and its key material while the tag changes. The create
+    handler re-requested the certificate on every property change, which
+    moved IssuedAt and left the tag at its old value."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-acm-upd-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_certificate_template(uid, "a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "CertRef")
+        before = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+        pem = acm_client.get_certificate(CertificateArn=arn)["Certificate"]
+        acm_client.add_tags_to_certificate(
+            CertificateArn=arn, Tags=[{"Key": "owner", "Value": "ops"}])
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_certificate_template(uid, "b"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "CertRef") == arn
+        after = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+        assert after["IssuedAt"] == before["IssuedAt"]
+        assert after["NotAfter"] == before["NotAfter"]
+        assert acm_client.get_certificate(CertificateArn=arn)["Certificate"] == pem
+        tags = {t["Key"]: t["Value"] for t in acm_client.list_tags_for_certificate(
+            CertificateArn=arn)["Tags"]}
+        assert tags["team"] == "b"
+        assert tags["owner"] == "ops"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_acm_certificate_domain_change_replaces_it(cfn, acm_client):
+    """DomainName requires replacement: a new certificate is requested under
+    a new ARN and the old one is deleted, CloudFormation's replacement
+    order."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-acm-repl-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_certificate_template(uid, "a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_arn = _output(stack, "CertRef")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_certificate_template(
+            uid, "a", domain=f"cfn-{uid}-moved.example.com"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "CertRef")
+        assert new_arn != old_arn
+        assert acm_client.describe_certificate(CertificateArn=new_arn)["Certificate"][
+            "DomainName"] == f"cfn-{uid}-moved.example.com"
+        with pytest.raises(ClientError):
+            acm_client.describe_certificate(CertificateArn=old_arn)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_acm_certificate_validation_method_change_regenerates_options(
+        cfn, acm_client):
+    """ValidationMethod is No interruption and updates in place; the
+    DomainValidationOptions, one entry per SAN keyed by the method, are
+    regenerated with it instead of reporting the old method."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-acm-method-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_certificate_template(uid, "a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "CertRef")
+        before = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+        assert before["DomainValidationOptions"][0]["ValidationMethod"] == "DNS"
+
+        template = json.loads(_cfn_certificate_template(uid, "a"))
+        template["Resources"]["Cert"]["Properties"]["ValidationMethod"] = "EMAIL"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "CertRef") == arn
+
+        after = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+        assert len(after["DomainValidationOptions"]) == 1
+        assert after["DomainValidationOptions"][0]["ValidationMethod"] == "EMAIL"
+        assert after["DomainValidationOptions"][0]["DomainName"] == \
+            before["DomainValidationOptions"][0]["DomainName"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_email_identity_template(uid, mail_from, identity=None):
+    return json.dumps({
+        "Resources": {
+            "Ident": {
+                "Type": "AWS::SES::EmailIdentity",
+                "Properties": {
+                    "EmailIdentity": identity or f"cfn-{uid}.example.com",
+                    "MailFromAttributes": {"MailFromDomain": mail_from},
+                },
+            },
+        },
+        "Outputs": {"IdentRef": {"Value": {"Ref": "Ident"}}},
+    })
+
+
+def test_cfn_ses_email_identity_reads_through_the_v2_api(cfn, sesv2):
+    """AWS::SES::EmailIdentity is the SES v2 resource type, but the create
+    handler registered the identity in the v1 store alone, so
+    GetEmailIdentity and ListEmailIdentities could not see a template's own
+    identity."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ses-v2-{uid}"
+    domain = f"cfn-{uid}.example.com"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_email_identity_template(uid, "mail.example.com"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        identity = sesv2.get_email_identity(EmailIdentity=domain)
+        assert identity["IdentityType"] == "DOMAIN"
+        assert identity["MailFromAttributes"]["MailFromDomain"] == "mail.example.com"
+        assert domain in [i["IdentityName"]
+                          for i in sesv2.list_email_identities()["EmailIdentities"]]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        sesv2.get_email_identity(EmailIdentity=domain)
+
+
+def test_cfn_ses_email_identity_update_keeps_its_dkim_tokens(cfn, ses, sesv2):
+    """MailFromAttributes is No interruption, so the identity keeps the DKIM
+    tokens and the verification status it holds; the create handler rebuilt
+    the record and put both back to their defaults."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ses-upd-{uid}"
+    domain = f"cfn-{uid}.example.com"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_email_identity_template(uid, "mail.example.com"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        tokens = ses.verify_domain_dkim(Domain=domain)["DkimTokens"]
+        assert tokens
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_email_identity_template(
+            uid, "bounces.example.com"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "IdentRef") == domain
+        assert ses.get_identity_dkim_attributes(Identities=[domain])[
+            "DkimAttributes"][domain]["DkimTokens"] == tokens
+        identity = sesv2.get_email_identity(EmailIdentity=domain)
+        assert identity["MailFromAttributes"]["MailFromDomain"] == "bounces.example.com"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_thing_type_template(uid, description, name=None, deprecate=None,
+                             generated_name=False, searchable=("serial",),
+                             mqtt5_key=None, policy=None):
+    props = {
+        "ThingTypeProperties": {
+            "ThingTypeDescription": description,
+            "SearchableAttributes": list(searchable),
+        },
+    }
+    if mqtt5_key:
+        props["ThingTypeProperties"]["Mqtt5Configuration"] = {"PropagatingAttributes": [
+            {"UserPropertyKey": mqtt5_key, "ConnectionAttribute": "iot:ClientId"},
+        ]}
+    if not generated_name:
+        props["ThingTypeName"] = name or f"cfn-tt-{uid}"
+    if deprecate is not None:
+        props["DeprecateThingType"] = deprecate
+    resource = {"Type": "AWS::IoT::ThingType", "Properties": props}
+    if policy:
+        resource["UpdateReplacePolicy"] = policy
+    return json.dumps({
+        "Resources": {"TT": resource},
+        "Outputs": {
+            "TTRef": {"Value": {"Ref": "TT"}},
+            "TTArn": {"Value": {"Fn::GetAtt": ["TT", "Arn"]}},
+        },
+    })
+
+
+def test_cfn_iot_thing_type_update_in_place(cfn, iot_client):
+    """DeprecateThingType and Mqtt5Configuration update in place through a
+    change set, and a template that drops Mqtt5Configuration clears it
+    (measured). The thing type keeps its id and its creation date. A type
+    declared deprecated from the start comes up deprecated."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-tt-{uid}"
+    name = f"cfn-tt-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_thing_type_template(
+        uid, "same", deprecate=True, mqtt5_key="k1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        described = iot_client.describe_thing_type(thingTypeName=name)
+        type_id = described["thingTypeId"]
+        created = described["thingTypeMetadata"]["creationDate"]
+        assert described["thingTypeMetadata"]["deprecated"] is True
+
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="mqtt5",
+                              TemplateBody=_cfn_thing_type_template(
+                                  uid, "same", deprecate=False, mqtt5_key="k2"))
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="mqtt5")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "TTRef") == name
+        described = iot_client.describe_thing_type(thingTypeName=name)
+        assert described["thingTypeId"] == type_id
+        assert described["thingTypeMetadata"]["creationDate"] == created
+        assert described["thingTypeMetadata"]["deprecated"] is False
+        assert described["thingTypeProperties"]["mqtt5Configuration"] == {
+            "propagatingAttributes": [
+                {"userPropertyKey": "k2", "connectionAttribute": "iot:ClientId"},
+            ],
+        }
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_thing_type_template(
+            uid, "same", deprecate=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        described = iot_client.describe_thing_type(thingTypeName=name)
+        assert described["thingTypeId"] == type_id
+        assert "mqtt5Configuration" not in described["thingTypeProperties"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_thing_type_properties_change_under_generated_name_replaces_it(
+        cfn, iot_client):
+    """Under a generated name there is nothing to refuse, so a description
+    change replaces the thing type. The generated name is deterministic, so
+    the handler deletes before it creates, and an UpdateReplacePolicy of
+    Retain cannot keep the predecessor."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-tt-gen-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_thing_type_template(
+        uid, "before", generated_name=True, policy="Retain"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name = _output(stack, "TTRef")
+        old_id = iot_client.describe_thing_type(thingTypeName=name)["thingTypeId"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_thing_type_template(
+            uid, "after", generated_name=True, policy="Retain"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "TTRef") == name
+        described = iot_client.describe_thing_type(thingTypeName=name)
+        assert described["thingTypeId"] != old_id
+        assert described["thingTypeProperties"]["thingTypeDescription"] == "after"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_thing_type_rename_replaces_it(cfn, iot_client):
+    """ThingTypeName requires replacement: the thing type under the new name
+    is created before the old one is removed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-tt-ren-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_thing_type_template(uid, "same"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_thing_type_template(
+            uid, "same", name=f"cfn-tt-{uid}-moved"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "TTRef") == f"cfn-tt-{uid}-moved"
+        assert iot_client.describe_thing_type(
+            thingTypeName=f"cfn-tt-{uid}-moved")["thingTypeProperties"][
+                "thingTypeDescription"] == "same"
+        with pytest.raises(ClientError):
+            iot_client.describe_thing_type(thingTypeName=f"cfn-tt-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_account_update_removes_a_dropped_role():
+    """CloudWatchRoleArn is No interruption. The create handler only ever
+    wrote a declared role, so a template that dropped the property left the
+    old role in the account settings GetAccount answers.
+
+    The settings are one record per account and region, and
+    tests/test_apigatewayv1.py writes the default region's, so this runs in
+    us-west-2 rather than racing it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigw-account-{uid}"
+    role_arn = f"arn:aws:iam::000000000000:role/cfn-apigw-{uid}"
+    cfn = _regional_cfn_test_client("cloudformation", "us-west-2")
+    apigw_v1 = _regional_cfn_test_client("apigateway", "us-west-2")
+
+    def template(with_role):
+        return json.dumps({"Resources": {"Account": {
+            "Type": "AWS::ApiGateway::Account",
+            "Properties": {"CloudWatchRoleArn": role_arn} if with_role else {},
+        }}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert apigw_v1.get_account()["cloudwatchRoleArn"] == role_arn
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert "cloudwatchRoleArn" not in apigw_v1.get_account()
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("case", [
+    "lb_scheme", "tg_port", "web_acl_scope", "vault_key",
+    "thing_type_description", "thing_type_searchable",
+])
+def test_cfn_replacing_change_under_custom_name_fails_loudly(
+        cfn, elbv2, wafv2, backup, iot_client, case):
+    """A change that requires replacing a resource whose name the template
+    sets is refused: the stack rolls back and the resource keeps its value.
+    Measured for the vault key and the thing type properties; the load
+    balancer page states it ("If you specify a name, you cannot perform
+    updates that require replacement of this resource")."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-custom-repl-{uid}"
+    tt = f"cfn-tt-{uid}"
+    before, after, read, kept = {
+        "lb_scheme": (
+            _cfn_elbv2_template(uid), _cfn_elbv2_template(uid, scheme="internal"),
+            lambda st: elbv2.describe_load_balancers(LoadBalancerArns=[
+                _output(st, "LbRef")])["LoadBalancers"][0]["Scheme"],
+            "internet-facing"),
+        "tg_port": (
+            _cfn_elbv2_template(uid), _cfn_elbv2_template(uid, tg_port=8080),
+            lambda st: elbv2.describe_target_groups(TargetGroupArns=[
+                _output(st, "TgRef")])["TargetGroups"][0]["Port"],
+            80),
+        "web_acl_scope": (
+            _cfn_web_acl_template(uid, "d"),
+            _cfn_web_acl_template(uid, "d", scope="CLOUDFRONT"),
+            lambda st: [a["Id"] for a in wafv2.list_web_acls(Scope="REGIONAL")["WebACLs"]
+                        if a["Name"] == f"cfn-acl-{uid}"] == [_output(st, "AclId")],
+            True),
+        "vault_key": (
+            _cfn_backup_template(uid, 1, "a"),
+            _cfn_backup_template(uid, 1, "a", encryption_key_arn=(
+                f"arn:aws:kms:us-east-1:000000000000:key/cfn-{uid}")),
+            lambda st: backup.describe_backup_vault(
+                BackupVaultName=f"cfn-vault-{uid}")["EncryptionKeyArn"],
+            ""),
+        "thing_type_description": (
+            _cfn_thing_type_template(uid, "before"),
+            _cfn_thing_type_template(uid, "after"),
+            lambda st: iot_client.describe_thing_type(
+                thingTypeName=tt)["thingTypeProperties"]["thingTypeDescription"],
+            "before"),
+        "thing_type_searchable": (
+            _cfn_thing_type_template(uid, "same"),
+            _cfn_thing_type_template(uid, "same", searchable=("serial", "batch")),
+            lambda st: iot_client.describe_thing_type(
+                thingTypeName=tt)["thingTypeProperties"]["searchableAttributes"],
+            ["serial"]),
+    }[case]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=before)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=after)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", \
+            stack.get("StackStatusReason")
+        assert "custom-named resource requires replacing" in \
+            _stack_event_reasons(cfn, stack_name)
+        assert read(stack) == kept
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_auto_named_template(uid, *, lb_type="application", port=80,
+                             scope="REGIONAL"):
+    """A load balancer, a target group and a web ACL with no name property, so
+    each carries the name the emulator generates for it."""
+    return json.dumps({
+        "Resources": {
+            "LB": {
+                "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                "Properties": {"Type": lb_type},
+            },
+            "TG": {
+                "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+                "Properties": {"Port": port, "Protocol": "HTTP",
+                               "TargetType": "ip"},
+            },
+            "Acl": {
+                "Type": "AWS::WAFv2::WebACL",
+                "Properties": {
+                    "Scope": scope,
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {
+                        "SampledRequestsEnabled": True,
+                        "CloudWatchMetricsEnabled": True,
+                        "MetricName": f"cfnauto{uid}",
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "LbRef": {"Value": {"Ref": "LB"}},
+            "TgRef": {"Value": {"Ref": "TG"}},
+            "AclRef": {"Value": {"Ref": "Acl"}},
+            "AclId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
+        },
+    })
+
+
+def test_cfn_replacing_property_replaces_an_auto_named_resource(
+        cfn, elbv2, wafv2):
+    """The custom-name refusal covers a resource whose name the template sets.
+    Under a generated name there is nothing to refuse, so a load balancer's
+    Type, a target group's Port and a web ACL's Scope come back under a new
+    physical id carrying the new value instead of being dropped."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-auto-replace-{uid}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_auto_named_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        lb_arn = _output(stack, "LbRef")
+        tg_arn = _output(stack, "TgRef")
+        acl_id = _output(stack, "AclId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_auto_named_template(
+            uid, lb_type="network", port=8080, scope="CLOUDFRONT"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_lb = _output(stack, "LbRef")
+        new_tg = _output(stack, "TgRef")
+        new_acl = _output(stack, "AclId")
+        assert new_lb != lb_arn
+        assert new_tg != tg_arn
+        assert new_acl != acl_id
+        assert elbv2.describe_load_balancers(
+            LoadBalancerArns=[new_lb])["LoadBalancers"][0]["Type"] == "network"
+        assert elbv2.describe_target_groups(
+            TargetGroupArns=[new_tg])["TargetGroups"][0]["Port"] == 8080
+        assert new_acl in {a["Id"] for a
+                           in wafv2.list_web_acls(Scope="CLOUDFRONT")["WebACLs"]}
+        assert acl_id not in {a["Id"] for a
+                              in wafv2.list_web_acls(Scope="REGIONAL")["WebACLs"]}
+        with pytest.raises(ClientError):
+            elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_auto_named_replacement_retains_the_predecessor(cfn, elbv2):
+    """That replacement is deleted through the shared helper, so an
+    UpdateReplacePolicy of Retain keeps the load balancer a Type change
+    replaced; without the policy the predecessor goes."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-auto-retain-{uid}"
+    kept = []
+
+    def template(lb_type, policy):
+        res = {"Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+               "Properties": {"Type": lb_type}}
+        if policy:
+            res["UpdateReplacePolicy"] = policy
+        return json.dumps({
+            "Resources": {"LB": res},
+            "Outputs": {"LbRef": {"Value": {"Ref": "LB"}}},
+        })
+
+    def exists(arn):
+        try:
+            elbv2.describe_load_balancers(LoadBalancerArns=[arn])
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "LoadBalancerNotFound", \
+                exc.response["Error"]
+            return False
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=template("application", "Retain"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        first = _output(stack, "LbRef")
+        kept.append(first)
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template("network", "Retain"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        second = _output(stack, "LbRef")
+        assert second != first
+        assert exists(first), "the retained predecessor was deleted"
+        assert exists(second)
+        assert "DELETE_SKIPPED" in [
+            s for s, _ in _resource_events(cfn, stack_name, "LB")]
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template("application", None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        third = _output(stack, "LbRef")
+        assert third != second
+        assert not exists(second)
+        assert exists(third)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for arn in kept:
+            try:
+                elbv2.delete_load_balancer(LoadBalancerArn=arn)
+            except ClientError:
+                pass
+
+
 def test_cfn_ssm_parameter_timestamp_is_epoch(cfn, ssm):
     """SSM parameters created via CloudFormation must store LastModifiedDate
     as an epoch float, not an ISO string.  The JS SDK v3 deserializes SSM
@@ -6407,6 +7640,24 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
                     "Endpoint": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
                 },
             },
+            "PipeQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "PipeQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "PipeTopic"}}},
+                        }],
+                    },
+                },
+            },
             "DdbToSnsPipe": {
                 "Type": "AWS::Pipes::Pipe",
                 "Properties": {
@@ -6543,6 +7794,24 @@ def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
                     "FilterPolicy": {"color": ["blue"]},
                 },
             },
+            "FilterQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "FilterQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["FilterQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "FilterTopic"}}},
+                        }],
+                    },
+                },
+            },
         },
         "Outputs": {
             "TopicArn": {"Value": {"Ref": "FilterTopic"}},
@@ -6607,6 +7876,24 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
                     "TopicArn": {"Ref": "RawTopic"},
                     "Endpoint": {"Fn::GetAtt": ["RawQueue", "Arn"]},
                     "RawMessageDelivery": True,
+                },
+            },
+            "RawQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "RawQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": "sns-fanout",
+                            "Effect": "Allow",
+                            "Principal": {"Service": "sns.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["RawQueue", "Arn"]},
+                            "Condition": {"ArnEquals": {
+                                "aws:SourceArn": {"Ref": "RawTopic"}}},
+                        }],
+                    },
                 },
             },
         },
@@ -7889,18 +9176,19 @@ def test_cfn_change_set_keeps_tagged_resources_without_update_handler(cfn, sqs):
         _delete_cfn_test_stack(cfn, name)
 
 
-def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn):
+def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn, scheduler):
     """A stack-tag change is an update; a tagged type without an update
-    handler (a certificate) keeps its ARN instead of being re-created."""
+    handler (a schedule group) keeps its physical id instead of being
+    re-created."""
     name = f"cfn-tag-only-{_uuid_mod.uuid4().hex[:8]}"
     template = json.dumps({
         "Resources": {
-            "Cert": {
-                "Type": "AWS::CertificateManager::Certificate",
-                "Properties": {"DomainName": f"{name}.example.local", "ValidationMethod": "DNS"},
+            "Group": {
+                "Type": "AWS::Scheduler::ScheduleGroup",
+                "Properties": {"Name": name},
             },
         },
-        "Outputs": {"CertArn": {"Value": {"Ref": "Cert"}}},
+        "Outputs": {"GroupArn": {"Value": {"Fn::GetAtt": ["Group", "Arn"]}}},
     })
     cfn.create_stack(
         StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
@@ -7908,22 +9196,22 @@ def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn):
     try:
         stack = _wait_stack(cfn, name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        arn = _output(stack, "CertArn")
+        arn = _output(stack, "GroupArn")
         cfn.update_stack(
             StackName=name, UsePreviousTemplate=True,
             Tags=[{"Key": "owner", "Value": "team-b"}],
         )
         stack = _wait_stack(cfn, name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "CertArn") == arn
+        assert _output(stack, "GroupArn") == arn
         assert stack["Tags"] == [{"Key": "owner", "Value": "team-b"}]
-        detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Cert")
-        assert detail["StackResourceDetail"]["PhysicalResourceId"] == arn
-        # Without an update handler the certificate keeps the tags it was
-        # created with; the changed stack tag does not reach it.
-        acm = _regional_cfn_test_client("acm", cfn.meta.region_name)
-        cert_tags = {t["Key"]: t["Value"] for t in acm.list_tags_for_certificate(CertificateArn=arn)["Tags"]}
-        assert cert_tags == {"owner": "team-a", **_system_tags(stack, "Cert")}
+        detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Group")
+        assert detail["StackResourceDetail"]["PhysicalResourceId"] == name
+        # Without an update handler the group keeps the tags it was created
+        # with; the changed stack tag does not reach it.
+        group_tags = {t["Key"]: t["Value"]
+                      for t in scheduler.list_tags_for_resource(ResourceArn=arn)["Tags"]}
+        assert group_tags == {"owner": "team-a", **_system_tags(stack, "Group")}
     finally:
         _delete_cfn_test_stack(cfn, name)
 
@@ -11411,6 +12699,180 @@ def test_cfn_apigateway_stage_ref_returns_stage_name(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_stage_method_settings_become_a_map(cfn, apigw_v1):
+    """MethodSettings is a list in CloudFormation and a map on the stage.
+
+    Regression for the 1.5.14 outage: the list was stored verbatim, so the
+    throttling lookup on the request path raised and every method answered 500.
+    """
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-method-settings-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"method-settings-{suffix}"},
+            },
+            "MockResource": {
+                "Type": "AWS::ApiGateway::Resource",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ParentId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                    "PathPart": "mock",
+                },
+            },
+            "MockMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResourceId": {"Ref": "MockResource"},
+                    "HttpMethod": "GET",
+                    "AuthorizationType": "NONE",
+                    "Integration": {"Type": "MOCK"},
+                },
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "DependsOn": "MockMethod",
+                "Properties": {"RestApiId": {"Ref": "Api"}},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGateway::Stage",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "DeploymentId": {"Ref": "Deployment"},
+                    "StageName": "prod",
+                    "MethodSettings": [
+                        {
+                            "ResourcePath": "/*",
+                            "HttpMethod": "*",
+                            "LoggingLevel": "INFO",
+                            "MetricsEnabled": True,
+                        },
+                        {
+                            "ResourcePath": "/mock",
+                            "HttpMethod": "GET",
+                            "ThrottlingBurstLimit": 11,
+                            "ThrottlingRateLimit": 7,
+                            "CachingEnabled": "false",
+                            "CacheTtlInSeconds": "60",
+                        },
+                    ],
+                },
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}[
+            "ApiId"
+        ]
+
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert set(settings) == {"*/*", "/mock/GET"}
+        assert settings["*/*"] == {
+            "metricsEnabled": True,
+            "loggingLevel": "INFO",
+            "dataTraceEnabled": False,
+            "throttlingBurstLimit": 5000,
+            "throttlingRateLimit": 10000.0,
+            "cachingEnabled": False,
+            "cacheTtlInSeconds": 300,
+            "cacheDataEncrypted": False,
+            "requireAuthorizationForCacheControl": True,
+            "unauthorizedCacheControlHeaderStrategy": "SUCCEED_WITH_RESPONSE_HEADER",
+        }
+        # Each property is typed by its shape, not by how the template spelled
+        # it: a stringly-typed template value lands as the bool or int AWS reports.
+        per_method = settings["/mock/GET"]
+        assert per_method["throttlingBurstLimit"] == 11
+        assert isinstance(per_method["throttlingRateLimit"], float)
+        assert per_method["throttlingRateLimit"] == 7.0
+        assert per_method["cachingEnabled"] is False
+        assert per_method["cacheTtlInSeconds"] == 60
+        assert per_method["loggingLevel"] == "OFF"
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/prod/mock",
+            method="GET",
+            headers={"Host": f"{api_id}.execute-api.localhost:{port}"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_stage_method_settings_update_in_place(cfn, apigw_v1):
+    """A changed MethodSettings list reaches the stage through UpdateStage as a
+    map, not as the raw CloudFormation list."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-method-settings-upd-{suffix}"
+
+    def _template(logging_level):
+        return json.dumps({
+            "Resources": {
+                "Api": {
+                    "Type": "AWS::ApiGateway::RestApi",
+                    "Properties": {"Name": f"method-settings-upd-{suffix}"},
+                },
+                "Deployment": {
+                    "Type": "AWS::ApiGateway::Deployment",
+                    "Properties": {"RestApiId": {"Ref": "Api"}},
+                },
+                "Stage": {
+                    "Type": "AWS::ApiGateway::Stage",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "DeploymentId": {"Ref": "Deployment"},
+                        "StageName": "prod",
+                        "MethodSettings": [
+                            {
+                                "ResourcePath": "/*",
+                                "HttpMethod": "*",
+                                "LoggingLevel": logging_level,
+                            },
+                        ],
+                    },
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_template("ERROR"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}[
+            "ApiId"
+        ]
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert settings["*/*"]["loggingLevel"] == "ERROR"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_template("INFO"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert set(settings) == {"*/*"}
+        assert settings["*/*"]["loggingLevel"] == "INFO"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_rest_api_tracks_stack_region(cfn, apigw_v1):
     """A v1 REST API created by a regional stack is scoped to that region, while
     unsigned execute-api data-plane requests still resolve by API id."""
@@ -11853,6 +13315,69 @@ def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
             except ClientError:
                 pass
         apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_gateway_response_applies_with_its_deployment(cfn, apigw_v1):
+    """A GatewayResponse reaches the data plane through the Deployment that
+    depends on it; updating only the response leaves the deployed one in effect."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    stack_name = f"intg-cfn-gateway-response-deploy-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(marker):
+        return json.dumps({
+            "Resources": {
+                "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": stack_name}},
+                "Method": {
+                    "Type": "AWS::ApiGateway::Method",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "ResourceId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                        "HttpMethod": "GET",
+                        "AuthorizationType": "NONE",
+                        "Integration": {"Type": "MOCK"},
+                    },
+                },
+                "Response": {
+                    "Type": "AWS::ApiGateway::GatewayResponse",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "ResponseType": "MISSING_AUTHENTICATION_TOKEN",
+                        "ResponseParameters": {"gatewayresponse.header.X-Cfn": f"'{marker}'"},
+                    },
+                },
+                "Deploy": {
+                    "Type": "AWS::ApiGateway::Deployment",
+                    "DependsOn": ["Method", "Response"],
+                    "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "s1"},
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+        })
+
+    def marker(api_id):
+        req = urllib.request.Request(f"http://localhost:{port}/_aws/execute-api/{api_id}/s1/nope")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=30)
+        assert exc.value.code == 403
+        return exc.value.headers.get("X-Cfn")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = stack["Outputs"][0]["OutputValue"]
+        assert marker(api_id) == "v1"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        response = apigw_v1.get_gateway_response(restApiId=api_id, responseType="MISSING_AUTHENTICATION_TOKEN")
+        assert response["responseParameters"] == {"gatewayresponse.header.X-Cfn": "'v2'"}
+        assert marker(api_id) == "v1"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
 
 
 def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
@@ -12332,6 +13857,203 @@ def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
     assert api_id not in ids
 
 
+def test_cfn_restapi_openapi_body_security_definitions(cfn, apigw_v1, cognito_idp):
+    """securityDefinitions in a RestApi Body create authorizers and bind methods.
+
+    This is the only mechanism by which SAM's Auth property reaches a method —
+    the translator emits no AWS::ApiGateway::Authorizer resource — so before
+    this the method imported as authorizationType NONE and served everyone.
+    """
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-restapi-security-{suffix}"
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-body-{suffix}")["UserPool"]["Id"]
+    pool_region = pool_id.split("_")[0]
+    pool_arn = f"arn:aws:cognito-idp:{pool_region}:000000000000:userpool/{pool_id}"
+
+    mock = {
+        "x-amazon-apigateway-integration": {"type": "mock", "httpMethod": "GET"},
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": f"security-{suffix}"},
+        "securityDefinitions": {
+            "CognitoAuthorizer": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "Authorization",
+                "x-amazon-apigateway-authtype": "cognito_user_pools",
+                "x-amazon-apigateway-authorizer": {
+                    "type": "cognito_user_pools",
+                    "providerARNs": [pool_arn],
+                },
+            },
+            "LambdaAuthorizer": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "X-Token",
+                "x-amazon-apigateway-authtype": "custom",
+                "x-amazon-apigateway-authorizer": {
+                    "type": "token",
+                    "authorizerUri": (
+                        "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/"
+                        "functions/arn:aws:lambda:us-east-1:000000000000:"
+                        "function:noop/invocations"
+                    ),
+                    "authorizerResultTtlInSeconds": 60,
+                },
+            },
+        },
+        "paths": {
+            "/devices": {
+                "get": dict(mock, security=[{"CognitoAuthorizer": ["devices/read"]}]),
+            },
+            "/tokens": {"get": dict(mock, security=[{"LambdaAuthorizer": []}])},
+            "/open": {"get": dict(mock)},
+        },
+    }
+    template = json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}},
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "prod"},
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+        authorizers = {
+            a["name"]: a for a in apigw_v1.get_authorizers(restApiId=api_id)["items"]
+        }
+        assert set(authorizers) == {"CognitoAuthorizer", "LambdaAuthorizer"}
+        cognito_auth = authorizers["CognitoAuthorizer"]
+        assert cognito_auth["type"] == "COGNITO_USER_POOLS"
+        assert cognito_auth["providerARNs"] == [pool_arn]
+        assert cognito_auth["identitySource"] == "method.request.header.Authorization"
+        assert cognito_auth["authType"] == "cognito_user_pools"
+        lambda_auth = authorizers["LambdaAuthorizer"]
+        assert lambda_auth["type"] == "TOKEN"
+        assert lambda_auth["identitySource"] == "method.request.header.X-Token"
+        assert lambda_auth["authorizerResultTtlInSeconds"] == 60
+
+        resources = {
+            r["path"]: r["id"]
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]
+        }
+        devices = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/devices"], httpMethod="GET",
+        )
+        assert devices["authorizationType"] == "COGNITO_USER_POOLS"
+        assert devices["authorizerId"] == cognito_auth["id"]
+        assert devices["authorizationScopes"] == ["devices/read"]
+
+        tokens = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/tokens"], httpMethod="GET",
+        )
+        assert tokens["authorizationType"] == "CUSTOM"
+        assert tokens["authorizerId"] == lambda_auth["id"]
+
+        open_method = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/open"], httpMethod="GET",
+        )
+        assert open_method["authorizationType"] == "NONE"
+
+        def _call(path):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/prod{path}",
+                method="GET",
+                headers={"Host": f"{api_id}.execute-api.localhost:{port}"},
+            )
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+
+        # The gap this closes: both of these previously answered 200.
+        assert _call("/devices") == 401
+        assert _call("/tokens") == 401
+        assert _call("/open") == 200
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_restapi_openapi_body_document_level_security(cfn, apigw_v1):
+    """A document-level security block applies to every operation that does not
+    override it, and an operation's empty security list opts back out."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-restapi-security-doc-{suffix}"
+    mock = {
+        "x-amazon-apigateway-integration": {"type": "mock", "httpMethod": "GET"},
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": f"security-doc-{suffix}"},
+        "securityDefinitions": {
+            "sigv4": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "Authorization",
+                "x-amazon-apigateway-authtype": "awsSigv4",
+            },
+            "api_key": {"in": "header", "type": "apiKey", "name": "x-api-key"},
+        },
+        "security": [{"sigv4": []}],
+        "paths": {
+            "/inherited": {"get": dict(mock)},
+            "/keyed": {"get": dict(mock, security=[{"api_key": []}])},
+            "/public": {"get": dict(mock, security=[])},
+        },
+    }
+    template = json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}},
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+        # Neither scheme carries x-amazon-apigateway-authorizer, so no authorizer.
+        assert apigw_v1.get_authorizers(restApiId=api_id)["items"] == []
+
+        resources = {
+            r["path"]: r["id"]
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]
+        }
+
+        def _method(path):
+            return apigw_v1.get_method(
+                restApiId=api_id, resourceId=resources[path], httpMethod="GET",
+            )
+
+        assert _method("/inherited")["authorizationType"] == "AWS_IAM"
+        keyed = _method("/keyed")
+        assert keyed["authorizationType"] == "NONE"
+        assert keyed["apiKeyRequired"] is True
+        assert _method("/public")["authorizationType"] == "NONE"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 # ============================================================================
 # Nested Stacks (AWS::CloudFormation::Stack)
 # ============================================================================
@@ -12619,12 +14341,15 @@ def test_cfn_logs_subscription_filter_updates_in_place(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs):
+@pytest.mark.parametrize("rollback", [False, True])
+def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs, rollback):
     """LogGroupName requires replacement: the filter is created on the new
     group and removed from the old one. The filter keeps its explicit
     FilterName, so the physical id does not change; without an update
     handler the create wrote the new filter and the old group kept its
-    copy, since the engine saw no replacement to clean up."""
+    copy, since the engine saw no replacement to clean up. When a later
+    resource fails the update, the rollback removes the new filter and the
+    old one stays on its group."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-subfilter-move-{uid}"
     group_a = f"/cfn/subfilter-upd-a-{uid}"
@@ -12641,14 +14366,19 @@ def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
 
-        cfn.update_stack(StackName=stack_name,
-                         TemplateBody=_cfn_subfilter_template(uid, filter_props("GroupB")))
+        body = json.loads(_cfn_subfilter_template(uid, filter_props("GroupB")))
+        if rollback:
+            body["Resources"]["Bad"] = {"Type": "AWS::SSM::Parameter", "DependsOn": "Filter",
+                                        "Properties": {"Type": "Bogus", "Value": "v"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
         stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        expected = "UPDATE_ROLLBACK_COMPLETE" if rollback else "UPDATE_COMPLETE"
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
         assert _output(stack, "FilterRef") == f"cfn-move-{uid}"
-        assert logs.describe_subscription_filters(logGroupName=group_a)["subscriptionFilters"] == []
-        moved = logs.describe_subscription_filters(logGroupName=group_b)["subscriptionFilters"]
-        assert [f["filterName"] for f in moved] == [f"cfn-move-{uid}"]
+        kept, moved = (group_a, group_b) if rollback else (group_b, group_a)
+        filters = logs.describe_subscription_filters(logGroupName=kept)["subscriptionFilters"]
+        assert [(f["filterName"], f["filterPattern"]) for f in filters] == [(f"cfn-move-{uid}", "[Producer]")]
+        assert logs.describe_subscription_filters(logGroupName=moved)["subscriptionFilters"] == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -12925,6 +14655,63 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         assert payload["value"] == "from-cfn-layer"
     finally:
         cfn.delete_stack(StackName=stack_name)
+
+
+@pytest.mark.parametrize("granted", [False, True], ids=["ungranted", "granted"])
+def test_cfn_lambda_function_foreign_layer_follows_the_layer_policy(granted):
+    """A template resolves its layers the way CreateFunction does, so a stack
+    cannot attach, and later load, another account's layer without a grant."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    consumer_id = str(int(owner_id) + 400000000000)
+
+    def client(service, account):
+        return boto3.client(
+            service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1", aws_access_key_id=account, aws_secret_access_key="test",
+        )
+
+    owner, lam, cfn = client("lambda", owner_id), client("lambda", consumer_id), client(
+        "cloudformation", consumer_id)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/foreign.py", "VALUE = 1\n")
+    published = owner.publish_layer_version(LayerName="foreign", Content={"ZipFile": buf.getvalue()})
+    arn = published["LayerVersionArn"]
+    if granted:
+        owner.add_layer_version_permission(
+            LayerName="foreign", VersionNumber=published["Version"], StatementId="shared",
+            Action="lambda:GetLayerVersion", Principal=consumer_id,
+        )
+    stack_name = "cfn-foreign-layer"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+            "FunctionName": "foreign-layer-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": f"arn:aws:iam::{consumer_id}:role/cfn-role",
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"},
+            "Layers": [arn],
+        },
+    }}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        if granted:
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+            assert lam.get_function_configuration(FunctionName="foreign-layer-fn")["Layers"] == [
+                {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+        else:
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(
+                StackName=stack_name)["StackEvents"] if e["ResourceStatus"] == "CREATE_FAILED"]
+            assert any(
+                f"User: arn:aws:iam::{consumer_id}:root is not authorized to perform: "
+                f"lambda:GetLayerVersion on resource: {arn} because no resource-based "
+                "policy allows the lambda:GetLayerVersion action" in reason
+                for reason in reasons
+            ), reasons
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        owner.delete_layer_version(LayerName="foreign", VersionNumber=published["Version"])
 
 
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
@@ -13249,7 +15036,7 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     import sys
 
     from ministack.services.cloudformation.engine import (
-        _apply_sam_transform_if_applicable,
+        _apply_transforms,
     )
 
     # Simulate the package being absent: a None entry makes `from ... import`
@@ -13267,14 +15054,14 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
         },
     }
     with pytest.raises(ValueError) as exc:
-        _apply_sam_transform_if_applicable(template)
+        _apply_transforms(template)
     msg = str(exc.value)
     assert "AWS::Serverless-2016-10-31" in msg
     assert "docs/iac#sam" in msg
 
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
-    assert _apply_sam_transform_if_applicable(plain) is plain
+    assert _apply_transforms(plain) is plain
 
 
 # AWS::OpenSearchService::Domain
@@ -15161,12 +16948,11 @@ def test_cfn_create_rollback_delete_failure_lands_rollback_failed(cfn, lam):
             pass
 
 
-def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, lam):
-    """An update rollback whose delete fails lands UPDATE_ROLLBACK_FAILED and
-    keeps the previous resources on the stack."""
+def test_cfn_update_rollback_cleanup_delete_failure_still_completes(cfn, lam):
+    """A delete that fails in the cleanup phase still lands UPDATE_ROLLBACK_COMPLETE."""
     suffix = _uuid_mod.uuid4().hex[:8]
     fn = f"cr-urb-fail-{suffix}"
-    stack_name = f"cfn-update-rollback-failed-{suffix}"
+    stack_name = f"cfn-update-rollback-cleanup-{suffix}"
     topic_name = f"cfn-urb-topic-{suffix}"
     lam.create_function(
         FunctionName=fn,
@@ -15202,9 +16988,92 @@ def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, la
 
         cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
         stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in retained] == ["Topic"]
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_FAILED"
+                   for e in events)
+        assert not any(e["ResourceType"] == "AWS::CloudFormation::Stack"
+                       and e["ResourceStatus"] == "UPDATE_ROLLBACK_FAILED"
+                       for e in events)
+    finally:
+        try:
+            lam.update_function_code(
+                FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS)
+            )
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def _cr_mode_handler(fail_mode):
+    """A custom-resource handler that refuses an Update to Mode ``fail_mode``."""
+    return f"""\
+import json, urllib.request
+
+FAIL_MODE = {fail_mode!r}
+
+def handler(event, context):
+    mode = event.get("ResourceProperties", {{}}).get("Mode")
+    failed = event["RequestType"] == "Update" and mode == FAIL_MODE
+    payload = json.dumps({{
+        "Status": "FAILED" if failed else "SUCCESS",
+        "Reason": "update to %s refused for testing" % mode,
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": event.get("PhysicalResourceId") or "mode-cr",
+        "Data": {{"Mode": str(mode)}},
+    }}).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"], data=payload, method="PUT",
+        headers={{"content-type": "", "content-length": str(len(payload))}},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def _cr_revert_fails_templates(fn, topic_name):
+    """A custom resource going from Mode before to after beside a failing resource."""
+    def template(mode, with_bad):
+        resources = {
+            "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": topic_name}},
+            "CR": {"Type": "Custom::Tester", "Properties": {
+                "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+                "Mode": mode}},
+        }
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+        return json.dumps({"Resources": resources})
+    return template("before", False), template("after", True)
+
+
+def test_cfn_update_rollback_revert_failure_lands_update_rollback_failed(cfn, lam):
+    """A revert that fails lands UPDATE_ROLLBACK_FAILED and keeps the previous resources."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-urb-revert-{suffix}"
+    stack_name = f"cfn-update-rollback-failed-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_cr_mode_handler("before"))},
+    )
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-urb-topic-{suffix}")
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
+        stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
 
-        # The pre-update resources survive on the stack.
         retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
         assert "Topic" in [r["LogicalResourceId"] for r in retained]
 
@@ -15261,16 +17130,11 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
     stack_name = f"cfn-continue-rollback-{suffix}"
     lam.create_function(
         FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
-        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+        Code={"ZipFile": _cr_make_zip(_cr_mode_handler("before"))},
     )
-    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
-                                    "Properties": {"TopicName": f"cfn-cur-{suffix}"}}}}
-    updated = json.loads(json.dumps(base))
-    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
-        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
-    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-cur-{suffix}")
     try:
-        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         with pytest.raises(ClientError) as exc:
@@ -15278,7 +17142,7 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
         assert "cannot be called from current stack status" in (
             exc.value.response["Error"]["Message"])
 
-        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
 
@@ -15290,17 +17154,15 @@ def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
             cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["Topic"])
         assert "Topic" in exc.value.response["Error"]["Message"]
 
-        # Once the resource can be deleted, the retry completes the rollback
-        # without skipping anything.
+        # Once the revert is accepted, the retry completes.
         lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
         cfn.continue_update_rollback(StackName=stack_name)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
-        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_COMPLETE"
-                   for e in events)
+        resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert sorted(r["LogicalResourceId"] for r in resources) == ["CR", "Topic"]
 
-        again = json.loads(json.dumps(base))
+        again = json.loads(base)
         again["Resources"]["Topic"]["Properties"]["DisplayName"] = "after"
         cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(again))
         stack = _wait_stack(cfn, stack_name)
@@ -15325,18 +17187,13 @@ def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
     stack_name = f"cfn-continue-skip-{suffix}"
     lam.create_function(
         FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
-        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+        Code={"ZipFile": _cr_make_zip(_cr_mode_handler("before"))},
     )
-    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
-                                    "Properties": {"TopicName": f"cfn-cur-skip-{suffix}"}}}}
-    updated = json.loads(json.dumps(base))
-    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
-        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
-    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    base, updated = _cr_revert_fails_templates(fn, f"cfn-cur-skip-{suffix}")
     try:
-        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        cfn.create_stack(StackName=stack_name, TemplateBody=base)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
-        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        cfn.update_stack(StackName=stack_name, TemplateBody=updated)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
 
         cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["CR"])
@@ -15344,6 +17201,7 @@ def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
         events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
         assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "UPDATE_COMPLETE"
+                   and e.get("ResourceStatusReason") == "Resource rollback skipped by user"
                    for e in events)
     finally:
         try:
@@ -15491,6 +17349,101 @@ def test_cfn_appsync_schema_stack_delete_removes_schema(cfn, appsync):
             appsync.delete_graphql_api(apiId=api_id)
         except ClientError:
             pass
+
+
+def _cfn_output(cfn, stack_name, key):
+    return _output(cfn.describe_stacks(StackName=stack_name)["Stacks"][0], key)
+
+
+def _cfn_appsync_members_template(name, api_props, oidc):
+    return json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::AppSync::GraphQLApi", "Properties": {
+                "Name": f"{name}_a", "AuthenticationType": "API_KEY", **api_props}},
+            "Oidc": {"Type": "AWS::AppSync::GraphQLApi", "Properties": {
+                "Name": f"{name}_b", "AuthenticationType": "OPENID_CONNECT",
+                "OpenIDConnectConfig": oidc}},
+        },
+        "Outputs": {"ApiId": {"Value": {"Fn::GetAtt": ["Api", "ApiId"]}},
+                    "OidcId": {"Value": {"Fn::GetAtt": ["Oidc", "ApiId"]}}},
+    })
+
+
+def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
+    """ClusterSettings, DefaultCapacityProviderStrategy and Configuration read back in camelCase."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-cl-{suffix}"
+    cluster = f"cfn-ecs-cl-{suffix}"
+
+    def template(setting, logging):
+        return json.dumps({
+            "Resources": {
+                "Cluster": {
+                    "Type": "AWS::ECS::Cluster",
+                    "Properties": {
+                        "ClusterName": cluster,
+                        "ClusterSettings": [
+                            {"Name": "containerInsights", "Value": setting},
+                        ],
+                        "CapacityProviders": ["FARGATE"],
+                        "DefaultCapacityProviderStrategy": [
+                            {"CapacityProvider": "FARGATE", "Weight": 1, "Base": 0},
+                        ],
+                        "Configuration": {
+                            "ExecuteCommandConfiguration": {"Logging": logging},
+                        },
+                        "Tags": [{"Key": "stage", "Value": setting}],
+                    },
+                },
+                "TD": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": f"cfn-ecs-td-{suffix}",
+                        "ContainerDefinitions": [
+                            {"Name": "app", "Image": "nginx", "Memory": 128},
+                        ],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": f"cfn-ecs-svc-{suffix}",
+                        "TaskDefinition": {"Ref": "TD"},
+                        "DesiredCount": 1,
+                    },
+                },
+            },
+        })
+
+    def described():
+        return ecs.describe_clusters(
+            clusters=[cluster], include=["SETTINGS", "CONFIGURATIONS"])["clusters"][0]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("disabled", "DEFAULT"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        before = described()
+        assert before["settings"] == [{"name": "containerInsights", "value": "disabled"}]
+        assert before["defaultCapacityProviderStrategy"] == [
+            {"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+        assert before["configuration"] == {
+            "executeCommandConfiguration": {"logging": "DEFAULT"}}
+        assert before["activeServicesCount"] == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("enabled", "NONE"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        after = described()
+        assert after["settings"] == [
+            {"name": "containerInsights", "value": "enabled"}]
+        assert after["configuration"] == {
+            "executeCommandConfiguration": {"logging": "NONE"}}
+        assert after["activeServicesCount"] == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 # ===========================================================================
@@ -19019,8 +20972,7 @@ def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_stateme
     """When an update that replaced the permission fails later in the run,
     the rollback removes the statement the replacement added, since the
     delete resolves the Sid the way the create did. The previous statement
-    is not re-added: the rollback restores the stack record without
-    re-provisioning, which is disclosed in the PR."""
+    stays: its removal waits for the cleanup phase of a successful update."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-perm-rb-{uid}"
     fn_name = f"cfn-perm-rb-{uid}"
@@ -19058,8 +21010,7 @@ def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_stateme
         cfn.update_stack(StackName=stack_name, TemplateBody=template("events.amazonaws.com", "N"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        statements = _lambda_policy_statements(lam, fn_name)
-        assert {s["Sid"] for s in statements} == {"kept"}
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == sids
         assert ddb.describe_table(TableName=table_name)["Table"]["AttributeDefinitions"] == [
             {"AttributeName": "pk", "AttributeType": "S"}]
     finally:
@@ -19248,22 +21199,140 @@ def _cfn_policy_test_roles_cleanup(iam, roles):
     for role in roles:
         for p in iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]:
             iam.detach_role_policy(RoleName=role, PolicyArn=p["PolicyArn"])
+        # DeleteRole refuses a role that still holds an inline policy, which is
+        # the shape an AWS::IAM::Policy leaves behind.
+        for name in iam.list_role_policies(RoleName=role)["PolicyNames"]:
+            iam.delete_role_policy(RoleName=role, PolicyName=name)
         iam.delete_role(RoleName=role)
+
+
+def _inline_role_document(iam, role, policy_name):
+    """The inline policy document on a role, parsed."""
+    doc = iam.get_role_policy(RoleName=role, PolicyName=policy_name)["PolicyDocument"]
+    return json.loads(doc) if isinstance(doc, str) else doc
+
+
+def _cfn_inline_policy_template(policy_name, document=None, **entities):
+    """One AWS::IAM::Policy on the Roles / Users / Groups passed as keywords."""
+    return json.dumps({"Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+        "PolicyName": policy_name,
+        "PolicyDocument": document or {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+        **entities,
+    }}}})
+
+
+def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
+    """"Adds or updates an inline policy document that is embedded in the
+    specified IAM group, user or role" (aws-resource-iam-policy.html) — the
+    document lands on the role itself, and no managed policy is created for
+    it. Ref and GetAtt Id both return the generated physical id, not the
+    PolicyName: on AWS the type's primary identifier is its read-only Id, and
+    a template that sets an explicit PolicyName still gets an opaque id."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-inl-{uid}"
+    role = f"cfn-pol-inl-role-{uid}"
+    policy_name = f"cfn-pol-inl-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    before = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
+    template = json.dumps({
+        "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": policy_name,
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+            "Roles": [role],
+        }}},
+        "Outputs": {"Ref": {"Value": {"Ref": "Pol"}},
+                    "Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
+        document = _inline_role_document(iam, role, policy_name)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
+
+        # Nothing managed: no attachment on the role and no new Local policy.
+        assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+        after = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
+        assert after == before
+
+        assert _output(stack, "Ref") == _output(stack, "Id")
+        assert _output(stack, "Ref") != policy_name
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_same_name_in_two_stacks_stays_separate(cfn, iam):
+    """An inline policy is scoped to its entity, so the same PolicyName on two
+    roles is two independent policies. CDK reaches this constantly: it derives
+    PolicyName from the construct path, so every stack that grants something
+    to a role at the same path emits the same name. Provisioned as one managed
+    policy these collapse onto a single record and the second stack silently
+    takes the first role's grants away."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    shared_name = f"cfn-pol-shared-{uid}"
+    roles = [f"cfn-pol-sh-role-a-{uid}", f"cfn-pol-sh-role-b-{uid}"]
+    _cfn_policy_test_roles(iam, roles)
+    stacks = [f"cfn-iam-pol-sh-a-{uid}", f"cfn-iam-pol-sh-b-{uid}"]
+
+    def template(role, action):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+                "PolicyName": shared_name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": action, "Resource": "*"}]},
+                "Roles": [role],
+            }}},
+            "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(roles[0], "s3:GetObject"))
+        stack_a = _wait_stack(cfn, stacks[0])
+        assert stack_a["StackStatus"] == "CREATE_COMPLETE", stack_a.get("StackStatusReason")
+        cfn.create_stack(StackName=stacks[1], TemplateBody=template(roles[1], "sqs:SendMessage"))
+        stack_b = _wait_stack(cfn, stacks[1])
+        assert stack_b["StackStatus"] == "CREATE_COMPLETE", stack_b.get("StackStatusReason")
+
+        # Each role kept its own document under the shared name.
+        for role, action in zip(roles, ["s3:GetObject", "sqs:SendMessage"]):
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [shared_name]
+            document = _inline_role_document(iam, role, shared_name)
+            assert document["Statement"][0]["Action"] == action
+
+        # And the two resources are distinct, so neither stack owns the other's.
+        assert _output(stack_a, "Id") != _output(stack_b, "Id")
+
+        # Deleting the second leaves the first alone.
+        cfn.delete_stack(StackName=stacks[1])
+        assert _wait_stack(cfn, stacks[1])["StackStatus"] == "DELETE_COMPLETE"
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == [shared_name]
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == []
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, roles)
 
 
 def test_cfn_iam_policy_update_in_place(cfn, iam):
     """PolicyDocument and Roles update the inline policy in place, as
-    PutRolePolicy does: Ref keeps the policy name, GetAtt Id the same policy
-    id, the document is rewritten and the second role gets the attachment."""
+    PutRolePolicy does: Ref and GetAtt Id keep the same physical id, the
+    document is rewritten and the second role gets its own copy."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-upd-{uid}"
     roles = [f"cfn-pol-role-a-{uid}", f"cfn-pol-role-b-{uid}"]
+    policy_name = f"cfn-pol-upd-{uid}"
     _cfn_policy_test_roles(iam, roles)
 
     def template(actions, role_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-upd-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": actions, "Resource": "*"}]},
                 "Roles": role_names,
@@ -19276,53 +21345,50 @@ def test_cfn_iam_policy_update_in_place(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        attached = iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-upd-{uid}"]
-        policy_arn = attached[0]["PolicyArn"]
+        physical_id = _output(stack, "Id")
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == [policy_name]
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == []
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(
             ["s3:GetObject", "s3:PutObject"], roles))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Name") == f"cfn-pol-upd-{uid}"
-        assert _output(stack, "Id") == policy_id
+        assert _output(stack, "Name") == physical_id
+        assert _output(stack, "Id") == physical_id
 
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 2
-        assert policy["DefaultVersionId"] == "v2"
-        version = iam.get_policy_version(
-            PolicyArn=policy_arn, VersionId=policy["DefaultVersionId"])["PolicyVersion"]
-        document = version["Document"]
-        if isinstance(document, str):
-            document = json.loads(document)
-        assert document["Statement"][0]["Action"] == ["s3:GetObject", "s3:PutObject"]
         for role in roles:
-            attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-            assert [p["PolicyArn"] for p in attached] == [policy_arn]
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
+            document = _inline_role_document(iam, role, policy_name)
+            assert document["Statement"][0]["Action"] == ["s3:GetObject", "s3:PutObject"]
+            assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
 
 
-def test_cfn_iam_policy_rename_keeps_id_versions_and_attachments(cfn, iam):
+def test_cfn_iam_policy_rename_keeps_the_id_and_leaves_no_stale_policy(cfn, iam):
     """"PolicyName ... Update requires: No interruption", and "GetAtt Id: The
     stable and unique string identifying the policy"
-    (aws-resource-iam-policy.html) — a renamed policy keeps its id, its
-    version history and its attachments; Ref follows the new name."""
+    (aws-resource-iam-policy.html) — a renamed policy keeps its id, the role
+    ends up holding only the new name, and the old one is gone. A rename that
+    cannot finish takes nothing off.
+
+    The id staying put is what keeps the rename safe: the engine reads a
+    changed physical id as a replacement and deletes the predecessor once the
+    update completes, and an inline policy is keyed by its entity and its
+    name, so that cleanup would delete the policy the update just wrote."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-ren-{uid}"
     role = f"cfn-pol-ren-role-{uid}"
     _cfn_policy_test_roles(iam, [role])
 
-    def template(name, action):
+    def template(name, action, role_names=None):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
                 "PolicyName": name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": action, "Resource": "*"}]},
-                "Roles": [role],
+                "Roles": role_names or [role],
             }}},
             "Outputs": {"Name": {"Value": {"Ref": "Pol"}},
                         "Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
@@ -19332,57 +21398,89 @@ def test_cfn_iam_policy_rename_keeps_id_versions_and_attachments(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        old_arn = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"][0]["PolicyArn"]
-        created = iam.get_policy(PolicyArn=old_arn)["Policy"]["CreateDate"]
+        physical_id = _output(stack, "Id")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-a-{uid}"]
 
-        # A document change first, so the rename has a version history to keep.
+        # A document change first, so the rename has something to carry over.
         cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-pol-a-{uid}", "s3:PutObject"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert iam.get_policy(PolicyArn=old_arn)["Policy"]["DefaultVersionId"] == "v2"
+        document = _inline_role_document(iam, role, f"cfn-pol-a-{uid}")
+        assert document["Statement"][0]["Action"] == "s3:PutObject"
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-pol-b-{uid}", "s3:PutObject"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Name") == f"cfn-pol-b-{uid}"
-        assert _output(stack, "Id") == policy_id
+        assert _output(stack, "Name") == physical_id
+        assert _output(stack, "Id") == physical_id
 
-        attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-b-{uid}"]
-        new_arn = attached[0]["PolicyArn"]
-        assert new_arn != old_arn
-        policy = iam.get_policy(PolicyArn=new_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["PolicyName"] == f"cfn-pol-b-{uid}"
-        assert policy["AttachmentCount"] == 1
-        assert policy["DefaultVersionId"] == "v2"
-        assert policy["CreateDate"] == created
-        versions = iam.list_policy_versions(PolicyArn=new_arn)["Versions"]
-        assert sorted(v["VersionId"] for v in versions) == ["v1", "v2"]
-        entities = iam.list_entities_for_policy(PolicyArn=new_arn)
-        assert [r["RoleName"] for r in entities["PolicyRoles"]] == [role]
+        # Only the new name survives, carrying the current document.
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-b-{uid}"]
+        document = _inline_role_document(iam, role, f"cfn-pol-b-{uid}")
+        assert document["Statement"][0]["Action"] == "s3:PutObject"
         with pytest.raises(ClientError) as exc_info:
-            iam.get_policy(PolicyArn=old_arn)
+            iam.get_role_policy(RoleName=role, PolicyName=f"cfn-pol-a-{uid}")
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
+
+        # A rename that names a role which is not there takes nothing off. The
+        # rollback of an update leaves a resource that kept its physical id
+        # alone, so the drop has to wait until every name resolves.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(f"cfn-pol-c-{uid}", "s3:PutObject",
+                                               [role, f"cfn-pol-ren-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [f"cfn-pol-b-{uid}"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
 
 
-def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
-    """A role dropped from Roles loses the policy, the way the inline policy
-    goes away on AWS, while the document, the policy id and the other
-    role's attachment stay."""
+def test_cfn_iam_policy_malformed_update_rolls_back_before_touching_the_role(cfn, iam):
+    """An update whose new PolicyDocument does not validate rolls back, and
+    the role keeps its last good document. Measured on a real account with a
+    statement that has no Resource."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-bad-doc-{uid}"
+    role = f"cfn-pol-bad-doc-role-{uid}"
+    policy_name = f"cfn-pol-bad-doc-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+
+    good_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    bad_document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject"}]}  # no Resource
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, good_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, bad_document, Roles=[role]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        assert _inline_role_document(iam, role, policy_name) == good_document
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_role_removed_from_roles_loses_the_policy(cfn, iam):
+    """A role dropped from Roles loses the inline policy, the way it goes away
+    on AWS, while the remaining role keeps its copy and the id stays."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-rm-{uid}"
     roles = [f"cfn-pol-rm-role-a-{uid}", f"cfn-pol-rm-role-b-{uid}"]
+    policy_name = f"cfn-pol-rm-{uid}"
     _cfn_policy_test_roles(iam, roles)
 
     def template(role_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-rm-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
                 "Roles": role_names,
@@ -19394,21 +21492,18 @@ def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"][0]["PolicyArn"]
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 2
+        physical_id = _output(stack, "Id")
+        for role in roles:
+            assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(roles[1:]))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Id") == policy_id
-        assert iam.list_attached_role_policies(RoleName=roles[0])["AttachedPolicies"] == []
-        attached = iam.list_attached_role_policies(RoleName=roles[1])["AttachedPolicies"]
-        assert [p["PolicyArn"] for p in attached] == [policy_arn]
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 1
-        assert policy["DefaultVersionId"] == "v1"
+        assert _output(stack, "Id") == physical_id
+        assert iam.list_role_policies(RoleName=roles[0])["PolicyNames"] == []
+        assert iam.list_role_policies(RoleName=roles[1])["PolicyNames"] == [policy_name]
+        document = _inline_role_document(iam, roles[1], policy_name)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, roles)
@@ -19417,12 +21512,13 @@ def test_cfn_iam_policy_role_removed_from_roles_is_detached(cfn, iam):
 def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     """"Users ... Update requires: No interruption" and "Groups ... Update
     requires: No interruption" (aws-resource-iam-policy.html) — a user or
-    group dropped from the list is detached, one added is attached, and the
-    policy id survives the update."""
+    group dropped from the list loses the inline policy, one added gets it,
+    and the id survives the update."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-ug-{uid}"
     users = [f"cfn-pol-user-a-{uid}", f"cfn-pol-user-b-{uid}"]
     groups = [f"cfn-pol-group-a-{uid}", f"cfn-pol-group-b-{uid}"]
+    policy_name = f"cfn-pol-ug-{uid}"
     for user in users:
         iam.create_user(UserName=user)
     for group in groups:
@@ -19431,7 +21527,7 @@ def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     def template(user_names, group_names):
         return json.dumps({
             "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-ug-{uid}",
+                "PolicyName": policy_name,
                 "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                     {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
                 "Users": user_names,
@@ -19444,52 +21540,53 @@ def test_cfn_iam_policy_users_and_groups_reconcile(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"][0]["PolicyArn"]
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"]] == [policy_arn]
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 2
+        physical_id = _output(stack, "Id")
+        # Users and groups keep their inline policies in stores of their own,
+        # away from the role store, so both paths are worth asserting.
+        assert iam.list_user_policies(UserName=users[0])["PolicyNames"] == [policy_name]
+        assert iam.list_group_policies(GroupName=groups[0])["PolicyNames"] == [policy_name]
+        assert iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"] == []
+        assert iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"] == []
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(users[1:], groups[1:]))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "Id") == policy_id
-        assert iam.list_attached_user_policies(UserName=users[0])["AttachedPolicies"] == []
-        assert iam.list_attached_group_policies(GroupName=groups[0])["AttachedPolicies"] == []
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_user_policies(UserName=users[1])["AttachedPolicies"]] == [policy_arn]
-        assert [p["PolicyArn"] for p in
-                iam.list_attached_group_policies(GroupName=groups[1])["AttachedPolicies"]] == [policy_arn]
-        policy = iam.get_policy(PolicyArn=policy_arn)["Policy"]
-        assert policy["PolicyId"] == policy_id
-        assert policy["AttachmentCount"] == 2
-        entities = iam.list_entities_for_policy(PolicyArn=policy_arn)
-        assert [u["UserName"] for u in entities["PolicyUsers"]] == users[1:]
-        assert [g["GroupName"] for g in entities["PolicyGroups"]] == groups[1:]
+        assert _output(stack, "Id") == physical_id
+        assert iam.list_user_policies(UserName=users[0])["PolicyNames"] == []
+        assert iam.list_group_policies(GroupName=groups[0])["PolicyNames"] == []
+        assert iam.list_user_policies(UserName=users[1])["PolicyNames"] == [policy_name]
+        assert iam.list_group_policies(GroupName=groups[1])["PolicyNames"] == [policy_name]
+        document = iam.get_user_policy(
+            UserName=users[1], PolicyName=policy_name)["PolicyDocument"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         for user in users:
-            for p in iam.list_attached_user_policies(UserName=user)["AttachedPolicies"]:
-                iam.detach_user_policy(UserName=user, PolicyArn=p["PolicyArn"])
+            for name in iam.list_user_policies(UserName=user)["PolicyNames"]:
+                iam.delete_user_policy(UserName=user, PolicyName=name)
             iam.delete_user(UserName=user)
         for group in groups:
+            for name in iam.list_group_policies(GroupName=group)["PolicyNames"]:
+                iam.delete_group_policy(GroupName=group, PolicyName=name)
             iam.delete_group(GroupName=group)
 
 
-def test_cfn_iam_policy_delete_detaches_entities(cfn, iam):
+def test_cfn_iam_policy_delete_removes_the_inline_policy(cfn, iam):
     """Deleting the stack takes the inline policy off the role it was
     embedded in ("Adds or updates an inline policy document that is embedded
     in the specified IAM group, user or role", aws-resource-iam-policy.html):
-    the role's attached list is empty and the policy is gone once the stack
-    reports DELETE_COMPLETE — checked before the fixture cleanup, which
-    would otherwise mask a leftover attachment."""
+    the role holds nothing once the stack reports DELETE_COMPLETE — checked
+    before the fixture cleanup, which would otherwise mask a leftover."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-iam-pol-del-{uid}"
     role = f"cfn-pol-del-role-{uid}"
+    policy_name = f"cfn-pol-del-{uid}"
     _cfn_policy_test_roles(iam, [role])
     template = json.dumps({
         "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-            "PolicyName": f"cfn-pol-del-{uid}",
+            "PolicyName": policy_name,
             "PolicyDocument": {"Version": "2012-10-17", "Statement": [
                 {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
             "Roles": [role],
@@ -19500,19 +21597,204 @@ def test_cfn_iam_policy_delete_detaches_entities(cfn, iam):
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        attached = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]
-        assert [p["PolicyName"] for p in attached] == [f"cfn-pol-del-{uid}"]
-        policy_arn = attached[0]["PolicyArn"]
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == [policy_name]
 
         cfn.delete_stack(StackName=stack_name)
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
-        assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == []
         with pytest.raises(ClientError) as exc_info:
-            iam.get_policy(PolicyArn=policy_arn)
+            iam.get_role_policy(RoleName=role, PolicyName=policy_name)
         assert exc_info.value.response["Error"]["Code"] == "NoSuchEntity"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_shows_up_in_the_authorization_details(cfn, iam):
+    """GetAccountAuthorizationDetails lists the policy under RolePolicyList
+    rather than AttachedManagedPolicies, which is where the IAM evaluator
+    reads a role's grants from."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-aad-{uid}"
+    role = f"cfn-pol-aad-role-{uid}"
+    policy_name = f"cfn-pol-aad-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    template = json.dumps({
+        "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": policy_name,
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]},
+            "Roles": [role],
+        }}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        details = iam.get_account_authorization_details(Filter=["Role"])
+        entry = next(r for r in details["RoleDetailList"] if r["RoleName"] == role)
+        assert [p["PolicyName"] for p in entry.get("RolePolicyList", [])] == [policy_name]
+        assert entry.get("AttachedManagedPolicies", []) == []
+        document = entry["RolePolicyList"][0]["PolicyDocument"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        assert document["Statement"][0]["Action"] == "s3:GetObject"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+def test_cfn_iam_policy_grant_survives_a_second_stack_with_the_same_name(cfn, iam):
+    """The grant reaches the evaluator, and a later stack sharing the
+    PolicyName does not take it away.
+
+    SimulatePrincipalPolicy resolves a role through _gather_role_policies, the
+    same function AUTH=true consults when it decides a request, so this is the
+    behaviour the resource exists for rather than another shape assertion.
+    Deploying the second stack is what makes it a real test: one managed
+    policy keyed by name serves both roles, so the second document replaces
+    the first and the first role quietly loses the grant its own template
+    declared."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    shared_name = f"cfn-pol-sim-{uid}"
+    roles = [f"cfn-pol-sim-role-a-{uid}", f"cfn-pol-sim-role-b-{uid}"]
+    stacks = [f"cfn-iam-pol-sim-a-{uid}", f"cfn-iam-pol-sim-b-{uid}"]
+    _cfn_policy_test_roles(iam, roles)
+    arns = [iam.get_role(RoleName=role)["Role"]["Arn"] for role in roles]
+
+    def template(role, action):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
+                "PolicyName": shared_name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": action,
+                     "Resource": f"arn:aws:s3:::bucket-{uid}/*"}]},
+                "Roles": [role],
+            }}},
+        })
+
+    def decision(arn, action):
+        results = iam.simulate_principal_policy(
+            PolicySourceArn=arn, ActionNames=[action],
+            ResourceArns=[f"arn:aws:s3:::bucket-{uid}/*"],
+        )["EvaluationResults"]
+        return results[0]["EvalDecision"]
+
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(roles[0], "s3:GetObject"))
+        stack = _wait_stack(cfn, stacks[0])
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert decision(arns[0], "s3:GetObject") == "allowed"
+
+        cfn.create_stack(StackName=stacks[1], TemplateBody=template(roles[1], "s3:PutObject"))
+        stack = _wait_stack(cfn, stacks[1])
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        # Each role is allowed what its own stack granted, and nothing else.
+        assert decision(arns[0], "s3:GetObject") == "allowed"
+        assert decision(arns[0], "s3:PutObject") != "allowed"
+        assert decision(arns[1], "s3:PutObject") == "allowed"
+        assert decision(arns[1], "s3:GetObject") != "allowed"
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, roles)
+
+
+def test_cfn_iam_policy_missing_entity_fails_the_resource(cfn):
+    """An AWS::IAM::Policy that names a role, user or group which does not
+    exist fails the resource instead of skipping it.
+
+    Measured on a real account with one stack per kind, rollback disabled so
+    the events survive: each reports CREATE_FAILED for the resource, with the
+    IAM sentence "The <kind> with name <name> cannot be found." in the reason,
+    and then CREATE_FAILED for the stack. Rollback is on here, so the stack
+    ends in ROLLBACK_COMPLETE and the reason is read off the events."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    for prop, kind in (("Roles", "role"), ("Users", "user"), ("Groups", "group")):
+        stack_name = f"cfn-iam-pol-miss-{kind}-{uid}"
+        missing = f"cfn-pol-miss-{kind}-{uid}"
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-miss-{uid}", **{prop: [missing]}))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert f"The {kind} with name {missing} cannot be found." in \
+                _stack_event_reasons(cfn, stack_name)
+        finally:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_policy_missing_entity_writes_nothing_at_all(cfn, iam):
+    """A resource that names one role that exists and one that does not writes
+    the policy on neither: the names are resolved before the first document is
+    embedded, so the failed resource leaves nothing behind for the rollback to
+    miss."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-part-{uid}"
+    role = f"cfn-pol-part-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            f"cfn-pol-part-{uid}", Roles=[role, f"cfn-pol-part-gone-{uid}"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert iam.list_role_policies(RoleName=role)["PolicyNames"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _cfn_policy_test_roles_cleanup(iam, [role])
+
+
+@pytest.mark.parametrize("prop,kind", [("Users", "user"), ("Groups", "group")])
+def test_cfn_iam_policy_update_adding_a_missing_entity_keeps_the_policy(cfn, iam, prop, kind):
+    """An update that adds a user or group which does not exist rolls back, and
+    the entity that held the policy still holds it. The rename test covers the
+    same case for a role."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-add-{kind}-{uid}"
+    entity = {"UserName" if kind == "user" else "GroupName": f"cfn-pol-add-{kind}-{uid}"}
+    policy_name = f"cfn-pol-add-{uid}"
+    missing = f"cfn-pol-add-gone-{uid}"
+    getattr(iam, f"create_{kind}")(**entity)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: list(entity.values())}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+            policy_name, **{prop: [*entity.values(), missing]}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert f"The {kind} with name {missing} cannot be found." in \
+            _stack_event_reasons(cfn, stack_name)
+        assert getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"] == [policy_name]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in getattr(iam, f"list_{kind}_policies")(**entity)["PolicyNames"]:
+            getattr(iam, f"delete_{kind}_policy")(PolicyName=name, **entity)
+        getattr(iam, f"delete_{kind}")(**entity)
+
+
+def test_cfn_iam_policy_delete_tolerates_an_entity_that_is_already_gone(cfn, iam):
+    """A role deleted out from under a live stack does not fail the stack
+    delete: an entity is routinely torn down before the policy on it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-pol-gone-{uid}"
+    role = f"cfn-pol-gone-role-{uid}"
+    _cfn_policy_test_roles(iam, [role])
+    try:
+        try:
+            cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_inline_policy_template(
+                f"cfn-pol-gone-{uid}", Roles=[role]))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        finally:
+            _cfn_policy_test_roles_cleanup(iam, [role])
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
@@ -19671,60 +21953,8 @@ def test_cfn_iam_instance_profile_path_change_under_generated_name_replaces_it(c
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_iam_policy_version_cap_prunes_on_sixth_document(cfn, iam):
-    """Every PolicyDocument change becomes a new default version; at the IAM
-    five-version cap the oldest non-default version is pruned first, so the
-    sixth document lands as v6 with five versions listed and the policy id
-    unchanged throughout."""
-    uid = _uuid_mod.uuid4().hex[:8]
-    stack_name = f"cfn-iam-pol-cap-{uid}"
-    role = f"cfn-pol-cap-role-{uid}"
-    _cfn_policy_test_roles(iam, [role])
-
-    def template(n):
-        return json.dumps({
-            "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
-                "PolicyName": f"cfn-pol-cap-{uid}",
-                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
-                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::bucket-{n}/*"}]},
-                "Roles": [role],
-            }}},
-            "Outputs": {"Id": {"Value": {"Fn::GetAtt": ["Pol", "Id"]}}},
-        })
-
-    cfn.create_stack(StackName=stack_name, TemplateBody=template(1))
-    try:
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
-        policy_id = _output(stack, "Id")
-        policy_arn = iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"][0]["PolicyArn"]
-
-        for n in range(2, 7):
-            cfn.update_stack(StackName=stack_name, TemplateBody=template(n))
-            stack = _wait_stack(cfn, stack_name)
-            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-            assert _output(stack, "Id") == policy_id
-            assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["DefaultVersionId"] == f"v{n}"
-
-        versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
-        assert sorted(v["VersionId"] for v in versions) == ["v2", "v3", "v4", "v5", "v6"]
-        assert [v["VersionId"] for v in versions if v["IsDefaultVersion"]] == ["v6"]
-        document = iam.get_policy_version(PolicyArn=policy_arn, VersionId="v6")["PolicyVersion"]["Document"]
-        if isinstance(document, str):
-            document = json.loads(document)
-        assert document["Statement"][0]["Resource"] == "arn:aws:s3:::bucket-6/*"
-        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["AttachmentCount"] == 1
-    finally:
-        _delete_cfn_test_stack(cfn, stack_name)
-        _cfn_policy_test_roles_cleanup(iam, [role])
 def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, ddb):
-    """A failed update rolls back only what the update created. The queue
-    existed before the update and kept its physical id through an in-place
-    change, so the rollback leaves it alone; the queue the update added is
-    deleted; the table, whose attribute type change is refused under its
-    custom name, is what fails the update. The in-place change itself is not
-    reverted: the queue keeps the new VisibilityTimeout while the stack
-    records the old template."""
+    """The rollback sends an in-place change back and deletes only what the update created."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-rb-keep-{uid}"
     queue_name = f"cfn-rb-keep-{uid}"
@@ -19763,13 +21993,23 @@ def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, d
                     and e["ResourceStatus"].startswith("DELETE")]
         assert [e for e in events if e["LogicalResourceId"] == "Added"
                 and e["ResourceStatus"] == "DELETE_COMPLETE"]
+        # The queue goes back first, the refused table is marked complete, then the added queue is deleted.
+        rollback = next(i for i, e in enumerate(events)
+                        if e["LogicalResourceId"] == stack_name
+                        and e["ResourceStatus"] == "UPDATE_ROLLBACK_IN_PROGRESS")
+        assert [(e["LogicalResourceId"], e["ResourceStatus"])
+                for e in reversed(events[:rollback])
+                if e["LogicalResourceId"] != stack_name
+                and e["ResourceStatus"] != "DELETE_IN_PROGRESS"] == [
+            ("Queue", "UPDATE_IN_PROGRESS"), ("Queue", "UPDATE_COMPLETE"),
+            ("Table", "UPDATE_COMPLETE"), ("Added", "DELETE_COMPLETE")]
 
         assert sqs.get_queue_url(QueueName=queue_name)["QueueUrl"] == queue_url
         attributes = sqs.get_queue_attributes(
             QueueUrl=queue_url, AttributeNames=["VisibilityTimeout", "ApproximateNumberOfMessages"]
         )["Attributes"]
         assert attributes["ApproximateNumberOfMessages"] == "1"
-        assert attributes["VisibilityTimeout"] == "45"  # the in-place change is not reverted
+        assert attributes["VisibilityTimeout"] == "30"
         with pytest.raises(ClientError):
             sqs.get_queue_url(QueueName=added_name)
         table = ddb.describe_table(TableName=table_name)["Table"]
@@ -19785,36 +22025,30 @@ def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, d
         sqs.get_queue_url(QueueName=queue_name)
 
 
-def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record(cfn, sqs, ddb):
-    """A resource replaced under a new physical id during a failed update has
-    the replacement deleted on rollback, and the restored stack record points
-    at the old physical id again. The queue is renamed, which is a replacement
-    (QueueName is create-only); the table, whose attribute type change is
-    refused under its custom name, is what fails the update.
+def test_cfn_update_rollback_deletes_the_replacement_and_keeps_the_old_resource(cfn, sqs, ssm, ddb):
+    """A resource replaced during a failed update has the replacement deleted
+    on rollback and the old resource kept, and the restored stack record
+    points at it again. The queue and the parameter are renamed (both names
+    are create-only); the table, whose attribute type change is refused under
+    its custom name, is what fails the update. A later successful update
+    deletes the predecessors in the cleanup phase.
 
-    AWS, "Understand update behaviors of stack resources": a replacement
-    "recreates the resource during an update, which also generates a new
-    physical ID. CloudFormation usually creates the replacement resource
-    first, changes references from other dependent resources to point to the
-    replacement resource, and then deletes the old resource." And on a failed
-    operation ("Managing AWS resources as a single unit"): "CloudFormation
-    rolls the stack back and automatically deletes any resources that were
-    created."
-
-    The emulator's replacement deletes the old queue as soon as the new one
-    exists, so the rollback cannot bring it back: the restored record names a
-    queue that no longer exists. That is the disclosed limit this test pins.
+    Measured on AWS 2026-09-15 with a renamed SSM parameter and a resource
+    failing after it: the new parameter is deleted in
+    UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS and the old one survives.
     """
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-rb-replace-{uid}"
-    old_name = f"cfn-rb-old-{uid}"
-    new_name = f"cfn-rb-new-{uid}"
+    old_name, new_name = f"cfn-rb-old-{uid}", f"cfn-rb-new-{uid}"
+    old_param, new_param = f"/cfn-rb-{uid}/old", f"/cfn-rb-{uid}/new"
     table_name = f"cfn-rb-replace-{uid}"
 
-    def template(queue_name, key_type):
+    def template(queue_name, param_name, key_type):
         return json.dumps({"Resources": {
             "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
-            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+            "Param": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": param_name, "Type": "String", "Value": "v"}},
+            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": ["Queue", "Param"], "Properties": {
                 "TableName": table_name,
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -19822,33 +22056,49 @@ def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record
             }},
         }})
 
-    cfn.create_stack(StackName=stack_name, TemplateBody=template(old_name, "S"))
+    def param_exists(name):
+        try:
+            ssm.get_parameter(Name=name)
+            return True
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ParameterNotFound", exc.response["Error"]
+            return False
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(old_name, old_param, "S"))
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         old_url = sqs.get_queue_url(QueueName=old_name)["QueueUrl"]
+        new_url = f"{old_url.rsplit('/', 1)[0]}/{new_name}"
 
-        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, "N"))
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, new_param, "N"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        events = [e for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
-                  if e["LogicalResourceId"] == "Queue"]
-        deleted = [e for e in events if e["ResourceStatus"] == "DELETE_COMPLETE"]
-        assert [e["PhysicalResourceId"] for e in deleted] == [f"{old_url.rsplit('/', 1)[0]}/{new_name}"]
-
-        with pytest.raises(ClientError):
-            sqs.get_queue_url(QueueName=new_name)
-        with pytest.raises(ClientError):  # the replacement already removed it; not restored
-            sqs.get_queue_url(QueueName=old_name)
-        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(
-            StackName=stack_name)["StackResources"]}
-        assert set(resources) == {"Queue", "Table"}
-        assert resources["Queue"]["PhysicalResourceId"] == old_url
-        assert resources["Table"]["PhysicalResourceId"] == table_name
+        for logical_id, new_pid in (("Queue", new_url), ("Param", new_param)):
+            # DELETE_IN_PROGRESS then DELETE_COMPLETE, both for the replacement.
+            deleted = [pid for status, pid in _resource_events(cfn, stack_name, logical_id)
+                       if status.startswith("DELETE")]
+            assert deleted == [new_pid, new_pid], (logical_id, deleted)
+        assert _queue_exists(sqs, old_name) and not _queue_exists(sqs, new_name)
+        assert param_exists(old_param) and not param_exists(new_param)
+        resources = {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                     for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert resources == {"Queue": old_url, "Param": old_param, "Table": table_name}
         table = ddb.describe_table(TableName=table_name)["Table"]
         assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, new_param, "S"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, new_name) and not _queue_exists(sqs, old_name)
+        assert param_exists(new_param) and not param_exists(old_param)
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+        for name in (old_name, new_name):
+            _delete_queue_if_present(sqs, name)
+        ssm.delete_parameters(Names=[old_param, new_param])
+
+
 def _queue_exists(sqs, name):
     try:
         sqs.get_queue_url(QueueName=name)
@@ -21297,8 +23547,11 @@ def test_cfn_rules_cdk_check_bootstrap_version(cfn, ssm):
 def test_cfn_rules_condition_and_list_functions(cfn):
     """A rule whose RuleCondition is false is skipped; Fn::Contains,
     Fn::EachMemberEquals and Fn::EachMemberIn see a CommaDelimitedList
-    parameter as a list of trimmed members; Fn::And, Fn::Or, Fn::Equals and
-    Fn::If nest; the pseudo parameters resolve."""
+    parameter as a list of trimmed members; Fn::And, Fn::Or and Fn::Equals
+    nest; the pseudo parameters resolve. Fn::If is deliberately absent: a real
+    account refuses it in the Rules block ("Following functions are not
+    supported in the Rules block of the template: [Fn::If]", us-east-1
+    2026-09-19), even though the resource reference lists it."""
     uid = _uuid_mod.uuid4().hex[:8]
     params = {
         "Env": {"Type": "String", "Default": "test"},
@@ -21323,9 +23576,7 @@ def test_cfn_rules_condition_and_list_functions(cfn):
             {"Fn::Or": [{"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]},
                         {"Fn::Equals": [{"Ref": "AWS::AccountId"}, "000000000000"]}]},
             {"Fn::Not": [{"Fn::Equals": [{"Ref": "AWS::Partition"}, "aws-cn"]}]},
-            {"Fn::Contains": [{"Ref": "Zones"},
-                              {"Fn::If": [{"Fn::Equals": [{"Ref": "Env"}, "test"]},
-                                          "us-east-1b", "us-east-1z"]}]},
+            {"Fn::Contains": [{"Ref": "Zones"}, "us-east-1b"]},
         ]}}]},
     }
     body = _rules_template(rules, params)
@@ -21920,3 +24171,3391 @@ def _include_transform(cfn, s3, ssm, uid, bucket, name):
         == "second"
     assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
         == "edited"
+
+
+
+# ---------------------------------------------------------------------------
+# AWS::LanguageExtensions transform
+# ---------------------------------------------------------------------------
+
+_LANGEXT_ERROR = "Transform AWS::LanguageExtensions failed with: "
+
+# An Fn::ForEach in a template that declares no transform, from CreateStack and
+# ValidateTemplate alike (measured).
+_LANGEXT_UNDECLARED_LOOP = ("Template format error: [/Resources/Fn::ForEach::Loop] "
+                            "resource definition is malformed")
+
+
+def test_cfn_language_extensions_transform(cfn, ssm):
+    """Fn::ForEach over a literal list, a CommaDelimitedList parameter, nested
+    and inside Properties; the identifier in a fragment key, an Fn::Sub and a
+    Ref to it, literal everywhere else; Fn::Length, Fn::ToJsonString (one
+    member left to the stack), FindInMap deciding a Condition, a Conditions
+    loop, a DeletionPolicy from Fn::If. Then a change set, a failed update that
+    rolls back, the update, UsePreviousTemplate (no re-expansion, measured) and
+    the delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-{uid}"
+    prefix = f"/cfn-langext/{uid}"
+    try:
+        _language_extensions(cfn, ssm, prefix, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        for suffix in ("/kept-x", "/address-10.3"):
+            try:
+                ssm.delete_parameter(Name=prefix + suffix)
+            except ClientError:
+                pass
+
+
+def _langext_template(prefix):
+    def parameter(suffix, value, tags=None, **extra):
+        properties = {"Name": {"Fn::Sub": prefix + suffix}, "Type": "String", "Value": value}
+        if tags:
+            properties["Tags"] = tags
+        return dict({"Type": "AWS::SSM::Parameter", "Properties": properties}, **extra)
+
+    return {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {
+            "Addresses": {"Type": "CommaDelimitedList", "Default": "10.1,10.2"},
+            "Stage": {"Type": "String", "Default": "dev"},
+        },
+        "Mappings": {"Gate": {"Condition": {"A": "Never"}},
+                     "Values": {"Only": {"A": "from-map"}}},
+        "Conditions": {
+            "Always": {"Fn::Equals": [{"Ref": "Stage"}, "dev"]},
+            "Never": {"Fn::Equals": [{"Ref": "Stage"}, "prod"]},
+            "Fn::ForEach::Tiers": ["Tier", ["dev", "prod"], {
+                "Is${Tier}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Tier"}]},
+            }],
+        },
+        "Resources": {
+            # GatedA's condition is false; GatedB's default is AWS::NoValue.
+            "Fn::ForEach::Gated": ["Id", ["A", "B"], {
+                "Gated${Id}": parameter(
+                    "/gated-${Id}",
+                    {"Fn::FindInMap": ["Values", "Only", {"Ref": "Id"},
+                                       {"DefaultValue": "default"}]},
+                    Condition={"Fn::FindInMap": ["Gate", "Condition", {"Ref": "Id"},
+                                                 {"DefaultValue": {"Ref": "AWS::NoValue"}}]}),
+            }],
+            "Fn::ForEach::Addresses": ["Address", {"Ref": "Addresses"}, {
+                "Address&{Address}": parameter("/address-${Address}", {"Ref": "Address"}),
+            }],
+            "Fn::ForEach::Outer": ["Outer", ["x", "y"], {
+                "Pair${Outer}": parameter("/pair-${Outer}", "pair"),
+                "Fn::ForEach::Inner": ["Inner", ["1", "2"], {
+                    "Pair${Outer}${Inner}": parameter(
+                        "/pair-${Outer}-${Inner}",
+                        {"Fn::GetAtt": [{"Fn::Sub": "Pair${Outer}"}, "Value"]}),
+                }],
+            }],
+            "Counted": parameter("/counted", {"Fn::Sub": [
+                "${Count}", {"Count": {"Fn::Length": {"Ref": "Addresses"}}}]}),
+            "TierDev": parameter("/tier-dev", "dev", Condition="Isdev"),
+            "TierProd": parameter("/tier-prod", "prod", Condition="Isprod"),
+            # A plain value, &{Id} in an Fn::Sub and a nested key stay literal
+            # (measured); a loop inside Properties produces its keys, which
+            # need not be alphanumeric (measured).
+            "Fn::ForEach::Literal": ["Id", ["x"], {
+                "Literal${Id}": parameter("/literal-${Id}", "${Id}", tags={
+                    "Fn::ForEach::Tags": ["Tag", ["a", "b"], {"VAR_${Tag}": {"Ref": "Tag"}}]}),
+                "Sub${Id}": parameter("/sub-${Id}", {"Fn::Sub": "&{Id}|${Id}"}),
+                "Nested${Id}": parameter("/nested-${Id}", {"Fn::ToJsonString": {
+                    "k${Id}": {"Ref": "Id"}}}),
+            }],
+            "Json": parameter("/json", {"Fn::ToJsonString": {"config": {
+                "stage": {"Ref": "Stage"}, "addresses": {"Ref": "Addresses"},
+                "region": {"Ref": "AWS::Region"}}}}),
+            "Fn::ForEach::Kept": ["Id", ["x"], {
+                "Kept${Id}": parameter("/kept-${Id}", "kept",
+                                       DeletionPolicy={"Fn::If": ["Always", "Retain", "Delete"]}),
+            }],
+        },
+        "Outputs": {"Fn::ForEach::Names": ["Id", ["x"], {
+            "Pair${Id}Name": {"Value": {"Ref": {"Fn::Sub": "Pair${Id}"}}},
+            "Pair${Id}Literal": {"Value": {"Fn::Join": ["", ["&{Id}", "-", "${Id}"]]}},
+        }]},
+    }
+
+
+def _language_extensions(cfn, ssm, prefix, name):
+    template = json.dumps(_langext_template(prefix))
+
+    def value(suffix):
+        return ssm.get_parameter(Name=prefix + suffix)["Parameter"]["Value"]
+
+    def logical_ids():
+        return sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"])
+
+    def update(expected, addresses, **kwargs):
+        cfn.update_stack(StackName=name, **kwargs, Parameters=[
+            {"ParameterKey": "Addresses", "ParameterValue": addresses}])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    created = ["Address101", "Address102", "Counted", "GatedB", "Json", "Keptx", "Literalx",
+               "Nestedx", "Pairx", "Pairx1", "Pairx2", "Pairy", "Pairy1", "Pairy2", "Subx",
+               "TierDev"]
+    assert logical_ids() == created
+    assert value("/gated-B") == "default"
+    assert value("/tier-dev") == "dev"
+    for missing in ("/gated-A", "/tier-prod"):
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + missing)
+    assert value("/address-10.2") == "10.2"
+    assert value("/literal-x") == "${Id}"
+    assert value("/sub-x") == "&{Id}|x"
+    assert value("/nested-x") == '{"k${Id}":"x"}'
+    tags = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=prefix + "/literal-x")
+    assert {t["Key"]: t["Value"] for t in tags["TagList"]
+            if not t["Key"].startswith("aws:")} == {"VAR_a": "a", "VAR_b": "b"}
+    assert value("/pair-y-2") == "pair"
+    assert value("/counted") == "2"
+    assert value("/json") == ('{"config":{"stage":"dev","addresses":["10.1","10.2"],'
+                              f'"region":"{cfn.meta.region_name}"}}}}')
+    assert _output(stack, "PairxName") == prefix + "/pair-x"
+    assert _output(stack, "PairxLiteral") == "&{Id}-${Id}"
+
+    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    assert "Fn::ForEach::Addresses" in stored["Resources"]
+
+    parameters = [{"ParameterKey": "Addresses", "ParameterValue": "10.1,10.2,10.3"}]
+    cfn.create_change_set(StackName=name, ChangeSetName="third",
+                          TemplateBody=template, Parameters=parameters)
+    for _ in range(40):
+        described = cfn.describe_change_set(StackName=name, ChangeSetName="third")
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(0.25)
+    assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]
+            if c["ResourceChange"]["Action"] == "Add"] == ["Address103"]
+    cfn.delete_change_set(StackName=name, ChangeSetName="third")
+
+    # The third copy collides with a parameter outside the stack: the update
+    # rolls back to the two-address expansion.
+    ssm.put_parameter(Name=prefix + "/address-10.3", Value="outside", Type="String")
+    update("UPDATE_ROLLBACK_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert logical_ids() == created
+    assert value("/counted") == "2"
+    ssm.delete_parameter(Name=prefix + "/address-10.3")
+
+    update("UPDATE_COMPLETE", "10.1,10.2,10.3", TemplateBody=template)
+    assert value("/address-10.3") == "10.3"
+    assert value("/counted") == "3"
+
+    # UsePreviousTemplate reuses the processed template: a new list value does
+    # not expand the loop again (measured).
+    update("UPDATE_COMPLETE", "10.1", UsePreviousTemplate=True)
+    assert "Address103" in logical_ids()
+    assert value("/counted") == "3"
+
+    cfn.delete_stack(StackName=name)
+    assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+    assert value("/kept-x") == "kept"
+    with pytest.raises(ClientError):
+        ssm.get_parameter(Name=prefix + "/counted")
+
+
+def test_cfn_language_extensions_refusals(cfn):
+    """Every refusal answers before a stack exists; an account rolls back a
+    created stack instead. Sentences marked measured are the account's."""
+    name = f"cfn-langext-refused-{_uuid_mod.uuid4().hex[:8]}"
+    topic = {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": {"Fn::Sub": "t-${Id}"}}}
+
+    def loop(spec, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions",
+                     "Resources": {"Fn::ForEach::Loop": spec}}, **sections)
+
+    def declared(resources, **sections):
+        return dict({"Transform": "AWS::LanguageExtensions", "Resources": resources},
+                    **sections)
+
+    def undeclared_function(function, argument):
+        return {"Resources": {"T": {"Type": "AWS::SNS::Topic", "Properties": {
+            "DisplayName": {function: argument}}}}}
+
+    cases = [
+        ({"Resources": {"Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}},
+         _LANGEXT_UNDECLARED_LOOP),  # measured
+        (undeclared_function("Fn::Length", ["a", "b"]),
+         _LANGEXT_ERROR + "Fn::Length requires the AWS::LanguageExtensions transform, "
+         "which the template does not declare."),
+        (undeclared_function("Fn::ToJsonString", {"a": "b"}),
+         _LANGEXT_ERROR + "Fn::ToJsonString requires the AWS::LanguageExtensions "
+         "transform, which the template does not declare."),
+        (declared({"T": topic}, Mappings={"M": {"Fn::ForEach::Loop": ["Id", ["a"], {"${Id}": {}}]}}),
+         _LANGEXT_ERROR + "Fn::ForEach is not supported in the Mappings section. The "
+         "functions of AWS::LanguageExtensions are supported in the Resources, "
+         "Conditions and Outputs sections."),
+        (loop(["Id", ["a"]]),
+         _LANGEXT_ERROR + "Fn::ForEach::Loop takes an identifier, a collection and a "
+         "fragment."),
+        (loop(["Id", ["a"], {"Topic": topic}]),
+         _LANGEXT_ERROR + "The key Topic of Fn::ForEach::Loop does not contain ${Id} "
+         "or &{Id}. Every key a loop produces has to carry its identifier, or the "
+         "iterations would collide."),
+        (loop(["Id", "a,b,c", {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::ForEach layout is incorrect"),  # measured
+        (loop(["Id", {"Ref": "Plain"}, {"T${Id}": topic}],
+              Parameters={"Plain": {"Type": "String", "Default": "a,b"}}),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),  # measured
+        (loop(["Id", {"Fn::GetAtt": ["T", "TopicName"]}, {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Could not find a collection or could not be resolved for "
+         "Fn::ForEach"),
+        (loop(["Id", {"Fn::Split": [",", {"Fn::Select": ["-1", ["z", "a,b"]]}]},
+               {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "Fn::Select cannot select nonexistent value at index -1"),  # measured
+        (loop(["Id", ["10.1"], {"T${Id}": topic}]),
+         _LANGEXT_ERROR + "LogicalId 'T10.1' should be alphanumeric"),
+        (declared({"T": topic}, Outputs={"Fn::ForEach::Loop": ["Id", ["1-x"], {
+            "Param${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "OutputKey 'Param1-x' should be alphanumeric"),  # measured
+        (declared({"Loop": {"Type": "AWS::SNS::Topic"},
+                   "Fn::ForEach::Loop": ["Id", ["a"], {"T${Id}": topic}]}),
+         _LANGEXT_ERROR + "The loop name Loop is the logical id of a resource. A loop "
+         "name cannot conflict with a logical id in the Resources section."),
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Loop": ["Id", ["a"], {"O${Id}": {"Value": "v"}}]}),
+         _LANGEXT_ERROR + "The loop name Loop is used more than once. A loop name must be "
+         "unique within the template."),
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Fn::Length": {"Fn::GetAtt": ["T", "TopicName"]}}})}),
+         _LANGEXT_ERROR + "The Fn::Length value could not be resolved for properties"),  # measured
+        # An account resolves this one (measured); not implemented here.
+        (declared({"T": dict(topic, Properties={
+            "DisplayName": {"Ref": {"Fn::Join": ["", ["a", "b"]]}}})}),
+         _LANGEXT_ERROR + "Ref takes the name of a parameter or a resource here. An "
+         "intrinsic function inside Ref is supported by the transform, but not by this "
+         "implementation, unless a loop resolves it to a name."),
+        (loop(["Id", ["a"], {"T${Id}": dict(topic, Condition="Is${Id}")}],
+              Conditions={"Isa": {"Fn::Equals": [{"Ref": "AWS::Region"}, "nowhere"]}}),
+         _LANGEXT_ERROR + "Key Is${Id} is missing in the map."),  # measured
+        (loop(["Id", ["a"], {"T${Id}": topic}],
+              Outputs={"Fn::ForEach::Names": ["Id", ["a"], {
+                  "O${Id}": {"Value": {"Fn::Sub": "${T${Id}}"}}}]}),
+         "Template error: variable names in Fn::Sub syntax must contain only alphanumeric "
+         "characters, underscores, periods, and colons"),  # measured
+        ({"Resources": {"T": {"Type": "AWS::SNS::Topic",
+                              "Fn::Transform": {"Name": "AWS::LanguageExtensions"}}}},
+         _LANGEXT_ERROR + "the transform is declared at the top level of a template only."),
+        # "the quotas ... apply to the resultant template".
+        (loop(["Id", [str(i) for i in range(501)], {"T${Id}": topic}]),
+         "Template format error: Number of resources, 501, is greater than maximum "
+         "allowed, 500"),
+    ]
+    try:
+        for template, expected in cases:
+            with pytest.raises(ClientError) as exc:
+                cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == expected
+            with pytest.raises(ClientError):
+                cfn.describe_stacks(StackName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_validate_template_and_summary(cfn):
+    """ValidateTemplate refuses an undeclared loop with CreateStack's sentence;
+    neither it nor GetTemplateSummary expands a declaring template. The
+    summary then carries no ResourceTypes and no Capabilities (measured)."""
+    undeclared = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Fn::ForEach::Loop": ["Id", ["a", "b"], {
+            "T${Id}": {"Type": "AWS::SNS::Topic"}}]},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=json.dumps(undeclared))
+    assert exc.value.response["Error"]["Message"] == _LANGEXT_UNDECLARED_LOOP
+
+    declared = dict(undeclared, Transform="AWS::LanguageExtensions",
+                    Parameters={"Topics": {"Type": "CommaDelimitedList", "Default": "a,b"}})
+    declared["Resources"] = dict(declared["Resources"], Bucket={"Type": "AWS::S3::Bucket"})
+    result = cfn.validate_template(TemplateBody=json.dumps(declared))
+    assert [p["ParameterKey"] for p in result["Parameters"]] == ["Topics"]
+    assert result["Capabilities"] == ["CAPABILITY_AUTO_EXPAND"]
+
+    summary = cfn.get_template_summary(TemplateBody=json.dumps(declared))
+    assert "ResourceTypes" not in summary
+    assert "Capabilities" not in summary
+    assert summary["DeclaredTransforms"] == ["AWS::LanguageExtensions"]
+    assert [p["ParameterKey"] for p in summary["Parameters"]] == ["Topics"]
+
+
+def test_cfn_language_extensions_collections(cfn, ssm):
+    """Collections an intrinsic answers, all measured: Fn::Sub members with a
+    variable map, Fn::Split over Fn::Select, Fn::FindInMap answering a list."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-coll-{uid}"
+    prefix = f"/cfn-langext-coll/{uid}"
+
+    def copies(loop, identifier, collection):
+        return {f"Fn::ForEach::{loop}": [identifier, collection, {
+            f"{loop}${{{identifier}}}": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": {"Fn::Sub": f"{prefix}/{loop}-${{{identifier}}}"},
+                "Type": "String", "Value": {"Ref": identifier}}}}]}
+
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Parameters": {"Stage": {"Type": "String", "Default": "dev"}},
+        "Mappings": {"M": {"k": {"list": ["m1", "m2"]}}},
+        "Resources": dict(
+            copies("Sub", "Item", [{"Fn::Sub": ["${Stage}one", {"Stage": {"Ref": "Stage"}}]},
+                                   {"Fn::Sub": ["${Stage}two", {"Stage": {"Ref": "Stage"}}]}]),
+            **copies("Split", "Part", {"Fn::Split": [",", {"Fn::Select": [1, ["z", "s1,s2"]]}]}),
+            **copies("Map", "Entry", {"Fn::FindInMap": ["M", "k", "list"]})),
+        # Only a variable nested in a name is refused; any other name is the engine's.
+        "Outputs": {"Odd": {"Value": {"Fn::Sub": "${Not-Alnum}"}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Mapm1", "Mapm2", "Splits1", "Splits2", "Subdevone", "Subdevtwo"]
+        assert ssm.get_parameter(Name=prefix + "/Sub-devtwo")["Parameter"]["Value"] == "devtwo"
+        assert _output(stack, "Odd") == "Not-Alnum"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_reference_to_a_plain_string_target(cfn, ssm):
+    """A Ref, Fn::GetAtt or DependsOn naming the plain string ``Param${Item}``
+    names nothing. An account fails the stack over each (measured); this
+    engine resolves an unknown Ref to its name, an unknown Fn::GetAtt to ""
+    and ignores an unknown DependsOn for every template. Pinned here."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-plain-{uid}"
+    prefix = f"/cfn-langext-plain/{uid}"
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Resources": {"Fn::ForEach::Items": ["Item", ["alpha"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+            "Dep${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Param${Item}",
+                "Properties": {"Name": {"Fn::Sub": prefix + "/dep-${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+        "Outputs": {"Fn::ForEach::Names": ["Item", ["alpha"], {
+            "Good${Item}": {"Value": {"Ref": {"Fn::Sub": "Param${Item}"}}},
+            "Bad${Item}": {"Value": {"Ref": "Param${Item}"}},
+            "BadAtt${Item}": {"Value": {"Fn::GetAtt": ["Param${Item}", "Value"]}},
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Goodalpha") == prefix + "/alpha"
+        assert _output(stack, "Badalpha") == "Param${Item}"
+        assert _output(stack, "BadAttalpha") == ""
+        assert sorted(r["LogicalResourceId"] for r in
+                      cfn.describe_stack_resources(StackName=name)["StackResources"]) \
+            == ["Depalpha", "Paramalpha"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_language_extensions_condition_from_an_intrinsic(cfn, ssm):
+    """An Fn::Sub in the Condition of a copy resolves to the condition name,
+    so only the copy whose condition is true is created (measured). The
+    transform is declared in the {"Name": ...} form (measured)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-langext-cond-{uid}"
+    prefix = f"/cfn-langext-cond/{uid}"
+    template = {
+        "Transform": {"Name": "AWS::LanguageExtensions"},
+        "Parameters": {"Stage": {"Type": "String", "Default": "alpha"}},
+        "Conditions": {"Fn::ForEach::Flags": ["Item", ["alpha", "beta"], {
+            "Is${Item}": {"Fn::Equals": [{"Ref": "Stage"}, {"Ref": "Item"}]},
+        }]},
+        "Resources": {"Fn::ForEach::Params": ["Item", ["alpha", "beta"], {
+            "Param${Item}": {
+                "Type": "AWS::SSM::Parameter",
+                "Condition": {"Fn::Sub": "Is${Item}"},
+                "Properties": {"Name": {"Fn::Sub": prefix + "/${Item}"},
+                               "Type": "String", "Value": {"Ref": "Item"}},
+            },
+        }]},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=name)["StackResources"]] \
+            == ["Paramalpha"]
+        with pytest.raises(ClientError):
+            ssm.get_parameter(Name=prefix + "/beta")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_s3_bucket_lambda_notification_reads_back(cfn, s3, lam):
+    """An AWS::S3::Bucket NotificationConfiguration with a LambdaConfigurations
+    entry has to be readable through GetBucketNotificationConfiguration. The CFN
+    property names differ from the API's (Function, singular Event), and the wire
+    element names differ again -- the S3 model spells the lambda list
+    CloudFunctionConfiguration -- so a config could be stored and delivered yet
+    come back empty to every SDK."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-s3-notif-{uid}"
+    bucket = f"cfn-s3-notif-{uid}"
+    fn_name = f"cfn-s3-notif-{uid}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {}\n")
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    template = json.dumps({"Resources": {
+        "Permission": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceAccount": {"Ref": "AWS::AccountId"}}},
+        "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {
+            "BucketName": bucket,
+            "NotificationConfiguration": {"LambdaConfigurations": [{
+                "Function": {"Fn::Sub":
+                             "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:"
+                             f"function:{fn_name}"},
+                "Event": "s3:ObjectCreated:*",
+                "Filter": {"S3Key": {"Rules": [{"Name": "prefix", "Value": "in/"}]}},
+            }]}}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        configs = s3.get_bucket_notification_configuration(
+            Bucket=bucket)["LambdaFunctionConfigurations"]
+        assert len(configs) == 1, configs
+        assert configs[0]["LambdaFunctionArn"].endswith(f"function:{fn_name}")
+        assert configs[0]["Events"] == ["s3:ObjectCreated:*"]
+        assert configs[0]["Id"]
+        assert configs[0]["Filter"]["Key"]["FilterRules"] == [
+            {"Name": "prefix", "Value": "in/"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn_name)
+        except ClientError:
+            pass
+
+
+def test_cfn_rds_instance_defaults_to_snapshot_on_delete(cfn, rds):
+    """A DBInstance without DBClusterIdentifier defaults to DeletionPolicy
+    Snapshot: the stack delete takes a snapshot and then removes the instance."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-snap-{uid}"
+    db_id = f"cfn-rds-snap-{uid}"
+    template = json.dumps({"Resources": {
+        "Db": {"Type": "AWS::RDS::DBInstance", "Properties": {
+            "DBInstanceIdentifier": db_id,
+            "Engine": "postgres",
+            "DBInstanceClass": "db.t3.micro",
+            "AllocatedStorage": "20",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        }},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"]
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+        snap = rds.describe_db_snapshots(
+            DBSnapshotIdentifier=f"{db_id}-final-snapshot")["DBSnapshots"][0]
+        assert snap["DBInstanceIdentifier"] == db_id
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_instances(DBInstanceIdentifier=db_id)
+        assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            rds.delete_db_snapshot(DBSnapshotIdentifier=f"{db_id}-final-snapshot")
+        except ClientError:
+            pass
+
+
+def test_cfn_rds_cluster_defaults_to_snapshot_on_delete(cfn, rds):
+    """Same default for AWS::RDS::DBCluster, through the cluster snapshot API."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rdsc-snap-{uid}"
+    cluster_id = f"cfn-rdsc-snap-{uid}"
+    template = json.dumps({"Resources": {
+        "Cluster": {"Type": "AWS::RDS::DBCluster", "Properties": {
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        }},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+        snap = rds.describe_db_cluster_snapshots(
+            DBClusterSnapshotIdentifier=f"{cluster_id}-final-snapshot",
+        )["DBClusterSnapshots"][0]
+        assert snap["DBClusterIdentifier"] == cluster_id
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            rds.delete_db_cluster_snapshot(
+                DBClusterSnapshotIdentifier=f"{cluster_id}-final-snapshot")
+        except ClientError:
+            pass
+
+
+def test_cfn_rds_instance_in_a_cluster_defaults_to_delete(cfn, rds):
+    """A DBInstance that names DBClusterIdentifier is outside AWS's exception,
+    so it defaults to Delete and leaves no snapshot behind."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rdsm-snap-{uid}"
+    cluster_id, db_id = f"cfn-rdsm-c-{uid}", f"cfn-rdsm-i-{uid}"
+    template = json.dumps({"Resources": {
+        "Cluster": {"Type": "AWS::RDS::DBCluster", "DeletionPolicy": "Delete",
+                    "Properties": {
+                        "DBClusterIdentifier": cluster_id,
+                        "Engine": "aurora-postgresql",
+                        "MasterUsername": "admin",
+                        "MasterUserPassword": "password123"}},
+        "Member": {"Type": "AWS::RDS::DBInstance", "Properties": {
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-postgresql",
+            "DBInstanceClass": "db.t3.medium"}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            rds.describe_db_snapshots(DBSnapshotIdentifier=f"{db_id}-final-snapshot")
+        assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _template(resource_type, properties):
+    return {"Resources": {"R": {"Type": resource_type, "Properties": properties}}}
+
+
+@pytest.fixture
+def stack(cfn):
+    names = []
+
+    def create(template):
+        name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        names.append(name)
+        cfn.get_waiter("stack_create_complete").wait(
+            StackName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+        return name
+
+    yield create
+    for name in names:
+        cfn.delete_stack(StackName=name)
+        cfn.get_waiter("stack_delete_complete").wait(
+            StackName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+
+
+def _change(cfn, name, template):
+    cfn.create_change_set(StackName=name, ChangeSetName="cs", ChangeSetType="UPDATE",
+                          TemplateBody=json.dumps(template))
+    cfn.get_waiter("change_set_create_complete").wait(
+        StackName=name, ChangeSetName="cs", WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+    return cfn.describe_change_set(StackName=name, ChangeSetName="cs")["Changes"][0]["ResourceChange"]
+
+
+def _requirements(change):
+    return {d["Target"]["Name"]: d["Target"]["RequiresRecreation"]
+            for d in change.get("Details", []) if d["Target"].get("Name")}
+
+
+# These are independent AWS observations, including negative cases where
+# service API immutability must not be turned into an Always result.
+@pytest.mark.parametrize("rtype,old,new,expected", [
+    ("AWS::Cognito::UserPool", {"UserPoolName": "before"}, {"UserPoolName": "after"}, "Never"),
+    ("AWS::Cognito::UserPool", {}, {"Schema": [{"Name": "review", "AttributeDataType": "String"}]}, "Never"),
+    ("AWS::IoT::ThingType",
+     {"ThingTypeProperties": {"Mqtt5Configuration": {"PropagatingAttributes": []}}},
+     {"ThingTypeProperties": {"Mqtt5Configuration": {"PropagatingAttributes": [{"UserPropertyKey": "k", "ThingAttribute": "v"}]}}}, "Never"),
+    ("AWS::DynamoDB::Table",
+     {"AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]},
+     {"AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "N"}]}, "Never"),
+    ("AWS::DynamoDB::Table", {}, {"ImportSourceSpecification": {"InputFormat": "CSV"}}, "Always"),
+    ("AWS::DynamoDB::Table", {"KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]},
+     {"KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}]},
+     "Conditionally"),
+    ("AWS::Lambda::Function", {"DurableConfig": {"ExecutionTimeout": 60}},
+     {"DurableConfig": {"ExecutionTimeout": 120}}, "Conditionally"),
+    ("AWS::Lambda::Function", {"DurableConfig": {"ExecutionTimeout": 60}}, {}, "Conditionally"),
+    ("AWS::SQS::Queue", {"QueueName": "before"}, {"QueueName": "after"}, "Always"),
+    ("AWS::SQS::Queue", {"FifoQueue": False}, {"FifoQueue": True}, "Always"),
+    ("AWS::SQS::Queue", {"DelaySeconds": 0}, {"DelaySeconds": 5}, "Never"),
+    ("AWS::SSM::Parameter", {"Value": "before"}, {"Value": "after"}, "Never"),
+    ("AWS::SNS::Topic", {"FifoTopic": False}, {"FifoTopic": True}, "Always"),
+    # Fixed at CreateUserPool by the service API, yet reported in place.
+    ("AWS::Cognito::UserPool", {}, {"AliasAttributes": ["email"]}, "Never"),
+    ("AWS::Lambda::LayerVersion", {"Content": {"S3Bucket": "layers", "S3Key": "a.zip"}},
+     {"Content": {"S3Bucket": "layers", "S3Key": "b.zip"}}, "Always"),
+])
+def test_property_reporting(rtype, old, new, expected):
+    change = _diff_resources(_template(rtype, old), _template(rtype, new))[0]["ResourceChange"]
+    assert set(_requirements(change).values()) == {expected}
+    assert change["Replacement"] == {"Never": "False", "Always": "True", "Conditionally": "Conditional"}[expected]
+
+
+def test_adding_a_dynamodb_index_does_not_report_replacement():
+    old = {"AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}
+    new = {
+        "AttributeDefinitions": [*old["AttributeDefinitions"], {"AttributeName": "gpk", "AttributeType": "S"}],
+        "GlobalSecondaryIndexes": [{"IndexName": "review", "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                                    "Projection": {"ProjectionType": "KEYS_ONLY"}}],
+    }
+    change = _diff_resources(_template("AWS::DynamoDB::Table", old), _template("AWS::DynamoDB::Table", new))[0]["ResourceChange"]
+    assert change["Replacement"] == "False"
+    assert _requirements(change) == {"AttributeDefinitions": "Never", "GlobalSecondaryIndexes": "Never"}
+
+
+# Measured AWS change sets: a listed type reports every property its schema
+# does not mark create-only or conditionally create-only as Never.
+@pytest.mark.parametrize("rtype,old,new", [
+    ("AWS::DynamoDB::Table", {}, {"TimeToLiveSpecification": {"AttributeName": "ttl", "Enabled": True}}),
+    ("AWS::DynamoDB::Table", {}, {"Tags": [{"Key": "review", "Value": "1"}]}),
+    ("AWS::Lambda::Function", {"Timeout": 30}, {"Timeout": 45}),
+    ("AWS::StepFunctions::StateMachine", {"DefinitionString": "a"}, {"DefinitionString": "b"}),
+    ("AWS::Cognito::UserPoolGroup", {"Description": "a"}, {"Description": "b"}),
+    ("AWS::Cognito::UserPoolResourceServer", {"Name": "a"}, {"Name": "b"}),
+    ("AWS::IoT::ThingGroup", {"ThingGroupProperties": {"ThingGroupDescription": "a"}},
+     {"ThingGroupProperties": {"ThingGroupDescription": "b"}}),
+    ("AWS::IoT::ProvisioningTemplate", {"Description": "a"}, {"Description": "b"}),
+    ("AWS::IAM::InstanceProfile", {"Roles": ["a"]}, {"Roles": ["b"]}),
+    ("AWS::CloudFront::Function", {"FunctionCode": "a"}, {"FunctionCode": "b"}),
+    ("AWS::Backup::BackupVault", {}, {"AccessPolicy": {"Version": "2012-10-17", "Statement": []}}),
+    ("AWS::Location::Tracker", {"Description": "a"}, {"Description": "b"}),
+    ("AWS::ElasticLoadBalancingV2::TargetGroup", {},
+     {"TargetGroupAttributes": [{"Key": "lambda.multi_value_headers.enabled", "Value": "true"}]}),
+])
+def test_listed_types_report_other_properties_in_place(rtype, old, new):
+    change = _diff_resources(_template(rtype, old), _template(rtype, new))[0]["ResourceChange"]
+    assert set(_requirements(change).values()) == {"Never"}
+    assert change["Replacement"] == "False"
+
+
+def test_conditional_and_in_place_properties_report_together():
+    # KeySchema is conditionally create-only in the DynamoDB schema, so the
+    # change stays Conditional next to an in-place AttributeDefinitions edit.
+    rtype = "AWS::DynamoDB::Table"
+    attributes = [{"AttributeName": "pk", "AttributeType": "S"}]
+    keys = [{"AttributeName": "pk", "KeyType": "HASH"}]
+    old = _template(rtype, {"AttributeDefinitions": attributes, "KeySchema": keys})
+    new = _template(rtype, {
+        "AttributeDefinitions": [*attributes, {"AttributeName": "sk", "AttributeType": "S"}],
+        "KeySchema": [*keys, {"AttributeName": "sk", "KeyType": "RANGE"}],
+    })
+    change = _diff_resources(old, new)[0]["ResourceChange"]
+    assert change["Replacement"] == "Conditional"
+    assert _requirements(change) == {"AttributeDefinitions": "Never", "KeySchema": "Conditionally"}
+
+
+def test_unknown_resource_type_keeps_conditional():
+    change = _diff_resources(_template("Custom::Example", {"Value": "a"}),
+                             _template("Custom::Example", {"Value": "b"}))[0]["ResourceChange"]
+    assert change["Replacement"] == "Conditional"
+
+
+def test_policy_only_edit_does_not_replace():
+    old = _template("AWS::SSM::Parameter", {"Type": "String", "Value": "value"})
+    new = _template("AWS::SSM::Parameter", {"Type": "String", "Value": "value"})
+    new["Resources"]["R"]["UpdateReplacePolicy"] = "Retain"
+    change = _diff_resources(old, new)[0]["ResourceChange"]
+    assert change["Replacement"] == "False"
+    assert change["Scope"] == ["UpdateReplacePolicy"]
+
+
+def test_reporting_tables_are_consistent():
+    assert _REPLACING_PROPERTIES.keys() <= _RESOURCE_HANDLERS.keys()
+    # A conditional row for an unlisted type would never be read.
+    assert _CONDITIONALLY_REPLACING_PROPERTIES.keys() <= _REPLACING_PROPERTIES.keys()
+    for rtype, names in _CONDITIONALLY_REPLACING_PROPERTIES.items():
+        assert names
+        assert not set(names).intersection(_REPLACING_PROPERTIES[rtype])
+
+
+@pytest.mark.parametrize("rename,value", [(True, "a"), (False, "b"), (True, "b")])
+def test_ssm_change_set_reports_each_property(cfn, stack, rename, value):
+    pname = f"/repl/{_uuid_mod.uuid4().hex[:10]}"
+    old = _template("AWS::SSM::Parameter", {"Name": pname, "Type": "String", "Value": "a"})
+    new = _template("AWS::SSM::Parameter", {"Name": pname + "-new" if rename else pname, "Type": "String", "Value": value})
+    change = _change(cfn, stack(old), new)
+    expected = {}
+    if rename:
+        expected["Name"] = "Always"
+    if value != "a":
+        expected["Value"] = "Never"
+    assert _requirements(change) == expected
+    assert change["Replacement"] == ("True" if rename else "False")
+
+
+@pytest.mark.parametrize("prop,value,recreation,replacement", [
+    ("TopicName", None, "Always", "True"),
+    ("DisplayName", "review", "Never", "False"),
+])
+def test_sns_change_set_reports_name_and_display_name(cfn, stack, prop, value,
+                                                      recreation, replacement):
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+    old = _template("AWS::SNS::Topic", {"TopicName": name})
+    new = _template("AWS::SNS::Topic", {"TopicName": name, prop: value or name + "-new"})
+    change = _change(cfn, stack(old), new)
+    assert _requirements(change) == {prop: recreation}
+    assert change["Replacement"] == replacement
+
+
+def test_cognito_change_set_reports_mfa_configuration_in_place(cfn, stack):
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+    old = _template("AWS::Cognito::UserPool", {"UserPoolName": name})
+    new = _template("AWS::Cognito::UserPool", {"UserPoolName": name, "MfaConfiguration": "OFF"})
+    change = _change(cfn, stack(old), new)
+    assert _requirements(change) == {"MfaConfiguration": "Never"}
+    assert change["Replacement"] == "False"
+
+
+_PASS = json.dumps({"StartAt": "A", "States": {"A": {"Type": "Pass", "End": True}}})
+_ROLE = "arn:aws:iam::000000000000:role/review"
+
+
+@pytest.mark.parametrize("rtype,props,prop,value", [
+    ("AWS::DynamoDB::Table", {"BillingMode": "PAY_PER_REQUEST",
+                              "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                              "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]},
+     "Tags", [{"Key": "review", "Value": "1"}]),
+    ("AWS::Lambda::Function", {"Runtime": "python3.13", "Handler": "index.handler", "Timeout": 30,
+                               "Role": _ROLE, "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"}},
+     "Timeout", 45),
+    ("AWS::StepFunctions::StateMachine", {"RoleArn": _ROLE, "DefinitionString": _PASS},
+     "DefinitionString", _PASS.replace('"A"', '"B"')),
+], ids=["dynamodb-tags", "lambda-timeout", "sfn-definition"])
+def test_change_set_reports_other_properties_in_place(cfn, stack, rtype, props, prop, value):
+    old = _template(rtype, props)
+    new = _template(rtype, {**props, prop: value})
+    change = _change(cfn, stack(old), new)
+    assert _requirements(change) == {prop: "Never"}
+    assert change["Replacement"] == "False"
+
+
+def test_sqs_change_set_reports_the_issue_reproduction(cfn, stack):
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+    old = _template("AWS::SQS::Queue", {"QueueName": name})
+    new = _template("AWS::SQS::Queue", {"QueueName": name + "-new", "DelaySeconds": 5})
+    change = _change(cfn, stack(old), new)
+    assert change["Replacement"] == "True"
+    assert _requirements(change) == {"QueueName": "Always", "DelaySeconds": "Never"}
+
+
+def test_cfn_appconfig_application_updates_in_place(cfn, appconfig_client):
+    """An application update keeps its id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-ac-app-update-{suffix}"
+
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {
+                    "Type": "AWS::AppConfig::Application",
+                    "Properties": {
+                        "Name": name,
+                        "Description": description,
+                        "Tags": [{"Key": "stage", "Value": description}],
+                    },
+                },
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=f"cfn-ac-app-{suffix}", TemplateBody=template("before"))
+        _wait_stack(cfn, f"cfn-ac-app-{suffix}")
+        app_id = _cfn_output(cfn, f"cfn-ac-app-{suffix}", "AppId")
+        assert appconfig_client.get_application(ApplicationId=app_id)["Name"] == name
+
+        cfn.update_stack(StackName=f"cfn-ac-app-{suffix}", TemplateBody=template("after"))
+        assert _wait_stack(cfn, f"cfn-ac-app-{suffix}")["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert _cfn_output(cfn, f"cfn-ac-app-{suffix}", "AppId") == app_id, (
+            "the update minted a second application")
+        assert appconfig_client.get_application(ApplicationId=app_id)["Description"] == "after"
+
+        arn = f"arn:aws:appconfig:us-east-1:000000000000:application/{app_id}"
+        assert appconfig_client.list_tags_for_resource(
+            ResourceArn=arn)["Tags"]["stage"] == "after"
+    finally:
+        _delete_cfn_test_stack(cfn, f"cfn-ac-app-{suffix}")
+
+
+def test_cfn_appconfig_application_description_change_is_rolled_back(cfn, appconfig_client):
+    """A description change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-rb-{suffix}"
+
+    def template(description, with_bad):
+        resources = {"App": {"Type": "AWS::AppConfig::Application", "Properties": {
+            "Name": f"cfn-ac-rb-{suffix}", "Description": description}}}
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "App"}
+        return json.dumps({"Resources": resources,
+                           "Outputs": {"AppId": {"Value": {"Ref": "App"}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("before", False))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        app_id = next(o["OutputValue"] for o in
+                      cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                      if o["OutputKey"] == "AppId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("after", True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert appconfig_client.get_application(ApplicationId=app_id)["Description"] == "before"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_environment_updates_in_place(cfn, appconfig_client):
+    """An environment update keeps its id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {
+                    "Type": "AWS::AppConfig::Application",
+                    "Properties": {"Name": f"cfn-ac-env-app-{suffix}"},
+                },
+                "Env": {
+                    "Type": "AWS::AppConfig::Environment",
+                    "Properties": {
+                        "ApplicationId": {"Ref": "App"},
+                        "Name": f"cfn-ac-env-{suffix}",
+                        "Description": description,
+                    },
+                },
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "EnvId": {"Value": {"Ref": "Env"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=f"cfn-ac-env-{suffix}", TemplateBody=template("before"))
+        _wait_stack(cfn, f"cfn-ac-env-{suffix}")
+        app_id = _cfn_output(cfn, f"cfn-ac-env-{suffix}", "AppId")
+        env_id = _cfn_output(cfn, f"cfn-ac-env-{suffix}", "EnvId")
+
+        cfn.update_stack(StackName=f"cfn-ac-env-{suffix}", TemplateBody=template("after"))
+        assert _wait_stack(cfn, f"cfn-ac-env-{suffix}")["StackStatus"] == "UPDATE_COMPLETE"
+
+        envs = appconfig_client.list_environments(ApplicationId=app_id)["Items"]
+        assert len(envs) == 1, "the update minted a second environment"
+        assert envs[0]["Id"] == env_id
+        assert envs[0]["Description"] == "after"
+    finally:
+        _delete_cfn_test_stack(cfn, f"cfn-ac-env-{suffix}")
+
+
+def test_cfn_appconfig_profile_update_keeps_hosted_versions(cfn, appconfig_client):
+    """A profile update keeps its id and its hosted configuration versions."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {
+                    "Type": "AWS::AppConfig::Application",
+                    "Properties": {"Name": f"cfn-ac-prof-app-{suffix}"},
+                },
+                "Profile": {
+                    "Type": "AWS::AppConfig::ConfigurationProfile",
+                    "Properties": {
+                        "ApplicationId": {"Ref": "App"},
+                        "Name": f"cfn-ac-prof-{suffix}",
+                        "LocationUri": "hosted",
+                        "Description": description,
+                    },
+                },
+                "HCV": {
+                    "Type": "AWS::AppConfig::HostedConfigurationVersion",
+                    "Properties": {
+                        "ApplicationId": {"Ref": "App"},
+                        "ConfigurationProfileId": {"Ref": "Profile"},
+                        "ContentType": "application/json",
+                        "Content": "{\"flag\": true}",
+                    },
+                },
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "ProfileId": {"Value": {"Ref": "Profile"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=f"cfn-ac-prof-{suffix}", TemplateBody=template("before"))
+        _wait_stack(cfn, f"cfn-ac-prof-{suffix}")
+        app_id = _cfn_output(cfn, f"cfn-ac-prof-{suffix}", "AppId")
+        profile_id = _cfn_output(cfn, f"cfn-ac-prof-{suffix}", "ProfileId")
+        assert appconfig_client.list_hosted_configuration_versions(
+            ApplicationId=app_id, ConfigurationProfileId=profile_id)["Items"]
+
+        cfn.update_stack(StackName=f"cfn-ac-prof-{suffix}", TemplateBody=template("after"))
+        assert _wait_stack(cfn, f"cfn-ac-prof-{suffix}")["StackStatus"] == "UPDATE_COMPLETE"
+
+        profiles = appconfig_client.list_configuration_profiles(
+            ApplicationId=app_id)["Items"]
+        assert len(profiles) == 1, "the update minted a second profile"
+        assert profiles[0]["Id"] == profile_id
+        # Description is not in ConfigurationProfileSummary.
+        assert appconfig_client.get_configuration_profile(
+            ApplicationId=app_id,
+            ConfigurationProfileId=profile_id)["Description"] == "after"
+        assert appconfig_client.list_hosted_configuration_versions(
+            ApplicationId=app_id, ConfigurationProfileId=profile_id
+        )["Items"], "the hosted configuration version was orphaned"
+    finally:
+        _delete_cfn_test_stack(cfn, f"cfn-ac-prof-{suffix}")
+
+
+def test_cfn_appconfig_deployment_strategy_update_and_rename(cfn, appconfig_client):
+    """GrowthFactor updates in place; a rename replaces the strategy."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    def template(name, growth):
+        return json.dumps({
+            "Resources": {
+                "Strategy": {
+                    "Type": "AWS::AppConfig::DeploymentStrategy",
+                    "Properties": {
+                        "Name": name,
+                        "DeploymentDurationInMinutes": 1,
+                        "GrowthFactor": growth,
+                        "ReplicateTo": "NONE",
+                    },
+                },
+            },
+            "Outputs": {"StrategyId": {"Value": {"Ref": "Strategy"}}},
+        })
+
+    def strategy():
+        # By Ref: the list pages at 50.
+        strategy_id = _cfn_output(cfn, f"cfn-ac-strat-{suffix}", "StrategyId")
+        return appconfig_client.get_deployment_strategy(DeploymentStrategyId=strategy_id)
+
+    try:
+        cfn.create_stack(StackName=f"cfn-ac-strat-{suffix}",
+                         TemplateBody=template(f"cfn-ac-strat-a-{suffix}", 10))
+        _wait_stack(cfn, f"cfn-ac-strat-{suffix}")
+        created = strategy()
+        assert created["Name"] == f"cfn-ac-strat-a-{suffix}"
+        strategy_id = created["Id"]
+
+        # In place: the growth factor changes under the same id.
+        cfn.update_stack(StackName=f"cfn-ac-strat-{suffix}",
+                         TemplateBody=template(f"cfn-ac-strat-a-{suffix}", 25))
+        assert _wait_stack(cfn, f"cfn-ac-strat-{suffix}")["StackStatus"] == "UPDATE_COMPLETE"
+        same = strategy()
+        assert same["Id"] == strategy_id
+        assert same["GrowthFactor"] == 25
+
+        # Replacement: a new id, and the old strategy gone.
+        cfn.update_stack(StackName=f"cfn-ac-strat-{suffix}",
+                         TemplateBody=template(f"cfn-ac-strat-b-{suffix}", 25))
+        assert _wait_stack(cfn, f"cfn-ac-strat-{suffix}")["StackStatus"] == "UPDATE_COMPLETE"
+        renamed = strategy()
+        assert renamed["Name"] == f"cfn-ac-strat-b-{suffix}"
+        assert renamed["Id"] != strategy_id
+        with pytest.raises(ClientError) as exc:
+            appconfig_client.get_deployment_strategy(DeploymentStrategyId=strategy_id)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException", (
+            "the predecessor survived")
+    finally:
+        _delete_cfn_test_stack(cfn, f"cfn-ac-strat-{suffix}")
+
+
+def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
+    """A GraphQL API update keeps its id and its data sources."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-upd-{suffix}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {
+                "Api": {
+                    "Type": "AWS::AppSync::GraphQLApi",
+                    "Properties": {"Name": name, "AuthenticationType": "API_KEY"},
+                },
+                "DS": {
+                    "Type": "AWS::AppSync::DataSource",
+                    "Properties": {
+                        "ApiId": {"Fn::GetAtt": ["Api", "ApiId"]},
+                        "Name": "probe_source",
+                        "Type": "NONE",
+                    },
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Fn::GetAtt": ["Api", "ApiId"]}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(f"api_{suffix}_a"))
+        _wait_stack(cfn, stack_name)
+        api_id = next(
+            o["OutputValue"]
+            for o in cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+            if o["OutputKey"] == "ApiId")
+        assert appsync.get_data_source(
+            apiId=api_id, name="probe_source")["dataSource"]["name"] == "probe_source"
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(f"api_{suffix}_b"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        api = appsync.get_graphql_api(apiId=api_id)["graphqlApi"]
+        assert api["name"] == f"api_{suffix}_b"
+        assert appsync.get_data_source(
+            apiId=api_id, name="probe_source")["dataSource"]["name"] == "probe_source"
+        assert len([a for a in appsync.list_graphql_apis()["graphqlApis"]
+                    if a["name"].startswith(f"api_{suffix}")]) == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_api_key_updates_in_place(cfn, appsync):
+    """An API key update keeps its key id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-key-{suffix}"
+    expiry = (int(time.time()) + 7 * 86400) // 3600 * 3600
+
+    def template(description, expires):
+        return json.dumps({
+            "Resources": {
+                "Api": {
+                    "Type": "AWS::AppSync::GraphQLApi",
+                    "Properties": {"Name": f"keyapi_{suffix}",
+                                   "AuthenticationType": "API_KEY"},
+                },
+                "Key": {
+                    "Type": "AWS::AppSync::ApiKey",
+                    "Properties": {
+                        "ApiId": {"Fn::GetAtt": ["Api", "ApiId"]},
+                        "Description": description,
+                        "Expires": expires,
+                    },
+                },
+            },
+            "Outputs": {
+                "ApiId": {"Value": {"Fn::GetAtt": ["Api", "ApiId"]}},
+                "KeyId": {"Value": {"Fn::GetAtt": ["Key", "ApiKeyId"]}},
+            },
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before", expiry))
+        _wait_stack(cfn, stack_name)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in
+                   cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]}
+        api_id, key_id = outputs["ApiId"], outputs["KeyId"]
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template("after", expiry + 3600))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        keys = appsync.list_api_keys(apiId=api_id)["apiKeys"]
+        assert len(keys) == 1, "the update left the previous key on the API"
+        assert keys[0]["id"] == key_id
+        assert keys[0]["description"] == "after"
+        assert keys[0]["expires"] == expiry + 3600
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_appsync_api_template(name, providers=None, with_bad=False):
+    props = {"Name": name, "AuthenticationType": "API_KEY"}
+    if providers is not None:
+        props["AdditionalAuthenticationProviders"] = providers
+    resources = {"Api": {"Type": "AWS::AppSync::GraphQLApi", "Properties": props}}
+    if with_bad:
+        resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "Api"}
+    return json.dumps({
+        "Resources": resources,
+        "Outputs": {"ApiId": {"Value": {"Fn::GetAtt": ["Api", "ApiId"]}}},
+    })
+
+
+def test_cfn_appsync_additional_auth_provider_added_by_update_reads_back(cfn, appsync):
+    """An added AdditionalAuthenticationProviders entry reads back in camelCase."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-auth-upd-{suffix}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appsync_api_template(f"auth_{suffix}"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_api_template(
+            f"auth_{suffix}", [{"AuthenticationType": "AWS_IAM"}]))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        api = appsync.get_graphql_api(apiId=api_id)["graphqlApi"]
+        assert api["additionalAuthenticationProviders"] == [
+            {"authenticationType": "AWS_IAM"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_additional_auth_providers_at_create_read_back(cfn, appsync):
+    """AdditionalAuthenticationProviders from the create read back in camelCase."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-auth-new-{suffix}"
+    providers = [
+        {"AuthenticationType": "AWS_IAM"},
+        {"AuthenticationType": "OPENID_CONNECT",
+         "OpenIDConnectConfig": {"Issuer": "https://issuer.example.com",
+                                 "ClientId": "client-1", "IatTTL": 60}},
+    ]
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_api_template(
+        f"auth_{suffix}", providers))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api = appsync.get_graphql_api(
+            apiId=_cfn_output(cfn, stack_name, "ApiId"))["graphqlApi"]
+        assert api["additionalAuthenticationProviders"] == [
+            {"authenticationType": "AWS_IAM"},
+            {"authenticationType": "OPENID_CONNECT",
+             "openIDConnectConfig": {"issuer": "https://issuer.example.com",
+                                     "clientId": "client-1", "iatTTL": 60}},
+        ]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_api_rename_is_rolled_back(cfn, appsync):
+    """A rename is sent back by the rollback under the same id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-rb-{suffix}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appsync_api_template(f"rb_{suffix}_a"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_api_template(
+            f"rb_{suffix}_b", with_bad=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "ApiId") == api_id
+        assert appsync.get_graphql_api(apiId=api_id)["graphqlApi"]["name"] == f"rb_{suffix}_a"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_additional_auth_provider_removed_reads_absent(cfn, appsync):
+    """A removed AdditionalAuthenticationProviders reads absent."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-auth-rm-{suffix}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_api_template(
+        f"auth_{suffix}", [{"AuthenticationType": "AWS_IAM"}]))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_appsync_api_template(f"auth_{suffix}"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        api = appsync.get_graphql_api(
+            apiId=_cfn_output(cfn, stack_name, "ApiId"))["graphqlApi"]
+        assert "additionalAuthenticationProviders" not in api
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_api_members_apply_change_and_reset(cfn, appsync):
+    """API members apply at create, change in place and reset when removed."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-members-{suffix}"
+    name = f"members_{suffix}"
+    oidc = {"Issuer": "https://issuer.example.com", "ClientId": "c1"}
+
+    def members(api_id):
+        api = appsync.get_graphql_api(apiId=api_id)["graphqlApi"]
+        return {key: api.get(key) for key in (
+            "xrayEnabled", "queryDepthLimit", "resolverCountLimit",
+            "introspectionConfig", "ownerContact", "visibility", "apiType")}
+
+    def env(api_id):
+        return appsync.get_graphql_api_environment_variables(
+            apiId=api_id)["environmentVariables"]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(name, {
+        "XrayEnabled": True, "QueryDepthLimit": 5, "ResolverCountLimit": 10,
+        "IntrospectionConfig": "DISABLED", "EnvironmentVariables": {"K1": "v1"},
+        "OwnerContact": "owner-a"}, oidc))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+        oidc_id = _cfn_output(cfn, stack_name, "OidcId")
+        assert members(api_id) == {
+            "xrayEnabled": True, "queryDepthLimit": 5, "resolverCountLimit": 10,
+            "introspectionConfig": "DISABLED", "ownerContact": "owner-a",
+            "visibility": "GLOBAL", "apiType": "GRAPHQL"}
+        assert env(api_id) == {"K1": "v1"}
+        assert appsync.get_graphql_api(apiId=oidc_id)["graphqlApi"]["openIDConnectConfig"] == {
+            "issuer": "https://issuer.example.com", "clientId": "c1", "authTTL": 0, "iatTTL": 0}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(name, {
+            "XrayEnabled": False, "QueryDepthLimit": 6, "ResolverCountLimit": 11,
+            "IntrospectionConfig": "ENABLED", "EnvironmentVariables": {"K1": "v2", "K2": "x"},
+            "OwnerContact": "owner-b"}, {**oidc, "ClientId": "c2"}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "ApiId") == api_id
+        assert _cfn_output(cfn, stack_name, "OidcId") == oidc_id
+        assert members(api_id) == {
+            "xrayEnabled": False, "queryDepthLimit": 6, "resolverCountLimit": 11,
+            "introspectionConfig": "ENABLED", "ownerContact": "owner-b",
+            "visibility": "GLOBAL", "apiType": "GRAPHQL"}
+        assert env(api_id) == {"K1": "v2", "K2": "x"}
+        assert appsync.get_graphql_api(
+            apiId=oidc_id)["graphqlApi"]["openIDConnectConfig"]["clientId"] == "c2"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(
+            name, {}, {**oidc, "ClientId": "c2"}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert members(api_id) == {
+            "xrayEnabled": False, "queryDepthLimit": 0, "resolverCountLimit": 0,
+            "introspectionConfig": "ENABLED", "ownerContact": None,
+            "visibility": "GLOBAL", "apiType": "GRAPHQL"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_api_visibility_change_fails_the_update(cfn, appsync):
+    """A Visibility change fails the update and rolls back."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-vis-{suffix}"
+    oidc = {"Issuer": "https://issuer.example.com", "ClientId": "c1"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(
+        f"vis_{suffix}", {}, oidc))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(
+            f"vis_{suffix}", {"Visibility": "PRIVATE"}, oidc))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "")
+                   for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Api" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert reasons and "Property Visibility can only be set when creating a GraphQL API" in reasons[0]
+        assert _cfn_output(cfn, stack_name, "ApiId") == api_id
+        assert appsync.get_graphql_api(apiId=api_id)["graphqlApi"]["visibility"] == "GLOBAL"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appsync_api_tags_take_the_stack_tags(cfn, appsync):
+    """The API carries the template and stack tags, without the aws: ones."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-tags-{suffix}"
+    template = json.dumps({
+        "Resources": {"Api": {"Type": "AWS::AppSync::GraphQLApi", "Properties": {
+            "Name": f"tags_{suffix}", "AuthenticationType": "API_KEY",
+            "Tags": [{"Key": "own", "Value": "a"}]}}},
+        "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Api", "Arn"]}}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     Tags=[{"Key": "stage", "Value": "one"}])
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = _cfn_output(cfn, stack_name, "Arn")
+        assert appsync.list_tags_for_resource(resourceArn=arn)["tags"] == {
+            "own": "a", "stage": "one"}
+        cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert appsync.list_tags_for_resource(resourceArn=arn)["tags"] == {
+            "own": "a", "stage": "two"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_update_keeps_arn_and_created_time(cfn, autoscaling):
+    """A size change keeps the group's ARN and CreatedTime."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-{suffix}"
+    group = f"cfn-asg-{suffix}"
+
+    def template(max_size):
+        return json.dumps({
+            "Resources": {
+                "LC": {
+                    "Type": "AWS::AutoScaling::LaunchConfiguration",
+                    "Properties": {"ImageId": "ami-12345678",
+                                   "InstanceType": "t3.micro"},
+                },
+                "ASG": {
+                    "Type": "AWS::AutoScaling::AutoScalingGroup",
+                    "Properties": {
+                        "AutoScalingGroupName": group,
+                        "LaunchConfigurationName": {"Ref": "LC"},
+                        "MinSize": "1",
+                        "MaxSize": str(max_size),
+                        "AvailabilityZones": ["us-east-1a"],
+                    },
+                },
+            },
+        })
+
+    def described():
+        return autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[group])["AutoScalingGroups"][0]
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(3))
+        _wait_stack(cfn, stack_name)
+        before = described()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(5))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        after = described()
+        assert after["MaxSize"] == 5
+        assert after["AutoScalingGroupARN"] == before["AutoScalingGroupARN"], \
+            "the group came back under a new ARN"
+        assert after["CreatedTime"] == before["CreatedTime"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_scaling_policy_update_keeps_arn(cfn, autoscaling):
+    """A policy update keeps its ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-pol-{suffix}"
+    group = f"cfn-asg-pol-{suffix}"
+
+    def template(cooldown):
+        return json.dumps({
+            "Resources": {
+                "LC": {
+                    "Type": "AWS::AutoScaling::LaunchConfiguration",
+                    "Properties": {"ImageId": "ami-12345678",
+                                   "InstanceType": "t3.micro"},
+                },
+                "ASG": {
+                    "Type": "AWS::AutoScaling::AutoScalingGroup",
+                    "Properties": {
+                        "AutoScalingGroupName": group,
+                        "LaunchConfigurationName": {"Ref": "LC"},
+                        "MinSize": "1", "MaxSize": "3",
+                        "AvailabilityZones": ["us-east-1a"],
+                    },
+                },
+                "Policy": {
+                    "Type": "AWS::AutoScaling::ScalingPolicy",
+                    "Properties": {
+                        # No PolicyName, so the name is generated.
+                        "AutoScalingGroupName": {"Ref": "ASG"},
+                        "AdjustmentType": "ChangeInCapacity",
+                        "ScalingAdjustment": 1,
+                        "Cooldown": str(cooldown),
+                    },
+                },
+            },
+            "Outputs": {"PolicyArn": {"Value": {"Ref": "Policy"}}},
+        })
+
+    def policy_arn():
+        return next(
+            o["OutputValue"]
+            for o in cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+            if o["OutputKey"] == "PolicyArn")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(300))
+        _wait_stack(cfn, stack_name)
+        before = policy_arn()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(600))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        policies = autoscaling.describe_policies(
+            AutoScalingGroupName=group)["ScalingPolicies"]
+        assert len(policies) == 1
+        assert policies[0]["Cooldown"] == 600
+        assert policies[0]["PolicyARN"] == before, \
+            "the policy came back under a new ARN"
+        assert policies[0]["PolicyName"].startswith(f"{stack_name}-Policy-")
+        assert policy_arn() == before
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_scheduled_action_update_keeps_arn(cfn, autoscaling):
+    """A scheduled action update keeps its ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-sched-{suffix}"
+    group = f"cfn-asg-sched-{suffix}"
+
+    def template(max_size):
+        return json.dumps({
+            "Resources": {
+                "LC": {
+                    "Type": "AWS::AutoScaling::LaunchConfiguration",
+                    "Properties": {"ImageId": "ami-12345678",
+                                   "InstanceType": "t3.micro"},
+                },
+                "ASG": {
+                    "Type": "AWS::AutoScaling::AutoScalingGroup",
+                    "Properties": {
+                        "AutoScalingGroupName": group,
+                        "LaunchConfigurationName": {"Ref": "LC"},
+                        "MinSize": "1", "MaxSize": "9",
+                        "AvailabilityZones": ["us-east-1a"],
+                    },
+                },
+                "Sched": {
+                    "Type": "AWS::AutoScaling::ScheduledAction",
+                    "Properties": {
+                        "AutoScalingGroupName": {"Ref": "ASG"},
+                        "Recurrence": "0 9 * * *",
+                        "MinSize": 1,
+                        "MaxSize": max_size,
+                    },
+                },
+            },
+            "Outputs": {"Sched": {"Value": {"Ref": "Sched"}}},
+        })
+
+    def action():
+        actions = autoscaling.describe_scheduled_actions(
+            AutoScalingGroupName=group)["ScheduledUpdateGroupActions"]
+        assert len(actions) == 1
+        return actions[0]
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(4))
+        _wait_stack(cfn, stack_name)
+        before = action()["ScheduledActionARN"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(6))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        after = action()
+        assert after["MaxSize"] == 6
+        assert after["ScheduledActionARN"] == before, \
+            "the scheduled action came back under a new ARN"
+        assert _cfn_output(cfn, stack_name, "Sched") == after["ScheduledActionName"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_asg_policy_template(group, policies):
+    return json.dumps({
+        "Resources": {
+            "LC": {"Type": "AWS::AutoScaling::LaunchConfiguration",
+                   "Properties": {"ImageId": "ami-12345678", "InstanceType": "t3.micro"}},
+            "ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+                "AutoScalingGroupName": group, "LaunchConfigurationName": {"Ref": "LC"},
+                "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                "AvailabilityZones": ["us-east-1a"]}},
+            **{name: {"Type": "AWS::AutoScaling::ScalingPolicy",
+                      "Properties": {"AutoScalingGroupName": {"Ref": "ASG"}, **props}}
+               for name, props in policies.items()},
+        },
+        "Outputs": {name: {"Value": {"Ref": name}} for name in policies},
+    })
+
+
+def _cfn_asg_policies_by_arn(autoscaling, group):
+    return {p["PolicyARN"]: p for p in autoscaling.describe_policies(
+        AutoScalingGroupName=group)["ScalingPolicies"]}
+
+
+def test_cfn_asg_target_tracking_policy_reads_back_and_updates_in_place(cfn, autoscaling):
+    """TargetTrackingConfiguration reads back typed and updates in place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-tt-{suffix}"
+    group = f"cfn-asg-tt-{suffix}"
+
+    def template(target):
+        return _cfn_asg_policy_template(group, {"Tt": {
+            "PolicyType": "TargetTrackingScaling",
+            "EstimatedInstanceWarmup": 120,
+            "TargetTrackingConfiguration": {
+                "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "ASGAverageCPUUtilization"},
+                "TargetValue": target}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(40))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _cfn_output(cfn, stack_name, "Tt")
+        policy = _cfn_asg_policies_by_arn(autoscaling, group)[arn]
+        assert policy["PolicyName"].startswith(f"{stack_name}-Tt-")
+        assert policy["TargetTrackingConfiguration"] == {
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ASGAverageCPUUtilization"},
+            "TargetValue": 40.0,
+            "DisableScaleIn": False,
+        }
+        assert policy["EstimatedInstanceWarmup"] == 120
+        assert policy["Enabled"] is True
+        assert not {"AdjustmentType", "ScalingAdjustment", "Cooldown"} & set(policy)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(60))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "Tt") == arn
+        policy = _cfn_asg_policies_by_arn(autoscaling, group)[arn]
+        assert policy["TargetTrackingConfiguration"]["TargetValue"] == 60.0
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_scaling_policy_keeps_a_template_policy_name(cfn, autoscaling):
+    """A template PolicyName names the policy at create."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-pname-{suffix}"
+    group = f"cfn-asg-pname-{suffix}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_policy_template(group, {"Named": {
+        "PolicyName": f"named-{suffix}", "AdjustmentType": "ChangeInCapacity",
+        "ScalingAdjustment": 1}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        policies = autoscaling.describe_policies(AutoScalingGroupName=group)["ScalingPolicies"]
+        assert [p["PolicyName"] for p in policies] == [f"named-{suffix}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_scaling_policy_name_change_is_not_applied(cfn, autoscaling):
+    """A PolicyName change or removal keeps the policy's name and ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-pren-{suffix}"
+    group = f"cfn-asg-pren-{suffix}"
+
+    def template(name):
+        props = {"AdjustmentType": "ChangeInCapacity", "ScalingAdjustment": 1}
+        if name:
+            props["PolicyName"] = name
+        return _cfn_asg_policy_template(group, {"Policy": props})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"pa-{suffix}"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = _cfn_output(cfn, stack_name, "Policy")
+        for name in (f"pb-{suffix}", None):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(name))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _cfn_output(cfn, stack_name, "Policy") == arn
+            policies = autoscaling.describe_policies(AutoScalingGroupName=group)["ScalingPolicies"]
+            assert [(p["PolicyName"], p["PolicyARN"]) for p in policies] == [(f"pa-{suffix}", arn)]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_asg_scheduled_template(group, props):
+    return json.dumps({
+        "Resources": {
+            "LC": {"Type": "AWS::AutoScaling::LaunchConfiguration",
+                   "Properties": {"ImageId": "ami-12345678", "InstanceType": "t3.micro"}},
+            "ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+                "AutoScalingGroupName": group, "LaunchConfigurationName": {"Ref": "LC"},
+                "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                "AvailabilityZones": ["us-east-1a"]}},
+            "Sched": {"Type": "AWS::AutoScaling::ScheduledAction", "Properties": {
+                "AutoScalingGroupName": {"Ref": "ASG"}, "MinSize": 0, "MaxSize": 1,
+                "DesiredCapacity": 0, "Recurrence": "0 9 * * *", **props}},
+        },
+        "Outputs": {"Sched": {"Value": {"Ref": "Sched"}},
+                    "Name": {"Value": {"Fn::GetAtt": ["Sched", "ScheduledActionName"]}}},
+    })
+
+
+def test_cfn_asg_scheduled_action_is_named_by_cloudformation(cfn, autoscaling):
+    """The action gets a generated name, which Ref returns; ScheduledActionName is ignored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-sname-{suffix}"
+    group = f"cfn-asg-sname-{suffix}"
+
+    def action():
+        actions = autoscaling.describe_scheduled_actions(
+            AutoScalingGroupName=group)["ScheduledUpdateGroupActions"]
+        assert len(actions) == 1
+        return actions[0]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_scheduled_template(
+        group, {"ScheduledActionName": f"sa-{suffix}"}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        created = action()
+        assert created["ScheduledActionName"].startswith(f"{stack_name}-Sched-")
+        assert _cfn_output(cfn, stack_name, "Sched") == created["ScheduledActionName"]
+        assert _cfn_output(cfn, stack_name, "Name") == created["ScheduledActionName"]
+        for props in ({"ScheduledActionName": f"sb-{suffix}"}, {}):
+            cfn.update_stack(StackName=stack_name,
+                             TemplateBody=_cfn_asg_scheduled_template(group, props))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert action() == created
+            assert _cfn_output(cfn, stack_name, "Sched") == created["ScheduledActionName"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert autoscaling.describe_scheduled_actions(
+        AutoScalingGroupName=group)["ScheduledUpdateGroupActions"] == []
+
+
+def test_cfn_asg_scheduled_action_times_read_back_and_update(cfn, autoscaling):
+    """StartTime, EndTime and TimeZone read back and update in place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-stimes-{suffix}"
+    group = f"cfn-asg-stimes-{suffix}"
+
+    def times():
+        action = autoscaling.describe_scheduled_actions(
+            AutoScalingGroupName=group)["ScheduledUpdateGroupActions"][0]
+        return {key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                for key, value in action.items()
+                if key in ("StartTime", "Time", "EndTime", "TimeZone", "ScheduledActionARN")}
+
+    start = {"StartTime": "2027-01-04T09:00:00Z"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_scheduled_template(group, {
+        **start, "EndTime": "2027-06-01T00:00:00Z", "TimeZone": "Europe/Berlin"}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = times()
+        arn = before.pop("ScheduledActionARN")
+        assert before == {"StartTime": "2027-01-04T09:00:00+00:00",
+                          "Time": "2027-01-04T09:00:00+00:00",
+                          "EndTime": "2027-06-01T00:00:00+00:00",
+                          "TimeZone": "Europe/Berlin"}
+        steps = [
+            ({**start, "EndTime": "2027-07-01T00:00:00Z", "TimeZone": "Europe/Berlin"},
+             {"EndTime": "2027-07-01T00:00:00+00:00"}),
+            ({**start, "EndTime": "2027-07-01T00:00:00Z", "TimeZone": "Etc/UTC"},
+             {"TimeZone": "Etc/UTC"}),
+            ({"StartTime": "2027-02-01T09:00:00Z", "EndTime": "2027-07-01T00:00:00Z",
+              "TimeZone": "Etc/UTC"},
+             {"StartTime": "2027-02-01T09:00:00+00:00", "Time": "2027-02-01T09:00:00+00:00"}),
+            ({"StartTime": "2027-02-01T09:00:00Z", "TimeZone": "Etc/UTC"}, {"EndTime": None}),
+        ]
+        for props, change in steps:
+            cfn.update_stack(StackName=stack_name,
+                             TemplateBody=_cfn_asg_scheduled_template(group, props))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            before.update(change)
+            after = times()
+            assert after.pop("ScheduledActionARN") == arn
+            assert after == {k: v for k, v in before.items() if v is not None}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_predictive_scaling_policy_reads_back_and_updates_in_place(cfn, autoscaling):
+    """PredictiveScalingConfiguration reads back with its default and updates in place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-pred-{suffix}"
+    group = f"cfn-asg-pred-{suffix}"
+
+    def template(target):
+        return _cfn_asg_policy_template(group, {"Pred": {
+            "PolicyType": "PredictiveScaling",
+            "PredictiveScalingConfiguration": {
+                "Mode": "ForecastOnly",
+                "MetricSpecifications": [{
+                    "TargetValue": target,
+                    "PredefinedMetricPairSpecification": {
+                        "PredefinedMetricType": "ASGCPUUtilization"}}]}}})
+
+    def config(target):
+        return {"Mode": "ForecastOnly", "MaxCapacityBreachBehavior": "HonorMaxCapacity",
+                "MetricSpecifications": [{
+                    "TargetValue": target,
+                    "PredefinedMetricPairSpecification": {
+                        "PredefinedMetricType": "ASGCPUUtilization"}}]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(40))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = _cfn_output(cfn, stack_name, "Pred")
+        policy = _cfn_asg_policies_by_arn(autoscaling, group)[arn]
+        assert policy["PredictiveScalingConfiguration"] == config(40.0)
+        assert not {"AdjustmentType", "ScalingAdjustment", "Cooldown"} & set(policy)
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(50))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Pred") == arn
+        policy = _cfn_asg_policies_by_arn(autoscaling, group)[arn]
+        assert policy["PredictiveScalingConfiguration"] == config(50.0)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_launch_template_reads_back_its_name_and_id(cfn, autoscaling):
+    """The group answers the launch template's id and name, whichever it was given."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-ltname-{suffix}"
+    lt_name = f"cfn-asg-ltname-{suffix}"
+
+    def group(logical_id, reference):
+        return {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+            "AutoScalingGroupName": f"{lt_name}-{logical_id.lower()}",
+            "LaunchTemplate": {**reference, "Version": {"Fn::GetAtt": ["LT", "LatestVersionNumber"]}},
+            "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+            "AvailabilityZones": ["us-east-1a"]}}
+
+    template = json.dumps({"Resources": {
+        "LT": {"Type": "AWS::EC2::LaunchTemplate", "Properties": {
+            "LaunchTemplateName": lt_name,
+            "LaunchTemplateData": {"ImageId": "ami-12345678", "InstanceType": "t3.micro"}}},
+        "ById": group("ById", {"LaunchTemplateId": {"Ref": "LT"}}),
+        "ByName": group("ByName", {"LaunchTemplateName": lt_name}),
+    }, "Outputs": {"Lt": {"Value": {"Ref": "LT"}}}})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        lt_id = _cfn_output(cfn, stack_name, "Lt")
+        groups = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[
+            f"{lt_name}-byid", f"{lt_name}-byname"])["AutoScalingGroups"]
+        assert [g["LaunchTemplate"] for g in groups] == [
+            {"LaunchTemplateId": lt_id, "LaunchTemplateName": lt_name, "Version": "1"}] * 2
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_instance_id_change_replaces_the_group(cfn, autoscaling):
+    """An InstanceId change replaces the group."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-inst-{suffix}"
+
+    def template(instance_id):
+        return json.dumps({"Resources": {"ASG": {
+            "Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+                "InstanceId": instance_id, "MinSize": "0", "MaxSize": "1",
+                "DesiredCapacity": "0", "AvailabilityZones": ["us-east-1a"]}}},
+            "Outputs": {"Name": {"Value": {"Ref": "ASG"}}}})
+
+    def arn():
+        # The stack's Ref names the replacement.
+        name = _cfn_output(cfn, stack_name, "Name")
+        groups = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name])["AutoScalingGroups"]
+        assert len(groups) == 1, f"no group under the stack's Ref {name}"
+        return groups[0]["AutoScalingGroupARN"]
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("i-0123456789abcdef0"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = arn()
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("i-0fedcba9876543210"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert arn() != before
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_step_and_customized_metric_policies_read_back(cfn, autoscaling):
+    """Step and customized-metric policies read back typed."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-step-{suffix}"
+    group = f"cfn-asg-step-{suffix}"
+    body = _cfn_asg_policy_template(group, {
+        "Step": {
+            "PolicyType": "StepScaling",
+            "AdjustmentType": "PercentChangeInCapacity",
+            "MinAdjustmentMagnitude": 1,
+            "MetricAggregationType": "Average",
+            "EstimatedInstanceWarmup": 60,
+            "StepAdjustments": [
+                {"MetricIntervalLowerBound": 0, "MetricIntervalUpperBound": 10,
+                 "ScalingAdjustment": 10},
+                {"MetricIntervalLowerBound": 10, "ScalingAdjustment": 20},
+            ]},
+        "Tc": {
+            "PolicyType": "TargetTrackingScaling",
+            "TargetTrackingConfiguration": {
+                "CustomizedMetricSpecification": {
+                    "MetricName": "CPUUtilization", "Namespace": "AWS/EC2",
+                    "Dimensions": [{"Name": "AutoScalingGroupName", "Value": group}],
+                    "Statistic": "Average", "Unit": "Percent"},
+                "TargetValue": 50.5,
+                "DisableScaleIn": True}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=body)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        policies = _cfn_asg_policies_by_arn(autoscaling, group)
+        step = policies[_cfn_output(cfn, stack_name, "Step")]
+        assert step["AdjustmentType"] == "PercentChangeInCapacity"
+        assert step["MinAdjustmentMagnitude"] == 1
+        assert step["MetricAggregationType"] == "Average"
+        assert step["EstimatedInstanceWarmup"] == 60
+        assert step["StepAdjustments"] == [
+            {"MetricIntervalLowerBound": 0.0, "MetricIntervalUpperBound": 10.0,
+             "ScalingAdjustment": 10},
+            {"MetricIntervalLowerBound": 10.0, "ScalingAdjustment": 20},
+        ]
+        assert not {"ScalingAdjustment", "Cooldown"} & set(step)
+        tracking = policies[_cfn_output(cfn, stack_name, "Tc")]["TargetTrackingConfiguration"]
+        assert tracking == {
+            "CustomizedMetricSpecification": {
+                "MetricName": "CPUUtilization", "Namespace": "AWS/EC2",
+                "Dimensions": [{"Name": "AutoScalingGroupName", "Value": group}],
+                "Statistic": "Average", "Unit": "Percent"},
+            "TargetValue": 50.5,
+            "DisableScaleIn": True,
+        }
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_asg_group_template(group, max_size="3", tags=None, with_bad=False):
+    props = {"AutoScalingGroupName": group, "LaunchConfigurationName": {"Ref": "LC"},
+             "MinSize": "0", "MaxSize": max_size, "DesiredCapacity": "0",
+             "AvailabilityZones": ["us-east-1a"]}
+    if tags is not None:
+        props["Tags"] = tags
+    resources = {
+        "LC": {"Type": "AWS::AutoScaling::LaunchConfiguration",
+               "Properties": {"ImageId": "ami-12345678", "InstanceType": "t3.micro"}},
+        "ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": props},
+    }
+    if with_bad:
+        resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "ASG"}
+    return json.dumps({"Resources": resources})
+
+
+def test_cfn_asg_tag_change_keeps_tags_added_through_the_api(cfn, autoscaling):
+    """A template tag change keeps tags from CreateOrUpdateTags."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-tags-{suffix}"
+    group = f"cfn-asg-tags-{suffix}"
+
+    def own_tags():
+        described = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[group])["AutoScalingGroups"][0]
+        return sorted((t["Key"], t["Value"], t["PropagateAtLaunch"])
+                      for t in described["Tags"] if not t["Key"].startswith("aws:"))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_group_template(
+        group, tags=[{"Key": "a", "Value": "1", "PropagateAtLaunch": False}]))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        autoscaling.create_or_update_tags(Tags=[{
+            "ResourceId": group, "ResourceType": "auto-scaling-group",
+            "Key": "api", "Value": "kept", "PropagateAtLaunch": False}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_asg_group_template(
+            group, tags=[{"Key": "a", "Value": "2", "PropagateAtLaunch": False},
+                         {"Key": "b", "Value": "3", "PropagateAtLaunch": True}]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert own_tags() == [("a", "2", False), ("api", "kept", False), ("b", "3", True)]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_max_size_change_is_rolled_back(cfn, autoscaling):
+    """A MaxSize change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-rb-{suffix}"
+    group = f"cfn-asg-rb-{suffix}"
+
+    def described():
+        return autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[group])["AutoScalingGroups"][0]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_asg_group_template(group, max_size="1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = described()["AutoScalingGroupARN"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_asg_group_template(
+            group, max_size="2", with_bad=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert described()["MaxSize"] == 1
+        assert described()["AutoScalingGroupARN"] == arn
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_policy_target_value_change_is_rolled_back(cfn, autoscaling):
+    """A TargetValue change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-pol-rb-{suffix}"
+    group = f"cfn-asg-pol-rb-{suffix}"
+
+    def template(target):
+        return _cfn_asg_policy_template(group, {"Tt": {
+            "PolicyType": "TargetTrackingScaling",
+            "TargetTrackingConfiguration": {
+                "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "ASGAverageCPUUtilization"},
+                "TargetValue": target}}})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(40))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = _cfn_output(cfn, stack_name, "Tt")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template(60), "Tt"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        policies = _cfn_asg_policies_by_arn(autoscaling, group)
+        assert list(policies) == [arn]
+        assert policies[arn]["TargetTrackingConfiguration"]["TargetValue"] == 40.0
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_scheduled_action_recurrence_change_is_rolled_back(cfn, autoscaling):
+    """A Recurrence change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-sched-rb-{suffix}"
+    group = f"cfn-asg-sched-rb-{suffix}"
+
+    def actions():
+        return autoscaling.describe_scheduled_actions(
+            AutoScalingGroupName=group)["ScheduledUpdateGroupActions"]
+
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_asg_scheduled_template(group, {}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        [before] = actions()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_with_failing_resource(
+            _cfn_asg_scheduled_template(group, {"Recurrence": "0 10 * * *"}), "Sched"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        [after] = actions()
+        assert after["Recurrence"] == "0 9 * * *"
+        assert after["ScheduledActionARN"] == before["ScheduledActionARN"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_vpc_update_keeps_id_and_leaves_no_default_children(cfn, ec2):
+    """A VPC update keeps its id and leaves no second set of default children."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpc-upd-{suffix}"
+
+    def template(dns):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {
+                    "Type": "AWS::EC2::VPC",
+                    "Properties": {
+                        "CidrBlock": "10.42.0.0/16",
+                        "EnableDnsHostnames": dns,
+                        "Tags": [{"Key": "probe", "Value": str(dns)}],
+                    },
+                },
+            },
+            "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}},
+        })
+
+    def vpc_id():
+        return next(o["OutputValue"] for o in
+                    cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                    if o["OutputKey"] == "VpcId")
+
+    def children_of(vid):
+        sgs = [g for g in ec2.describe_security_groups()["SecurityGroups"]
+               if g.get("VpcId") == vid]
+        rtbs = [r for r in ec2.describe_route_tables()["RouteTables"]
+                if r.get("VpcId") == vid]
+        acls = [a for a in ec2.describe_network_acls()["NetworkAcls"]
+                if a.get("VpcId") == vid]
+        return sgs, rtbs, acls
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+        _wait_stack(cfn, stack_name)
+        before = vpc_id()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert vpc_id() == before, "the VPC came back under a new id"
+        sgs, rtbs, acls = children_of(before)
+        assert len(sgs) == 1 and len(rtbs) == 1 and len(acls) == 1, (
+            "the update left a second set of default children behind: "
+            f"{len(sgs)} security groups, {len(rtbs)} route tables, {len(acls)} ACLs")
+        assert ec2.describe_vpc_attribute(
+            VpcId=before, Attribute="enableDnsHostnames"
+        )["EnableDnsHostnames"]["Value"] is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_vpc_children(ec2, vpc_id):
+    return (
+        [g["GroupId"] for g in ec2.describe_security_groups()["SecurityGroups"]
+         if g.get("VpcId") == vpc_id],
+        [r["RouteTableId"] for r in ec2.describe_route_tables()["RouteTables"]
+         if r.get("VpcId") == vpc_id],
+        [a["NetworkAclId"] for a in ec2.describe_network_acls()["NetworkAcls"]
+         if a.get("VpcId") == vpc_id],
+    )
+
+
+def test_cfn_ec2_vpc_stack_delete_removes_its_default_children(cfn, ec2):
+    """A stack delete removes the VPC's default children."""
+    stack_name = f"cfn-vpc-del-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {"Vpc": {"Type": "AWS::EC2::VPC",
+                              "Properties": {"CidrBlock": "10.47.0.0/16"}}},
+        "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}},
+    })
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        vpc_id = _output(_wait_stack(cfn, stack_name), "VpcId")
+        sgs, rtbs, acls = _cfn_vpc_children(ec2, vpc_id)
+        assert len(sgs) == 1 and len(rtbs) == 1 and len(acls) == 1
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+        assert _cfn_vpc_children(ec2, vpc_id) == ([], [], []), (
+            "the stack delete left the VPC's default children behind")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_vpc_stack_delete_keeps_a_security_group_made_outside_it(cfn, ec2):
+    """A security group made outside the stack blocks the VPC delete (DependencyViolation)."""
+    stack_name = f"cfn-vpc-dep-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {"Vpc": {"Type": "AWS::EC2::VPC",
+                              "Properties": {"CidrBlock": "10.48.0.0/16"}}},
+        "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}},
+    })
+    group_id = None
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        vpc_id = _output(_wait_stack(cfn, stack_name), "VpcId")
+        group_id = ec2.create_security_group(
+            GroupName=f"foreign-{stack_name}", Description="outside the stack",
+            VpcId=vpc_id,
+        )["GroupId"]
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_FAILED"
+
+        groups = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"]
+        assert [g["GroupId"] for g in groups] == [group_id]
+        assert ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"]
+    finally:
+        if group_id:
+            try:
+                ec2.delete_security_group(GroupId=group_id)
+            except ClientError:
+                pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_vpc_attribute(ec2, vpc_id, attribute):
+    key = attribute[0].upper() + attribute[1:]
+    return ec2.describe_vpc_attribute(VpcId=vpc_id, Attribute=attribute)[key]["Value"]
+
+
+def test_cfn_ec2_vpc_dns_property_removed_returns_to_its_default(cfn, ec2):
+    """A removed DNS property goes back to its default."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpc-dns-{suffix}"
+
+    def template(both, off):
+        return json.dumps({
+            "Resources": {
+                "Both": {"Type": "AWS::EC2::VPC", "Properties": {
+                    "CidrBlock": "10.45.0.0/16", **both}},
+                "Off": {"Type": "AWS::EC2::VPC", "Properties": {
+                    "CidrBlock": "10.46.0.0/16", **off}},
+            },
+            "Outputs": {"Both": {"Value": {"Ref": "Both"}}, "Off": {"Value": {"Ref": "Off"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        {"EnableDnsSupport": True, "EnableDnsHostnames": True}, {"EnableDnsSupport": False}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        both, off = _cfn_output(cfn, stack_name, "Both"), _cfn_output(cfn, stack_name, "Off")
+        assert _cfn_vpc_attribute(ec2, both, "enableDnsHostnames") is True
+        assert _cfn_vpc_attribute(ec2, off, "enableDnsSupport") is False
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            {"EnableDnsSupport": True}, {}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "Both") == both
+        assert _cfn_output(cfn, stack_name, "Off") == off
+        assert _cfn_vpc_attribute(ec2, both, "enableDnsHostnames") is False
+        assert _cfn_vpc_attribute(ec2, both, "enableDnsSupport") is True
+        assert _cfn_vpc_attribute(ec2, off, "enableDnsSupport") is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_vpc_tag_change_keeps_tags_added_through_the_api(cfn, ec2):
+    """A template tag change keeps tags from CreateTags."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpc-tags-{suffix}"
+
+    def template(tags):
+        return json.dumps({
+            "Resources": {"Vpc": {"Type": "AWS::EC2::VPC", "Properties": {
+                "CidrBlock": "10.47.0.0/16", "Tags": tags}}},
+            "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template([{"Key": "a", "Value": "1"}]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        vpc_id = _cfn_output(cfn, stack_name, "VpcId")
+        ec2.create_tags(Resources=[vpc_id], Tags=[{"Key": "api", "Value": "kept"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            [{"Key": "a", "Value": "2"}, {"Key": "b", "Value": "3"}]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        tags = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0].get("Tags", [])
+        assert sorted((t["Key"], t["Value"]) for t in tags
+                      if not t["Key"].startswith("aws:")) == [
+            ("a", "2"), ("api", "kept"), ("b", "3")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_vpc_dns_hostnames_change_is_rolled_back(cfn, ec2):
+    """An EnableDnsHostnames change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpc-rb-{suffix}"
+
+    def template(hostnames, with_bad):
+        resources = {"Vpc": {"Type": "AWS::EC2::VPC", "Properties": {
+            "CidrBlock": "10.48.0.0/16", "EnableDnsSupport": True,
+            "EnableDnsHostnames": hostnames}}}
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "Vpc"}
+        return json.dumps({"Resources": resources,
+                           "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False, False))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc_id = _cfn_output(cfn, stack_name, "VpcId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True, True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "VpcId") == vpc_id
+        assert _cfn_vpc_attribute(ec2, vpc_id, "enableDnsHostnames") is False
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_vpc_create_only_ipam_members_replace_the_vpc(cfn, ec2):
+    """An IPAM member change replaces the VPC."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpc-ipam-{suffix}"
+
+    def template(netmask):
+        return json.dumps({
+            "Resources": {"Vpc": {"Type": "AWS::EC2::VPC", "Properties": {
+                "Ipv4IpamPoolId": "ipam-pool-0123456789abcdef0",
+                "Ipv4NetmaskLength": netmask}}},
+            "Outputs": {"VpcId": {"Value": {"Ref": "Vpc"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(24))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = _cfn_output(cfn, stack_name, "VpcId")
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(28))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        after = _cfn_output(cfn, stack_name, "VpcId")
+        assert after != before
+        assert not ec2.describe_vpcs(Filters=[{"Name": "vpc-id", "Values": [before]}])["Vpcs"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_update_keeps_id(cfn, ec2):
+    """A MapPublicIpOnLaunch change keeps the subnet's id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-upd-{suffix}"
+
+    def template(public):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC",
+                        "Properties": {"CidrBlock": "10.43.0.0/16"}},
+                "Subnet": {
+                    "Type": "AWS::EC2::Subnet",
+                    "Properties": {
+                        "VpcId": {"Ref": "Vpc"},
+                        "CidrBlock": "10.43.1.0/24",
+                        "MapPublicIpOnLaunch": public,
+                    },
+                },
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    def subnet_id():
+        return next(o["OutputValue"] for o in
+                    cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                    if o["OutputKey"] == "SubnetId")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+        _wait_stack(cfn, stack_name)
+        before = subnet_id()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert subnet_id() == before, "the subnet came back under a new id"
+        described = ec2.describe_subnets(SubnetIds=[before])["Subnets"][0]
+        assert described["MapPublicIpOnLaunch"] is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_keeps_map_public_ip_when_the_property_is_removed(cfn, ec2):
+    """A removed MapPublicIpOnLaunch keeps its value."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-map-{suffix}"
+
+    def template(extra):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.49.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.49.1.0/24", **extra}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"MapPublicIpOnLaunch": True}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        subnet_id = _cfn_output(cfn, stack_name, "SubnetId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "SubnetId") == subnet_id
+        described = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        assert described["MapPublicIpOnLaunch"] is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_create_only_members_replace_the_subnet(cfn, ec2):
+    """An AvailabilityZoneId change replaces the subnet."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-azid-{suffix}"
+
+    def template(zone_id):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.53.1.0/24",
+                    "AvailabilityZoneId": zone_id}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("use1-az2"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = _cfn_output(cfn, stack_name, "SubnetId")
+        subnet = ec2.describe_subnets(SubnetIds=[before])["Subnets"][0]
+        assert (subnet["AvailabilityZoneId"], subnet["AvailabilityZone"]) == ("use1-az2", "us-east-1b")
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("use1-az3"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        after = _cfn_output(cfn, stack_name, "SubnetId")
+        assert after != before
+        assert ec2.describe_subnets(SubnetIds=[after])["Subnets"][0]["AvailabilityZoneId"] == "use1-az3"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_subnet_dns_name_options_update_in_place(cfn, ec2):
+    """PrivateDnsNameOptionsOnLaunch updates in place; EnableDns64 without IPv6 fails."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subnet-dns-{suffix}"
+
+    def template(extra):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.55.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.55.1.0/24", **extra}},
+            },
+            "Outputs": {"SubnetId": {"Value": {"Ref": "Subnet"}}},
+        })
+
+    def attributes(subnet_id):
+        subnet = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+        return {key: subnet.get(key) for key in (
+            "PrivateDnsNameOptionsOnLaunch", "EnableDns64", "Ipv6Native",
+            "AssignIpv6AddressOnCreation")}
+
+    def options(hostname_type, a_record):
+        return {"HostnameType": hostname_type, "EnableResourceNameDnsARecord": a_record,
+                "EnableResourceNameDnsAAAARecord": False}
+
+    resource_name = {"HostnameType": "resource-name", "EnableResourceNameDnsARecord": True}
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        {"PrivateDnsNameOptionsOnLaunch": resource_name}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        subnet_id = _cfn_output(cfn, stack_name, "SubnetId")
+        defaults = {"EnableDns64": False, "Ipv6Native": False, "AssignIpv6AddressOnCreation": False}
+        assert attributes(subnet_id) == {
+            "PrivateDnsNameOptionsOnLaunch": options("resource-name", True), **defaults}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({
+            "PrivateDnsNameOptionsOnLaunch": {
+                "HostnameType": "ip-name", "EnableResourceNameDnsARecord": False}}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "SubnetId") == subnet_id
+        assert attributes(subnet_id)["PrivateDnsNameOptionsOnLaunch"] == options("ip-name", False)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            {"PrivateDnsNameOptionsOnLaunch": resource_name}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert attributes(subnet_id)["PrivateDnsNameOptionsOnLaunch"] == options("resource-name", True)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({"EnableDns64": True}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "")
+                   for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Subnet" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert reasons and "Property Ipv6CidrBlock or Ipv6IpamPoolId cannot be empty." in reasons[0]
+        assert attributes(subnet_id)["EnableDns64"] is False
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_security_group_update_keeps_id_and_rules(cfn, ec2):
+    """An ingress change keeps the group's id and its out-of-band rules."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sg-upd-{suffix}"
+
+    def template(port):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC",
+                        "Properties": {"CidrBlock": "10.44.0.0/16"}},
+                "Sg": {
+                    "Type": "AWS::EC2::SecurityGroup",
+                    "Properties": {
+                        "GroupDescription": "probe",
+                        "VpcId": {"Ref": "Vpc"},
+                        "SecurityGroupIngress": [
+                            {"IpProtocol": "tcp", "FromPort": port,
+                             "ToPort": port, "CidrIp": "10.0.0.0/8"},
+                        ],
+                    },
+                },
+            },
+            "Outputs": {"SgId": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}},
+        })
+
+    def sg_id():
+        return next(o["OutputValue"] for o in
+                    cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                    if o["OutputKey"] == "SgId")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(80))
+        _wait_stack(cfn, stack_name)
+        before = sg_id()
+        # A rule added out of band is what the replacement destroys.
+        ec2.authorize_security_group_ingress(
+            GroupId=before,
+            IpPermissions=[{"IpProtocol": "tcp", "FromPort": 8443, "ToPort": 8443,
+                            "IpRanges": [{"CidrIp": "192.0.2.0/24"}]}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(443))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert sg_id() == before, "the security group came back under a new id"
+        perms = ec2.describe_security_groups(
+            GroupIds=[before])["SecurityGroups"][0]["IpPermissions"]
+        ports = sorted(p["FromPort"] for p in perms if "FromPort" in p)
+        assert 443 in ports, "the template's new ingress rule was not applied"
+        assert 8443 in ports, "the out-of-band rule was destroyed"
+        assert 80 not in ports, "the template's old ingress rule survived"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_security_group_rule_members_update_in_place(cfn, ec2):
+    """Rule descriptions, prefix-list and group sources update in place."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sg-members-{suffix}"
+    prefix_list = ec2.create_managed_prefix_list(
+        PrefixListName=f"cfn-sg-members-{suffix}", MaxEntries=1, AddressFamily="IPv4",
+        Entries=[{"Cidr": "198.51.100.0/24"}])["PrefixList"]["PrefixListId"]
+
+    def template(ingress_description, egress_description, with_list):
+        ingress = [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                    "CidrIp": "10.0.0.0/8", "Description": ingress_description},
+                   {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080,
+                    "SourceSecurityGroupId": {"Fn::GetAtt": ["Vpc", "DefaultSecurityGroup"]},
+                    "Description": "from the default group"}]
+        if with_list:
+            ingress.append({"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                            "SourcePrefixListId": prefix_list, "Description": "from the list"})
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.57.0.0/16"}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                    "GroupDescription": "members", "VpcId": {"Ref": "Vpc"},
+                    "SecurityGroupIngress": ingress,
+                    "SecurityGroupEgress": [{"IpProtocol": "-1", "CidrIp": "0.0.0.0/0",
+                                             "Description": egress_description}]}},
+            },
+            "Outputs": {"Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}},
+        })
+
+    def rules(group_id, member):
+        group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+        flat = []
+        for perm in group[member]:
+            for entry in perm.get("IpRanges", []):
+                flat.append((perm.get("FromPort"), entry["CidrIp"], entry.get("Description")))
+            for entry in perm.get("PrefixListIds", []):
+                flat.append((perm.get("FromPort"), entry["PrefixListId"], entry.get("Description")))
+            for entry in perm.get("UserIdGroupPairs", []):
+                flat.append((perm.get("FromPort"), "group", entry.get("Description")))
+        return sorted(flat, key=str)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("a", "e1", True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group_id = _cfn_output(cfn, stack_name, "Sg")
+        listed = (443, prefix_list, "from the list")
+        by_group = (8080, "group", "from the default group")
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "a"), listed, by_group], key=str)
+        assert rules(group_id, "IpPermissionsEgress") == [(None, "0.0.0.0/0", "e1")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e1", True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Sg") == group_id
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "b"), listed, by_group], key=str)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e2", True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert rules(group_id, "IpPermissionsEgress") == [(None, "0.0.0.0/0", "e2")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("b", "e2", False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert rules(group_id, "IpPermissions") == sorted(
+            [(22, "10.0.0.0/8", "b"), by_group], key=str)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ec2.delete_managed_prefix_list(PrefixListId=prefix_list)
+
+
+def test_cfn_ec2_security_group_egress_update_matches_the_create(cfn, ec2):
+    """Declaring egress drops allow-all; dropping the declaration does not bring it back."""
+    stack_name = f"cfn-sg-egress-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(egress):
+        props = {"GroupDescription": "egress", "VpcId": {"Ref": "Vpc"}}
+        if egress:
+            props["SecurityGroupEgress"] = [
+                {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                 "CidrIp": "10.0.0.0/8"}]
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.58.0.0/16"}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": props},
+            },
+            "Outputs": {"Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}},
+        })
+
+    def egress(group_id):
+        group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+        return sorted(
+            (perm["IpProtocol"], perm.get("FromPort"), entry["CidrIp"])
+            for perm in group["IpPermissionsEgress"]
+            for entry in perm.get("IpRanges", [])
+        )
+
+    allow_all = ("-1", None, "0.0.0.0/0")
+    declared = ("tcp", 443, "10.0.0.0/8")
+    foreign = ("tcp", 25, "192.0.2.0/24")
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        group_id = _cfn_output(cfn, stack_name, "Sg")
+        ec2.authorize_security_group_egress(
+            GroupId=group_id,
+            IpPermissions=[{"IpProtocol": "tcp", "FromPort": 25, "ToPort": 25,
+                            "IpRanges": [{"CidrIp": "192.0.2.0/24"}]}])
+        assert egress(group_id) == sorted([allow_all, foreign])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert egress(group_id) == sorted([declared, foreign]), (
+            "declaring egress kept the allow-all rule the create would not add")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert egress(group_id) == sorted([foreign]), (
+            "dropping the egress declaration brought the allow-all rule back")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_security_group_ingress_change_is_rolled_back(cfn, ec2):
+    """An ingress change is sent back by the rollback."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sg-rb-{suffix}"
+
+    def template(ports, with_bad):
+        resources = {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.50.0.0/16"}},
+            "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "probe", "VpcId": {"Ref": "Vpc"},
+                "SecurityGroupIngress": [
+                    {"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
+                     "CidrIp": "10.0.0.0/8"} for port in ports]}},
+        }
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "Sg"}
+        return json.dumps({"Resources": resources,
+                           "Outputs": {"SgId": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template([22], False))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        sg_id = _cfn_output(cfn, stack_name, "SgId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template([22, 443], True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "SgId") == sg_id
+        perms = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]
+        assert sorted(p["FromPort"] for p in perms if "FromPort" in p) == [22]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_launch_template_update_adds_a_version(cfn, ec2):
+    """A data change adds a version and leaves the default."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lt-upd-{suffix}"
+    name = f"cfn-lt-upd-{suffix}"
+
+    def template(instance_type):
+        return json.dumps({
+            "Resources": {
+                "LT": {
+                    "Type": "AWS::EC2::LaunchTemplate",
+                    "Properties": {
+                        "LaunchTemplateName": name,
+                        "LaunchTemplateData": {
+                            "ImageId": "ami-cfn7777",
+                            "InstanceType": instance_type,
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "LtId": {"Value": {"Ref": "LT"}},
+                "Latest": {"Value": {"Fn::GetAtt": ["LT", "LatestVersionNumber"]}},
+                "Default": {"Value": {"Fn::GetAtt": ["LT", "DefaultVersionNumber"]}},
+            },
+        })
+
+    def outputs():
+        return {o["OutputKey"]: o["OutputValue"] for o in
+                cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]}
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("t3.micro"))
+        _wait_stack(cfn, stack_name)
+        before = outputs()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("t3.large"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        after = outputs()
+        assert after["LtId"] == before["LtId"], \
+            "the launch template came back under a new id"
+        assert after["Latest"] == "2", \
+            f"the data change did not add a version (latest {after['Latest']})"
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=before["LtId"])["LaunchTemplateVersions"]
+        assert sorted(v["VersionNumber"] for v in versions) == [1, 2]
+        latest = next(v for v in versions if v["VersionNumber"] == 2)
+        assert latest["LaunchTemplateData"]["InstanceType"] == "t3.large"
+        # The default version stays 1.
+        assert after["Default"] == "1"
+        assert latest["DefaultVersion"] is False
+        described = ec2.describe_launch_templates(
+            LaunchTemplateIds=[before["LtId"]])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (2, 1)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_launch_template_tags_come_from_tag_specifications(cfn, ec2):
+    """The template's tags come from its launch-template TagSpecifications, at create only."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lt-tags-{suffix}"
+
+    def template(value):
+        return json.dumps({
+            "Resources": {"LT": {"Type": "AWS::EC2::LaunchTemplate", "Properties": {
+                "LaunchTemplateData": {"ImageId": "ami-cfn7777", "InstanceType": "t3.micro"},
+                "TagSpecifications": [
+                    {"ResourceType": "launch-template",
+                     "Tags": [{"Key": "v", "Value": value}]},
+                    {"ResourceType": "instance",
+                     "Tags": [{"Key": "launched", "Value": "yes"}]},
+                ]}}},
+            "Outputs": {"LtId": {"Value": {"Ref": "LT"}}},
+        })
+
+    def tags(lt_id):
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        return sorted((t["Key"], t["Value"]) for t in described.get("Tags", []))
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("one"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        lt_id = _cfn_output(cfn, stack_name, "LtId")
+        assert tags(lt_id) == [("v", "one")]
+        ec2.create_tags(Resources=[lt_id], Tags=[{"Key": "api", "Value": "kept"}])
+        assert tags(lt_id) == [("api", "kept"), ("v", "one")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "LtId") == lt_id
+        assert tags(lt_id) == [("api", "kept"), ("v", "one")]
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (2, 1)
+
+        # The stack delete takes the template's tags with it.
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [lt_id]}])["Tags"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_launch_template_data_change_is_rolled_back(cfn, ec2):
+    """The rollback of a data change adds a version with the old data."""
+    stack_name = f"cfn-lt-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(instance_type):
+        return json.dumps({
+            "Resources": {"Lt": {"Type": "AWS::EC2::LaunchTemplate", "Properties": {
+                "LaunchTemplateData": {"ImageId": "ami-cfn7777",
+                                       "InstanceType": instance_type}}}},
+            "Outputs": {
+                "LtId": {"Value": {"Ref": "Lt"}},
+                "Latest": {"Value": {"Fn::GetAtt": ["Lt", "LatestVersionNumber"]}},
+                "Default": {"Value": {"Fn::GetAtt": ["Lt", "DefaultVersionNumber"]}},
+            },
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("t3.micro"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        lt_id = _cfn_output(cfn, stack_name, "LtId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("t3.large"), "Lt"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "LtId") == lt_id
+        assert (_cfn_output(cfn, stack_name, "Latest"),
+                _cfn_output(cfn, stack_name, "Default")) == ("1", "1")
+        described = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])["LaunchTemplates"][0]
+        assert (described["LatestVersionNumber"], described["DefaultVersionNumber"]) == (3, 1)
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=lt_id)["LaunchTemplateVersions"]
+        assert sorted((v["VersionNumber"], v["LaunchTemplateData"]["InstanceType"],
+                       v["DefaultVersion"]) for v in versions) == [
+            (1, "t3.micro", True), (2, "t3.large", False), (3, "t3.micro", False)]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_internet_gateway_tag_update_keeps_id_and_attachment(cfn, ec2):
+    """A tag change keeps the gateway's id and attachment."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-igw-upd-{suffix}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC",
+                        "Properties": {"CidrBlock": "10.45.0.0/16"}},
+                "Igw": {
+                    "Type": "AWS::EC2::InternetGateway",
+                    "Properties": {"Tags": [{"Key": "stage", "Value": stage}]},
+                },
+                "Attach": {
+                    "Type": "AWS::EC2::VPCGatewayAttachment",
+                    "Properties": {"VpcId": {"Ref": "Vpc"},
+                                   "InternetGatewayId": {"Ref": "Igw"}},
+                },
+            },
+            "Outputs": {"IgwId": {"Value": {"Ref": "Igw"}}},
+        })
+
+    def igw_id():
+        return next(o["OutputValue"] for o in
+                    cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                    if o["OutputKey"] == "IgwId")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        _wait_stack(cfn, stack_name)
+        before = igw_id()
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("after"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert igw_id() == before, "the gateway came back under a new id"
+        described = ec2.describe_internet_gateways(
+            InternetGatewayIds=[before])["InternetGateways"][0]
+        assert described["Attachments"], "the VPC attachment was dropped"
+        assert _template_tags(described.get("Tags", [])) == \
+            [{"Key": "stage", "Value": "after"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_internet_gateway_tag_change_is_rolled_back(cfn, ec2):
+    """A gateway tag change is sent back by the rollback."""
+    stack_name = f"cfn-igw-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.52.0.0/16"}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway",
+                        "Properties": {"Tags": [{"Key": "stage", "Value": stage}]}},
+                "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "InternetGatewayId": {"Ref": "Igw"}}},
+            },
+            "Outputs": {"IgwId": {"Value": {"Ref": "Igw"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        igw_id = _cfn_output(cfn, stack_name, "IgwId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("after"), "Igw"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "IgwId") == igw_id
+        described = ec2.describe_internet_gateways(
+            InternetGatewayIds=[igw_id])["InternetGateways"][0]
+        assert described["Attachments"], "the VPC attachment was dropped"
+        assert _template_tags(described.get("Tags", [])) == [{"Key": "stage", "Value": "before"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_route_table_tag_update_keeps_id_and_routes(cfn, ec2):
+    """A tag change keeps the table's id and routes."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rtb-upd-{suffix}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC",
+                        "Properties": {"CidrBlock": "10.46.0.0/16"}},
+                "Rtb": {
+                    "Type": "AWS::EC2::RouteTable",
+                    "Properties": {"VpcId": {"Ref": "Vpc"},
+                                   "Tags": [{"Key": "stage", "Value": stage}]},
+                },
+            },
+            "Outputs": {"RtbId": {"Value": {"Ref": "Rtb"}}},
+        })
+
+    def rtb_id():
+        return next(o["OutputValue"] for o in
+                    cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                    if o["OutputKey"] == "RtbId")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        _wait_stack(cfn, stack_name)
+        before = rtb_id()
+        # A route added out of band is what the replacement destroys.
+        ec2.create_route(RouteTableId=before, DestinationCidrBlock="198.51.100.0/24",
+                         GatewayId="local")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("after"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        assert rtb_id() == before, "the route table came back under a new id"
+        table = ec2.describe_route_tables(RouteTableIds=[before])["RouteTables"][0]
+        dests = [r.get("DestinationCidrBlock") for r in table["Routes"]]
+        assert "198.51.100.0/24" in dests, "the out-of-band route was destroyed"
+        assert _template_tags(table.get("Tags", [])) == \
+            [{"Key": "stage", "Value": "after"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_route_table_tag_change_is_rolled_back(cfn, ec2):
+    """A route table tag change is sent back by the rollback."""
+    stack_name = f"cfn-rtb-rb-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(stage):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "Tags": [{"Key": "stage", "Value": stage}]}},
+            },
+            "Outputs": {"RtbId": {"Value": {"Ref": "Rtb"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("before"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        rtb_id = _cfn_output(cfn, stack_name, "RtbId")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template("after"), "Rtb"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "RtbId") == rtb_id
+        table = ec2.describe_route_tables(RouteTableIds=[rtb_id])["RouteTables"][0]
+        assert _template_tags(table.get("Tags", [])) == [{"Key": "stage", "Value": "before"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_network_tag_change_keeps_tags_added_through_the_api(cfn, ec2):
+    """Subnet, group, gateway and table tag changes keep tags from CreateTags."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-net-tags-{suffix}"
+
+    def template(value):
+        tags = [{"Key": "a", "Value": value}]
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.51.0.0/16"}},
+                "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.51.1.0/24", "Tags": tags}},
+                "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                    "GroupDescription": "probe", "VpcId": {"Ref": "Vpc"}, "Tags": tags}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway", "Properties": {"Tags": tags}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "Tags": tags}},
+            },
+            "Outputs": {
+                "Subnet": {"Value": {"Ref": "Subnet"}},
+                "Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}},
+                "Igw": {"Value": {"Ref": "Igw"}},
+                "Rtb": {"Value": {"Ref": "Rtb"}},
+            },
+        })
+
+    def tags_of(resource_id):
+        found = ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [resource_id]}])["Tags"]
+        return sorted((t["Key"], t["Value"]) for t in found if not t["Key"].startswith("aws:"))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ids = {key: _cfn_output(cfn, stack_name, key) for key in ("Subnet", "Sg", "Igw", "Rtb")}
+        ec2.create_tags(Resources=list(ids.values()), Tags=[{"Key": "api", "Value": "kept"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        for key, resource_id in ids.items():
+            assert _cfn_output(cfn, stack_name, key) == resource_id, key
+            assert tags_of(resource_id) == [("a", "2"), ("api", "kept")], key
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_networking_resources_carry_the_stack_tags(cfn, ec2):
+    """The networking types carry the stack and aws:cloudformation tags."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-net-stack-tags-{suffix}"
+    own = [{"Key": "own", "Value": "a"}]
+    template = json.dumps({
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.63.0.0/16", "Tags": own}},
+            "Subnet": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.63.1.0/24", "Tags": own}},
+            "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "stack tags", "VpcId": {"Ref": "Vpc"}, "Tags": own}},
+            "Igw": {"Type": "AWS::EC2::InternetGateway", "Properties": {"Tags": own}},
+            "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {"VpcId": {"Ref": "Vpc"}, "Tags": own}},
+        },
+        "Outputs": {
+            "Vpc": {"Value": {"Ref": "Vpc"}}, "Subnet": {"Value": {"Ref": "Subnet"}},
+            "Sg": {"Value": {"Fn::GetAtt": ["Sg", "GroupId"]}},
+            "Igw": {"Value": {"Ref": "Igw"}}, "Rtb": {"Value": {"Ref": "Rtb"}},
+        },
+    })
+
+    def tags_of(resource_id):
+        return {t["Key"]: t["Value"] for t in ec2.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [resource_id]}])["Tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     Tags=[{"Key": "stage", "Value": "one"}])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ids = {key: _cfn_output(cfn, stack_name, key) for key in ("Vpc", "Subnet", "Sg", "Igw", "Rtb")}
+        for logical_id, resource_id in ids.items():
+            assert tags_of(resource_id) == {
+                "own": "a", "stage": "one",
+                "aws:cloudformation:stack-name": stack_name,
+                "aws:cloudformation:stack-id": stack["StackId"],
+                "aws:cloudformation:logical-id": logical_id,
+            }, logical_id
+        cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        for logical_id, resource_id in ids.items():
+            assert tags_of(resource_id)["stage"] == "two", logical_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_route_target_change_does_not_duplicate(cfn, ec2):
+    """A target change replaces the route instead of adding a second one."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-route-upd-{suffix}"
+
+    def template(target):
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC",
+                        "Properties": {"CidrBlock": "10.47.0.0/16"}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable",
+                        "Properties": {"VpcId": {"Ref": "Vpc"}}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway"},
+                "Attach": {
+                    "Type": "AWS::EC2::VPCGatewayAttachment",
+                    "Properties": {"VpcId": {"Ref": "Vpc"},
+                                   "InternetGatewayId": {"Ref": "Igw"}},
+                },
+                "Route": {
+                    "Type": "AWS::EC2::Route",
+                    "DependsOn": "Attach",
+                    "Properties": {
+                        "RouteTableId": {"Ref": "Rtb"},
+                        "DestinationCidrBlock": "0.0.0.0/0",
+                        "GatewayId": target,
+                    },
+                },
+            },
+            "Outputs": {"RtbId": {"Value": {"Ref": "Rtb"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("igw-aaaaaaaa"))
+        _wait_stack(cfn, stack_name)
+        rtb = next(o["OutputValue"] for o in
+                   cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+                   if o["OutputKey"] == "RtbId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("igw-bbbbbbbb"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        table = ec2.describe_route_tables(RouteTableIds=[rtb])["RouteTables"][0]
+        default = [r for r in table["Routes"]
+                   if r.get("DestinationCidrBlock") == "0.0.0.0/0"]
+        assert len(default) == 1, \
+            f"the target change left {len(default)} routes for one destination"
+        assert default[0].get("GatewayId") == "igw-bbbbbbbb"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_route_destinations_are_separate_routes(cfn, ec2):
+    """IPv4, IPv6 and prefix-list destinations are separate routes."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-route-dest-{suffix}"
+    prefix_list = ec2.create_managed_prefix_list(
+        PrefixListName=f"cfn-route-dest-{suffix}", MaxEntries=1, AddressFamily="IPv4",
+        Entries=[{"Cidr": "198.51.100.0/24"}])["PrefixList"]["PrefixListId"]
+
+    def template(with_v4):
+        routes = {
+            "RoutePl": {"DestinationPrefixListId": prefix_list},
+            "Route6": {"DestinationIpv6CidrBlock": "::/0"},
+        }
+        if with_v4:
+            routes["Route4"] = {"DestinationCidrBlock": "0.0.0.0/0"}
+        return json.dumps({
+            "Resources": {
+                "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.59.0.0/16"}},
+                "Rtb": {"Type": "AWS::EC2::RouteTable", "Properties": {"VpcId": {"Ref": "Vpc"}}},
+                "Igw": {"Type": "AWS::EC2::InternetGateway"},
+                "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                    "VpcId": {"Ref": "Vpc"}, "InternetGatewayId": {"Ref": "Igw"}}},
+                **{logical_id: {"Type": "AWS::EC2::Route", "DependsOn": "Attach", "Properties": {
+                    "RouteTableId": {"Ref": "Rtb"}, "GatewayId": {"Ref": "Igw"}, **destination}}
+                   for logical_id, destination in routes.items()},
+            },
+            "Outputs": {"Rtb": {"Value": {"Ref": "Rtb"}}, "RoutePl": {"Value": {"Ref": "RoutePl"}}},
+        })
+
+    def destinations(rtb):
+        table = ec2.describe_route_tables(RouteTableIds=[rtb])["RouteTables"][0]
+        return sorted(
+            r.get("DestinationCidrBlock") or r.get("DestinationIpv6CidrBlock")
+            or r.get("DestinationPrefixListId") for r in table["Routes"])
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rtb = _cfn_output(cfn, stack_name, "Rtb")
+        assert _cfn_output(cfn, stack_name, "RoutePl") == f"{rtb}|{prefix_list}"
+        assert destinations(rtb) == sorted(["0.0.0.0/0", "10.59.0.0/16", "::/0", prefix_list])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert destinations(rtb) == sorted(["10.59.0.0/16", "::/0", prefix_list])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ec2.delete_managed_prefix_list(PrefixListId=prefix_list)
+
+
+def test_cfn_update_rollback_records_the_cleanup_phase(cfn):
+    """The rollback's stack events, cleanup phase included."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rb-events-{uid}"
+    table_name = f"cfn-rb-events-{uid}"
+
+    def template(key_type, extra=None):
+        resources = {
+            "Table": {"Type": "AWS::DynamoDB::Table", "Properties": {
+                "TableName": table_name,
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            }},
+        }
+        if extra == "wait":
+            resources["Handle"] = {"Type": "AWS::CloudFormation::WaitConditionHandle"}
+            resources["Wait"] = {"Type": "AWS::CloudFormation::WaitCondition",
+                                 "Properties": {"Handle": {"Ref": "Handle"}, "Timeout": "1"}}
+        elif extra == "added":
+            resources["Added"] = {"Type": "AWS::SQS::Queue", "Properties": {}}
+            resources["Table"]["DependsOn"] = "Added"
+        return json.dumps({"Resources": resources})
+
+    def rollback_events():
+        events = list(reversed(cfn.describe_stack_events(StackName=stack_name)["StackEvents"]))
+        start = max(i for i, e in enumerate(events)
+                    if e["LogicalResourceId"] == stack_name
+                    and e["ResourceStatus"] == "UPDATE_IN_PROGRESS")
+        return events[start:]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("S"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        # The table's key type change is refused after the update created a queue.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("N", "added"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        events = rollback_events()
+        stack_events = [(e["ResourceStatus"], e.get("ResourceStatusReason", ""))
+                        for e in events if e["LogicalResourceId"] == stack_name]
+        assert stack_events[1:] == [
+            ("UPDATE_ROLLBACK_IN_PROGRESS", "The following resource(s) failed to update: [Table]. "),
+            ("UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", ""),
+            ("UPDATE_ROLLBACK_COMPLETE", ""),
+        ]
+        cleanup = next(i for i, e in enumerate(events)
+                       if e["ResourceStatus"] == "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS")
+        assert [(e["LogicalResourceId"], e["ResourceStatus"]) for e in events[cleanup + 1:]] == [
+            ("Added", "DELETE_IN_PROGRESS"), ("Added", "DELETE_COMPLETE"),
+            (stack_name, "UPDATE_ROLLBACK_COMPLETE")]
+
+        # A resource the update adds fails: the wait condition times out.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("S", "wait"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in rollback_events()
+                   if e["LogicalResourceId"] == stack_name
+                   and e["ResourceStatus"] == "UPDATE_ROLLBACK_IN_PROGRESS"]
+        assert reasons == ["The following resource(s) failed to create: [Wait]. "]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_change_set_rollback_restores_the_parameters(cfn, sqs):
+    """A change set that rolls back restores the previous parameters."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cs-rb-params-{uid}"
+    queue_name = f"cfn-cs-rb-params-{uid}"
+    template = json.dumps({
+        "Parameters": {"P": {"Type": "String", "Default": "30"},
+                       "K": {"Type": "String", "Default": "S"}},
+        "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+                "QueueName": queue_name, "VisibilityTimeout": {"Ref": "P"}}},
+            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+                "TableName": f"cfn-cs-rb-params-{uid}",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": {"Ref": "K"}}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            }},
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.create_change_set(
+            StackName=stack_name, ChangeSetName="raise", UsePreviousTemplate=True,
+            Parameters=[{"ParameterKey": "P", "ParameterValue": "45"},
+                        {"ParameterKey": "K", "ParameterValue": "N"}])
+        for _ in range(60):
+            change_set = cfn.describe_change_set(StackName=stack_name, ChangeSetName="raise")
+            if not change_set["Status"].endswith(("_PENDING", "_IN_PROGRESS")):
+                break
+            time.sleep(0.5)
+        assert change_set["Status"] == "CREATE_COMPLETE", change_set.get("StatusReason")
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="raise")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert sorted((p["ParameterKey"], p["ParameterValue"])
+                      for p in stack["Parameters"]) == [("K", "S"), ("P", "30")]
+        queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+        assert sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["VisibilityTimeout"]
+        )["Attributes"]["VisibilityTimeout"] == "30"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_mode_cr_function(lam, fn, fail_mode):
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_cr_mode_handler(fail_mode))},
+    )
+
+
+def _cfn_mode_cr_accept_all(lam, fn):
+    lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_cr_mode_handler(None)))
+
+
+def _cfn_events_since_rollback(cfn, stack_name, logical_id):
+    """One resource's statuses since the latest UPDATE_ROLLBACK_IN_PROGRESS, oldest first."""
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    rollback = next(i for i, e in enumerate(events)
+                    if e["LogicalResourceId"] == stack_name
+                    and e["ResourceStatus"] == "UPDATE_ROLLBACK_IN_PROGRESS")
+    return [e["ResourceStatus"] for e in reversed(events[:rollback])
+            if e["LogicalResourceId"] == logical_id]
+
+
+def test_cfn_update_rollback_failed_revert_is_retried_by_continue_update_rollback(cfn, lam):
+    """ContinueUpdateRollback retries a failed revert as an update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-revert-fails-{suffix}"
+    stack_name = f"cfn-revert-fails-{suffix}"
+    _cfn_mode_cr_function(lam, fn, fail_mode="old")
+    token = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    def template(mode, with_bad):
+        resources = {"CR": {"Type": "Custom::Tester",
+                            "Properties": {"ServiceToken": token, "Mode": mode}}}
+        if with_bad:
+            resources["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+        return json.dumps({"Resources": resources})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("old", False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("new", True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+        assert stack["StackStatusReason"] == (
+            "The following resource(s) failed to update: [CR].")
+        statuses = _cfn_events_since_rollback(cfn, stack_name, "CR")
+        assert statuses[:2] == ["UPDATE_IN_PROGRESS", "UPDATE_FAILED"], statuses
+
+        # Still refused: the retry fails the same way.
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+        assert "failed to update: [CR]" in stack["StackStatusReason"]
+
+        # Accepted now: the retry is an update, so the resource is not deleted.
+        _cfn_mode_cr_accept_all(lam, fn)
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        statuses = _cfn_events_since_rollback(cfn, stack_name, "CR")
+        assert statuses == ["UPDATE_IN_PROGRESS", "UPDATE_COMPLETE"], statuses
+        resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in resources] == ["CR"]
+    finally:
+        try:
+            _cfn_mode_cr_accept_all(lam, fn)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_rollback_failed_revert_can_be_skipped(cfn, lam):
+    """ResourcesToSkip accepts a resource whose revert failed."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-revert-skip-{suffix}"
+    stack_name = f"cfn-revert-skip-{suffix}"
+    _cfn_mode_cr_function(lam, fn, fail_mode="old")
+    token = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    base = {"Resources": {"CR": {"Type": "Custom::Tester",
+                                 "Properties": {"ServiceToken": token, "Mode": "old"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"]["Properties"]["Mode"] = "new"
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
+
+        cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["CR"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_events_since_rollback(cfn, stack_name, "CR") == ["UPDATE_COMPLETE"]
+    finally:
+        try:
+            _cfn_mode_cr_accept_all(lam, fn)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_rollback_reverts_the_resource_whose_update_failed(cfn, lam):
+    """A custom resource whose update failed is sent back too."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-fwd-fails-{suffix}"
+    stack_name = f"cfn-fwd-fails-{suffix}"
+    _cfn_mode_cr_function(lam, fn, fail_mode="new")
+    token = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+
+    def template(mode):
+        return json.dumps({"Resources": {"CR": {
+            "Type": "Custom::Tester", "Properties": {"ServiceToken": token, "Mode": mode}}}})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("old"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("new"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_events_since_rollback(cfn, stack_name, "CR") == [
+            "UPDATE_IN_PROGRESS", "UPDATE_COMPLETE"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_rollback_does_not_resend_a_refused_resource_update(cfn):
+    """A type's refused update is not resent; it is recorded UPDATE_COMPLETE."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rb-refused-{uid}"
+    oidc = {"Issuer": "https://issuer.example.com", "ClientId": "c1"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(
+            f"refused_{uid}", {}, oidc))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_template(
+            f"refused_{uid}", {"Visibility": "PRIVATE"}, oidc))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_events_since_rollback(cfn, stack_name, "Api") == ["UPDATE_COMPLETE"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

@@ -4,6 +4,11 @@ Pure routing-layer tests — no boto3, no live server. Covers the path-based
 fallback (i.e. when neither X-Amz-Target nor a SigV4 credential scope is
 available to disambiguate the service).
 """
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from ministack.core.router import detect_service
@@ -116,6 +121,29 @@ def _sigv4_headers(service):
     }
 
 
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvm-images/ministack/versions/1",
+    "/2025-09-09/microvms",
+    "/2025-09-09/microvms/microvm-123/terminate",
+])
+def test_lambda_microvm_paths_override_lambda_credential_scope(path):
+    """The AWS CLI signs Lambda MicroVM requests with the `lambda` scope.
+
+    The path must therefore win over the generic Lambda function router, or
+    `/2025-09-09/microvm-images` is treated as a Lambda function name.
+    """
+    assert detect_service("POST", path, _sigv4_headers("lambda"), {}) == "lambda-microvms"
+
+
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvms",
+])
+def test_lambda_microvm_paths_route_without_signature(path):
+    assert detect_service("POST", path, _HEADERS, {}) == "lambda-microvms"
+
+
 def test_iot_jobs_data_credential_scope_routes():
     """The SDK signs iot-jobs-data requests with the `iot-jobs-data` scope
     (botocore signingName); the same path signed with `iot` must stay on the
@@ -130,8 +158,7 @@ def test_iot_jobs_data_credential_scope_routes():
 @pytest.mark.parametrize(
     "host",
     [
-        # What DescribeEndpoint(endpointType="iot:Jobs") actually hands out —
-        # a device following the documented flow signs against exactly this.
+        # The legacy iot:Jobs endpoint shape.
         "a1b2c3.jobs.iot.us-east-1.localhost:4566",
         # The spelling the AWS Device SDK's jobs documentation uses.
         "a1b2c3.data.jobs.iot.us-east-1.localhost:4566",
@@ -474,3 +501,54 @@ def test_location_host_routes(host):
     assert detect_service(
         "POST", "/tracking/v0/trackers", {"host": host}, {}
     ) == "location"
+
+
+# ---------------------------------------------------------------------------
+# What a request pulls in
+# ---------------------------------------------------------------------------
+
+
+def test_first_request_does_not_import_cloudformation():
+    """A request to any service must not load the CloudFormation package.
+
+    In a subprocess: the rest of the suite has imported everything already.
+    """
+    src = textwrap.dedent(
+        """
+        import asyncio, sys
+        from ministack.app import app
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            pass
+
+        for method in ("GET", "PUT", "POST"):
+            asyncio.run(app(
+                {"type": "http", "method": method, "path": "/",
+                 "query_string": b"", "headers": []},
+                receive, send,
+            ))
+        print(",".join(
+            m for m in ("ministack.services.cloudformation", "ministack.services.appsync", "graphql")
+            if m in sys.modules
+        ))
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", src],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={**os.environ, "IOT_MTLS_ENABLED": "0"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"request imported {proc.stdout.strip()}"
+
+
+def test_cfn_signal_prefix_matches_wait_conditions():
+    """Guards the literal in app.py against drifting from the module."""
+    from ministack.services.cloudformation import wait_conditions
+
+    assert wait_conditions.SIGNAL_PATH == "/_ministack/cfn-signal/"

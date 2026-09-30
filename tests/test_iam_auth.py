@@ -30,6 +30,7 @@ from ministack.core.iam_evaluator import (
     evaluate_trust_policy,
     find_iam_access_key_account,
     fnmatch_iam,
+    fnmatch_iam_cs,
     parse_policy_document,
     resolve_credential,
     resolve_principal,
@@ -37,7 +38,8 @@ from ministack.core.iam_evaluator import (
 )
 
 # ---------------------------------------------------------------------------
-# Wildcard matching (IAM spec: case-insensitive, * = any, ? = single char)
+# Wildcard matching. Action/NotAction is case-insensitive; Resource/NotResource,
+# StringLike and the Arn operators are case-sensitive.
 # ---------------------------------------------------------------------------
 
 class TestFnmatchIam:
@@ -72,6 +74,73 @@ class TestFnmatchIam:
     def test_empty_pattern_matches_empty(self):
         assert fnmatch_iam("", "")
         assert not fnmatch_iam("something", "")
+
+
+class TestFnmatchIamCaseSensitive:
+    """"In the Resource element, the IAM user name is case sensitive."
+    (reference_policies_elements_resource)"""
+
+    @pytest.mark.parametrize("pattern", ("*", "arn:aws:iam::1:user/Bob", "arn:aws:iam::1:user/B*",
+                                         "arn:aws:iam::1:user/Bo?"))
+    def test_matching_case_matches(self, pattern):
+        assert fnmatch_iam_cs("arn:aws:iam::1:user/Bob", pattern)
+
+    @pytest.mark.parametrize("pattern", ("arn:aws:iam::1:user/bob", "arn:aws:iam::1:user/BOB",
+                                         "arn:aws:iam::1:user/b*", "ARN:AWS:IAM::1:USER/Bob"))
+    def test_wrong_case_does_not_match(self, pattern):
+        assert not fnmatch_iam_cs("arn:aws:iam::1:user/Bob", pattern)
+
+    def test_the_two_matchers_disagree_only_on_case(self):
+        value, pattern = "arn:aws:s3:::MyBucket/Key", "arn:aws:s3:::mybucket/*"
+        assert fnmatch_iam(value, pattern)
+        assert not fnmatch_iam_cs(value, pattern)
+
+    def test_action_matching_stays_case_insensitive(self):
+        assert fnmatch_iam("s3:PutObject", "s3:putobject")
+
+
+class TestResourceAndConditionCaseSensitivity:
+    def _decide(self, resource, request_arn="arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser",
+                condition=None):
+        stmt = {"Effect": "Allow", "Action": "rds-db:connect", "Resource": resource}
+        if condition:
+            stmt["Condition"] = condition
+        doc = {"Version": "2012-10-17", "Statement": [stmt]}
+        return evaluate(EvalContext(
+            principal_arn="arn:aws:iam::1:user/u", principal_type="user",
+            principal_account="1", action="rds-db:connect",
+            resource_arn=request_arn, region="us-east-1",
+            service_context={"tag": "Prod", "arn": "arn:aws:sns:us-east-1:1:Topic"},
+        ), [parse_policy_document(json.dumps(doc))]).decision
+
+    def test_resource_case_decides_the_outcome(self):
+        assert self._decide("arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser") == "Allow"
+        assert self._decide("arn:aws:rds-db:us-east-1:1:dbuser:db-X/appuser") == "ImplicitDeny"
+
+    def test_not_resource_case_decides_the_outcome(self):
+        doc = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "rds-db:connect",
+            "NotResource": "arn:aws:rds-db:us-east-1:1:dbuser:db-X/appuser"}]}
+        assert evaluate(EvalContext(
+            principal_arn="arn:aws:iam::1:user/u", principal_type="user",
+            principal_account="1", action="rds-db:connect",
+            resource_arn="arn:aws:rds-db:us-east-1:1:dbuser:db-X/AppUser",
+            region="us-east-1",
+        ), [parse_policy_document(json.dumps(doc))]).decision == "Allow"
+
+    @pytest.mark.parametrize("pattern,expected", (("Prod*", "Allow"), ("prod*", "ImplicitDeny")))
+    def test_string_like_is_case_sensitive(self, pattern, expected):
+        """"Case-sensitive matching" (reference_policies_elements_condition_operators)."""
+        assert self._decide(
+            "*", condition={"StringLike": {"tag": pattern}}) == expected
+
+    @pytest.mark.parametrize("value,expected", (
+        ("arn:aws:sns:us-east-1:1:Topic", "Allow"),
+        ("arn:aws:sns:us-east-1:1:topic", "ImplicitDeny"),
+    ))
+    def test_arn_like_is_case_sensitive(self, value, expected):
+        """"Case-sensitive matching of the ARN" (same page)."""
+        assert self._decide("*", condition={"ArnLike": {"arn": value}}) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +527,8 @@ class TestResourceAccountCondition:
         ("arn:aws:sqs:us-east-1:222222222222:q", "222222222222"),
         ("not-an-arn", None),
         ("arn:aws:sqs", None),                            # too short
+        ("arn:aws:sqs:us-east-1:12345:q", None),          # not twelve digits
+        ("a:b:c:d:123456789012:e", None),                 # twelve digits, not an ARN
     ])
     def test_account_from_arn(self, arn, expected):
         from ministack.core.iam_evaluator import _account_from_arn
@@ -700,6 +771,67 @@ class TestEnforce:
             iam_svc._users.pop("enforce-user", None)
             iam_svc._user_inline_policies.pop("enforce-user", None)
 
+    def test_secretsmanager_suffix_grant_matches_the_stored_arn(self):
+        """The grant shape the CDK writes for a secret looked up by name.
+
+        Measured on AWS: a policy on "secret:<name>-??????" allows a request
+        against "secret:<name>-0ac6da". The resolved resource therefore has to
+        carry the stored suffix, or a correctly scoped policy denies.
+        """
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import iam as iam_svc
+        from ministack.services import secretsmanager as sm
+
+        fake_key = "AKIATESTSECRET0001"
+        stored = sm.create_secret_in_process("enforce-suffix-secret", "v")
+        prefix = stored.rsplit("-", 1)[0]
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "secret-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["secret-user"] = {
+            "UserName": "secret-user",
+            "Arn": "arn:aws:iam::000000000000:user/secret-user",
+            "UserId": "AIDA789", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["secret-user"] = {
+            "p": json.dumps({"Statement": [{
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": f"{prefix}-??????",
+            }]})
+        }
+
+        def decide(secret_id):
+            resource = extract_resource_arn(
+                "secretsmanager", "POST", "/", {},
+                json.dumps({"SecretId": secret_id}).encode(), {},
+                "us-east-1", get_account_id(),
+            )
+            return enforce(
+                fake_key, "secretsmanager:GetSecretValue", "secretsmanager",
+                "us-east-1", resource_arn=resource,
+            )
+
+        try:
+            assert decide("enforce-suffix-secret") is None
+            # The same grant on a different secret still denies.
+            assert decide("some-other-secret").decision == "ImplicitDeny"
+            # An explicit Deny on the stored ARN now matches as well.
+            iam_svc._user_inline_policies["secret-user"]["d"] = json.dumps({"Statement": [{
+                "Effect": "Deny",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": f"{prefix}-*",
+            }]})
+            assert decide("enforce-suffix-secret").decision == "Deny"
+        finally:
+            sm._secrets.pop("enforce-suffix-secret", None)
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("secret-user", None)
+            iam_svc._user_inline_policies.pop("secret-user", None)
+
     def test_explicit_deny_in_policy_blocks(self):
         from ministack.services import iam as iam_svc
         fake_key = "AKIATESTDENY000001"
@@ -891,6 +1023,107 @@ class TestSeededAwsManagedPolicies:
 # Resource ARN construction
 # ---------------------------------------------------------------------------
 
+_FORM = {"content-type": "application/x-www-form-urlencoded"}
+
+
+def _sigv4_headers(credential_scope: str, host: str) -> dict:
+    """Headers shaped like a signed request, which is how the router decides
+    the service: the credential scope wins over the host and the path."""
+    return {
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/eu-central-1/{credential_scope}"
+            "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+        ),
+        "host": host,
+    }
+
+
+def _capture_enforced_arn(monkeypatch) -> dict:
+    """Record the action and resource ARN the data-plane check was handed.
+
+    Always allows, so the call carries on into dispatch.
+    """
+    import ministack.app as app
+
+    seen: dict[str, str] = {}
+
+    def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
+                 service_context=None):
+        seen["action"] = iam_action
+        seen["arn"] = resource_arn
+        seen["context"] = service_context
+        return None
+
+    monkeypatch.setattr(app, "_enforce_data_plane", _capture)
+    monkeypatch.setattr(app, "extract_region", lambda h, q=None: "eu-central-1")
+    return seen
+
+
+class _NoApiModule:
+    """Stands in for the apigateway modules so dispatch stops at the 404."""
+
+    @staticmethod
+    def find_api_scope(api_id):
+        return None
+
+    @staticmethod
+    async def handle_connections_api(method, api_id, stage, connection_id, body, headers):
+        return 200, {}, b""
+
+
+_NOTIFY_ARN = "arn:aws:lambda:eu-central-1:000000000000:function:notify"
+
+
+def _grant_invoke_url_statements():
+    """The two statements ``grantInvokeUrl`` writes, as aws-cdk-lib 2.260.0 does."""
+    return parse_policy_document({"Statement": [
+        {
+            "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl",
+            "Resource": _NOTIFY_ARN,
+            "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}},
+        },
+        {
+            "Effect": "Allow", "Action": "lambda:InvokeFunction",
+            "Resource": _NOTIFY_ARN,
+            "Condition": {"Bool": {"lambda:InvokedViaFunctionUrl": "true"}},
+        },
+    ]})
+
+
+def _function_url_eval_context(service_context: dict) -> EvalContext:
+    """A Function URL invoke as the evaluator sees it, keys lowered the way
+    ``enforce`` lowers what a handler passes."""
+    return EvalContext(
+        principal_arn="arn:aws:sts::000000000000:assumed-role/caller/session",
+        principal_type="AssumedRole", principal_account="000000000000",
+        action="lambda:InvokeFunctionUrl", resource_arn=_NOTIFY_ARN,
+        region="eu-central-1",
+        service_context={k.lower(): v for k, v in service_context.items()},
+    )
+
+
+def _function_url_module(resolved):
+    """Stands in for lambda_svc with one Function URL resolution. ``handled``
+    records what the handler was passed."""
+
+    class _Module:
+        handled: dict = {}
+
+        @staticmethod
+        def resolve_function_url(url_id):
+            return resolved
+
+        @staticmethod
+        async def handle_function_url_request(*args, **kwargs):
+            _Module.handled.update(kwargs)
+            return 200, {}, b""
+
+    return _Module
+
+
+_FUNCTION_URL_HOST = "3f2a1c4d-0b6e-4a58-9c71-8d5e2f0a1b93.lambda-url.eu-central-1.on.aws"
+
+
 class TestResourceArn:
     def test_s3_bucket(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1028,6 +1261,112 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         body = json.dumps({"SecretId": "my-secret"}).encode()
         assert extract_resource_arn("secretsmanager", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:secretsmanager:us-east-1:123:secret:my-secret"
+
+    @pytest.mark.parametrize("form", ["name", "arn", "partial_arn"])
+    def test_secretsmanager_resolves_the_stored_arn(self, form):
+        # AWS evaluates against the stored ARN with its six random characters.
+        # A request may name the secret by name, full ARN or ARN without them.
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import secretsmanager as sm
+
+        stored = sm.create_secret_in_process("suffix-secret", "v")
+        try:
+            secret_id = {
+                "name": "suffix-secret",
+                "arn": stored,
+                "partial_arn": stored.rsplit("-", 1)[0],
+            }[form]
+            body = json.dumps({"SecretId": secret_id}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, body, {}, "us-east-1", get_account_id()
+            ) == stored
+        finally:
+            sm._secrets.pop("suffix-secret", None)
+
+    def test_secretsmanager_resolves_the_stored_arn_when_routed_through_detect_service(self):
+        """A signed GetSecretValue reaches this branch through detect_service."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.core.router import detect_service
+        from ministack.services import secretsmanager as sm
+
+        stored = sm.create_secret_in_process("router-secret", "v")
+        try:
+            headers = {
+                **_sigv4_headers("secretsmanager", "secretsmanager.us-east-1.amazonaws.com"),
+                "x-amz-target": "secretsmanager.GetSecretValue",
+                "content-type": "application/x-amz-json-1.1",
+            }
+            body = json.dumps({"SecretId": "router-secret"}).encode()
+            service = detect_service("POST", "/", headers, {})
+            assert service == "secretsmanager"
+            assert extract_resource_arn(
+                service, "POST", "/", headers, body, {}, "us-east-1", get_account_id()
+            ) == stored
+        finally:
+            sm._secrets.pop("router-secret", None)
+
+    @pytest.mark.parametrize("owner_region,owner_account", [
+        ("eu-central-1", None),
+        ("us-east-1", "111122223333"),
+    ])
+    def test_secretsmanager_secret_in_another_scope_is_not_resolved(self, owner_region, owner_account):
+        """The lookup is scoped to the request's account and region, like the
+        handlers'. A name held only in another region or account keeps the
+        name-derived ARN, and that secret's full ARN passes through unchanged."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import (
+            _request_account_id,
+            get_account_id,
+            get_region,
+            set_request_region,
+        )
+        from ministack.services import secretsmanager as sm
+
+        account_id = get_account_id()
+        owner = owner_account or account_id
+        prev_region = get_region()
+        token = _request_account_id.set(owner)
+        set_request_region(owner_region)
+        try:
+            stored = sm.create_secret_in_process("scoped-secret", "v")
+        finally:
+            _request_account_id.reset(token)
+            set_request_region("us-east-1")
+        try:
+            name_arn = f"arn:aws:secretsmanager:us-east-1:{account_id}:secret:scoped-secret"
+            for secret_id, expected in (("scoped-secret", name_arn), (stored, stored)):
+                body = json.dumps({"SecretId": secret_id}).encode()
+                assert extract_resource_arn(
+                    "secretsmanager", "POST", "/", {}, body, {}, "us-east-1", account_id
+                ) == expected
+        finally:
+            set_request_region(prev_region)
+            sm._secrets.pop_scoped(owner, owner_region, "scoped-secret", None)
+
+    def test_createsecret_on_an_existing_name_resolves_the_stored_arn(self):
+        """CreateSecret on a name the store already holds resolves the stored
+        ARN; a new name keeps the name-derived ARN. Which ARN AWS evaluates
+        here is unmeasured."""
+        from ministack.core.iam_actions import extract_resource_arn
+        from ministack.core.responses import get_account_id
+        from ministack.services import secretsmanager as sm
+
+        account_id = get_account_id()
+        stored = sm.create_secret_in_process("existing-createsecret-name", "v")
+        try:
+            existing_body = json.dumps({"Name": "existing-createsecret-name"}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, existing_body, {}, "us-east-1", account_id
+            ) == stored
+
+            new_body = json.dumps({"Name": "brand-new-createsecret-name"}).encode()
+            assert extract_resource_arn(
+                "secretsmanager", "POST", "/", {}, new_body, {}, "us-east-1", account_id
+            ) == f"arn:aws:secretsmanager:us-east-1:{account_id}:secret:brand-new-createsecret-name"
+        finally:
+            sm._secrets.pop("existing-createsecret-name", None)
 
     def test_iam_role(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1202,6 +1541,439 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/rules/my-rule", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:rule/my-rule"
 
+    def test_iot_job(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "PUT", "/jobs/rollout-2024", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:job/rollout-2024"
+
+    def test_iot_provisioning_template(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
+
+    def test_iot_publish_topic_keeps_every_level(self):
+        """A topic ARN carries the whole topic, not its first segment:
+        arn:aws:iot:...:topic/sensors/rack-1/temperature. Truncating it to
+        topic/sensors would authorize a publish against the wrong resource."""
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot", "POST", "/topics/sensors/rack-1/temperature", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:topic/sensors/rack-1/temperature"
+
+    def test_iot_shadow_resolves_to_its_thing(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot", "GET", "/things/my-thing/shadow", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:thing/my-thing"
+
+    def test_iot_collection_call_has_no_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "GET", "/jobs", {}, b"", {}, "us-east-1", "123") == "*"
+
+    def test_iot_job_policy_from_the_cdk_actually_allows_the_call(self):
+        """The two halves together, which is where this showed up. The CDK's
+        AwsCustomResource emits exactly this policy for an IoT job, and every
+        such stack failed to deploy under AUTH because the request carried no
+        job ARN to match it against: only Resource "*" got through."""
+        from ministack.core.iam_actions import extract_resource_arn
+
+        arn = extract_resource_arn(
+            "iot", "PUT", "/jobs/hawkbit_rollout-2024", {}, b"", {}, "eu-central-1", "000000000000"
+        )
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow",
+            "Action": "iot:CreateJob",
+            "Resource": [
+                "arn:aws:iot:eu-central-1:000000000000:job/hawkbit_rollout-2024",
+                "arn:aws:iot:eu-central-1:000000000000:thinggroup/hawkbit_rollout",
+            ],
+        }]})
+        ctx = EvalContext(
+            principal_arn="arn:aws:sts::000000000000:assumed-role/deployer/session",
+            principal_type="AssumedRole",
+            principal_account="000000000000",
+            action="iot:CreateJob", resource_arn=arn, region="eu-central-1",
+        )
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+    def test_iot_retained_message_is_its_topic(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot-data", "GET", "/retainedMessage/sensors/rack-1", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:topic/sensors/rack-1"
+
+    # --- The data planes route by credential scope, not as "iot" ---
+    def test_publish_resolves_through_the_router(self):
+        """The branch above is reached only if the router agrees. A boto3
+        iot-data client signs with the iotdata scope, so detect_service answers
+        "iot-data" and not "iot": a branch keyed on "iot" alone is dead code
+        that a test calling extract_resource_arn("iot", ...) cannot see."""
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        from ministack.core.router import detect_service
+
+        path = "/topics/sensors/rack-1/temperature"
+        headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
+        service = detect_service("POST", path, headers, {})
+        assert service == "iot-data"
+        assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+        assert extract_resource_arn(
+            service, "POST", path, headers, b"", {}, "eu-central-1", "123"
+        ) == "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
+
+    def test_publish_resolves_the_same_topic_however_the_sdk_sent_it(self):
+        """Publish's URI label is non-greedy, so botocore percent-encodes the
+        separators and the ASGI server hands them back decoded. Both spellings
+        have to name one resource, or the grant matches on one path only."""
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        from ministack.core.router import detect_service
+
+        headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
+        expected = "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
+        for path in ("/topics/sensors/rack-1/temperature",
+                     "/topics/sensors%2Frack-1%2Ftemperature"):
+            service = detect_service("POST", path, headers, {})
+            assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+            assert extract_resource_arn(
+                service, "POST", path, headers, b"", {}, "eu-central-1", "123"
+            ) == expected
+
+    def test_create_job_resolves_through_the_router(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        from ministack.core.router import detect_service
+
+        headers = _sigv4_headers("iot", "iot.eu-central-1.amazonaws.com")
+        service = detect_service("PUT", "/jobs/rollout-2024", headers, {})
+        assert service == "iot"
+        assert extract_iam_action(service, "PUT", "/jobs/rollout-2024", headers, b"", {}) == "iot:CreateJob"
+        assert extract_resource_arn(
+            service, "PUT", "/jobs/rollout-2024", headers, b"", {}, "eu-central-1", "123"
+        ) == "arn:aws:iot:eu-central-1:123:job/rollout-2024"
+
+    def test_job_execution_on_the_jobs_data_plane_is_its_thing(self):
+        """AWS scopes the jobs data plane on the thing, not the job."""
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot-jobs-data", "GET", "/things/dev-01/jobs/j1", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:thing/dev-01"
+
+    # --- Query-protocol services put their parameters in the body ---
+    def test_ec2_reads_a_form_encoded_body(self):
+        """botocore POSTs EC2 as application/x-www-form-urlencoded, so nothing
+        reaches the query string and the branch below resolved nothing. The
+        router merges that body in, which is why this goes through it."""
+        from ministack.app import _routing_params
+        from ministack.core.iam_actions import extract_resource_arn
+
+        body = b"Action=AuthorizeSecurityGroupIngress&GroupId=sg-0abc&Version=2016-11-15"
+        params = _routing_params("POST", "/", _FORM, body, {})
+        assert extract_resource_arn(
+            "ec2", "POST", "/", _FORM, body, params, "eu-central-1", "123"
+        ) == "arn:aws:ec2:eu-central-1:123:security-group/sg-0abc"
+
+    def test_cloudformation_reads_a_form_encoded_body(self):
+        from ministack.app import _routing_params
+        from ministack.core.iam_actions import extract_resource_arn
+
+        body = b"Action=DescribeStacks&StackName=my-stack"
+        params = _routing_params("POST", "/", _FORM, body, {})
+        assert extract_resource_arn(
+            "cloudformation", "POST", "/", _FORM, body, params, "us-east-1", "123",
+        ) == "arn:aws:cloudformation:us-east-1:123:stack/my-stack/*"
+
+    def test_query_params_win_over_the_body(self):
+        from ministack.app import _routing_params
+        from ministack.core.iam_actions import extract_resource_arn
+
+        body = b"GroupId=sg-body"
+        params = _routing_params("POST", "/", _FORM, body, {"GroupId": ["sg-query"]})
+        assert extract_resource_arn(
+            "ec2", "POST", "/", _FORM, body, params, "us-east-1", "123",
+        ) == "arn:aws:ec2:us-east-1:123:security-group/sg-query"
+
+    def test_body_is_read_even_when_the_action_was_lifted_out_of_it(self):
+        """The router already lifted Action out of this same body, so a merge
+        that fired only on an empty dict would be a no-op on exactly the
+        requests it exists for."""
+        from ministack.app import _routing_params
+        from ministack.core.iam_actions import extract_resource_arn
+
+        body = b"Action=AuthorizeSecurityGroupIngress&GroupId=sg-0abc&Version=2016-11-15"
+        params = _routing_params(
+            "POST", "/", _FORM, body, {"Action": ["AuthorizeSecurityGroupIngress"]}
+        )
+        assert params["GroupId"] == ["sg-0abc"]
+        assert extract_resource_arn(
+            "ec2", "POST", "/", _FORM, body, params, "eu-central-1", "123",
+        ) == "arn:aws:ec2:eu-central-1:123:security-group/sg-0abc"
+
+    @pytest.mark.parametrize("content_type, body", [
+        ("application/x-amz-json-1.1", b'{"TableName":"users"}'),
+        ("application/xml", b"<Response>a=b</Response>"),
+        ("application/x-www-form-urlencoded", b""),
+        ("", b"Action=DescribeStacks&StackName=my-stack"),
+    ])
+    def test_only_a_form_encoded_body_is_merged(self, content_type, body):
+        """A body of any other content type is left alone, which is what keeps
+        this off the S3 upload path: extract_resource_arn runs on every
+        authenticated request, and a PutObject body can be very large."""
+        from ministack.app import _routing_params
+        assert _routing_params("POST", "/", {"content-type": content_type}, body, {}) == {}
+
+    def test_a_json_body_still_resolves_its_own_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, b'{"TableName":"users"}', {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/users"
+
+    # --- No false allows ---
+    def test_a_scoped_grant_denies_the_resource_it_does_not_name(self):
+        """The other half of the fix: the request now resolves to its own ARN,
+        so a grant naming a different one has to stop matching."""
+        from ministack.core.iam_actions import extract_resource_arn
+
+        arn = extract_resource_arn(
+            "iot", "PUT", "/jobs/rollout-2025", {}, b"", {}, "eu-central-1", "000000000000"
+        )
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "iot:CreateJob",
+            "Resource": "arn:aws:iot:eu-central-1:000000000000:job/rollout-2024",
+        }]})
+        ctx = EvalContext(
+            principal_arn="arn:aws:sts::000000000000:assumed-role/deployer/session",
+            principal_type="AssumedRole", principal_account="000000000000",
+            action="iot:CreateJob", resource_arn=arn, region="eu-central-1",
+        )
+        assert evaluate(ctx, [stmts]).decision == "ImplicitDeny"
+
+    def test_a_wildcard_grant_still_matches_a_resolved_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+
+        arn = extract_resource_arn(
+            "iot", "PUT", "/jobs/rollout-2024", {}, b"", {}, "eu-central-1", "000000000000"
+        )
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "iot:CreateJob", "Resource": "*",
+        }]})
+        ctx = EvalContext(
+            principal_arn="arn:aws:sts::000000000000:assumed-role/deployer/session",
+            principal_type="AssumedRole", principal_account="000000000000",
+            action="iot:CreateJob", resource_arn=arn, region="eu-central-1",
+        )
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+    # --- execute-api ---
+    def test_execute_api_invoke_is_authorized_against_its_own_arn(self, monkeypatch):
+        """Every invoke used to be authorized against "*", so a grant scoped to
+        one API and stage — what the CDK's grantExecute and every hand-written
+        service-to-service policy produce — never matched."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        app._enforce_execute_api("d9506af4", "dev", "POST", "/commands/delete", {}, {})
+        assert seen["arn"] == (
+            "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/dev/POST/commands/delete"
+        )
+
+    def test_execute_api_default_stage_is_not_taken_from_the_path(self, monkeypatch):
+        """Why the call sits after the stage is resolved. A v2 API on $default
+        serves from the root, so the first path segment is a path segment, and
+        authorizing on it would name a resource that does not exist."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        monkeypatch.setattr(app, "_parse_execute_api_url",
+                            lambda host, path: ("d9506af4", "commands", "/delete"))
+        monkeypatch.setattr(app, "_resolve_stage_and_path",
+                            lambda api_id, tentative, path: ("$default", f"/{tentative}{path}"))
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+
+        asyncio.run(app._handle_execute_api_request(
+            "d9506af4.execute-api.eu-central-1.amazonaws.com",
+            "/commands/delete", "POST", {}, b"", {},
+        ))
+        assert seen["arn"] == (
+            "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/$default/POST/commands/delete"
+        )
+
+    # --- The WebSocket @connections API is its own action ---
+    @pytest.mark.parametrize("via_mapping", [False, True])
+    def test_connections_api_asks_for_manage_connections(self, monkeypatch, via_mapping):
+        """AWS authorizes @connections under execute-api:ManageConnections. It
+        asked for execute-api:Invoke, so a grantManageConnections policy, which
+        names only that action, could not match. Also through a base-path
+        mapping that names the stage."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        target = ("d9506af4", "dev", "/@connections/cid-1")
+        if via_mapping:
+            monkeypatch.setattr(app, "_parse_execute_api_url", lambda host, path: None)
+            monkeypatch.setattr(app, "_resolve_custom_domain_request", lambda host, path: target)
+        else:
+            monkeypatch.setattr(app, "_parse_execute_api_url", lambda host, path: target)
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+
+        asyncio.run(app._handle_execute_api_request(
+            "d9506af4.execute-api.eu-central-1.amazonaws.com",
+            "/dev/@connections/cid-1", "POST", {}, b"", {},
+        ))
+        assert seen["action"] == "execute-api:ManageConnections"
+        assert seen["arn"] == (
+            "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/dev/POST/@connections/cid-1"
+        )
+
+    @pytest.mark.parametrize("granted,status", [
+        ("execute-api:ManageConnections", 200),
+        ("execute-api:Invoke", 403),
+    ])
+    def test_a_manage_connections_grant_is_enforced_end_to_end(self, monkeypatch, granted, status):
+        """The grant grantManageConnections writes, through the real
+        _enforce_data_plane and enforce: it allows @connections, and an Invoke
+        grant on the same resource does not."""
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+
+        fake_key = "AKIATESTMANAGECONN1"
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "conn-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["conn-user"] = {
+            "UserName": "conn-user",
+            "Arn": "arn:aws:iam::000000000000:user/conn-user",
+            "UserId": "AIDACONN1", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["conn-user"] = {"p": json.dumps({"Statement": [{
+            "Effect": "Allow", "Action": granted,
+            "Resource": "arn:aws:execute-api:eu-central-1:000000000000:d9506af4/*/*/@connections/*",
+        }]})}
+        monkeypatch.setattr(app, "AUTH", True)
+        monkeypatch.setattr(app, "_parse_execute_api_url",
+                            lambda host, path: ("d9506af4", "dev", "/@connections/cid-1"))
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+        headers = {"authorization": (
+            f"AWS4-HMAC-SHA256 Credential={fake_key}/20260101/eu-central-1/execute-api"
+            "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+        )}
+        try:
+            response = asyncio.run(app._handle_execute_api_request(
+                "d9506af4.execute-api.eu-central-1.amazonaws.com",
+                "/dev/@connections/cid-1", "POST", headers, b"", {},
+            ))
+        finally:
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("conn-user", None)
+            iam_svc._user_inline_policies.pop("conn-user", None)
+        assert response[0] == status
+
+    def test_a_plain_invoke_still_asks_for_invoke(self, monkeypatch):
+        """Nothing but @connections moves off execute-api:Invoke. Through the
+        handler, because that is where the branch is."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        monkeypatch.setattr(app, "_parse_execute_api_url",
+                            lambda host, path: ("d9506af4", "dev", "/commands/delete"))
+        monkeypatch.setattr(app, "_resolve_stage_and_path",
+                            lambda api_id, tentative, path: (tentative, path))
+        monkeypatch.setattr(app, "_get_module", lambda name: _NoApiModule)
+
+        asyncio.run(app._handle_execute_api_request(
+            "d9506af4.execute-api.eu-central-1.amazonaws.com",
+            "/dev/commands/delete", "POST", {}, b"", {},
+        ))
+        assert seen["action"] == "execute-api:Invoke"
+
+    # --- Lambda Function URLs ---
+    @pytest.mark.parametrize("resolved,arn,context", [
+        (("000000000000", "eu-central-1", "notify", None, {"AuthType": "AWS_IAM"}),
+         _NOTIFY_ARN, {"lambda:FunctionUrlAuthType": "AWS_IAM"}),
+        (("000000000000", "eu-central-1", "notify", "prod", {"AuthType": "NONE"}),
+         f"{_NOTIFY_ARN}:prod", {"lambda:FunctionUrlAuthType": "NONE"}),
+        (None, "*", {}),
+    ], ids=["function", "alias", "unknown"])
+    def test_function_url_is_authorized_against_its_function(self, monkeypatch, resolved, arn, context):
+        """lambda:InvokeFunctionUrl ran against "*", so a grant naming the
+        function, which is what grantInvokeUrl writes, never matched. A URL on
+        an alias carries the qualifier. The URL's AuthType is supplied as
+        lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl is not. An
+        id that resolves to nothing keeps "*" and no keys, so the lookup,
+        which runs before the caller is authorized, reports nothing about which
+        URLs exist. The handler reuses the resolution."""
+        import ministack.app as app
+
+        seen = _capture_enforced_arn(monkeypatch)
+        module = _function_url_module(resolved)
+        monkeypatch.setattr(app, "_get_module", lambda name: module)
+
+        asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert seen["action"] == "lambda:InvokeFunctionUrl"
+        assert seen["arn"] == arn
+        assert seen["context"] == context
+        assert module.handled["resolved"] == resolved
+
+    def test_the_resolved_resource_and_key_reach_the_evaluator(self, monkeypatch):
+        """The tests above stub _enforce_data_plane, so they pin what the handler
+        resolved. _enforce_data_plane has to hand both on to enforce. With AUTH
+        off nothing reaches enforce and the URL is still served."""
+        import ministack.app as app
+        from ministack.core import iam_evaluator
+
+        seen: dict = {}
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
+            seen.update(action=iam_action, arn=resource_arn, context=service_context)
+            return None
+
+        monkeypatch.setattr(app, "AUTH", True)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        monkeypatch.setattr(app, "_get_module", lambda name: _function_url_module(
+            ("000000000000", "eu-central-1", "notify", None, {"AuthType": "NONE"})))
+
+        asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert seen == {"action": "lambda:InvokeFunctionUrl", "arn": _NOTIFY_ARN,
+                        "context": {"lambda:FunctionUrlAuthType": "NONE"}}
+
+        seen.clear()
+        monkeypatch.setattr(app, "AUTH", False)
+        response = asyncio.run(app._handle_lambda_url_request(_FUNCTION_URL_HOST, "/", "GET", {}, b"", {}))
+        assert response[0] == 200
+        assert seen == {}
+
+    def test_the_function_url_handler_does_not_resolve_a_passed_resolution_again(self, monkeypatch):
+        from ministack.services import lambda_svc
+
+        def fail(url_id):
+            raise AssertionError("resolve_function_url must not run when resolved= is passed")
+
+        monkeypatch.setattr(lambda_svc, "resolve_function_url", fail)
+        status, _, body = asyncio.run(lambda_svc.handle_function_url_request(
+            "url-id", "GET", "/", {}, b"", {},
+            resolved=("000000000000", "eu-central-1", "no-such-fn", None, {"AuthType": "NONE"}),
+        ))
+        assert status == 404
+        assert b"no-such-fn" in body
+
+    def test_a_grant_invoke_url_policy_matches_an_aws_iam_url(self):
+        """End of the chain: the resource and the condition key together are
+        what make the policy the CDK writes match."""
+        ctx = _function_url_eval_context({"lambda:FunctionUrlAuthType": "AWS_IAM"})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "Allow"
+
+    def test_a_grant_invoke_url_policy_does_not_match_a_none_url(self):
+        """The negative case. A URL whose AuthType is NONE supplies NONE, the
+        StringEquals fails, and the statement does not match, which is what AWS
+        answers for the same pair."""
+        ctx = _function_url_eval_context({"lambda:FunctionUrlAuthType": "NONE"})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "ImplicitDeny"
+
+    def test_the_same_policy_without_the_key_still_does_not_match(self):
+        """What the behaviour was before, and what it still is for a key this
+        does not supply: an unresolved key makes the condition false. The
+        evaluator's fallback is unchanged; only the key became resolvable."""
+        ctx = _function_url_eval_context({})
+        assert evaluate(ctx, [_grant_invoke_url_statements()]).decision == "ImplicitDeny"
+
     # --- API Gateway ---
     def test_apigateway_v2(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1285,6 +2057,74 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("unknown_svc", "GET", "/", {}, b"", {}) is None
 
+    def test_the_jobs_data_plane_is_the_iotjobsdata_namespace(self):
+        """The four job-execution operations are iotjobsdata: actions on AWS.
+        They were mapped to iot:, which a grant of the documented action cannot
+        match. StartCommandExecution is the fifth operation the same botocore
+        model declares, and AWS keeps that one on iot:."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        def act(method, path):
+            return extract_iam_action("iot-jobs-data", method, path, {}, b"", {})
+
+        assert act("GET", "/things/dev-01/jobs") == "iotjobsdata:GetPendingJobExecutions"
+        assert act("PUT", "/things/dev-01/jobs/$next") == "iotjobsdata:StartNextPendingJobExecution"
+        assert act("GET", "/things/dev-01/jobs/j1") == "iotjobsdata:DescribeJobExecution"
+        assert act("POST", "/things/dev-01/jobs/j1/") == "iotjobsdata:UpdateJobExecution"
+        assert act("POST", "/command-executions") == "iot:StartCommandExecution"
+
+    def test_the_jobs_data_plane_resolves_through_the_router(self):
+        """The branch above is reached only if the router agrees. The AWS IoT
+        Jobs SDK signs with credential scope iot-jobs-data and hits the
+        data.jobs.iot... host family; a test calling extract_iam_action with
+        the literal string "iot-jobs-data" cannot see whether the router
+        actually routes a real signed request there, the way
+        test_publish_resolves_through_the_router does for the message plane."""
+        from ministack.core.iam_actions import extract_iam_action
+        from ministack.core.router import detect_service
+
+        headers = _sigv4_headers("iot-jobs-data", "data.jobs.iot.eu-central-1.localhost")
+
+        path = "/things/dev-01/jobs"
+        service = detect_service("GET", path, headers, {})
+        assert service == "iot-jobs-data"
+        assert extract_iam_action(service, "GET", path, headers, b"", {}) == "iotjobsdata:GetPendingJobExecutions"
+
+        service = detect_service("POST", "/command-executions", headers, {})
+        assert service == "iot-jobs-data"
+        assert extract_iam_action(
+            service, "POST", "/command-executions", headers, b"", {}
+        ) == "iot:StartCommandExecution"
+
+    def test_the_iot_control_plane_and_message_plane_keep_the_iot_namespace(self):
+        """Only the jobs data plane moves. iot: is still the namespace for the
+        control plane and for publish."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        assert extract_iam_action("iot", "PUT", "/jobs/rollout-2024", {}, b"", {}) == "iot:CreateJob"
+        assert extract_iam_action("iot-data", "POST", "/topics/a/b/c", {}, b"", {}) == "iot:Publish"
+
+    @pytest.mark.parametrize("granted,decision", [
+        ("iot:*", "ImplicitDeny"),
+        ("iotjobsdata:UpdateJobExecution", "Allow"),
+    ])
+    def test_a_jobs_data_plane_grant_needs_the_iotjobsdata_name(self, granted, decision):
+        """A policy written for the old iot: name stops matching, as on AWS, and
+        the name the documentation tells a device policy to grant matches."""
+        from ministack.core.iam_actions import extract_iam_action
+
+        action = extract_iam_action("iot-jobs-data", "POST", "/things/dev-01/jobs/j1/", {}, b"", {})
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": granted,
+            "Resource": "arn:aws:iot:eu-central-1:000000000000:thing/dev-01",
+        }]})
+        ctx = EvalContext(
+            principal_arn="arn:aws:sts::000000000000:assumed-role/device/session",
+            principal_type="AssumedRole", principal_account="000000000000",
+            action=action, resource_arn="arn:aws:iot:eu-central-1:000000000000:thing/dev-01",
+            region="eu-central-1",
+        )
+        assert evaluate(ctx, [stmts]).decision == decision
 
 
 class TestS3ActionMapping:
@@ -1726,6 +2566,54 @@ def test_put_role_policy_rejects_malformed_document(iam):
         assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
     finally:
         iam.delete_role(RoleName="validation-test-role-2")
+
+
+def test_put_group_policy_rejects_malformed_document(iam):
+    """PutGroupPolicy validates its document like PutRolePolicy and
+    PutUserPolicy. Measured: a real account answers MalformedPolicyDocument for
+    a document that is not JSON, one without a Statement, one whose Effect is
+    neither Allow nor Deny, and one whose statement has no Resource."""
+    iam.create_group(GroupName="validation-test-group")
+    try:
+        for document in ("not json",
+                         json.dumps({"Version": "2012-10-17"}),
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]}),
+                         json.dumps({"Statement": [{"Effect": "Allow",
+                                                    "Action": "s3:GetObject"}]})):
+            with pytest.raises(ClientError) as exc:
+                iam.put_group_policy(GroupName="validation-test-group",
+                                     PolicyName="bad", PolicyDocument=document)
+            assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+        assert iam.list_group_policies(
+            GroupName="validation-test-group")["PolicyNames"] == []
+    finally:
+        iam.delete_group(GroupName="validation-test-group")
+
+
+def test_put_inline_policy_reports_the_missing_entity_before_the_document(iam):
+    """A call that is wrong in both ways at once is answered NoSuchEntity, not
+    MalformedPolicyDocument.
+
+    Measured per kind on a real account, with a document whose Effect is
+    neither Allow nor Deny on a group, a role and a user, and again, on a role
+    and a user, with one that is not JSON: the missing entity is reported
+    before the document is read."""
+    for call, kind, kwargs in (
+        (iam.put_group_policy, "group", {"GroupName": "validation-absent-group"}),
+        (iam.put_role_policy, "role", {"RoleName": "validation-absent-role"}),
+        (iam.put_user_policy, "user", {"UserName": "validation-absent-user"}),
+    ):
+        for document in ("not json",
+                         json.dumps({"Statement": [{"Effect": "Maybe",
+                                                    "Action": "s3:GetObject",
+                                                    "Resource": "*"}]})):
+            with pytest.raises(ClientError) as exc:
+                call(PolicyName="bad", PolicyDocument=document, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+            assert exc.value.response["Error"]["Message"] == \
+                f"The {kind} with name validation-absent-{kind} cannot be found."
 
 
 # ---------------------------------------------------------------------------

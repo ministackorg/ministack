@@ -73,6 +73,43 @@ def set_docker_id(token: str, docker_id: str) -> None:
             container["DockerId"] = docker_id
 
 
+def set_task_status(task_arn: str, known_status=None, desired_status=None) -> None:
+    """Task-level status for the V4 endpoint, pushed at each transition.
+
+    KnownStatus is task-level only; a container's own is pushed separately,
+    because AWS reports the two independently (a Fargate task serves
+    "KnownStatus": "NONE" for itself and "RUNNING" for the container in one
+    payload). DesiredStatus is the task's on every payload.
+    """
+    with _LOCK:
+        task = _TASKS.get(task_arn)
+        if task is None:
+            return
+        if known_status is not None:
+            task["KnownStatus"] = known_status
+        if desired_status is not None:
+            task["DesiredStatus"] = desired_status
+            for container in task.get("Containers", []):
+                container["DesiredStatus"] = desired_status
+
+
+def set_container_status(token: str, known_status: str) -> None:
+    """Push one container's own KnownStatus onto its payload."""
+    with _LOCK:
+        if container := _TOKEN_TO_CONTAINER.get(token):
+            container["KnownStatus"] = known_status
+
+
+def set_all_container_status(task_arn: str, known_status: str) -> None:
+    """One KnownStatus onto every container. Only the stop path moves them together."""
+    with _LOCK:
+        task = _TASKS.get(task_arn)
+        if task is None:
+            return
+        for container in task.get("Containers", []):
+            container["KnownStatus"] = known_status
+
+
 def reset() -> None:
     with _LOCK:
         _TASKS.clear()
@@ -100,3 +137,11 @@ async def handle_request(method, path, headers, body, query_params):
     if rest in ("/stats", "/task/stats"):
         return json_response({})
     return json_response({"message": "not found"}, status=404)
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

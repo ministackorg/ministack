@@ -6,7 +6,11 @@ bedrock-agent-runtime-2023-07-26. Streaming ops drive boto3's EventStream
 parser to validate eventstream framing + event sequence.
 """
 
+import json
+import uuid as _uuid_mod
+
 import botocore.exceptions
+import pytest
 from conftest import make_client
 
 
@@ -445,3 +449,91 @@ def test_bedrock_ar_list_tags_rejects_unknown_resource_arn():
         assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
     else:
         raise AssertionError("expected ResourceNotFoundException")
+
+
+def _ingest_with_metadata(suffix):
+    """Three documents sharing a query term: one without metadata, one with the
+    typed sidecar form, one with a plain scalar."""
+    bucket = f"kb-filter-{suffix}"
+    s3 = make_client("s3")
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="kb/a.txt", Body=b"alpha shared keyword")
+    s3.put_object(Bucket=bucket, Key="kb/b.txt", Body=b"beta shared keyword")
+    s3.put_object(Bucket=bucket, Key="kb/b.txt.metadata.json", Body=json.dumps({
+        "metadataAttributes": {
+            "file_id": {"value": {"type": "STRING", "stringValue": "file-abc123"},
+                        "includeForEmbedding": False},
+            "rank": {"value": {"type": "NUMBER", "numberValue": 7}},
+            "tags": {"value": {"type": "STRING_LIST", "stringListValue": ["x", "y"]}},
+        },
+    }).encode())
+    s3.put_object(Bucket=bucket, Key="kb/c.txt", Body=b"gamma shared keyword")
+    s3.put_object(Bucket=bucket, Key="kb/c.txt.metadata.json",
+                  Body=json.dumps({"metadataAttributes": {"file_id": "plain-form"}}).encode())
+    kb = _make_kb(f"kb-filter-{suffix}")["knowledgeBaseId"]
+    agent_api = make_client("bedrock-agent")
+    ds = agent_api.create_data_source(
+        knowledgeBaseId=kb, name="ds",
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {
+            "bucketArn": f"arn:aws:s3:::{bucket}", "inclusionPrefixes": ["kb/"]}},
+    )["dataSource"]["dataSourceId"]
+    agent_api.start_ingestion_job(knowledgeBaseId=kb, dataSourceId=ds)
+    return kb
+
+
+def _names(kb, metadata_filter=None):
+    config = {"vectorSearchConfiguration": {"numberOfResults": 10}}
+    if metadata_filter is not None:
+        config["vectorSearchConfiguration"]["filter"] = metadata_filter
+    response = _ar().retrieve(
+        knowledgeBaseId=kb, retrievalQuery={"text": "shared keyword"},
+        retrievalConfiguration=config,
+    )
+    return sorted(r["location"]["s3Location"]["uri"].rsplit("/", 1)[-1]
+                  for r in response["retrievalResults"])
+
+
+@pytest.mark.parametrize(("metadata_filter", "expected"), [
+    (None, ["a.txt", "b.txt", "c.txt"]),
+    ({"equals": {"key": "file_id", "value": "file-abc123"}}, ["b.txt"]),
+    ({"equals": {"key": "file_id", "value": "plain-form"}}, ["c.txt"]),
+    ({"notEquals": {"key": "file_id", "value": "file-abc123"}}, ["a.txt", "c.txt"]),
+    ({"startsWith": {"key": "file_id", "value": "file-"}}, ["b.txt"]),
+    ({"stringContains": {"key": "file_id", "value": "abc"}}, ["b.txt"]),
+    ({"in": {"key": "file_id", "value": ["file-abc123", "plain-form"]}},
+     ["b.txt", "c.txt"]),
+    ({"notIn": {"key": "file_id", "value": ["file-abc123"]}}, ["a.txt", "c.txt"]),
+    ({"greaterThan": {"key": "rank", "value": 5}}, ["b.txt"]),
+    ({"greaterThanOrEquals": {"key": "rank", "value": 7}}, ["b.txt"]),
+    ({"lessThan": {"key": "rank", "value": 7}}, []),
+    ({"lessThanOrEquals": {"key": "rank", "value": 7}}, ["b.txt"]),
+    ({"listContains": {"key": "tags", "value": "x"}}, ["b.txt"]),
+    ({"andAll": [{"equals": {"key": "file_id", "value": "file-abc123"}},
+                 {"greaterThan": {"key": "rank", "value": 5}}]}, ["b.txt"]),
+    ({"orAll": [{"equals": {"key": "file_id", "value": "file-abc123"}},
+                {"equals": {"key": "file_id", "value": "plain-form"}}]},
+     ["b.txt", "c.txt"]),
+    ({"equals": {"key": "missing", "value": "x"}}, []),
+])
+def test_bedrock_ar_retrieve_applies_the_metadata_filter(metadata_filter, expected):
+    """Retrieve honours retrievalConfiguration.vectorSearchConfiguration.filter
+    across the RetrievalFilter grammar: the eleven comparators plus andAll and
+    orAll. Without it a shared knowledge base leaks every tenant's documents."""
+    kb = _ingest_with_metadata(f"{_uuid_mod.uuid4().hex[:8]}")
+    assert _names(kb, metadata_filter) == expected
+
+
+def test_bedrock_ar_retrieve_returns_the_document_metadata():
+    """RetrievalResultMetadata carries the attributes the sidecar defined; a
+    document without a sidecar omits the key, since the map has min 1."""
+    kb = _ingest_with_metadata(f"{_uuid_mod.uuid4().hex[:8]}")
+    response = _ar().retrieve(
+        knowledgeBaseId=kb, retrievalQuery={"text": "shared keyword"},
+        retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 10}},
+    )
+    by_name = {r["location"]["s3Location"]["uri"].rsplit("/", 1)[-1]: r
+               for r in response["retrievalResults"]}
+    assert by_name["b.txt"]["metadata"] == {
+        "file_id": "file-abc123", "rank": 7, "tags": ["x", "y"]}
+    assert by_name["c.txt"]["metadata"] == {"file_id": "plain-form"}
+    assert "metadata" not in by_name["a.txt"]

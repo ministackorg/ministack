@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.5.11"
+version = "1.5.18"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -54,9 +54,8 @@ full = [
     "aws-sam-translator>=1.90",
 ]
 # Exactly what CI installs to run the test suite — kept separate from `dev`
-# (which also carries linters, type stubs and the DB drivers the container-backed
-# RDS tests skip without) so the workflow has one name to install instead of an
-# inline package list that drifts from this file.
+# (which also carries linters and type stubs) so the workflow has one name to
+# install instead of an inline package list that drifts from this file.
 test = [
     "boto3>=1.34",
     "pytest>=8.0",
@@ -65,6 +64,8 @@ test = [
     "docker>=7.0.0",
     "cbor2>=5.4.0",
     "cryptography>=41.0",
+    "psycopg2-binary>=2.9",
+    "pymysql>=1.1",
     "aws-sam-translator>=1.90",
     "websockets>=12.0",
 ]
@@ -103,6 +104,7 @@ python_functions = ["test_*"]
 addopts = "--dist=loadfile"
 markers = [
     "serial: tests that mutate global server state and must run alone",
+    "data_plane: tests that require live Docker-backed service behavior",
 ]
 
 [tool.ruff]
@@ -127,4 +129,3 @@ ignore = [
 [tool.coverage.run]
 source = ["ministack"]
 omit = ["tests/*"]
-

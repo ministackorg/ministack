@@ -13,9 +13,10 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
     ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
-    ``ListCACertificates``, ``DeleteCACertificate``; registering a device
-    certificate under a CA with auto-registration enabled publishes the AWS
-    JITR event to ``$aws/events/certificates/registered/{caCertificateId}``
+    ``ListCACertificates``, ``DeleteCACertificate``; an mTLS connect with an
+    unknown certificate signed by a CA with auto-registration enabled creates
+    it PENDING_ACTIVATION and publishes the AWS JITR event to
+    ``$aws/events/certificates/registered/{caCertificateId}``
   - Provisioning templates: ``CreateProvisioningTemplate``,
     ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
     ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate`` —
@@ -45,7 +46,7 @@ lookups (mTLS).
 
 State is fully isolated per account and region via
 ``AccountRegionScopedDict`` and persisted through
-``get_state``/``restore_state``. The Local CA (used to sign
+``get_state``/``_restore_state``. The Local CA (used to sign
 ``CreateKeysAndCertificate`` certificates) is also persisted so previously
 issued client certificates remain valid across restarts.
 """
@@ -69,7 +70,6 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -255,7 +255,11 @@ def get_state() -> dict:
     }
 
 
-def restore_state(data: dict | None) -> None:
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
     global _mtls_server_cert_pem, _mtls_server_key_pem
     if not data:
@@ -328,12 +332,6 @@ def reset() -> None:
         logger.debug("IoT mTLS: restart after reset failed", exc_info=True)
 
 
-try:
-    _restored = load_state("iot")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted IoT state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +605,17 @@ async def handle_request(
 # ---------------------------------------------------------------------------
 
 
+# AWS refuses the legacy endpoint types; the jobs data plane is served from
+# the iot:Data-ATS endpoint.
+_RETIRED_ENDPOINT_TYPES = {
+    "iot:Data": "iot:Data is not supported. Please use iot:Data-ATS instead.",
+    "iot:Jobs": (
+        "IoT Jobs and Commands APIs are now available through iot:Data-ATS "
+        "endpoints instead of iot:Jobs endpoints. Please use iot:Data-ATS."
+    ),
+}
+
+
 def _describe_endpoint(qp: dict) -> tuple:
     """Return a per-account endpoint hostname.
 
@@ -620,13 +629,24 @@ def _describe_endpoint(qp: dict) -> tuple:
     prefix = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
     region = get_region()
 
-    if endpoint_type in ("iot:Data-ATS", "iot:Data", None):
-        suffix = "-ats" if endpoint_type != "iot:Data" else ""
-        host = f"{prefix}{suffix}.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    if endpoint_type in _RETIRED_ENDPOINT_TYPES:
+        return error_response_json(
+            "InvalidRequestException", _RETIRED_ENDPOINT_TYPES[endpoint_type], 400
+        )
+    if endpoint_type == "iot:Data-ATS":
+        host = f"{prefix}-ats.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
     elif endpoint_type == "iot:CredentialProvider":
         host = f"{prefix}.credentials.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
     elif endpoint_type == "iot:Jobs":
-        host = f"{prefix}.jobs.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+        # Retired: AWS now serves Jobs and Commands from the Data-ATS endpoint
+        # (captured eu-north-1 2026-09-19). Signing with the `iot-jobs-data`
+        # scope against the Data-ATS host routes there already.
+        return error_response_json(
+            "InvalidRequestException",
+            "IoT Jobs and Commands APIs are now available through iot:Data-ATS "
+            "endpoints instead of iot:Jobs endpoints. Please use iot:Data-ATS.",
+            400,
+        )
     else:
         return error_response_json(
             "InvalidRequestException",
@@ -1342,6 +1362,64 @@ def _delete_provisioning_template(name: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def _certificate_record(
+    cert_id: str, cert_pem: str, status: str, ca_id: str | None = None
+) -> dict:
+    """The registry record of a device certificate, owned by the current scope."""
+    return {
+        "certificateId": cert_id,
+        "certificateArn": _cert_arn(cert_id),
+        "certificatePem": cert_pem,  # verbatim
+        "status": status,
+        "creationDate": _now_epoch(),
+        "ownedBy": get_account_id(),
+        "caCertificateId": ca_id,
+        "attachedThings": [],
+        "attachedPolicies": [],
+    }
+
+
+async def _publish_certificate_registered(
+    account_id: str,
+    region: str,
+    record: dict,
+    source_ip: str | None,
+    registration_timestamp: str | None,
+) -> None:
+    """Publish the JITR event to ``$aws/events/certificates/registered/{caId}``.
+
+    AWS sends it when a device connects with a certificate its CA
+    auto-registers: ``certificateRegistrationTimestamp`` is null on the connect
+    that created the certificate and the creation time in epoch milliseconds,
+    as a string, on every later connect while it is still PENDING_ACTIVATION.
+    """
+    ca_id = record["caCertificateId"]
+    event = {
+        "certificateId": record["certificateId"],
+        "caCertificateId": ca_id,
+        "timestamp": int(time.time() * 1000),
+        "certificateStatus": record["status"],
+        "awsAccountId": account_id,
+        "certificateRegistrationTimestamp": registration_timestamp,
+        "sourceIp": source_ip,
+    }
+    try:
+        await broker_publish(
+            account_id,
+            region,
+            f"$aws/events/certificates/registered/{ca_id}",
+            json.dumps(event).encode("utf-8"),
+            qos=0,
+        )
+    except Exception:
+        # The certificate is already registered at this point, so a broker
+        # failure must not undo it; the iot-data publish path guards the same
+        # call the same way.
+        logger.warning(
+            "JITR registered-event publish failed for CA %s", ca_id, exc_info=True
+        )
+
+
 def _create_keys_and_certificate(qp: dict) -> tuple:
     """Generate a fresh keypair and sign a leaf certificate with the Local CA."""
     set_active = qp.get("setAsActive", "false").lower() == "true"
@@ -1355,21 +1433,10 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
     except RuntimeError as e:
         return error_response_json("InternalFailureException", str(e), 503)
     cert_id = get_certificate_id(cert_pem)
-    arn = _cert_arn(cert_id)
-    record = {
-        "certificateId": cert_id,
-        "certificateArn": arn,
-        "certificatePem": cert_pem,
-        "status": "ACTIVE" if set_active else "INACTIVE",
-        "creationDate": _now_epoch(),
-        "ownedBy": get_account_id(),
-        "caCertificateId": None,
-        "attachedThings": [],
-        "attachedPolicies": [],
-    }
+    record = _certificate_record(cert_id, cert_pem, "ACTIVE" if set_active else "INACTIVE")
     _certificates[cert_id] = record
     return json_response({
-        "certificateArn": arn,
+        "certificateArn": record["certificateArn"],
         "certificateId": cert_id,
         "certificatePem": cert_pem,
         "keyPair": {
@@ -1406,11 +1473,10 @@ async def _register_certificate(
 
     ``caCertificatePem`` must name a CA registered via
     ``RegisterCACertificate`` in this account/region that really signed the
-    leaf; anything else is a ``CertificateValidationException``. When that CA's
-    ``autoRegistrationStatus`` is ``ENABLE``, the AWS JITR lifecycle event is
-    published to ``$aws/events/certificates/registered/{caCertificateId}`` so
-    just-in-time-registration Lambdas subscribed via topic rules fire exactly
-    as on AWS.
+    leaf; anything else is a ``CertificateValidationException``. Registering
+    publishes no JITR event, whatever the CA's ``autoRegistrationStatus``: AWS
+    sends that event only from a device connect (see ``_mtls_auto_register``),
+    and refuses a registration with status PENDING_ACTIVATION.
     """
     cert_pem = payload.get("certificatePem") or qp.get("certificatePem")
     if not cert_pem:
@@ -1418,6 +1484,12 @@ async def _register_certificate(
             "InvalidRequestException", "certificatePem is required", 400
         )
     status = payload.get("status")
+    if status == "PENDING_ACTIVATION":
+        return error_response_json(
+            "CertificateStateException",
+            "Not allowed to register certificate with PENDING_ACTIVATION status",
+            406,
+        )
     if without_ca:
         set_active = False
     else:
@@ -1464,55 +1536,10 @@ async def _register_certificate(
             )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
-    record = {
-        "certificateId": cert_id,
-        "certificateArn": _cert_arn(cert_id),
-        "certificatePem": cert_pem,  # verbatim
-        "status": status or ("ACTIVE" if set_active else "INACTIVE"),
-        "creationDate": _now_epoch(),
-        "ownedBy": get_account_id(),
-        "caCertificateId": ca_id,
-        "attachedThings": [],
-        "attachedPolicies": [],
-    }
+    record = _certificate_record(
+        cert_id, cert_pem, status or ("ACTIVE" if set_active else "INACTIVE"), ca_id
+    )
     _certificates[cert_id] = record
-
-    # JITR: the registered-certificate lifecycle event, fired when the
-    # referenced CA is ACTIVE and has auto-registration enabled — AWS
-    # auto-registers nothing under an INACTIVE CA. certificateStatus echoes
-    # the requested register status; real connect-triggered auto-registration
-    # carries PENDING_ACTIVATION, but here registration is always explicit —
-    # there is no mTLS first-connect path to auto-register from.
-    if (
-        ca
-        and ca.get("status") == "ACTIVE"
-        and ca.get("autoRegistrationStatus") == "ENABLE"
-    ):
-        now_ms = int(time.time() * 1000)
-        event = {
-            "certificateId": cert_id,
-            "caCertificateId": ca_id,
-            "timestamp": now_ms,
-            "certificateStatus": record["status"],
-            "awsAccountId": get_account_id(),
-            "certificateRegistrationTimestamp": str(now_ms),
-        }
-        try:
-            await broker_publish(
-                get_account_id(),
-                get_region(),
-                f"$aws/events/certificates/registered/{ca_id}",
-                json.dumps(event).encode("utf-8"),
-                qos=0,
-            )
-        except Exception:
-            # The certificate is already registered at this point, so a broker
-            # failure must not turn a successful registration into a 500 — the
-            # iot-data publish path guards the same call the same way.
-            logger.warning(
-                "JITR registered-event publish failed for CA %s", ca_id, exc_info=True
-            )
-
     return json_response({
         "certificateArn": record["certificateArn"],
         "certificateId": cert_id,
@@ -2972,9 +2999,8 @@ def _eval_select_function(
             return _MISSING
         return value.replace(old, new)
     if name == "clientid" and not args:
-        # HTTP publishes carry no MQTT client id — AWS resolves clientid() to
-        # Undefined there, so the field is omitted from the projection.
-        return client_id if client_id else _MISSING
+        # Documented as the client id "or n/a if the message wasn't sent over MQTT".
+        return client_id if client_id else "n/a"
     # principal() and traceid() land here too: this publish path carries no
     # certificate identity or trace id to report, so they warn like any other
     # function the evaluator does not implement.
@@ -3041,7 +3067,9 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message, client_id:
 # NOT can tell that apart from false. `_eval_where` then fires the rule on true
 # alone, so an Undefined predicate fails closed however it was reached.
 
-_WHERE_OPERATORS = ("<>", "!=", "==", "<=", ">=", "=", "<", ">")
+# AWS refuses `!=` ("Unexpected character '!'") and `==` ("Unexpected token,
+# 'EQ'") — captured eu-north-1 2026-09-19. Longest first so <= beats <.
+_WHERE_OPERATORS = ("<>", "<=", ">=", "=", "<", ">")
 _REGEXP_MATCHES_RE = re.compile(
     r"regexp_matches\s*\(\s*(?P<expr>.+?)\s*,\s*'(?P<regex>[^']*)'\s*\)",
     re.IGNORECASE | re.DOTALL,
@@ -3477,10 +3505,10 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message, client_id
     right = _eval_select_expr(right_expr, topic, payload, message, client_id)
     if left is _MISSING or right is _MISSING:
         return _MISSING
-    if op in ("=", "=="):
+    if op == "=":
         # Equality does not convert: on AWS a mismatched pair is simply unequal.
         return _where_values_equal(left, right)
-    if op in ("<>", "!="):
+    if op == "<>":
         return not _where_values_equal(left, right)
     lnum, rnum = _sql_as_number(left), _sql_as_number(right)
     if lnum is None or rnum is None:
@@ -3535,8 +3563,15 @@ def _validate_rule_sql(sql: str) -> str | None:
     ):
         return "FROM clause must name a topic filter in single quotes"
     pred = _rule_where_clause(sql)
-    if pred and _parse_where(pred) is None:
-        return f"Unsupported WHERE clause: {pred}"
+    if pred:
+        # A nested SELECT (the documented EXISTS-subquery form) is refused by
+        # AWS itself: "Unexpected token, 'SELECT'" (captured eu-north-1
+        # 2026-09-19). Literals are blanked first so 'select' inside a string
+        # is not mistaken for the keyword.
+        if re.search(r"\bSELECT\b", _SQL_LITERAL_RE.sub("''", pred), re.IGNORECASE):
+            return f"Unexpected token, 'SELECT' in WHERE clause: {pred}"
+        if _parse_where(pred) is None:
+            return f"Unsupported WHERE clause: {pred}"
     return None
 
 
@@ -3728,6 +3763,11 @@ def _list_topic_rules(qp: dict) -> tuple:
 # device that has to fetch that job by id could then never reach it.
 _JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
+# schedulingConfig start/end times are minute-precision and carry no timezone
+# suffix: "must follow the format YYYY-MM-DDThh:mm" (measured eu-north-1
+# 2026-09-19).
+_JOB_SCHEDULE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+
 _JOB_TARGET_SELECTIONS = {"SNAPSHOT", "CONTINUOUS"}
 
 _JOB_EXECUTION_TERMINAL = {
@@ -3760,9 +3800,9 @@ def _jobs_now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _jobs_ms_to_s(millis: int | None) -> float | None:
-    """Millisecond record stamp → epoch-seconds float for `timestamp` shapes."""
-    return None if millis is None else millis / 1000.0
+def _jobs_ms_to_s(millis: int | None) -> int | None:
+    """Millisecond record stamp → whole epoch seconds for `timestamp` shapes."""
+    return None if millis is None else millis // 1000
 
 
 def _jobs_ms_to_long_s(millis: int | None) -> int | None:
@@ -3853,6 +3893,65 @@ def _jobs_materialize_executions(job_id: str) -> None:
 def _jobs_materialize_all() -> None:
     for job_id in list(_jobs.keys()):
         _jobs_materialize_executions(job_id)
+
+
+def _jobs_timeout_minutes(execution: dict, job: dict | None) -> int | None:
+    """The in-progress timeout for one execution, in minutes, or None.
+
+    ``stepTimeoutInMinutes`` from the device's own UpdateJobExecution wins over
+    the job's ``timeoutConfig.inProgressTimeoutInMinutes``, which the reference
+    describes as applying to every execution of the job.
+    """
+    step = execution.get("stepTimeoutInMinutes")
+    if step is not None:
+        return step
+    cfg = (job or {}).get("timeoutConfig") or {}
+    minutes = cfg.get("inProgressTimeoutInMinutes")
+    return minutes if isinstance(minutes, int) else None
+
+
+def _jobs_seconds_before_timeout(execution: dict) -> int | None:
+    """Seconds an IN_PROGRESS execution has left before TIMED_OUT, or None when
+    no timeout applies. The device plane models this as a ``long``."""
+    if execution.get("status") != "IN_PROGRESS":
+        return None
+    minutes = _jobs_timeout_minutes(execution, _jobs.get(execution["jobId"]))
+    if not minutes:
+        return None
+    started = (execution.get("timeoutStartedAt")
+               or execution.get("startedAt")
+               or execution.get("lastUpdatedAt"))
+    if started is None:
+        return None
+    left = minutes * 60 - (_jobs_now_ms() - started) // 1000
+    return max(0, int(left))
+
+
+def _jobs_apply_timeout(execution: dict) -> dict:
+    """Flip an execution that has outstayed its timeout to TIMED_OUT.
+
+    Evaluated on read rather than by a timer, the way the broker's session
+    expiry is: "whenever a job execution remains in the IN_PROGRESS status for
+    longer than this interval, the job execution will fail and switch to the
+    terminal TIMED_OUT status".
+    """
+    if execution.get("status") != "IN_PROGRESS":
+        return execution
+    minutes = _jobs_timeout_minutes(execution, _jobs.get(execution["jobId"]))
+    if not minutes:
+        return execution
+    started = (execution.get("timeoutStartedAt")
+               or execution.get("startedAt")
+               or execution.get("lastUpdatedAt"))
+    if started is None:
+        return execution
+    if _jobs_now_ms() - started <= minutes * 60_000:
+        return execution
+    execution["status"] = "TIMED_OUT"
+    execution["lastUpdatedAt"] = _jobs_now_ms()
+    execution["versionNumber"] += 1
+    _jobs_maybe_complete(execution["jobId"])
+    return execution
 
 
 def _jobs_maybe_complete(job_id: str) -> None:
@@ -3974,6 +4073,33 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             + ", ".join(sorted(_JOB_TARGET_SELECTIONS)),
             400,
         )
+    sched_cfg = payload.get("schedulingConfig") or {}
+    for field in ("startTime", "endTime"):
+        value = sched_cfg.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not _JOB_SCHEDULE_TIME_RE.match(value):
+            # Exact wording measured eu-north-1 2026-09-19; note the minute
+            # precision — an ISO stamp with seconds or a Z is refused.
+            return error_response_json(
+                "InvalidRequestException",
+                f"1 validation error detected: Provided time {value} UTC must "
+                "follow the format YYYY-MM-DDThh:mm.",
+                400,
+            )
+    timeout_cfg = payload.get("timeoutConfig") or {}
+    if timeout_cfg:
+        minutes = timeout_cfg.get("inProgressTimeoutInMinutes")
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = None
+        if minutes is None or not 1 <= minutes <= 10080:
+            return error_response_json(
+                "InvalidRequestException",
+                "inProgressTimeoutInMinutes must be between 1 and 10080",
+                400,
+            )
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -3997,6 +4123,23 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             )
         target_things.update(resolved)
     document = payload.get("document")
+    if isinstance(document, str) and len(document) > 32768:
+        return error_response_json(
+            "InvalidRequestException",
+            "document exceeds the maximum length of 32768", 400,
+        )
+    source = payload.get("documentSource")
+    if isinstance(source, str) and not 1 <= len(source) <= 1350:
+        return error_response_json(
+            "InvalidRequestException",
+            "documentSource must be between 1 and 1350 characters", 400,
+        )
+    if not document and not payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "document is required if you do not specify a value for documentSource",
+            400,
+        )
     if not document and payload.get("documentSource"):
         # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
         # serves its CONTENT to devices. MiniStack does not fetch it — it
@@ -4025,6 +4168,16 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
+        # Stored so DescribeJob echoes them. timeoutConfig is acted on; nothing aborts.
+        "abortConfig": payload.get("abortConfig"),
+        "timeoutConfig": payload.get("timeoutConfig"),
+        "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
+        "namespaceId": payload.get("namespaceId"),
+        "jobTemplateArn": payload.get("jobTemplateArn"),
+        "documentParameters": payload.get("documentParameters"),
+        "schedulingConfig": payload.get("schedulingConfig"),
+        "destinationPackageVersions": payload.get("destinationPackageVersions"),
+        "tags": payload.get("tags"),
         "snapshotted": False,
     }
     _jobs_materialize_executions(job_id)
@@ -4090,6 +4243,26 @@ def _describe_job(job_id: str) -> tuple:
         job_doc["comment"] = job["comment"]
     if job.get("reasonCode") is not None:
         job_doc["reasonCode"] = job["reasonCode"]
+    if job.get("forceCanceled") is not None:
+        job_doc["forceCanceled"] = job["forceCanceled"]
+    # Members the Job shape models and CreateJob accepted. `tags` is NOT among
+    # them (tags are read through ListTagsForResource), so it is not echoed.
+    for member in (
+        "abortConfig", "jobExecutionsRetryConfig", "namespaceId", "jobTemplateArn",
+        "documentParameters", "destinationPackageVersions",
+    ):
+        if job.get(member) is not None:
+            job_doc[member] = job[member]
+    # timeoutConfig and schedulingConfig come back as {} even when unset, unlike
+    # abortConfig, which is omitted (captured eu-north-1 2026-09-19).
+    job_doc["timeoutConfig"] = job.get("timeoutConfig") or {}
+    job_doc["schedulingConfig"] = job.get("schedulingConfig") or {}
+    # isConcurrent is false in every steady state (captured eu-north-1
+    # 2026-09-19 with a QUEUED, an IN_PROGRESS and a SUCCEEDED execution). It is
+    # true only inside the rollout/cancel window the reference describes, which
+    # this emulator does not model. processingTargets is null throughout the same
+    # capture, so it stays omitted rather than echoing the target ARNs.
+    job_doc["isConcurrent"] = False
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]
@@ -4164,6 +4337,8 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
     force = _qp_bool(qp, "force")
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
+    if force:
+        job["forceCanceled"] = True
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -4251,6 +4426,7 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
             "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
             "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
             "executionNumber": execution["executionNumber"],
+            "retryAttempt": execution.get("retryAttempt", 0),
         }
         if execution.get("startedAt") is not None:
             summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
@@ -4346,6 +4522,9 @@ def jobs_pending_for_thing(thing_name: str) -> list[dict]:
     creation gets its execution here, on the read that first needs it.
     """
     _jobs_materialize_all()
+    for execution in _job_executions.values():
+        if execution["thingName"] == thing_name:
+            _jobs_apply_timeout(execution)
     pending = [
         dict(execution)
         for execution in _job_executions.values()
@@ -4396,7 +4575,9 @@ def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     """One execution (a copy), materializing the job's targets first."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing_name, job_id))
-    return None if execution is None else dict(execution)
+    if execution is None:
+        return None
+    return dict(_jobs_apply_timeout(execution))
 
 
 def jobs_job_document(job_id: str) -> str:
@@ -4424,6 +4605,7 @@ def jobs_update_execution(
     status,
     expected_version=None,
     status_details: dict | None = None,
+    step_timeout_minutes=None,
 ) -> tuple:
     """Apply a device-reported status to an execution.
 
@@ -4462,11 +4644,12 @@ def jobs_update_execution(
             409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
+        # InvalidStateTransitionException, not InvalidRequestException
+        # (measured eu-north-1 2026-09-19).
         return None, error_response_json(
-            "InvalidRequestException",
-            f"A device cannot set status {status} via UpdateJobExecution; "
-            "allowed statuses are IN_PROGRESS, SUCCEEDED, FAILED, and REJECTED",
-            400,
+            "InvalidStateTransitionException",
+            f"The status of job execution cannot be changed to be {status}",
+            409,
         )
     now = _jobs_now_ms()
     execution["status"] = status
@@ -4474,6 +4657,11 @@ def jobs_update_execution(
         execution["statusDetails"] = dict(status_details)
     if status == "IN_PROGRESS" and execution.get("startedAt") is None:
         execution["startedAt"] = now
+    if status == "IN_PROGRESS" and step_timeout_minutes is not None:
+        # The device's own step timeout, reset every time it re-reports
+        # IN_PROGRESS with a new value.
+        execution["stepTimeoutInMinutes"] = step_timeout_minutes
+        execution["timeoutStartedAt"] = now
     execution["lastUpdatedAt"] = now
     execution["versionNumber"] += 1
     _jobs_maybe_complete(job_id)
@@ -4499,6 +4687,9 @@ def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
     }
     if execution.get("startedAt") is not None:
         view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    remaining = _jobs_seconds_before_timeout(execution)
+    if remaining is not None:
+        view["approximateSecondsBeforeTimedOut"] = remaining
     if document is not None:
         view["jobDocument"] = document
     return view
@@ -4984,6 +5175,25 @@ def _validate_publish_topic(topic: str) -> bool:
     return True
 
 
+# The reserved topic space a client may publish into. AWS closes the connection
+# of an MQTT client that publishes to any other topic starting with ``$``
+# (measured for ``$aws/events/...``, ``$aws/jobs/...`` and ``$foo/...``; a
+# publish under ``$aws/rules/`` and ``$aws/things/`` is acknowledged). The HTTPS
+# Publish in iot_data.py applies the same list and answers 400.
+RESERVED_PUBLISH_PREFIXES = (
+    "$aws/rules/",
+    "$aws/things/",
+    "$aws/certificates/",
+    "$aws/provisioning-templates/",
+    "$aws/device_location/",
+    "$aws/commands/",
+)
+
+
+def _reserved_topic_publish_allowed(topic: str) -> bool:
+    return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
+
+
 # ---------------------------------------------------------------------------
 # Broker public API (consumed by iot_data.py and handle_websocket)
 # ---------------------------------------------------------------------------
@@ -5308,7 +5518,9 @@ async def _dispatch_rule_error_action(
         "topic": topic,
         # The emulator's publish path carries no CloudWatch trace id.
         "cloudwatchTraceId": "",
-        "clientId": client_id or "",
+        # "N/A", not "" — and not clientid()'s lowercase "n/a" (measured eu-north-1 2026-09-19).
+        "clientId": client_id or "N/A",
+        "sourceIp": _publish_source_ip.get(),
         "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
         "failures": failures,
     }
@@ -5323,6 +5535,40 @@ async def _dispatch_rule_error_action(
             type(exc).__name__,
             exc,
         )
+
+
+# failedResource is the resource the action targeted, a different member per type.
+_RULE_ACTION_RESOURCE_KEYS = {
+    "dynamoDBv2": ("putItem", "tableName"),
+    "sns": ("targetArn",),
+    "sqs": ("queueUrl",),
+    "republish": ("topic",),
+    "lambda": ("functionArn",),
+}
+
+
+def _rule_action_name(action_type: str) -> str:
+    """``failedAction`` for an action type: the key capitalised, plus ``Action``.
+    ``DynamoDBv2Action`` (measured eu-north-1 2026-09-19); ``S3Action`` is the reference's own example."""
+    if not action_type:
+        return ""
+    return action_type[0].upper() + action_type[1:] + "Action"
+
+
+def _rule_action_resource(action: dict, action_type: str) -> str:
+    """The resource an action names, for the errorAction document's
+    ``failedResource``. Empty when the action type does not name one."""
+    spec = action.get(action_type)
+    if not isinstance(spec, dict):
+        return ""
+    for key in _RULE_ACTION_RESOURCE_KEYS.get(action_type, ()):
+        value = spec.get(key)
+        if isinstance(value, dict):
+            spec = value
+            continue
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 async def _run_rule_actions(
@@ -5372,9 +5618,11 @@ async def _run_rule_actions(
                 type(exc).__name__,
                 exc,
             )
-            failures.append(
-                {"action": action_type, "errorMessage": f"{type(exc).__name__}: {exc}"}
-            )
+            failures.append({
+                "failedAction": _rule_action_name(action_type),
+                "failedResource": _rule_action_resource(action, action_type),
+                "errorMessage": f"{type(exc).__name__}: {exc}",
+            })
     if failures:
         await _dispatch_rule_error_action(
             account_id, region, rule, topic, payload, client_id, failures
@@ -6284,6 +6532,14 @@ _delivery_properties: contextvars.ContextVar[bytes] = contextvars.ContextVar(
     "_iot_delivery_properties", default=b""
 )
 
+# The publisher's IP, for the errorAction document's `sourceIp`. Carried the
+# same way as the two below: the publish path is several frames deep and only
+# the error document needs it.
+_publish_source_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_iot_publish_source_ip", default="127.0.0.1"
+)
+
+
 # The RETAIN flag one delivery goes out with, carried the same way and for the
 # same reason. It is resolved per subscriber rather than per message, because
 # Retain As Published makes it a property of the subscription: two subscribers
@@ -6929,6 +7185,13 @@ class _WSSession:
                 if self.protocol_version == MQTT_5:
                     await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
+            if not _reserved_topic_publish_allowed(topic):
+                # AWS closes the connection without a PUBACK (measured over
+                # MQTT 3.1.1; the MQTT 5 reason code is not measured).
+                _broker_logger.warning("IoT broker: PUBLISH to a reserved topic closes the connection: %r", topic)
+                if self.protocol_version == MQTT_5:
+                    await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
+                return False
             payload = body[off:]
             delivered = await broker_publish(
                 self.account_id,
@@ -7157,6 +7420,9 @@ async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
     """Drive an MQTT-over-WebSocket session."""
+    client = scope.get("client")
+    if client:
+        _publish_source_ip.set(client[0])
     msg = await receive()
     if msg.get("type") != "websocket.connect":
         return
@@ -7254,6 +7520,12 @@ async def handle_websocket(
 #   mean anything and what real AWS IoT does. The ambiguous case cannot be
 #   attributed at all: two registrations see byte-identical bytes, so any
 #   tie-break would award the session to whoever registered the copy.
+# * just-in-time registration, as on AWS: a certificate that is unknown, or
+#   still PENDING_ACTIVATION, and signed by a registered CA that is ACTIVE
+#   with auto-registration enabled is created PENDING_ACTIVATION in that CA's
+#   account and region, the registered event is published, and the connection
+#   is closed without a CONNACK. As on AWS this happens on the CONNECT packet;
+#   a handshake that sends no CONNECT registers nothing.
 #
 # The TLS layer adds one constraint of its own: a presented chain is verified,
 # so a certificate from a CA the listener does not trust fails the handshake
@@ -7333,7 +7605,8 @@ def _mtls_server_cert_sans() -> tuple[list[str], list[str]]:
     import ipaddress
     import socket as _socket
 
-    dns_names = ["localhost"]
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    dns_names = [f"*.iot.{region}.{_MINISTACK_HOST}", "localhost"]
     ip_addresses = ["127.0.0.1", "::1"]
     candidates = [os.environ.get("MINISTACK_HOST", "localhost"), _socket.gethostname()]
     for candidate in candidates:
@@ -7390,7 +7663,7 @@ def _mtls_ensure_server_cert() -> tuple[str, str]:
     cert_pem, key_pem, _public_pem = sign_leaf_certificate(
         ca_cert_pem,
         ca_key_pem,
-        common_name="Ministack IoT Broker",
+        common_name=dns_names[0],
         san_dns=dns_names,
         san_ips=ip_addresses,
     )
@@ -7497,6 +7770,11 @@ def _mtls_build_ssl_context() -> ssl.SSLContext:
     _mtls_refresh_trust_anchors(ctx)
     ctx.sni_callback = _mtls_on_client_hello
     return ctx
+
+
+def mtls_is_listening() -> bool:
+    """Whether the mTLS listener holds a bound socket."""
+    return _mtls_server is not None
 
 
 async def mtls_start() -> None:
@@ -7616,12 +7894,16 @@ def mtls_schedule_restart() -> None:
         _mtls_logger.debug("IoT mTLS: could not schedule a restart: %s", e)
 
 
-def _mtls_active_registrations(cert_id: str) -> list[tuple[str, str, dict]]:
-    """Every (account_id, region, record) holding this certificate ACTIVE."""
+def _mtls_active_registrations(
+    cert_id: str, status: str | None = "ACTIVE"
+) -> list[tuple[str, str, dict]]:
+    """Every (account_id, region, record) holding this certificate in ``status``
+    (any status when None)."""
     return [
         (account_id, region, record)
         for (account_id, region, key), record in list(_certificates._data.items())
-        if key == cert_id and isinstance(record, dict) and record.get("status") == "ACTIVE"
+        if key == cert_id and isinstance(record, dict)
+        and (status is None or record.get("status") == status)
     ]
 
 
@@ -7664,11 +7946,126 @@ def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
     return None
 
 
+def _mtls_auto_registering_ca(account_id: str, region: str, ca_id: str | None) -> dict | None:
+    """The CA record when it would auto-register a device certificate now."""
+    ca = _ca_certificates.get_scoped(account_id, region, ca_id) if ca_id else None
+    if (
+        isinstance(ca, dict)
+        and ca.get("status") == "ACTIVE"
+        and ca.get("autoRegistrationStatus") == "ENABLE"
+        and ca.get("certificateMode", "DEFAULT") == "DEFAULT"
+    ):
+        return ca
+    return None
+
+
+def _mtls_auto_registering_signers(cert_pem: str) -> list[tuple[str, str, str]]:
+    """Every (account_id, region, ca_id) of an auto-registering CA that signed ``cert_pem``."""
+    return [
+        (account_id, region, ca_id)
+        for (account_id, region, ca_id), ca in list(_ca_certificates._data.items())
+        if _mtls_auto_registering_ca(account_id, region, ca_id) is not None
+        and certificate_is_signed_by(cert_pem, ca.get("certificatePem") or "")
+    ]
+
+
+async def _mtls_auto_register(der: bytes, peername) -> bool:
+    """Just-in-time registration for a presented certificate that no scope
+    holds ACTIVE. True when it applied, and the caller closes without a
+    CONNACK; False leaves the refusal to ``_mtls_refuse``.
+
+    An unknown certificate is created PENDING_ACTIVATION under the one
+    auto-registering CA that signed it. A certificate already
+    PENDING_ACTIVATION under such a CA only publishes the event again. AWS
+    does both on every such connect, and nothing for an INACTIVE certificate
+    or a CA with auto-registration disabled.
+    """
+    cert_id = hashlib.sha256(der).hexdigest()
+    held = _mtls_active_registrations(cert_id, status=None)
+    if len(held) > 1:
+        return False
+    if held:
+        account_id, region, record = held[0]
+        if record.get("status") != "PENDING_ACTIVATION":
+            return False
+        if _mtls_auto_registering_ca(account_id, region, record.get("caCertificateId")) is None:
+            return False
+        registration_timestamp = str(int(record["creationDate"] * 1000))
+    else:
+        cert_pem = ssl.DER_cert_to_PEM_cert(der)
+        # One signature check per auto-registering CA, off the broker's loop:
+        # a device retrying with a refused certificate must not stall it.
+        signers = await asyncio.to_thread(_mtls_auto_registering_signers, cert_pem)
+        # The same CA registered in several scopes cannot be attributed, for
+        # the same reason an ambiguous ACTIVE certificate is refused.
+        if len(signers) != 1:
+            return False
+        account_id, region, ca_id = signers[0]
+        with request_scope(account_id, region):
+            record = _certificate_record(cert_id, cert_pem, "PENDING_ACTIVATION", ca_id)
+            _certificates[cert_id] = record
+        registration_timestamp = None
+    _mtls_logger.info(
+        "IoT mTLS: certificate %s is PENDING_ACTIVATION under CA %s in %s/%s; "
+        "published the registered event and closing",
+        cert_id,
+        record["caCertificateId"],
+        account_id,
+        region,
+    )
+    source_ip = peername[0] if isinstance(peername, tuple) and peername else None
+    await _publish_certificate_registered(
+        account_id, region, record, source_ip, registration_timestamp
+    )
+    return True
+
+
+async def _mtls_first_packet(reader: asyncio.StreamReader) -> bytes | None:
+    """The client's first complete MQTT packet, or None when the peer closes,
+    sends nothing within ``_MTLS_REFUSE_READ_TIMEOUT`` or exceeds
+    ``_MTLS_REFUSE_MAX_BYTES`` without completing one."""
+    buffer = bytearray()
+    try:
+        while len(buffer) < _MTLS_REFUSE_MAX_BYTES:
+            data = await asyncio.wait_for(
+                reader.read(_MTLS_READ_CHUNK), timeout=_MTLS_REFUSE_READ_TIMEOUT
+            )
+            if not data:
+                return None
+            buffer.extend(data)
+            if len(buffer) < 2:
+                continue
+            try:
+                remaining, header_end = _decode_remaining_length(bytes(buffer), 1)
+            except ValueError:
+                continue
+            if len(buffer) < header_end + remaining:
+                continue
+            return bytes(buffer[: header_end + remaining])
+    except (asyncio.TimeoutError, OSError, ssl.SSLError):
+        return None
+    return None
+
+
+def _connect_protocol_level(packet: bytes) -> int | None:
+    """The protocol level of a CONNECT packet; None for any other packet."""
+    if (packet[0] >> 4) & 0x0F != PKT_CONNECT:
+        return None
+    remaining, header_end = _decode_remaining_length(packet, 1)
+    body = packet[header_end : header_end + remaining]
+    try:
+        _proto_name, level_at = _read_string(body, 0)
+        return body[level_at]
+    except (ValueError, IndexError):
+        return MQTT_311
+
+
 async def _mtls_refuse(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cert_id: str
+    writer: asyncio.StreamWriter, cert_id: str, protocol_level: int | None
 ) -> None:
     """Answer an unusable client certificate with a "not authorized" CONNACK
-    (0x05, or reason code 0x87 for an MQTT 5 client), then close.
+    (0x05, or reason code 0x87 for an MQTT 5 client) when the client sent a
+    CONNECT, then close.
 
     AWS closes the socket without a CONNACK unless just-in-time registration
     applies. Diverging here is deliberate: an emulator's job is
@@ -7679,44 +8076,19 @@ async def _mtls_refuse(
     _mtls_logger.warning(
         "IoT mTLS: refusing client certificate %s (%s)", cert_id, _mtls_refusal_reason(cert_id)
     )
-    buffer = bytearray()
+    if protocol_level is None:
+        return
+    # The CONNACK has to match the client's protocol level: a v5 client
+    # handed the two-byte 3.1.1 form dies in its decoder instead of reporting
+    # the refusal, and 0x05 is not a defined v5 reason code.
+    if protocol_level == MQTT_5:
+        connack = _make_connack(return_code=RC5_NOT_AUTHORIZED, protocol_version=MQTT_5)
+    else:
+        connack = _make_connack(return_code=CONNACK_311_NOT_AUTHORIZED)
     try:
-        while len(buffer) < _MTLS_REFUSE_MAX_BYTES:
-            data = await asyncio.wait_for(
-                reader.read(_MTLS_READ_CHUNK), timeout=_MTLS_REFUSE_READ_TIMEOUT
-            )
-            if not data:
-                return
-            buffer.extend(data)
-            if len(buffer) < 2:
-                continue
-            try:
-                remaining, header_end = _decode_remaining_length(bytes(buffer), 1)
-            except ValueError:
-                continue
-            if len(buffer) < header_end + remaining:
-                continue
-            if (buffer[0] >> 4) & 0x0F == PKT_CONNECT:
-                # The CONNACK has to match the client's protocol level: a v5
-                # client handed the two-byte 3.1.1 form dies in its decoder
-                # instead of reporting the refusal, and 0x05 is not a defined
-                # v5 reason code.
-                body = bytes(buffer[header_end:header_end + remaining])
-                try:
-                    _proto_name, level_at = _read_string(body, 0)
-                    protocol_level = body[level_at]
-                except (ValueError, IndexError):
-                    protocol_level = MQTT_311
-                if protocol_level == MQTT_5:
-                    connack = _make_connack(
-                        return_code=RC5_NOT_AUTHORIZED, protocol_version=MQTT_5
-                    )
-                else:
-                    connack = _make_connack(return_code=CONNACK_311_NOT_AUTHORIZED)
-                writer.write(connack)
-                await writer.drain()
-            return
-    except (asyncio.TimeoutError, OSError, ssl.SSLError):
+        writer.write(connack)
+        await writer.drain()
+    except (OSError, ssl.SSLError):
         return
 
 
@@ -7744,7 +8116,16 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
     owner = _mtls_resolve_identity(der)
     if owner is None:
         try:
-            await _mtls_refuse(reader, writer, hashlib.sha256(der).hexdigest())
+            # AWS registers on the CONNECT packet, not on the handshake: a
+            # client that closes after the handshake, sends nothing, or sends
+            # another packet first registers nothing (measured).
+            packet = await _mtls_first_packet(reader)
+            protocol_level = _connect_protocol_level(packet) if packet else None
+            if protocol_level is not None and await _mtls_auto_register(
+                der, writer.get_extra_info("peername")
+            ):
+                return
+            await _mtls_refuse(writer, hashlib.sha256(der).hexdigest(), protocol_level)
         finally:
             await _mtls_close(writer)
         return

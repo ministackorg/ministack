@@ -323,15 +323,31 @@ def test_cur_state_round_trips_through_get_and_restore():
     cur.reset()
     assert "r1" not in cur._report_definitions
 
-    cur.restore_state(snapshot)
+    cur.load_persisted_state(snapshot)
     assert cur._report_definitions["r1"]["S3Bucket"] == "billing"
     assert cur._report_tags["r1"] == {"team": "finops"}
 
 
-def test_cur_module_calls_load_state_on_import():
-    """The bug we fixed: load_state was never invoked at import time, so
-    every warm-boot lost CUR state. Verify the module exposes _restored
-    (set by the import-time block whether or not anything was found)."""
+def test_cur_central_restore_recovers_reports_and_tags(monkeypatch, tmp_path):
+    """CUR reports survive a disk round trip through the gateway loader."""
+    import ministack.app as app
+    from ministack.core import persistence
+    from ministack.core.responses import AccountScopedDict
     from ministack.services import cur
 
-    assert hasattr(cur, "_restored")
+    monkeypatch.setattr(cur, "_report_definitions", AccountScopedDict())
+    monkeypatch.setattr(cur, "_report_tags", AccountScopedDict())
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_state_map", {"cur": "cur"})
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    report = _report_definition("restored-report")
+    cur._report_definitions[report["ReportName"]] = report
+    cur._report_tags[report["ReportName"]] = {"team": "finops"}
+    persistence.save_all({"cur": app._build_persistence_save_dict()["cur"]})
+    cur.reset()
+
+    app._load_persisted_state()
+
+    assert cur._report_definitions[report["ReportName"]] == report
+    assert cur._report_tags[report["ReportName"]] == {"team": "finops"}

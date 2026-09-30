@@ -172,8 +172,10 @@ def test_athena_workgroups_isolated_per_account():
         assert wg not in names_b, \
             f"CRITICAL: Athena workgroup leaking cross-account; B saw: {names_b}"
     finally:
-        try: a.delete_work_group(WorkGroup=wg)
-        except Exception: pass
+        try:
+            a.delete_work_group(WorkGroup=wg)
+        except Exception:
+            pass
 
 
 def test_ses_sent_emails_isolated_per_account():
@@ -229,5 +231,23 @@ def test_apigateway_v1_stages_isolated_per_account():
         assert all(api["id"] != a_api for api in apis_b), \
             f"CRITICAL: APIGW v1 REST api leaking cross-account; B saw: {apis_b}"
     finally:
-        try: a.delete_rest_api(restApiId=a_api)
-        except Exception: pass
+        try:
+            a.delete_rest_api(restApiId=a_api)
+        except Exception:
+            pass
+
+def test_post_object_uses_the_account_from_the_form_credentials():
+    import requests
+
+    s3 = _client("s3", access_key="123456789012")
+    s3.create_bucket(Bucket="tenant-post-bucket")
+
+    post = s3.generate_presigned_post(Bucket="tenant-post-bucket", Key="hello.txt")
+    response = requests.post(
+        post["url"], data=post["fields"], files={"file": ("hello.txt", b"hello world")}
+    )
+    assert response.status_code == 204
+    assert s3.get_object(Bucket="tenant-post-bucket", Key="hello.txt")["Body"].read() == b"hello world"
+
+    # the upload stayed in the tenant's account
+    assert "tenant-post-bucket" not in [b["Name"] for b in _client("s3").list_buckets()["Buckets"]]

@@ -38,6 +38,72 @@ def _call(service, method, path="/v2/email/tags", *, body=None, query=None):
     return status, json.loads(raw.decode("utf-8")) if raw else {}
 
 
+def test_ses_v2_target_delegates_to_ses_v2_handler(monkeypatch):
+    """The legacy SES dispatcher must not retain a separate v2 implementation."""
+    from ministack.services import ses, ses_v2
+
+    received = {}
+
+    async def delegated_handler(method, path, headers, body, query_params):
+        received.update(
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            query_params=query_params,
+        )
+        return 204, {}, b""
+
+    monkeypatch.setattr(ses_v2, "handle_request", delegated_handler)
+    result = asyncio.run(
+        ses.handle_request(
+            "POST", "/", {"x-amz-target": "SESv2.SendEmail"}, b"{}", {"key": ["value"]}
+        )
+    )
+
+    assert result == (204, {}, b"")
+    assert received == {
+        "method": "POST",
+        "path": "/",
+        "headers": {"x-amz-target": "SESv2.SendEmail"},
+        "body": b"{}",
+        "query_params": {"key": ["value"]},
+    }
+
+
+@pytest.mark.parametrize("prefix", ["", "/v2/email"])
+@pytest.mark.parametrize("suffix", ["", "/"])
+@pytest.mark.parametrize("bulk", [False, True])
+def test_ses_target_send_uses_real_v2_handler(ses_v2, prefix, suffix, bulk):
+    from ministack.services import ses
+
+    template = {"TemplateContent": {"Subject": "Hello {{name}}", "Text": "Welcome"},
+                "TemplateData": json.dumps({"name": "Alice"})}
+    destination = {"ToAddresses": ["recipient@example.com"]}
+    body = {"FromEmailAddress": "sender@example.com"}
+    if bulk:
+        operation, route = "SendBulkEmail", "/outbound-bulk-emails"
+        body.update(DefaultContent={"Template": template},
+                    BulkEmailEntries=[{"Destination": destination}])
+    else:
+        operation, route = "SendEmail", "/outbound-emails"
+        body.update(Content={"Template": template}, Destination=destination)
+
+    status, _, raw = asyncio.run(ses.handle_request(
+        "POST", prefix + route + suffix, {"x-amz-target": f"SESv2.{operation}"},
+        json.dumps(body).encode(), {},
+    ))
+
+    assert status == 200
+    response = json.loads(raw)
+    message_id = response["BulkEmailEntryResults"][0]["MessageId"] if bulk else response["MessageId"]
+    records = ses_v2._sent_emails_list()
+    assert len(records) == 1
+    assert records[0]["MessageId"] == message_id
+    assert records[0]["Subject"] == "Hello Alice"
+    assert records[0]["To"] == destination["ToAddresses"]
+
+
 def _send_template(ses_v2, template, template_data, *, to="recipient@example.com"):
     return _call(
         ses_v2,

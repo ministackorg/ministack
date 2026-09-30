@@ -1,14 +1,18 @@
+import base64
+import hashlib
 import json
 import os
 import re
+import struct
 import time
+import uuid
 import uuid as _uuid_mod
 from datetime import datetime
 from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import make_client, patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1637,6 +1641,10 @@ def test_s3_event_notification_to_sqs(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-bkt",
         NotificationConfiguration={
@@ -1659,6 +1667,10 @@ def test_s3_event_notification_filter(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-filter-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-filter-bkt",
         NotificationConfiguration={
@@ -1686,6 +1698,10 @@ def test_s3_event_notification_delete(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-del-bkt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="s3-evt-del-bkt",
         NotificationConfiguration={
@@ -1709,6 +1725,10 @@ def test_s3_put_notification_sends_test_event(s3, sqs):
         QueueUrl=queue_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bkt, "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
         NotificationConfiguration={
@@ -1778,6 +1798,15 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
         Bucket=bkt,
         CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
     )
+    # The destination has to exist: AWS verifies an SQS or SNS target by sending
+    # it a test notification and fails the whole PUT when that does not arrive.
+    _west_sqs = _regional_client("sqs", "us-west-2")
+    _west_q_url = _west_sqs.create_queue(QueueName="s3-west-region-q")["QueueUrl"]
+    _west_sqs.set_queue_attributes(
+        QueueUrl=_west_q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_s3(
+            "arn:aws:sqs:us-west-2:000000000000:s3-west-region-q",
+            bkt, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bkt,
@@ -1806,15 +1835,11 @@ def test_s3_notification_validates_target_region_against_bucket_region(s3):
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sqs:us-east-1:000000000001:shared-q",
-        "arn:aws:sqs:us-west-2:000000000000:shared-q",
-    ],
-)
+# A same-region queue in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fallback(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sqs as sqsmod
@@ -1825,24 +1850,22 @@ def test_s3_notification_sqs_delivery_rejects_out_of_scope_arns_without_name_fal
     monkeypatch.setattr(sqsmod, "_queues", {"url/shared-q": {"messages": messages}})
     monkeypatch.setattr(sqsmod, "_ensure_msg_fields", lambda msg: None)
 
-    s3mod._deliver_event_to_sqs(target_arn, {"Records": []}, "us-east-1")
+    s3mod._deliver_event_to_sqs(
+        "arn:aws:sqs:us-west-2:000000000000:shared-q", {"Records": []}, "us-east-1")
 
     assert messages == []
 
 
-@pytest.mark.parametrize(
-    "target_arn",
-    [
-        "arn:aws:sns:us-east-1:000000000001:shared-topic",
-        "arn:aws:sns:us-west-2:000000000000:shared-topic",
-    ],
-)
+# A same-region topic in another account is in scope: S3 delivers to it when
+# its policy allows (see test_messaging_policies.py). Only a wrong-region ARN
+# stays out of scope here.
 def test_s3_notification_sns_delivery_rejects_out_of_scope_arns_before_fanout(
-    monkeypatch, target_arn,
+    monkeypatch,
 ):
     from ministack.services import s3 as s3mod
     from ministack.services import sns as snsmod
 
+    target_arn = "arn:aws:sns:us-west-2:000000000000:shared-topic"
     fanouts = []
     monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
     monkeypatch.setattr(snsmod, "_topics", {target_arn: {"subscriptions": []}})
@@ -1910,6 +1933,10 @@ def test_s3_event_notification_cross_account():
     )["Attributes"]["QueueArn"]
     # Confirm the clients really resolve to the non-default account.
     assert f":{account}:" in queue_arn
+    sqsc.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "s3-evt-xacct-bkt", account))})
 
     s3c.put_bucket_notification_configuration(
         Bucket="s3-evt-xacct-bkt",
@@ -3568,6 +3595,233 @@ def test_s3_delete_bucket_removes_persisted_dir(tmp_path, monkeypatch):
         s3mod._buckets._data.pop(("000000000000", "issue824-delete"), None)
 
 
+# ---------------------------------------------------------------------------
+# Delete-marker persistence (S3_PERSIST)
+#
+# A delete marker has no body, so the data file left on disk belongs to the
+# version it hides. Persisting the marker to the key's .meta.json sidecar is
+# what stops a restart from reloading that file as a live object.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def s3_persist(tmp_path, monkeypatch):
+    """Point S3 at a throwaway DATA_DIR with persistence on, default account."""
+    from ministack.core import responses as respmod
+    from ministack.services import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    monkeypatch.setattr(respmod, "get_account_id", lambda: "000000000000")
+
+    buckets_before = set(s3mod._buckets._data)
+    versions_before = set(s3mod._object_versions._data)
+    versioning_before = set(s3mod._bucket_versioning._data)
+    annotations_before = set(s3mod._object_annotations._data)
+    yield s3mod
+    for store, before in (
+        (s3mod._buckets._data, buckets_before),
+        (s3mod._object_versions._data, versions_before),
+        (s3mod._bucket_versioning._data, versioning_before),
+        (s3mod._object_annotations._data, annotations_before),
+    ):
+        for key in set(store) - before:
+            store.pop(key, None)
+
+
+def _reload_bucket(s3mod, tmp_path, bucket, account="000000000000"):
+    """Drop one bucket from memory and reload it from disk (a restart)."""
+    s3mod._buckets._data.pop((account, bucket), None)
+    for vkey in [k for k in s3mod._object_versions._data
+                 if k[0] == account and k[1][0] == bucket]:
+        s3mod._object_versions._data.pop(vkey, None)
+    s3mod._load_persisted_bucket(
+        account, bucket, os.path.join(str(tmp_path), account, bucket))
+
+
+def test_s3_delete_marker_survives_restart(s3_persist, tmp_path):
+    """A versioned delete persists its marker; a restart keeps the key hidden
+    instead of reloading the object's still-present data file as current."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "gone.txt", b"payload", {})
+
+    status, del_headers, _ = s3mod._delete_object(bucket, "gone.txt")
+    assert status == 204
+    assert del_headers["x-amz-delete-marker"] == "true"
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "gone.txt.meta.json")
+    with open(meta_path) as mf:
+        meta = json.load(mf)
+    assert meta["is_delete_marker"] is True
+    assert meta["version_id"] == del_headers["x-amz-version-id"]
+    assert meta["versions"][0]["etag"]
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert "gone.txt" not in restored["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "gone.txt"))]
+    assert versions[-1]["is_delete_marker"] is True
+    assert versions[-1]["is_latest"] is True
+
+    # GetObject on the hidden key reports the miss as a delete marker.
+    status, get_headers, _ = s3mod._get_object(bucket, "gone.txt", {})
+    assert status == 404
+    assert get_headers.get("x-amz-delete-marker") == "true"
+
+
+def test_s3_delete_marker_restores_previous_version_metadata(s3_persist, tmp_path):
+    """The version a marker displaced is rebuilt below it, so
+    ListObjectVersions does not lose it across a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-prev"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+
+    s3mod._delete_object(bucket, "k")
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [bool(v.get("is_delete_marker")) for v in versions] == [False, True]
+    assert versions[0]["version_id"] == version_id
+    assert versions[0]["etag"] == put_headers["ETag"]
+    assert versions[0]["is_latest"] is False
+    assert versions[1]["is_latest"] is True
+
+
+def test_s3_lone_delete_marker_sidecar_restores_without_data_file(s3_persist, tmp_path):
+    """A marker whose data file is gone (key never had a body, or the version
+    was purged) still survives as a lone .meta.json sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-dm-lone"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+    s3mod._delete_object(bucket, "k")
+
+    os.remove(os.path.join(str(tmp_path), "000000000000", bucket, "k"))
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_purging_delete_marker_restores_object_after_restart(s3_persist, tmp_path):
+    """Deleting the marker by version id un-hides the object, and the sidecar
+    must be rewritten so a restart does not keep it hidden."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-undelete"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    _, put_headers, _ = s3mod._put_object(bucket, "k", b"data", {})
+    version_id = put_headers["x-amz-version-id"]
+    _, del_headers, _ = s3mod._delete_object(bucket, "k")
+    marker_id = del_headers["x-amz-version-id"]
+
+    status, _, _ = s3mod._delete_object(bucket, "k", query_params={"versionId": marker_id})
+    assert status == 204
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert restored["objects"]["k"]["version_id"] == version_id
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert not versions[-1].get("is_delete_marker")
+
+
+def test_s3_put_after_delete_marker_clears_marker_on_disk(s3_persist, tmp_path):
+    """A write over a delete marker replaces the marker sidecar, so the new
+    object is visible again after a restart."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-reput"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"one", {})
+    s3mod._delete_object(bucket, "k")
+    s3mod._put_object(bucket, "k", b"two", {})
+
+    meta_path = os.path.join(str(tmp_path), "000000000000", bucket, "k.meta.json")
+    with open(meta_path) as mf:
+        assert "is_delete_marker" not in json.load(mf)
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    restored = s3mod._buckets._data[("000000000000", bucket)]
+    assert s3mod._read_body(bucket, "k", restored["objects"]["k"]) == b"two"
+
+
+def test_s3_batch_delete_objects_persists_delete_marker(s3_persist, tmp_path):
+    """DeleteObjects on a versioned bucket creates a marker via the same path
+    as DeleteObject, so it must persist too."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-batch-dm"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    body = (
+        b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Object><Key>k</Key></Object></Delete>"
+    )
+    status, _, _ = s3mod._delete_objects(bucket, body)
+    assert status == 200
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    assert "k" not in s3mod._buckets._data[("000000000000", bucket)]["objects"]
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert versions[-1]["is_delete_marker"] is True
+
+
+def test_s3_noncurrent_versions_keep_bytes_tags_and_acls_across_restart(s3_persist, tmp_path):
+    """Every version comes back with its own bytes, tags and ACL, including
+    after a noncurrent version is purged under a delete marker."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-history"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    vids = [s3mod._put_object(bucket, "k", body, {"x-amz-tagging": f"n={body.decode()}"})[1]["x-amz-version-id"]
+            for body in (b"one", b"two", b"three")]
+    s3mod._put_object_acl(bucket, "k", b"", {"x-amz-acl": "public-read"}, {"versionId": [vids[0]]})
+    s3mod._delete_object(bucket, "k")
+    s3mod._delete_object(bucket, "k", query_params={"versionId": vids[2]})
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+
+    versions = s3mod._object_versions._data[("000000000000", (bucket, "k"))]
+    assert [v["version_id"] for v in versions[:-1]] == vids[:2]
+    assert versions[-1]["is_delete_marker"] and versions[-1]["is_latest"]
+    assert [s3mod._get_object_data(bucket, "k", version_id=v) for v in vids[:2]] == [b"one", b"two"]
+    assert [s3mod._object_tags[(bucket, "k", v)] for v in vids[:2]] == [{"n": "one"}, {"n": "two"}]
+    assert "AllUsers" in s3mod._object_acl[(bucket, "k", vids[0])]
+
+
+def test_s3_unversioned_delete_removes_persisted_files(s3_persist, tmp_path):
+    """Regression guard: a plain delete on an unversioned bucket still removes
+    both the data file and its sidecar."""
+    s3mod = s3_persist
+    bucket = "qa-s3-persist-unversioned"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._put_object(bucket, "k", b"data", {})
+
+    data_path = os.path.join(str(tmp_path), "000000000000", bucket, "k")
+    assert os.path.isfile(data_path)
+
+    s3mod._delete_object(bucket, "k")
+    assert not os.path.exists(data_path)
+    assert not os.path.exists(data_path + ".meta.json")
+
+    _reload_bucket(s3mod, tmp_path, bucket)
+    assert s3mod._buckets._data.get(("000000000000", bucket), {}).get("objects", {}) == {}
+
+
 def test_s3_copy_object_propagates_storage_class(s3):
     """CopyObject with explicit StorageClass overrides the source's class (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc-copy")
@@ -4441,6 +4695,10 @@ def test_s3_event_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"]
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
 
     s3.put_bucket_notification_configuration(
         Bucket=bucket,
@@ -6174,6 +6432,10 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, "qa-s3-restore-evt", "000000000000"))})
     s3.put_bucket_notification_configuration(
         Bucket="qa-s3-restore-evt",
         NotificationConfiguration={
@@ -6663,3 +6925,864 @@ def test_s3_mrap_cleared_by_reset(cfn, s3):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _mrap_get(alias, "who.txt")
     assert ei.value.code in (403, 404)
+
+
+def _s3_lambda_arn(name="s3-notify-target"):
+    return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
+
+
+def test_s3_notification_is_stored_in_the_sdk_wire_form(s3):
+    """Stored as the wire spells it, so any SDK reads back what another wrote."""
+    import urllib.request
+
+    bucket = f"notif-wire-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    arn = _s3_lambda_arn()
+    xml = (
+        '<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        "<LambdaFunctionConfiguration>"
+        f"<LambdaFunctionArn>{arn}</LambdaFunctionArn>"
+        "<Event>s3:ObjectCreated:*</Event>"
+        "</LambdaFunctionConfiguration></NotificationConfiguration>"
+    )
+    request = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}?notification", data=xml.encode(), method="PUT")
+    with urllib.request.urlopen(request) as response:
+        assert response.status == 200
+
+    configs = s3.get_bucket_notification_configuration(
+        Bucket=bucket)["LambdaFunctionConfigurations"]
+    assert [c["LambdaFunctionArn"] for c in configs] == [arn]
+    assert configs[0]["Events"] == ["s3:ObjectCreated:*"]
+
+
+def test_s3_notification_auto_generates_a_base64_uuid_id(s3, sqs):
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
+    import base64 as _b64
+
+    bucket = f"notif-id-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    queue = sqs.create_queue(QueueName=f"notif-id-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={"QueueConfigurations": [
+            {"QueueArn": queue_arn, "Events": ["s3:ObjectCreated:*"]}]},
+    )
+    config = s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]
+    generated = config["Id"]
+    assert generated, "AWS auto-generates an Id when the caller omits one"
+    # base64 of a 36-char UUID: 48 chars, no padding.
+    assert len(generated) == 48
+    decoded = _b64.b64decode(generated + "==").decode()
+    assert _uuid_mod.UUID(decoded)
+    # It is stable across reads, not minted per GET.
+    assert s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]["Id"] == generated
+
+
+def test_s3_notification_keeps_an_explicit_id(s3, sqs):
+    bucket = f"notif-expl-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    queue = sqs.create_queue(QueueName=f"notif-expl-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue,
+        Attributes={"Policy": json.dumps(
+            sqs_policy_allow_s3(queue_arn, bucket, "000000000000"))})
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket,
+        NotificationConfiguration={"QueueConfigurations": [
+            {"Id": "mine", "QueueArn": queue_arn, "Events": ["s3:ObjectCreated:*"]}]},
+    )
+    assert s3.get_bucket_notification_configuration(
+        Bucket=bucket)["QueueConfigurations"][0]["Id"] == "mine"
+
+
+# --- Object annotations ---
+
+def _bucket(s3, versioned=False, **create):
+    name = f"annot-{uuid.uuid4().hex[:12]}"
+    s3.create_bucket(Bucket=name, **create)
+    if versioned:
+        s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+    return name
+
+
+def _code(exc):
+    return exc.value.response["Error"]["Code"]
+
+
+def _status(exc):
+    return exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+
+# ── Put / Get ──────────────────────────────────────────────────────────
+
+
+def test_put_and_get_an_annotation(s3):
+    bucket = _bucket(s3, versioned=True)
+    payload = b'{"archive":"Images"}'
+    put = s3.put_object(Bucket=bucket, Key="photo.jpg", Body=b"jpeg")
+    out = s3.put_object_annotation(Bucket=bucket, Key="photo.jpg", AnnotationName="nexus.system", AnnotationPayload=payload)
+    assert out["ObjectVersionId"] == put["VersionId"]
+    assert out["ETag"] == f'"{hashlib.md5(payload).hexdigest()}"'
+    got = s3.get_object_annotation(Bucket=bucket, Key="photo.jpg", AnnotationName="nexus.system")
+    assert got["AnnotationPayload"].read() == payload
+    assert got["ObjectVersionId"] == put["VersionId"]
+    assert got["ContentLength"] == len(payload)
+    assert got["ServerSideEncryption"] == "AES256"
+
+
+def test_an_annotation_leaves_the_object_alone(s3):
+    """"Adding, updating, or removing an annotation does not modify the parent
+    object's ETag", and makes no new version."""
+    bucket = _bucket(s3, versioned=True)
+    put = s3.put_object(Bucket=bucket, Key="k", Body=b"body")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    head = s3.head_object(Bucket=bucket, Key="k")
+    assert head["ETag"] == put["ETag"] and head["VersionId"] == put["VersionId"]
+    assert len(s3.list_object_versions(Bucket=bucket)["Versions"]) == 1
+    assert s3.get_object(Bucket=bucket, Key="k")["Body"].read() == b"body"
+
+
+def test_putting_again_replaces_the_payload(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"first")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"second")
+    got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert got["AnnotationPayload"].read() == b"second"
+
+
+def test_get_of_a_missing_annotation(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="absent")
+    assert (_code(exc), _status(exc)) == ("NoSuchAnnotation", 404)
+
+
+def test_annotation_on_a_missing_key_or_bucket(s3):
+    bucket = _bucket(s3)
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="nope", AnnotationName="a", AnnotationPayload=b"1")
+    assert _code(exc) == "NoSuchKey"
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=f"missing-{uuid.uuid4().hex[:8]}", Key="k", AnnotationName="a")
+    assert _code(exc) == "NoSuchBucket"
+
+
+@pytest.mark.parametrize(
+    "name, code",
+    [
+        ("aws.reserved", "InvalidAnnotationName"),
+        ("AWSthing", "InvalidAnnotationName"),
+        ("s3-thing", "InvalidAnnotationName"),
+        ("S3", "InvalidAnnotationName"),
+        ("has space", "InvalidAnnotationName"),
+        ("slash/name", "InvalidAnnotationName"),
+        ("   ", "InvalidAnnotationName"),
+        ("n" * 513, "AnnotationNameTooLong"),
+    ],
+)
+def test_annotation_naming_rules(s3, name, code):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName=name, AnnotationPayload=b"1")
+    assert (_code(exc), _status(exc)) == (code, 400)
+
+
+def test_names_may_use_letters_of_any_language(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    for name in ("données_1.2-3", "名前", "n" * 512):
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName=name, AnnotationPayload=b"1")
+
+
+def test_payload_limits(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="max", AnnotationPayload=b"a" * (1024 * 1024))
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="big", AnnotationPayload=b"a" * (1024 * 1024 + 1))
+    assert _code(exc) == "InvalidRequest"
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="empty", AnnotationPayload=b"")
+    assert _code(exc) == "InvalidRequest"
+
+
+def test_payload_must_be_utf8(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="bin", AnnotationPayload=b"\xff\xfe")
+    assert (_code(exc), _status(exc)) == ("UnsupportedMediaType", 415)
+
+
+def test_a_version_holds_at_most_1000_annotations(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    for i in range(1000):
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName=f"n{i}", AnnotationPayload=b"1")
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="n1000", AnnotationPayload=b"1")
+    assert _code(exc) == "AnnotationLimitExceeded"
+    # Replacing one of the thousand is not a new one.
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="n0", AnnotationPayload=b"2")
+
+
+def test_object_if_match(s3):
+    bucket = _bucket(s3)
+    etag = s3.put_object(Bucket=bucket, Key="k", Body=b"x")["ETag"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1", ObjectIfMatch=etag)
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(
+            Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"2", ObjectIfMatch='"deadbeef"'
+        )
+    assert _status(exc) == 412
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", ObjectIfMatch='"deadbeef"')
+    assert _status(exc) == 412
+    s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", ObjectIfMatch=etag)
+
+
+# ── Checksums ──────────────────────────────────────────────────────────
+
+
+def test_default_checksum_is_crc64nvme(s3):
+    """"If the annotation doesn't have a specified checksum algorithm or
+    checksum value, Amazon S3 uses the CRC-64/NVME algorithm"."""
+    plain = make_client("s3", {"request_checksum_calculation": "when_required"})
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    out = plain.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"123456789")
+    expected = base64.b64encode(struct.pack(">Q", _crc64nvme_bitwise(b"123456789"))).decode()
+    assert out["ChecksumCRC64NVME"] == expected
+    got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", ChecksumMode="ENABLED")
+    assert got["ChecksumCRC64NVME"] == expected
+    # Only when asked: a client that does not send x-amz-checksum-mode gets none back.
+    unasked = make_client("s3", {"response_checksum_validation": "when_required"})
+    assert "ChecksumCRC64NVME" not in unasked.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+
+@pytest.mark.parametrize(
+    "member, digest",
+    [
+        ("ChecksumSHA256", lambda b: hashlib.sha256(b).digest()),
+        ("ChecksumSHA512", lambda b: hashlib.sha512(b).digest()),
+        ("ChecksumMD5", lambda b: hashlib.md5(b).digest()),
+        # XXH64's published check value for b"abc" (the xxHash reference).
+        ("ChecksumXXHASH64", lambda b: struct.pack(">Q", 0x44BC2CF5AD770999)),
+    ],
+)
+def test_a_checksum_sent_is_verified(s3, member, digest):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    good = base64.b64encode(digest(b"abc")).decode()
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"abc", **{member: good})
+    got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", ChecksumMode="ENABLED")
+    assert got[member] == good and got["ChecksumType"] == "FULL_OBJECT"
+    bad = base64.b64encode(bytes(x ^ 0xFF for x in digest(b"abc"))).decode()
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"abc", **{member: bad})
+    assert _code(exc) == "BadDigest"
+
+
+def test_xxh64_check_values():
+    from ministack.services import s3 as s3mod
+
+    assert s3mod._xxh64(b"") == 0xEF46DB3751D8E999
+    assert s3mod._xxh64(b"abc") == 0x44BC2CF5AD770999
+    # Past the 32-byte stripe loop, against the reference implementation's output.
+    assert s3mod._xxh64(b"Nobody inspects the spammish repetition") == 0xFBCEA83C8A378BF1
+
+
+def test_an_algorithm_ministack_cannot_compute_is_refused(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(
+            Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"abc", ChecksumXXHASH3="AAAAAAAAAAA="
+        )
+    assert _code(exc) == "InvalidRequest"
+
+
+# ── Encryption ─────────────────────────────────────────────────────────
+
+
+def test_annotations_take_the_objects_encryption(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId="alias/annot")
+    out = s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    assert out["ServerSideEncryption"] == "aws:kms"
+    got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert got["ServerSideEncryption"] == "aws:kms"
+
+
+def test_sse_c_objects_cannot_have_annotations(s3):
+    bucket = _bucket(s3)
+    key = os.urandom(32)
+    s3.put_object(
+        Bucket=bucket,
+        Key="k",
+        Body=b"x",
+        SSECustomerAlgorithm="AES256",
+        SSECustomerKey=key,
+    )
+    with pytest.raises(ClientError) as exc:
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    assert _code(exc) == "InvalidRequest"
+
+
+# ── Versions ───────────────────────────────────────────────────────────
+
+
+def test_annotations_belong_to_one_version(s3):
+    bucket = _bucket(s3, versioned=True)
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"on v1")
+    v2 = s3.put_object(Bucket=bucket, Key="k", Body=b"two")["VersionId"]
+    # "Creating a new version does not copy annotations from the previous version."
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert _code(exc) == "NoSuchAnnotation"
+    got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=v1)
+    assert got["AnnotationPayload"].read() == b"on v1" and got["ObjectVersionId"] == v1
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"on v2")
+    assert s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=v2)["AnnotationPayload"].read() == b"on v2"
+    assert s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=v1)["AnnotationPayload"].read() == b"on v1"
+
+
+def test_a_delete_marker_keeps_the_versions_annotations(s3):
+    bucket = _bucket(s3, versioned=True)
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"kept")
+    marker = s3.delete_object(Bucket=bucket, Key="k")["VersionId"]
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert _code(exc) == "NoSuchKey"
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=marker)
+    assert _status(exc) == 405
+    assert s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=v1)["AnnotationPayload"].read() == b"kept"
+    # Removing the marker brings the version back with its annotations.
+    s3.delete_object(Bucket=bucket, Key="k", VersionId=marker)
+    assert s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")["AnnotationPayload"].read() == b"kept"
+
+
+def test_deleting_a_version_deletes_its_annotations(s3):
+    bucket = _bucket(s3, versioned=True)
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    s3.delete_object(Bucket=bucket, Key="k", VersionId=v1)
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", VersionId=v1)
+    assert _code(exc) == "NoSuchVersion"
+
+
+def test_unversioned_overwrite_and_delete_drop_annotations(s3):
+    """"In a non-versioned bucket, if you delete or overwrite the object, the
+    annotations are deleted with it.\""""
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"one")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert _code(exc) == "NoSuchAnnotation"
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="b", AnnotationPayload=b"1")
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.put_object(Bucket=bucket, Key="k", Body=b"three")
+    assert s3.list_object_annotations(Bucket=bucket, Key="k")["Annotations"] == []
+
+
+def test_batch_delete_drops_annotations(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"one")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": "k"}]})
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    assert s3.list_object_annotations(Bucket=bucket, Key="k")["Annotations"] == []
+
+
+def test_annotations_need_no_restore_for_archived_objects(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="cold", Body=b"x", StorageClass="GLACIER")
+    s3.put_object_annotation(Bucket=bucket, Key="cold", AnnotationName="a", AnnotationPayload=b"1")
+    assert s3.get_object_annotation(Bucket=bucket, Key="cold", AnnotationName="a")["AnnotationPayload"].read() == b"1"
+
+
+# ── List ───────────────────────────────────────────────────────────────
+
+
+def test_list_annotations(s3):
+    bucket = _bucket(s3, versioned=True)
+    version = s3.put_object(Bucket=bucket, Key="k", Body=b"x")["VersionId"]
+    for name, payload in (("ml.label", b"cat"), ("etl.status", b"done"), ("ml.score", b"0.97")):
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName=name, AnnotationPayload=payload, ChecksumAlgorithm="SHA256")
+    out = s3.list_object_annotations(Bucket=bucket, Key="k")
+    assert [a["AnnotationName"] for a in out["Annotations"]] == ["etl.status", "ml.label", "ml.score"]
+    assert out["AnnotationCount"] == 3 and out["ObjectVersionId"] == version
+    assert out["Bucket"] == bucket and out["Key"] == "k"
+    entry = out["Annotations"][1]
+    assert entry["Size"] == 3 and entry["ETag"] == f'"{hashlib.md5(b"cat").hexdigest()}"'
+    assert entry["ChecksumAlgorithm"] == ["SHA256"] and "LastModified" in entry
+    assert "NextContinuationToken" not in out
+
+
+def test_list_annotations_by_prefix_and_page(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    for i in range(5):
+        s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName=f"page.{i}", AnnotationPayload=b"1")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="other", AnnotationPayload=b"1")
+    first = s3.list_object_annotations(Bucket=bucket, Key="k", AnnotationPrefix="page.", MaxAnnotationResults=2)
+    assert [a["AnnotationName"] for a in first["Annotations"]] == ["page.0", "page.1"]
+    assert first["AnnotationPrefix"] == "page." and first["MaxAnnotationResults"] == 2
+    token = first["NextContinuationToken"]
+    rest = s3.list_object_annotations(Bucket=bucket, Key="k", AnnotationPrefix="page.", ContinuationToken=token)
+    assert [a["AnnotationName"] for a in rest["Annotations"]] == ["page.2", "page.3", "page.4"]
+    assert rest["ContinuationToken"] == token and "NextContinuationToken" not in rest
+
+
+def test_list_rejects_a_bad_page_size_or_prefix(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    plain = make_client("s3", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        plain.list_object_annotations(Bucket=bucket, Key="k", MaxAnnotationResults=1001)
+    assert _code(exc) == "InvalidArgument"
+    with pytest.raises(ClientError) as exc:
+        s3.list_object_annotations(Bucket=bucket, Key="k", AnnotationPrefix="p" * 513)
+    assert _code(exc) == "InvalidPrefix"
+
+
+# ── Delete ─────────────────────────────────────────────────────────────
+
+
+def test_delete_an_annotation(s3):
+    bucket = _bucket(s3, versioned=True)
+    version = s3.put_object(Bucket=bucket, Key="k", Body=b"x")["VersionId"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    out = s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert out["ResponseMetadata"]["HTTPStatusCode"] == 204 and out["ObjectVersionId"] == version
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    assert _code(exc) == "NoSuchAnnotation"
+    # Deleting one that is not there is not an error.
+    s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+
+# Observed on AWS (ap-southeast-2, 2026-09-28): annotations are writes to the object version, so Object Lock guards
+# PutObjectAnnotation and DeleteObjectAnnotation alike. Governance retention yields to
+# x-amz-bypass-governance-retention; compliance retention and a legal hold refuse both, bypass or not.
+
+
+RETENTION = "Access Denied because object protected by object lock retention."
+LEGAL_HOLD = "Access Denied because object protected by object lock legal hold."
+
+
+def _lock_call(method, path, headers=None, body=b"", query=None):
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    with request_scope("000000000000", "us-east-1"):
+        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, query or {}))
+
+
+def _locked_in_process(**lock_headers):
+    bucket = f"ann-lock-{uuid.uuid4().hex[:10]}"
+    assert _lock_call("PUT", f"/{bucket}", {"x-amz-bucket-object-lock-enabled": "true"})[0] == 200
+    assert _lock_call("PUT", f"/{bucket}/k", lock_headers, b"x")[0] == 200
+    return bucket
+
+
+def _annotation_write(bucket, method, bypass=False):
+    headers = {"x-amz-bypass-governance-retention": "true"} if bypass else {}
+    query = {"annotation": [""], "annotationName": ["a"]}
+    return _lock_call(method, f"/{bucket}/k", headers, b"1" if method == "PUT" else b"", query)
+
+
+def _assert_refused(response, message):
+    status, _, body = response
+    assert status == 403
+    assert b"<Code>AccessDenied</Code>" in body and message.encode() in body
+
+
+def _until():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+
+
+def test_governance_retention_needs_the_bypass_to_put_or_delete_an_annotation(monkeypatch):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    bucket = _locked_in_process(**{"x-amz-object-lock-mode": "GOVERNANCE",
+                                   "x-amz-object-lock-retain-until-date": _until()})
+    _assert_refused(_annotation_write(bucket, "PUT"), RETENTION)
+    assert _annotation_write(bucket, "PUT", bypass=True)[0] == 200
+    _assert_refused(_annotation_write(bucket, "DELETE"), RETENTION)
+    assert _annotation_write(bucket, "DELETE", bypass=True)[0] == 204
+
+
+@pytest.mark.parametrize("lock_headers,message", [
+    ({"x-amz-object-lock-mode": "COMPLIANCE"}, RETENTION),
+    ({"x-amz-object-lock-legal-hold": "ON"}, LEGAL_HOLD),
+])
+def test_compliance_and_legal_hold_refuse_annotation_writes_even_with_the_bypass(monkeypatch, lock_headers, message):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    if "x-amz-object-lock-mode" in lock_headers:
+        lock_headers = dict(lock_headers, **{"x-amz-object-lock-retain-until-date": _until()})
+    bucket = _locked_in_process(**lock_headers)
+    for method in ("PUT", "DELETE"):
+        for bypass in (False, True):
+            _assert_refused(_annotation_write(bucket, method, bypass), message)
+
+
+def test_object_lock_does_not_refuse_annotation_writes_without_auth(monkeypatch):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    bucket = _locked_in_process(**{"x-amz-object-lock-legal-hold": "ON"})
+    assert _annotation_write(bucket, "PUT")[0] == 200
+    assert _annotation_write(bucket, "DELETE")[0] == 204
+
+
+def _locked(s3, **lock):
+    bucket = _bucket(s3, ObjectLockEnabledForBucket=True)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x", **lock)
+    return bucket
+
+
+def test_an_unlocked_object_in_a_lock_enabled_bucket_takes_annotations_freely(s3):
+    bucket = _locked(s3)
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"2")
+    s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+
+# ── CopyObject ─────────────────────────────────────────────────────────
+
+
+def test_copy_carries_annotations_by_default(s3):
+    src = _bucket(s3, versioned=True)
+    dst = _bucket(s3, versioned=True)
+    s3.put_object(Bucket=src, Key="landing/x.jpg", Body=b"x")
+    s3.put_object_annotation(Bucket=src, Key="landing/x.jpg", AnnotationName="nexus.system", AnnotationPayload=b"{}")
+    copied = s3.copy_object(Bucket=dst, Key="assets/x.jpg", CopySource={"Bucket": src, "Key": "landing/x.jpg"})
+    got = s3.get_object_annotation(Bucket=dst, Key="assets/x.jpg", AnnotationName="nexus.system")
+    assert got["AnnotationPayload"].read() == b"{}" and got["ObjectVersionId"] == copied["VersionId"]
+
+
+def test_copy_of_a_named_version_carries_that_versions_annotations(s3):
+    bucket = _bucket(s3, versioned=True)
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"v1")
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    s3.copy_object(Bucket=bucket, Key="copy", CopySource={"Bucket": bucket, "Key": "k", "VersionId": v1})
+    assert s3.get_object_annotation(Bucket=bucket, Key="copy", AnnotationName="a")["AnnotationPayload"].read() == b"v1"
+
+
+def test_copy_with_exclude_leaves_them_behind(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="src", AnnotationName="a", AnnotationPayload=b"1")
+    s3.copy_object(Bucket=bucket, Key="dst", CopySource={"Bucket": bucket, "Key": "src"}, AnnotationDirective="EXCLUDE")
+    assert s3.list_object_annotations(Bucket=bucket, Key="dst")["Annotations"] == []
+
+
+def test_copy_rejects_an_unknown_directive(s3):
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    plain = make_client("s3", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        plain.copy_object(Bucket=bucket, Key="dst", CopySource={"Bucket": bucket, "Key": "src"}, AnnotationDirective="REPLACE")
+    assert _code(exc) == "InvalidArgument"
+
+
+def test_copy_with_a_new_algorithm_rechecksums_the_annotations(s3):
+    """"If you specify a different checksum algorithm in the copy request, the
+    new algorithm applies to both the object and its annotations.\""""
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="src", AnnotationName="a", AnnotationPayload=b"abc")
+    s3.copy_object(Bucket=bucket, Key="dst", CopySource={"Bucket": bucket, "Key": "src"}, ChecksumAlgorithm="SHA256")
+    got = s3.get_object_annotation(Bucket=bucket, Key="dst", AnnotationName="a", ChecksumMode="ENABLED")
+    assert got["ChecksumSHA256"] == base64.b64encode(hashlib.sha256(b"abc").digest()).decode()
+
+
+# ── Replication ────────────────────────────────────────────────────────
+
+
+def test_annotations_replicate(s3):
+    src = _bucket(s3, versioned=True)
+    dst = _bucket(s3, versioned=True)
+    s3.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": "arn:aws:iam::000000000000:role/repl",
+            "Rules": [{"ID": "r1", "Status": "Enabled", "Prefix": "", "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}],
+        },
+    )
+    s3.put_object(Bucket=src, Key="k", Body=b"x")
+    s3.put_object_annotation(Bucket=src, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    assert s3.get_object_annotation(Bucket=src, Key="k", AnnotationName="a")["ReplicationStatus"] == "COMPLETED"
+    replica = s3.get_object_annotation(Bucket=dst, Key="k", AnnotationName="a")
+    assert replica["AnnotationPayload"].read() == b"1" and replica["ReplicationStatus"] == "REPLICA"
+    listed = s3.list_object_annotations(Bucket=dst, Key="k")["Annotations"]
+    assert [(a["AnnotationName"], a["ReplicationStatus"]) for a in listed] == [("a", "REPLICA")]
+
+
+# ── Event notifications ────────────────────────────────────────────────
+
+
+def _notified(s3, sqs, events, versioned=True):
+    bucket = _bucket(s3, versioned=versioned)
+    url = sqs.create_queue(QueueName=bucket)["QueueUrl"]
+    arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket=bucket, NotificationConfiguration={"QueueConfigurations": [{"QueueArn": arn, "Events": events}]}
+    )
+    return bucket, url
+
+
+def _records(sqs, url, expected, timeout=10):
+    records = []
+    deadline = time.time() + timeout
+    while len(records) < expected and time.time() < deadline:
+        for m in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", []):
+            records.extend(json.loads(m["Body"]).get("Records", []))
+            sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+    return records
+
+
+def test_annotation_events(s3, sqs):
+    bucket, url = _notified(s3, sqs, ["s3:ObjectAnnotation:*", "s3:ObjectCreated:*"])
+    version = s3.put_object(Bucket=bucket, Key="k", Body=b"x")["VersionId"]
+    assert [r["eventName"] for r in _records(sqs, url, 1)] == ["ObjectCreated:Put"]
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"abc")
+    s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    records = sorted(_records(sqs, url, 2), key=lambda r: r["eventName"], reverse=True)
+    # "PutObjectAnnotation and DeleteObjectAnnotation send only annotation-specific events."
+    assert [r["eventName"] for r in records] == ["ObjectAnnotation:Put", "ObjectAnnotation:Delete"]
+    put, delete = records
+    assert put["objectAnnotation"] == [{"name": "a", "size": 3, "eTag": hashlib.md5(b"abc").hexdigest()}]
+    assert delete["objectAnnotation"] == [{"name": "a"}]
+    assert put["s3"]["object"]["versionId"] == version
+    assert "sequencer" not in put["s3"]["object"]
+
+
+def test_get_and_list_send_no_events(s3, sqs):
+    bucket, url = _notified(s3, sqs, ["s3:ObjectAnnotation:*"])
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    assert len(_records(sqs, url, 1)) == 1
+    s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    s3.list_object_annotations(Bucket=bucket, Key="k")
+    assert _records(sqs, url, 1, timeout=2) == []
+
+
+def test_copy_event_says_whether_annotations_came(s3, sqs):
+    bucket, url = _notified(s3, sqs, ["s3:ObjectCreated:Copy"])
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    s3.put_object_annotation(Bucket=bucket, Key="src", AnnotationName="a", AnnotationPayload=b"1")
+    s3.copy_object(Bucket=bucket, Key="with", CopySource={"Bucket": bucket, "Key": "src"})
+    s3.copy_object(Bucket=bucket, Key="without", CopySource={"Bucket": bucket, "Key": "src"}, AnnotationDirective="EXCLUDE")
+    flags = {r["s3"]["object"]["key"]: r["s3"]["object"]["hasObjectAnnotation"] for r in _records(sqs, url, 2)}
+    assert flags == {"with": True, "without": False}
+
+
+# ── Persistence ────────────────────────────────────────────────────────
+
+
+def test_annotations_survive_a_restart(s3_persist, tmp_path):
+    s3mod = s3_persist
+    bucket = "qa-annot-persist"
+    s3mod._create_bucket(bucket, b"")
+    s3mod._bucket_versioning[bucket] = "Enabled"
+    v1 = s3mod._put_object(bucket, "k", b"one", {})[1]["x-amz-version-id"]
+    s3mod._put_object_annotation(bucket, "k", b"on v1", {}, {"annotationName": ["a"]})
+    v2 = s3mod._put_object(bucket, "k", b"two", {})[1]["x-amz-version-id"]
+    s3mod._put_object_annotation(bucket, "k", b"on v2", {}, {"annotationName": ["a"]})
+
+    s3mod._buckets._data.pop(("000000000000", bucket), None)
+    for store in (s3mod._object_versions._data, s3mod._object_annotations._data):
+        for k in [k for k in store if k[0] == "000000000000" and k[1][0] == bucket]:
+            store.pop(k, None)
+    s3mod._load_persisted_bucket("000000000000", bucket, os.path.join(str(tmp_path), "000000000000", bucket))
+
+    assert s3mod._object_annotations[(bucket, "k", v1)]["a"]["payload"] == "on v1"
+    assert s3mod._object_annotations[(bucket, "k", v2)]["a"]["payload"] == "on v2"
+
+
+# --- Event notification records ---
+
+def _queue(sqs, name):
+    url = sqs.create_queue(QueueName=name)["QueueUrl"]
+    arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    return url, arn
+
+
+def _event_records(sqs, url, expected, timeout=10):
+    """Every S3 record delivered to the queue, waiting until `expected` have arrived."""
+    records = []
+    deadline = time.time() + timeout
+    while len(records) < expected and time.time() < deadline:
+        resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        for m in resp.get("Messages", []):
+            body = json.loads(m["Body"])
+            records.extend(body.get("Records", []))
+            sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
+    return records
+
+
+@pytest.fixture
+def notified(s3, sqs):
+    """A bucket whose object events go to a fresh queue: (bucket, queue url, configure)."""
+    suffix = uuid.uuid4().hex[:8]
+    bucket = f"evt-records-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    url, arn = _queue(sqs, f"evt-records-{suffix}")
+
+    def configure(*events, versioned=False):
+        if versioned:
+            s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        s3.put_bucket_notification_configuration(
+            Bucket=bucket,
+            NotificationConfiguration={"QueueConfigurations": [{"QueueArn": arn, "Events": list(events)}]},
+        )
+        # The configuration's own s3:TestEvent carries no Records; drain it.
+        _event_records(sqs, url, 0, timeout=1)
+
+    return bucket, url, configure
+
+
+def test_record_key_is_url_encoded(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:*")
+    s3.put_object(Bucket=bucket, Key="photos/red flower+(1).jpg", Body=b"x")
+    [record] = _event_records(sqs, url, 1)
+    # "`red flower.jpg` becomes `red+flower.jpg`"; slashes stay, a literal + is escaped.
+    assert record["s3"]["object"]["key"] == "photos/red+flower%2B%281%29.jpg"
+    assert record["eventVersion"] == "2.6"
+
+
+def test_record_carries_the_version_the_put_made(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:*", versioned=True)
+    first = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"one")["VersionId"]
+    second = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"two")["VersionId"]
+    records = _event_records(sqs, url, 2)
+    assert sorted(r["s3"]["object"]["versionId"] for r in records) == sorted([first, second])
+
+
+def test_record_has_no_version_in_an_unversioned_bucket(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:*")
+    s3.put_object(Bucket=bucket, Key="plain.txt", Body=b"x")
+    [record] = _event_records(sqs, url, 1)
+    assert "versionId" not in record["s3"]["object"]
+
+
+def test_sequencer_grows_with_each_write(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:*", "s3:ObjectRemoved:*", versioned=True)
+    v1 = s3.put_object(Bucket=bucket, Key="seq.txt", Body=b"1")["VersionId"]
+    v2 = s3.put_object(Bucket=bucket, Key="seq.txt", Body=b"2")["VersionId"]
+    marker = s3.delete_object(Bucket=bucket, Key="seq.txt")["VersionId"]
+    by_version = {r["s3"]["object"]["versionId"]: r["s3"]["object"]["sequencer"] for r in _event_records(sqs, url, 3)}
+    # Compared as S3 says to: left-pad the shorter with zeros, then compare.
+    width = max(len(v) for v in by_version.values())
+    ordered = [by_version[v].rjust(width, "0") for v in (v1, v2, marker)]
+    assert ordered == sorted(ordered) and len(set(ordered)) == 3
+    assert all(int(s, 16) >= 0 for s in ordered)
+
+
+def test_delete_without_version_reports_the_marker(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectRemoved:*", versioned=True)
+    s3.put_object(Bucket=bucket, Key="gone.txt", Body=b"x")
+    marker = s3.delete_object(Bucket=bucket, Key="gone.txt")["VersionId"]
+    [record] = _event_records(sqs, url, 1)
+    assert record["eventName"] == "ObjectRemoved:DeleteMarkerCreated"
+    assert record["s3"]["object"]["versionId"] == marker
+
+
+def test_marker_is_not_an_object_removed_delete(s3, sqs, notified):
+    bucket, url, configure = notified
+    # Subscribed to permanent deletes only: a marker is its own event type.
+    configure("s3:ObjectRemoved:Delete", versioned=True)
+    version = s3.put_object(Bucket=bucket, Key="kept.txt", Body=b"x")["VersionId"]
+    s3.delete_object(Bucket=bucket, Key="kept.txt")
+    s3.delete_object(Bucket=bucket, Key="kept.txt", VersionId=version)
+    [record] = _event_records(sqs, url, 1)
+    assert record["eventName"] == "ObjectRemoved:Delete"
+    assert record["s3"]["object"]["versionId"] == version
+    assert _event_records(sqs, url, 1, timeout=2) == []
+
+
+def test_copy_record_names_the_new_version(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:Copy", versioned=True)
+    s3.put_object(Bucket=bucket, Key="src.txt", Body=b"x")
+    copied = s3.copy_object(Bucket=bucket, Key="dst.txt", CopySource={"Bucket": bucket, "Key": "src.txt"})
+    [record] = _event_records(sqs, url, 1)
+    assert record["eventName"] == "ObjectCreated:Copy"
+    assert record["s3"]["object"]["versionId"] == copied["VersionId"]
+
+
+def test_multipart_record_names_the_new_version(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectCreated:CompleteMultipartUpload", versioned=True)
+    upload = s3.create_multipart_upload(Bucket=bucket, Key="big.bin")["UploadId"]
+    part = s3.upload_part(Bucket=bucket, Key="big.bin", UploadId=upload, PartNumber=1, Body=b"x" * 16)
+    done = s3.complete_multipart_upload(
+        Bucket=bucket,
+        Key="big.bin",
+        UploadId=upload,
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]},
+    )
+    [record] = _event_records(sqs, url, 1)
+    assert record["s3"]["object"]["versionId"] == done["VersionId"]
+
+
+def test_delete_objects_sends_an_event_per_object(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectRemoved:*", versioned=True)
+    for k in ("a.txt", "b.txt"):
+        s3.put_object(Bucket=bucket, Key=k, Body=b"x")
+    version = s3.put_object(Bucket=bucket, Key="c.txt", Body=b"x")["VersionId"]
+    s3.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": "a.txt"}, {"Key": "b.txt"}, {"Key": "c.txt", "VersionId": version}]},
+    )
+    records = _event_records(sqs, url, 3)
+    got = sorted((r["s3"]["object"]["key"], r["eventName"]) for r in records)
+    assert got == [
+        ("a.txt", "ObjectRemoved:DeleteMarkerCreated"),
+        ("b.txt", "ObjectRemoved:DeleteMarkerCreated"),
+        ("c.txt", "ObjectRemoved:Delete"),
+    ]
+
+
+def test_delete_objects_in_an_unversioned_bucket(s3, sqs, notified):
+    bucket, url, configure = notified
+    configure("s3:ObjectRemoved:*")
+    s3.put_object(Bucket=bucket, Key="u.txt", Body=b"x")
+    s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": "u.txt"}, {"Key": "never-there.txt"}]})
+    [record] = _event_records(sqs, url, 1)
+    assert (record["s3"]["object"]["key"], record["eventName"]) == ("u.txt", "ObjectRemoved:Delete")

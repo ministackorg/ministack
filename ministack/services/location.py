@@ -79,7 +79,6 @@ import time
 import unicodedata
 import urllib.parse
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
@@ -130,7 +129,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     global _sequence
     if not data:
         return
@@ -143,12 +146,6 @@ def restore_state(data):
                 _sequence = max(_sequence, pos.get("Seq", 0))
 
 
-try:
-    _restored = load_state("location")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted location state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------

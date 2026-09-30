@@ -9,6 +9,8 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
           DeleteObjects (batch),
           Multipart Upload (Create, UploadPart, Complete, Abort, List, ListParts),
           Object Tagging (Get, Put, Delete),
+          Object Annotations (PutObjectAnnotation, GetObjectAnnotation,
+          ListObjectAnnotations, DeleteObjectAnnotation; carried by CopyObject),
           ListObjectVersions,
           Bucket sub-resources (Policy, Versioning, Encryption, Lifecycle,
           CORS, ACL, Tagging, Notification, Logging, Accelerate, RequestPayment,
@@ -29,6 +31,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -42,6 +45,7 @@ import time
 import zlib
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
+from urllib.parse import quote_plus as _url_quote_plus
 from urllib.parse import unquote as url_unquote
 from urllib.parse import urlparse as _urlparse
 from xml.etree.ElementTree import Element, ParseError, SubElement, tostring
@@ -56,7 +60,6 @@ from ministack.core.iam_evaluator import (
     find_iam_access_key_account,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -68,6 +71,7 @@ from ministack.core.responses import (
     set_request_account_id,
     set_request_region,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.core.sigv4 import (
     build_canonical_request,
     build_string_to_sign,
@@ -140,6 +144,7 @@ _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
 _object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
+_object_annotations = AccountScopedDict()
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
@@ -158,7 +163,7 @@ _completed_multipart_uploads = AccountScopedDict()
 
 # Module-level registry of per-bucket dicts that round-trip through s3.json.
 # One entry per module global: adding a new _bucket_* dict means one line here,
-# not two separate edits in get_state/restore_state. Must sit below every
+# not two separate edits in get_state/_restore_state. Must sit below every
 # _bucket_* declaration above — the dict literal holds live references.
 # Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
 # per-bucket keys like _ownership_controls / _public_access_block that live
@@ -198,32 +203,28 @@ def get_state():
     return state
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})
+    # Object persistence may already have created placeholder buckets during
+    # import. Restore metadata onto those records without replacing objects.
     if isinstance(bm, AccountScopedDict):
         # Restore all accounts' buckets directly via _data
         for scoped_key, meta in bm._data.items():
-            if scoped_key not in _buckets._data:
-                _buckets._data[scoped_key] = {**meta, "objects": {}}
+            _buckets._data.setdefault(scoped_key, {"objects": {}}).update(meta)
     else:
         # Legacy plain-dict format (pre-multi-tenancy)
         for name, meta in bm.items():
-            if name not in _buckets:
-                _buckets[name] = {**meta, "objects": {}}
+            _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
 
 
-try:
-    _restored = load_state("s3")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
@@ -754,16 +755,162 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if version_id:
         for v in _object_versions.get((bucket_name, key), []):
             if v["version_id"] == version_id:
-                data = v.get("data")
-                if data is not None:
-                    return data
-                obj = bucket["objects"].get(key)
-                return _read_body(bucket_name, key, obj) if obj else None
+                return _version_body(bucket, bucket_name, key, v)
         return None
     obj = bucket["objects"].get(key)
     if obj is None:
         return None
     return _read_body(bucket_name, key, obj)
+
+
+_ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+# The permissions that answer a read and a write, FULL_CONTROL covering both.
+_ACL_READ_PERMS = ("READ", "FULL_CONTROL")
+_ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
+
+
+def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
+    """``(group URI, permission)`` for every Group grant in a stored ACL."""
+    if not stored_xml:
+        return []
+    try:
+        root = fromstring(stored_xml.encode() if isinstance(stored_xml, str) else stored_xml)
+    except Exception:
+        return []
+    grants = []
+    for grant in root.iter():
+        if not grant.tag.endswith("Grant"):
+            continue
+        uri = permission = ""
+        for child in grant.iter():
+            if child.tag.endswith("URI") and child.text:
+                uri = child.text.strip()
+            elif child.tag.endswith("Permission") and child.text:
+                permission = child.text.strip()
+        if uri and permission:
+            grants.append((uri, permission))
+    return grants
+
+
+def _public_access_blocked(owner_account: str, bucket_name: str) -> bool:
+    """Whether the bucket's Public Access Block shuts public grants off."""
+    record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
+    stored = record.get("_public_access_block")
+    if not stored:
+        return False
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return False
+    for child in root.iter():
+        if child.tag.endswith(("BlockPublicAcls", "RestrictPublicBuckets",
+                               "BlockPublicPolicy", "IgnorePublicAcls")):
+            if (child.text or "").strip().lower() == "true":
+                return True
+    return False
+
+
+def _account_from_access_key(access_key: str) -> str:
+    """The tenant an access key selects, the way the router scopes a request."""
+    try:
+        return find_iam_access_key_account(access_key) or access_key
+    except AmbiguousAccessKeyError:
+        return ""
+
+
+def _bucket_owner_account(name: str) -> str | None:
+    """The account that owns *name*, or None.
+
+    "General purpose buckets exist in a global namespace, which means that each
+    bucket name must be unique across all AWS accounts in all the AWS Regions
+    within a partition" — so a name identifies one bucket, whoever asks. The
+    store stays account-scoped; this is the index over it.
+    """
+    for account_id, bucket_name in _buckets._data:
+        if bucket_name == name:
+            return account_id
+    return None
+
+
+def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
+                           method: str, query_params: dict, caller: str) -> bool:
+    """Whether a caller who does not own the bucket may have this request.
+
+    The owner's grants decide it: a Group grant on the bucket or the object
+    ACL, or an allow in the bucket policy. Nothing granted means the request
+    is denied, which is S3's default for a bucket nobody has opened up.
+    """
+    if _public_access_blocked(owner_account, bucket_name):
+        return False
+    wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
+    groups = [_ACL_GROUP_ALL_USERS] if not caller else [
+        _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
+
+    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
+    if key:
+        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, "")))
+    for stored in acls:
+        for uri, permission in _acl_group_grants(stored):
+            if uri in groups and permission in wants:
+                return True
+
+    policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
+    if policy:
+        from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+        action = "s3:GetObject" if method in ("GET", "HEAD") else "s3:PutObject"
+        resource = f"arn:aws:s3:::{bucket_name}"
+        ctx = EvalContext(
+            principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
+            principal_type="Root" if caller else "Anonymous",
+            principal_account=caller or "",
+            action=action,
+            resource_arn=f"{resource}/{key}" if key else resource,
+            region=get_region(),
+        )
+        if evaluate_resource_policy(policy, ctx).decision == "Allow":
+            return True
+    return False
+
+
+def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
+                        body: bytes) -> str:
+    """The caller's access key, including the one a browser POST signs into its
+    form rather than a header or the query string."""
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key and method == "POST" and not key:
+        access_key = _post_form_access_key_id(
+            _parse_multipart_form(headers.get("content-type", ""), body))
+    return access_key
+
+
+def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
+                        query_params: dict, body: bytes = b""):
+    """Resolve the request's bucket in the global namespace and gate it.
+
+    A bucket name identifies one bucket whoever asks, so a request for a name
+    another account owns is answered by that bucket — if its owner granted the
+    access. The scope is pinned to the owner for the rest of the request, so
+    every account-scoped lookup behind this reads the right tenant's state.
+    """
+    if not bucket:
+        return None
+    owner = _bucket_owner_account(bucket)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return None
+    if method == "PUT" and not key and not query_params:
+        # CreateBucket answers BucketAlreadyExists for a taken name.
+        return None
+    access_key = _request_access_key(method, key, headers, query_params, body)
+    if access_key and _account_from_access_key(access_key) == owner:
+        # The caller is the owner; the credential just was not in a header.
+        set_request_account_id(owner)
+        return None
+    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller):
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+    set_request_account_id(owner)
+    return None
 
 
 def _ensure_bucket(name: str):
@@ -1710,6 +1857,13 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
+    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body)
+    if denied is not None:
+        status, resp_headers, resp_body = denied
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
+
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
     status, resp_headers, resp_body = result
@@ -1732,6 +1886,11 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if method == "GET":
             if "uploadId" in query_params:
                 return _list_parts(bucket, key, query_params)
+            if "annotation" in query_params:
+                # One path for both: GetObjectAnnotation names an annotation, ListObjectAnnotations does not.
+                if "annotationName" in query_params:
+                    return _get_object_annotation(bucket, key, headers, query_params)
+                return _list_object_annotations(bucket, key, query_params)
             if "tagging" in query_params:
                 return _get_object_tagging(bucket, key, query_params)
             if "retention" in query_params:
@@ -1749,6 +1908,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
                 if "x-amz-copy-source" in headers:
                     return _upload_part_copy(bucket, key, query_params, headers)
                 return _upload_part(bucket, key, body, query_params, headers)
+            if "annotation" in query_params:
+                return _put_object_annotation(bucket, key, body, headers, query_params)
             if "tagging" in query_params:
                 return _put_object_tagging(bucket, key, body, query_params)
             if "retention" in query_params:
@@ -1780,6 +1941,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if method == "DELETE":
             if "uploadId" in query_params:
                 return _abort_multipart_upload(bucket, key, query_params)
+            if "annotation" in query_params:
+                return _delete_object_annotation(bucket, key, headers, query_params)
             if "tagging" in query_params:
                 return _delete_object_tagging(bucket, key, query_params)
             return _delete_object(bucket, key, headers, query_params)
@@ -1845,7 +2008,7 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if "policy" in query_params:
             return _put_bucket_policy(bucket, body)
         if "notification" in query_params:
-            return _put_bucket_notification(bucket, body)
+            return _put_bucket_notification(bucket, body, headers)
         if "tagging" in query_params:
             return _put_bucket_tagging(bucket, body)
         if "versioning" in query_params:
@@ -1984,6 +2147,18 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if name in _buckets:
         # Idempotent: same account already owns it — return 200 like real AWS
         return 200, {"Location": f"/{name}"}, b""
+    if _bucket_owner_account(name) is not None:
+        # "After creating a general purpose bucket in the shared global
+        # namespace, that bucket name is unavailable for anyone else to create
+        # within a partition."
+        return _error(
+            "BucketAlreadyExists",
+            "The requested bucket name is not available. The bucket namespace "
+            "is shared by all users of the system. Please select a different "
+            "name and try again.",
+            409,
+            f"/{name}",
+        )
 
     region = None
     tags = {}
@@ -2065,6 +2240,8 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _object_annotations if k[0] == name]:
+        del _object_annotations[k]
     for k in [k for k in _object_acl if k[0] == name]:
         del _object_acl[k]
     for k in [k for k in _object_retention if k[0] == name]:
@@ -2647,23 +2824,76 @@ def _get_bucket_notification(name: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_bucket_notification(name: str, body: bytes):
+def _generated_notification_id() -> str:
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
+    return base64.b64encode(new_uuid().encode()).decode().rstrip("=")
+
+
+def _notification_configs_to_xml(configs, has_eventbridge: bool) -> str:
+    """The canonical wire form of a notification configuration.
+
+    Element names come from the S3 model's locationName, which is what every
+    AWS SDK reads: LambdaFunctionConfigurations -> CloudFunctionConfiguration
+    and LambdaFunctionArn -> CloudFunction. Storing whatever spelling the
+    caller happened to send means a GET only parses for that same client.
+    """
+    root = Element("NotificationConfiguration", xmlns=S3_NS)
+    wire = {
+        "sqs": ("QueueConfiguration", "Queue"),
+        "sns": ("TopicConfiguration", "Topic"),
+        "lambda": ("CloudFunctionConfiguration", "CloudFunction"),
+    }
+    for config in configs or []:
+        names = wire.get(config.get("type"))
+        if not names:
+            continue
+        cfg_tag, arn_tag = names
+        cfg_el = SubElement(root, cfg_tag)
+        if config.get("id"):
+            SubElement(cfg_el, "Id").text = str(config["id"])
+        SubElement(cfg_el, arn_tag).text = str(config.get("arn", ""))
+        for event in config.get("events") or []:
+            SubElement(cfg_el, "Event").text = str(event)
+        rules = [("prefix", config.get("filter_prefix")),
+                 ("suffix", config.get("filter_suffix"))]
+        if any(value is not None for _name, value in rules):
+            s3key_el = SubElement(SubElement(cfg_el, "Filter"), "S3Key")
+            for name, value in rules:
+                if value is None:
+                    continue
+                rule_el = SubElement(s3key_el, "FilterRule")
+                SubElement(rule_el, "Name").text = name
+                SubElement(rule_el, "Value").text = value
+    if has_eventbridge:
+        SubElement(root, "EventBridgeConfiguration")
+    return tostring(root, encoding="unicode")
+
+
+def _put_bucket_notification(name: str, body: bytes, headers: dict | None = None):
     if name not in _buckets:
         return _no_such_bucket(name)
     raw = body.decode("utf-8", errors="replace")
     configs = _parse_notification_config_raw(raw)
     bucket_region = _notification_bucket_region(name)
-    validation_error = _validate_notification_configs(configs, bucket_region)
+    # x-amz-skip-destination-validation skips the destination probe below (the
+    # existence + policy check); malformed ARNs and out-of-scope targets are
+    # still rejected as config-shape errors.
+    skip_probe = (headers or {}).get("x-amz-skip-destination-validation", "").lower() == "true"
+    validation_error = _validate_notification_configs(
+        configs, bucket_region, name, skip_probe)
     if validation_error:
         return validation_error
-    _bucket_notifications[name] = raw
+    _bucket_notifications[name] = _notification_configs_to_xml(
+        configs, "EventBridgeConfiguration" in raw)
     # Fire the s3:TestEvent synchronously so it's delivered before PutBucketNotification
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
     # threads, which broke multi-tenant tests). Queue and topic destinations only;
-    # AWS does not send the test event to Lambda targets.
-    _fire_s3_test_event(name)
+    # AWS does not send the test event to Lambda targets. With validation
+    # skipped there is no probe, hence no test event either.
+    if not skip_probe:
+        _fire_s3_test_event(name)
     return 200, {}, b""
 
 
@@ -2945,7 +3175,8 @@ def _parse_notification_config_raw(raw: str | None) -> list[dict]:
                 continue
 
             id_el = _find_xml_tag(cfg_el, "Id")
-            config_id = id_el.text if id_el is not None and id_el.text else new_uuid()
+            config_id = (id_el.text if id_el is not None and id_el.text
+                         else _generated_notification_id())
 
             events: list[str] = []
             for ev_el in list(cfg_el.findall(f"{{{S3_NS}}}Event")) + list(cfg_el.findall("Event")):
@@ -3033,7 +3264,11 @@ def _parse_notification_target_arn(target_type: str, arn: str, bucket_region: st
         return spec, f"expected {expected_service} ARN, got {spec.service}"
     if not spec.account_id:
         return spec, "destination ARN must include an account ID"
-    if spec.account_id != get_account_id():
+    if target_type == "lambda" and spec.account_id != get_account_id():
+        # SQS/SNS destinations may live in another account: real S3 delivers
+        # to them when their resource policy allows it, and the probe below
+        # verifies exactly that. Lambda stays same-account — function policies
+        # are not modeled, so a foreign function could never be verified.
         return spec, "destination account must match bucket owner account"
     if not spec.region:
         return spec, "destination ARN must include a region"
@@ -3056,11 +3291,79 @@ def _validate_notification_target_arn(target_type: str, arn: str, bucket_region:
     return None
 
 
-def _validate_notification_configs(configs: list[dict], bucket_region: str) -> tuple | None:
+def _notification_destination_exists(target_type: str, arn: str, bucket_region: str) -> bool:
+    """Whether the queue or topic an SQS/SNS destination names is there.
+
+    S3 verifies an SNS or SQS destination by sending it a test notification,
+    and "if the message fails, the entire PUT action will fail, and Amazon S3
+    will not add the configuration to your bucket". A Lambda destination is
+    verified through its function permissions instead, which this emulator
+    does not model, so a Lambda target is not checked here.
+    """
+    spec = _parse_delivery_notification_target(target_type, arn, bucket_region)
+    if not spec:
+        return False
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
+    from ministack.services import sns as _sns
+
+    # The topic may belong to another account, so resolve it in its owner's
+    # scope — a current-scope lookup would reject a cross-account topic whose
+    # policy allows the delivery.
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topic_by_arn_any_scope(arn) is not None
+
+
+def _notification_destination_allows(target_type: str, arn: str,
+                                      bucket_name: str, owner: str) -> bool:
+    """Whether the destination's resource policy lets S3 publish to it.
+
+    The Put-time probe half of the AWS verification ("S3 verifies an SNS or
+    SQS destination by sending it a test notification, and if the message
+    fails, the entire PUT action will fail"): no probe message is actually
+    sent here — the delivery-time check answers the same question, and the
+    single test event goes out after the config is stored.
+    """
+    source_arn = f"arn:aws:s3:::{bucket_name}" if bucket_name else ""
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return _sqs.queue_policy_allows(arn, "s3.amazonaws.com",
+                                        source_arn, owner)
+    from ministack.services import sns as _sns
+
+    return _sns.topic_policy_allows(arn, "s3.amazonaws.com", source_arn, owner)
+
+
+def _validate_notification_configs(configs: list[dict], bucket_region: str,
+                                   bucket_name: str = "",
+                                   skip_destination_validation: bool = False,
+                                   ) -> tuple | None:
     for cfg in configs:
         error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
         if error:
             return error
+    if skip_destination_validation:
+        return None
+    # The destination check is second: an ARN that does not parse is reported
+    # as malformed before anything tries to reach what it names. A destination
+    # fails the probe when it does not exist or when its resource policy does
+    # not let S3 publish — either way the whole PUT fails, like real S3. The
+    # policy half is permissive while AUTH is off, leaving the existence check.
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    unreachable = [
+        cfg["arn"] for cfg in configs
+        if cfg["type"] in ("sqs", "sns")
+        and (not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+             or not _notification_destination_allows(cfg["type"], cfg["arn"],
+                                                     bucket_name, owner or ""))
+    ]
+    if unreachable:
+        return _invalid_notification_config(
+            "Unable to validate the following destination configurations: "
+            + ", ".join(unreachable)
+        )
     return None
 
 
@@ -3128,6 +3431,23 @@ def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str | None]:
     return detail_type, reason
 
 
+# Clock-seeded so sequencers keep growing across restarts.
+_event_sequence = itertools.count(time.time_ns() // 1000)
+_EVENT_SEQUENCED_FAMILIES = ("s3:ObjectCreated:", "s3:ObjectRemoved:")
+
+
+def _next_event_sequencer(event_name: str) -> str | None:
+    """Sequencer for create/delete events only; None otherwise."""
+    if not event_name.startswith(_EVENT_SEQUENCED_FAMILIES):
+        return None
+    return f"{next(_event_sequence):018X}"
+
+
+def _event_object_key(key: str) -> str:
+    """URL-encoded key for notification records (EventBridge keeps it raw)."""
+    return _url_quote_plus(key, safe="/")
+
+
 def _fire_s3_event(
     bucket_name: str,
     key: str,
@@ -3136,6 +3456,10 @@ def _fire_s3_event(
     etag: str = "",
     deletion_type: str | None = None,
     restore_event_data: dict | None = None,
+    version_id: str | None = None,
+    sequencer: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
@@ -3150,11 +3474,19 @@ def _fire_s3_event(
         event_time = now_iso()
         request_id = new_uuid()
         clean_etag = etag.strip('"')
+        event_object = {"key": _event_object_key(key), "size": size, "eTag": clean_etag}
+        if version_id:
+            event_object["versionId"] = version_id
+        if sequencer:
+            event_object["sequencer"] = sequencer
+        if object_extra:
+            event_object.update(object_extra)
 
         event_payload = {
             "Records": [
                 {
-                    "eventVersion": "2.1",
+                    # One unified version for every event type since 2.4.
+                    "eventVersion": "2.6",
                     "eventSource": "aws:s3",
                     "awsRegion": bucket_region,
                     "eventTime": event_time,
@@ -3173,16 +3505,13 @@ def _fire_s3_event(
                             "ownerIdentity": {"principalId": "EXAMPLE"},
                             "arn": f"arn:aws:s3:::{bucket_name}",
                         },
-                        "object": {
-                            "key": key,
-                            "size": size,
-                            "eTag": clean_etag,
-                            "sequencer": "0",
-                        },
+                        "object": event_object,
                     },
                 }
             ],
         }
+        if record_extra:
+            event_payload["Records"][0].update(record_extra)
         if restore_event_data:
             # glacierEventData appears only on s3:ObjectRestore:Completed.
             event_payload["Records"][0]["glacierEventData"] = {
@@ -3202,9 +3531,11 @@ def _fire_s3_event(
                 payload["Records"][0]["s3"]["configurationId"] = cfg["id"]
 
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "lambda":
                     _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
             except Exception:
@@ -3220,7 +3551,7 @@ def _fire_s3_event(
                     "version": "0",
                     "event-version": "1.0",
                     "bucket": {"name": bucket_name},
-                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
+                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": sequencer or "0"},
                     "request-id": request_id,
                     "requester": get_account_id(),
                     "source-ip-address": "127.0.0.1",
@@ -3269,7 +3600,8 @@ def _parse_delivery_notification_target(target_type: str, arn: str, bucket_regio
     return spec
 
 
-def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> None:
+def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sqs as _sqs
 
     spec = _parse_delivery_notification_target("sqs", arn, bucket_region)
@@ -3282,6 +3614,14 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> 
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("S3 notification: SQS queue %s not found", queue_name)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sqs.queue_policy_allows(
+            str(spec), "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: queue policy denies delivery from %s to %s",
+                       bucket_name, queue_name)
         return
 
     body = json.dumps(event_payload)
@@ -3300,7 +3640,8 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str) -> 
     logger.info("S3 notification → SQS %s", queue_name)
 
 
-def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str) -> None:
+def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sns as _sns
 
     spec = _parse_delivery_notification_target("sns", arn, bucket_region)
@@ -3309,9 +3650,17 @@ def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str) -> 
     if not _topic_name_from_sns_arn_spec(spec):
         logger.warning("S3 notification: invalid SNS topic ARN %s", arn)
         return
-    topic = _sns._topics.get(arn)
+    topic = _sns._topic_by_arn_any_scope(arn)
     if not topic:
         logger.warning("S3 notification: SNS topic %s not found", arn)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sns.topic_policy_allows(
+            arn, "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: topic policy denies delivery from %s to %s",
+                       bucket_name, arn)
         return
 
     message = json.dumps(event_payload)
@@ -3349,10 +3698,14 @@ def _fire_s3_event_async(
     size: int = 0,
     etag: str = "",
     deletion_type: str | None = None,
+    version_id: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    sequencer = _next_event_sequencer(event_name)
     # threading.Thread does not copy contextvars, so without this snapshot the
     # worker runs under the default account (000000000000): the account-scoped
     # _bucket_notifications lookup comes back empty and the event is silently
@@ -3363,6 +3716,12 @@ def _fire_s3_event_async(
     t = threading.Thread(
         target=ctx.run,
         args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
+        kwargs={
+            "version_id": version_id,
+            "sequencer": sequencer,
+            "object_extra": object_extra,
+            "record_extra": record_extra,
+        },
         daemon=True,
     )
     t.start()
@@ -3387,9 +3746,11 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         for cfg in configs:
             try:
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 # No lambda branch: AWS verifies Lambda destinations by checking the
                 # function's permissions, not by invoking them.
             except Exception:
@@ -3455,29 +3816,32 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"])
-
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(sse_headers)
     _maybe_replicate(bucket_name, key, obj, body)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
-
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
+    # After the version is cut, so the record names it.
+    _fire_s3_event_async(
+        bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"], version_id=version_id
+    )
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
         if obj.get("_replica"):
             dest_name, replica_version = obj["_replica"]
             _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+            _persist_version_state(dest_name, key, _buckets[dest_name])
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
     return 200, resp_headers, b""
 
 
@@ -3565,6 +3929,16 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _post_form_access_key_id(parts) -> str:
+    for name, _filename, _part_headers, value in parts:
+        if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
+            continue
+        try:
+            credential = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return credential.split("/", 1)[0]
+    return ""
 
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
@@ -3576,11 +3950,16 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     `success_action_redirect`. Policy and signature fields are accepted and
     ignored — same lenient stance as ministack's presigned-URL handling.
     """
+    parts = _parse_multipart_form(headers.get("content-type", ""), body)
+
+    access_key_id = _post_form_access_key_id(parts)
+    if access_key_id:
+        set_request_account_id(access_key_id)
+
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    parts = _parse_multipart_form(headers.get("content-type", ""), body)
     if not parts:
         return _error(
             "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.", 400
@@ -3684,22 +4063,22 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         if len(parsed) <= 10:
             pending_tags = parsed
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag)
-
     _maybe_replicate(bucket_name, key, obj, file_value)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
-
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag, version_id=version_id)
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
         if obj.get("_replica"):
             _object_tags[(obj["_replica"][0], key, obj["_replica"][1])] = dict(pending_tags)
+            _persist_version_state(obj["_replica"][0], key, _buckets[obj["_replica"][0]])
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -3835,9 +4214,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 precondition = _check_read_preconditions(headers, vobj, resp_headers)
                 if precondition is not None:
                     return precondition
-                body = v.get("data")
+                body = _version_body(bucket, bucket_name, key, v)
                 if body is None:
-                    body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                    break
                 return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -4101,6 +4480,7 @@ def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     """Remove the current object plus its key-level metadata and on-disk copy."""
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
     _object_acl.pop((bucket_name, key, None), None)
@@ -4235,8 +4615,12 @@ def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, o
     the current-object record the write displaced (captured before the
     overwrite), preserved as the null version when it predates versioning."""
     versioning = _bucket_versioning.get(bucket_name)
+    if versioning != "Enabled":
+        # Overwriting the null version drops its annotations.
+        _object_annotations.pop((bucket_name, key, None), None)
     if versioning not in ("Enabled", "Suspended"):
         return None
+    _persist_displaced_version(bucket_name, key, prior_obj, versioning)
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
     if versioning == "Enabled":
@@ -4258,9 +4642,11 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
     """Append a delete marker per the bucket's versioning state and return its
     version id: a fresh id on Enabled, the literal "null" on Suspended — where
     the marker REPLACES any existing null version, as AWS does."""
+    enabled = _bucket_versioning.get(bucket_name) == "Enabled"
+    _persist_displaced_version(bucket_name, key, prior_obj, "Enabled" if enabled else "Suspended")
     vkey = (bucket_name, key)
     versions = _object_versions.setdefault(vkey, [])
-    if _bucket_versioning.get(bucket_name) == "Enabled":
+    if enabled:
         _preserve_null_version(bucket_name, key, versions, prior_obj)
         marker_id = new_uuid()
     else:
@@ -4268,16 +4654,18 @@ def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) ->
         versions[:] = [v for v in versions if v["version_id"] != "null"]
     for v in versions:
         v["is_latest"] = False
-    versions.append(
-        {
-            "version_id": marker_id,
-            "last_modified": now_iso(),
-            "etag": "",
-            "size": 0,
-            "is_latest": True,
-            "is_delete_marker": True,
-        }
-    )
+    marker = {
+        "version_id": marker_id,
+        "last_modified": now_iso(),
+        "etag": "",
+        "size": 0,
+        "is_latest": True,
+        "is_delete_marker": True,
+    }
+    versions.append(marker)
+    # Persist the marker to the key's sidecar so a restart keeps the object
+    # hidden instead of resurrecting it from its still-present data file.
+    _persist_delete_marker(bucket_name, key, marker)
     return marker_id
 
 
@@ -4341,10 +4729,12 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
         return False, False
 
     removed = versions.pop(idx)
+    _delete_version_file(bucket_name, key, version_id)
     was_delete_marker = bool(removed.get("is_delete_marker"))
     # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
     _object_acl.pop((bucket_name, key, version_id), None)
+    _object_annotations.pop((bucket_name, key, None if version_id == "null" else version_id), None)
 
     if not versions:
         # History is now empty — drop the index entry and the current object.
@@ -4363,7 +4753,12 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     if latest.get("is_delete_marker"):
         bucket["objects"].pop(key, None)
     else:
-        bucket["objects"][key] = _object_record_from_version(latest)
+        record = _object_record_from_version(latest)
+        record["body"] = _version_body(bucket, bucket_name, key, latest)
+        bucket["objects"][key] = record
+    # The key now resolves to a different version (or to a marker): align the
+    # sidecar so a restart does not restore the pre-delete view.
+    _persist_version_state(bucket_name, key, bucket)
     return True, was_delete_marker
 
 
@@ -4428,7 +4823,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         if was_delete_marker:
             resp_headers["x-amz-delete-marker"] = "true"
         if _found:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", version_id=version_id)
         return 204, resp_headers, b""
 
     versioning = _bucket_versioning.get(bucket_name, "")
@@ -4438,12 +4833,19 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", deletion_type="Delete Marker Created")
+            _fire_s3_event_async(
+                bucket_name,
+                key,
+                "s3:ObjectRemoved:DeleteMarkerCreated",
+                deletion_type="Delete Marker Created",
+                version_id=delete_marker_id,
+            )
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
     _object_acl.pop((bucket_name, key, None), None)
@@ -4586,12 +4988,25 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
+    # A new checksum algorithm on the copy also applies to the annotations.
+    annotation_directive = headers.get("x-amz-object-annotation-directive", "COPY").upper()
+    if annotation_directive not in ("COPY", "EXCLUDE"):
+        return _error("InvalidArgument", f"Invalid annotation directive: {annotation_directive}", 400)
+    annotation_algorithm = (
+        headers.get("x-amz-checksum-algorithm") or headers.get("x-amz-sdk-checksum-algorithm") or ""
+    ).upper()
+    if annotation_algorithm and _annotation_checksum(annotation_algorithm, b"") is None:
+        return _annotation_checksum_unsupported(annotation_algorithm)
+
     if src_version_id:
         ventry = next(
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        ventry_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            ventry_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if ventry_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
@@ -4602,7 +5017,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         # the body plus the wire metadata, so a COPY metadata-directive carries
         # the version's user metadata and headers like a current-object copy.
         src_obj = {
-            "body": ventry.get("data", b""),
+            "body": ventry_body,
             "etag": ventry["etag"],
             "size": ventry["size"],
             "last_modified": ventry["last_modified"],
@@ -4708,6 +5123,19 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         if src_tags:
             pending_dest_tags = dict(src_tags)
 
+    pending_dest_annotations: dict | None = None
+    if annotation_directive == "COPY":
+        src_annotations = _object_annotations.get((src_bucket_name, src_key, src_obj.get("version_id")))
+        if src_annotations:
+            pending_dest_annotations = {}
+            for name, entry in src_annotations.items():
+                carried = {k: v for k, v in entry.items() if k != "replication_status"}
+                if annotation_algorithm:
+                    carried["checksums"] = {
+                        annotation_algorithm: _annotation_checksum(annotation_algorithm, entry["payload"].encode())
+                    }
+                pending_dest_annotations[name] = carried
+
     # --- Preserve lock / retention ---
     src_retention = _object_retention.get((src_bucket_name, src_key))
     if src_retention:
@@ -4721,14 +5149,6 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     else:
         _object_legal_hold.pop((bucket_name, dest_key), None)
 
-    _fire_s3_event_async(
-        bucket_name,
-        dest_key,
-        "s3:ObjectCreated:Copy",
-        size=dest_obj["size"],
-        etag=new_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(dest_sse)
     if copy_src_vid:
@@ -4739,17 +5159,33 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     version_id = _record_object_version(bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
-
-    # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
-    if S3_PERSIST:
-        _persist_object(bucket_name, dest_key, dest_obj)
+    _fire_s3_event_async(
+        bucket_name,
+        dest_key,
+        "s3:ObjectCreated:Copy",
+        size=dest_obj["size"],
+        etag=new_etag,
+        version_id=version_id,
+        object_extra={"hasObjectAnnotation": bool(pending_dest_annotations)},
+    )
 
     dest_version_id = dest_obj.get("version_id")
+    if pending_dest_annotations:
+        _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
+        if dest_obj.get("_replica"):
+            replica_bucket, replica_version = dest_obj["_replica"]
+            _object_annotations[(replica_bucket, dest_key, replica_version)] = {
+                name: dict(entry, replication_status="REPLICA") for name, entry in pending_dest_annotations.items()
+            }
+            for entry in pending_dest_annotations.values():
+                entry["replication_status"] = "COMPLETED"
+    else:
+        _object_annotations.pop((bucket_name, dest_key, dest_version_id), None)
     if pending_dest_tags is not None:
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
         if dest_obj.get("_replica"):
             _object_tags[(dest_obj["_replica"][0], dest_key, dest_obj["_replica"][1])] = dict(pending_dest_tags)
+            _persist_version_state(dest_obj["_replica"][0], dest_key, _buckets[dest_obj["_replica"][0]])
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
 
@@ -4761,6 +5197,11 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         # The destination is a new object: it does not inherit whatever the
         # key it replaced was permissioned with.
         _object_acl.pop((bucket_name, dest_key, dest_version_id), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, dest_key, dest_obj)
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -4864,6 +5305,7 @@ def _put_object_tagging(bucket_name: str, key: str, body: bytes, query_params: d
         return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags[(bucket_name, key, version_id)] = tags
+    _persist_version_state(bucket_name, key, bucket)
     resp_headers = {"Content-Type": "application/xml"}
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -4886,10 +5328,444 @@ def _delete_object_tagging(bucket_name: str, key: str, query_params: dict | None
         return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags.pop((bucket_name, key, version_id), None)
+    _persist_version_state(bucket_name, key, bucket)
     resp_headers = {}
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
     return 204, resp_headers, b""
+
+
+# ---------------------------------------------------------------------------
+# Object annotations
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_MAX_PER_VERSION = 1000
+_ANNOTATION_MAX_NAME_BYTES = 512
+_ANNOTATION_MAX_PAYLOAD = 1024 * 1024
+_ANNOTATION_NAME_PUNCTUATION = frozenset("0123456789_.-")
+# XXHASH3/XXHASH128 have no stdlib implementation and are refused.
+_ANNOTATION_CHECKSUM_ALGORITHMS = (
+    "CRC32",
+    "CRC32C",
+    "CRC64NVME",
+    "SHA1",
+    "SHA256",
+    "SHA512",
+    "MD5",
+    "XXHASH64",
+    "XXHASH3",
+    "XXHASH128",
+)
+
+# XXH64 per the xxHash spec.
+_XXH64_P1 = 0x9E3779B185EBCA87
+_XXH64_P2 = 0xC2B2AE3D27D4EB4F
+_XXH64_P3 = 0x165667B19E3779F9
+_XXH64_P4 = 0x85EBCA77C2B2AE63
+_XXH64_P5 = 0x27D4EB2F165667C5
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rotl64(x: int, r: int) -> int:
+    return ((x << r) | (x >> (64 - r))) & _U64
+
+
+def _xxh64_round(acc: int, lane: int) -> int:
+    return (_rotl64((acc + lane * _XXH64_P2) & _U64, 31) * _XXH64_P1) & _U64
+
+
+def _xxh64(data: bytes, seed: int = 0) -> int:
+    n = len(data)
+    i = 0
+    if n >= 32:
+        v = [
+            (seed + _XXH64_P1 + _XXH64_P2) & _U64,
+            (seed + _XXH64_P2) & _U64,
+            seed & _U64,
+            (seed - _XXH64_P1) & _U64,
+        ]
+        while i + 32 <= n:
+            for lane in range(4):
+                v[lane] = _xxh64_round(v[lane], int.from_bytes(data[i + 8 * lane : i + 8 * lane + 8], "little"))
+            i += 32
+        h = (_rotl64(v[0], 1) + _rotl64(v[1], 7) + _rotl64(v[2], 12) + _rotl64(v[3], 18)) & _U64
+        for acc in v:
+            h = ((h ^ _xxh64_round(0, acc)) * _XXH64_P1 + _XXH64_P4) & _U64
+    else:
+        h = (seed + _XXH64_P5) & _U64
+    h = (h + n) & _U64
+    while i + 8 <= n:
+        h ^= _xxh64_round(0, int.from_bytes(data[i : i + 8], "little"))
+        h = (_rotl64(h, 27) * _XXH64_P1 + _XXH64_P4) & _U64
+        i += 8
+    if i + 4 <= n:
+        h ^= (int.from_bytes(data[i : i + 4], "little") * _XXH64_P1) & _U64
+        h = (_rotl64(h, 23) * _XXH64_P2 + _XXH64_P3) & _U64
+        i += 4
+    while i < n:
+        h ^= (data[i] * _XXH64_P5) & _U64
+        h = (_rotl64(h, 11) * _XXH64_P1) & _U64
+        i += 1
+    h ^= h >> 33
+    h = (h * _XXH64_P2) & _U64
+    h ^= h >> 29
+    h = (h * _XXH64_P3) & _U64
+    return h ^ (h >> 32)
+
+
+def _annotation_checksum(algorithm: str, data: bytes) -> str | None:
+    """Base64 checksum of a payload, or None if the algorithm is unsupported."""
+    algo = (algorithm or "").upper().replace("_", "")
+    if algo not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return None
+    if algo == "SHA512":
+        return base64.b64encode(hashlib.sha512(data).digest()).decode()
+    if algo == "MD5":
+        return base64.b64encode(hashlib.md5(data).digest()).decode()
+    if algo == "XXHASH64":
+        return base64.b64encode(struct.pack(">Q", _xxh64(data))).decode()
+    return _compute_s3_checksum(algo, data)
+
+
+def _annotation_checksum_unsupported(algorithm: str) -> tuple:
+    supported = ", ".join(a for a in _ANNOTATION_CHECKSUM_ALGORITHMS if _annotation_checksum(a, b"") is not None)
+    return _error(
+        "InvalidRequest",
+        f"Checksum algorithm not supported: {algorithm}. Supported: {supported}.",
+        400,
+    )
+
+
+def _resolve_annotation_checksums(payload: bytes, headers: dict):
+    """Return ``(checksums, error_or_None)``; CRC64NVME when none is named."""
+    provided = {
+        alg: headers[f"x-amz-checksum-{alg.lower()}"]
+        for alg in _ANNOTATION_CHECKSUM_ALGORITHMS
+        if headers.get(f"x-amz-checksum-{alg.lower()}")
+    }
+    requested = (headers.get("x-amz-sdk-checksum-algorithm") or "").upper().replace("_", "")
+    if requested and requested not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return {}, _error("InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid.", 400)
+    if len(provided) > 1:
+        return {}, _error(
+            "InvalidRequest",
+            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+            400,
+        )
+    algorithm = next(iter(provided), None) or requested or "CRC64NVME"
+    if requested and provided and requested != algorithm:
+        return {}, _error(
+            "InvalidRequest",
+            f"Value for x-amz-sdk-checksum-algorithm header is invalid: {requested} does not match "
+            f"the x-amz-checksum-{algorithm.lower()} header sent.",
+            400,
+        )
+    computed = _annotation_checksum(algorithm, payload)
+    if computed is None:
+        return {}, _annotation_checksum_unsupported(algorithm)
+    if algorithm in provided and provided[algorithm] != computed:
+        return {}, _error("BadDigest", f"The {algorithm} you specified did not match the calculated checksum.", 400)
+    content_md5 = headers.get("content-md5")
+    if content_md5 and content_md5 != base64.b64encode(hashlib.md5(payload).digest()).decode():
+        return {}, _error("BadDigest", "The Content-MD5 you specified did not match what we received.", 400)
+    return {algorithm: computed}, None
+
+
+def _annotation_name_error(name: str) -> tuple | None:
+    """Validate an annotation name against S3's naming rules."""
+    if not name or not name.strip():
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    if len(name.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("AnnotationNameTooLong", "The annotation name exceeds 512 bytes.", 400)
+    if name.lower().startswith(("aws", "s3")) or not all(
+        ch.isalpha() or ch in _ANNOTATION_NAME_PUNCTUATION for ch in name
+    ):
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    return None
+
+
+def _annotation_target(bucket_name: str, key: str, query_params: dict):
+    """Resolve the object version an annotation call acts on."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return None, _no_such_bucket(bucket_name)
+    vid = _qp(query_params or {}, "versionId", "")
+    current = bucket["objects"].get(key)
+    if not vid:
+        if current is None:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}"
+            )
+            err_headers = dict(err_headers)
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return None, (status, err_headers, err_body)
+        return (bucket, current.get("version_id"), current), None
+    if vid == "null" and current is not None and not current.get("version_id"):
+        return (bucket, None, current), None
+    entry = next((v for v in _object_versions.get((bucket_name, key), []) if v["version_id"] == vid), None)
+    if entry is None:
+        return None, _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+    if entry.get("is_delete_marker"):
+        return None, _delete_marker_read_refused(entry)
+    return (bucket, None if vid == "null" else vid, entry), None
+
+
+def _annotation_version_header(bucket_name: str, version_key: str | None) -> dict:
+    """x-amz-object-version-id for the annotated version."""
+    if version_key:
+        return {"x-amz-object-version-id": version_key}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        return {"x-amz-object-version-id": "null"}
+    return {}
+
+
+def _annotation_sse_headers(record: dict) -> dict:
+    """Annotations inherit the object's encryption; SSE-S3 when it has none."""
+    sse = _stored_sse_headers(record)
+    out = {"x-amz-server-side-encryption": sse.get("x-amz-server-side-encryption") or "AES256"}
+    if sse.get("x-amz-server-side-encryption-aws-kms-key-id"):
+        out["x-amz-server-side-encryption-aws-kms-key-id"] = sse["x-amz-server-side-encryption-aws-kms-key-id"]
+    return out
+
+
+def _annotation_if_match(headers: dict, record: dict) -> tuple | None:
+    """x-amz-object-if-match checks the object's ETag."""
+    expected = headers.get("x-amz-object-if-match")
+    if expected and expected != "*" and expected.strip('"') != (record.get("etag") or "").strip('"'):
+        return _error("PreconditionFailed", "At least one of the pre-conditions you specified did not hold", 412)
+    return None
+
+
+def _annotation_checksum_headers(entry: dict) -> dict:
+    out = {f"x-amz-checksum-{alg.lower()}": value for alg, value in (entry.get("checksums") or {}).items()}
+    if out:
+        out["x-amz-checksum-type"] = "FULL_OBJECT"
+    return out
+
+
+def _annotation_lock_error(bucket_name: str, key: str, headers: dict) -> tuple | None:
+    """Object Lock refusal for an annotation write (observed on AWS)."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    if _object_legal_hold.get((bucket_name, key)) == "ON":
+        return _error("AccessDenied", "Access Denied because object protected by object lock legal hold.", 403)
+    retention = _object_retention.get((bucket_name, key))
+    if not retention:
+        return None
+    retain_until = retention.get("RetainUntilDate", "")
+    if not retain_until or retain_until <= now_iso():
+        return None
+    mode = retention.get("Mode", "")
+    bypass = headers.get("x-amz-bypass-governance-retention", "").lower() == "true"
+    if mode == "COMPLIANCE" or (mode == "GOVERNANCE" and not bypass):
+        return _error("AccessDenied", "Access Denied because object protected by object lock retention.", 403)
+    return None
+
+
+def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    if _stored_sse_headers(record).get("x-amz-server-side-encryption-customer-algorithm"):
+        return _error("InvalidRequest", "Objects encrypted with SSE-C cannot have annotations.", 400)
+    payload = body or b""
+    if not payload or len(payload) > _ANNOTATION_MAX_PAYLOAD:
+        return _error("InvalidRequest", "An annotation payload must be between 1 byte and 1 MiB.", 400)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return _error("UnsupportedMediaType", "The annotation payload is not valid UTF-8 encoded text.", 415)
+    checksums, checksum_error = _resolve_annotation_checksums(payload, headers)
+    if checksum_error:
+        return checksum_error
+
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    if name not in annotations and len(annotations) >= _ANNOTATION_MAX_PER_VERSION:
+        return _error(
+            "AnnotationLimitExceeded",
+            "The request would exceed the maximum number of annotations allowed per object.",
+            400,
+        )
+    entry = {
+        "payload": text,
+        "size": len(payload),
+        "etag": f'"{md5_hash(payload)}"',
+        "last_modified": now_iso(),
+        "checksums": checksums,
+    }
+    # Annotations replicate onto the version's replica.
+    current = bucket["objects"].get(key)
+    if current is not None and current.get("version_id") == version_key and current.get("_replica"):
+        replica_bucket, replica_version = current["_replica"]
+        replica_key = (replica_bucket, key, replica_version)
+        replica_annotations = dict(_object_annotations.get(replica_key) or {})
+        replica_annotations[name] = dict(entry, replication_status="REPLICA")
+        _object_annotations[replica_key] = replica_annotations
+        _persist_version_state(replica_bucket, key, _buckets[replica_bucket])
+        entry["replication_status"] = "COMPLETED"
+    annotations[name] = entry
+    _object_annotations[store_key] = annotations
+    _persist_version_state(bucket_name, key, bucket)
+
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectAnnotation:Put",
+        size=record.get("size", 0),
+        etag=record.get("etag", ""),
+        version_id=version_headers.get("x-amz-object-version-id"),
+        record_extra={"objectAnnotation": [{"name": name, "size": entry["size"], "eTag": entry["etag"].strip('"')}]},
+    )
+
+    resp_headers = {"Content-Type": "application/xml", "ETag": entry["etag"]}
+    resp_headers.update(version_headers)
+    resp_headers.update(_annotation_checksum_headers(entry))
+    resp_headers.update(_annotation_sse_headers(record))
+    root = Element("PutObjectAnnotationOutput", xmlns=S3_NS)
+    SubElement(root, "Key").text = key
+    SubElement(root, "AnnotationName").text = name
+    return 200, resp_headers, _xml_body(root)
+
+
+def _get_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, record = target
+    entry = (_object_annotations.get((bucket_name, key, version_key)) or {}).get(name)
+    if entry is None:
+        return _error(
+            "NoSuchAnnotation", "The specified annotation does not exist on this object.", 404, f"/{bucket_name}/{key}"
+        )
+    payload = entry["payload"].encode("utf-8")
+    resp_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(payload)),
+        "ETag": entry["etag"],
+        "Last-Modified": iso_to_rfc7231(entry["last_modified"]),
+    }
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    resp_headers.update(_annotation_sse_headers(record))
+    if entry.get("replication_status"):
+        resp_headers["x-amz-replication-status"] = entry["replication_status"]
+    # As for GetObject, stored checksums come back only when asked for.
+    if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
+        resp_headers.update(_annotation_checksum_headers(entry))
+    return 200, resp_headers, payload
+
+
+def _list_object_annotations(bucket_name: str, key: str, query_params: dict):
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, _record = target
+    prefix = _qp(query_params, "annotation-prefix", "")
+    if len(prefix.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("InvalidPrefix", "The annotation prefix you provided is invalid.", 400)
+    raw_max = _qp(query_params, "max-annotation-results", "")
+    try:
+        max_results = int(raw_max) if raw_max else _ANNOTATION_MAX_PER_VERSION
+    except ValueError:
+        max_results = 0
+    if not 1 <= max_results <= _ANNOTATION_MAX_PER_VERSION:
+        return _error("InvalidArgument", "max-annotation-results must be between 1 and 1000.", 400)
+    token = _qp(query_params, "continuation-token", "")
+    after = ""
+    if token:
+        try:
+            after = base64.urlsafe_b64decode(token.encode()).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return _error("InvalidArgument", "The continuation token provided is incorrect.", 400)
+
+    # UTF-8 binary order (undocumented); the token is the last name returned.
+    annotations = _object_annotations.get((bucket_name, key, version_key)) or {}
+    names = sorted(
+        (n for n in annotations if n.startswith(prefix) and (not after or n.encode() > after.encode())),
+        key=lambda n: n.encode("utf-8"),
+    )
+    page = names[:max_results]
+
+    root = Element("ListObjectAnnotationsOutput", xmlns=S3_NS)
+    listed = SubElement(root, "Annotations")
+    for name in page:
+        entry = annotations[name]
+        el = SubElement(listed, "AnnotationEntry")
+        SubElement(el, "AnnotationName").text = name
+        for alg in entry.get("checksums") or {}:
+            SubElement(el, "ChecksumAlgorithm").text = alg
+        SubElement(el, "ETag").text = entry["etag"]
+        SubElement(el, "LastModified").text = entry["last_modified"]
+        if entry.get("replication_status"):
+            SubElement(el, "ReplicationStatus").text = entry["replication_status"]
+        SubElement(el, "Size").text = str(entry["size"])
+    SubElement(root, "Bucket").text = bucket_name
+    SubElement(root, "Key").text = key
+    if prefix:
+        SubElement(root, "AnnotationPrefix").text = prefix
+    SubElement(root, "MaxAnnotationResults").text = str(max_results)
+    SubElement(root, "AnnotationCount").text = str(len(page))
+    if token:
+        SubElement(root, "ContinuationToken").text = token
+    if len(names) > max_results:
+        SubElement(root, "NextContinuationToken").text = base64.urlsafe_b64encode(page[-1].encode()).decode()
+    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    return 200, resp_headers, _xml_body(root)
+
+
+def _delete_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    # A missing annotation still answers 204; only a real delete fires the event.
+    if annotations.pop(name, None) is not None:
+        if annotations:
+            _object_annotations[store_key] = annotations
+        else:
+            _object_annotations.pop(store_key, None)
+        _persist_version_state(bucket_name, key, bucket)
+        _fire_s3_event_async(
+            bucket_name,
+            key,
+            "s3:ObjectAnnotation:Delete",
+            size=record.get("size", 0),
+            etag=record.get("etag", ""),
+            version_id=version_headers.get("x-amz-object-version-id"),
+            record_extra={"objectAnnotation": [{"name": name}]},
+        )
+    return 204, version_headers, b""
 
 
 # ---------------------------------------------------------------------------
@@ -5278,6 +6154,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
         if canned not in _CANNED_OBJECT_ACLS:
             return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned, _canonical_owner_id())
+        _persist_version_state(bucket_name, key, bucket)
         return 200, {}, b""
 
     if not body:
@@ -5295,6 +6172,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
             400,
         )
     _object_acl[(bucket_name, key, version_id)] = body.decode("utf-8", errors="replace")
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {}, b""
 
 
@@ -5678,17 +6556,33 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             # S3 reports the delete as successful even if the version was absent.
             _found, was_marker = _delete_object_version(bucket, bucket_name, k, version_id)
             deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+            # Each entry sends the single-object DELETE's event.
+            if _found:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete", version_id=version_id)
         elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
             # No VersionId on a versioned bucket: create a delete marker —
             # even for a key that never existed — exactly as the single-object
             # DELETE does, and report it on the Deleted entry.
+            existed = k in bucket["objects"]
             marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
             bucket["objects"].pop(k, None)
             deleted.append({"key": k, "version_id": "", "was_marker": False, "marker_created": marker_id})
+            if existed:
+                _fire_s3_event_async(
+                    bucket_name,
+                    k,
+                    "s3:ObjectRemoved:DeleteMarkerCreated",
+                    deletion_type="Delete Marker Created",
+                    version_id=marker_id,
+                )
         else:
             # No VersionId → plain delete of the current object.
+            existed = k in bucket["objects"]
+            if existed:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete")
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
+            _object_annotations.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
             _object_acl.pop((bucket_name, k, None), None)
@@ -5883,14 +6777,16 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
             (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        src_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            src_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if src_body is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
                 404,
                 f"/{src_bucket_name}/{src_key}",
             )
-        src_body = ventry.get("data") or b""
     else:
         if src_key not in src_bucket["objects"]:
             return _error("NoSuchKey", "The specified key does not exist.", 404)
@@ -6109,20 +7005,20 @@ def _complete_multipart_upload(
 
     del _multipart_uploads[upload_id]
 
-    _fire_s3_event_async(
-        bucket_name,
-        key,
-        "s3:ObjectCreated:CompleteMultipartUpload",
-        size=obj["size"],
-        etag=final_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
     _maybe_replicate(bucket_name, key, obj, combined)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectCreated:CompleteMultipartUpload",
+        size=obj["size"],
+        etag=final_etag,
+        version_id=version_id,
+    )
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -6344,33 +7240,169 @@ def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
     os.replace(tmp, fpath)
 
 
+def _object_meta_from_record(obj: dict) -> dict:
+    """The metadata snapshot stored in an object's .meta.json sidecar."""
+    return {
+        "content_type": obj.get("content_type", "application/octet-stream"),
+        "content_encoding": obj.get("content_encoding"),
+        "etag": obj.get("etag", ""),
+        "last_modified": obj.get("last_modified", ""),
+        "size": obj.get("size", 0),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class", "STANDARD"),
+        "checksums": obj.get("checksums", {}),
+        "version_id": obj.get("version_id"),
+    }
+
+
 def _persist_object(bucket: str, key: str, obj):
     try:
         fpath = _object_disk_path(bucket, key)
         if fpath is None:
             return
         os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
-        data = obj["body"] if isinstance(obj, dict) else obj
-        _atomic_write(fpath, data)
         if isinstance(obj, dict):
-            meta = {
-                "content_type": obj.get("content_type", "application/octet-stream"),
-                "content_encoding": obj.get("content_encoding"),
-                "etag": obj.get("etag", ""),
-                "last_modified": obj.get("last_modified", ""),
-                "size": obj.get("size", 0),
-                "metadata": obj.get("metadata", {}),
-                "preserved_headers": obj.get("preserved_headers", {}),
-                "storage_class": obj.get("storage_class", "STANDARD"),
-                "checksums": obj.get("checksums", {}),
-                "version_id": obj.get("version_id"),
-            }
+            # A record rebuilt from a version entry may carry no body; the
+            # data file already on disk then stands, and only the sidecar is
+            # refreshed.
+            data = obj.get("body")
+            if data is not None:
+                _atomic_write(fpath, data)
+            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key)}
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
-        # Drop body from in-memory record to save RAM
-        if isinstance(obj, dict):
+            # Drop body from in-memory record to save RAM
             obj["body"] = None
+        else:
+            _atomic_write(fpath, obj)
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
+
+
+def _persist_delete_marker(bucket_name: str, key: str, marker: dict):
+    """Record a delete marker in the key's .meta.json sidecar.
+
+    A marker has no body, so it cannot ride the data file the way a version
+    does — the sidecar is its only on-disk record. Without it a restart finds
+    the hidden object's data file, reloads it as current, and the deleted
+    object reappears."""
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _object_disk_path(bucket_name, key)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        meta = {
+            "is_delete_marker": True,
+            "version_id": marker.get("version_id"),
+            "last_modified": marker.get("last_modified", ""),
+            **_key_history_meta(bucket_name, key),
+        }
+        _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
+    except Exception as e:
+        logger.warning("Failed to persist S3 delete marker %s/%s: %s", bucket_name, key, e)
+
+
+def _persist_version_state(bucket_name: str, key: str, bucket: dict):
+    """Rewrite a key's on-disk state after a version operation.
+
+    Purging a version can change what the key resolves to — a removed delete
+    marker may expose an older version, or promote another marker — and the
+    sidecar must agree with that, or a restart restores the pre-delete view."""
+    if not S3_PERSIST:
+        return
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker"):
+        _persist_delete_marker(bucket_name, key, latest)
+    elif key in bucket["objects"]:
+        _persist_object(bucket_name, key, bucket["objects"][key])
+    else:
+        _delete_persisted_object(bucket_name, key)
+
+
+def _key_history_meta(bucket_name: str, key: str) -> dict:
+    versions = _object_versions.get((bucket_name, key)) or []
+    extra = {}
+    if versions:
+        extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
+    vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
+    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+        found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
+        found = {vid: value for vid, value in found.items() if value is not None}
+        if found:
+            extra[field] = found
+    return extra
+
+
+_VERSIONS_DIR = ".versions"
+
+
+def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
+    if account_id is None:
+        account_id = get_account_id()
+    root = os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id))
+    candidate = os.path.realpath(os.path.join(root, key))
+    try:
+        if candidate == root or os.path.commonpath([root, candidate]) != root:
+            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+            return None
+    except ValueError:
+        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+        return None
+    return candidate
+
+
+def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
+    fpath = _version_disk_path(bucket_name, key, version_id, account_id)
+    return fpath is not None and os.path.isfile(fpath)
+
+
+def _persist_displaced_version(bucket_name: str, key: str, prior_obj: dict | None, versioning: str):
+    if not S3_PERSIST:
+        return
+    try:
+        if versioning == "Suspended":
+            _delete_version_file(bucket_name, key, "null")
+        if prior_obj is None:
+            return
+        prior_vid = prior_obj.get("version_id") or "null"
+        if versioning == "Suspended" and prior_vid == "null":
+            return
+        fpath = _version_disk_path(bucket_name, key, prior_vid)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        _atomic_write(fpath, _read_body(bucket_name, key, prior_obj))
+    except Exception as e:
+        logger.warning("Failed to persist S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_version_file(bucket_name: str, key: str, version_id: str):
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _version_disk_path(bucket_name, key, version_id)
+        if fpath is not None and os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception as e:
+        logger.warning("Failed to delete persisted S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _version_body(bucket: dict, bucket_name: str, key: str, v: dict) -> bytes | None:
+    if v.get("data") is not None:
+        return v["data"]
+    if S3_PERSIST and _version_file_exists(bucket_name, key, v["version_id"]):
+        try:
+            with open(_version_disk_path(bucket_name, key, v["version_id"]), "rb") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning("Failed to read persisted S3 object version %s/%s: %s", bucket_name, key, e)
+    current = bucket["objects"].get(key)
+    if current is not None and (current.get("version_id") or "null") == v["version_id"]:
+        return _read_body(bucket_name, key, current)
+    return None
 
 
 def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
@@ -6451,6 +7483,8 @@ def _load_persisted_data():
             entry_path = os.path.join(DATA_DIR, entry)
             if not os.path.isdir(entry_path):
                 continue
+            if entry == _VERSIONS_DIR:
+                continue
             # Detect if this entry is an account ID directory (12-digit or has bucket subdirs)
             if entry.isdigit() and len(entry) == 12:
                 # New layout: entry is an account ID
@@ -6499,6 +7533,13 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                         meta = json.load(mf)
                 except Exception:
                     pass
+            # A delete marker's sidecar stands in for the object it hides: the
+            # data file belongs to the version underneath, not to the current
+            # key. Rebuild the marker (and the version it covers) instead of
+            # resurrecting the object as current.
+            if meta.get("is_delete_marker"):
+                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+                continue
             # Body stays on disk — only load metadata into memory.
             # Compute size/etag from meta sidecar; fall back to reading
             # the file only when the sidecar is missing or incomplete.
@@ -6523,6 +7564,9 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             }
             if meta.get("version_id"):
                 bucket["objects"][key]["version_id"] = meta["version_id"]
+            if "versions" in meta or "tags" in meta or "acl" in meta:
+                _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+            elif meta.get("version_id"):
                 vkey = (bucket_name, key)
                 scoped_vkey = (account_id, vkey)
                 if scoped_vkey not in _object_versions._data:
@@ -6543,6 +7587,71 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                         "checksums": meta.get("checksums", {}),
                     }
                 )
+    # Delete markers whose data file is gone (a key that never held a body, or
+    # whose version was purged) live on as a lone sidecar.
+    for dirpath, _dirnames, filenames in os.walk(bucket_path):
+        for fname in filenames:
+            if not fname.endswith(".meta.json"):
+                continue
+            meta_path = os.path.join(dirpath, fname)
+            data_path = meta_path[: -len(".meta.json")]
+            if os.path.exists(data_path):
+                continue  # handled with its data file above
+            try:
+                with open(meta_path) as mf:
+                    meta = json.load(mf)
+            except Exception:
+                continue
+            if meta.get("is_delete_marker"):
+                key = os.path.relpath(data_path, bucket_path)
+                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+
+
+def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a persisted delete marker and hide the key."""
+    bucket["objects"].pop(key, None)
+    if "versions" in meta:
+        _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        return
+    _object_versions._data[(account_id, (bucket_name, key))] = [
+        {
+            "version_id": meta.get("version_id") or "null",
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "etag": "",
+            "size": 0,
+            "is_latest": True,
+            "is_delete_marker": True,
+        }
+    ]
+
+
+def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a key's version history, tags and ACLs from its sidecar. A real
+    version comes back only when its bytes did."""
+    current = bucket["objects"].get(key)
+    current_vid = (current.get("version_id") or "null") if current is not None else None
+    versions = [
+        dict(v, data=None)
+        for v in meta.get("versions", [])
+        if v.get("is_delete_marker")
+        or v["version_id"] == current_vid
+        or _version_file_exists(bucket_name, key, v["version_id"], account_id)
+    ]
+    scoped_vkey = (account_id, (bucket_name, key))
+    if versions:
+        for v in versions:
+            v["is_latest"] = False
+        versions[-1]["is_latest"] = True
+        _object_versions._data[scoped_vkey] = versions
+    else:
+        _object_versions._data.pop(scoped_vkey, None)
+    live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
+    if current is not None and not current.get("version_id"):
+        live.add("null")
+    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+        for vid, value in (meta.get(field) or {}).items():
+            if vid in live:
+                store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value
 
 
 _load_persisted_data()
@@ -6554,7 +7663,7 @@ def reset():
     global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
-    global _object_tags, _multipart_uploads, _object_versions, _object_acl
+    global _object_tags, _multipart_uploads, _object_versions, _object_acl, _object_annotations
     global _bucket_object_lock, _bucket_replication, _object_retention, _object_legal_hold
     for d in (
         _buckets,
@@ -6572,6 +7681,7 @@ def reset():
         _bucket_request_payment_config,
         _object_tags,
         _object_acl,
+        _object_annotations,
         _multipart_uploads,
         _completed_multipart_uploads,
         _bucket_object_lock,

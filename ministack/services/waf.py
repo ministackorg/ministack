@@ -17,7 +17,6 @@ import logging
 import os
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -59,7 +58,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not isinstance(data, dict):
         return
     arn_rewrites = {}
@@ -226,6 +229,24 @@ def create_web_acl_record(name, scope, props):
     return uid, arn, record
 
 
+def web_acl_record(uid, scope):
+    """The stored web ACL, or None. The CloudFormation provisioner reads it
+    to update an ACL in place."""
+    return _resource_from_scope(_web_acls, uid, scope)
+
+
+def update_web_acl_record(acl, props):
+    """Apply the members ``create_web_acl_record`` stores to an existing web
+    ACL and roll its lock token, as ``UpdateWebACL`` does. The ACL keeps its
+    id, ARN and tags."""
+    acl["Description"] = props.get("Description", "")
+    acl["DefaultAction"] = props.get("DefaultAction", {"Allow": {}})
+    acl["Rules"] = props.get("Rules", [])
+    acl["VisibilityConfig"] = props.get("VisibilityConfig", {})
+    acl["LockToken"] = new_uuid()
+    return acl
+
+
 def delete_web_acl_record(uid, scope):
     acl = _web_acls.pop_scoped(get_account_id(), _scope_home_region(scope), uid, None)
     if acl:
@@ -248,15 +269,6 @@ def _values_for_scope(store, scope):
     return store.values_scoped(get_account_id(), _scope_home_region(scope))
 
 
-try:
-    _restored = load_state("waf")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _waf_err(code, message):

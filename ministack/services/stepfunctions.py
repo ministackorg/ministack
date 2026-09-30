@@ -27,6 +27,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 
 import ast
 import asyncio
+import base64
 import contextvars
 import copy
 import json
@@ -47,7 +48,6 @@ except ImportError:  # the wheel is optional at runtime: JSONata states refuse
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -131,6 +131,11 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
 
 _state_machines = AccountRegionScopedDict()
 _executions = AccountRegionScopedDict()
+# Continuation tokens are ephemeral, like AWS's 24-hour history tokens. Each
+# token fixes the history length so new events cannot shift reverse-order pages.
+_HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_history_page_tokens = {}
+_history_page_tokens_lock = threading.Lock()
 _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
@@ -161,7 +166,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _state_machines.update(data.get("state_machines", {}))
@@ -180,15 +189,6 @@ def restore_state(data):
             exc["cause"] = "Execution was running when service restarted"
 
 
-try:
-    _restored = load_state("stepfunctions")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 _TIMESTAMP_RESPONSE_FIELDS = {
@@ -780,11 +780,67 @@ def _get_execution_history(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    max_results = data.get("maxResults", 100)
+    if max_results == 0 and not isinstance(max_results, bool):
+        max_results = 100
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 0 < max_results <= 1000:
+        return error_response_json("ValidationException", "maxResults must be between 0 and 1000", 400)
+
+    reverse_order = data.get("reverseOrder", False)
+    include_data = data.get("includeExecutionData", True)
     events = list(execution["events"])
-    if data.get("reverseOrder", False):
-        events = list(reversed(events))
-    max_results = data.get("maxResults", 1000)
-    return json_response({"events": events[:max_results]})
+    token = data.get("nextToken")
+    if token is None:
+        start, snapshot_size = 0, len(events)
+    else:
+        with _history_page_tokens_lock:
+            page_state = _history_page_tokens.get(token) if isinstance(token, str) else None
+        if (page_state is None or page_state["expires"] <= time.time()
+                or page_state["executionArn"] != exec_arn
+                or page_state["maxResults"] != max_results
+                or page_state["reverseOrder"] != reverse_order
+                or page_state["includeExecutionData"] != include_data
+                or page_state["snapshotSize"] > len(events)):
+            return error_response_json("InvalidToken", "Invalid pagination token", 400)
+        start, snapshot_size = page_state["start"], page_state["snapshotSize"]
+
+    events = events[:snapshot_size]
+    if reverse_order:
+        events.reverse()
+
+    page = events[start:start + max_results]
+    if include_data is False:
+        page = [copy.deepcopy(event) for event in page]
+        for event in page:
+            for key, details in event.items():
+                if key.endswith("EventDetails") and isinstance(details, dict):
+                    for payload in ("input", "output"):
+                        if payload in details:
+                            del details[payload]
+
+    response = {"events": page}
+    if start + max_results < snapshot_size:
+        now = time.time()
+        with _history_page_tokens_lock:
+            # Dict insertion order is creation order, so expired tokens are
+            # removed from the front without scanning live continuations.
+            while _history_page_tokens:
+                oldest = next(iter(_history_page_tokens))
+                if _history_page_tokens[oldest]["expires"] > now:
+                    break
+                del _history_page_tokens[oldest]
+            next_token = new_uuid()
+            _history_page_tokens[next_token] = {
+                "executionArn": exec_arn,
+                "maxResults": max_results,
+                "reverseOrder": reverse_order,
+                "includeExecutionData": include_data,
+                "start": start + max_results,
+                "snapshotSize": snapshot_size,
+                "expires": now + _HISTORY_TOKEN_TTL_SECONDS,
+            }
+        response["nextToken"] = next_token
+    return json_response(response)
 
 
 def _start_sync_execution(data):
@@ -3469,6 +3525,15 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         wire_data = _convert_keys_to_camel(input_data or {})
     else:
         wire_data = input_data
+    # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
+    # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
+    # without changing the state input or guessing whether the text is base64.
+    if (service_name == "secretsmanager"
+            and pascal_action in {"CreateSecret", "PutSecretValue"}
+            and isinstance(wire_data, dict)
+            and isinstance(wire_data.get("SecretBinary"), str)):
+        wire_data = dict(wire_data)
+        wire_data["SecretBinary"] = base64.b64encode(wire_data["SecretBinary"].encode("utf-8")).decode("ascii")
     body = json.dumps(wire_data)
     headers = {
         "x-amz-target": target,
@@ -3495,6 +3560,10 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_type = result.get("__type", result.get("Error", {}).get("Code", "ServiceException"))
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(_prefix_sdk_error(service_name, error_type), error_msg)
+
+    if (service_name == "secretsmanager" and pascal_action == "GetSecretValue"
+            and isinstance(result, dict) and "SecretBinary" in result):
+        result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
     # For JSON-protocol services, only convert top-level keys to avoid
     # mangling user-defined data (e.g. DynamoDB attribute names).
@@ -4777,6 +4846,8 @@ _SERVICE_DISPATCH = {
 def reset():
     _state_machines.clear()
     _executions.clear()
+    with _history_page_tokens_lock:
+        _history_page_tokens.clear()
     _task_tokens.clear()
     _tags.clear()
     _activities.clear()

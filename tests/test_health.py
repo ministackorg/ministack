@@ -1,7 +1,6 @@
 import json
 import os
 
-
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 

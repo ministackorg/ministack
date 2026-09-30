@@ -1108,6 +1108,61 @@ def test_logs_delivery_destination_crud(logs):
     logs.delete_delivery_destination(name=dest_name)
 
 
+def test_logs_delivery_destination_policy_crud(logs):
+    """Put/Get/Delete round-trip for a delivery destination policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    dest_name = f"intg-dest-{uid}"
+    dest_resource_arn = f"arn:aws:logs:us-east-1:000000000000:log-group:/intg/delivery-{uid}:*"
+
+    dest_resp = logs.put_delivery_destination(
+        name=dest_name,
+        deliveryDestinationConfiguration={
+            "destinationResourceArn": dest_resource_arn,
+        },
+    )
+    dest_arn = dest_resp["deliveryDestination"]["arn"]
+    policy = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowCWLDelivery",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "delivery.logs.amazonaws.com"},
+                    "Action": "logs:CreateDelivery",
+                    "Resource": dest_arn,
+                }
+            ],
+        }
+    )
+
+    put_resp = logs.put_delivery_destination_policy(
+        deliveryDestinationName=dest_name,
+        deliveryDestinationPolicy=policy,
+    )
+    assert put_resp["policy"]["deliveryDestinationPolicy"] == policy
+
+    get_resp = logs.get_delivery_destination_policy(deliveryDestinationName=dest_name)
+    assert get_resp["policy"]["deliveryDestinationPolicy"] == policy
+
+    logs.delete_delivery_destination_policy(deliveryDestinationName=dest_name)
+    with pytest.raises(ClientError) as exc:
+        logs.get_delivery_destination_policy(deliveryDestinationName=dest_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    logs.delete_delivery_destination(name=dest_name)
+
+
+def test_logs_delivery_destination_policy_requires_existing_destination(logs):
+    """PutDeliveryDestinationPolicy on an unknown destination is ResourceNotFoundException."""
+    with pytest.raises(ClientError) as exc:
+        logs.put_delivery_destination_policy(
+            deliveryDestinationName="does-not-exist",
+            deliveryDestinationPolicy="{}",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_logs_delivery_create_binds_source_and_destination(logs):
     """CreateDelivery wires a source to a destination and returns a delivery id/ARN."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -1526,7 +1581,7 @@ def _round_trip(mod, svc_key="cloudwatch_logs"):
         "file was not written by save_state(). Check get_state() "
         "correctness and that PERSIST_STATE is True."
     )
-    mod.restore_state(loaded)
+    mod.load_persisted_state(loaded)
 
 
 # ── _destinations ──────────────────────────────────────────────────────
@@ -1613,7 +1668,7 @@ def test_legacy_metric_filters_restore_to_log_group_region():
 
     try:
         set_request_region("us-east-1")
-        mod.restore_state({
+        mod.load_persisted_state({
             "log_groups": {
                 group: {
                     "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
@@ -1722,7 +1777,7 @@ def test_legacy_queries_restore_to_log_group_region():
 
     try:
         set_request_region("us-east-1")
-        mod.restore_state({
+        mod.load_persisted_state({
             "log_groups": {
                 group: {
                     "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",

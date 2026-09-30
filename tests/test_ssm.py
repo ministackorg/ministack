@@ -332,7 +332,7 @@ def test_ssm_restore_legacy_parameter_history_uses_parameter_arn_region():
     ]
 
     try:
-        ssm_service.restore_state({
+        ssm_service.load_persisted_state({
             "parameters": parameters,
             "parameter_history": parameter_history,
         })
@@ -376,7 +376,7 @@ def test_ssm_restore_legacy_history_prefers_exact_parameter_name_region():
     ]
 
     try:
-        ssm_service.restore_state({
+        ssm_service.load_persisted_state({
             "parameters": parameters,
             "parameter_history": parameter_history,
         })
@@ -410,7 +410,7 @@ def test_ssm_restore_legacy_bare_name_tags_uses_stored_parameter_arn():
     tags[legacy_arn] = {"env": "legacy"}
 
     try:
-        ssm_service.restore_state({
+        ssm_service.load_persisted_state({
             "parameters": parameters,
             "tags": tags,
         })
@@ -472,7 +472,7 @@ def test_ssm_arn_lookup_prefers_exact_stored_arn_match():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service.load_persisted_state({"parameters": parameters})
         set_request_region("us-west-2")
         assert ssm_service.resolve_parameter_value(bare_arn) == "bare"
         assert ssm_service.resolve_parameter_value(path_arn) == "path"
@@ -509,7 +509,7 @@ def test_ssm_exact_legacy_slash_twin_can_be_overwritten():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service.load_persisted_state({"parameters": parameters})
         set_request_region("us-west-2")
         status, _headers, _body = ssm_service._put_parameter({
             "Name": bare_name,
@@ -547,7 +547,7 @@ def test_ssm_legacy_no_slash_arn_does_not_fallback_to_path_parameter():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service.load_persisted_state({"parameters": parameters})
         set_request_region("us-west-2")
         assert ssm_service.resolve_parameter_value(path_arn) == "path"
         assert ssm_service.resolve_parameter_value(stale_legacy_arn) is None
@@ -578,7 +578,7 @@ def test_ssm_malformed_or_foreign_partition_arn_does_not_fallback_to_name():
     }
 
     try:
-        ssm_service.restore_state({"parameters": parameters})
+        ssm_service.load_persisted_state({"parameters": parameters})
         assert ssm_service.resolve_parameter_value(canonical_arn) == "value"
         assert ssm_service.resolve_parameter_value(missing_region_arn) is None
         assert ssm_service.resolve_parameter_value(foreign_partition_arn) is None
@@ -610,7 +610,7 @@ def test_ssm_restore_legacy_add_tags_key_for_bare_name_parameter():
     tags[legacy_add_tags_arn] = {"env": "legacy-add-tags"}
 
     try:
-        ssm_service.restore_state({
+        ssm_service.load_persisted_state({
             "parameters": parameters,
             "tags": tags,
         })
@@ -879,6 +879,7 @@ def _poll_invocation(ssm, command_id, instance_id, timeout=30):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_run_command_health_probe(ssm, boxed_instance):
     """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
     tag = _uuid_mod.uuid4().hex[:8]
@@ -913,6 +914,7 @@ def test_ssm_run_command_health_probe(ssm, boxed_instance):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_run_command_probe_can_fail(ssm, boxed_instance):
     """The point of a real box: a health check that is wrong reports Failed, not Success."""
     command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
@@ -957,6 +959,7 @@ def test_ssm_send_command_validates_the_instance(ssm, ec2):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
     """Rejecting everything would satisfy the refusals above, so prove one is taken."""
     assert ssm.send_command(InstanceIds=[boxed_instance],
@@ -968,6 +971,7 @@ def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
     """listCommands narrows by command and instance; unknown ids get what AWS answers."""
     ami = ec2.register_image(Name=f"ssm-lookup-{_uuid_mod.uuid4().hex[:8]}",

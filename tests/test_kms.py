@@ -1,6 +1,8 @@
 import base64
+import datetime as _dt
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
 
@@ -303,6 +305,73 @@ def test_kms_encrypt_decrypt_with_explicit_key(kms_client):
         KeyId=key_id, CiphertextBlob=enc_resp["CiphertextBlob"]
     )
     assert dec_resp["Plaintext"] == plaintext
+
+@pytest.mark.parametrize("key_spec", ["AES_128", "AES_256"])
+def test_kms_generate_data_key_material_id(kms_client, key_spec):
+    """The material identifier belongs to the wrapping key material."""
+    key_id = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT",
+        KeyUsage="ENCRYPT_DECRYPT",
+    )["KeyMetadata"]["KeyId"]
+
+    try:
+        first = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "first"},
+        )
+        second = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "second"},
+        )
+
+        material_id = first.get("KeyMaterialId")
+        assert isinstance(material_id, str)
+        assert re.fullmatch(r"[a-f0-9]{64}", material_id)
+        assert second.get("KeyMaterialId") == material_id
+    finally:
+        kms_client.schedule_key_deletion(
+            KeyId=key_id,
+            PendingWindowInDays=7,
+        )
+
+def test_kms_generate_data_key_material_id_survives_state_roundtrip():
+    from ministack.services import kms as _kms
+
+    _kms.reset()
+    try:
+        status, _headers, body = _kms._create_key({
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+        })
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+
+        def material_id():
+            status, _headers, body = _kms._generate_data_key({
+                "KeyId": key_id,
+                "KeySpec": "AES_256",
+            })
+            assert status == 200
+            return json.loads(body)["KeyMaterialId"]
+
+        original_id = material_id()
+
+        state = _kms.get_state()
+        _kms.reset()
+        _kms.load_persisted_state(state)
+
+        assert material_id() == original_id
+
+        # Keep the key ID, but replace its material.
+        rec = _kms._keys[key_id]
+        rec["_symmetric_key"] = bytes(
+            byte ^ 0xFF for byte in rec["_symmetric_key"]
+        )
+        assert material_id() != original_id
+    finally:
+        _kms.reset()
 
 def test_kms_generate_data_key_aes_256(kms_client):
     key = kms_client.create_key(
@@ -794,7 +863,7 @@ def test_kms_restore_legacy_account_scoped_state_adopts_key_arn_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._keys.get_scoped(account_id, "us-east-1", key_id) is None
         assert _kms._keys.get_scoped(account_id, "us-west-2", key_id)["Arn"] == key_arn
@@ -849,7 +918,7 @@ def test_kms_restore_legacy_bare_alias_name_adopts_target_key_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._aliases.get_scoped(account_id, "us-east-1", alias_arn) is None
         assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
@@ -1920,7 +1989,7 @@ def test_kms_hmac_key_survives_state_roundtrip():
         assert "_hmac_key_b64" in state["keys"][key_id]
         assert "_hmac_key" not in state["keys"][key_id]
         _kms.reset()
-        _kms.restore_state(state)
+        _kms.load_persisted_state(state)
 
         rec = _kms._keys[key_id]
         assert isinstance(rec["_hmac_key"], bytes)
@@ -2128,3 +2197,576 @@ def test_kms_primary_with_replicas_waits_on_deletion():
 
     west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
     assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+# ---------------------------------------------------------------------------
+# Imported key material (BYOK): Origin EXTERNAL, GetParametersForImport,
+# ImportKeyMaterial, DeleteImportedKeyMaterial.
+# ---------------------------------------------------------------------------
+
+_BYOK_MATERIAL = bytes(range(32))
+_NO_EXPIRY = "KEY_MATERIAL_DOES_NOT_EXPIRE"
+
+
+def _wrap_material(public_key_der, algorithm, material=_BYOK_MATERIAL):
+    """Wrap key material the way a caller does, per WrappingAlgorithm."""
+    keywrap = pytest.importorskip("cryptography.hazmat.primitives.keywrap")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    public_key = serialization.load_der_public_key(public_key_der)
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return public_key.encrypt(material, padding.PKCS1v15())
+    digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+    oaep = padding.OAEP(mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None)
+    if algorithm.startswith("RSAES_OAEP"):
+        return public_key.encrypt(material, oaep)
+    ephemeral = os.urandom(32)
+    return (public_key.encrypt(ephemeral, oaep)
+            + keywrap.aes_key_wrap_with_padding(ephemeral, material))
+
+
+def _import_external_key(kms, algorithm="RSAES_OAEP_SHA_256", material=_BYOK_MATERIAL,
+                         expiration=_NO_EXPIRY, valid_to=None, **create_kwargs):
+    key_id = kms.create_key(Origin="EXTERNAL", **create_kwargs)["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm=algorithm, WrappingKeySpec="RSA_2048")
+    kwargs = {"ExpirationModel": expiration}
+    if valid_to is not None:
+        kwargs["ValidTo"] = valid_to
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=_wrap_material(params["PublicKey"], algorithm, material),
+        **kwargs)
+    return key_id, params
+
+
+def test_kms_external_key_starts_pending_import_and_refuses_use():
+    """An EXTERNAL key has no material until it is imported, so it starts
+    PendingImport and every cryptographic operation is refused."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    metadata = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]
+    assert metadata["Origin"] == "EXTERNAL"
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=metadata["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+@pytest.mark.parametrize("algorithm", [
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+])
+def test_kms_import_key_material_every_wrapping_algorithm(algorithm):
+    """Each WrappingAlgorithm in the enum unwraps, and the key then encrypts
+    and decrypts with the caller's own material."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, params = _import_external_key(kms, algorithm)
+    assert params["KeyId"].endswith(key_id)
+    assert params["ParametersValidTo"]
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Enabled"] is True
+    assert metadata["ExpirationModel"] == _NO_EXPIRY
+    assert "ValidTo" not in metadata
+    ciphertext = kms.encrypt(KeyId=key_id, Plaintext=b"hello byok")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext)["Plaintext"] == b"hello byok"
+
+
+def test_kms_imported_material_is_the_callers_own_bytes():
+    """The point of BYOK: two keys given the same material are interchangeable,
+    so a fixture can pin the key bytes a test depends on."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    first, _ = _import_external_key(kms)
+    second, _ = _import_external_key(kms)
+    ciphertext = kms.encrypt(KeyId=first, Plaintext=b"same material")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext, KeyId=second)["Plaintext"] \
+        == b"same material"
+
+
+def test_kms_import_expiring_material_reports_valid_to():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    valid_to = _dt.datetime(2030, 1, 1, tzinfo=_dt.timezone.utc)
+    key_id, _ = _import_external_key(
+        kms, expiration="KEY_MATERIAL_EXPIRES", valid_to=valid_to)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["ExpirationModel"] == "KEY_MATERIAL_EXPIRES"
+    assert metadata["ValidTo"] == valid_to
+
+
+def test_kms_delete_imported_key_material_returns_the_key_to_pending_import():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(kms)
+    kms.delete_imported_key_material(KeyId=key_id)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    assert "ValidTo" not in metadata
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=key_id, Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_import_rejects_a_bad_token_wrong_material_and_reuse():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+        WrappingKeySpec="RSA_2048")
+    wrapped = _wrap_material(params["PublicKey"], "RSAES_OAEP_SHA_256")
+
+    def fails_with(code, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            kms.import_key_material(KeyId=key_id, ExpirationModel=_NO_EXPIRY, **kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+
+    fails_with("InvalidImportTokenException",
+               ImportToken=b"nope", EncryptedKeyMaterial=wrapped)
+    fails_with("InvalidCiphertextException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=b"x" * 256)
+    fails_with("IncorrectKeyMaterialException",
+               ImportToken=params["ImportToken"],
+               EncryptedKeyMaterial=_wrap_material(
+                   params["PublicKey"], "RSAES_OAEP_SHA_256", b"tooshort"))
+    # ValidTo is required when the material expires.
+    with pytest.raises(ClientError) as exc:
+        kms.import_key_material(
+            KeyId=key_id, ImportToken=params["ImportToken"],
+            EncryptedKeyMaterial=wrapped, ExpirationModel="KEY_MATERIAL_EXPIRES")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=wrapped, ExpirationModel=_NO_EXPIRY)
+    # The token is single-use.
+    fails_with("InvalidImportTokenException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=wrapped)
+
+
+def test_kms_import_flow_refuses_a_non_external_key():
+    """GetParametersForImport, ImportKeyMaterial and DeleteImportedKeyMaterial
+    all require Origin EXTERNAL."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="RSA_2048")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    with pytest.raises(ClientError) as exc:
+        kms.delete_imported_key_material(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def test_kms_external_origin_wrapping_key_specs_are_validated():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="SM2")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def _pkcs8_der(private_key):
+    """The private key alone, DER-encoded PKCS#8, which is the form AWS imports."""
+    from cryptography.hazmat.primitives import serialization
+    return private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def test_kms_external_hmac_key_imports_its_own_material():
+    """AWS supports imported key material for HMAC keys, and the imported bytes
+    are the ones the MAC is computed with."""
+    pytest.importorskip("cryptography")
+    import hashlib
+    import hmac
+    kms = _regional_kms("us-east-1")
+    material = bytes(range(32))
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSAES_OAEP_SHA_256", material=material,
+        KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Origin"] == "EXTERNAL"
+    mac = kms.generate_mac(KeyId=key_id, Message=b"hmac byok",
+                           MacAlgorithm="HMAC_SHA_256")["Mac"]
+    assert hmac.new(material, b"hmac byok", hashlib.sha256).digest() == mac
+
+
+@pytest.mark.parametrize("key_spec", [
+    "RSA_2048", "ECC_NIST_P256", "ECC_NIST_EDWARDS25519",
+])
+def test_kms_external_asymmetric_key_imports_its_own_private_key(key_spec):
+    """AWS imports the private key alone and derives the public key from it, so
+    GetPublicKey returns the pair of the material the caller supplied."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    kms = _regional_kms("us-east-1")
+    if key_spec == "RSA_2048":
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    elif key_spec == "ECC_NIST_P256":
+        private_key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    # A private key is far larger than RSAES_OAEP can wrap directly, so
+    # asymmetric material travels under the AES key-wrap algorithms.
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec=key_spec, KeyUsage="SIGN_VERIFY")
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+    assert kms.get_public_key(KeyId=key_id)["PublicKey"] == \
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_kms_imported_asymmetric_key_signs_with_the_imported_material():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    signature = kms.sign(KeyId=key_id, Message=b"sign byok",
+                         SigningAlgorithm="ECDSA_SHA_256")["Signature"]
+    assert kms.verify(KeyId=key_id, Message=b"sign byok", Signature=signature,
+                      SigningAlgorithm="ECDSA_SHA_256")["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("key_spec,key_usage,material", [
+    ("HMAC_256", "GENERATE_VERIFY_MAC", bytes(16)),
+    ("ECC_NIST_P256", "SIGN_VERIFY", b"not a der private key"),
+])
+def test_kms_import_rejects_material_that_does_not_fit_the_key_spec(
+        key_spec, key_usage, material):
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=material,
+            KeySpec=key_spec, KeyUsage=key_usage)
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_import_rejects_a_private_key_of_the_wrong_curve():
+    """The material must be the key the KeySpec declares, not merely parseable."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+            material=_pkcs8_der(ec.generate_private_key(ec.SECP384R1())),
+            KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_delete_imported_material_clears_the_asymmetric_key():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+        material=_pkcs8_der(ec.generate_private_key(ec.SECP256R1())),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    kms.delete_imported_key_material(KeyId=key_id)
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingImport"
+    with pytest.raises(ClientError) as exc:
+        kms.get_public_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_alias_carries_creation_and_last_updated_dates(kms_client):
+    first = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    second = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    alias = f"alias/dates-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=first)
+    try:
+        entry = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert isinstance(entry["CreationDate"], _dt.datetime)
+        assert entry["LastUpdatedDate"] == entry["CreationDate"]
+        time.sleep(1.1)
+        kms_client.update_alias(AliasName=alias, TargetKeyId=second)
+        updated = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert updated["CreationDate"] == entry["CreationDate"]
+        assert updated["LastUpdatedDate"] > entry["LastUpdatedDate"]
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_list_grants(kms_client):
+    meta = kms_client.create_key()["KeyMetadata"]
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        resp = kms_client.list_grants(KeyId=key_ref)
+        assert resp["Grants"] == [] and resp["Truncated"] is False
+    for missing in ("00000000-0000-0000-0000-000000000000", "alias/does-not-matter"):
+        with pytest.raises(ClientError) as exc:
+            kms_client.list_grants(KeyId=missing)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def _new_grant_key(kms_client, **kwargs):
+    return kms_client.create_key(**kwargs)["KeyMetadata"]
+
+
+def test_kms_create_grant_is_listed(kms_client):
+    meta = _new_grant_key(kms_client)
+    grantee = "arn:aws:iam::000000000000:role/grant-reader"
+    resp = kms_client.create_grant(
+        KeyId=meta["KeyId"],
+        GranteePrincipal=grantee,
+        RetiringPrincipal="arn:aws:iam::000000000000:role/grant-retirer",
+        Operations=["Encrypt", "Decrypt"],
+        Constraints={"EncryptionContextSubset": {"app": "billing"}},
+    )
+    assert resp["GrantId"] and resp["GrantToken"]
+
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        grants = kms_client.list_grants(KeyId=key_ref)["Grants"]
+        assert len(grants) == 1
+        grant = grants[0]
+        assert grant["GrantId"] == resp["GrantId"]
+        assert grant["KeyId"] == meta["Arn"]
+        assert grant["GranteePrincipal"] == grantee
+        assert grant["RetiringPrincipal"] == "arn:aws:iam::000000000000:role/grant-retirer"
+        assert grant["Operations"] == ["Encrypt", "Decrypt"]
+        assert grant["Constraints"] == {"EncryptionContextSubset": {"app": "billing"}}
+        assert grant["IssuingAccount"].startswith("arn:aws:iam::")
+        assert isinstance(grant["CreationDate"], _dt.datetime)
+        assert "GrantToken" not in grant
+
+
+def test_kms_list_grants_filters(kms_client):
+    meta = _new_grant_key(kms_client)
+    first = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+    kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b", Operations=["Decrypt"])
+    other = _new_grant_key(kms_client)
+    kms_client.create_grant(KeyId=other["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 2
+    by_id = kms_client.list_grants(KeyId=meta["KeyId"], GrantId=first["GrantId"])["Grants"]
+    assert [g["GrantId"] for g in by_id] == [first["GrantId"]]
+    by_grantee = kms_client.list_grants(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b")["Grants"]
+    assert [g["GranteePrincipal"] for g in by_grantee] == ["arn:aws:iam::000000000000:role/b"]
+
+
+def test_kms_list_grants_paginates(kms_client):
+    meta = _new_grant_key(kms_client)
+    created = {
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal=f"arn:aws:iam::000000000000:role/p{i}", Operations=["Encrypt"])["GrantId"]
+        for i in range(5)
+    }
+    seen, marker = [], None
+    while True:
+        kwargs = {"KeyId": meta["KeyId"], "Limit": 2}
+        if marker:
+            kwargs["Marker"] = marker
+        page = kms_client.list_grants(**kwargs)
+        assert len(page["Grants"]) <= 2
+        seen += [g["GrantId"] for g in page["Grants"]]
+        if not page["Truncated"]:
+            assert "NextMarker" not in page
+            break
+        marker = page["NextMarker"]
+    assert len(seen) == len(set(seen)) == 5
+    assert set(seen) == created
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.list_grants(KeyId=meta["KeyId"], Marker="not-a-marker")
+    assert exc.value.response["Error"]["Code"] == "InvalidMarkerException"
+
+
+def test_kms_create_grant_with_name_is_idempotent(kms_client):
+    meta = _new_grant_key(kms_client)
+    params = {"KeyId": meta["KeyId"], "GranteePrincipal": "arn:aws:iam::000000000000:role/n", "Operations": ["Encrypt"], "Name": "retry-safe"}
+    first = kms_client.create_grant(**params)
+    again = kms_client.create_grant(**params)
+    assert again["GrantId"] == first["GrantId"]
+    assert again["GrantToken"] != first["GrantToken"]
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+    changed = kms_client.create_grant(**{**params, "Operations": ["Decrypt"]})
+    assert changed["GrantId"] != first["GrantId"]
+
+    unnamed = {k: v for k, v in params.items() if k != "Name"}
+    assert kms_client.create_grant(**unnamed)["GrantId"] != kms_client.create_grant(**unnamed)["GrantId"]
+
+
+def test_kms_revoke_grant(kms_client):
+    meta = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    kms_client.revoke_grant(KeyId=meta["Arn"], GrantId=grant_id)
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_revoke_grant_checks_the_key(kms_client):
+    meta = _new_grant_key(kms_client)
+    other = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=other["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_retire_grant_by_token_and_by_id(kms_client):
+    meta = _new_grant_key(kms_client)
+    by_token = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/t", Operations=["Encrypt"])
+    by_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/i", Operations=["Encrypt"])
+
+    kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    kms_client.retire_grant(KeyId=meta["Arn"], GrantId=by_id["GrantId"])
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    assert exc.value.response["Error"]["Code"] == "InvalidGrantTokenException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantId=by_id["GrantId"])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_create_grant_rejects_operations_the_key_cannot_do(kms_client):
+    symmetric = _new_grant_key(kms_client)
+    signing = _new_grant_key(kms_client, KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    for key, operation in ((symmetric, "Sign"), (symmetric, "GenerateMac"), (signing, "GenerateDataKey")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=[operation])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.create_grant(KeyId=signing["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=["Sign", "Verify"])["GrantId"]
+
+
+def test_kms_create_grant_key_states(kms_client):
+    disabled = _new_grant_key(kms_client)
+    kms_client.disable_key(KeyId=disabled["KeyId"])
+    pending = _new_grant_key(kms_client)
+    kms_client.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    for meta, code in ((disabled, "DisabledException"), (pending, "KMSInvalidStateException")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/s", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == code
+        assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+
+def test_kms_grant_operations_reject_unknown_key_and_alias(kms_client):
+    meta = _new_grant_key(kms_client)
+    alias = f"alias/grant-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    try:
+        for key_ref in ("00000000-0000-0000-0000-000000000000", alias):
+            with pytest.raises(ClientError) as exc:
+                kms_client.create_grant(KeyId=key_ref, GranteePrincipal="arn:aws:iam::000000000000:role/x", Operations=["Encrypt"])
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+            with pytest.raises(ClientError) as exc:
+                kms_client.revoke_grant(KeyId=key_ref, GrantId="0" * 64)
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_grant_dry_run_changes_nothing(kms_client):
+    meta = _new_grant_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"], DryRun=True)
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    grant = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"])
+    for call in (
+        lambda: kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant["GrantId"], DryRun=True),
+        lambda: kms_client.retire_grant(GrantToken=grant["GrantToken"], DryRun=True),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_grants_survive_persistence(monkeypatch, tmp_path):
+    from ministack.core import persistence
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        _status, _headers, body = _kms._create_key({})
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        _status, _headers, body = _kms._create_grant({
+            "KeyId": key_id,
+            "GranteePrincipal": "arn:aws:iam::000000000000:role/persisted",
+            "Operations": ["Encrypt"],
+            "Name": "persisted",
+        })
+        created = json.loads(body)
+
+        persistence.save_state("kms", _kms.get_state())
+        _kms.reset()
+        _kms.load_persisted_state(persistence.load_state("kms"))
+
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert [g["GrantId"] for g in json.loads(body)["Grants"]] == [created["GrantId"]]
+        status, _headers, _body = _kms._retire_grant({"GrantToken": created["GrantToken"]})
+        assert status == 200
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert json.loads(body)["Grants"] == []
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_create_grant_on_hmac_key_allows_only_mac_operations(kms_client):
+    hmac_key = _new_grant_key(kms_client, KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    for operations in (["Encrypt"], ["Sign"], ["GenerateDataKey"], ["GetPublicKey"], ["GenerateMac", "Decrypt"]):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=operations)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"] == []
+
+    allowed = ["GenerateMac", "VerifyMac", "DescribeKey", "CreateGrant", "RetireGrant"]
+    kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=allowed)
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"][0]["Operations"] == allowed
+
+
+def test_kms_create_grant_rejects_primary_pending_replica_deletion():
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    try:
+        assert east.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)["KeyState"] == "PendingReplicaDeletion"
+        with pytest.raises(ClientError) as exc:
+            east.create_grant(KeyId=key_id, GranteePrincipal="arn:aws:iam::000000000000:role/m", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+        assert east.list_grants(KeyId=key_id)["Grants"] == []
+    finally:
+        west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)

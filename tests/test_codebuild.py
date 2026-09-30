@@ -264,7 +264,7 @@ def test_codebuild_restore_legacy_state_uses_resource_arn_region():
 
     service.reset()
     try:
-        service.restore_state({"projects": projects, "builds": builds})
+        service.load_persisted_state({"projects": projects, "builds": builds})
         assert service._projects.get_scoped(
             account_id, resource_region, project_name
         )["name"] == project_name
@@ -523,7 +523,7 @@ def test_env_file_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
 
 def test_restored_in_flight_builds_are_not_left_running():
     """A build cannot survive a restart, so it must not restore as IN_PROGRESS."""
-    codebuild.restore_state({
+    codebuild.load_persisted_state({
         "projects": {},
         "builds": {"demo:0010": {
             "id": "demo:0010",

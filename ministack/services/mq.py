@@ -30,7 +30,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -288,7 +287,11 @@ def get_state() -> dict:
     }
 
 
-def restore_state(data: dict) -> None:
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data: dict) -> None:
     if not data:
         return
     _brokers.update(data.get("brokers", {}))
@@ -328,12 +331,6 @@ def restore_state(data: dict) -> None:
                 _users.set_scoped(account_id, region, broker_id, users)
 
 
-try:
-    _restored = load_state("mq")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore mq state; starting fresh")
 
 
 # ============================================================================

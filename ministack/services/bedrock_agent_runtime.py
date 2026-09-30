@@ -36,7 +36,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -206,7 +205,11 @@ def get_state():
     })
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _sessions.update(data.get("sessions", {}))
@@ -217,12 +220,6 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("bedrock_agent_runtime")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore bedrock_agent_runtime state; continuing fresh")
 
 
 # ===========================================================================
@@ -288,6 +285,66 @@ def _delete_agent_memory(agent_id: str, alias_id: str, query_params) -> tuple:
 # ===========================================================================
 
 
+# The metadata filter grammar of RetrievalFilter (botocore bedrock-agent-runtime):
+# eleven leaf comparators plus the andAll / orAll combinators.
+def _filter_leaf(op: str, attribute: dict, metadata: dict) -> bool:
+    key = (attribute or {}).get("key")
+    expected = (attribute or {}).get("value")
+    present = isinstance(metadata, dict) and key in metadata
+    actual = metadata.get(key) if present else None
+    # An absent attribute matches nothing, and its negation matches: the
+    # document simply does not carry the key.
+    if op in ("notEquals", "notIn"):
+        if not present:
+            return True
+    elif not present:
+        return False
+    if op == "equals":
+        return actual == expected
+    if op == "notEquals":
+        return actual != expected
+    if op in ("greaterThan", "greaterThanOrEquals", "lessThan", "lessThanOrEquals"):
+        try:
+            if op == "greaterThan":
+                return actual > expected
+            if op == "greaterThanOrEquals":
+                return actual >= expected
+            if op == "lessThan":
+                return actual < expected
+            return actual <= expected
+        except TypeError:
+            return False
+    if op == "in":
+        return isinstance(expected, list) and actual in expected
+    if op == "notIn":
+        return not (isinstance(expected, list) and actual in expected)
+    if op == "startsWith":
+        return isinstance(actual, str) and isinstance(expected, str) \
+            and actual.startswith(expected)
+    if op == "stringContains":
+        return isinstance(actual, str) and isinstance(expected, str) \
+            and expected in actual
+    if op == "listContains":
+        return isinstance(actual, list) and expected in actual
+    return False
+
+
+def _filter_matches(flt, metadata: dict) -> bool:
+    """Whether a document's metadata satisfies a RetrievalFilter."""
+    if not isinstance(flt, dict) or not flt:
+        return True
+    if "andAll" in flt:
+        clauses = flt["andAll"] or []
+        return all(_filter_matches(c, metadata) for c in clauses)
+    if "orAll" in flt:
+        clauses = flt["orAll"] or []
+        return any(_filter_matches(c, metadata) for c in clauses)
+    for op, attribute in flt.items():
+        if not _filter_leaf(op, attribute, metadata):
+            return False
+    return True
+
+
 def _retrieve(kb_id: str, body) -> tuple:
     body_obj, err = _parse_body(body)
     if err:
@@ -298,9 +355,10 @@ def _retrieve(kb_id: str, body) -> tuple:
     from ministack.services import bedrock_agent as agent_svc
     if kb_id not in agent_svc._knowledge_bases:
         return _not_found(f"Knowledge base {kb_id} not found.")
-    number_of_results = (((body_obj.get("retrievalConfiguration") or {})
-                          .get("vectorSearchConfiguration") or {})
-                         .get("numberOfResults")) or 5
+    vector_config = ((body_obj.get("retrievalConfiguration") or {})
+                     .get("vectorSearchConfiguration") or {})
+    number_of_results = vector_config.get("numberOfResults") or 5
+    metadata_filter = vector_config.get("filter")
     # Lexical retrieval over the documents ingestion actually stored — no
     # embeddings locally, so scoring is term overlap: the fraction of query
     # terms present in the document.
@@ -309,16 +367,24 @@ def _retrieve(kb_id: str, body) -> tuple:
     for key, doc in agent_svc._kb_document_texts.items():
         if not key.startswith(f"{kb_id}/"):
             continue
+        if not _filter_matches(metadata_filter, doc.get("Metadata") or {}):
+            continue
         doc_terms = set(re.findall(r"[a-z0-9]+", doc["Text"].lower()))
         hits = len(terms & doc_terms)
         if hits:
             scored.append((hits / len(terms), doc))
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    results = [{
-        "Content": {"Text": doc["Text"], "Type": "TEXT"},
-        "Location": {"Type": "S3", "S3Location": {"Uri": doc["Uri"]}},
-        "Score": round(score, 4),
-    } for score, doc in scored[:number_of_results]]
+    results = []
+    for score, doc in scored[:number_of_results]:
+        result = {
+            "Content": {"Text": doc["Text"], "Type": "TEXT"},
+            "Location": {"Type": "S3", "S3Location": {"Uri": doc["Uri"]}},
+            "Score": round(score, 4),
+        }
+        # RetrievalResultMetadata has min 1, so it is omitted when empty.
+        if doc.get("Metadata"):
+            result["Metadata"] = doc["Metadata"]
+        results.append(result)
     return _json({"RetrievalResults": results})
 
 

@@ -1,12 +1,86 @@
 import json
 import os
 import time
+import urllib.request
 import uuid as _uuid_mod
 
 import boto3
+import duckdb
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+@pytest.fixture
+def persisted_parquet_store(monkeypatch, tmp_path):
+    """Make a local Parquet file visible to MiniStack's Glue-backed Athena reader."""
+    from ministack.services import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def configure(path):
+        request = urllib.request.Request(
+            f"{endpoint}/_ministack/config",
+            data=json.dumps({"athena.ATHENA_DATA_DIR": path}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5).close()
+
+    configure(str(tmp_path))
+    try:
+        yield s3mod
+    finally:
+        configure(os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3"))
+
+
+def test_athena_queries_glue_backed_parquet(
+    athena, glue, s3, persisted_parquet_store, tmp_path,
+):
+    """Resolve a Glue Parquet table and apply a predicate to its rows."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket = f"athena-parquet-{suffix}"
+    database = f"parquet_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+
+    parquet = tmp_path / "items.parquet"
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE items (id INTEGER, category VARCHAR)")
+        connection.executemany(
+            "INSERT INTO items VALUES (?, ?)", [(1, "keep"), (2, "skip"), (3, "keep")],
+        )
+        connection.execute(f"COPY items TO '{parquet}' (FORMAT PARQUET)")
+    persisted_parquet_store._persist_object(
+        bucket, "data/items.parquet", parquet.read_bytes(),
+    )
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "items",
+        "StorageDescriptor": {
+            "Location": f"s3://{bucket}/data/",
+            "Columns": [
+                {"Name": "id", "Type": "int"},
+                {"Name": "category", "Type": "string"},
+            ],
+        },
+        "Parameters": {"classification": "parquet"},
+    })
+    query_id = athena.start_query_execution(
+        QueryString=(f"SELECT id FROM {database}.items "
+                     "WHERE category = 'keep' ORDER BY id"),
+        QueryExecutionContext={"Database": database},
+        ResultConfiguration={"OutputLocation": f"s3://{bucket}/results/"},
+    )["QueryExecutionId"]
+    for _ in range(30):
+        execution = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]
+        if execution["Status"]["State"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            break
+        time.sleep(0.1)
+    assert execution["Status"]["State"] == "SUCCEEDED", execution["Status"]
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    assert [row["Data"][0]["VarCharValue"] for row in rows] == ["id", "1", "3"]
 
 
 def _client(region):
@@ -229,7 +303,7 @@ def test_athena_legacy_state_migrates_to_configured_boot_region(monkeypatch):
 
     service.reset()
     try:
-        service.restore_state(payload)
+        service.load_persisted_state(payload)
         for store_name, (key, value) in stores.items():
             restored = getattr(service, store_name).get_scoped(
                 account_id, boot_region, key
@@ -314,7 +388,7 @@ def test_athena_legacy_children_follow_workgroup_region(monkeypatch):
     service.reset()
     try:
         assert service.REGION != first_request_region
-        service.restore_state(payload)
+        service.load_persisted_state(payload)
 
         assert service._workgroups.get_scoped(
             account_id, workgroup_region, workgroup_name

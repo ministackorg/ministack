@@ -44,6 +44,7 @@ import contextvars
 import copy
 import datetime
 import hashlib
+import io
 import json
 import logging
 import math
@@ -51,6 +52,7 @@ import os
 import re
 import secrets as stdlib_secrets
 import socket
+import tarfile
 import threading
 import time
 from urllib.parse import parse_qs
@@ -59,7 +61,6 @@ from xml.sax.saxutils import escape as _esc
 from ministack.core import container_reaper, persistence
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -365,7 +366,11 @@ def get_state():
     return state
 
 
-def restore_state(data):
+def load_persisted_state(data) -> None:
+    _restore_state(data, resume_runtime=True)
+
+
+def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -453,6 +458,9 @@ def restore_state(data):
             _instances.set_scoped(get_account_id(), region, name, inst)
             to_respawn.append((None, region, name, inst))
 
+    if not resume_runtime:
+        return
+
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
     # container itself is killed by the host restart, so the restore path has
@@ -525,7 +533,7 @@ def restore_state(data):
         )
         if cluster and members:
             # Publish the restore/migration gate before the daemon starts. A
-            # create arriving immediately after restore_state() must not start
+            # create arriving immediately after _restore_state() must not start
             # fresh cluster storage before the writer volume is adopted.
             cluster["_shared_legacy_migration_in_progress"] = True
             cluster.pop("_shared_legacy_migration_blocked", None)
@@ -1043,6 +1051,152 @@ def _rds_container_is_owned_by(
     return labels.get("region") in (None, region or get_region())
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL server TLS. AWS installs the DB server certificate itself and
+# rotates it; there is no way to supply your own ("The CA signs the DB server
+# certificate, which is installed on each DB instance", UsingWithRDS.SSL), and
+# every instance we report already carries CACertificateIdentifier
+# rds-ca-rsa2048-g1. So MiniStack mints its own CA and signs a per-container
+# server certificate, and TLS is always on. The stock postgres image ships no
+# key material and dies with `ssl=on` alone, unlike MySQL, which
+# auto-generates (measured: `auto-generate-certs TRUE`).
+# ---------------------------------------------------------------------------
+
+_PG_TLS_DIR = "/ministack-rds-tls"
+_pg_ca_lock = threading.Lock()
+_pg_ca: tuple[str, str] | None = None
+
+
+def pg_ca_cert_pem() -> str:
+    """The RDS CA certificate, minted on first use. Clients verifying a
+    MiniStack database trust this one file, as they would AWS's bundle."""
+    return _ensure_pg_ca()[0]
+
+
+def _ensure_pg_ca() -> tuple[str, str]:
+    global _pg_ca
+    if _pg_ca is not None:
+        return _pg_ca
+    with _pg_ca_lock:
+        if _pg_ca is None:
+            from ministack.core.x509_utils import generate_ca
+
+            region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            _pg_ca = generate_ca(
+                org_name="Amazon Web Services, Inc.",
+                common_name=f"Amazon RDS {region} Root CA RSA2048 G1",
+            )
+            logger.info("RDS: generated the server-certificate CA")
+        return _pg_ca
+
+
+def _pg_server_material(names, ips) -> tuple[str, str]:
+    """A server certificate for the names a client may connect to."""
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    ca_cert, ca_key = _ensure_pg_ca()
+    cert_pem, key_pem, _public = sign_leaf_certificate(
+        ca_cert, ca_key,
+        common_name=(names[0] if names else "localhost"),
+        san_dns=names, san_ips=ips,
+        subject_rdns=[("OU", "RDS"), ("O", "Amazon.com"), ("L", "Seattle"),
+                      ("ST", "Washington"), ("C", "US")],
+    )
+    return cert_pem, key_pem
+
+
+def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
+    """The cert and key as a tar for put_archive: no host path is shared with
+    the daemon, and the key lands outside every PGDATA mount at 0600."""
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as bundle:
+        entry = tarfile.TarInfo(_PG_TLS_DIR.lstrip("/"))
+        entry.type = tarfile.DIRTYPE
+        entry.mode = 0o700
+        bundle.addfile(entry)
+        for filename, content in (("server.crt", cert_pem), ("server.key", key_pem)):
+            data = content.encode()
+            entry = tarfile.TarInfo(f"{_PG_TLS_DIR.lstrip('/')}/{filename}")
+            entry.mode = 0o600
+            entry.size = len(data)
+            bundle.addfile(entry, io.BytesIO(data))
+    return archive.getvalue()
+
+
+def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tls_ips=()):
+    """Start a backing container, with PostgreSQL TLS enabled.
+
+    MySQL needs nothing: its image generates its own material and defaults to
+    ssl=ON. PostgreSQL gets a certificate copied in before it starts, so a
+    client using sslmode=verify-full with our CA connects. Plaintext clients
+    keep working, as they do on AWS without rds.force_ssl.
+    """
+    if engine not in ("postgres", "aurora-postgresql"):
+        return docker_client.containers.run(**container_kwargs)
+    # Injecting the certificate needs create -> put_archive -> start, so a
+    # client that cannot do that keeps the plain launch and serves plaintext.
+    if not hasattr(docker_client.containers, "create"):
+        return docker_client.containers.run(**container_kwargs)
+
+    container = None
+    try:
+        names = [n for n in dict.fromkeys(tls_names) if n and not _is_ip_address(n)]
+        names += [n for n in ("localhost", _MINISTACK_HOST) if n and n not in names]
+        ips = [i for i in dict.fromkeys(tuple(tls_ips) + ("127.0.0.1", "::1")) if i]
+        cert_pem, key_pem = _pg_server_material(names, ips)
+        archive = _pg_tls_archive(cert_pem, key_pem)
+
+        kwargs = dict(container_kwargs)
+        command = list(kwargs.get("command") or ["postgres"])
+        if command[:2] == ["sh", "-c"]:
+            # `sh -c SCRIPT` takes the next argument as $0, so the flags land
+            # in "$@" for the script's own exec.
+            command.append("ministack-pg")
+        command += ["-c", "ssl=on",
+                    "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
+                    "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        entrypoint = kwargs.get("entrypoint") or ["docker-entrypoint.sh"]
+        if isinstance(entrypoint, str):
+            entrypoint = [entrypoint]
+        # Archive members arrive root-owned; chown before the image's own
+        # entrypoint drops privileges. postgres refuses a group/world-readable
+        # key, so the mode matters as much as the owner.
+        kwargs["user"] = "0:0"
+        kwargs["entrypoint"] = [
+            "sh", "-c",
+            f"chown -R postgres:postgres {_PG_TLS_DIR} && exec \"$@\"",
+            "ministack-pg-tls",
+        ]
+        kwargs["command"] = list(entrypoint) + command
+
+        from docker.errors import ImageNotFound
+        try:
+            container = docker_client.containers.create(**kwargs)
+        except ImageNotFound:
+            docker_client.images.pull(kwargs["image"])
+            container = docker_client.containers.create(**kwargs)
+        if not container.put_archive("/", archive):
+            raise RuntimeError("Docker rejected the PostgreSQL TLS archive")
+        container.start()
+        return container
+    except Exception:
+        if container is not None:
+            try:
+                container.remove(force=True, v=False)
+            except Exception:
+                logger.warning("RDS: could not remove a failed TLS container")
+        raise
+
+
+def _is_ip_address(value: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     """Start the single backing container owned by an Aurora cluster.
 
@@ -1192,7 +1346,10 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         cluster["_shared_container_ready"] = False
         logger.warning("RDS: failed to start shared container for cluster %s: %s", cluster_id, e)
@@ -1235,6 +1392,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         },
         "_shared_internal_address": internal_host,
         "_shared_internal_port": internal_port,
+        # The reader alias this container actually carries. Only a name
+        # registered as a network alias may be published as the reader
+        # endpoint; PG clusters launched with replication on carry the
+        # writer name only, and a later demotion must not invent a
+        # reader name nothing resolves.
+        "_shared_reader_alias": (
+            endpoint_aliases[1] if len(endpoint_aliases) > 1 else None
+        ),
         "_shared_container_ready": False,
         "_shared_container_epoch": container_epoch,
     })
@@ -1417,7 +1582,11 @@ def _start_pg_reader_container(db_id, cluster):
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=_cluster_endpoint_aliases(cluster)
+            + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
@@ -2107,10 +2276,16 @@ def _restart_cluster_shared_container(cluster_id, cluster):
     readiness_host = "127.0.0.1"
     readiness_port = host_port
     if ms_network:
+        endpoint_aliases = _cluster_endpoint_aliases(cluster)
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
+            # Report the alias, not the address behind it — same rule as first
+            # launch. StopDBCluster/StartDBCluster must not rewrite a stored
+            # DNS name into a raw address: the name keeps resolving to the
+            # restarted container, while the address may not survive.
+            endpoint_host = (endpoint_aliases[0] if endpoint_aliases
+                             else container_ip)
             endpoint_port = container_port
             internal_host = container_ip
             internal_port = container_port
@@ -2276,7 +2451,11 @@ def _start_rds_container_for_instance(db_id, instance):
         }
 
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
+                       container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
@@ -4217,7 +4396,22 @@ def _sync_cluster_endpoints(cluster):
         # so the address is published as before.
         if (isinstance(writer_address, str) and ".cluster-" in writer_address
                 and not _pg_cluster_replication_enabled(cluster)):
-            reader_address = writer_address.replace(".cluster-", ".cluster-ro-", 1)
+            # Derive the ro- name only when it was registered as an alias on
+            # the backing container (recorded at launch). A cluster launched
+            # with PG replication on carries the writer name alone, so after
+            # a demotion nothing resolves the derived reader name — publish
+            # the address behind the writer instead. Clusters persisted
+            # before the field existed keep the derived-name behavior.
+            if "_shared_reader_alias" in cluster:
+                reader_address = (
+                    cluster.get("_shared_reader_alias")
+                    or cluster.get("_shared_internal_address")
+                    or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+                )
+            else:
+                reader_address = writer_address.replace(
+                    ".cluster-", ".cluster-ro-", 1,
+                )
         else:
             reader_address = (
                 cluster.get("_shared_internal_address")
@@ -4526,7 +4720,11 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
-                container = docker_client.containers.run(**container_kwargs)
+                container = _run_rds_container(
+                    docker_client, engine, container_kwargs,
+                    tls_names=[endpoint_host or "",
+                               container_kwargs.get("name") or ""],
+                )
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:
@@ -5588,6 +5786,7 @@ def _create_db_cluster_impl(p):
         "Capacity": 0,
         "ClusterScalabilityType": "standard",
         "_shared_container_id": None,
+        "_shared_reader_alias": None,
         "_shared_host_port": None,
         "_shared_endpoint": None,
         "_shared_volume_name": None,
@@ -6435,28 +6634,14 @@ def _reset_db_cluster_param_group(p):
 # DB Cluster Snapshots
 # ---------------------------------------------------------------------------
 
-def _create_db_cluster_snapshot(p):
-    snap_id = _p(p, "DBClusterSnapshotIdentifier")
-    cluster_id = _p(p, "DBClusterIdentifier")
-    if not snap_id:
-        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
-    if snap_id in _db_cluster_snapshots:
-        return _error("DBClusterSnapshotAlreadyExistsFault",
-            f"DB cluster snapshot {snap_id} already exists.", 400)
-
-    cluster = _resolve_cluster_in_request_region(cluster_id)
-    if not cluster:
-        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
-        if wrong_region:
-            return wrong_region
-        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
-    cluster_id = cluster["DBClusterIdentifier"]
-
+def _create_cluster_snapshot_internal(snap_id, cluster):
+    """The snapshot record for one cluster. Shared with the CloudFormation
+    ``DeletionPolicy: Snapshot`` path, which has no request to parse."""
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
     now_ts = time.time()
     snap = {
         "DBClusterSnapshotIdentifier": snap_id,
-        "DBClusterIdentifier": cluster_id,
+        "DBClusterIdentifier": cluster["DBClusterIdentifier"],
         "DBClusterSnapshotArn": arn,
         "Engine": cluster["Engine"],
         "EngineVersion": cluster["EngineVersion"],
@@ -6479,6 +6664,28 @@ def _create_db_cluster_snapshot(p):
     }
     _db_cluster_snapshots[snap_id] = snap
 
+    return snap
+
+
+def _create_db_cluster_snapshot(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    cluster_id = _p(p, "DBClusterIdentifier")
+    if not snap_id:
+        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
+    if snap_id in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotAlreadyExistsFault",
+            f"DB cluster snapshot {snap_id} already exists.", 400)
+
+    cluster = _resolve_cluster_in_request_region(cluster_id)
+    if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster["DBClusterIdentifier"]
+
+    snap = _create_cluster_snapshot_internal(snap_id, cluster)
+    arn = snap["DBClusterSnapshotArn"]
     req_tags = _parse_tags(p)
     if req_tags:
         _tags[arn] = req_tags
@@ -7132,7 +7339,7 @@ def _failover_db_cluster_impl(p):
     if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
         "_shared_legacy_migration_blocked",
     ):
-        # restore_state's one-time legacy-storage migration reads
+        # _restore_state's one-time legacy-storage migration reads
         # IsClusterWriter to pick which member's volume becomes the
         # cluster's adopted shared state; flipping the flag mid-migration
         # could make it adopt a reader's volume. Same gate as
@@ -10892,6 +11099,9 @@ _ACTION_MAP = {
 
 
 def reset():
+    from ministack.core import rds_iam
+
+    rds_iam.reset()
     # Serialize teardown with warm-boot shared-container startup. Otherwise a
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
@@ -10957,20 +11167,6 @@ def reset():
         _port_counter[0] = BASE_PORT
 
 
-# Load persisted state at module import. Must run AFTER every helper this
-# code path may touch (notably `_get_docker`, `_docker_image_for_engine`,
-# `_get_ministack_network`) is defined — `restore_state` spawns daemon threads
-# that race against the rest of module parsing, and a thread reaching an
-# undefined name raises NameError mid-restore (issue #692 follow-up).
-try:
-    _restored = load_state("rds")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):

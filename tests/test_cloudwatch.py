@@ -4,6 +4,7 @@ import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import sqs_policy_allow_sns
 
 
 def test_cloudwatch_metrics(cw):
@@ -629,6 +630,9 @@ def test_cloudwatch_alarm_actions_publish_to_sns(cw, sns, sqs):
     queue_arn = sqs.get_queue_attributes(
         QueueUrl=queue_url, AttributeNames=["QueueArn"]
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=queue_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(queue_arn, topic_arn))})
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
 
     cw.put_metric_alarm(

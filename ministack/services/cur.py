@@ -17,7 +17,6 @@ import copy
 import json
 import logging
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -41,25 +40,21 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
+    # No `or {}`: a scoped dict holding only other accounts' entries is falsy
+    # here, and the loader runs at boot with no request scope.
     _report_definitions.clear()
-    _report_definitions.update(data.get("report_definitions") or {})
+    _report_definitions.update(data.get("report_definitions", {}))
     _report_tags.clear()
-    _report_tags.update(data.get("report_tags") or {})
+    _report_tags.update(data.get("report_tags", {}))
 
 
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
-try:
-    _restored = load_state("cur")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted CUR state; continuing with fresh store")
 
 
 def _json(status: int, body: dict):

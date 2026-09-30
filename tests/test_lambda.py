@@ -3,16 +3,16 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
-import shutil
-import sys
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
@@ -26,6 +26,7 @@ from conftest import (
     LoopProbe,
     concurrent_burst,
     make_probe_lambda,
+    patch_endpoint_dns,
 )
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
@@ -1047,6 +1048,51 @@ def test_lambda_create_function(lam):
     assert resp["LastUpdateStatus"] in ("InProgress", "Successful")
     assert "FunctionArn" in resp
 
+
+def test_lambda_vpc_id_follows_subnets_on_create_and_update(lam, ec2):
+    name = f"lam-vpc-id-{_uuid_mod.uuid4().hex[:8]}"
+    networks = []
+    try:
+        for cidr, subnet_cidrs in (("10.91.0.0/16", ("10.91.1.0/24", "10.91.2.0/24")),
+                                   ("10.92.0.0/16", ("10.92.1.0/24", "10.92.2.0/24"))):
+            vpc_id = ec2.create_vpc(CidrBlock=cidr)["Vpc"]["VpcId"]
+            subnet_ids = [ec2.create_subnet(VpcId=vpc_id, CidrBlock=subnet_cidr)["Subnet"]["SubnetId"]
+                          for subnet_cidr in subnet_cidrs]
+            group_id = ec2.create_security_group(
+                GroupName=f"{name}-{len(networks)}", Description="Lambda VPC ID test", VpcId=vpc_id,
+            )["GroupId"]
+            networks.append((vpc_id, subnet_ids, group_id))
+
+        first_vpc, first_subnets, first_group = networks[0]
+        created = lam.create_function(
+            FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            VpcConfig={"SubnetIds": first_subnets, "SecurityGroupIds": [first_group]},
+            Publish=True,
+        )
+        assert created["VpcConfig"]["VpcId"] == first_vpc
+        assert lam.get_function_configuration(FunctionName=name)["VpcConfig"]["VpcId"] == first_vpc
+        assert lam.get_function(FunctionName=name)["Configuration"]["VpcConfig"]["VpcId"] == first_vpc
+
+        second_vpc, second_subnets, second_group = networks[1]
+        updated = lam.update_function_configuration(
+            FunctionName=name,
+            VpcConfig={"SubnetIds": second_subnets, "SecurityGroupIds": [second_group]},
+        )
+        assert updated["VpcConfig"]["VpcId"] == second_vpc
+        assert lam.get_function_configuration(FunctionName=name)["VpcConfig"]["VpcId"] == second_vpc
+        assert lam.get_function_configuration(FunctionName=name, Qualifier="1")["VpcConfig"]["VpcId"] == first_vpc
+    finally:
+        try:
+            lam.delete_function(FunctionName=name)
+        except ClientError:
+            pass
+        for vpc_id, subnet_ids, group_id in reversed(networks):
+            ec2.delete_security_group(GroupId=group_id)
+            for subnet_id in subnet_ids:
+                ec2.delete_subnet(SubnetId=subnet_id)
+            ec2.delete_vpc(VpcId=vpc_id)
+
 def test_lambda_create_duplicate(lam):
     with pytest.raises(ClientError) as exc:
         lam.create_function(
@@ -1705,8 +1751,11 @@ def test_lambda_warm_start(lam, apigw):
         req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
         return _urlreq.urlopen(req).read().decode()
 
-    t1 = call()  # cold start — spawns worker, imports module
-    t2 = call()  # warm — reuses worker, same module state
+    # The generated execute-api subdomain is not in DNS; only the literal
+    # endpoint host is. patch_endpoint_dns maps *.{host} onto it.
+    with patch_endpoint_dns():
+        t1 = call()  # cold start — spawns worker, imports module
+        t2 = call()  # warm — reuses worker, same module state
     assert t1 == t2, f"Warm worker should reuse module state: {t1} != {t2}"
 
     apigw.delete_api(ApiId=api_id)
@@ -1822,6 +1871,7 @@ def test_lambda_returned_error_shaped_dict_is_not_a_function_error(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_uncaught_exception_is_unhandled_function_error(lam):
     """Docker/RIE executor variant: the RIE does not set an error header in
     practice, so the classifier must recognise the runtime's uncaught-exception
@@ -2985,11 +3035,22 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
         with pytest.raises(ClientError) as update_exc:
             east.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
         assert update_exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+        assert update_exc.value.response["Error"]["Message"] == (
+            "Layers are not in the same region as the function. "
+            "Layers are expected to be in region us-east-1."
+        )
     finally:
         east.delete_function(FunctionName=update_name)
 
 
 def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
+    """A foreign-account ARN with no grant behind it is refused.
+
+    The layer store is keyed by account and region, so rewriting the account
+    field of an ARN this account published must not hand back that layer's
+    content — and with no AddLayerVersionPermission statement naming the
+    caller, the attachment is denied on create and on update alike.
+    """
     suffix = _uuid_mod.uuid4().hex[:8]
 
     layer_buf = io.BytesIO()
@@ -3027,8 +3088,12 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
         with pytest.raises(ClientError) as update_exc:
             lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
         assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
-        cfg = lam.get_function_configuration(FunctionName=update_name)
-        assert cfg["Layers"] == []
+
+        # The layer this account really published still resolves to its bytes.
+        lam.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
+        own = lam.get_function_configuration(FunctionName=update_name)
+        assert own["Layers"][0]["Arn"] == layer_arn
+        assert own["Layers"][0]["CodeSize"] > 0
     finally:
         for name in (create_name, update_name):
             try:
@@ -3703,7 +3768,7 @@ def test_lambda_layer_version_permission_survives_persistence_roundtrip(lambda_s
         status, _headers, _body = svc._get_layer_version_policy(layer_name, 1)
         assert status == 404
 
-        svc.restore_state(state)
+        svc.load_persisted_state(state)
         status, _headers, body = svc._get_layer_version_policy(layer_name, 1)
         assert status == 200
         restored = json.loads(body)
@@ -3926,6 +3991,7 @@ def test_lambda_provided_runtime_create(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_provided_runtime_docker_invoke(lam):
     """Invoke a provided.al2023 Lambda via the Docker executor.
 
@@ -4116,7 +4182,8 @@ def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
             method="GET",
         )
         req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-        resp = _urlreq.urlopen(req).read().decode()
+        with patch_endpoint_dns():
+            resp = _urlreq.urlopen(req).read().decode()
         body = json.loads(resp)
 
         assert body.get("route") == "GET /test", f"Expected handler result, got: {resp}"
@@ -4677,6 +4744,410 @@ def test_esm_response_no_function_name_field(lam, sqs):
         sqs.delete_queue(QueueUrl=q_url)
 
 
+# CloudWatch Lambda Insights, the layer people reference cross-account; nothing resolves the version locally.
+_AWS_MANAGED_LAYER = "arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38"
+_OTHER_REGION_LAYER = "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:38"
+_FOREIGN_ACCOUNT = "580247275435"
+_FOREIGN_REGION = "us-east-1"
+_FOREIGN_CODE_SIZE = 4198176
+_CALLER_ACCOUNT = "000000000000"
+
+
+def _via_endpoint(url):
+    """Content.Location names MINISTACK_HOST/GATEWAY_PORT; aim it at MINISTACK_ENDPOINT."""
+    endpoint = urlparse(_endpoint)
+    return urlparse(url)._replace(scheme=endpoint.scheme, netloc=endpoint.netloc).geturl()
+
+
+def _foreign_arn(layer_name, version=7, account=_FOREIGN_ACCOUNT):
+    return f"arn:aws:lambda:{_FOREIGN_REGION}:{account}:layer:{layer_name}:{version}"
+
+
+def _layer_access_denied(arn, caller=f"arn:aws:iam::{_CALLER_ACCOUNT}:root"):
+    return (f"User: {caller} is not authorized to perform: lambda:GetLayerVersion on resource: {arn} "
+            "because no resource-based policy allows the lambda:GetLayerVersion action")
+
+
+def _import_handler(module):
+    """Handler code reporting whether a layer module imports, and its VALUE."""
+    return _make_zip(
+        "def handler(e, c):\n    try:\n"
+        f"        import {module}\n        return {{'value': getattr({module}, 'VALUE', True)}}\n"
+        "    except ImportError:\n        return {'value': None}\n"
+    )
+
+
+def _layer_verdicts(arn):
+    """(attach config, attach error, GetLayerVersionByArn payload, read error), in process;
+    an error is (code, message) or None."""
+    import ministack.services.lambda_svc as _lsvc
+
+    version_config, err = _lsvc._resolve_layer_version_for_attachment(arn)
+    status, _headers, body = _lsvc._get_layer_version_by_arn(arn)
+    payload = json.loads(body)
+
+    def error(response_body):
+        parsed = json.loads(response_body)
+        return parsed["__type"], parsed.get("message", "")
+    return (version_config, err and error(err[2]),
+            None if status >= 400 else payload, error(body) if status >= 400 else None)
+
+
+@contextlib.contextmanager
+def _foreign_layer(layer_name, version=7, granted_to=None, org_id=None, owner=_FOREIGN_ACCOUNT):
+    """Seed one layer version in *owner*'s scope, grant it through the real
+    AddLayerVersionPermission, and run the block as the consumer account."""
+    import ministack.services.lambda_svc as _lsvc
+    from ministack.core.responses import request_scope
+
+    version_config = None
+    if layer_name is not None:
+        arn = _foreign_arn(layer_name, version, owner)
+        version_config = {"LayerArn": arn.rsplit(":", 1)[0], "LayerVersionArn": arn, "Version": version,
+                          "Content": {"CodeSize": _FOREIGN_CODE_SIZE}}
+        _lsvc._layers.set_scoped(owner, _FOREIGN_REGION, layer_name,
+                                 {"versions": [version_config], "next_version": version + 1})
+    try:
+        if granted_to is not None:
+            grant = {"StatementId": "shared", "Action": "lambda:GetLayerVersion", "Principal": granted_to}
+            if org_id:
+                grant["OrganizationId"] = org_id
+            with request_scope(owner, _FOREIGN_REGION):
+                status, _headers, body = _lsvc._add_layer_version_permission(layer_name, version, grant)
+            assert status == 201, body
+        with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+            yield version_config
+    finally:
+        if layer_name is not None:
+            _lsvc._layers.pop_scoped(owner, _FOREIGN_REGION, layer_name, None)
+
+
+_DENIED = "AccessDeniedException"
+
+
+# (seeded layer name, grant principal, explicit ARN, attachment error code, GetLayerVersionByArn error code)
+@pytest.mark.parametrize(("layer_name", "granted_to", "arn", "attach_error", "read_error"), [
+    pytest.param("owner-granted", _CALLER_ACCOUNT, None, None, None, id="account-grant"),
+    pytest.param("root-granted", f"arn:aws:iam::{_CALLER_ACCOUNT}:root", None, None, None,
+                 id="account-root-arn-grant"),
+    pytest.param("everyone-granted", "*", None, None, None, id="wildcard-grant"),
+    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),
+    pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
+    pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
+                 id="missing-version-of-known-layer"),
+    # A name AWS does not publish, under the same account: the gate is the layer
+    # NAME, so this is still denied.
+    pytest.param(None, None, _foreign_arn("not-an-aws-extension", 38), _DENIED, _DENIED,
+                 id="unknown-foreign-layer"),
+    # An extension AWS publishes itself carries a public grant on AWS, so a
+    # template referencing it deploys there. It resolves here too; the bytes are
+    # not available offline, so CodeSize is 0 and the extension does not run.
+    pytest.param(None, None, _AWS_MANAGED_LAYER, None, None, id="aws-published-extension"),
+    pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
+    pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
+                 "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
+])
+def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
+    """A grant makes stored foreign content attachable and readable. Without
+    one — no statement, a statement naming another account, or no layer of that
+    name at all — the attachment and the read are denied. The resolver does not
+    read AUTH (see the next test)."""
+    arn = arn or _foreign_arn(layer_name)
+    with _foreign_layer(layer_name, granted_to=granted_to):
+        version_config, attach, payload, read = _layer_verdicts(arn)
+    assert ((attach or [None])[0], (read or [None])[0]) == (attach_error, read_error)
+    messages = {"InvalidParameterValueException": f"Layer version {arn} does not exist.",
+                "ResourceNotFoundException": "The resource you requested does not exist."}
+    for error in filter(None, (attach, read)):
+        assert error[1] == messages.get(error[0], _layer_access_denied(arn))
+    if attach_error is None:
+        assert version_config["Content"]["CodeSize"] == (_FOREIGN_CODE_SIZE if layer_name else 0)
+    if read_error is None:
+        expected_size = _FOREIGN_CODE_SIZE if layer_name else 0
+        assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, expected_size)
+        assert not [key for key in payload if key.startswith("_")]
+
+
+def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):
+    """Through the app with AUTH=true as an IAM user of the consuming account: the
+    layer policy decides, and a denial names that user the way AWS does."""
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
+    user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
+    seeded = [
+        (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
+        (iam_svc._user_inline_policies, user,
+         {"lambda": {"Statement": [{"Effect": "Allow", "Action": "lambda:*", "Resource": "*"}]}}),
+        (iam_svc._access_keys, key, {"AccessKeyId": key, "SecretAccessKey": "s", "Status": "Active", "UserName": user}),
+    ]
+    for store, name, record in seeded:
+        store.set_scoped(_CALLER_ACCOUNT, None, name, record)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    try:
+        for granted_to in ("*", None):
+            sent.clear()
+            arn = _foreign_arn("auth-layer")
+            with _foreign_layer("auth-layer", granted_to=granted_to):
+                asyncio.run(app_mod.app({
+                    "type": "http", "method": "GET", "path": "/2018-10-31/layers",
+                    "query_string": f"find=LayerVersion&Arn={arn}".encode(),
+                    "headers": [(b"host", b"lambda.localhost"), (b"authorization", (
+                        f"AWS4-HMAC-SHA256 Credential={key}/20260915/{_FOREIGN_REGION}/lambda/aws4_request, "
+                        "SignedHeaders=host, Signature=0").encode())],
+                }, receive, send))
+            status, body = sent[0]["status"], json.loads(sent[1]["body"])
+            if granted_to:
+                assert (status, body["Content"]["CodeSize"]) == (200, _FOREIGN_CODE_SIZE)
+            else:
+                assert (status, body["message"]) == (403, _layer_access_denied(arn, user_arn))
+    finally:
+        for store, name, _record in seeded:
+            store.pop_scoped(_CALLER_ACCOUNT, None, name, None)
+
+
+@pytest.fixture
+def shared_layer():
+    """Publish real layer bytes and provision the consumer's execution role."""
+    owner_id = str(100000000000 + _uuid_mod.uuid4().int % 400000000000)
+    caller_id = str(int(owner_id) + 400000000000)
+    owner = _account_context_client("lambda", owner_id)
+    caller = _account_context_client("lambda", caller_id)
+    iam = _account_context_client("iam", caller_id)
+    name = f"shared-layer-{_uuid_mod.uuid4().hex[:8]}"
+    role = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({"Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}),
+    )["Role"]["Arn"]
+    published = owner.publish_layer_version(
+        LayerName=name, Content={"ZipFile": _make_zip_js("VALUE = 'shared bytes'\n", "python/shared_module.py")})
+    try:
+        yield owner, caller, published, role
+    finally:
+        # Functions first: a deleted layer version is retained while one is still attached.
+        for fn in caller.list_functions()["Functions"]:
+            caller.delete_function(FunctionName=fn["FunctionName"])
+        owner.delete_layer_version(LayerName=name, VersionNumber=published["Version"])
+        iam.delete_role(RoleName=name)
+
+
+def test_lambda_shared_layer_execution_and_lifecycle(shared_layer):
+    owner, caller, published, role = shared_layer
+    arn, layer_arn, version = published["LayerVersionArn"], published["LayerArn"], published["Version"]
+    layer_name = arn.split(":")[-2]
+    owner.add_layer_version_permission(LayerName=layer_name, VersionNumber=version, StatementId="shared",
+                                       Action="lambda:GetLayerVersion", Principal=role.split(":")[4])
+    for result in [caller.get_layer_version_by_arn(Arn=arn),
+                   caller.get_layer_version(LayerName=layer_arn, VersionNumber=version)]:
+        assert (result["LayerVersionArn"], result["Content"]["CodeSize"]) == (arn, published["Content"]["CodeSize"])
+        assert not any(key.startswith("_") for key in result)
+        with _urlreq.urlopen(_via_endpoint(result["Content"]["Location"])) as response:
+            assert len(response.read()) == published["Content"]["CodeSize"]
+
+    code = _import_handler("shared_module")
+    for name, layers in [("created", [arn]), ("updated", [])]:
+        caller.create_function(FunctionName=name, Runtime="python3.13", Handler="index.handler",
+                               Role=role, Code={"ZipFile": code}, Layers=layers)
+    assert _invoke_lambda_payload(caller, "created")[1] == {"value": "shared bytes"}
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": None}
+    caller.update_function_configuration(FunctionName="updated", Layers=[arn])
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": "shared bytes"}
+    fn_version = caller.publish_version(FunctionName="updated")["Version"]
+
+    owner.remove_layer_version_permission(LayerName=layer_name, VersionNumber=version, StatementId="shared")
+    for deleted in [False, True]:
+        if deleted:
+            owner.delete_layer_version(LayerName=layer_name, VersionNumber=version)
+            assert owner.list_layer_versions(LayerName=layer_name)["LayerVersions"] == []
+            assert owner.list_layers()["Layers"] == []
+            with pytest.raises(ClientError) as missing:
+                owner.get_layer_version(LayerName=layer_name, VersionNumber=version)
+            assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        for call in [
+            lambda: caller.create_function(FunctionName="denied", Runtime="python3.13", Handler="index.handler",
+                                           Role=role, Code={"ZipFile": code}, Layers=[arn]),
+            lambda: caller.update_function_configuration(FunctionName="updated", Layers=[arn]),
+            lambda: caller.get_layer_version_by_arn(Arn=arn),
+            lambda: caller.get_layer_version(LayerName=layer_arn, VersionNumber=version),
+        ]:
+            with pytest.raises(ClientError) as denied:
+                call()
+            assert denied.value.response["Error"]["Code"] == _DENIED
+        # Force a cold start after revocation/deletion without reattaching the layer.
+        caller.update_function_configuration(FunctionName="updated", Environment={"Variables": {"D": str(deleted)}})
+        assert _invoke_lambda_payload(caller, "updated")[1] == {"value": "shared bytes"}
+        assert caller.get_function_configuration(FunctionName="updated")["Layers"] == [
+            {"Arn": arn, "CodeSize": published["Content"]["CodeSize"]}]
+
+    caller.update_function_configuration(FunctionName="updated", Layers=[])
+    caller.delete_function(FunctionName="created")
+    assert _invoke_lambda_payload(caller, "updated")[1] == {"value": None}
+    # First invocation of the published version is cold, after deletion and detach.
+    assert _invoke_lambda_payload(caller, "updated", Qualifier=fn_version)[1] == {"value": "shared bytes"}
+
+
+@pytest.mark.parametrize(("membership", "allowed"), [("matching", True), ("different", False), ("absent", False)])
+def test_lambda_shared_layer_organization_condition(monkeypatch, membership, allowed):
+    """A wildcard grant carrying OrganizationId reaches org members only, and
+    asking the question must not enrol the caller in an organization."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_svc, organizations
+
+    orgs = AccountScopedDict()
+    monkeypatch.setattr(organizations, "_orgs", orgs)
+    if membership != "absent":
+        orgs.set_scoped(_CALLER_ACCOUNT, None, "self",
+                        {"Id": "o-0123456789" if membership == "matching" else "o-9876543210"})
+    with _foreign_layer("org-layer", granted_to="*", org_id="o-0123456789"):
+        arn = _foreign_arn("org-layer")
+        assert (_layer_verdicts(arn)[1] is None) is allowed
+        for response in [lambda_svc._get_layer_version_by_arn(arn),
+                         lambda_svc._get_layer_version(arn.rsplit(":", 1)[0], 7)]:
+            assert response[0] == (200 if allowed else 403)
+    assert len(orgs._data) == (0 if membership == "absent" else 1)
+
+
+@pytest.fixture
+def isolated_layers(lambda_svc_isolated, monkeypatch):
+    """lambda_svc with an empty layer store and extraction cache."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    svc, _ = lambda_svc_isolated
+    monkeypatch.setattr(svc, "_layers", AccountRegionScopedDict())
+    monkeypatch.setattr(svc, "_docker_extract_dirs", {})
+    return svc
+
+
+def test_lambda_deleted_shared_layer_retention_and_restore(isolated_layers):
+    """A deleted version keeps serving the functions attached to it, survives a
+    state round trip while one still is, and is reaped when the last goes."""
+    import base64
+
+    from ministack.core.responses import request_scope
+
+    svc = isolated_layers
+    layer_zip = _make_zip("retained bytes")
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        _, _, body = svc._publish_layer_version("retained", {"Content": {"ZipFile": base64.b64encode(layer_zip).decode()}})
+        arn = json.loads(body)["LayerVersionArn"]
+        svc._add_layer_version_permission(
+            "retained", 1, {"StatementId": "shared", "Action": "lambda:GetLayerVersion", "Principal": "*"})
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        svc._functions["retains-version"] = {
+            "config": {"FunctionName": "retains-version", "Layers": []},
+            "versions": {"1": {"config": {"Layers": [{"Arn": arn, "CodeSize": len(layer_zip)}]}}},
+        }
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        svc._delete_layer_version("retained", 1)
+        # A deleted version reads back the way AWS reports it; the two APIs word it differently.
+        status, _, body = svc._get_layer_version("retained", 1)
+        assert (status, json.loads(body)["message"]) == (404, "The resource you requested does not exist.")
+        status, _, body = svc._get_layer_version_policy("retained", 1)
+        assert (status, json.loads(body)["message"]) == (404, f"Layer version {arn} does not exist.")
+        assert svc.serve_layer_content("retained", 1)[0] == 404
+        assert [vc["Version"] for vc in svc._layers["retained"]["versions"]] == [1]
+
+    state = svc.get_state()
+    svc._layers.clear()
+    svc._functions.clear()
+    svc.load_persisted_state(state)
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        assert svc._resolve_layer_zip(arn) == layer_zip
+        assert svc._layer_unzipped_size(arn) == len("retained bytes")
+        assert _layer_verdicts(arn)[1][0] == _DENIED
+        svc._delete_function("retains-version", {}, path_qualifier="1")
+        assert svc._resolve_layer_zip(arn) is None
+        assert _layer_verdicts(arn)[1][0] == _DENIED
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert svc._layers["retained"]["versions"] == []
+    assert not [vc for layer in svc.get_state()["layers"]._data.values() for vc in layer["versions"]]
+
+
+def _seed_attached_layer(svc, name, attached, deleted):
+    from ministack.core.responses import request_scope
+
+    arn = _foreign_arn(name, 1)
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        svc._layers[name] = {"versions": [{"Version": 1, "LayerVersionArn": arn, "Content": {"CodeSize": 4096},
+                                           "_zip_data": _make_zip("x"), "_deleted": deleted}], "next_version": 2}
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        svc._functions["attached"] = {"config": {
+            "FunctionName": "attached",
+            "Layers": [{"Arn": arn, "CodeSize": 4096}] if attached else []}}
+    return arn
+
+
+@pytest.mark.parametrize(("attached", "reaped"), [
+    pytest.param(True, False, id="attached-version-retained"),
+    pytest.param(False, True, id="unreferenced-version-reaped"),
+])
+def test_lambda_deleted_layer_version_reaping(isolated_layers, attached, reaped):
+    """A deleted version lives on exactly while a function still references it."""
+    from ministack.core.responses import request_scope
+
+    _seed_attached_layer(isolated_layers, "reaped-layer", attached, deleted=True)
+    isolated_layers._sweep_extract_cache()
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert (isolated_layers._layers["reaped-layer"]["versions"] == []) is reaped
+
+
+def test_lambda_cfn_deletes_and_restore_reap_unreferenced_layer_versions(isolated_layers):
+    """CloudFormation deletes tombstone and sweep like the Lambda API, and a
+    restored snapshot drops a tombstone nothing references."""
+    from ministack.core.responses import AccountRegionScopedDict, request_scope
+    from ministack.services.cloudformation import provisioners
+
+    svc = isolated_layers
+    arn = _seed_attached_layer(svc, "cfn-layer", True, deleted=False)
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        provisioners._lambda_layer_delete(arn, {})
+        assert svc._layers["cfn-layer"]["versions"][0]["_deleted"]
+    state = svc.get_state()
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        provisioners._lambda_delete("attached", {})
+    state["functions"] = AccountRegionScopedDict()
+    with request_scope(_FOREIGN_ACCOUNT, _FOREIGN_REGION):
+        assert svc._layers["cfn-layer"]["versions"] == []
+        svc._layers.clear()
+        svc.load_persisted_state(state)
+        assert svc._layers["cfn-layer"]["versions"] == []
+
+
+@pytest.mark.parametrize("owner", [_FOREIGN_ACCOUNT, _CALLER_ACCOUNT], ids=["shared-layer", "own-layer"])
+def test_lambda_layer_attachment_checks_total_unzipped_size(monkeypatch, owner):
+    """The function-plus-layers unzipped limit covers create and update, for a
+    granted foreign layer and an own one; a rejected update changes nothing."""
+    import base64
+
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_svc, "_functions", AccountRegionScopedDict())
+    monkeypatch.setattr(lambda_svc, "_UNZIPPED_LIMIT_BYTES", 30)
+    with _foreign_layer("quota-layer", granted_to="*" if owner != _CALLER_ACCOUNT else None, owner=owner) as vc:
+        vc["_zip_data"] = _make_zip("x" * 20)
+        arn = _foreign_arn("quota-layer", account=owner)
+        fname = f"quota-{_uuid_mod.uuid4().hex[:8]}"
+        original = {"FunctionName": fname, "Layers": [], "Description": "before"}
+        lambda_svc._functions[fname] = {"config": original.copy(), "code_zip": _make_zip("x" * 20)}
+        response = lambda_svc._update_config(fname, {"Layers": [arn], "Description": "after"})
+        assert (response[0], json.loads(response[2])["__type"]) == (400, "InvalidParameterValueException")
+        assert lambda_svc._functions[fname]["config"] == original
+        response = lambda_svc._create_function({
+            "FunctionName": "too-large", "Runtime": "python3.13", "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+            "Code": {"ZipFile": base64.b64encode(_make_zip("x" * 20)).decode()}, "Layers": [arn]})
+        assert response[0] == 400
+        assert "too-large" not in lambda_svc._functions
+
+
 def test_lambda_update_function_configuration_layers(lam):
     """Attaching a layer via update-function-configuration should normalize ARN strings
     to {Arn, CodeSize} dicts — regression test for 'str' object has no attribute 'get'."""
@@ -4827,7 +5298,7 @@ def test_lambda_restore_legacy_plain_functions_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        lsvc.restore_state({"functions": {function_name: legacy_func}})
+        lsvc.load_persisted_state({"functions": {function_name: legacy_func}})
 
         assert lsvc._functions.get_scoped(account_id, "us-west-2", function_name) is legacy_func
         assert lsvc._functions.get_scoped(account_id, "us-east-1", function_name) is None
@@ -4925,7 +5396,7 @@ def test_lambda_sqs_poller_does_not_tail_match_foreign_region_event_source(monke
         _sqs._queues.clear()
 
         queue_name = "esm-runtime-region-guard"
-        queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+        queue_url = _sqs._queue_url(queue_name)
         _sqs._queues[queue_url] = {
             "name": queue_name,
             "messages": [{
@@ -5156,21 +5627,24 @@ def esm_poll_state(tmp_path, monkeypatch):
         lsvc._kinesis_positions._data.clear()
         lsvc._dynamodb_stream_positions._data.clear()
         lsvc._esm_backoff_until._data.clear()
+        lsvc._esm_inflight.clear()
         _sqs._queues._data.clear()
         _kin._streams._data.clear()
         _ddb._tables._data.clear()
         _ddb._stream_records._data.clear()
         _ddb._stream_trimmed._data.clear()
 
+    # Run dispatched SQS batches inline so a poll pass finishes its invokes before returning.
+    monkeypatch.setattr(lsvc, "spawn_background", lambda task, **_: task())
     _clear_all()
     try:
         yield lsvc, _sqs, _kin, _ddb
     finally:
         _clear_all()
-        lsvc.restore_state(lambda_state)
-        _sqs.restore_state(sqs_state)
-        _kin.restore_state(kinesis_state)
-        _ddb.restore_state(dynamodb_state)
+        lsvc.load_persisted_state(lambda_state)
+        _sqs.load_persisted_state(sqs_state)
+        _kin.load_persisted_state(kinesis_state)
+        _ddb.load_persisted_state(dynamodb_state)
         _ddb._stream_records._data.update(stream_records)
         _ddb._stream_trimmed._data.update(trimmed)
 
@@ -5181,7 +5655,7 @@ def test_poll_sqs_returns_true_when_batch_processed(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5297,14 +5771,14 @@ def test_poll_dynamodb_streams_returns_true_when_batch_processed(esm_poll_state,
     assert _lsvc._poll_dynamodb_streams() is True
 
 
-def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
+def test_poll_sqs_backs_off_after_invoke_fails(esm_poll_state, monkeypatch):
     """A failed invoke leaves the message undeleted (just invisible for its
-    visibility timeout) rather than advancing — _poll_loop must not skip its
-    idle sleep for a pass that made no real progress."""
+    visibility timeout) and puts the ESM in backoff, so the next pass finds
+    nothing to take and _poll_loop goes back to waiting instead of spinning."""
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-failure"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5344,8 +5818,9 @@ def test_poll_sqs_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
         lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
     )
 
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(_sqs._queues[queue_url]["messages"]) == 1
+    assert _lsvc._poll_sqs() is False
 
 
 def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_state, monkeypatch):
@@ -5355,7 +5830,7 @@ def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_sta
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     def make_queue(name):
-        queue_url = f"http://localhost:4566/000000000000/{name}"
+        queue_url = _sqs._queue_url(name)
         _sqs._queues[queue_url] = {
             "name": name,
             "messages": [{
@@ -5453,7 +5928,7 @@ def test_poll_sqs_record_carries_trace_header_and_fifo_attributes(esm_poll_state
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-trace-attrs"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     trace = "Root=1-6893a2b4-aaaabbbbccccddddeeeeffff;Parent=0123456789abcdef;Sampled=1"
     base = {
         "md5_body": "", "sent_at": time.time(), "visible_at": 0,
@@ -5521,7 +5996,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
     _lsvc, _sqs, _kin, _ddb = esm_poll_state
 
     queue_name = "esm-drain-signal-recovers"
-    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    queue_url = _sqs._queue_url(queue_name)
     _sqs._queues[queue_url] = {
         "name": queue_name,
         "messages": [{
@@ -5570,7 +6045,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
     fake_now = [1_000_000.0]
     monkeypatch.setattr(_lsvc.time, "time", lambda: fake_now[0])
 
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(invoke_calls) == 1
 
     # Still within the backoff window — skipped before it would even receive.
@@ -5580,7 +6055,7 @@ def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch)
 
     # Backoff has elapsed — the ESM is retried (and fails again).
     fake_now[0] += _lsvc._ESM_BACKOFF_SECONDS
-    assert _lsvc._poll_sqs() is False
+    assert _lsvc._poll_sqs() is True
     assert len(invoke_calls) == 2
 
 
@@ -5709,7 +6184,7 @@ def test_poll_loop_skips_sleep_when_a_poller_processed_work(monkeypatch):
     monkeypatch.setattr(lsvc, "_poll_sqs", fake_poll_sqs)
     monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
-    monkeypatch.setattr(lsvc.time, "sleep", lambda secs: sleep_calls.append(secs))
+    monkeypatch.setattr(lsvc._esm_wake, "wait", lambda secs: sleep_calls.append(secs))
 
     with pytest.raises(_StopPollLoop):
         lsvc._poll_loop()
@@ -5732,12 +6207,131 @@ def test_poll_loop_sleeps_when_no_poller_processed_work(esm_poll_state, monkeypa
     monkeypatch.setattr(lsvc, "_poll_sqs", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
     monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
-    monkeypatch.setattr(lsvc.time, "sleep", fake_sleep)
+    monkeypatch.setattr(lsvc._esm_wake, "wait", fake_sleep)
 
     with pytest.raises(_StopPollLoop):
         lsvc._poll_loop()
 
     assert sleep_calls == [5]
+
+
+def test_esm_batch_completion_wakes_poll_loop(esm_poll_state):
+    """A finished batch frees a concurrency slot; the poll loop must refill it
+    right away rather than waiting out its idle cadence."""
+    lsvc._esm_wake.clear()
+    lsvc._dispatch_esm_batch("esm-wake", lambda: None)
+    assert lsvc._esm_wake.is_set()
+    assert "esm-wake" not in lsvc._esm_inflight
+
+
+def _sqs_esm_fixture(_lsvc, _sqs, name, *, messages=1, esm_extra=None, func_extra=None):
+    queue_url = _sqs._queue_url(name)
+    _sqs._queues[queue_url] = {
+        "name": name,
+        "messages": [{
+            "id": f"msg-{i}", "body": "payload", "md5_body": "", "receipt_handle": None,
+            "sent_at": time.time(), "visible_at": 0, "receive_count": 0,
+            "first_receive_at": None, "message_attributes": {},
+        } for i in range(messages)],
+        "attributes": {"QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{name}"},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions[f"{name}-fn"] = {
+        "config": {
+            "FunctionName": f"{name}-fn",
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}-fn",
+        },
+        "versions": {}, "aliases": {},
+        **(func_extra or {}),
+    }
+    _lsvc._esms[name] = {
+        "UUID": name,
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{name}",
+        "FunctionName": f"{name}-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 1,
+        **(esm_extra or {}),
+    }
+    return queue_url
+
+
+@pytest.fixture
+def esm_threaded_dispatch(esm_poll_state, monkeypatch):
+    """Real worker threads instead of the inline dispatch esm_poll_state installs."""
+    from ministack.core.concurrency import spawn_background
+
+    threads = []
+    monkeypatch.setattr(lsvc, "spawn_background", lambda task, **kw: threads.append(spawn_background(task, **kw)))
+    release = threading.Event()
+    try:
+        yield esm_poll_state, release
+    finally:
+        release.set()
+        for t in threads:
+            t.join(10)
+
+
+def test_poll_sqs_slow_handler_does_not_block_other_esms(esm_threaded_dispatch, monkeypatch):
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-slow")
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-fast")
+    fast_done = threading.Event()
+
+    def fake_execute(func, _event):
+        if func["config"]["FunctionName"] == "esm-slow-fn":
+            release.wait(10)
+        else:
+            fast_done.set()
+        return {"body": {}}
+
+    monkeypatch.setattr(_lsvc, "_execute_function", fake_execute)
+
+    assert _lsvc._poll_sqs() is True
+    assert fast_done.wait(5), "fast ESM waited on the slow ESM's handler"
+
+
+@pytest.mark.parametrize("esm_extra,func_extra,expected", [
+    ({}, {}, 5),
+    ({"ScalingConfig": {"MaximumConcurrency": 3}}, {}, 3),
+    ({"ScalingConfig": {"MaximumConcurrency": 8}}, {"concurrency": 2}, 2),
+])
+def test_poll_sqs_caps_in_flight_batches_per_esm(esm_threaded_dispatch, monkeypatch, esm_extra, func_extra, expected):
+    """MaximumConcurrency (default 5) bounds one ESM's in-flight batches, and a
+    lower ReservedConcurrentExecutions wins so the ESM doesn't throttle itself."""
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(_lsvc, _sqs, "esm-capped", messages=20, esm_extra=esm_extra, func_extra=func_extra)
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: (release.wait(10), {"body": {}})[1])
+
+    for _ in range(20):
+        _lsvc._poll_sqs()
+
+    assert _lsvc._esm_inflight["esm-capped"] == expected
+
+
+def test_poll_sqs_keeps_a_fifo_queue_serial(esm_threaded_dispatch, monkeypatch):
+    """A FIFO queue gets one batch in flight whatever MaximumConcurrency says.
+
+    "Amazon SQS ensures that messages in the same group are delivered to Lambda
+    in order", and a batch here spans groups, so two in flight at once reorder
+    a group. The cap is not MaximumConcurrency for FIFO: on AWS concurrency is
+    bounded by the number of message group IDs, and the poller does not
+    partition batches by MessageGroupId, so serial is the only safe setting.
+    """
+    (_lsvc, _sqs, _kin, _ddb), release = esm_threaded_dispatch
+    _sqs_esm_fixture(
+        _lsvc, _sqs, "esm-fifo", messages=20,
+        esm_extra={"ScalingConfig": {"MaximumConcurrency": 8}},
+    )
+    _sqs._queues[_sqs._queue_url("esm-fifo")]["is_fifo"] = True
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _func, _event: (release.wait(10), {"body": {}})[1])
+
+    for _ in range(20):
+        _lsvc._poll_sqs()
+
+    assert _lsvc._esm_inflight["esm-fifo"] == 1
 
 
 def test_lambda_create_esm_rejects_unresolved_function_arn():
@@ -6115,6 +6709,50 @@ def test_function_concurrency_cap_none_is_unbounded():
     assert reason == "spawn"
 
 
+def test_function_concurrency_cap_zero_disables():
+    """ReservedConcurrentExecutions=0 → every invoke throttles, even on an empty pool."""
+    entry, reason = lsvc._pool_acquire("k", max_concurrency=0)
+    assert entry is None
+    assert reason == "func_cap"
+
+
+def test_execution_slot_zero_reserved_throttles():
+    """ReservedConcurrentExecutions=0 → _acquire_execution_slot refuses the first slot."""
+    func = {"concurrency": 0}
+    config = {
+        "FunctionName": "cap-zero-unit",
+        "Version": "$LATEST",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:cap-zero-unit",
+    }
+    slot, limit = lsvc._acquire_execution_slot(func, config)
+    assert slot is None
+    assert limit == "function"
+
+
+def test_execution_slot_reserved_concurrency_shared_across_versions():
+    """A published version and $LATEST share the function's reserved limit."""
+    name = f"cap-version-{_uuid_mod.uuid4().hex[:8]}"
+    func = {"concurrency": 1}
+    latest_config = {
+        "FunctionName": name,
+        "Version": "$LATEST",
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    published_config = {**latest_config, "Version": "1"}
+
+    latest_slot, limit = lsvc._acquire_execution_slot(func, latest_config)
+    assert latest_slot is not None
+    assert limit is None
+    try:
+        published_slot, limit = lsvc._acquire_execution_slot(func, published_config)
+        if published_slot is not None:
+            lsvc._release_execution_slot(published_slot)
+        assert published_slot is None
+        assert limit == "function"
+    finally:
+        lsvc._release_execution_slot(latest_slot)
+
+
 def test_account_concurrency_cap_rejects(monkeypatch):
     """Global account cap: 3 in-use total → 4th is throttled as acct_cap."""
     monkeypatch.setattr(lsvc, "_ACCOUNT_CONCURRENCY_CAP", 3)
@@ -6235,7 +6873,7 @@ def test_route_async_failure_to_sqs_dlq():
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
     # Create a queue directly in the internal state
-    url = "http://localhost:4566/000000000000/dlq-test"
+    url = _sqs._queue_url("dlq-test")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-test"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},
@@ -6377,7 +7015,7 @@ def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
     original_region = get_region()
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
-    url = "http://localhost:4566/000000000000/dlq-region-guard"
+    url = _sqs._queue_url("dlq-region-guard")
     arn = "arn:aws:sqs:us-east-1:000000000000:dlq-region-guard"
     _sqs._queues[url] = {
         "messages": [], "attributes": {"QueueArn": arn},
@@ -7045,7 +7683,6 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
         '--privileged --read-only --unknown-flag ignored'
     ))
     monkeypatch.setattr(lsvc, "_docker_available", True)
-
     captured = {}
     fake_container = _mk_container()
     fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
@@ -8554,14 +9191,14 @@ def test_lambda_durable_persistence_round_trip():
         # Wipe and restore.
         lambda_durable._executions.clear()
         assert not lambda_durable._executions
-        lambda_durable.restore_state(snap)
+        lambda_durable.load_persisted_state(snap)
         assert rec["DurableExecutionArn"] in lambda_durable._executions
         restored = lambda_durable._executions[rec["DurableExecutionArn"]]
         assert restored["Status"] == "RUNNING"
         assert restored["InputPayload"] == '{"k":"v"}'
     finally:
         lambda_durable._executions.clear()
-        lambda_durable.restore_state(original)
+        lambda_durable.load_persisted_state(original)
 
 
 # ---------------------------------------------------------------------------
@@ -8604,7 +9241,7 @@ def lambda_svc_isolated(tmp_path, monkeypatch):
         yield lambda_svc, tmp_path / "lambda-blobs"
     finally:
         lambda_svc._functions._data.clear()
-        lambda_svc.restore_state(original)
+        lambda_svc.load_persisted_state(original)
 
 
 def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
@@ -8615,7 +9252,7 @@ def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
 
     state = svc.get_state()
     svc._functions._data.clear()
-    svc.restore_state(state)
+    svc.load_persisted_state(state)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
     assert restored["code_zip"] == code
@@ -8654,7 +9291,7 @@ def test_lambda_per_version_code_zip_also_externalized(lambda_svc_isolated):
     }
 
     svc._functions._data.clear()
-    svc.restore_state(state)
+    svc.load_persisted_state(state)
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
     assert restored["code_zip"] == v2
     assert restored["versions"]["1"]["code_zip"] == v1
@@ -8699,7 +9336,7 @@ def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated
         "versions": {},
     }
 
-    svc.restore_state(legacy)
+    svc.load_persisted_state(legacy)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "old-fn")]
     assert restored["code_zip"] == code
@@ -8726,7 +9363,7 @@ def test_lambda_missing_blob_degrades_without_aborting_restore(lambda_svc_isolat
         "versions": {},
     }
 
-    svc.restore_state(state)
+    svc.load_persisted_state(state)
 
     assert svc._functions._data[("000000000000", svc.get_region(), "orphan")]["code_zip"] is None
 
@@ -9210,7 +9847,7 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
     }
     with _preserved_lambda_durable_state(_ld):
         # Pretend ministack just booted and read this rec from disk.
-        _ld.restore_state({"executions": {arn: rec}})
+        _ld.load_persisted_state({"executions": {arn: rec}})
         # Index must contain the STARTED callback.
         assert cb_op_id in _ld._callback_index
         assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
@@ -9241,7 +9878,7 @@ def test_lambda_durable_restore_rearms_non_boot_region_from_arn():
     }])
 
     with _preserved_lambda_durable_state(_ld):
-        _ld.restore_state({"executions": {arn: rec}})
+        _ld.load_persisted_state({"executions": {arn: rec}})
         with _ld._resume_lock:
             entries = [e for e in _ld._resume_queue if e[1] == arn]
         assert entries, "no resume entry queued after restore"
@@ -9275,7 +9912,7 @@ def test_lambda_durable_restore_rebuilds_non_default_account_records():
 
     with _preserved_lambda_durable_state(_ld):
         try:
-            _ld.restore_state({"executions": executions})
+            _ld.load_persisted_state({"executions": executions})
             set_request_account_id(account_id)
             set_request_region(region)
             assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
@@ -9326,7 +9963,7 @@ def test_lambda_durable_restore_callback_index_is_account_scoped():
     original_region = get_region()
     with _preserved_lambda_durable_state(_ld):
         try:
-            _ld.restore_state({"executions": executions})
+            _ld.load_persisted_state({"executions": executions})
 
             set_request_account_id(account_a)
             set_request_region(region)
@@ -9366,7 +10003,7 @@ def test_lambda_durable_restore_skips_non_running_executions():
         "InputPayload": "{}",
     }
     with _preserved_lambda_durable_state(_ld):
-        _ld.restore_state({"executions": {arn_done: rec}})
+        _ld.load_persisted_state({"executions": {arn_done: rec}})
         # SUCCEEDED callback must NOT be indexed (only STARTED ones).
         assert cb_op_id not in _ld._callback_index
 
@@ -9389,7 +10026,7 @@ def test_lambda_durable_restore_malformed_arn_falls_back_and_continues(caplog):
     executions = AccountScopedDict.from_dict({(account_id, arn): rec})
 
     with _preserved_lambda_durable_state(_ld), caplog.at_level("WARNING"):
-        _ld.restore_state({"executions": executions})
+        _ld.load_persisted_state({"executions": executions})
         assert "Malformed DurableExecutionArn during restore" in caplog.text
         with _ld._resume_lock:
             entries = [e for e in _ld._resume_queue if e[1] == arn]
@@ -10188,6 +10825,7 @@ def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -10232,6 +10870,7 @@ def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 def test_lambda_docker_init_error_is_reported_not_retried(lam):
     """The real RIE end of the same story: a handler that cannot import.
 
@@ -11355,6 +11994,7 @@ def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
     os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
+@pytest.mark.data_plane
 @pytest.mark.parametrize(
     "declared,expected_machine",
     [("arm64", "aarch64"), ("x86_64", "x86_64")],
@@ -12009,9 +12649,9 @@ def test_snapstart_version_worker_is_reapable():
             lr._workers.pop("000000000000:us-east-1:reap-probe:1", None)
 
 
-def test_snapstart_pending_version_reprovisions_on_restore():
+def test_snapstart_pending_version_reprovisions_on_load():
     """A SnapStart version persisted while Pending (crash mid-publish) must be
-    re-provisioned by restore_state — otherwise it answers 409 forever."""
+    re-provisioned by load_persisted_state — otherwise it answers 409 forever."""
     import copy as _copy
 
     arn = "arn:aws:lambda:us-east-1:000000000000:function:snap-restore-fn"
@@ -12039,7 +12679,7 @@ def test_snapstart_pending_version_reprovisions_on_restore():
     }
     key = ("000000000000", "us-east-1", "snap-restore-fn")
     try:
-        lsvc.restore_state({"functions": {"snap-restore-fn": func}})
+        lsvc.load_persisted_state({"functions": {"snap-restore-fn": func}})
         for _ in range(60):
             state = ver_cfg["State"]
             if state != "Pending":
@@ -13080,3 +13720,257 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
         result = lambda_svc._delete_function(name, {})
     assert result[0] in (200, 204)
     assert not lambda_runtime._workers
+
+
+# ---------------------------------------------------------------------------
+# Reaching Cognito at the host its tokens name. AWS's own CognitoJwtVerifier
+# derives the expected issuer and the JWKS URL from the pool id and overrides
+# neither, so a verifying handler must find the gateway at
+# cognito-idp.{region}.amazonaws.com.
+# ---------------------------------------------------------------------------
+
+
+def _wire(monkeypatch, **env):
+    from ministack.services import lambda_svc as lsvc
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    run_kwargs, container_env, mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, mounts)
+    return run_kwargs, container_env, mounts
+
+
+def test_cognito_issuer_host_is_not_wired_without_use_ssl(monkeypatch, tmp_path):
+    """`iss` is https, so with a plain gateway there is nothing for the name to
+    usefully resolve to and the container must be left alone."""
+    monkeypatch.delenv("USE_SSL", raising=False)
+    run_kwargs, container_env, mounts = _wire(monkeypatch, TMPDIR=str(tmp_path))
+    assert (run_kwargs, container_env, mounts) == ({}, {}, [])
+
+
+def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, tmp_path):
+    from ministack.services import lambda_svc as lsvc
+
+    run_kwargs, container_env, mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    assert run_kwargs["extra_hosts"]["cognito-idp.us-east-1.amazonaws.com"] == "host-gateway"
+    assert run_kwargs["extra_hosts"]["cognito-idp.eu-west-2.amazonaws.com"] == "host-gateway"
+    # NODE_EXTRA_CA_CERTS adds to node's roots, so it takes the bare certificate.
+    assert container_env["NODE_EXTRA_CA_CERTS"] == lsvc._CONTAINER_CA_PATH
+    # The other two replace the trust store, so they take the public roots with
+    # ours appended, or the handler loses every other HTTPS endpoint.
+    for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        assert container_env[var] == lsvc._CONTAINER_BUNDLE_PATH
+    assert [(m["Target"], m["ReadOnly"]) for m in mounts] == [
+        (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
+
+
+def test_cognito_issuer_wiring_never_overrides_the_caller(monkeypatch, tmp_path):
+    """LAMBDA_DOCKER_FLAGS --add-host and a function's own env come first."""
+    from ministack.services import lambda_svc as lsvc
+
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
+    host = "cognito-idp.us-east-1.amazonaws.com"
+    run_kwargs = {"extra_hosts": {host: "10.0.0.9"}}
+    container_env = {"NODE_EXTRA_CA_CERTS": "/opt/mine.pem"}
+    lsvc._wire_cognito_issuer_host(run_kwargs, container_env, [])
+    assert run_kwargs["extra_hosts"][host] == "10.0.0.9"
+    assert container_env["NODE_EXTRA_CA_CERTS"] == "/opt/mine.pem"
+
+
+def test_cognito_issuer_wiring_gives_a_java_runtime_its_own_truststore(monkeypatch, tmp_path):
+    """JAVA_TOOL_OPTIONS makes every JVM announce itself on stderr, so it is
+    set only where a JVM will read it."""
+    pytest.importorskip("cryptography")
+    from ministack.services import lambda_svc as lsvc
+
+    _rk, java_env, java_mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    java_env.clear(), java_mounts.clear()
+    lsvc._wire_cognito_issuer_host({}, java_env, java_mounts, "java21")
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in java_env["JAVA_TOOL_OPTIONS"]
+    assert "trustStoreType=pkcs12" in java_env["JAVA_TOOL_OPTIONS"]
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH in [m["Target"] for m in java_mounts]
+
+    _rk2, py_env, py_mounts = {}, {}, []
+    lsvc._wire_cognito_issuer_host(_rk2, py_env, py_mounts, "python3.12")
+    assert "JAVA_TOOL_OPTIONS" not in py_env
+    assert lsvc._CONTAINER_TRUSTSTORE_PATH not in [m["Target"] for m in py_mounts]
+class _ProxyHandler(BaseHTTPRequestHandler):
+    received: list[dict] = []
+    response: tuple[int, bytes, dict] = (200, b'{"ok":true}', {"Content-Type": "application/json"})
+    sleep_seconds: float = 0.0
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        type(self).received.append({
+            "path": self.path,
+            "headers": {k: v for k, v in self.headers.items()},
+            "body": body,
+        })
+        if type(self).sleep_seconds:
+            time.sleep(type(self).sleep_seconds)
+        status, payload, headers = type(self).response
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args, **_kwargs):
+        pass
+
+
+@pytest.fixture
+def proxy_server():
+    server = HTTPServer(("127.0.0.1", 0), _ProxyHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _ProxyHandler.received = []
+    _ProxyHandler.response = (200, b'{"ok":true}', {"Content-Type": "application/json"})
+    _ProxyHandler.sleep_seconds = 0.0
+    try:
+        yield port
+    finally:
+        server.shutdown()
+
+
+def _make_client():
+    return boto3.client(
+        "lambda",
+        endpoint_url=_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+
+
+def _create_proxy_function(client, name: str, url: str | None):
+    env = {"Variables": {"MINISTACK_LAMBDA_PROXY_URL": url}} if url else None
+    kwargs = dict(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/x",
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event,context):\n    return event\n")},
+    )
+    if env is not None:
+        kwargs["Environment"] = env
+    client.create_function(**kwargs)
+
+
+def test_proxy_invoke_forwards_event_and_returns_response(proxy_server):
+    name = "proxy_echo"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+
+    event = {"hello": "world", "n": 42}
+    resp = client.invoke(FunctionName=name, Payload=json.dumps(event).encode())
+    body = json.loads(resp["Payload"].read())
+
+    assert body == {"ok": True}
+    assert _ProxyHandler.received, "container never received the invocation"
+    forwarded = _ProxyHandler.received[-1]
+    assert forwarded["path"] == "/invoke"
+    assert json.loads(forwarded["body"]) == event
+    h = forwarded["headers"]
+    assert h.get("X-Amzn-Lambda-Function-Name") == name
+    assert h.get("X-Amzn-Lambda-Request-Id")
+    assert h.get("X-Amzn-Lambda-Function-Arn", "").endswith(f":function:{name}")
+
+
+def test_proxy_invoke_passes_through_response_payload(proxy_server):
+    name = "proxy_payload"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+    _ProxyHandler.response = (200, b'{"statusCode":201,"body":"created"}', {"Content-Type": "application/json"})
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    body = json.loads(resp["Payload"].read())
+    assert body == {"statusCode": 201, "body": "created"}
+
+
+def test_proxy_invoke_non_2xx_returns_lambda_error_shape(proxy_server):
+    name = "proxy_500"
+    client = _make_client()
+    _create_proxy_function(client, name, f"http://127.0.0.1:{proxy_server}/invoke")
+    _ProxyHandler.response = (500, b"boom", {"Content-Type": "text/plain"})
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    assert resp.get("FunctionError") == "Unhandled"
+    body = json.loads(resp["Payload"].read())
+    assert body.get("errorType") == "Runtime.HandlerError"
+    assert "HTTP 500" in body.get("errorMessage", "")
+
+
+def test_proxy_invoke_unreachable_returns_lambda_error_shape():
+    name = "proxy_unreachable"
+    client = _make_client()
+    _create_proxy_function(client, name, "http://127.0.0.1:1/invoke")
+
+    resp = client.invoke(FunctionName=name, Payload=b"{}")
+    assert resp.get("FunctionError") == "Unhandled"
+    body = json.loads(resp["Payload"].read())
+    assert body.get("errorType") in ("Runtime.HandlerError", "Sandbox.Timedout")
+    assert "errorMessage" in body
+
+
+def test_proxy_unset_falls_back_to_normal_executor():
+    name = "proxy_unset"
+    client = _make_client()
+    _create_proxy_function(client, name, None)
+    resp = client.invoke(FunctionName=name, Payload=b'{"a":1}')
+    body = json.loads(resp["Payload"].read())
+    assert body == {"a": 1}
+
+
+def test_proxy_via_apigw_aws_proxy_integration(proxy_server):
+    """API Gateway HTTP API routes through to a proxy Lambda's container and returns its response."""
+    import urllib.request as _urlreq
+    from urllib.parse import urlparse
+
+    name = "proxy_apigw_fn"
+    lam = _make_client()
+    _create_proxy_function(lam, name, f"http://127.0.0.1:{proxy_server}/invoke")
+
+    # Container replies with a Lambda Proxy response shape, which APIGW unwraps.
+    _ProxyHandler.response = (
+        200,
+        b'{"statusCode":200,"headers":{"Content-Type":"application/json"},"body":"{\\"hi\\":\\"from-php\\"}"}',
+        {"Content-Type": "application/json"},
+    )
+
+    apigw = boto3.client(
+        "apigatewayv2",
+        endpoint_url=_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    api_id = apigw.create_api(Name=f"proxy-api-{name}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    port = urlparse(_endpoint).port or 4566
+    url = f"http://{api_id}.execute-api.localhost:{port}/$default/hello"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{port}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"hi": "from-php"}
+
+    # The container should have received an APIGW v2 event JSON, not a raw HTTP request.
+    forwarded = json.loads(_ProxyHandler.received[-1]["body"])
+    assert forwarded.get("rawPath") == "/hello"
+    assert forwarded.get("requestContext", {}).get("http", {}).get("method") == "GET"

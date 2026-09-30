@@ -158,3 +158,91 @@ def test_trailing_slash_on_root_is_tolerated():
     status, body = _call("GET", "/v4/tok-aaaaaaaa/")
     assert status == 200
     assert body["Name"] == "web"
+
+
+def test_status_is_pushed_onto_the_payload_as_the_task_moves():
+    """The endpoint reports the task's status instead of always saying RUNNING."""
+    arn = "arn:aws:ecs:us-east-1:000000000000:task/c/statusprobe01"
+    _register("statusprobetoken01", arn, "probe", KnownStatus="PENDING")
+
+    for status in ("PENDING", "ACTIVATING", "RUNNING"):
+        ecs_metadata.set_task_status(arn, known_status=status)
+        _, body = _call("GET", "/v4/statusprobetoken01/task")
+        assert body["KnownStatus"] == status
+
+    # On AWS a starting task serves "NONE" for itself and "RUNNING" for the
+    # container reading the endpoint, in one payload.
+    ecs_metadata.set_task_status(arn, known_status="ACTIVATING")
+    ecs_metadata.set_container_status("statusprobetoken01", "RUNNING")
+    _, body = _call("GET", "/v4/statusprobetoken01/task")
+    assert body["KnownStatus"] == "ACTIVATING"
+    assert body["Containers"][0]["KnownStatus"] == "RUNNING"
+    assert _call("GET", "/v4/statusprobetoken01")[1]["KnownStatus"] == "RUNNING"
+
+    # DesiredStatus is the task's on both.
+    ecs_metadata.set_task_status(arn, desired_status="STOPPED")
+    _, body = _call("GET", "/v4/statusprobetoken01/task")
+    assert body["DesiredStatus"] == "STOPPED"
+    assert body["Containers"][0]["DesiredStatus"] == "STOPPED"
+    assert _call("GET", "/v4/statusprobetoken01")[1]["DesiredStatus"] == "STOPPED"
+    # ... and it did not drag the container's KnownStatus with it.
+    assert body["Containers"][0]["KnownStatus"] == "RUNNING"
+
+
+def test_stop_pushes_every_container_to_stopped():
+    """The stop path moves every container of the task at once."""
+    arn = "arn:aws:ecs:us-east-1:000000000000:task/c/stopprobe01"
+    _register("stopprobetoken01", arn, "web")
+    _register("stopprobetoken02", arn, "sidecar")
+
+    ecs_metadata.set_task_status(arn, known_status="STOPPED", desired_status="STOPPED")
+    ecs_metadata.set_all_container_status(arn, "STOPPED")
+
+    _, body = _call("GET", "/v4/stopprobetoken01/task")
+    assert body["KnownStatus"] == "STOPPED"
+    assert [c["KnownStatus"] for c in body["Containers"]] == ["STOPPED", "STOPPED"]
+
+
+def test_a_push_for_an_unregistered_task_is_a_no_op():
+    """A task whose tokens are already unregistered must not resurrect an entry."""
+    ecs_metadata.set_task_status("arn:aws:ecs:us-east-1:000000000000:task/c/none", known_status="STOPPED")
+    ecs_metadata.set_all_container_status("arn:aws:ecs:us-east-1:000000000000:task/c/none", "STOPPED")
+    ecs_metadata.set_container_status("no-such-token", "STOPPED")
+    assert ecs_metadata._TASKS == {}
+
+
+def test_status_falls_back_to_what_was_registered_when_the_task_is_gone():
+    """No task record, no overlay: the endpoint serves what was registered."""
+    arn = "arn:aws:ecs:us-east-1:000000000000:task/c/goneprobe01"
+    _register("goneprobetoken01", arn, "probe", KnownStatus="ACTIVATING")
+    _, body = _call("GET", "/v4/goneprobetoken01/task")
+    assert body["Containers"][0]["KnownStatus"] == "ACTIVATING"
+
+
+def test_seeding_finds_a_task_outside_the_default_account_and_region():
+    """The seed is keyed off the task ARN, not the request, which carries no SigV4."""
+    from ministack.services import ecs
+
+    account, region = "111122223333", "eu-central-1"
+    arn = f"arn:aws:ecs:{region}:{account}:task/c/otherprobe01"
+    ecs._tasks.set_scoped(account, region, arn, {
+        "taskArn": arn,
+        "desiredStatus": "RUNNING",
+        "lastStatus": "ACTIVATING",
+        "containers": [{"name": "probe", "lastStatus": "PENDING"}],
+    })
+    try:
+        assert ecs._task_status_snapshot(arn) == (
+            "RUNNING", "ACTIVATING", {"probe": "PENDING"},
+        )
+    finally:
+        ecs._tasks.pop_scoped(account, region, arn, None)
+
+
+def test_seeding_returns_none_for_an_unparseable_or_missing_task():
+    from ministack.services import ecs
+
+    assert ecs._task_status_snapshot("not-an-arn") is None
+    assert ecs._task_status_snapshot(
+        "arn:aws:ecs:us-east-1:000000000000:task/c/absent01"
+    ) is None

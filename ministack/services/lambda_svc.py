@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
@@ -64,7 +64,7 @@ from ministack.core.lambda_runtime import (
     reap_idle_workers,
     release_worker,
 )
-from ministack.core.persistence import STATE_DIR, load_state
+from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountRegionScopedDict,
@@ -78,6 +78,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
 )
+from ministack.core.router import extract_access_key_id
 
 logger = logging.getLogger("lambda")
 
@@ -175,6 +176,13 @@ _INVOKE_DEPTH_HEADER = INVOKE_DEPTH_HEADER.lower()
 # is where the executors read it back to seed the child environment.
 _invoke_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "ministack_invoke_depth", default=0
+)
+
+
+# The caller's access key, set per request so a layer-policy denial can name
+# the calling identity the way AWS does.
+_request_access_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ministack_lambda_request_access_key", default=""
 )
 
 
@@ -445,21 +453,32 @@ def _b64_sha_to_hex(b64_sha: str) -> str | None:
 
 def _sweep_extract_cache() -> None:
     """Drop cached extraction trees whose blob no longer backs any function,
-    function version, or layer version — the same reference-based policy the
-    lambda-blob persistence sweep uses. Called when references disappear
-    (function delete, code update, layer-version delete); reset() still
-    clears everything wholesale. Runs on stored CodeSha256 values only, so a
-    sweep never hashes a byte."""
+    function version, or layer version, and reap deleted layer versions once
+    no function references them. Called when references disappear (function
+    delete, code update, layer detach, layer-version delete, CloudFormation
+    deletes) and after a state restore; reset() still clears everything
+    wholesale. Runs on stored CodeSha256 values only, so a sweep never hashes
+    a byte."""
     live_code: set[str] = set()
     live_layer: set[str] = set()
+    attached_layers: set[str] = set()
     for func in _functions._data.values():
         for cfg in [func.get("config") or {}] + [
                 (v or {}).get("config") or {} for v in (func.get("versions") or {}).values()]:
             sha = _b64_sha_to_hex(cfg.get("CodeSha256", ""))
             if sha:
                 live_code.add(sha)
+            for ref in cfg.get("Layers") or []:
+                attached_layers.add(ref if isinstance(ref, str) else ref.get("Arn", ""))
     for layer in _layers._data.values():
-        for ver in layer.get("versions", []):
+        versions = layer.get("versions") or []
+        # A deleted version survives only while an attached function still
+        # needs its bytes. Removed in place, one atomic list.remove at a time,
+        # so a version a concurrent publish appends is never lost.
+        for ver in [v for v in versions if v.get("_deleted")
+                    and v.get("LayerVersionArn") not in attached_layers]:
+            versions.remove(ver)
+        for ver in versions:
             sha = _b64_sha_to_hex((ver.get("Content") or {}).get("CodeSha256", ""))
             if sha:
                 live_layer.add(sha)
@@ -486,7 +505,7 @@ def _sweep_extract_cache() -> None:
 # files no longer referenced by any function or version (e.g. previous
 # ``UpdateFunctionCode`` generations).
 #
-# Backward compatibility: ``restore_state`` accepts the legacy inline
+# Backward compatibility: ``_restore_state`` accepts the legacy inline
 # base64 shape (``"code_zip": "<b64>"``) so an upgrade in place works
 # without a one-shot migration step.
 
@@ -619,7 +638,14 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    if _esms.has_any():
+        _ensure_poller()
+    _resume_pending_snapstart_versions()
+
+
+def _restore_state(data):
     if data:
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):
@@ -645,26 +671,26 @@ def restore_state(data):
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
+        # A snapshot may carry a deleted layer version whose last reference
+        # did not survive the restore.
+        _sweep_extract_cache()
         _restore_esms(data.get("esms", {}))
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
         _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
-        # A SnapStart version persisted mid-publish restores as State=Pending
-        # with no provisioning thread behind it — and Pending SnapStart
-        # versions answer 409 on Invoke and are skipped by the generic state
-        # flipper, so without re-provisioning here the version would be
-        # uninvokable forever. Re-run the publish-time initialization.
-        for scoped_key, func in list(_functions._data.items()):
-            fn_name = scoped_key[-1]
-            for ver_record in (func.get("versions") or {}).values():
-                cfg = ver_record.get("config") or {}
-                if (
-                    cfg.get("State") == "Pending"
-                    and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
-                ):
-                    _snapstart_provision_version_async(fn_name, ver_record)
-        if _esms.has_any():
-            _ensure_poller()
+
+
+def _resume_pending_snapstart_versions() -> None:
+    """Resume provisioners that cannot survive a process restart."""
+    for scoped_key, func in list(_functions._data.items()):
+        fn_name = scoped_key[-1]
+        for ver_record in (func.get("versions") or {}).values():
+            cfg = ver_record.get("config") or {}
+            if (
+                cfg.get("State") == "Pending"
+                and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+            ):
+                _snapstart_provision_version_async(fn_name, ver_record)
 
 
 def _region_from_function_record(func: dict) -> str:
@@ -739,14 +765,6 @@ def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
                 account_id = get_account_id()
                 region = esm_scopes.get((account_id, key), get_region())
                 store._data[(account_id, region, key)] = value
-
-
-# NOTE: the persisted-state load used to run here, but ``restore_state`` calls
-# ``_ensure_poller()`` when the restored data contains event source mappings,
-# and that helper is defined much later in this module. Restoring at import
-# time raised ``NameError: _ensure_poller`` on warm starts with a populated
-# ``lambda.json`` (issue #412). The load now lives at the bottom of the file,
-# after ``_ensure_poller`` is defined.
 
 
 # ---------------------------------------------------------------------------
@@ -1260,15 +1278,12 @@ def _validate_unzipped_size(zip_data: bytes | None):
     return None
 
 
-def _layer_unzipped_size(layer_arn: str) -> int:
+def _layer_unzipped_size(attachment: str | dict) -> int:
     """Unzipped size of an attached layer version's content. A layer we don't
     hold the bytes for (an external ARN, or content that failed to fetch)
     contributes 0 — it can't be measured, so it isn't counted rather than
     guessed at (never over-rejecting a function that AWS would accept)."""
-    version_config, err = _resolve_layer_version_for_attachment(layer_arn)
-    if err or not version_config:
-        return 0
-    return _unzipped_size(version_config.get("_zip_data"))
+    return _unzipped_size(_resolve_layer_zip(attachment))
 
 
 def _validate_total_unzipped_size(code_zip: bytes | None, layers):
@@ -1278,9 +1293,8 @@ def _validate_total_unzipped_size(code_zip: bytes | None, layers):
     layers and custom runtimes" (unzipped)."""
     total = _unzipped_size(code_zip)
     for layer in layers or []:
-        arn = layer.get("Arn") if isinstance(layer, dict) else layer
-        if arn:
-            total += _layer_unzipped_size(arn)
+        if layer:
+            total += _layer_unzipped_size(layer)
     if total > _UNZIPPED_LIMIT_BYTES:
         return error_response_json(
             "InvalidParameterValueException",
@@ -1542,6 +1556,30 @@ def _snapstart_provision_version_async(name: str, ver_record: dict) -> None:
     ).start()
 
 
+def _vpc_config_with_id(request_config: dict | None) -> dict:
+    """Add Lambda's read-only VpcId from the configured EC2 subnets."""
+    config = copy.deepcopy(request_config) if request_config is not None else {
+        "SubnetIds": [], "SecurityGroupIds": [],
+    }
+    subnet_ids = config.get("SubnetIds") or []
+    vpc_ids = set()
+    all_found = True
+    if subnet_ids:
+        from ministack.services import ec2
+
+        ec2._ensure_defaults_initialized()
+        for subnet_id in subnet_ids:
+            subnet = ec2._subnets.get(subnet_id)
+            if subnet is None:
+                all_found = False
+                break
+            vpc_ids.add(subnet["VpcId"])
+    # An unknown or mixed-VPC subnet set must not claim a VPC. AWS validates
+    # these inputs; MiniStack currently accepts them, so leave VpcId empty.
+    config["VpcId"] = vpc_ids.pop() if all_found and len(vpc_ids) == 1 else ""
+    return config
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -1589,14 +1627,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "Architectures": data.get("Architectures", ["x86_64"]),
         "Layers": layers_cfg,
         "TracingConfig": data.get("TracingConfig", {"Mode": "PassThrough"}),
-        "VpcConfig": data.get(
-            "VpcConfig",
-            {
-                "SubnetIds": [],
-                "SecurityGroupIds": [],
-                "VpcId": "",
-            },
-        ),
+        "VpcConfig": _vpc_config_with_id(data.get("VpcConfig")),
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
@@ -1651,6 +1682,62 @@ def _invalid_layer_version_arn(layer_arn: str):
     )
 
 
+def _layer_access_denied(layer_arn: str):
+    """The denial AWS returns for a foreign layer, naming the calling identity."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+
+    identity = resolve_caller_identity(_request_access_key.get()) or {}
+    caller = identity.get("userArn") or f"arn:aws:iam::{get_account_id()}:root"
+    return None, error_response_json(
+        "AccessDeniedException",
+        f"User: {caller} is not authorized to perform: lambda:GetLayerVersion on "
+        f"resource: {layer_arn} because no resource-based policy allows the "
+        "lambda:GetLayerVersion action",
+        403,
+    )
+
+
+# The extensions AWS publishes from its own accounts and grants
+# lambda:GetLayerVersion on to everyone. Keyed by LAYER NAME, not by publisher
+# account: the name is stable while the account differs in every region, so one
+# short list replaces ~190 account ids that go stale as regions are added.
+_AWS_PUBLISHED_LAYER_PREFIXES = (
+    "LambdaInsightsExtension",
+    "AWS-Parameters-and-Secrets-Lambda-Extension",
+    "AWS-AppConfig-Extension",
+    "AWSOpenTelemetryDistro",
+    "aws-otel-",
+    "AWSSDKPandas-",
+)
+
+
+def _is_aws_published_layer(layer_name: str) -> bool:
+    return layer_name.startswith(_AWS_PUBLISHED_LAYER_PREFIXES)
+
+
+def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
+    """Another account's layer through its grant; an unknown account passes by
+    name, and the bytes are not available offline (CodeSize 0, does not run)."""
+    if spec.region != get_region():
+        return _layer_access_denied(layer_arn)
+    layer_name, version = name_and_version
+    vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+    if vc is not None and _layer_policy_allows(vc, get_account_id()):
+        return vc, None
+    if vc is None and _is_aws_published_layer(layer_name):
+        logger.warning(
+            "Layer %s is an AWS-published extension: the reference resolves so "
+            "the stack deploys, but the bytes are not available offline and the "
+            "extension will not run", layer_arn,
+        )
+        return {
+            "LayerVersionArn": layer_arn,
+            "Version": version,
+            "Content": {"CodeSize": 0},
+        }, None
+    return _layer_access_denied(layer_arn)
+
+
 def _resolve_layer_version_for_attachment(layer_arn: str):
     try:
         spec = parse_arn(layer_arn)
@@ -1662,30 +1749,19 @@ def _resolve_layer_version_for_attachment(layer_arn: str):
         return None, _invalid_layer_version_arn(layer_arn)
 
     if spec.account_id != get_account_id():
-        return None, error_response_json(
-            "AccessDeniedException",
-            "User is not authorized to access this resource.",
-            403,
-        )
+        return _resolve_cross_account_layer(layer_arn, spec, layer_ref)
     if spec.region != get_region():
         return None, error_response_json(
             "InvalidParameterValueException",
-            f"Layer version ARN {layer_arn} is in region {spec.region}; "
-            f"function region is {get_region()}",
+            "Layers are not in the same region as the function. "
+            f"Layers are expected to be in region {get_region()}.",
             400,
         )
 
     layer_name, version = layer_ref
-    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
-    if not layer:
-        return None, error_response_json(
-            "InvalidParameterValueException",
-            f"Layer version {layer_arn} does not exist.",
-            400,
-        )
-    for version_config in layer["versions"]:
-        if version_config["Version"] == version:
-            return version_config, None
+    version_config, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+    if version_config is not None:
+        return version_config, None
     return None, error_response_json(
         "InvalidParameterValueException",
         f"Layer version {layer_arn} does not exist.",
@@ -1925,6 +2001,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 
     path = unquote(path)
     parts = path.rstrip("/").split("/")
+    _request_access_key.set(extract_access_key_id(headers, query_params))
 
     # --- Durable Execution surface (preview, API version 2025-12-01) ---
     # Routed first because some paths embed the function ARN as a path segment
@@ -2224,10 +2301,6 @@ def _create_function(data: dict):
             version_id=code_data.get("S3ObjectVersion"),
         )
 
-    err = _validate_total_unzipped_size(code_zip, data.get("Layers"))
-    if err is not None:
-        return err
-
     if image_uri:
         data.setdefault("PackageType", "Image")
 
@@ -2243,6 +2316,9 @@ def _create_function(data: dict):
     if err:
         return err
     layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
+    if err:
+        return err
+    err = _validate_total_unzipped_size(code_zip, layers_cfg)
     if err:
         return err
     if data.get("Layers") is not None:
@@ -2759,6 +2835,9 @@ def _update_config(name: str, data: dict):
         layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
         if err:
             return err
+        err = _validate_total_unzipped_size(_functions[name].get("code_zip"), layers_cfg)
+        if err:
+            return err
         data = dict(data)
         data["Layers"] = layers_cfg
     config = _functions[name]["config"]
@@ -2815,6 +2894,8 @@ def _update_config(name: str, data: dict):
                 # Request carries only ApplyOn; the stored/echoed shape adds
                 # OptimizationStatus, which is always Off on $LATEST.
                 config["SnapStart"] = _snapstart_response(data["SnapStart"])
+            elif key == "VpcConfig":
+                config[key] = _vpc_config_with_id(data[key])
             else:
                 config[key] = data[key]
     if "Architectures" in data:
@@ -2851,6 +2932,8 @@ def _update_config(name: str, data: dict):
         # in-process warm worker recycle solved for Python/Node.
         _pool_kill_function(get_account_id(), name)
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
+    if "Layers" in data:
+        _sweep_extract_cache()
     return json_response(config)
 
 
@@ -3269,7 +3352,8 @@ def _pool_acquire(key: str, max_concurrency: int | None):
 
     `max_concurrency` semantics:
       - int > 0   : per-function cap (ReservedConcurrentExecutions). At cap → (None, False).
-      - None / 0  : no per-function cap. Always spawn a fresh container if no free one.
+      - 0         : function disabled (ReservedConcurrentExecutions=0). Always throttle.
+      - None      : no per-function cap. Always spawn a fresh container if no free one.
 
     Account-level cap (if `_ACCOUNT_CONCURRENCY_CAP > 0`) is enforced globally across all keys.
 
@@ -3292,8 +3376,8 @@ def _pool_acquire(key: str, max_concurrency: int | None):
                 e["in_use"] = True
                 e["last_used"] = time.time()
                 return e, "reused"
-        # Function-level cap
-        if max_concurrency and len(entries) >= max_concurrency:
+        # Function-level cap (0 disables the function — every invoke throttles)
+        if max_concurrency is not None and len(entries) >= max_concurrency:
             return None, "func_cap"
         # Account-level cap (count in-use entries across all pools)
         if _ACCOUNT_CONCURRENCY_CAP > 0:
@@ -3423,7 +3507,7 @@ def _ensure_reaper_thread() -> None:
 # Active / Successful asynchronously when the runtime is ready. Real AWS takes
 # seconds to tens of seconds (image pull time for Image type); we use a short
 # delay so local integration tests see the transition without spinning.
-_LAMBDA_STATE_TRANSITION_DELAY = float(os.environ.get("LAMBDA_STATE_TRANSITION_SECONDS", "0.5"))
+_LAMBDA_STATE_TRANSITION_DELAY = 0.5
 
 
 def _schedule_state_transition(func_name: str, delay: float) -> None:
@@ -4018,6 +4102,49 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
+_CONTAINER_CA_PATH = "/var/ministack/ministack-ca.pem"
+_CONTAINER_BUNDLE_PATH = "/var/ministack/ca-bundle.pem"
+_CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
+
+
+def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
+    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert."""
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return
+    try:
+        cert_path, _key_path = _tls.resolve_tls_material()
+    except SystemExit:
+        return
+    extra_hosts = run_kwargs.setdefault("extra_hosts", {})
+    for host in _tls.cognito_idp_hosts():
+        extra_hosts.setdefault(host, "host-gateway")
+    if not os.path.exists(cert_path):
+        return
+    # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
+    bundle = _tls.ca_bundle_path(cert_path)
+    mounts.append(docker_lib.types.Mount(
+        _CONTAINER_CA_PATH, cert_path, type="bind", read_only=True))
+    container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
+    if bundle:
+        mounts.append(docker_lib.types.Mount(
+            _CONTAINER_BUNDLE_PATH, bundle, type="bind", read_only=True))
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+            container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
+    # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
+    if runtime.startswith("java"):
+        store = _tls.java_truststore_path(cert_path)
+        if store:
+            mounts.append(docker_lib.types.Mount(
+                _CONTAINER_TRUSTSTORE_PATH, store, type="bind", read_only=True))
+            container_env.setdefault("JAVA_TOOL_OPTIONS", " ".join((
+                f"-Djavax.net.ssl.trustStore={_CONTAINER_TRUSTSTORE_PATH}",
+                "-Djavax.net.ssl.trustStoreType=pkcs12",
+                f"-Djavax.net.ssl.trustStorePassword={_tls.JAVA_TRUSTSTORE_PASSWORD}",
+            )))
+
+
 def _declared_docker_platform(config: dict):
     """The linux/* platform to pin, or None when the function never declared one.
 
@@ -4262,8 +4389,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             raise ValueError("Zip PackageType requires code_zip bytes")
         code_dir = _docker_extracted_dir(code_zip, "code")
         for layer_ref in layers_list:
-            layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
-            layer_zip = _resolve_layer_zip(layer_arn_str)
+            layer_zip = _resolve_layer_zip(layer_ref)
             if not layer_zip:
                 continue
             layers_dirs.append(_docker_extracted_dir(layer_zip, "layer"))
@@ -4394,6 +4520,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         if shim_cmd:
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
+
+    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime)
 
     if mounts:
         run_kwargs["mounts"] = mounts
@@ -4572,7 +4700,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     reserved = func.get("concurrency")
     if isinstance(reserved, dict):
         reserved = reserved.get("ReservedConcurrentExecutions")
-    max_conc = int(reserved) if reserved else None  # None = unbounded per-function
+    # None = unbounded per-function; 0 disables the function (throttle-all).
+    max_conc = None if reserved is None else int(reserved)
 
     _ensure_reaper_thread()
     key = _warm_pool_key(fn_name, config)
@@ -4791,7 +4920,17 @@ def _inflight_key(config: dict) -> str:
         account, region = _account_region_from_function_config(config)
     except Exception:
         account, region = get_account_id(), get_region()
-    return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
+    # Reserved concurrency is shared across all versions and aliases.
+    return f"{account}:{region}:{config.get('FunctionName', '?')}"
+
+
+def _reserved_concurrency(func: dict, config: dict) -> int | None:
+    reserved = (func or {}).get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    if reserved is None:
+        reserved = config.get("ReservedConcurrentExecutions")
+    return None if reserved is None else int(reserved)
 
 
 def _acquire_execution_slot(func: dict, config: dict):
@@ -4806,14 +4945,10 @@ def _acquire_execution_slot(func: dict, config: dict):
     so both are consulted rather than assuming either shape.
     """
     global _inflight_total
-    reserved = (func or {}).get("concurrency")
-    if isinstance(reserved, dict):
-        reserved = reserved.get("ReservedConcurrentExecutions")
-    if reserved is None:
-        reserved = config.get("ReservedConcurrentExecutions")
+    reserved = _reserved_concurrency(func, config)
     key = _inflight_key(config)
     with _inflight_lock:
-        if reserved and _inflight.get(key, 0) >= int(reserved):
+        if reserved is not None and _inflight.get(key, 0) >= reserved:
             return None, "function"
         if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
             return None, "account"
@@ -5416,8 +5551,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
 
             layers_dirs: list[str] = []
             for layer_ref in config.get("Layers", []):
-                layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
-                layer_zip = _resolve_layer_zip(layer_arn_str)
+                layer_zip = _resolve_layer_zip(layer_ref)
                 if layer_zip:
                     layer_dir = os.path.join(tmpdir, f"layer_{len(layers_dirs)}")
                     os.makedirs(layer_dir)
@@ -5565,33 +5699,22 @@ def _execute_function_local(func: dict, event: dict) -> dict:
         }
 
 
-def _resolve_layer_zip(layer_arn_str: str) -> bytes | None:
-    """Given a layer version ARN return the stored zip bytes, or None."""
+def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
+    """Return attached content, including versions deleted since attachment."""
+    if isinstance(attachment, dict):
+        attachment = attachment.get("Arn", "")
     try:
-        spec = parse_arn(layer_arn_str)
+        spec = parse_arn(attachment)
     except ArnParseError:
         return None
-    if spec.service != "lambda":
+    ref = _lambda_layer_version_name_and_number_from_arn_spec(spec)
+    if ref is None or spec.region != get_region():
         return None
-    if spec.account_id != get_account_id():
-        return None
-    if spec.region != get_region():
-        return None
-    parts = spec.resource.split(":", 2)
-    if len(parts) != 3 or parts[0] != "layer":
-        return None
-    layer_name = parts[1]
-    try:
-        version = int(parts[2])
-    except ValueError:
-        return None
-    layer = _layers.get_scoped(spec.account_id, spec.region, layer_name)
-    if not layer:
-        return None
-    for v in layer["versions"]:
-        if v["Version"] == version:
-            return v.get("_zip_data")
-    return None
+    # Attachment checks permission. Cold starts must still work after revocation.
+    vc, _ = _find_layer_version(
+        *ref, spec.account_id, spec.region, include_deleted=True
+    )
+    return vc.get("_zip_data") if vc else None
 
 
 def _layer_codesize_for_arn(layer_arn_str: str) -> int:
@@ -6142,7 +6265,7 @@ def _list_layer_versions(layer_name: str, query_params: dict):
     all_versions = [
         {k: v for k, v in vc.items() if not k.startswith("_")}
         for vc in layer["versions"]
-        if _match_layer_version(vc, runtime, arch)
+        if not vc.get("_deleted") and _match_layer_version(vc, runtime, arch)
     ]
     all_versions.sort(key=lambda v: v["Version"], reverse=True)
 
@@ -6169,6 +6292,8 @@ def _get_layer_version(layer_name: str, version: int):
             "Layer Version Cannot be less than 1.",
             400,
         )
+    if layer_name.startswith("arn:"):
+        return _get_layer_version_by_arn(f"{layer_name}:{version}")
     layer = _layers.get(layer_name)
     if not layer:
         return error_response_json(
@@ -6177,7 +6302,7 @@ def _get_layer_version(layer_name: str, version: int):
             404,
         )
     for vc in layer["versions"]:
-        if vc["Version"] == version:
+        if vc["Version"] == version and not vc.get("_deleted"):
             out = {k: v for k, v in vc.items() if not k.startswith("_")}
             return json_response(out)
     return error_response_json(
@@ -6204,20 +6329,19 @@ def _get_layer_version_by_arn(arn: str):
             "arn:(aws[a-zA-Z-]*)?:lambda:[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{{1}}:\\d{{12}}:layer:[a-zA-Z0-9-_]+:[0-9]+",
             400,
         )
+    layer_name = parts[1]
+    version = int(parts[2])
     if spec.account_id != get_account_id():
-        return error_response_json(
-            "AccessDeniedException",
-            "User is not authorized to access this resource.",
-            403,
-        )
+        vc, err = _resolve_cross_account_layer(arn, spec, (layer_name, version))
+        if err:
+            return err
+        return json_response({k: v for k, v in vc.items() if not k.startswith("_")})
     if spec.region != get_region():
         return error_response_json(
             "ResourceNotFoundException",
             "The resource you requested does not exist.",
             404,
         )
-    layer_name = parts[1]
-    version = int(parts[2])
     return _get_layer_version(layer_name, version)
 
 
@@ -6231,7 +6355,9 @@ def _delete_layer_version(layer_name: str, version: int):
     layer = _layers.get(layer_name)
     if not layer:
         return 204, {}, b""
-    layer["versions"] = [vc for vc in layer["versions"] if vc["Version"] != version]
+    for vc in layer["versions"]:
+        if vc["Version"] == version:
+            vc["_deleted"] = True
     # The removed version may have been the last reference to its extracted
     # layer tree in the docker executor cache.
     _sweep_extract_cache()
@@ -6244,7 +6370,8 @@ def _list_layers(query_params: dict):
 
     result = []
     for name, layer in _layers.items():
-        matching = [vc for vc in layer["versions"] if _match_layer_version(vc, runtime, arch)]
+        matching = [vc for vc in layer["versions"]
+                    if not vc.get("_deleted") and _match_layer_version(vc, runtime, arch)]
         if matching:
             latest = matching[-1]
             result.append(
@@ -6281,6 +6408,8 @@ def _find_layer_version(
     version: int,
     account_id: str | None = None,
     region: str | None = None,
+    *,
+    include_deleted: bool = False,
 ):
     """Return (layer_version_config, error_response) — one will be None."""
     if account_id and region:
@@ -6295,7 +6424,7 @@ def _find_layer_version(
             404,
         )
     for vc in layer["versions"]:
-        if vc["Version"] == version:
+        if vc["Version"] == version and (include_deleted or not vc.get("_deleted")):
             return vc, None
     return None, error_response_json(
         "ResourceNotFoundException",
@@ -6310,6 +6439,9 @@ def _find_layer_version(
 # rejected with PreconditionFailedException (412) rather than silently
 # clobbering a policy that changed underneath them.
 _LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+# The other two modeled constraints on AddLayerVersionPermission.
+_LAYER_ORG_ID_RE = re.compile(r"^o-[a-z0-9]{10,32}$")
+_LAYER_STATEMENT_ID_RE = re.compile(r"^[a-zA-Z0-9\-_]{1,100}$")
 
 
 def _layer_policy_revision_id(vc: dict) -> str:
@@ -6345,6 +6477,25 @@ def _layer_statement_principal(principal: str):
     if principal.isdigit():
         return {"AWS": f"arn:aws:iam::{principal}:root"}
     return {"AWS": principal}
+
+
+def _layer_policy_allows(version_config: dict, account_id: str) -> bool:
+    """Whether the layer version's resource policy grants the calling account
+    lambda:GetLayerVersion. The caller is the account root, the way an
+    AddLayerVersionPermission grant names it; aws:PrincipalOrgID and every
+    other condition key resolve inside the evaluator."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iam::{account_id}:root",
+        principal_type="Root",
+        principal_account=account_id,
+        action="lambda:GetLayerVersion",
+        resource_arn=version_config["LayerVersionArn"],
+        region=get_region(),
+    )
+    result = evaluate_resource_policy(version_config.get("_policy"), ctx)
+    return result.decision == "Allow"
 
 
 def _add_layer_version_permission(
@@ -6383,12 +6534,28 @@ def _add_layer_version_permission(
             "The principal must be * when an organization id is provided.",
             400,
         )
+    if org_id and not _LAYER_ORG_ID_RE.match(org_id):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{org_id}' at 'organizationId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"o-[a-z0-9]{10,32}",
+            400,
+        )
 
     err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
     sid = data.get("StatementId", "")
+    if not _LAYER_STATEMENT_ID_RE.match(sid):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{sid}' at 'statementId' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            r"([a-zA-Z0-9-_]+)",
+            400,
+        )
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
     for s in policy["Statement"]:
         if s.get("Sid") == sid:
@@ -6967,6 +7134,49 @@ _dynamodb_stream_positions_lock = threading.Lock()
 _esm_backoff_until = AccountRegionScopedDict()
 _ESM_BACKOFF_SECONDS = 1.0
 
+# SQS batches run off the poll thread so a slow handler can't stall other ESMs.
+# Per-ESM limit is ScalingConfig.MaximumConcurrency, else this default.
+_ESM_SQS_DEFAULT_CONCURRENCY = 5
+# esm_uuid -> dispatched batches not yet finished.
+_esm_inflight: dict[str, int] = {}
+_esm_inflight_lock = threading.Lock()
+# Set when a dispatched batch finishes, so _poll_loop refills the slot at once.
+_esm_wake = threading.Event()
+
+
+def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | None = None) -> int:
+    """In-flight batches allowed for one SQS event source mapping.
+
+    FIFO is 1: "Amazon SQS ensures that messages in the same group are
+    delivered to Lambda in order", and a batch here spans groups, so two in
+    flight reorder one. Serial until the poller splits batches by
+    MessageGroupId.
+    """
+    if (queue or {}).get("is_fifo"):
+        return 1
+    limit = (esm.get("ScalingConfig") or {}).get("MaximumConcurrency") or _ESM_SQS_DEFAULT_CONCURRENCY
+    reserved = _reserved_concurrency(func_rec, config)
+    return min(limit, reserved) if reserved is not None else limit
+
+
+def _dispatch_esm_batch(esm_id: str, fn, *args) -> None:
+    with _esm_inflight_lock:
+        _esm_inflight[esm_id] = _esm_inflight.get(esm_id, 0) + 1
+
+    def _task():
+        try:
+            fn(*args)
+        finally:
+            with _esm_inflight_lock:
+                remaining = _esm_inflight.get(esm_id, 0) - 1
+                if remaining > 0:
+                    _esm_inflight[esm_id] = remaining
+                else:
+                    _esm_inflight.pop(esm_id, None)
+            _esm_wake.set()
+
+    spawn_background(_task, thread_name="ministack-esm")
+
 
 def _init_stream_position(esm_id, source_arn, starting):
     """Anchor a DynamoDB-stream ESM's read position at subscription time so
@@ -7002,6 +7212,7 @@ def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
     while True:
         processed = False
+        _esm_wake.clear()
         try:
             processed = _poll_sqs() or processed
         except Exception as e:
@@ -7018,7 +7229,7 @@ def _poll_loop():
         # immediately rather than waiting out the idle cadence below, so
         # throughput isn't throttled to batch_size-per-tick.
         if not processed:
-            time.sleep(1 if _esms.has_any() else 5)
+            _esm_wake.wait(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():
@@ -7045,8 +7256,8 @@ def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
 
 
 def _poll_sqs():
-    """Returns True if any ESM advanced past a batch this pass (successfully
-    invoked, or filtered out entirely)."""
+    """Returns True if any ESM took a batch this pass (dispatched for invoke,
+    or filtered out entirely)."""
     from ministack.services import sqs as _sqs
 
     processed_any = False
@@ -7085,6 +7296,9 @@ def _poll_sqs():
 
             esm_id = esm["UUID"]
             if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+            # Only this thread increments, so the count can't rise before dispatch.
+            if _esm_inflight.get(esm_id, 0) >= _sqs_esm_concurrency(esm, func_rec, _cfg, queue):
                 continue
 
             batch_size = esm.get("BatchSize", 10)
@@ -7142,65 +7356,75 @@ def _poll_sqs():
                 processed_any = True
                 continue
 
-            event = {"Records": records}
-            result = _execute_function(func_rec, event)
-
-            if result.get("error"):
-                err_body = result.get("body") or {}
-                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                esm["LastProcessingResult"] = "FAILED"
-                logger.warning(
-                    "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                    func_name, queue_name, err_type, err_msg, result.get("log", ""),
-                )
-                # Failed messages stay invisible for their visibility timeout
-                # rather than advancing, so don't report this as processed.
-                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
-            else:
-                processed_any = True
-                _esm_backoff_until.pop(esm_id, None)
-                # Check for ReportBatchItemFailures — partial batch response
-                failed_ids = set()
-                if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
-                    body = result.get("body")
-                    if isinstance(body, dict):
-                        for failure in body.get("batchItemFailures", []):
-                            fid = failure.get("itemIdentifier", "")
-                            if fid:
-                                failed_ids.add(fid)
-                    elif isinstance(body, str):
-                        try:
-                            parsed = json.loads(body)
-                            for failure in parsed.get("batchItemFailures", []):
-                                fid = failure.get("itemIdentifier", "")
-                                if fid:
-                                    failed_ids.add(fid)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-
-                # Delete only the messages that succeeded (not in failed_ids)
-                succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
-                receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
-                if receipt_handles:
-                    _sqs._delete_messages_for_esm(queue_url, receipt_handles)
-
-                n_failed = len(batch) - len(succeeded)
-                if n_failed:
-                    esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                                func_name, len(succeeded), queue_name, n_failed)
-                else:
-                    esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
-                log_output = result.get("log", "")
-                if log_output:
-                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+            _dispatch_esm_batch(
+                esm_id, _run_sqs_batch, esm, func_rec, {"Records": records}, batch, queue_url, queue_name
+            )
+            processed_any = True
         finally:
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
     return processed_any
+
+
+def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
+    from ministack.services import sqs as _sqs
+
+    esm_id = esm["UUID"]
+    func_name = esm["FunctionName"]
+    result = _execute_function(func_rec, event)
+
+    if result.get("error"):
+        err_body = result.get("body") or {}
+        err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+        err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+        esm["LastProcessingResult"] = "FAILED"
+        logger.warning(
+            "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
+            func_name, queue_name, err_type, err_msg, result.get("log", ""),
+        )
+        # Failed messages stay invisible for their visibility timeout; pace
+        # retries so the poll loop doesn't spin on a broken ESM.
+        _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
+        return
+
+    _esm_backoff_until.pop(esm_id, None)
+    # Check for ReportBatchItemFailures — partial batch response
+    failed_ids = set()
+    if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+        body = result.get("body")
+        if isinstance(body, dict):
+            for failure in body.get("batchItemFailures", []):
+                fid = failure.get("itemIdentifier", "")
+                if fid:
+                    failed_ids.add(fid)
+        elif isinstance(body, str):
+            try:
+                parsed = json.loads(body)
+                for failure in parsed.get("batchItemFailures", []):
+                    fid = failure.get("itemIdentifier", "")
+                    if fid:
+                        failed_ids.add(fid)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # Delete only the messages that succeeded (not in failed_ids)
+    succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+    receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+    if receipt_handles:
+        _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+
+    n_failed = len(batch) - len(succeeded)
+    if n_failed:
+        esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                    func_name, len(succeeded), queue_name, n_failed)
+    else:
+        esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
+    log_output = result.get("log", "")
+    if log_output:
+        logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
 def _poll_kinesis():
@@ -7790,10 +8014,17 @@ def _build_function_url_event(
 
 
 async def handle_function_url_request(
-    url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict
+    url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict,
+    resolved: tuple | None = None,
 ) -> tuple:
-    """Serve a Lambda Function URL data-plane request."""
-    resolved = resolve_function_url(url_id)
+    """Serve a Lambda Function URL data-plane request.
+
+    ``resolved`` is the tuple the IAM check in ``app.py`` already looked up
+    for ``url_id``, which spares a second scan over the Function URL config.
+    ``None`` falls back to resolving here.
+    """
+    if resolved is None:
+        resolved = resolve_function_url(url_id)
     if resolved is None:
         return error_response_json("ResourceNotFoundException", "Not Found", 404)
     account_id, region, func_name, qualifier, cfg = resolved
@@ -7906,18 +8137,3 @@ def reset():
     with _docker_extract_lock:
         _docker_extract_dirs.clear()
     shutil.rmtree(_DOCKER_EXTRACT_CACHE, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Persisted-state restore — runs at module import time but deferred to the
-# very bottom of the file so forward references to helpers (e.g.
-# ``_ensure_poller``) resolve at call time (issue #412). A corrupt or
-# incompatible ``lambda.json`` logs and continues instead of breaking the
-# whole service.
-# ---------------------------------------------------------------------------
-try:
-    _restored = load_state("lambda")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted Lambda state; continuing with a fresh store")

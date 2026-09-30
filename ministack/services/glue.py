@@ -29,7 +29,6 @@ from urllib.parse import unquote
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -48,7 +47,7 @@ _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
+CRAWLER_RUN_SECONDS = 5
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 
@@ -153,7 +152,11 @@ def get_state():
     return copy.deepcopy(_ALL_STATE)
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     for key, store in _ALL_STATE.items():
         store.clear()
         restored = data.get(key, {})
@@ -177,14 +180,6 @@ def _restore_regional_store(store, restored):
         store[key] = value
 
 
-try:
-    _restored = load_state("glue")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def _arn(resource_type, name):

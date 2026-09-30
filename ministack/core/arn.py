@@ -62,3 +62,17 @@ def parse_arn(value: str) -> Arn:
 def is_arn(value: str) -> bool:
     """Return whether a value is shaped like an ARN."""
     return isinstance(value, str) and value.startswith(_ARN_PREFIX) and value.count(":") >= _ARN_SECTIONS - 1
+
+
+def execute_api_arn(region: str, account_id: str, api_id: str,
+                    stage: str, method: str, path: str) -> str:
+    """Build the ``execute-api`` ARN for one invoke.
+
+    ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``.
+    Both the Lambda authorizer's method ARN and the IAM evaluator's resource
+    have to be this exact string, so they share one builder.
+    """
+    return (
+        f"arn:aws:execute-api:{region}:{account_id}:"
+        f"{api_id}/{stage}/{method}/{path.lstrip('/')}"
+    )

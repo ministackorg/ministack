@@ -308,7 +308,8 @@ def test_iot_jobs_update_rejects_service_side_statuses(
 ):
     """A device may only report IN_PROGRESS / SUCCEEDED / FAILED / REJECTED;
     the service-side statuses (CANCELED, TIMED_OUT, REMOVED) must be rejected
-    with InvalidRequestException (400), as on AWS."""
+    with InvalidStateTransitionException (409) and the message "The status of job
+    execution cannot be changed to be X" — captured eu-north-1 2026-09-19."""
     thing = _unique("jobs-thing")
     job_id = _unique("job")
     try:
@@ -321,10 +322,11 @@ def test_iot_jobs_update_rejects_service_side_statuses(
                     jobId=job_id, thingName=thing, status=status
                 )
             error = ei.value.response["Error"]
-            assert error["Code"] == "InvalidRequestException", status
+            assert error["Code"] == "InvalidStateTransitionException", status
             assert (
-                ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+                ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
             ), status
+            assert f"cannot be changed to be {status}" in error["Message"], status
 
         # The rejected updates must not have touched the execution.
         execution = iot_jobs_data.describe_job_execution(
@@ -447,9 +449,40 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
 # ---------------------------------------------------------------------------
 
 
-def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
-    """The documented device flow: `DescribeEndpoint(endpointType='iot:Jobs')`
-    hands out `{prefix}.jobs.iot.{region}`, and a request carrying that Host
+def test_iot_jobs_update_rejects_a_mismatched_execution_number(
+    iot_client, iot_jobs_data
+):
+    """UpdateJobExecution's executionNumber identifies one execution on the
+    device. Nothing re-queues here, so only number 1 exists and any other
+    number is ResourceNotFoundException, as the describe path already answers."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        with pytest.raises(ClientError) as ei:
+            iot_jobs_data.update_job_execution(
+                jobId=job_id, thingName=thing, status="IN_PROGRESS",
+                executionNumber=7,
+            )
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # Number 1 is the one that exists.
+        iot_jobs_data.update_job_execution(
+            jobId=job_id, thingName=thing, status="IN_PROGRESS", executionNumber=1,
+        )
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_describe_job_steady_state_shape(iot_client):
+    """Captured eu-north-1 2026-09-19 across QUEUED, IN_PROGRESS and SUCCEEDED
+    executions: isConcurrent is false throughout, processingTargets is null
+    throughout, and timeoutConfig/schedulingConfig come back as {} while
+    abortConfig is omitted."""
+def test_iot_jobs_endpoint_host_reaches_the_data_plane(iot_client):
+    """A request carrying the jobs endpoint Host `{prefix}.jobs.iot.{region}`
     must land on the jobs data plane. Routed to the `iot` control plane
     instead, `GET /things/{t}/jobs` is ListJobExecutionsForThing and silently
     answers a different envelope."""
@@ -458,11 +491,45 @@ def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
     try:
         thing_arn = _create_thing(iot_client, thing)
         iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["isConcurrent"] is False
+        assert "processingTargets" not in job["jobProcessDetails"]
+        assert job["timeoutConfig"] == {}
+        assert job["schedulingConfig"] == {}
+        assert "abortConfig" not in job
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
-        endpoint = iot_client.describe_endpoint(endpointType="iot:Jobs")[
+
+def test_iot_jobs_endpoint_type_is_retired(iot_client):
+    """AWS retired `iot:Jobs`: DescribeEndpoint answers InvalidRequestException
+    and points at iot:Data-ATS (captured eu-north-1 2026-09-19). Jobs and
+    Commands are served from the Data-ATS endpoint, where the `iot-jobs-data`
+    signing scope selects the data plane."""
+    with pytest.raises(ClientError) as exc:
+        iot_client.describe_endpoint(endpointType="iot:Jobs")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert "iot:Data-ATS" in exc.value.response["Error"]["Message"]
+
+
+def test_iot_jobs_data_plane_reachable_on_the_data_ats_endpoint(
+    iot_client, iot_jobs_data
+):
+    """The replacement flow: the Data-ATS endpoint serves the jobs data plane.
+    A request signed with the `iot-jobs-data` scope must answer the
+    GetPendingJobExecutions envelope, not the control plane's
+    `executionSummaries`."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        endpoint = iot_client.describe_endpoint(endpointType="iot:Data-ATS")[
             "endpointAddress"
         ]
-        assert ".jobs.iot." in endpoint
+        assert ".jobs.iot." not in endpoint
+        endpoint = "a1b2c3.jobs.iot.us-east-1.localhost"
         request = urllib.request.Request(
             f"{ENDPOINT}/things/{quote(thing)}/jobs",
             method="GET",
@@ -471,7 +538,7 @@ def test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane(iot_client):
         with urllib.request.urlopen(request, timeout=5) as resp:
             body = json.loads(resp.read())
 
-        # The GetPendingJobExecutions envelope — not `executionSummaries`.
+        body = iot_jobs_data.get_pending_job_executions(thingName=thing)
         assert [q["jobId"] for q in body["queuedJobs"]] == [job_id]
         assert body["inProgressJobs"] == []
     finally:
@@ -1238,19 +1305,38 @@ def test_iot_jobs_lists_do_not_paginate_and_return_no_token(iot_client):
 # ---------------------------------------------------------------------------
 # Jobs over MQTT: the reserved $aws/things/<t>/jobs/# bridge
 # ---------------------------------------------------------------------------
-from test_iot_data import _collect_shadow_frames  # noqa: E402
+import asyncio  # noqa: E402
+
+from conftest import patch_endpoint_dns  # noqa: E402
+from test_iot_data import (  # noqa: E402
+    _WS_HANDSHAKE_TIMEOUT,
+    _collect_shadow_frames,
+    _make_publish,
+    _mqtt_connect,
+    _mqtt_disconnect,
+)
 
 _DOCUMENT_OBJECT = json.loads(_DOCUMENT)
 
 
+def _mqtt_publish(topic, payload):
+    """Publish at QoS 1 over the MQTT-over-WebSocket broker and wait for the
+    PUBACK. The jobs topics are MQTT-only: AWS refuses them over HTTPS."""
+
+    async def _run():
+        ws = await _mqtt_connect(_unique("jobs-device"))
+        try:
+            await ws.send(_make_publish(topic, payload, qos=1, packet_id=1))
+            await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
+        finally:
+            await _mqtt_disconnect(ws)
+
+    with patch_endpoint_dns():
+        asyncio.run(_run())
+
+
 def _frames_by_topic(received):
     return {topic: json.loads(payload) for topic, payload in received}
-
-
-def _assert_epoch_seconds(value):
-    """Stamps must be whole epoch seconds — milliseconds are off by 1000x."""
-    assert isinstance(value, int)
-    assert abs(value - time.time()) < 5 * 60
 
 
 def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client):
@@ -1291,7 +1377,7 @@ def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client
 
     received = _collect_shadow_frames(
         f"{base}/get/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/get",
             payload=json.dumps({"clientToken": "tok-get"}).encode(),
         ),
@@ -1357,7 +1443,7 @@ def test_jobs_mqtt_start_next_of_first_job_is_silent(iot_client, iot_data_client
 
     received = _collect_shadow_frames(
         f"{base}/#",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/start-next",
             payload=json.dumps({"clientToken": "tok-sn"}).encode(),
         ),
@@ -1397,13 +1483,13 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     )
     _collect_shadow_frames(
         f"{base}/start-next/accepted",
-        lambda: iot_data_client.publish(topic=f"{base}/start-next", payload=b"{}"),
+        lambda: _mqtt_publish(topic=f"{base}/start-next", payload=b"{}"),
         want=1,
     )
 
     received = _collect_shadow_frames(
         f"{base}/{job_id}/update/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1425,7 +1511,7 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
 
     received = _collect_shadow_frames(
         f"{base}/#",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1472,7 +1558,7 @@ def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/{job_id}/update/rejected",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/{job_id}/update",
             payload=json.dumps(
                 {
@@ -1501,7 +1587,7 @@ def test_jobs_mqtt_update_unknown_job_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/no-such-job/update/rejected",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/no-such-job/update",
             payload=json.dumps({"status": "SUCCEEDED", "clientToken": "tok-x"}).encode(),
         ),
@@ -1524,7 +1610,7 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/$next/get/accepted",
-        lambda: iot_data_client.publish(
+        lambda: _mqtt_publish(
             topic=f"{base}/$next/get",
             payload=json.dumps({"clientToken": "tok-next"}).encode(),
         ),
@@ -1540,7 +1626,7 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/get/accepted",
-        lambda: iot_data_client.publish(topic=f"{base}/get", payload=b"{}"),
+        lambda: _mqtt_publish(topic=f"{base}/get", payload=b"{}"),
         want=1,
     )
     doc = _frames_by_topic(received)[f"{base}/get/accepted"]
@@ -1557,7 +1643,7 @@ def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
 
     received = _collect_shadow_frames(
         f"{base}/get/rejected",
-        lambda: iot_data_client.publish(topic=f"{base}/get", payload=b"[1, 2]"),
+        lambda: _mqtt_publish(topic=f"{base}/get", payload=b"[1, 2]"),
         want=1,
     )
     doc = _frames_by_topic(received)[f"{base}/get/rejected"]
@@ -1566,7 +1652,7 @@ def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
 
 
 def _qa_publish(iot_data_client, topic, payload):
-    iot_data_client.publish(topic=topic, qos=1, payload=payload)
+    _mqtt_publish(topic=topic, payload=payload)
 
 
 def test_jobs_mqtt_malformed_json_is_rejected_invalidjson(iot_client, iot_data_client):

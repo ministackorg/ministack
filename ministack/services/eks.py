@@ -12,16 +12,24 @@ Supports:
   Nodegroups: CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup
   IdP configs: AssociateIdentityProviderConfig, DescribeIdentityProviderConfig,
               DisassociateIdentityProviderConfig, ListIdentityProviderConfigs
+  Pod identity: CreatePodIdentityAssociation, DescribePodIdentityAssociation,
+              ListPodIdentityAssociations, UpdatePodIdentityAssociation,
+              DeletePodIdentityAssociation
+  Authentication: AWS IAM exec tokens through a k3s TokenReview webhook
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
 
 import base64
 import copy
+import datetime as dt
+import fnmatch
+import hashlib
 import importlib
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -29,14 +37,28 @@ import urllib.parse
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_caller_identity,
+    resolve_credential,
+)
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _account_from_sts_session,
     apply_image_prefix,
     get_account_id,
     get_region,
     new_uuid,
+)
+from ministack.core.router import extract_access_key_id
+from ministack.core.sigv4 import (
+    build_canonical_request,
+    build_string_to_sign,
+    calculate_signature,
+    signatures_match,
 )
 
 logger = logging.getLogger("eks")
@@ -71,10 +93,28 @@ _access_entries = AccountRegionScopedDict() # "cluster\x00principalArn" -> acces
 _access_policies = AccountRegionScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
 _idp_configs = AccountRegionScopedDict()     # "cluster\x00idp_name" -> idp record
+_pod_identity_associations = AccountRegionScopedDict()  # "cluster\x00associationId" -> association
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
 _oidc_keypair = None                  # (private_key, jwk_dict, kid)
+_rbac_reconcilers_lock = threading.Lock()
+_rbac_reconcilers = {}                 # (account, region, cluster) -> (stop, wake)
+_rbac_reconcile_locks = {}             # (account, region, cluster) -> Lock
+# Paces only the discovery of a namespace created after a wildcard-scoped
+# policy was associated; every other trigger wakes the loop directly.
+_EKS_RBAC_RECONCILE_INTERVAL = 2.0
+
+
+def _cluster_endpoint(port):
+    """The endpoint DescribeCluster advertises for the kube-apiserver — the
+    host-published port ``https://{MINISTACK_HOST}:{port}``. The k3s container
+    publishes 6443 to this host port (``ports={"6443/tcp": port}``), so it is
+    reachable from the host (``aws eks update-kubeconfig`` + kubectl) and from
+    containers that can route to ``MINISTACK_HOST``. The same value is used on
+    every path (create, restart, restore).
+    """
+    return f"https://{_MINISTACK_HOST}:{port}"
 
 
 def _ministack_issuer_base():
@@ -134,6 +174,7 @@ def _get_oidc_keypair():
 
 
 def reset():
+    _stop_all_rbac_reconcilers()
     _clusters.clear()
     _nodegroups.clear()
     _addons.clear()
@@ -141,6 +182,7 @@ def reset():
     _access_policies.clear()
     _tags.clear()
     _idp_configs.clear()
+    _pod_identity_associations.clear()
     _port_counter[0] = EKS_BASE_PORT
     _stop_all_k3s()
 
@@ -162,6 +204,7 @@ def get_state():
         "access_policies": copy.deepcopy(_access_policies),
         "tags": copy.deepcopy(_tags),
         "idp_configs": copy.deepcopy(_idp_configs),
+        "pod_identity_associations": copy.deepcopy(_pod_identity_associations),
         "port_counter": _port_counter[0],
     }
 
@@ -195,7 +238,11 @@ def _restore_cluster_child_store(store, restored, cluster_regions, separator):
         store.set_scoped(account_id, region, key, value)
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     _clusters.update(data.get("clusters", {}))
     cluster_regions = {
         (account_id, cluster_name): region
@@ -207,6 +254,7 @@ def restore_state(data):
         (_access_entries, "access_entries", "\x00"),
         (_access_policies, "access_policies", "\x00"),
         (_idp_configs, "idp_configs", "\x00"),
+        (_pod_identity_associations, "pod_identity_associations", "\x00"),
     ):
         _restore_cluster_child_store(
             store,
@@ -236,16 +284,10 @@ def restore_state(data):
         c["_docker_id"] = None
         port = c.get("_port")
         if port:
-            c["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
+            c["endpoint"] = _cluster_endpoint(port)
 
 
 
-try:
-    _restored = load_state("eks")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted eks state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +330,18 @@ def _ap_key(cluster_name: str, principal_arn: str, policy_arn: str) -> str:
     return f"{cluster_name}\x00{principal_arn}\x00{policy_arn}"
 
 
+def _pia_key(cluster_name: str, association_id: str) -> str:
+    return f"{cluster_name}\x00{association_id}"
+
+
+def _pod_identity_association_arn(cluster_name, association_id):
+    # AWS: arn:aws:eks:{region}:{account}:podidentityassociation/{cluster}/{associationId}.
+    return (
+        f"arn:aws:eks:{get_region()}:{get_account_id()}:"
+        f"podidentityassociation/{cluster_name}/{association_id}"
+    )
+
+
 def _now():
     return int(time.time())
 
@@ -322,17 +376,6 @@ def _get_ministack_network(client):
         return nets[0] if nets else None
     except Exception:
         return None
-
-
-def _cluster_endpoint(port):
-    """The endpoint DescribeCluster advertises for the kube-apiserver — the
-    host-published port ``https://{MINISTACK_HOST}:{port}``. The k3s container
-    publishes 6443 to this host port (``ports={"6443/tcp": port}``), so it is
-    reachable from the host (``aws eks update-kubeconfig`` + kubectl) and from
-    containers that can route to ``MINISTACK_HOST``. The same value is used on
-    every path (create, restart, restore).
-    """
-    return f"https://{_MINISTACK_HOST}:{port}"
 
 
 def _collect_oidc_state(cluster_name: str):
@@ -402,6 +445,7 @@ def _k3s_run_kwargs(
         "--disable=traefik,metrics-server,servicelb",
         "--tls-san=0.0.0.0",
         "--https-listen-port=6443",
+        "--kube-apiserver-arg=authentication-token-webhook-config-file=/etc/rancher/k3s/eks-auth-webhook.yaml",
     ]
     if oidc_args:
         command.extend(oidc_args)
@@ -438,6 +482,59 @@ def _k3s_run_kwargs(
     run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
     return run_kwargs
+
+
+def _k3s_gateway_host(client, ms_network):
+    """Return the address a k3s container can use to call MiniStack."""
+    if ms_network and client is not None:
+        try:
+            self_container = client.containers.get(os.environ.get("HOSTNAME", ""))
+            nets = self_container.attrs["NetworkSettings"]["Networks"]
+            host = (nets.get(ms_network) or {}).get("IPAddress")
+            if host:
+                return host
+        except Exception:
+            pass
+    return "host.docker.internal"
+
+
+def _k3s_auth_webhook_config(client, ms_network, cluster_name, account_id=None,
+                             region=None, auth_token=""):
+    """Build the kubeconfig consumed by the k3s token webhook authenticator.
+
+    The webhook endpoint is deliberately addressed through MiniStack's
+    container-network address rather than the host-published EKS port. This
+    works for both a shared Docker network and a host-run gateway.
+    """
+    from ministack.core import tls as _tls
+
+    host = _k3s_gateway_host(client, ms_network)
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    scheme = "https" if _tls.use_ssl_enabled() else "http"
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    server = (
+        f"{scheme}://{host}:{port}/_ministack/eks-auth/"
+        f"{account_id}/{region}/{cluster_name}/{auth_token}"
+    )
+    return (
+        "apiVersion: v1\n"
+        "kind: Config\n"
+        "clusters:\n"
+        "- name: ministack-eks-auth\n"
+        "  cluster:\n"
+        f"    server: {server}\n"
+        "    insecure-skip-tls-verify: true\n"
+        "users:\n"
+        "- name: ministack-eks-auth\n"
+        "  user: {}\n"
+        "contexts:\n"
+        "- name: ministack-eks-auth\n"
+        "  context:\n"
+        "    cluster: ministack-eks-auth\n"
+        "    user: ministack-eks-auth\n"
+        "current-context: ministack-eks-auth\n"
+    ).encode()
 
 
 def _ecr_registry_hosts(cluster: dict) -> list[str]:
@@ -489,13 +586,16 @@ def _k3s_registries_yaml(client, ms_network: str | None, ecr_hosts: list[str]) -
     return ("\n".join(lines) + "\n").encode()
 
 
-def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None):
+def _start_k3s_container(
+    client, run_kwargs: dict, registries_yaml: bytes | None,
+    auth_webhook_config: bytes | None = None,
+):
     """Start the k3s container, injecting registries.yaml before boot.
 
     k3s reads /etc/rancher/k3s/registries.yaml once at startup, so the file
     must exist before the entrypoint runs: create the container stopped,
     upload the file with put_archive, then start it."""
-    if not registries_yaml:
+    if not registries_yaml and not auth_webhook_config:
         return client.containers.run(**run_kwargs)
     import io
     import tarfile
@@ -511,13 +611,19 @@ def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None
     try:
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo("etc/rancher/k3s/registries.yaml")
-            info.size = len(registries_yaml)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(registries_yaml))
+            for filename, content in (
+                ("etc/rancher/k3s/registries.yaml", registries_yaml),
+                ("etc/rancher/k3s/eks-auth-webhook.yaml", auth_webhook_config),
+            ):
+                if not content:
+                    continue
+                info = tarfile.TarInfo(filename)
+                info.size = len(content)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(content))
         container.put_archive("/", buf.getvalue())
     except Exception as e:
-        logger.warning("EKS: could not inject ECR registries.yaml: %s", e)
+        logger.warning("EKS: could not inject k3s startup configuration: %s", e)
     container.start()
     return container
 
@@ -557,7 +663,7 @@ def _extract_ca_cert(container, timeout=30):
 # Clusters
 # ---------------------------------------------------------------------------
 
-def _create_cluster(body):
+def _create_cluster(body, creator_arn=None):
     name = body.get("name", "")
     if not name:
         return _error(400, "InvalidParameterException", "Cluster name is required.")
@@ -582,7 +688,7 @@ def _create_cluster(body):
 
     # Build cluster record immediately (status CREATING) and return fast.
     # k3s startup happens in background thread to avoid blocking the event loop.
-    endpoint = f"https://{_MINISTACK_HOST}:{port}"
+    endpoint = _cluster_endpoint(port)
     cluster = {
         "name": name,
         "arn": arn,
@@ -613,6 +719,13 @@ def _create_cluster(body):
         "tags": body.get("tags", {}),
         "encryptionConfig": body.get("encryptionConfig", []),
         "accessConfig": body.get("accessConfig", {}),
+        "_creator_arn": creator_arn,
+        # The webhook URL's shared secret. The route is unauthenticated by
+        # necessity (the apiserver has no AWS credentials), so without this the
+        # path is guessable and anyone who reaches the gateway can ask whether a
+        # token is valid. Only k3s learns it, from the kubeconfig written into
+        # the container before boot.
+        "_auth_token": secrets.token_urlsafe(32),
         "_docker_id": None,
         "_port": port,
     }
@@ -620,8 +733,9 @@ def _create_cluster(body):
     _clusters[name] = cluster
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
+    _bootstrap_creator_access_entry(name, cluster, creator_arn)
 
-    region = get_region()
+    account_id, region = get_account_id(), get_region()
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
     node_labels = _collect_node_labels(cluster)
 
@@ -644,18 +758,25 @@ def _create_cluster(body):
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
-            container = _start_k3s_container(client, run_kwargs, registries_yaml)
+            auth_webhook_config = _k3s_auth_webhook_config(
+                client, ms_network, name, account_id, region,
+                cluster.get("_auth_token", ""),
+            )
+            container = _start_k3s_container(
+                client, run_kwargs, registries_yaml, auth_webhook_config
+            )
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(port)
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
+            _schedule_access_policy_reconcile(name, account_id, region)
         except Exception as e:
             logger.warning("EKS: failed to start k3s for %s — falling back to mock: %s", name, e)
             cluster["status"] = "ACTIVE"
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             # No container came up — advertise the host-published endpoint.
-            cluster["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
+            cluster["endpoint"] = _cluster_endpoint(port)
 
     threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})
@@ -674,10 +795,41 @@ def _list_clusters(query):
     return _json_resp(200, {"clusters": names})
 
 
+
+def _bootstrap_creator_access_entry(cluster_name, cluster, creator_arn):
+    """Give the cluster creator its access entry, as AWS does at creation.
+
+    "Specifies whether or not the cluster creator IAM principal was set as a
+    cluster admin access entry during cluster creation time"
+    (CreateAccessConfigRequest.bootstrapClusterCreatorAdminPermissions). It is
+    an ordinary STANDARD entry with AmazonEKSClusterAdminPolicy at cluster
+    scope, which is why ListAccessEntries returns it and deleting it is the
+    documented way to revoke the creator's admin access.
+    """
+    if not creator_arn:
+        return
+    if not cluster.get("accessConfig", {}).get(
+        "bootstrapClusterCreatorAdminPermissions", True
+    ):
+        return
+    entry = _build_access_entry(cluster_name, creator_arn, {"type": "STANDARD"})
+    _access_entries[_ae_key(cluster_name, creator_arn)] = entry
+    now = _now()
+    policy_arn = f"arn:aws:eks::aws:{_ACCESS_POLICY_ARN_PREFIX}AmazonEKSClusterAdminPolicy"
+    _access_policies[_ap_key(cluster_name, creator_arn, policy_arn)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+        "associatedAt": now,
+        "modifiedAt": now,
+    }
+
+
 def _delete_cluster(name):
     cluster = _clusters.get(name)
     if not cluster:
         return _error(404, "ResourceNotFoundException", f"No cluster found for name: {name}.")
+
+    _stop_access_policy_reconciler(name, get_account_id(), get_region())
 
     # Stop k3s container
     container_id = cluster.get("_docker_id")
@@ -698,6 +850,21 @@ def _delete_cluster(name):
         ng = _nodegroups.pop(k, None)
         if ng:
             _tags.pop(ng.get("nodegroupArn", ""), None)
+
+    # Access entries and their policy associations belong to the cluster, so
+    # they go with it. Left behind they outlive it, and a cluster recreated
+    # under the same name would inherit the previous one's grants.
+    prefix = f"{name}\x00"
+    for key in [k for k in _access_entries if str(k).startswith(prefix)]:
+        entry = _access_entries.pop(key, None)
+        if entry:
+            _tags.pop(entry.get("accessEntryArn", ""), None)
+    for key in [k for k in _access_policies if str(k).startswith(prefix)]:
+        _access_policies.pop(key, None)
+    for key in [k for k in _pod_identity_associations if str(k).startswith(prefix)]:
+        assoc = _pod_identity_associations.pop(key, None)
+        if assoc:
+            _tags.pop(assoc.get("associationArn", ""), None)
 
     arn = cluster["arn"]
     cluster["status"] = "DELETING"
@@ -968,6 +1135,140 @@ def _list_access_entries(cluster_name, query):
     return _json_resp(200, {"accessEntries": arns[:max_results]})
 
 
+# ---------------------------------------------------------------------------
+# EKS Pod Identity associations
+#
+# A pod identity association binds a Kubernetes service account in a namespace
+# to an IAM role. The EKS Pod Identity Agent and the controllers that read it
+# (the AWS Load Balancer Controller among them) list and describe these
+# records; nothing here runs inside the cluster, so the association is a
+# control-plane record, which is what the API serves.
+# ---------------------------------------------------------------------------
+
+def _pod_identity_summary(assoc):
+    """The PodIdentityAssociationSummary shape ListPodIdentityAssociations
+    returns: six of the full record's members, not the whole association."""
+    return {
+        "clusterName": assoc["clusterName"],
+        "namespace": assoc["namespace"],
+        "serviceAccount": assoc["serviceAccount"],
+        "associationArn": assoc["associationArn"],
+        "associationId": assoc["associationId"],
+        "ownerArn": assoc.get("ownerArn", ""),
+    }
+
+
+def _create_pod_identity_association(cluster_name, body):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = body.get("namespace", "")
+    service_account = body.get("serviceAccount", "")
+    role_arn = body.get("roleArn", "")
+    for name, value in (("namespace", namespace), ("serviceAccount", service_account),
+                        ("roleArn", role_arn)):
+        if not value:
+            return _error(400, "InvalidParameterException", f"{name} is required.")
+    # One association per (namespace, service account): a second one is
+    # ResourceInUseException, which the operation documents.
+    for key, existing in list(_pod_identity_associations.items()):
+        if (key.startswith(f"{cluster_name}\x00")
+                and existing["namespace"] == namespace
+                and existing["serviceAccount"] == service_account):
+            return _error(409, "ResourceInUseException",
+                          f"Association already exists for service account "
+                          f"{service_account} in namespace {namespace}.")
+    association_id = "a-" + new_uuid().replace("-", "")[:16]
+    now = _now()
+    assoc = {
+        "clusterName": cluster_name,
+        "namespace": namespace,
+        "serviceAccount": service_account,
+        "roleArn": role_arn,
+        "associationArn": _pod_identity_association_arn(cluster_name, association_id),
+        "associationId": association_id,
+        "tags": body.get("tags", {}),
+        "createdAt": now,
+        "modifiedAt": now,
+        "ownerArn": "",
+        "disableSessionTags": bool(body.get("disableSessionTags", False)),
+    }
+    if body.get("targetRoleArn"):
+        # A target role makes this a role-chaining association, and AWS mints
+        # the externalId the target role's trust policy matches on.
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc["externalId"] = new_uuid()
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    _pod_identity_associations[_pia_key(cluster_name, association_id)] = assoc
+    if assoc["tags"]:
+        _tags[assoc["associationArn"]] = dict(assoc["tags"])
+    return _json_resp(200, {"association": assoc})
+
+
+def _describe_pod_identity_association(cluster_name, association_id):
+    assoc = _pod_identity_associations.get(_pia_key(cluster_name, association_id))
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    return _json_resp(200, {"association": assoc})
+
+
+def _list_pod_identity_associations(cluster_name, query):
+    if cluster_name not in _clusters:
+        return _error(404, "ResourceNotFoundException",
+                      f"No cluster found for name: {cluster_name}.")
+    namespace = query.get("namespace")
+    service_account = query.get("serviceAccount")
+    prefix = f"{cluster_name}\x00"
+    summaries = []
+    for key, assoc in _pod_identity_associations.items():
+        if not key.startswith(prefix):
+            continue
+        if namespace is not None and assoc["namespace"] != namespace:
+            continue
+        if service_account is not None and assoc["serviceAccount"] != service_account:
+            continue
+        summaries.append(_pod_identity_summary(assoc))
+    summaries.sort(key=lambda a: a["associationId"])
+    max_results = int(query.get("maxResults", 100))
+    return _json_resp(200, {"associations": summaries[:max_results]})
+
+
+def _update_pod_identity_association(cluster_name, association_id, body):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    # The request carries only the mutable members; namespace and service
+    # account are not among them, so an association keeps the pair it was
+    # created for.
+    if body.get("roleArn"):
+        assoc["roleArn"] = body["roleArn"]
+    if "disableSessionTags" in body:
+        assoc["disableSessionTags"] = bool(body["disableSessionTags"])
+    if body.get("targetRoleArn"):
+        assoc["targetRoleArn"] = body["targetRoleArn"]
+        assoc.setdefault("externalId", new_uuid())
+    if body.get("policy"):
+        assoc["policy"] = body["policy"]
+    assoc["modifiedAt"] = _now()
+    return _json_resp(200, {"association": assoc})
+
+
+def _delete_pod_identity_association(cluster_name, association_id):
+    key = _pia_key(cluster_name, association_id)
+    assoc = _pod_identity_associations.get(key)
+    if not assoc:
+        return _error(404, "ResourceNotFoundException",
+                      f"No pod identity association found for ID: {association_id}.")
+    _tags.pop(assoc.get("associationArn", ""), None)
+    _pod_identity_associations.pop(key, None)
+    # The deleted association is the response body, as the operation documents.
+    return _json_resp(200, {"association": assoc})
+
+
 def _delete_access_entry(cluster_name, principal_arn):
     key = _ae_key(cluster_name, principal_arn)
     entry = _access_entries.get(key)
@@ -980,6 +1281,7 @@ def _delete_access_entry(cluster_name, principal_arn):
         _access_policies.pop(ak, None)
     _tags.pop(entry.get("accessEntryArn", ""), None)
     _access_entries.pop(key, None)
+    _schedule_access_policy_reconcile(cluster_name)
     return _json_resp(200, {})
 
 
@@ -998,9 +1300,13 @@ def _update_access_entry(cluster_name, principal_arn, body):
 
 
 def _associate_access_policy(cluster_name, principal_arn, body):
-    if _ae_key(cluster_name, principal_arn) not in _access_entries:
+    entry = _access_entries.get(_ae_key(cluster_name, principal_arn))
+    if not entry:
         return _error(404, "ResourceNotFoundException",
                       f"No access entry for principal {principal_arn}.")
+    if entry["type"] != "STANDARD":
+        return _error(400, "InvalidRequestException",
+                      "Access policies can only be associated with STANDARD access entries.")
     policy_arn = body.get("policyArn", "")
     if not policy_arn:
         return _error(400, "InvalidParameterException",
@@ -1010,20 +1316,31 @@ def _associate_access_policy(cluster_name, principal_arn, body):
     if scope_type not in ("cluster", "namespace"):
         return _error(400, "InvalidParameterException",
                       "accessScope.type must be 'cluster' or 'namespace'.")
-    if scope_type == "namespace" and not access_scope.get("namespaces"):
-        return _error(400, "InvalidParameterException",
-                      "namespaces is required when accessScope.type is 'namespace'.")
+    namespaces = access_scope.get("namespaces", [])
+    if scope_type == "namespace":
+        if (
+            not isinstance(namespaces, list)
+            or not namespaces
+            or not all(isinstance(namespace, str) and namespace for namespace in namespaces)
+        ):
+            return _error(400, "InvalidParameterException",
+                          "namespaces must be a nonempty list when accessScope.type is 'namespace'.")
+    else:
+        namespaces = []
     now = _now()
+    key = _ap_key(cluster_name, principal_arn, policy_arn)
+    existing = _access_policies.get(key) or {}
     associated = {
         "policyArn": policy_arn,
         "accessScope": {
             "type": scope_type,
-            "namespaces": access_scope.get("namespaces", []),
+            "namespaces": namespaces,
         },
-        "associatedAt": now,
+        "associatedAt": existing.get("associatedAt", now),
         "modifiedAt": now,
     }
-    _access_policies[_ap_key(cluster_name, principal_arn, policy_arn)] = associated
+    _access_policies[key] = associated
+    _schedule_access_policy_reconcile(cluster_name)
     return _json_resp(200, {
         "clusterName": cluster_name,
         "principalArn": principal_arn,
@@ -1040,6 +1357,7 @@ def _disassociate_access_policy(cluster_name, principal_arn, policy_arn):
         return _error(404, "ResourceNotFoundException",
                       f"Policy {policy_arn} is not associated with {principal_arn}.")
     _access_policies.pop(key, None)
+    _schedule_access_policy_reconcile(cluster_name)
     return _json_resp(200, {})
 
 
@@ -1055,6 +1373,358 @@ def _list_associated_access_policies(cluster_name, principal_arn, query):
         "principalArn": principal_arn,
         "associatedAccessPolicies": policies[:max_results],
     })
+
+
+# ---------------------------------------------------------------------------
+# Access policy RBAC materialization
+# ---------------------------------------------------------------------------
+
+_ACCESS_POLICY_ARN_PREFIX = "cluster-access-policy/"
+_ACCESS_POLICY_BINDING_LABEL = "ministack.org/eks-access-policy"
+_ACCESS_POLICY_MANAGED_LABEL = "ministack.org/managed"
+
+# These are the published Kubernetes rules for the five general-purpose EKS
+# access policies. EKS normally evaluates them in its proprietary authorizer;
+# k3s has only Kubernetes RBAC, so MiniStack materializes equivalent roles.
+# Keep this table explicit rather than referring to the built-in user-facing
+# roles: their rules are only similar to, rather than identical to, EKS policy.
+_ACCESS_POLICY_RULES = {
+    "AmazonEKSClusterAdminPolicy": [
+        {"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]},
+        {"nonResourceURLs": ["*"], "verbs": ["*"]},
+    ],
+    "AmazonEKSAdminPolicy": [
+        {"apiGroups": ["apps"], "resources": ["daemonsets", "deployments", "deployments/rollback", "deployments/scale", "replicasets", "replicasets/scale", "statefulsets", "statefulsets/scale"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["apps"], "resources": ["controllerrevisions", "daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "replicasets", "replicasets/scale", "replicasets/status", "statefulsets", "statefulsets/scale", "statefulsets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews"], "verbs": ["create"]},
+        {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers", "horizontalpodautoscalers/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["batch"], "resources": ["cronjobs", "jobs"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["batch"], "resources": ["cronjobs", "cronjobs/status", "jobs", "jobs/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["extensions"], "resources": ["daemonsets", "deployments", "deployments/rollback", "deployments/scale", "ingresses", "networkpolicies", "replicasets", "replicasets/scale", "replicationcontrollers/scale"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["extensions"], "resources": ["daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "ingresses", "ingresses/status", "networkpolicies", "replicasets", "replicasets/scale", "replicasets/status", "replicationcontrollers/scale"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses", "ingresses/status", "networkpolicies"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses", "networkpolicies"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets", "poddisruptionbudgets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["rolebindings", "roles"], "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]},
+        {"apiGroups": [""], "resources": ["configmaps", "endpoints", "persistentvolumeclaims", "persistentvolumeclaims/status", "pods", "replicationcontrollers", "replicationcontrollers/scale", "serviceaccounts", "services", "services/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["pods/attach", "pods/exec", "pods/portforward", "pods/proxy", "secrets", "services/proxy"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["configmaps", "events", "persistentvolumeclaims", "replicationcontrollers", "replicationcontrollers/scale", "secrets", "serviceaccounts", "services", "services/proxy"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": [""], "resources": ["pods", "pods/attach", "pods/exec", "pods/portforward", "pods/proxy"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"]},
+        {"apiGroups": [""], "resources": ["bindings", "events", "limitranges", "namespaces/status", "pods/log", "pods/status", "replicationcontrollers/status", "resourcequotas", "resourcequotas/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list", "watch"]},
+    ],
+    "AmazonEKSEditPolicy": [
+        {"apiGroups": ["apps"], "resources": ["daemonsets", "deployments", "deployments/rollback", "deployments/scale", "replicasets", "replicasets/scale", "statefulsets", "statefulsets/scale"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["apps"], "resources": ["controllerrevisions", "daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "replicasets", "replicasets/scale", "replicasets/status", "statefulsets", "statefulsets/scale", "statefulsets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers", "horizontalpodautoscalers/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["batch"], "resources": ["cronjobs", "jobs"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["batch"], "resources": ["cronjobs", "cronjobs/status", "jobs", "jobs/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["extensions"], "resources": ["daemonsets", "deployments", "deployments/rollback", "deployments/scale", "ingresses", "networkpolicies", "replicasets", "replicasets/scale", "replicationcontrollers/scale"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["extensions"], "resources": ["daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "ingresses", "ingresses/status", "networkpolicies", "replicasets", "replicasets/scale", "replicasets/status", "replicationcontrollers/scale"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses", "networkpolicies"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses", "ingresses/status", "networkpolicies"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets", "poddisruptionbudgets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["pods/attach", "pods/exec", "pods/portforward", "pods/proxy", "secrets", "services/proxy"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"]},
+        {"apiGroups": [""], "resources": ["pods", "pods/attach", "pods/exec", "pods/portforward", "pods/proxy"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": [""], "resources": ["configmaps", "events", "persistentvolumeclaims", "replicationcontrollers", "replicationcontrollers/scale", "secrets", "serviceaccounts", "services", "services/proxy"], "verbs": ["create", "delete", "deletecollection", "patch", "update"]},
+        {"apiGroups": [""], "resources": ["configmaps", "endpoints", "persistentvolumeclaims", "persistentvolumeclaims/status", "pods", "replicationcontrollers", "replicationcontrollers/scale", "serviceaccounts", "services", "services/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["bindings", "events", "limitranges", "namespaces/status", "pods/log", "pods/status", "replicationcontrollers/status", "resourcequotas", "resourcequotas/status"], "verbs": ["get", "list", "watch"]},
+    ],
+    "AmazonEKSViewPolicy": [
+        {"apiGroups": ["apps"], "resources": ["controllerrevisions", "daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "replicasets", "replicasets/scale", "replicasets/status", "statefulsets", "statefulsets/scale", "statefulsets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers", "horizontalpodautoscalers/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["batch"], "resources": ["cronjobs", "cronjobs/status", "jobs", "jobs/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["extensions"], "resources": ["daemonsets", "daemonsets/status", "deployments", "deployments/scale", "deployments/status", "ingresses", "ingresses/status", "networkpolicies", "replicasets", "replicasets/scale", "replicasets/status", "replicationcontrollers/scale"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses", "ingresses/status", "networkpolicies"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets", "poddisruptionbudgets/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["configmaps", "endpoints", "persistentvolumeclaims", "persistentvolumeclaims/status", "pods", "replicationcontrollers", "replicationcontrollers/scale", "serviceaccounts", "services", "services/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["bindings", "events", "limitranges", "namespaces/status", "pods/log", "pods/status", "replicationcontrollers/status", "resourcequotas", "resourcequotas/status"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list", "watch"]},
+    ],
+    "AmazonEKSAdminViewPolicy": [
+        {"apiGroups": ["*"], "resources": ["*"], "verbs": ["get", "list", "watch"]},
+    ],
+}
+
+
+def _access_policy_name(policy_arn):
+    """Return the supported EKS policy name for an AWS partition ARN."""
+    if not isinstance(policy_arn, str):
+        return None
+    match = re.fullmatch(
+        rf"arn:[^:]+:eks::aws:{_ACCESS_POLICY_ARN_PREFIX}([^/]+)",
+        policy_arn,
+    )
+    if not match or match.group(1) not in _ACCESS_POLICY_RULES:
+        return None
+    return match.group(1)
+
+
+def _access_policy_role_name(policy_arn):
+    name = _access_policy_name(policy_arn)
+    return f"ministack-eks-{name.lower()}" if name else None
+
+
+def _access_policy_binding_id(cluster_name, principal_arn, policy_arn):
+    value = "\x00".join((cluster_name, principal_arn, policy_arn)).encode()
+    return hashlib.sha256(value).hexdigest()[:24]
+
+
+def _access_policy_group(cluster_name, principal_arn, policy_arn):
+    return "ministack:eks:access:" + _access_policy_binding_id(
+        cluster_name, principal_arn, policy_arn
+    )
+
+
+def _access_policy_binding_name(cluster_name, principal_arn, policy_arn):
+    return "ministack-eks-" + _access_policy_binding_id(
+        cluster_name, principal_arn, policy_arn
+    )
+
+
+def _access_policy_associations(cluster_name, account_id, region):
+    """Yield supported policy associations for one cluster and tenant."""
+    prefix = f"{cluster_name}\x00"
+    for (account, policy_region, key), association in _access_policies.all_items():
+        if account != account_id or policy_region != region or not str(key).startswith(prefix):
+            continue
+        _name, principal_arn, policy_arn = str(key).split("\x00", 2)
+        if _access_policy_name(policy_arn):
+            yield principal_arn, policy_arn, association
+
+
+def _access_policy_rbac_objects(cluster_name, account_id, region, namespaces):
+    """Build MiniStack-managed RBAC objects for the cluster's associations."""
+    objects = [
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": _access_policy_role_name(
+                    f"arn:aws:eks::aws:{_ACCESS_POLICY_ARN_PREFIX}{name}"
+                ),
+                "labels": {_ACCESS_POLICY_MANAGED_LABEL: "true"},
+            },
+            "rules": rules,
+        }
+        for name, rules in _ACCESS_POLICY_RULES.items()
+    ]
+    for principal_arn, policy_arn, association in _access_policy_associations(
+        cluster_name, account_id, region
+    ):
+        scope = association.get("accessScope", {})
+        role_name = _access_policy_role_name(policy_arn)
+        binding_name = _access_policy_binding_name(
+            cluster_name, principal_arn, policy_arn
+        )
+        subject = {
+            "kind": "Group",
+            "apiGroup": "rbac.authorization.k8s.io",
+            "name": _access_policy_group(cluster_name, principal_arn, policy_arn),
+        }
+        metadata = {
+            "name": binding_name,
+            "labels": {_ACCESS_POLICY_BINDING_LABEL: "true"},
+        }
+        role_ref = {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": role_name,
+        }
+        if scope.get("type") == "cluster":
+            objects.append({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": metadata,
+                "subjects": [subject],
+                "roleRef": role_ref,
+            })
+            continue
+        patterns = scope.get("namespaces") or []
+        for namespace in sorted({n for n in namespaces if any(
+            fnmatch.fnmatchcase(n, pattern) for pattern in patterns
+        )}):
+            objects.append({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {**metadata, "namespace": namespace},
+                "subjects": [subject],
+                "roleRef": role_ref,
+            })
+    return objects
+
+
+def _k3s_exec(container, command):
+    result = container.exec_run(command)
+    if hasattr(result, "exit_code"):
+        exit_code, output = result.exit_code, result.output
+    elif isinstance(result, tuple):
+        exit_code = result[0]
+        output = result[1] if len(result) > 1 else b""
+    else:
+        exit_code, output = 0, b""
+    return exit_code, output.decode(errors="replace") if isinstance(output, bytes) else output
+
+
+def _apply_access_policy_rbac(container, objects):
+    """Apply a JSON Kubernetes List without relying on a container temp file."""
+    content = json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}).encode()
+    payload = base64.b64encode(content).decode("ascii")
+    # docker-py's exec_run does not expose a simple stdin path with an exit
+    # status. The payload is base64, so it is safe to pass as one shell token;
+    # decoding it in the container avoids Docker archive writes to k3s's tmpfs.
+    command = ["sh", "-c", f"printf '%s' '{payload}' | base64 -d | kubectl apply -f -"]
+    code, output = _k3s_exec(container, command)
+    if code:
+        raise RuntimeError(output)
+
+
+def _managed_access_policy_bindings(container, kind):
+    command = ["kubectl", "get", kind.lower(), "-l", f"{_ACCESS_POLICY_BINDING_LABEL}=true", "-o", "json"]
+    if kind == "RoleBinding":
+        command.append("--all-namespaces")
+    code, output = _k3s_exec(container, command)
+    if code:
+        raise RuntimeError(output)
+    return json.loads(output).get("items", [])
+
+
+def _binding_key(obj):
+    return (
+        obj.get("kind"), obj.get("metadata", {}).get("namespace", ""),
+        obj.get("metadata", {}).get("name"),
+    )
+
+
+def _reconcile_access_policy_rbac(cluster_name, account_id, region):
+    """Reconcile managed bindings after access-policy or namespace changes."""
+    key = (account_id, region, cluster_name)
+    with _rbac_reconcilers_lock:
+        lock = _rbac_reconcile_locks.setdefault(key, threading.Lock())
+    with lock:
+        cluster = _clusters.get_scoped(account_id, region, cluster_name)
+        if not cluster or not cluster.get("_docker_id"):
+            return False
+        client = _get_docker()
+        if not client:
+            return False
+        try:
+            container = client.containers.get(cluster["_docker_id"])
+            code, output = _k3s_exec(container, ["kubectl", "get", "namespaces", "-o", "json"])
+            if code:
+                raise RuntimeError(output)
+            namespaces = [item["metadata"]["name"] for item in json.loads(output).get("items", [])]
+            objects = _access_policy_rbac_objects(cluster_name, account_id, region, namespaces)
+            desired = {
+                _binding_key(obj) for obj in objects
+                if obj["kind"] in ("ClusterRoleBinding", "RoleBinding")
+            }
+            _apply_access_policy_rbac(container, objects)
+            for kind in ("ClusterRoleBinding", "RoleBinding"):
+                for existing in _managed_access_policy_bindings(container, kind):
+                    binding_key = _binding_key(existing)
+                    if binding_key in desired:
+                        continue
+                    command = ["kubectl", "delete", kind.lower(), binding_key[2]]
+                    if binding_key[1]:
+                        command.extend(["--namespace", binding_key[1]])
+                    code, output = _k3s_exec(container, command)
+                    if code:
+                        raise RuntimeError(output)
+            return True
+        except Exception as e:
+            logger.debug("EKS: RBAC reconciliation for %s failed: %s", cluster_name, e)
+            return False
+
+
+def _has_namespace_access_policy(cluster_name, account_id, region):
+    return any(
+        association.get("accessScope", {}).get("type") == "namespace"
+        for _principal, _policy, association in _access_policy_associations(
+            cluster_name, account_id, region
+        )
+    )
+
+
+def _schedule_access_policy_reconcile(cluster_name, account_id=None, region=None):
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    key = (account_id, region, cluster_name)
+    with _rbac_reconcilers_lock:
+        running = _rbac_reconcilers.get(key)
+        if running:
+            running[1].set()
+            return
+        stop = threading.Event()
+        wake = threading.Event()
+        state = (stop, wake)
+        _rbac_reconcilers[key] = state
+
+    def reconcile_loop():
+        try:
+            while not stop.is_set():
+                wake.clear()
+                reconciled = _reconcile_access_policy_rbac(
+                    cluster_name, account_id, region
+                )
+                if not reconciled:
+                    cluster = _clusters.get_scoped(account_id, region, cluster_name)
+                    if not cluster or (
+                        cluster.get("status") == "ACTIVE"
+                        and not cluster.get("_docker_id")
+                    ):
+                        return
+                    wake.wait(_EKS_RBAC_RECONCILE_INTERVAL)
+                    continue
+                watches_namespaces = _has_namespace_access_policy(
+                    cluster_name, account_id, region
+                )
+                with _rbac_reconcilers_lock:
+                    if _rbac_reconcilers.get(key) is not state:
+                        return
+                    if wake.is_set():
+                        continue
+                    if not watches_namespaces:
+                        _rbac_reconcilers.pop(key, None)
+                        return
+                wake.wait(_EKS_RBAC_RECONCILE_INTERVAL)
+        finally:
+            with _rbac_reconcilers_lock:
+                if _rbac_reconcilers.get(key) is state:
+                    _rbac_reconcilers.pop(key, None)
+
+    threading.Thread(
+        target=reconcile_loop, daemon=True,
+        name=f"eks-rbac-{cluster_name}",
+    ).start()
+
+
+def _stop_access_policy_reconciler(cluster_name, account_id, region):
+    with _rbac_reconcilers_lock:
+        state = _rbac_reconcilers.pop((account_id, region, cluster_name), None)
+    if state:
+        stop, wake = state
+        stop.set()
+        wake.set()
+
+
+def _stop_all_rbac_reconcilers():
+    with _rbac_reconcilers_lock:
+        states = list(_rbac_reconcilers.values())
+        _rbac_reconcilers.clear()
+    for stop, wake in states:
+        stop.set()
+        wake.set()
 
 
 # ---------------------------------------------------------------------------
@@ -1143,17 +1813,30 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
-            container = _start_k3s_container(client, run_kwargs, registries_yaml)
+            cluster_spec = parse_arn(cluster.get("arn", ""))
+            # A restart reuses the cluster's token; one minted here would not
+            # match the URL k3s was given, and the restored record carries it.
+            cluster.setdefault("_auth_token", secrets.token_urlsafe(32))
+            auth_webhook_config = _k3s_auth_webhook_config(
+                client, ms_network, cluster_name, cluster_spec.account_id,
+                cluster_spec.region, cluster["_auth_token"],
+            )
+            container = _start_k3s_container(
+                client, run_kwargs, registries_yaml, auth_webhook_config
+            )
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             _mark_idp_active()
+            _schedule_access_policy_reconcile(
+                cluster_name, cluster_spec.account_id, cluster_spec.region
+            )
         except Exception as e:
             logger.warning("EKS: failed to restart k3s for %s — falling back to mock: %s", cluster_name, e)
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             # No container came up — advertise the host-published endpoint.
-            cluster["endpoint"] = f"https://{_MINISTACK_HOST}:{cluster['_port']}"
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             _mark_idp_active()
 
     threading.Thread(target=_bg_restart, daemon=True, name=f"eks-restart-{cluster_name}").start()
@@ -1454,6 +2137,283 @@ def _list_tags(arn):
 
 
 # ---------------------------------------------------------------------------
+# AWS IAM authenticator compatible TokenReview webhook
+# ---------------------------------------------------------------------------
+
+_EKS_TOKEN_PREFIX = "k8s-aws-v1."
+_EKS_TOKEN_VALIDITY_SECONDS = 15 * 60
+
+
+def _token_review_response(review, *, authenticated=False, username="", uid="", groups=None,
+                           audiences=None):
+    status = {"authenticated": authenticated}
+    if authenticated:
+        status["user"] = {
+            "username": username,
+            "uid": uid,
+            "groups": groups or [],
+        }
+        if audiences:
+            status["audiences"] = audiences
+    return _json_resp(200, {
+        "apiVersion": review.get("apiVersion", "authentication.k8s.io/v1"),
+        "kind": "TokenReview",
+        "status": status,
+    })
+
+
+def _decode_aws_iam_token(token):
+    if not isinstance(token, str) or len(token) > 16384 or not token.startswith(_EKS_TOKEN_PREFIX):
+        return None
+    encoded = token[len(_EKS_TOKEN_PREFIX):]
+    try:
+        encoded += "=" * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        url = raw.decode("utf-8")
+        parsed = urllib.parse.urlsplit(url)
+    except (ValueError, UnicodeDecodeError, UnicodeEncodeError):
+        return None
+    if parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/"):
+        return None
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if any(len(values) != 1 for values in query.values()):
+        return None
+    return parsed, query
+
+
+def _qp(query, name):
+    values = query.get(name) or query.get(name.lower())
+    if isinstance(values, (list, tuple)):
+        return values[0] if values else ""
+    return values or ""
+
+
+def _verify_eks_token(token, cluster_name):
+    """Verify an AWS CLI EKS exec token without calling the real STS service.
+
+    ``aws eks get-token`` signs a GET to regional STS with the cluster name in
+    the ``x-k8s-aws-id`` signed header. The URL's advertised 60-second
+    presign lifetime is intentionally not used here: kubectl caches the
+    resulting ExecCredential for roughly 14 minutes and the upstream
+    authenticator accepts a 15-minute token window.
+    """
+    decoded = _decode_aws_iam_token(token)
+    if not decoded:
+        return None
+    parsed, query = decoded
+    if (
+        _qp(query, "X-Amz-Algorithm") != "AWS4-HMAC-SHA256"
+        or _qp(query, "Action") != "GetCallerIdentity"
+        or _qp(query, "Version") != "2011-06-15"
+    ):
+        return None
+    credential_scope = _qp(query, "X-Amz-Credential").split("/")
+    amz_date = _qp(query, "X-Amz-Date")
+    signed_headers = _qp(query, "X-Amz-SignedHeaders").lower()
+    signature = _qp(query, "X-Amz-Signature")
+    if (
+        len(credential_scope) != 5
+        or not credential_scope[0]
+        or not amz_date
+        or not re.fullmatch(r"[0-9a-f]{64}", signature)
+        or credential_scope[3] != "sts"
+        or credential_scope[4] != "aws4_request"
+        or "host" not in signed_headers.split(";")
+        or "x-k8s-aws-id" not in signed_headers.split(";")
+    ):
+        return None
+
+    host = parsed.netloc
+    hostname = parsed.hostname or ""
+    if not re.fullmatch(r"sts(?:[.-][a-z0-9-]+)?\.amazonaws\.com", hostname):
+        return None
+    if hostname != f"sts.{credential_scope[2]}.amazonaws.com":
+        return None
+    try:
+        if not 0 <= int(_qp(query, "X-Amz-Expires")) <= _EKS_TOKEN_VALIDITY_SECONDS:
+            return None
+        signed_at = dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    age = (dt.datetime.now(dt.timezone.utc) - signed_at).total_seconds()
+    if age < -300 or age > _EKS_TOKEN_VALIDITY_SECONDS or credential_scope[1] != amz_date[:8]:
+        return None
+
+    # The cluster ID is not present in the presigned query string. It is the
+    # value of a signed header on the original STS request, so inject the
+    # cluster being authenticated before rebuilding the canonical request.
+    signed_request_headers = {
+        "host": host,
+        "x-k8s-aws-id": cluster_name,
+    }
+    canonical_request = build_canonical_request(
+        "GET",
+        parsed.path or "/",
+        signed_request_headers,
+        query,
+        signed_headers,
+        # botocore's STS presigner signs an empty GET payload. Accepting only
+        # this hash also keeps the verifier compatible with the authenticator.
+        payload_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    string_to_sign = build_string_to_sign(
+        amz_date,
+        credential_scope[1],
+        credential_scope[2],
+        credential_scope[3],
+        canonical_request,
+    )
+    access_key_id = credential_scope[0]
+    try:
+        account_id = find_iam_access_key_account(access_key_id)
+    except AmbiguousAccessKeyError:
+        return None
+    # TokenReview calls have no AWS Authorization header. Resolve every kind
+    # of key independently of the gateway request's account context.
+    account_id = account_id or _account_from_sts_session(access_key_id)
+    if re.fullmatch(r"\d{12}", access_key_id):
+        account_id = access_key_id
+    credential = resolve_credential(
+        access_key_id,
+        account_id or os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000"),
+        _qp(query, "X-Amz-Security-Token") or None,
+    )
+    if isinstance(credential, CredentialResolutionError):
+        return None
+    expected = calculate_signature(
+        credential.secret_access_key,
+        credential_scope[1],
+        credential_scope[2],
+        credential_scope[3],
+        string_to_sign,
+    )
+    if not signatures_match(expected, signature):
+        return None
+    return credential
+
+
+def _cluster_for_auth(cluster_name, account_id=None, region=None):
+    """Find a cluster across scoped stores without leaking tenant state."""
+    matches = [
+        (account, cluster_region, cluster)
+        for (account, cluster_region, name), cluster in _clusters.all_items()
+        if name == cluster_name
+        and (account_id is None or account == account_id)
+        and (region is None or cluster_region == region)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _role_arn_from_assumed_role(arn):
+    match = re.fullmatch(r"arn:([^:]+):sts::([^:]+):assumed-role/([^/]+)/[^/]+", arn or "")
+    if not match:
+        return ""
+    partition, account, role = match.groups()
+    # STS session ARNs omit the IAM role's path. Recover it from IAM so that
+    # access entries for role/team/developer match assumed-role/developer/...
+    from ministack.services import iam
+    record = iam._roles.get_scoped(account, None, role)
+    if record:
+        return record.get("Arn", "")
+    return f"arn:{partition}:iam::{account}:role/{role}"
+
+
+def _access_entry_for_principal(cluster_name, account_id, region, principal_arn):
+    candidates = [principal_arn]
+    role_arn = _role_arn_from_assumed_role(principal_arn)
+    if role_arn:
+        candidates.append(role_arn)
+    for candidate in candidates:
+        entry = _access_entries.get_scoped(
+            account_id, region, _ae_key(cluster_name, candidate)
+        )
+        if entry:
+            return entry
+    return None
+
+
+def _authenticate_token_review(cluster_name, account_id, region, review, auth_token=""):
+    from ministack.app import AUTH
+
+    spec = review.get("spec")
+    if not isinstance(spec, dict) or not isinstance(spec.get("token"), str) or not spec["token"]:
+        return _token_review_response(review)
+
+    cluster_info = _cluster_for_auth(cluster_name, account_id, region)
+    if not cluster_info:
+        return _token_review_response(review)
+    account_id, region, cluster = cluster_info
+
+    # The URL's shared secret. Only the kubeconfig written into this cluster's
+    # container carries it, so a caller who merely reached the gateway cannot
+    # use the endpoint to test whether a token is valid.
+    expected_token = cluster.get("_auth_token") or ""
+    if not expected_token or not secrets.compare_digest(auth_token, expected_token):
+        return _token_review_response(review)
+
+    # Permissive mode accepts local bearer credentials without requiring an
+    # IAM identity, a matching secret, or an access entry, just like the AWS
+    # control plane skips IAM enforcement when AUTH=false.
+    if not AUTH:
+        return _token_review_response(
+            review, authenticated=True, username="ministack-local", uid="ministack-local",
+            groups=["system:authenticated", "system:masters"],
+        )
+
+    credential = _verify_eks_token(spec["token"], cluster_name)
+    if not credential:
+        return _token_review_response(review)
+
+    # IAM authorizes AWS EKS API operations at the gateway. Kubernetes access
+    # additionally requires the bootstrap creator grant or an access entry;
+    # an IAM Allow for eks:* alone does not confer Kubernetes permissions.
+    entry = _access_entry_for_principal(
+        cluster_name, account_id, region, credential.principal_arn
+    )
+    username = credential.principal_arn
+    groups = ["system:authenticated"]
+    if entry:
+        username = entry.get("username") or username
+        groups.extend(entry.get("kubernetesGroups") or [])
+        # EKS evaluates managed access policies in a separate authorizer. k3s
+        # has only RBAC, so each policy becomes an internal RBAC group bound
+        # to a MiniStack-managed ClusterRole or RoleBinding.
+        groups.extend(
+            _access_policy_group(cluster_name, entry["principalArn"], policy_arn)
+            for principal_arn, policy_arn, _association in _access_policy_associations(
+                cluster_name, account_id, region
+            )
+            if principal_arn == entry["principalArn"]
+        )
+    else:
+        # No entry, no Kubernetes access. The creator has one, minted at
+        # CreateCluster, so it authorizes through the same path as everyone
+        # else rather than through system:masters, which bypasses RBAC and
+        # could never be revoked.
+        return _token_review_response(review)
+
+    # Deduplicate while preserving the caller's configured order.
+    groups = list(dict.fromkeys(groups))
+    return _token_review_response(
+        review,
+        authenticated=True,
+        username=username,
+        uid=credential.principal_id or credential.principal_arn,
+        groups=groups,
+    )
+
+
+def _handle_auth_webhook(cluster_name, account_id, region, body_bytes, auth_token=""):
+    try:
+        review = json.loads(body_bytes) if body_bytes else {}
+    except (TypeError, json.JSONDecodeError):
+        review = {}
+    if not isinstance(review, dict):
+        review = {}
+    return _authenticate_token_review(cluster_name, account_id, region, review, auth_token)
+
+
+# ---------------------------------------------------------------------------
 # Sanitize (remove internal fields)
 # ---------------------------------------------------------------------------
 
@@ -1466,6 +2426,22 @@ def _sanitize(cluster):
 # ---------------------------------------------------------------------------
 
 def _handle_request_sync(method, path, headers, body_bytes, query_params):
+    # This private route is called by the k3s apiserver's authentication
+    # webhook, not by an AWS EKS client. Keep it outside the EKS JSON API
+    # namespace so the normal AWS action router never sees TokenReview data.
+    auth_match = re.fullmatch(
+        r"/_ministack/eks-auth/(\d{12})/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_-]{16,})",
+        path,
+    )
+    if auth_match and method == "POST":
+        return _handle_auth_webhook(
+            urllib.parse.unquote(auth_match.group(3)),
+            auth_match.group(1),
+            auth_match.group(2),
+            body_bytes,
+            auth_match.group(4),
+        )
+
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
@@ -1475,7 +2451,9 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
 
     # POST /clusters
     if path == "/clusters" and method == "POST":
-        return _create_cluster(body)
+        identity = resolve_caller_identity(extract_access_key_id(headers, query_params))
+        creator_arn = identity["userArn"] if identity else None
+        return _create_cluster(body, _role_arn_from_assumed_role(creator_arn) or creator_arn)
 
     # GET /clusters
     if path == "/clusters" and method == "GET":
@@ -1507,6 +2485,26 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
             return _describe_nodegroup(cluster_name, ng_name)
         if method == "DELETE":
             return _delete_nodegroup(cluster_name, ng_name)
+
+    # /clusters/{name}/pod-identity-associations — Create / List
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "POST":
+            return _create_pod_identity_association(cluster_name, body)
+        if method == "GET":
+            return _list_pod_identity_associations(cluster_name, query)
+
+    # /clusters/{name}/pod-identity-associations/{associationId}
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/pod-identity-associations/([A-Za-z0-9_-]+)", path)
+    if m:
+        cluster_name, association_id = m.group(1), m.group(2)
+        if method == "GET":
+            return _describe_pod_identity_association(cluster_name, association_id)
+        if method == "POST":
+            return _update_pod_identity_association(cluster_name, association_id, body)
+        if method == "DELETE":
+            return _delete_pod_identity_association(cluster_name, association_id)
 
     # POST /clusters/{name}/encryption-config/associate — AssociateEncryptionConfig
     m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/encryption-config/associate", path)

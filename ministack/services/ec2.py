@@ -75,7 +75,6 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
 from ministack.core.concurrency import resource_lock, run_offloop
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -334,7 +333,11 @@ def _restore_vpc_peering_store(restored):
         )
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _clear_state()
@@ -413,15 +416,6 @@ def _backfill_subnet_availability_zone_ids():
         subnet.setdefault("AvailabilityZoneId", _az_id_for_zone_name(subnet["AvailabilityZone"]))
 
 
-try:
-    _restored = load_state("ec2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # Default VPC / subnet created at import time so DescribeVpcs always returns something
@@ -2399,7 +2393,16 @@ def _parse_ec2_docker_flags(flags: str) -> dict:
     if args.privileged:
         kwargs["privileged"] = True
     if args.env:
-        kwargs["environment"] = dict(e.partition("=")[::2] for e in args.env)
+        # Bare `-e FOO` takes the host value, or is left out if unset: docker's rule.
+        environment = {}
+        for entry in args.env:
+            name, sep, value = entry.partition("=")
+            if sep:
+                environment[name] = value
+            elif name in os.environ:
+                environment[name] = os.environ[name]
+        if environment:
+            kwargs["environment"] = environment
     if args.volume:
         kwargs["volumes"] = args.volume
     if args.cap_add:
@@ -3125,14 +3128,34 @@ def _describe_vpc_classic_link_dns_support(p):
     return _xml(200, "DescribeVpcClassicLinkDnsSupportResponse", "<vpcs/>")
 
 
+def _subnet_dns_name_options(subnet):
+    """A subnet's PrivateDnsNameOptionsOnLaunch, defaulted when never set."""
+    return subnet.get("PrivateDnsNameOptionsOnLaunch") or {
+        "HostnameType": "ip-name",
+        "EnableResourceNameDnsARecord": False,
+        "EnableResourceNameDnsAAAARecord": False,
+    }
+
+
 def _modify_subnet_attribute(p):
     subnet_id = _p(p, "SubnetId")
     if subnet_id not in _subnets:
         return _error("InvalidSubnetID.NotFound",
                       f"The subnet ID '{subnet_id}' does not exist", 400)
+    subnet = _subnets[subnet_id]
     val = _p(p, "MapPublicIpOnLaunch.Value")
     if val:
-        _subnets[subnet_id]["MapPublicIpOnLaunch"] = val.lower() == "true"
+        subnet["MapPublicIpOnLaunch"] = val.lower() == "true"
+    options = dict(_subnet_dns_name_options(subnet))
+    hostname_type = _p(p, "PrivateDnsHostnameTypeOnLaunch")
+    if hostname_type:
+        options["HostnameType"] = hostname_type
+    for member in ("EnableResourceNameDnsARecord", "EnableResourceNameDnsAAAARecord"):
+        val = _p(p, f"{member}OnLaunch.Value")
+        if val:
+            options[member] = val.lower() == "true"
+    if options != _subnet_dns_name_options(subnet):
+        subnet["PrivateDnsNameOptionsOnLaunch"] = options
     return _xml(200, "ModifySubnetAttributeResponse", "<return>true</return>")
 
 
@@ -3591,6 +3614,7 @@ def _allocate_address(p):
         "NetworkInterfaceId": None,
         "PrivateIpAddress": None,
     }
+    _parse_tag_specs(p, "elastic-ip", allocation_id)
     return _xml(200, "AllocateAddressResponse", f"""
         <publicIp>{public_ip}</publicIp>
         <domain>{domain}</domain>
@@ -3601,6 +3625,7 @@ def _release_address(p):
     allocation_id = _p(p, "AllocationId")
     if allocation_id and allocation_id in _addresses:
         del _addresses[allocation_id]
+        _tags.pop(allocation_id, None)
     elif allocation_id:
         return _error("InvalidAllocationID.NotFound",
                       f"The allocation ID '{allocation_id}' does not exist", 400)
@@ -3644,6 +3669,7 @@ def _describe_addresses(p):
             <publicIp>{addr['PublicIp']}</publicIp>
             <domain>{addr['Domain']}</domain>
             {assoc}{inst}
+            {_tag_set_xml(addr['AllocationId'])}
         </item>"""
     return _xml(200, "DescribeAddressesResponse", f"<addressesSet>{items}</addressesSet>")
 
@@ -4315,6 +4341,8 @@ def _vpc_xml(vpc):
 
 
 def _subnet_fields_xml(subnet, tag="item"):
+    # No IPv6 block is modelled, so the two IPv6 members are always false.
+    dns_options = _subnet_dns_name_options(subnet)
     return f"""<{tag}>
         <subnetId>{subnet['SubnetId']}</subnetId>
         <subnetArn>arn:aws:ec2:{get_region()}:{get_account_id()}:subnet/{subnet['SubnetId']}</subnetArn>
@@ -4327,6 +4355,14 @@ def _subnet_fields_xml(subnet, tag="item"):
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
+        <assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation>
+        <enableDns64>{'true' if subnet.get('EnableDns64') else 'false'}</enableDns64>
+        <ipv6Native>false</ipv6Native>
+        <privateDnsNameOptionsOnLaunch>
+            <hostnameType>{dns_options['HostnameType']}</hostnameType>
+            <enableResourceNameDnsARecord>{'true' if dns_options['EnableResourceNameDnsARecord'] else 'false'}</enableResourceNameDnsARecord>
+            <enableResourceNameDnsAAAARecord>{'true' if dns_options['EnableResourceNameDnsAAAARecord'] else 'false'}</enableResourceNameDnsAAAARecord>
+        </privateDnsNameOptionsOnLaunch>
         {_tag_set_xml(subnet['SubnetId'])}
     </{tag}>"""
 
@@ -4352,21 +4388,33 @@ def _igw_xml(igw):
     return _igw_fields_xml(igw, tag="item")
 
 
+# The Route shape has no vpcEndpointId member; an endpoint target is a gatewayId.
+_ROUTE_MEMBERS = (
+    ("DestinationIpv6CidrBlock", "destinationIpv6CidrBlock"),
+    ("DestinationPrefixListId", "destinationPrefixListId"),
+    ("GatewayId", "gatewayId"),
+    ("VpcEndpointId", "gatewayId"),
+    ("NatGatewayId", "natGatewayId"),
+    ("InstanceId", "instanceId"),
+    ("VpcPeeringConnectionId", "vpcPeeringConnectionId"),
+    ("TransitGatewayId", "transitGatewayId"),
+    ("NetworkInterfaceId", "networkInterfaceId"),
+    ("EgressOnlyInternetGatewayId", "egressOnlyInternetGatewayId"),
+    ("CarrierGatewayId", "carrierGatewayId"),
+    ("LocalGatewayId", "localGatewayId"),
+    ("CoreNetworkArn", "coreNetworkArn"),
+    ("OdbNetworkArn", "odbNetworkArn"),
+)
+
+
 def _rtb_fields_xml(rtb, tag="item"):
     def _route_xml(r):
-        target = ""
-        if r.get("GatewayId"):
-            target = f"<gatewayId>{r['GatewayId']}</gatewayId>"
-        if r.get("NatGatewayId"):
-            target += f"<natGatewayId>{r['NatGatewayId']}</natGatewayId>"
-        if r.get("InstanceId"):
-            target += f"<instanceId>{r['InstanceId']}</instanceId>"
-        if r.get("VpcPeeringConnectionId"):
-            target += f"<vpcPeeringConnectionId>{r['VpcPeeringConnectionId']}</vpcPeeringConnectionId>"
-        if r.get("TransitGatewayId"):
-            target += f"<transitGatewayId>{r['TransitGatewayId']}</transitGatewayId>"
+        target = "".join(
+            f"<{element}>{_esc(r[key])}</{element}>"
+            for key, element in _ROUTE_MEMBERS if r.get(key))
+        if not any(r.get(key) for key in ("DestinationIpv6CidrBlock", "DestinationPrefixListId")):
+            target = f"<destinationCidrBlock>{r.get('DestinationCidrBlock', '')}</destinationCidrBlock>" + target
         return f"""<item>
-        <destinationCidrBlock>{r.get('DestinationCidrBlock','')}</destinationCidrBlock>
         {target}
         <state>{r.get('State','active')}</state>
         <origin>{r.get('Origin','')}</origin>
@@ -4872,6 +4920,20 @@ def _delete_nat_gateway(params):
 # Network ACLs
 # ---------------------------------------------------------------------------
 
+def _network_acl_entry_xml(entry):
+    cidr = (
+        f"<cidrBlock>{entry['CidrBlock']}</cidrBlock>"
+        if entry.get("CidrBlock")
+        else f"<ipv6CidrBlock>{entry['Ipv6CidrBlock']}</ipv6CidrBlock>"
+    )
+    return f"""<item>
+            <ruleNumber>{entry['RuleNumber']}</ruleNumber>
+            <protocol>{entry['Protocol']}</protocol>
+            <ruleAction>{entry['RuleAction']}</ruleAction>
+            <egress>{'true' if entry['Egress'] else 'false'}</egress>
+            {cidr}
+        </item>"""
+
 def _create_network_acl(params):
     vpc_id = _p(params, "VpcId")
     if not vpc_id:
@@ -4918,13 +4980,7 @@ def _describe_network_acls(params):
             want_default = filters["default"][0].lower() == "true"
             if acl.get("IsDefault", False) != want_default:
                 continue
-        entries = "".join(f"""<item>
-            <ruleNumber>{e['RuleNumber']}</ruleNumber>
-            <protocol>{e['Protocol']}</protocol>
-            <ruleAction>{e['RuleAction']}</ruleAction>
-            <egress>{'true' if e['Egress'] else 'false'}</egress>
-            <cidrBlock>{e.get('CidrBlock','0.0.0.0/0')}</cidrBlock>
-        </item>""" for e in acl["Entries"])
+        entries = "".join(_network_acl_entry_xml(e) for e in acl["Entries"])
         assocs = "".join(f"""<item>
             <networkAclAssociationId>{a['NetworkAclAssociationId']}</networkAclAssociationId>
             <networkAclId>{acl['NetworkAclId']}</networkAclId>
@@ -4960,8 +5016,15 @@ def _create_network_acl_entry(params):
         "Protocol": _p(params, "Protocol") or "-1",
         "RuleAction": _p(params, "RuleAction") or "allow",
         "Egress": _p(params, "Egress") == "true",
-        "CidrBlock": _p(params, "CidrBlock") or "0.0.0.0/0",
     }
+    cidr_block = _p(params, "CidrBlock")
+    ipv6_cidr_block = _p(params, "Ipv6CidrBlock")
+    if cidr_block:
+        entry["CidrBlock"] = cidr_block
+    elif ipv6_cidr_block:
+        entry["Ipv6CidrBlock"] = ipv6_cidr_block
+    else:
+        entry["CidrBlock"] = "0.0.0.0/0"
     _network_acls[acl_id]["Entries"].append(entry)
     return _xml(200, "CreateNetworkAclEntryResponse", "<return>true</return>")
 
@@ -4987,13 +5050,21 @@ def _replace_network_acl_entry(params):
     acl = _network_acls[acl_id]
     acl["Entries"] = [e for e in acl["Entries"]
                       if not (e["RuleNumber"] == rule_num and e["Egress"] == egress)]
-    acl["Entries"].append({
+    entry = {
         "RuleNumber": rule_num,
         "Protocol": _p(params, "Protocol") or "-1",
         "RuleAction": _p(params, "RuleAction") or "allow",
         "Egress": egress,
-        "CidrBlock": _p(params, "CidrBlock") or "0.0.0.0/0",
-    })
+    }
+    cidr_block = _p(params, "CidrBlock")
+    ipv6_cidr_block = _p(params, "Ipv6CidrBlock")
+    if cidr_block:
+        entry["CidrBlock"] = cidr_block
+    elif ipv6_cidr_block:
+        entry["Ipv6CidrBlock"] = ipv6_cidr_block
+    else:
+        entry["CidrBlock"] = "0.0.0.0/0"
+    acl["Entries"].append(entry)
     return _xml(200, "ReplaceNetworkAclEntryResponse", "<return>true</return>")
 
 
@@ -6637,7 +6708,7 @@ def _create_launch_template(p):
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
         <defaultVersionNumber>1</defaultVersionNumber>
         <latestVersionNumber>1</latestVersionNumber>
-        <tags>{tags_xml}</tags>
+        <tagSet>{tags_xml}</tagSet>
     </launchTemplate>""")
 
 
@@ -6712,7 +6783,7 @@ def _describe_launch_templates(p):
             <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
             <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
             <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
-            <tags>{tags_xml}</tags>
+            <tagSet>{tags_xml}</tagSet>
         </item>"""
     return _xml(200, "DescribeLaunchTemplatesResponse",
                 f"<launchTemplates>{items}</launchTemplates>")
@@ -6734,7 +6805,7 @@ def _describe_launch_template_versions(p):
                       "The specified launch template does not exist", 400)
     # Filter by version numbers
     req_versions = _parse_member_list(p, "LaunchTemplateVersion")
-    versions = lt["Versions"]
+    versions = sorted(lt["Versions"], key=lambda v: v["VersionNumber"], reverse=True)
     if req_versions:
         filtered = []
         for rv in req_versions:

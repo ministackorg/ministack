@@ -8,8 +8,8 @@ Implements the device-side REST surface of AWS IoT Jobs:
 
 Routing reaches us either through credential-scope detection (the SDK signs
 requests with the ``iot-jobs-data`` scope — botocore signingName) or via the
-host pattern ``{prefix}.jobs.iot.{region}.{host}``, which is what
-``DescribeEndpoint(endpointType='iot:Jobs')`` hands out.
+host pattern ``{prefix}.jobs.iot.{region}.{host}``, the shape of the legacy
+``iot:Jobs`` endpoint.
 
 This module is a wire adapter: it parses requests, shapes responses, and logs.
 The job store, the execution store, and every rule of the execution state
@@ -50,7 +50,11 @@ def get_state() -> dict:
     return {}
 
 
-def restore_state(data: dict | None) -> None:
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data: dict | None) -> None:
     return None
 
 
@@ -195,6 +199,23 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
 
 
 async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
+    # Nothing re-queues here, so only execution number 1 exists.
+    execution_number = payload.get("executionNumber")
+    if execution_number is not None:
+        try:
+            execution_number = int(execution_number)
+        except (TypeError, ValueError):
+            return error_response_json(
+                "InvalidRequestException",
+                f"Invalid executionNumber: {execution_number!r}", 400,
+            )
+        current = _iot_module.jobs_describe_execution(thing, job_id)
+        if current is not None and execution_number != current["executionNumber"]:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"No job execution {execution_number} found for thing {thing} "
+                f"and job {job_id}", 404,
+            )
     prev_next = _iot_module.jobs_first_pending_job_id(thing)
     execution, error = _iot_module.jobs_update_execution(
         thing,
@@ -202,6 +223,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         status=payload.get("status"),
         expected_version=payload.get("expectedVersion"),
         status_details=payload.get("statusDetails"),
+        step_timeout_minutes=payload.get("stepTimeoutInMinutes"),
     )
     if error:
         return error

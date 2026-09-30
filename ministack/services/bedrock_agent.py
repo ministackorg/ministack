@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
@@ -224,7 +223,11 @@ def get_state():
     })
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _agents.update(data.get("agents", {}))
@@ -246,12 +249,6 @@ def restore_state(data):
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("bedrock_agent")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore bedrock_agent state; continuing fresh")
 
 
 # ===========================================================================
@@ -935,7 +932,14 @@ def _run_s3_ingestion(kb_id: str, ds_id: str, ds_rec: dict) -> tuple[dict, list]
         doc_key = f"{kb_id}/{ds_id}/{key}"
         existing = doc_key in _kb_document_texts
         uri = f"s3://{bucket_name}/{key}"
-        _kb_document_texts[doc_key] = {"Text": text, "Uri": uri}
+        # The sidecar carries the attributes a Retrieve filter matches on.
+        metadata = {}
+        if f"{key}.metadata.json" in bucket["objects"]:
+            metadata = _metadata_attributes(
+                s3_svc._get_object_data(bucket_name, f"{key}.metadata.json"))
+        _kb_document_texts[doc_key] = {
+            "Text": text, "Uri": uri, "Metadata": metadata,
+        }
         _kb_documents[doc_key] = {
             "DocumentIdentifier": {"dataSourceType": "S3", "s3": {"uri": uri}},
             "Status": "INDEXED",
@@ -947,6 +951,43 @@ def _run_s3_ingestion(kb_id: str, ds_id: str, ds_rec: dict) -> tuple[dict, list]
         else:
             stats["NumberOfNewDocumentsIndexed"] += 1
     return stats, failures
+
+
+def _metadata_attributes(raw: bytes) -> dict:
+    """The attributes of a document's ``.metadata.json`` sidecar, flattened to
+    ``{key: value}``.
+
+    Two spellings are accepted: a plain scalar, and the typed form botocore
+    models as ``MetadataAttributeValue`` -- ``{"value": {"type": "STRING",
+    "stringValue": ...}}`` with type in BOOLEAN, NUMBER, STRING, STRING_LIST.
+    ``includeForEmbedding`` only affects embedding, never filtering, so it is
+    ignored here.
+    """
+    try:
+        document = json.loads(raw or b"{}")
+    except (ValueError, TypeError):
+        return {}
+    attributes = (document or {}).get("metadataAttributes")
+    if not isinstance(attributes, dict):
+        return {}
+    out = {}
+    for key, entry in attributes.items():
+        if isinstance(entry, dict):
+            value = entry.get("value", entry)
+            if isinstance(value, dict):
+                typed = {
+                    "STRING": value.get("stringValue"),
+                    "NUMBER": value.get("numberValue"),
+                    "BOOLEAN": value.get("booleanValue"),
+                    "STRING_LIST": value.get("stringListValue"),
+                }
+                value = typed.get(value.get("type"))
+                if value is None:
+                    continue
+            out[key] = value
+        else:
+            out[key] = entry
+    return out
 
 
 def _start_ingestion_job(kb_id: str, ds_id: str, body) -> tuple:
