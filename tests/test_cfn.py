@@ -8218,6 +8218,62 @@ def test_cfn_codebuild_project_basic(cfn, codebuild):
     assert len(result["projects"]) == 0
 
 
+def test_cfn_codebuild_project_uses_api_member_names(cfn, codebuild):
+    """Source, Artifacts and Environment are stored with the CodeBuild API's
+    member names, on create and on update: the template's BuildSpec is the
+    API's buildspec, and the other PascalCase members are camelCase."""
+    buildspec = "version: 0.2\nphases:\n  build:\n    commands:\n      - echo hi\n"
+
+    def template(image):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Project": {
+                    "Type": "AWS::CodeBuild::Project",
+                    "Properties": {
+                        "Name": "cfn-cb-api-names",
+                        "Source": {"Type": "NO_SOURCE", "BuildSpec": buildspec},
+                        "Artifacts": {"Type": "NO_ARTIFACTS"},
+                        "Environment": {
+                            "Type": "LINUX_CONTAINER",
+                            "Image": image,
+                            "ComputeType": "BUILD_GENERAL1_SMALL",
+                            "PrivilegedMode": True,
+                            "EnvironmentVariables": [
+                                {"Name": "STAGE", "Value": "test", "Type": "PLAINTEXT"},
+                            ],
+                        },
+                        "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                    },
+                }
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-cb-api-names", TemplateBody=template("aws/codebuild/standard:7.0"))
+    try:
+        assert _wait_stack(cfn, "cfn-cb-api-names")["StackStatus"] == "CREATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-api-names"])["projects"][0]
+        assert project["source"]["type"] == "NO_SOURCE"
+        assert project["source"]["buildspec"] == buildspec
+        assert project["artifacts"]["type"] == "NO_ARTIFACTS"
+        assert project["environment"]["type"] == "LINUX_CONTAINER"
+        assert project["environment"]["image"] == "aws/codebuild/standard:7.0"
+        assert project["environment"]["computeType"] == "BUILD_GENERAL1_SMALL"
+        assert project["environment"]["privilegedMode"] is True
+        assert project["environment"]["environmentVariables"] == [
+            {"name": "STAGE", "value": "test", "type": "PLAINTEXT"},
+        ]
+
+        cfn.update_stack(StackName="cfn-cb-api-names", TemplateBody=template("aws/codebuild/standard:6.0"))
+        assert _wait_stack(cfn, "cfn-cb-api-names")["StackStatus"] == "UPDATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-api-names"])["projects"][0]
+        assert project["environment"]["image"] == "aws/codebuild/standard:6.0"
+        assert project["source"]["buildspec"] == buildspec
+    finally:
+        cfn.delete_stack(StackName="cfn-cb-api-names")
+        _wait_stack(cfn, "cfn-cb-api-names")
+
+
 def test_cfn_codebuild_project_auto_name(cfn, codebuild):
     """When Name is omitted, _physical_name() generates one."""
     template = {

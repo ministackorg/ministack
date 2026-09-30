@@ -6590,6 +6590,18 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+def _codebuild_cfn_to_api(value):
+    """Spell a Source, Artifacts or Environment property the way the CodeBuild
+    API does. The template PascalCases the API's camelCase members (Type,
+    Image, EnvironmentVariables, ...) and calls the inline build spec BuildSpec
+    where the API has ``buildspec``; the build runner reads the API names.
+    """
+    value = _pascal_to_camel(value)
+    if isinstance(value, dict) and "buildSpec" in value:
+        value["buildspec"] = value.pop("buildSpec")
+    return value
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -6600,14 +6612,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _codebuild_cfn_to_api(props.get("Source", {"type": "NO_SOURCE"})),
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
+        "artifacts": _codebuild_cfn_to_api(props.get("Artifacts", {"type": "NO_ARTIFACTS"})),
+        "environment": _codebuild_cfn_to_api(props.get("Environment", {
             "type": "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        })),
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -11009,7 +11021,10 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            value = new_props[prop]
+            if prop in ("Source", "Artifacts", "Environment"):
+                value = _codebuild_cfn_to_api(value)
+            project[key] = value
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
