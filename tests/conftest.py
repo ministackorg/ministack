@@ -98,6 +98,15 @@ def sqs_policy_allow_sns(queue_arn, topic_arn):
             "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
 
 
+def iot_test_ca(registration_code, common_name="ministack-test-ca"):
+    """A fresh CA as ``(ca_pem, ca_key_pem, verification_pem)``, the verification certificate carrying ``registration_code`` as its CN."""
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=common_name)
+    verification_pem = sign_leaf_certificate(ca_pem, ca_key_pem, common_name=registration_code)[0]
+    return ca_pem, ca_key_pem, verification_pem
+
+
 _SERIAL_TESTS = {
     "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
     "tests/test_rds.py::test_rds_pg_two_replicating_readers_provision_source_once",
