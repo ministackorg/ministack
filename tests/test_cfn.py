@@ -14,7 +14,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import iot_test_ca, sqs_policy_allow_s3
+from conftest import iot_test_ca, make_client, sqs_policy_allow_s3
 
 from ministack.services import pipes as _pipes
 from ministack.services.cloudformation.provisioners import (
@@ -8119,6 +8119,146 @@ def test_cfn_pipes_rejects_cross_region_target(cfn):
             _wait_stack(cfn, stack_name)
         except ClientError:
             pass
+
+
+def _cfn_pipe_template(uid, description, team, desired_state="RUNNING",
+                       starting_position="TRIM_HORIZON", target=None,
+                       role_arn="arn:aws:iam::000000000000:role/test-pipe-role"):
+    """A DynamoDB stream -> SNS -> SQS pipe; every name is ``cfn-pipe-upd-{uid}``."""
+    name = f"cfn-pipe-upd-{uid}"
+    return json.dumps({"Resources": {
+        "Table": {"Type": "AWS::DynamoDB::Table", "Properties": {
+            "TableName": name, "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "StreamSpecification": {"StreamViewType": "NEW_IMAGE"}}},
+        "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": name}},
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name}},
+        "Sub": {"Type": "AWS::SNS::Subscription", "Properties": {
+            "Protocol": "sqs", "TopicArn": {"Ref": "Topic"},
+            "Endpoint": {"Fn::GetAtt": ["Queue", "Arn"]}}},
+        "Pipe": {"Type": "AWS::Pipes::Pipe", "DependsOn": "Sub", "Properties": {
+            "Name": name,
+            "RoleArn": role_arn,
+            "Source": {"Fn::GetAtt": ["Table", "StreamArn"]},
+            "SourceParameters": {"DynamoDBStreamParameters": {
+                "StartingPosition": starting_position}},
+            "Target": target or {"Ref": "Topic"},
+            "Description": description,
+            "DesiredState": desired_state,
+            "Tags": {"team": team}}},
+    }})
+
+
+def _cfn_pipe_delivered(sqs, queue_url, until):
+    """The pk of every record delivered, read until ``until`` arrived and once more."""
+    pks, deadline, seen = [], time.time() + 10, False
+    while time.time() < deadline:
+        for msg in sqs.receive_message(
+                QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", []):
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            record = json.loads(json.loads(msg["Body"])["Message"])
+            pks.append(record["dynamodb"]["Keys"]["pk"]["S"])
+        if seen:
+            break
+        seen = until in pks
+    return pks
+
+
+def test_cfn_update_pipe_in_place_keeps_the_stream_position(cfn, ddb, sqs):
+    """Description, Tags, DesiredState, Target and RoleArn change in place and no record is delivered twice."""
+    pipes = make_client("pipes")
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-pipe-upd-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v1", "a"))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        first = pipes.describe_pipe(Name=name)
+        queue_url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+        ddb.put_item(TableName=name, Item={"pk": {"S": "1"}})
+        assert _cfn_pipe_delivered(sqs, queue_url, "1") == ["1"]
+
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v2", "a"))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        ddb.put_item(TableName=name, Item={"pk": {"S": "2"}})
+        assert _cfn_pipe_delivered(sqs, queue_url, "2") == ["2"]
+        pipe = pipes.describe_pipe(Name=name)
+        assert pipe["CreationTime"] == first["CreationTime"]
+        assert (first["Description"], first["Tags"]) == ("v1", {"team": "a"})
+        assert pipe["Description"] == "v2"
+
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v2", "b"))
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert pipes.describe_pipe(Name=name)["Tags"] == {"team": "b"}
+
+        target = first["Target"] + "-other"
+        role_arn = "arn:aws:iam::000000000000:role/test-pipe-role-other"
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_pipe_template(
+            uid, "v2", "b", desired_state="STOPPED", target=target, role_arn=role_arn))
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+        pipe = pipes.describe_pipe(Name=name)
+        assert (pipe["DesiredState"], pipe["CurrentState"]) == ("STOPPED", "STOPPED")
+        assert (pipe["Target"], pipe["RoleArn"]) == (target, role_arn)
+        assert pipe["CreationTime"] == first["CreationTime"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_update_pipe_rollback_restores_the_description(cfn):
+    """A pipe changed in place gets its previous Description back when a later resource fails."""
+    pipes = make_client("pipes")
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-pipe-upd-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v1", "a"))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        created = pipes.describe_pipe(Name=name)["CreationTime"]
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_with_failing_resource(
+            _cfn_pipe_template(uid, "v2", "a"), "Pipe"))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        pipe = pipes.describe_pipe(Name=name)
+        assert pipe["CreationTime"] == created
+        assert pipe["Description"] == "v1"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_update_pipe_starting_position_on_a_custom_name_is_refused(cfn):
+    """StartingPosition is create-only: under an explicit Name the update is refused."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-pipe-upd-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v1", "a"))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_pipe_template(
+            uid, "v1", "a", starting_position="LATEST"))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_update_pipe_cross_region_target_is_refused(cfn):
+    """An in-place Target change to another region's ARN is refused like the create."""
+    pipes = make_client("pipes")
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-pipe-upd-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=_cfn_pipe_template(uid, "v1", "a"))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        target = pipes.describe_pipe(Name=name)["Target"]
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_pipe_template(
+            uid, "v1", "a", target=f"arn:aws:sns:us-west-2:000000000000:{name}"))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _pipes.CROSS_REGION_PIPE_ERROR in _stack_event_reasons(cfn, name)
+        assert pipes.describe_pipe(Name=name)["Target"] == target
+    finally:
+        _delete_cfn_test_stack(cfn, name)
 
 
 def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
