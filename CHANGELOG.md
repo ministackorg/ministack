@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **EventBridge — `PutEvents` refuses `aws.*` sources** — an entry whose `Source` starts with `aws.` now fails with `NotAuthorizedForSourceException` in its result entry and counts in `FailedEntryCount`, while the other entries of the batch are still delivered; previously it was dispatched to rules and archives like a custom event.
 - **Bedrock AgentCore — `InvokeAgentRuntime` enforces IAM policies** — with `AUTH=true`, runtime invocations now resolve to `bedrock-agentcore:InvokeAgentRuntime` and authorize against the ARN in the request path, so a policy can allow one runtime and deny another. Previously, the action was not extracted and the request bypassed identity-policy evaluation.
 - **IAM — a negated condition operator is true when its key is absent** — the evaluator treated an absent key as a failed condition for every operator, so a `Deny` guarded by `StringNotEquals`, `StringNotLike`, `ArnNotLike`, `NotIpAddress` or another negated operator never applied to a request without that key. AWS evaluates such a condition as true and denies. The single-valued negated operators now do the same, while `ForAnyValue` and the affirmative operators still fail on an absent key. Contributed by @iot-rocket.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
