@@ -305,6 +305,22 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
 # ---------------------------------------------------------------------------
 
 
+def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
+    parent, child = _unique("parent"), _unique("child")
+    iot_client.create_thing_group(thingGroupName=parent)
+    iot_client.create_thing_group(thingGroupName=child, parentGroupName=parent)
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing_group(thingGroupName=parent)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Cannot delete thing group : {parent} when there are still child groups attached to it"
+    )
+    assert iot_client.describe_thing_group(thingGroupName=child)["thingGroupMetadata"][
+        "parentGroupName"] == parent
+    iot_client.delete_thing_group(thingGroupName=child)
+    iot_client.delete_thing_group(thingGroupName=parent)
+
+
 def test_iot_thing_group_membership(iot_client):
     gname = _unique("group")
     tname = _unique("thing")

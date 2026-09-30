@@ -1153,6 +1153,11 @@ def _delete_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
         return _error_not_found("ThingGroup", name)
+    if any((c.get("thingGroupMetadata") or {}).get("parentGroupName") == name for c in _thing_groups.values()):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Cannot delete thing group : {name} when there are still child groups attached to it", 400,
+        )
     # Remove group from any Things that referenced it
     for tname in list(g.get("things", [])):
         thing = _things.get(tname)

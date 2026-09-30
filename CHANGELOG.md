@@ -13,6 +13,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — `DeleteThingGroup` refuses a group with child groups** — the delete went through and left the children pointing at a missing parent; it now fails with `InvalidRequestException` as on AWS, and a CloudFormation stack delete that reaches such a group ends in `DELETE_FAILED` instead of leaving the group behind.
 - **IoT — `UpdateThing` honours `removeThingType`** — the flag was ignored, so the thing kept its type, and an update without `attributePayload` cleared attributes that AWS keeps.
 - **EventBridge — `PutEvents` refuses `aws.*` sources** — an entry whose `Source` starts with `aws.` now fails with `NotAuthorizedForSourceException` in its result entry and counts in `FailedEntryCount`, while the other entries of the batch are still delivered; previously it was dispatched to rules and archives like a custom event.
 - **Bedrock AgentCore — `InvokeAgentRuntime` enforces IAM policies** — with `AUTH=true`, runtime invocations now resolve to `bedrock-agentcore:InvokeAgentRuntime` and authorize against the ARN in the request path, so a policy can allow one runtime and deny another. Previously, the action was not extracted and the request bypassed identity-policy evaluation.

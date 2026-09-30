@@ -23265,6 +23265,40 @@ def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, i
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
+    """A stack whose thing group still has a child group created outside the
+    stack lands in DELETE_FAILED with the service message and keeps the group;
+    once the child is gone a retried delete removes it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-tg-held-{uid}"
+    parent, child = f"cfn-tg-held-p-{uid}", f"cfn-tg-held-c-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Parent": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parent}}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        iot_client.create_thing_group(thingGroupName=child, parentGroupName=parent)
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert stack["StackStatusReason"] == "The following resource(s) failed to delete: [Parent]."
+        assert (f"Cannot delete thing group : {parent} when there are still child groups attached to it"
+                in _stack_event_reasons(cfn, stack_name))
+        iot_client.describe_thing_group(thingGroupName=parent)
+
+        iot_client.delete_thing_group(thingGroupName=child)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_thing_group(thingGroupName=parent)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            iot_client.delete_thing_group(thingGroupName=child)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
