@@ -1350,27 +1350,47 @@ def _s3_delete(physical_id, props):
 
 # --- SQS Queue ---
 
+_SQS_QUEUE_DEFAULTS = {
+    "VisibilityTimeout": "30",
+    "MaximumMessageSize": "262144",
+    "MessageRetentionPeriod": "345600",
+    "DelaySeconds": "0",
+    "ReceiveMessageWaitTimeSeconds": "0",
+}
+_SQS_QUEUE_OPTIONAL = (
+    "KmsMasterKeyId", "KmsDataKeyReusePeriodSeconds", "SqsManagedSseEnabled",
+    "RedrivePolicy", "RedriveAllowPolicy",
+)
+_SQS_FIFO_OPTIONAL = ("ContentBasedDeduplication", "DeduplicationScope", "FifoThroughputLimit")
+
+
+def _sqs_queue_fields(props, is_fifo):
+    """The queue attributes of the properties, validated as SetQueueAttributes does."""
+    fields = {key: str(props.get(key, default)) for key, default in _SQS_QUEUE_DEFAULTS.items()}
+    for key in _SQS_QUEUE_OPTIONAL + (_SQS_FIFO_OPTIONAL if is_fifo else ()):
+        value = props.get(key)
+        if isinstance(value, dict):
+            fields[key] = json.dumps(value, separators=(",", ":"))
+        elif isinstance(value, bool):
+            fields[key] = str(value).lower()
+        elif value is not None:
+            fields[key] = str(value)
+    if "RedrivePolicy" in fields:
+        _sqs._validate_redrive_policy(fields["RedrivePolicy"])
+    _sqs._validate_numeric_attrs(fields)
+    return fields
+
+
 def _sqs_create(logical_id, props, stack_name):
     name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
     is_fifo = name.endswith(".fifo")
+    attributes = _sqs_queue_fields(props, is_fifo)
     url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{get_account_id()}/{name}"
     arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
     now_ts = str(int(time.time()))
-
-    attributes = {
-        "QueueArn": arn,
-        "CreatedTimestamp": now_ts,
-        "LastModifiedTimestamp": now_ts,
-        "VisibilityTimeout": str(props.get("VisibilityTimeout", "30")),
-        "MaximumMessageSize": str(props.get("MaximumMessageSize", "262144")),
-        "MessageRetentionPeriod": str(props.get("MessageRetentionPeriod", "345600")),
-        "DelaySeconds": str(props.get("DelaySeconds", "0")),
-        "ReceiveMessageWaitTimeSeconds": str(props.get("ReceiveMessageWaitTimeSeconds", "0")),
-    }
+    attributes.update(QueueArn=arn, CreatedTimestamp=now_ts, LastModifiedTimestamp=now_ts)
     if is_fifo:
         attributes["FifoQueue"] = "true"
-        if props.get("ContentBasedDeduplication"):
-            attributes["ContentBasedDeduplication"] = str(props["ContentBasedDeduplication"]).lower()
 
     queue = {
         "name": name,
@@ -1405,21 +1425,12 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
+    fields = _sqs_queue_fields(new_props, queue["is_fifo"])
     attributes = queue["attributes"]
-    attributes["VisibilityTimeout"] = str(new_props.get("VisibilityTimeout", "30"))
-    attributes["MaximumMessageSize"] = str(new_props.get("MaximumMessageSize", "262144"))
-    attributes["MessageRetentionPeriod"] = str(new_props.get("MessageRetentionPeriod", "345600"))
-    attributes["DelaySeconds"] = str(new_props.get("DelaySeconds", "0"))
-    attributes["ReceiveMessageWaitTimeSeconds"] = str(new_props.get("ReceiveMessageWaitTimeSeconds", "0"))
-    if queue["is_fifo"]:
-        # Same omit-unless-truthy shape as create: an absent property must not
-        # materialize as ContentBasedDeduplication "false" on the record.
-        if new_props.get("ContentBasedDeduplication"):
-            attributes["ContentBasedDeduplication"] = str(
-                new_props["ContentBasedDeduplication"]
-            ).lower()
-        else:
-            attributes.pop("ContentBasedDeduplication", None)
+    for key in _SQS_QUEUE_OPTIONAL + _SQS_FIFO_OPTIONAL:
+        if key in old_props and key not in fields:
+            attributes.pop(key, None)
+    attributes.update(fields)
     _reconcile_tag_map(queue.setdefault("tags", {}), old_props, new_props)
     attributes["LastModifiedTimestamp"] = str(int(time.time()))
     arn = attributes["QueueArn"]
@@ -4022,8 +4033,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
     if is_update:
-        for stale_id in set(prev_resources) - set(provisioned):
+        for stale_id in set(prev_resources) - set(ordered):
             old = prev_resources[stale_id]
+            provisioned.pop(stale_id, None)
             try:
                 _delete_resource(old.get("ResourceType", ""),
                                  old.get("PhysicalResourceId", ""),
