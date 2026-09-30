@@ -17347,6 +17347,91 @@ def test_cfn_lambda_version_stack_delete_removes_version(cfn, lam):
             pass
 
 
+def _cfn_lambda_version_template(fn, result=1, version=None, capacity_provider=False, extra=None):
+    function = {"FunctionName": fn, "Runtime": "python3.12", "Handler": "index.handler",
+                "Role": _CR_LAMBDA_ROLE,
+                "Code": {"ZipFile": f"def handler(e, c):\n    return {result}\n"}}
+    if capacity_provider:
+        function["CapacityProviderConfig"] = {"LambdaManagedInstancesCapacityProviderConfig": {
+            "CapacityProviderArn": "arn:aws:lambda:us-east-1:000000000000:capacity-provider:cp"}}
+    return json.dumps({"Resources": {
+        "Fn": {"Type": "AWS::Lambda::Function", "Properties": function},
+        "V": {"Type": "AWS::Lambda::Version",
+              "Properties": {"FunctionName": {"Ref": "Fn"}, **(version or {})}},
+        **(extra or {}),
+    }})
+
+
+def _cfn_lambda_versions(lam, fn):
+    return [(v["Version"], v["Description"])
+            for v in lam.list_versions_by_function(FunctionName=fn)["Versions"]
+            if v["Version"] != "$LATEST"]
+
+
+def _cfn_lambda_version_update(cfn, stack_name, template, status):
+    cfn.update_stack(StackName=stack_name, TemplateBody=template)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == status, stack.get("StackStatusReason")
+
+
+def test_cfn_lambda_version_of_an_unchanged_function_is_refused(cfn, lam):
+    """A Description change alone fails; with a code change it publishes the next version."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = fn = f"cfn-ver-same-{suffix}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_lambda_version_template(
+            fn, version={"Description": "one"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        _cfn_lambda_version_update(cfn, stack_name, _cfn_lambda_version_template(
+            fn, version={"Description": "two"}), "UPDATE_ROLLBACK_COMPLETE")
+        assert "A version for this Lambda function exists ( 1 )" in _stack_event_reasons(
+            cfn, stack_name)
+        assert _stack_physical_id(cfn, stack_name, "V").endswith(":1")
+        assert _cfn_lambda_versions(lam, fn) == [("1", "one")]
+
+        _cfn_lambda_version_update(cfn, stack_name, _cfn_lambda_version_template(
+            fn, result=2, version={"Description": "two"}), "UPDATE_COMPLETE")
+        assert _stack_physical_id(cfn, stack_name, "V").endswith(":2")
+        assert _cfn_lambda_versions(lam, fn) == [("2", "two")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_lambda_second_version_of_an_unchanged_function_is_refused(cfn):
+    """Two versions of the same unchanged function in one template roll the stack back."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = fn = f"cfn-ver-two-{suffix}"
+    second = {"V2": {"Type": "AWS::Lambda::Version", "DependsOn": "V",
+                     "Properties": {"FunctionName": {"Ref": "Fn"}}}}
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_lambda_version_template(fn, extra=second))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "A version for this Lambda function exists ( 1 )" in _stack_event_reasons(
+            cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_lambda_version_scaling_config_needs_a_capacity_provider(cfn):
+    """FunctionScalingConfig on a function without a capacity provider fails the version."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = fn = f"cfn-ver-nocp-{suffix}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_lambda_version_template(
+            fn, version={"FunctionScalingConfig": {
+                "MinExecutionEnvironments": 0, "MaxExecutionEnvironments": 1}}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "FunctionScalingConfig can't be specified for this Lambda function type" in (
+            _stack_event_reasons(cfn, stack_name))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_appsync_schema_stack_delete_removes_schema(cfn, appsync):
     """AWS::AppSync::GraphQLSchema now has a real delete handler: deleting the
     stack removes the schema from the (externally owned) API."""

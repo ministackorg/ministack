@@ -2002,6 +2002,8 @@ def _lambda_create(logical_id, props, stack_name):
         func["config"]["ImageUri"] = image_uri
         if props.get("ImageConfig"):
             func["config"]["ImageConfigResponse"] = {"ImageConfig": props["ImageConfig"]}
+    if props.get("CapacityProviderConfig"):
+        func["config"]["CapacityProviderConfig"] = props["CapacityProviderConfig"]
     replaced = name in _lambda_svc._functions
     _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
@@ -3666,24 +3668,32 @@ def _lambda_permission_delete(physical_id, props, logical_id=None):
 
 # --- Lambda Version ---
 
-def _lambda_version_create(logical_id, props, stack_name):
+def _lambda_version_function(props):
+    """The target function and its name; FunctionScalingConfig needs a capacity provider."""
     func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+    if func and props.get("FunctionScalingConfig") and not func["config"].get("CapacityProviderConfig"):
+        raise ValueError("FunctionScalingConfig can't be specified for this Lambda function type.")
+    return func, func_name
+
+
+def _lambda_version_create(logical_id, props, stack_name):
+    func, func_name = _lambda_version_function(props)
     if func:
-        import copy
-        ver_num = func["next_version"]
-        func["next_version"] = ver_num + 1
-        ver_str = str(ver_num)
-        ver_config = copy.deepcopy(func["config"])
-        ver_config["Version"] = ver_str
+        latest = max(func["versions"], key=int, default=None)
+        if latest and func["versions"][latest].get("function_revision") == func["config"]["RevisionId"]:
+            raise ValueError(
+                f"A version for this Lambda function exists ( {latest} ). "
+                "Modify the function to create a new version."
+            )
+        status, _headers, body = _lambda_svc._publish_version(
+            func_name, {"Description": props.get("Description")})
+        if status >= 400:
+            raise ValueError(f"AWS::Lambda::Version PublishVersion failed: {body.decode()}")
         # Ref on AWS::Lambda::Version returns the *qualified* ARN
         # (arn:...:function:name:version) — that qualifier is also what lets
         # the delete handler find the version it published.
-        ver_arn = f"{ver_config['FunctionArn']}:{ver_str}"
-        func["versions"][ver_str] = {
-            "config": ver_config,
-            "code_zip": func.get("code_zip"),
-        }
-        return ver_arn, {"Version": ver_str}
+        config = json.loads(body)
+        return config["FunctionArn"], {"Version": config["Version"]}
     ver_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:1"
     return ver_arn, {"Version": "1"}
 
