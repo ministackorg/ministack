@@ -1042,6 +1042,55 @@ def test_logs_put_resource_policy_rejects_stale_revision(logs):
     logs.delete_resource_policy(policyName=name)
 
 
+def test_logs_resource_scoped_policy_lives_on_its_log_group(logs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/resource-policy/{uid}"
+    logs.create_log_group(logGroupName=group)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            logs.put_resource_policy(policyName="p", policyDocument="{}",
+                                     resourceArn=arn.replace(uid, "missing"))
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        first = logs.put_resource_policy(policyName="p", policyDocument="{}", resourceArn=arn)
+        assert first["resourcePolicy"]["policyScope"] == "RESOURCE"
+        with pytest.raises(ClientError) as exc:  # a second write needs the current revision
+            logs.put_resource_policy(policyName="p", policyDocument="{}", resourceArn=arn)
+        assert exc.value.response["Error"]["Code"] == "OperationAbortedException"
+        second = logs.put_resource_policy(policyName="p", policyDocument="{}", resourceArn=arn,
+                                          expectedRevisionId=first["revisionId"])
+
+        assert all(p["policyScope"] == "ACCOUNT"
+                   for p in logs.describe_resource_policies()["resourcePolicies"])
+        listed = logs.describe_resource_policies(resourceArn=arn)["resourcePolicies"]
+        assert [p["revisionId"] for p in listed] == [second["revisionId"]]
+        scoped = logs.describe_resource_policies(policyScope="RESOURCE")["resourcePolicies"]
+        assert any(p.get("resourceArn") == arn for p in scoped)
+
+        logs.delete_resource_policy(policyName="p", resourceArn=arn,
+                                    expectedRevisionId=second["revisionId"])
+        assert logs.describe_resource_policies(resourceArn=arn)["resourcePolicies"] == []
+    finally:
+        logs.delete_log_group(logGroupName=group)
+
+
+@pytest.mark.serial
+def test_logs_account_resource_policies_are_limited_to_ten(logs):
+    existing = len(logs.describe_resource_policies()["resourcePolicies"])
+    uid = _uuid_mod.uuid4().hex[:8]
+    created = [f"intg-limit-{uid}-{i}" for i in range(10 - existing)]
+    try:
+        for name in created:
+            logs.put_resource_policy(policyName=name, policyDocument="{}")
+        with pytest.raises(ClientError) as exc:
+            logs.put_resource_policy(policyName=f"intg-limit-{uid}-over", policyDocument="{}")
+        assert exc.value.response["Error"]["Code"] == "LimitExceededException"
+    finally:
+        for name in created:
+            logs.delete_resource_policy(policyName=name)
+
+
 # ---------------------------------------------------------------------------
 # ARN-based tagging operations (TagResource / UntagResource)
 # ---------------------------------------------------------------------------

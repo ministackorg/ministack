@@ -787,11 +787,7 @@ def _get_template(params):
             return _error("ValidationError",
                           f"Stack [{stack_name}] does not exist")
 
-    # The API reference defaults TemplateStage to Processed; Original stays the
-    # default here, which is what GetTemplate has always answered and what the
-    # tests of transform templates expect. For a template without a transform
-    # the two stages are the same.
-    if _p(params, "TemplateStage") == "Processed":
+    if _p(params, "TemplateStage", "Processed") == "Processed":
         template_body = _processed_template_body(record)
     else:
         template_body = record.get("_template_body") or "{}"
@@ -1389,9 +1385,8 @@ def _rollback_stack(params):
     to its last known stable state. ``CREATE_FAILED`` has none, so what the
     create made is deleted and the stack ends ``ROLLBACK_COMPLETE``;
     ``UPDATE_FAILED`` goes back to the stack as it was before the update and
-    ends ``UPDATE_ROLLBACK_COMPLETE`` (API_RollbackStack). ``RoleARN`` and
-    ``ClientRequestToken`` are accepted and not used: the emulator assumes no
-    role, and a repeated token is not refused."""
+    ends ``UPDATE_ROLLBACK_COMPLETE`` (API_RollbackStack). ``RoleARN`` is
+    accepted and not used."""
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")

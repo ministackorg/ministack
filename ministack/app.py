@@ -2406,6 +2406,7 @@ async def _dispatch_service_request(
     if AUTH:
         from ministack.core.iam_actions import (
             access_denied_response,
+            agentcore_endpoint_arn,
             dynamodb_resource_arns,
             dynamodb_service_context,
             eventbridge_resource_arns,
@@ -2454,6 +2455,10 @@ async def _dispatch_service_request(
                         break
             # PutEvents carries one entry per event, and entries may name
             # different buses: AWS authorizes each against its own bus.
+            if service == "bedrock-agentcore" and method == "POST" and not denied:
+                endpoint_arn = agentcore_endpoint_arn(path, routing_params)
+                if endpoint_arn:
+                    denied = enforce(access_key, iam_action, service, region, resource_arn=endpoint_arn)
             if service == "events" and not denied:
                 for extra_arn in eventbridge_resource_arns(
                         body, region, get_account_id())[1:]:
