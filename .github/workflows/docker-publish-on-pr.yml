@@ -279,6 +279,8 @@ jobs:
             diff -qr "$scratch/full" "$scratch/regular"
 
             docker rm "$full_container" "$regular_container" >/dev/null
+            # Classic image store: one image per digest ref ("cannot overwrite digest").
+            docker image rm "$FULL_IMAGE" "$REGULAR_IMAGE" >/dev/null
             full_container=
             regular_container=
           done
