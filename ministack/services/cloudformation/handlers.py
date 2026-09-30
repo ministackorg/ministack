@@ -973,7 +973,8 @@ def _update_stack(params):
 
     current_status = stack.get("StackStatus", "")
     if current_status not in ("CREATE_COMPLETE", "UPDATE_COMPLETE",
-                               "UPDATE_ROLLBACK_COMPLETE"):
+                               "UPDATE_ROLLBACK_COMPLETE", "IMPORT_COMPLETE",
+                               "IMPORT_ROLLBACK_COMPLETE"):
         return _error("ValidationError",
                       f"Stack [{stack_name}] is in {current_status} state "
                       f"and cannot be updated")

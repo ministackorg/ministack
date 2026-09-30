@@ -1,6 +1,5 @@
 """IMPORT change sets: what CreateChangeSet refuses or fails, the shape of an
-Import change, and that the unsupported execution leaves stack and service
-state intact.
+Import change, and that executing one leaves stack and service state intact.
 
 Every expected message is the one AWS answers for the same request.
 """
@@ -167,12 +166,10 @@ def _import_of(kind, value):
 
 # --- accepted imports ---
 
-def test_import_change_set_describes_only_imports_and_is_unavailable(cfn, adopted):
+def test_import_change_set_describes_only_imports_and_is_available(cfn, adopted):
     cs = _create(cfn, adopted)
-    assert cs["Status"] == "CREATE_COMPLETE"
-    # AWS answers AVAILABLE and executes the import; the emulator refuses it by design.
-    assert cs["ExecutionStatus"] == "UNAVAILABLE"
-    assert "import" in cs["StatusReason"].lower()
+    assert (cs["Status"], cs["ExecutionStatus"]) == ("CREATE_COMPLETE", "AVAILABLE")
+    assert cs["StatusReason"].startswith("Verify that resources and their properties")
     assert [(r["Type"], r["ResourceChange"]["LogicalResourceId"], r["ResourceChange"]["Action"],
              r["ResourceChange"]["ResourceType"]) for r in cs["Changes"]] == [
         ("Resource", "Q", "Import", "AWS::SQS::Queue")]
@@ -563,8 +560,7 @@ def test_import_into_a_new_stack_creates_it_for_review(cfn, fresh):
     cs_id = cfn.create_change_set(StackName=stack, ChangeSetName="imp", ChangeSetType="IMPORT",
                                   ResourcesToImport=to_import, TemplateBody=body)["Id"]
     cs = cfn.describe_change_set(ChangeSetName=cs_id)
-    # AWS answers AVAILABLE and executes the import; the emulator refuses it by design.
-    assert (cs["Status"], cs["ExecutionStatus"]) == ("CREATE_COMPLETE", "UNAVAILABLE")
+    assert (cs["Status"], cs["ExecutionStatus"]) == ("CREATE_COMPLETE", "AVAILABLE")
     assert cs["Changes"] == [{"Type": "Resource", "ResourceChange": {
         "Action": "Import", "LogicalResourceId": "Q", "PhysicalResourceId": url,
         "ResourceType": "AWS::SQS::Queue", "Scope": [], "Details": []}}]
@@ -574,10 +570,6 @@ def test_import_into_a_new_stack_creates_it_for_review(cfn, fresh):
     assert [(e["ResourceType"], e["ResourceStatus"], e.get("ResourceStatusReason")) for e in events] == [
         ("AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated")]
     assert [s["ChangeSetName"] for s in cfn.list_change_sets(StackName=stack)["Summaries"]] == ["imp"]
-    with pytest.raises(ClientError) as exc:
-        cfn.execute_change_set(ChangeSetName=cs_id)
-    # AWS executes the import; the emulator refuses it by design.
-    assert exc.value.response["Error"]["Code"] == "InvalidChangeSetStatus"
     # A second import set against the stack under review is accepted too, and
     # deleting the change sets leaves the stack for DeleteStack to remove.
     again = cfn.create_change_set(StackName=stack, ChangeSetName="again", ChangeSetType="IMPORT",
@@ -628,28 +620,24 @@ def test_failed_import_into_a_new_stack_leaves_the_stack_for_review(cfn, fresh):
     assert _stack_row(cfn, stack) == ("REVIEW_IN_PROGRESS", "User Initiated", None)
 
 
-# --- execution stays refused and harmless ---
+# --- execution adopts the queue and changes nothing else ---
 
 @pytest.mark.parametrize("by_arn", [False, True])
-def test_repeated_execution_preserves_stack_and_service_resources(cfn, sqs, ssm, adopted, by_arn):
+def test_executed_import_preserves_stack_and_service_resources(cfn, sqs, ssm, adopted, by_arn):
     stack, url, pname, _template, _to_import = adopted
     cs = _create(cfn, adopted)
-    before = cfn.describe_stacks(StackName=stack)["Stacks"]
     resources = cfn.describe_stack_resources(StackName=stack)["StackResources"]
-    events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
     parameter = ssm.get_parameter(Name=pname)["Parameter"]
-    template = cfn.get_template(StackName=stack)["TemplateBody"]
     target = {"ChangeSetName": cs["ChangeSetId"]} if by_arn else {"StackName": stack, "ChangeSetName": "imp"}
-    for _ in range(2):
-        with pytest.raises(ClientError) as exc:
-            cfn.execute_change_set(**target)
-        # AWS executes the import; the emulator refuses it by design.
-        assert exc.value.response["Error"]["Code"] == "InvalidChangeSetStatus"
-        assert "import" in exc.value.response["Error"]["Message"].lower()
-    assert cfn.describe_stacks(StackName=stack)["Stacks"] == before
-    assert cfn.describe_stack_resources(StackName=stack)["StackResources"] == resources
-    assert cfn.describe_stack_events(StackName=stack)["StackEvents"] == events
-    assert cfn.get_template(StackName=stack)["TemplateBody"] == template
+    cfn.execute_change_set(**target)
+    cfn.get_waiter("stack_import_complete").wait(
+        StackName=stack, WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+    with pytest.raises(ClientError) as exc:
+        cfn.execute_change_set(ChangeSetName=cs["ChangeSetId"])
+    assert exc.value.response["Error"]["Code"] == "InvalidChangeSetStatus"
+    after = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack)["StackResources"]}
+    assert after.pop("X") == resources[0]
+    assert (after["Q"]["PhysicalResourceId"], after["Q"]["ResourceStatus"]) == (url, "UPDATE_COMPLETE")
     assert ssm.get_parameter(Name=pname)["Parameter"] == parameter
     attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["VisibilityTimeout"])["Attributes"]
     assert attrs["VisibilityTimeout"] == "17"
