@@ -456,11 +456,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    # Both the control and data-plane clients sign with the same
-    # ``bedrock-agentcore`` name.  The control model supplies the REST routes
-    # for resource-policy CRUD; InvokeAgentRuntime remains explicit below so
-    # older Botocore installations still authorize it.
-    "bedrock-agentcore": ["bedrock-agentcore-control"],
+    "bedrock-agentcore": [],  # InvokeAgentRuntime is mapped in extract_iam_action
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -664,6 +660,14 @@ def _agentcore_runtime_arn(path: str) -> str | None:
     """Extract the runtime ARN from an InvokeAgentRuntime URI."""
     match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
     return match.group(1) if match else None
+
+
+def agentcore_endpoint_arn(path: str, query_params: dict) -> str | None:
+    """The runtime-endpoint ARN InvokeAgentRuntime also authorizes: the qualifier, else DEFAULT."""
+    runtime_arn = _agentcore_runtime_arn(path)
+    if not runtime_arn:
+        return None
+    return f"{runtime_arn}/runtime-endpoint/{_query_param(query_params, 'qualifier') or 'DEFAULT'}"
 
 
 def extract_iam_action(service: str, method: str, path: str,
