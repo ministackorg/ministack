@@ -726,7 +726,9 @@ def _list_broker_instance_options(query_params: dict) -> tuple:
                         "engineType": eng,
                         "hostInstanceType": host,
                         "storageType": stor,
-                        "supportedEngineVersions": [{"name": v} for v in cfg["versions"]],
+                        # plain version strings, unlike the {"name": ...} objects of
+                        # DescribeBrokerEngineTypes
+                        "supportedEngineVersions": list(cfg["versions"]),
                         "supportedDeploymentModes": list(cfg["deployment_modes"]),
                     }
                 )
