@@ -2135,6 +2135,9 @@ class TestActionExtraction:
             service, "POST", decoded_path, headers, b"{}", {}, "us-east-1", "000000000000"
         ) == "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
         assert extract_iam_action(service, "GET", decoded_path, headers, b"{}", {}) is None
+        assert extract_iam_action(
+            service, "POST", "/runtimes//invocations", headers, b"{}", {}
+        ) is None
 
 
 class TestBedrockAgentCoreAuthorization:

@@ -658,6 +658,12 @@ def _match_rest_action(service: str, method: str, path: str,
     return best_match
 
 
+def _agentcore_runtime_arn(path: str) -> str | None:
+    """Extract the runtime ARN from an InvokeAgentRuntime URI."""
+    match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
+    return match.group(1) if match else None
+
+
 def extract_iam_action(service: str, method: str, path: str,
                        headers: dict, body: bytes,
                        query_params: dict) -> str | None:
@@ -692,7 +698,7 @@ def extract_iam_action(service: str, method: str, path: str,
     if service == "bedrock-agentcore" and method == "POST":
         # AgentCore runtime ARNs contain slashes and SDKs percent-encode them
         # into the path label. Match only InvokeAgentRuntime's data-plane URI.
-        if re.fullmatch(r"/runtimes/.+?/invocations/?", unquote(path)):
+        if _agentcore_runtime_arn(path):
             return "bedrock-agentcore:InvokeAgentRuntime"
 
     # Tier 4: Generic botocore route matcher (all other REST services)
@@ -859,10 +865,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         # InvokeAgentRuntime addresses a specific runtime in the URI. The ARN
         # itself contains slashes and is percent-encoded by SDKs, so decode it
         # before returning it to IAM policy evaluation.
-        match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
-        if match:
-            return match.group(1)
-        return "*"
+        return _agentcore_runtime_arn(path) or "*"
 
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
