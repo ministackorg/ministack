@@ -2855,6 +2855,7 @@ def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
 def _appconfig_configuration_profile_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._config_profiles.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._hosted_version_counters.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._profile_arn(app_id, physical_id), None)
 
 
@@ -2872,20 +2873,16 @@ def _appconfig_hosted_version_create(logical_id, props, stack_name):
     # CDK / Fn::ToJsonString may pass parsed JSON; AWS wire shape is a string.
     if isinstance(content, (dict, list)):
         content = json.dumps(content)
-    existing = [
-        v for k, v in _appconfig._hosted_versions.items()
-        if k.startswith(f"{app_id}/{profile_id}/")
-    ]
-    version_number = len(existing) + 1
     # AWS optimistic-concurrency: if LatestVersionNumber is supplied, it must
-    # match the most-recent version_number — otherwise reject with a
+    # match the most-recent existing version — otherwise reject with a
     # ConflictException-shape error (mirrors real AppConfig's lock check).
+    latest = _appconfig._latest_hosted_version_number(app_id, profile_id)
     latest_lock = props.get("LatestVersionNumber")
-    if latest_lock is not None and int(latest_lock) != version_number - 1:
+    if latest_lock is not None and int(latest_lock) != latest:
         raise ValueError(
-            f"AWS::AppConfig::HostedConfigurationVersion LatestVersionNumber "
-            f"mismatch: supplied {latest_lock}, current latest is {version_number - 1}"
+            f"Expected latest version {latest_lock} does not match actual latest version {latest}"
         )
+    version_number = _appconfig._next_hosted_version_number(app_id, profile_id)
     _appconfig._hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = {
         "ApplicationId": app_id,
         "ConfigurationProfileId": profile_id,

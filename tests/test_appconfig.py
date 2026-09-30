@@ -307,6 +307,28 @@ def test_appconfig_delete_hosted_configuration_version(appconfig_client):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_appconfig_hosted_version_number_is_never_reused(appconfig_client):
+    """A version created after deleting one gets a fresh number."""
+    app = appconfig_client.create_application(Name="hcv-reuse-app")
+    ids = {"ApplicationId": app["Id"],
+           "ConfigurationProfileId": appconfig_client.create_configuration_profile(
+               ApplicationId=app["Id"], Name="hcv-reuse-profile", LocationUri="hosted")["Id"]}
+
+    def create(content):
+        return appconfig_client.create_hosted_configuration_version(
+            **ids, Content=content, ContentType="text/plain")["VersionNumber"]
+
+    assert [create(b"v1"), create(b"v2")] == [1, 2]
+    appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=1)
+    assert create(b"v3") == 3
+    appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=3)
+    assert create(b"v4") == 4
+    listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+    assert sorted(i["VersionNumber"] for i in listed) == [2, 4]
+    assert appconfig_client.get_hosted_configuration_version(
+        **ids, VersionNumber=2)["Content"].read() == b"v2"
+
+
 # ---------------------------------------------------------------------------
 # Deployment Strategies
 # ---------------------------------------------------------------------------
