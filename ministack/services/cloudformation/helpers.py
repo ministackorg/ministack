@@ -146,6 +146,45 @@ def capabilities_problems(values: list[str]) -> list[str]:
             f"[{', '.join(CAPABILITY_VALUES)}]"]
 
 
+# Valid values of the stack operation enums, in the botocore model's order.
+# OnFailure (CreateStack) and OnStackFailure (CreateChangeSet) share one.
+ON_FAILURE_VALUES = ("DO_NOTHING", "ROLLBACK", "DELETE")
+DELETION_MODE_VALUES = ("STANDARD", "FORCE_DELETE_STACK")
+TEMPLATE_STAGE_VALUES = ("Original", "Processed")
+
+
+def enum_problems(params, key: str, wire_name: str, values: tuple) -> list[str]:
+    """The enum constraint of one string parameter (``OnFailure``,
+    ``DeletionMode``, ``TemplateStage``, ...), in the API's parameter
+    validation wording; the valid values are the API reference's, in the
+    botocore model's order. Empty when the parameter is absent or valid."""
+    value = _p(params, key)
+    if not value or value in values:
+        return []
+    return [f"Value '{value}' at '{wire_name}' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(values)}]"]
+
+
+CLIENT_REQUEST_TOKEN_PATTERN = "[a-zA-Z0-9][-a-zA-Z0-9]*"
+CLIENT_REQUEST_TOKEN_RE = re.compile(CLIENT_REQUEST_TOKEN_PATTERN)
+CLIENT_REQUEST_TOKEN_MAX_CHARS = 128
+
+
+def client_request_token_problems(token: str) -> list[str]:
+    """The ``ClientRequestToken`` constraints of the stack operations: 1 to
+    128 characters matching ``[a-zA-Z0-9][-a-zA-Z0-9]*`` (API reference)."""
+    problems = []
+    if len(token) > CLIENT_REQUEST_TOKEN_MAX_CHARS:
+        problems.append(
+            f"Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member "
+            f"must have length less than or equal to {CLIENT_REQUEST_TOKEN_MAX_CHARS}")
+    if not CLIENT_REQUEST_TOKEN_RE.fullmatch(token):
+        problems.append(
+            f"Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member "
+            f"must satisfy regular expression pattern: {CLIENT_REQUEST_TOKEN_PATTERN}")
+    return problems
+
+
 def _template_body_problem(body: str) -> str | None:
     """The request-level constraint on ``TemplateBody`` (the quota page:
     "Template body size in a request", 51,200 bytes), as one sentence of the
