@@ -7332,22 +7332,44 @@ def _ec2_igw_delete(physical_id, props):
     _ec2._tags.pop(physical_id, None)
 
 
-def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
+def _ec2_vpc_gw_attachment(props):
+    """(gateway record, attachment, physical id) of an attachment's properties."""
     vpc_id = props.get("VpcId", "")
-    igw_id = props.get("InternetGatewayId", "")
-    igw = _ec2._internet_gateways.get(igw_id)
-    if igw:
-        igw["Attachments"] = [{"VpcId": vpc_id, "State": "available"}]
-    physical_id = f"{igw_id}|{vpc_id}"
+    if props.get("VpnGatewayId"):
+        return (_ec2._vpn_gateways.get(props["VpnGatewayId"]),
+                {"VpcId": vpc_id, "State": "attached"}, f"VGW|{vpc_id}")
+    return (_ec2._internet_gateways.get(props.get("InternetGatewayId", "")),
+            {"VpcId": vpc_id, "State": "available"}, f"IGW|{vpc_id}")
+
+
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
+    """Attach the gateway; a replaced attachment stays until its own delete."""
+    gateway, attachment, physical_id = _ec2_vpc_gw_attachment(props)
+    if gateway:
+        _ec2_vpc_gw_attach_delete(physical_id, props)
+        gateway["Attachments"].append(attachment)
+    return physical_id, {}
+
+
+def _ec2_vpc_gw_attach_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Swap the gateway in place; a changed VpcId or gateway type is a replacement."""
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _ec2_vpc_gw_attachment(new_props)[2], _ec2_vpc_gw_attachment(old_props)[2],
+        _ec2_vpc_gw_attach_create, _ec2_vpc_gw_attach_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _ec2_vpc_gw_attach_delete(physical_id, old_props)
+    _ec2_vpc_gw_attach_create(logical_id or physical_id, new_props, stack_name)
     return physical_id, {}
 
 
 def _ec2_vpc_gw_attach_delete(physical_id, props):
-    parts = physical_id.split("|")
-    if len(parts) == 2:
-        igw = _ec2._internet_gateways.get(parts[0])
-        if igw:
-            igw["Attachments"] = []
+    gateway, attachment, _ = _ec2_vpc_gw_attachment(props)
+    if gateway:
+        gateway["Attachments"] = [a for a in gateway.get("Attachments", [])
+                                  if a.get("VpcId") != attachment["VpcId"]]
 
 
 def _ec2_rtb_create(logical_id, props, stack_name):
@@ -11649,7 +11671,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ec2_igw_delete,
     },
-    "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
+    "AWS::EC2::VPCGatewayAttachment": {
+        "create": _ec2_vpc_gw_attach_create,
+        "update": _ec2_vpc_gw_attach_update,
+        "update_with_logical_id": True,
+        "delete": _ec2_vpc_gw_attach_delete,
+    },
     "AWS::EC2::RouteTable": {
         "create": _ec2_rtb_create,
         "update": _ec2_rtb_update,
