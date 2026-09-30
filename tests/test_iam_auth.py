@@ -1154,6 +1154,42 @@ class TestCustomerManagedPolicyResolution:
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
 
 
+class TestCombineResourcePolicy:
+    """An identity decision combined with the policy of the resource the request addresses."""
+
+    _USER = "arn:aws:iam::000000000000:user/u"
+
+    def _decide(self, identity, principal, effect="Allow", owner="000000000000", caller=_USER):
+        from ministack.core.iam_evaluator import combine_resource_policy
+
+        ctx = EvalContext(principal_arn=caller, principal_type="User", principal_account="000000000000",
+                          action="sqs:SendMessage", resource_arn=f"arn:aws:sqs:us-east-1:{owner}:q",
+                          region="us-east-1")
+        policy = {"Statement": [{"Effect": effect, "Principal": {"AWS": principal},
+                                 "Action": "sqs:*", "Resource": "*"}]}
+        return combine_resource_policy(EvalResult(identity, caller), ctx, policy, owner).decision
+
+    @pytest.mark.parametrize("identity,principal,effect,owner,expected", [
+        ("ImplicitDeny", _USER, "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "*", "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "ImplicitDeny"),
+        ("ImplicitDeny", "000000000000", "Allow", "000000000000", "ImplicitDeny"),
+        ("Allow", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "Allow"),
+        ("Allow", _USER, "Deny", "000000000000", "Deny"),
+        ("Allow", "arn:aws:iam::000000000000:user/other", "Deny", "000000000000", "Allow"),
+        ("ImplicitDeny", _USER, "Allow", "111111111111", "ImplicitDeny"),
+        ("Allow", "000000000000", "Allow", "111111111111", "Allow"),
+        ("Allow", "arn:aws:iam::111111111111:root", "Allow", "111111111111", "ImplicitDeny"),
+    ])
+    def test_decision(self, identity, principal, effect, owner, expected):
+        assert self._decide(identity, principal, effect, owner) == expected
+
+    def test_a_statement_naming_the_role_names_its_sessions(self):
+        session = "arn:aws:sts::000000000000:assumed-role/r/s"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/app/r", caller=session) == "Allow"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/x", caller=session) == "ImplicitDeny"
+
+
 class TestSeededAwsManagedPolicies:
     """The AWS-managed policies CDK, SAM and Serverless attach by their real ARNs
     resolve to a document: the service-role/* path is the only one AWS has for the
@@ -1475,7 +1511,13 @@ class TestResourceArn:
 
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
-        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+        url = "http://localhost:4566/000000000000/my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": [url]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:000000000000:my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": ["my-queue"]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:123:my-queue"
 
     def test_sqs_create_queue(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -3349,6 +3391,11 @@ class TestExtractResourceArn:
         # Query-protocol callers address the queue by path.
         assert self._arn("sqs", path="/000000000000/my-queue") == (
             "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_in_another_account_keeps_its_owner(self):
+        body = json.dumps({"QueueUrl": "http://localhost:4566/111111111111/my-queue"}).encode()
+        assert self._arn("sqs", body=body) == "arn:aws:sqs:us-east-1:111111111111:my-queue"
+        assert self._arn("sqs", path="/111111111111/my-queue") == "arn:aws:sqs:us-east-1:111111111111:my-queue"
 
     def test_sqs_without_a_queue_falls_back_to_star(self):
         assert self._arn("sqs", body=json.dumps({"MaxResults": 10}).encode()) == "*"

@@ -2223,7 +2223,8 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             return _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny")
+                                      explicit_deny=denied.decision == "Deny",
+                                      resource_policy_arn=denied.resource_policy_arn)
     return None
 
 
@@ -2707,6 +2708,7 @@ async def _dispatch_service_request(
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                    resource_policy_arn=denied.resource_policy_arn,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
