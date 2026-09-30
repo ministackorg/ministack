@@ -29380,6 +29380,224 @@ def test_cfn_import_of_a_pool_member_another_stack_holds_fails(cfn, cognito_idp)
         cognito_idp.delete_user_pool(UserPoolId=other)
 
 
+def _cfn_existing_change_set(cfn, stack, change_set_type, resources):
+    """A change set with ImportExistingResources; returns its description."""
+    cs_id = cfn.create_change_set(
+        StackName=stack, ChangeSetName="cs", ChangeSetType=change_set_type, ImportExistingResources=True,
+        TemplateBody=json.dumps({"Resources": resources}))["Id"]
+    return cfn.describe_change_set(ChangeSetName=cs_id)
+
+
+def _cfn_param(name=None, value="v", policy=None):
+    resource = {"Type": "AWS::SSM::Parameter", "Properties": {"Type": "String", "Value": value}}
+    if name:
+        resource["Properties"]["Name"] = name
+    if policy:
+        resource["DeletionPolicy"] = policy
+    return resource
+
+
+def test_cfn_import_existing_resources_on_create(cfn, ssm, logs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-exist-{uid}", f"cfn-imp-exist-{uid}"
+    ssm.put_parameter(Name=name, Type="String", Value="v1")
+    logs.create_log_group(logGroupName=name)
+    try:
+        cs = _cfn_existing_change_set(cfn, stack, "CREATE", {
+            "P": _cfn_param(name, "v2", "Retain"),
+            "L": {"Type": "AWS::Logs::LogGroup", "DeletionPolicy": "RetainExceptOnCreate",
+                  "Properties": {"LogGroupName": name}},
+            "N": _cfn_param()})
+        assert cs["ImportExistingResources"] is True
+        assert {c["ResourceChange"]["LogicalResourceId"]: (c["ResourceChange"]["Action"],
+                                                           c["ResourceChange"].get("PhysicalResourceId"))
+                for c in cs["Changes"]} == {"P": ("Import", name), "L": ("Import", name), "N": ("Add", None)}
+        cfn.execute_change_set(ChangeSetName=cs["ChangeSetId"])
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        events = [(e["LogicalResourceId"], e["ResourceStatus"], e.get("ResourceStatusReason", ""))
+                  for e in reversed(cfn.describe_stack_events(StackName=stack)["StackEvents"])]
+        assert [e for e in events if e[0] == "P"] == [
+            ("P", "IMPORT_IN_PROGRESS", "Resource import started."),
+            ("P", "IMPORT_IN_PROGRESS", ""),
+            ("P", "IMPORT_COMPLETE", "Resource import completed."),
+            ("P", "UPDATE_IN_PROGRESS", "Apply stack-level tags to imported resource if applicable."),
+            ("P", "UPDATE_COMPLETE", ""),
+        ]
+        assert {r["LogicalResourceId"]: r["ResourceStatus"]
+                for r in cfn.describe_stack_resources(StackName=stack)["StackResources"]} == {
+            "P": "UPDATE_COMPLETE", "L": "UPDATE_COMPLETE", "N": "CREATE_COMPLETE"}
+        assert ssm.get_parameter(Name=name)["Parameter"]["Version"] == 1
+        _delete_cfn_test_stack(cfn, stack)
+        # Both were imported, not created: RetainExceptOnCreate keeps the log group too.
+        assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "v1"
+        assert [g["logGroupName"] for g in logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]] == [name]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ssm.delete_parameter(Name=name)
+        logs.delete_log_group(logGroupName=name)
+
+
+def test_cfn_import_existing_resources_needs_a_retaining_policy(cfn, ssm, logs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-exist-nopol-{uid}", f"cfn-imp-exist-nopol-{uid}"
+    ssm.put_parameter(Name=name, Type="String", Value="v1")
+    logs.create_log_group(logGroupName=name)
+    try:
+        cs = _cfn_existing_change_set(cfn, stack, "CREATE", {
+            "P": _cfn_param(name), "L": {"Type": "AWS::Logs::LogGroup", "DeletionPolicy": "Delete",
+                                         "Properties": {"LogGroupName": name}}})
+        assert (cs["Status"], cs["ExecutionStatus"], cs["Changes"]) == ("FAILED", "UNAVAILABLE", [])
+        assert cs["StatusReason"] == (
+            "CloudFormation is attempting to import some resources because they already exist in your "
+            "account. The resources must have the DeletionPolicy attribute set to 'Retain' or "
+            "'RetainExceptOnCreate' in the template for successful import. The affected resources are "
+            f"P ({{Name={name}}}), L ({{LogGroupName={name}}})")
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ssm.delete_parameter(Name=name)
+        logs.delete_log_group(logGroupName=name)
+
+
+def test_cfn_import_existing_resources_needs_a_literal_name(cfn, ssm):
+    """A name from Fn::Sub or a Ref to a parameter is not imported: the change stays Add."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-imp-exist-dyn-{uid}"
+    sub, ref = f"{stack}-sub", f"{stack}-ref"
+    ssm.put_parameter(Name=sub, Type="String", Value="v1")
+    ssm.put_parameter(Name=ref, Type="String", Value="v1")
+    try:
+        cs_id = cfn.create_change_set(
+            StackName=stack, ChangeSetName="cs", ChangeSetType="CREATE", ImportExistingResources=True,
+            TemplateBody=json.dumps({
+                "Parameters": {"N": {"Type": "String", "Default": ref}},
+                "Resources": {
+                    "S": {**_cfn_param(None, "v1", "Retain"), "Properties": {
+                        "Type": "String", "Value": "v1", "Name": {"Fn::Sub": "${AWS::StackName}-sub"}}},
+                    "R": {**_cfn_param(None, "v1", "Retain"), "Properties": {
+                        "Type": "String", "Value": "v1", "Name": {"Ref": "N"}}}}}))["Id"]
+        cs = cfn.describe_change_set(ChangeSetName=cs_id)
+        assert (cs["Status"], cs["ExecutionStatus"]) == ("CREATE_COMPLETE", "AVAILABLE")
+        assert {c["ResourceChange"]["LogicalResourceId"]: c["ResourceChange"]["Action"]
+                for c in cs["Changes"]} == {"S": "Add", "R": "Add"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ssm.delete_parameter(Name=sub)
+        ssm.delete_parameter(Name=ref)
+
+
+def test_cfn_import_existing_resources_on_update_and_rollback(cfn, ssm, sqs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-exist-upd-{uid}", f"cfn-imp-exist-upd-{uid}"
+    ssm.put_parameter(Name=name, Type="String", Value="v1")
+    url = sqs.create_queue(QueueName=name)["QueueUrl"]
+    x = _cfn_param()
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"X": x}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        # A queue is identified by its URL, which the template does not set: it is not imported.
+        queue = {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain", "Properties": {"QueueName": name}}
+        cs = _cfn_existing_change_set(cfn, stack, "UPDATE", {"X": x, "P": _cfn_param(name, "v1", "Retain"),
+                                                              "Q": queue})
+        assert {c["ResourceChange"]["LogicalResourceId"]: c["ResourceChange"]["Action"]
+                for c in cs["Changes"]} == {"P": "Import", "Q": "Add"}
+        cfn.delete_change_set(ChangeSetName=cs["ChangeSetId"])
+        # The update fails after the import; the rollback leaves the parameter alone.
+        failing = {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+                   "W": {"Type": "AWS::CloudFormation::WaitCondition", "DependsOn": "P",
+                         "Properties": {"Handle": {"Ref": "H"}, "Timeout": "1"}}}
+        cs = _cfn_existing_change_set(cfn, stack, "UPDATE", {"X": x, "P": _cfn_param(name, "v1", "Retain"),
+                                                              **failing})
+        before = len(cfn.describe_stack_events(StackName=stack)["StackEvents"])
+        cfn.execute_change_set(ChangeSetName=cs["ChangeSetId"])
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        events = list(reversed(cfn.describe_stack_events(StackName=stack)["StackEvents"]))[before:]
+        # The parameter is released before the cleanup deletes what the update created.
+        assert [(e["LogicalResourceId"], e["ResourceStatus"]) for e in events
+                if e["LogicalResourceId"] in (stack, "P")] == [
+            (stack, "UPDATE_IN_PROGRESS"), ("P", "IMPORT_IN_PROGRESS"), ("P", "IMPORT_IN_PROGRESS"),
+            ("P", "IMPORT_COMPLETE"), ("P", "UPDATE_IN_PROGRESS"), ("P", "UPDATE_COMPLETE"),
+            (stack, "UPDATE_ROLLBACK_IN_PROGRESS"), ("P", "UPDATE_IN_PROGRESS"), ("P", "UPDATE_COMPLETE"),
+            ("P", "IMPORT_ROLLBACK_IN_PROGRESS"), ("P", "IMPORT_ROLLBACK_COMPLETE"),
+            (stack, "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS"), (stack, "UPDATE_ROLLBACK_COMPLETE")]
+        resources = cfn.describe_stack_resources(StackName=stack)["StackResources"]
+        assert [r["LogicalResourceId"] for r in resources] == ["X"]
+        assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "v1"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ssm.delete_parameter(Name=name)
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_cfn_import_existing_resources_released_by_rollback_stack(cfn, ssm):
+    """A create that failed with DisableRollback releases its imported resource on RollbackStack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-exist-rbs-{uid}", f"cfn-imp-exist-rbs-{uid}"
+    ssm.put_parameter(Name=name, Type="String", Value="v1")
+    try:
+        cs = _cfn_existing_change_set(cfn, stack, "CREATE", {
+            "P": _cfn_param(name, "v1", "Retain"),
+            "H": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+            "W": {"Type": "AWS::CloudFormation::WaitCondition", "DependsOn": "P",
+                  "Properties": {"Handle": {"Ref": "H"}, "Timeout": "1"}}})
+        assert {c["ResourceChange"]["LogicalResourceId"]: c["ResourceChange"]["Action"]
+                for c in cs["Changes"]} == {"P": "Import", "H": "Add", "W": "Add"}
+        cfn.execute_change_set(ChangeSetName=cs["ChangeSetId"], DisableRollback=True)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_FAILED"
+        before = len(cfn.describe_stack_events(StackName=stack)["StackEvents"])
+        cfn.rollback_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        events = list(reversed(cfn.describe_stack_events(StackName=stack)["StackEvents"]))[before:]
+        assert [(e["ResourceStatus"], e.get("ResourceStatusReason", "")) for e in events
+                if e["LogicalResourceId"] == "P"] == [
+            ("UPDATE_IN_PROGRESS", "Remove stack-level tags from imported resource if applicable."),
+            ("UPDATE_COMPLETE", ""), ("IMPORT_ROLLBACK_IN_PROGRESS", ""), ("IMPORT_ROLLBACK_COMPLETE", "")]
+        resources = cfn.describe_stack_resources(StackName=stack)["StackResources"]
+        assert "P" not in [r["LogicalResourceId"] for r in resources]
+        assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "v1"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ssm.delete_parameter(Name=name)
+
+
+def test_cfn_import_existing_resources_another_stack_holds(cfn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    held, stack, name = f"cfn-imp-exist-held-{uid}", f"cfn-imp-exist-take-{uid}", f"cfn-imp-exist-held-{uid}"
+    cfn.create_stack(StackName=held, TemplateBody=json.dumps({"Resources": {"P": _cfn_param(name)}}))
+    try:
+        owner = _wait_stack(cfn, held)
+        assert owner["StackStatus"] == "CREATE_COMPLETE"
+        # A missing retaining policy is reported first.
+        for policy, reason in ((None, "The affected resources are P ({Name=" + name + "})"),
+                               ("Retain", f"{name} already exists in stack {owner['StackId']}")):
+            cs = _cfn_existing_change_set(cfn, stack, "CREATE", {"P": _cfn_param(name, "v", policy)})
+            assert (cs["Status"], cs["ExecutionStatus"], cs["Changes"]) == ("FAILED", "UNAVAILABLE", [])
+            assert cs["StatusReason"].endswith(reason)
+            cfn.delete_change_set(ChangeSetName=cs["ChangeSetId"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        _delete_cfn_test_stack(cfn, held)
+
+
+def test_cfn_import_existing_resource_gone_before_execute(cfn, ssm):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-exist-gone-{uid}", f"cfn-imp-exist-gone-{uid}"
+    ssm.put_parameter(Name=name, Type="String", Value="v1")
+    try:
+        cs = _cfn_existing_change_set(cfn, stack, "CREATE", {"P": _cfn_param(name, "v1", "Retain")})
+        assert [c["ResourceChange"]["Action"] for c in cs["Changes"]] == ["Import"]
+        ssm.delete_parameter(Name=name)
+        cfn.execute_change_set(ChangeSetName=cs["ChangeSetId"])
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert [(e["ResourceStatus"], e.get("ResourceStatusReason", ""))
+                for e in reversed(cfn.describe_stack_events(StackName=stack)["StackEvents"])
+                if e["LogicalResourceId"] == "P"] == [
+            ("IMPORT_IN_PROGRESS", "Resource import started."),
+            ("IMPORT_FAILED", f"Resource of type 'AWS::SSM::Parameter' with identifier '{name}' was not found."),
+            ("IMPORT_ROLLBACK_IN_PROGRESS", ""), ("IMPORT_ROLLBACK_COMPLETE", "")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
 # ---------------------------------------------------------------------------
 # OnFailure, OnStackFailure, DeletionMode, TemplateStage, ClientRequestToken
 # ---------------------------------------------------------------------------

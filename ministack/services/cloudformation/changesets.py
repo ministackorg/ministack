@@ -50,6 +50,9 @@ from .helpers import (
 )
 from .provisioners import _RESOURCE_HANDLERS, _import_resource
 from .stacks import (
+    _IMPORT_COMPLETED,
+    _IMPORT_STARTED,
+    _IMPORT_TAGS,
     _add_event,
     _create_stack_task_in_region,
     _create_then_delete_on_failure,
@@ -358,24 +361,63 @@ def _import_changes(resources_to_import, template, diff):
         raise ValueError(f"The following resources to import {_listed(no_policy)} must have "
                          "DeletionPolicy attribute specified in the template.")
 
-    changes = []
-    for entry in resources_to_import:
-        change = {
-            "Action": "Import",
-            "LogicalResourceId": entry["LogicalResourceId"],
-            "ResourceType": entry["ResourceType"],
-            "Scope": [],
-            "Details": [],
-        }
-        # How AWS joins the keys of an unlisted multi-key type (AWS::IAM::RolePolicy's
-        # PolicyName + RoleName, say) is unmeasured, so none is invented for one.
-        identifier = entry["ResourceIdentifier"]
-        if entry["ResourceType"] in _IMPORT_LOOKUPS:
-            change["PhysicalResourceId"] = identifier[_IMPORT_LOOKUPS[entry["ResourceType"]][0][-1]]
-        elif len(identifier) == 1:
-            change["PhysicalResourceId"] = next(iter(identifier.values()))
-        changes.append({"ResourceChange": change})
-    return changes
+    return [_import_change(entry) for entry in resources_to_import]
+
+
+def _import_change(entry):
+    """The Import change of one resource to import."""
+    change = {
+        "Action": "Import",
+        "LogicalResourceId": entry["LogicalResourceId"],
+        "ResourceType": entry["ResourceType"],
+        "Scope": [],
+        "Details": [],
+    }
+    # How AWS joins the keys of an unlisted multi-key type (AWS::IAM::RolePolicy's
+    # PolicyName + RoleName, say) is unmeasured, so none is invented for one.
+    identifier = entry["ResourceIdentifier"]
+    if entry["ResourceType"] in _IMPORT_LOOKUPS:
+        change["PhysicalResourceId"] = identifier[_IMPORT_LOOKUPS[entry["ResourceType"]][0][-1]]
+    elif len(identifier) == 1:
+        change["PhysicalResourceId"] = next(iter(identifier.values()))
+    return {"ResourceChange": change}
+
+
+def _existing_resources(changes, template):
+    """The added resources ImportExistingResources finds, in the stack's region."""
+    found = []
+    for change in changes:
+        rc = change["ResourceChange"]
+        rtype, logical_id = rc["ResourceType"], rc["LogicalResourceId"]
+        if (rc["Action"] != "Add" or rtype not in _IMPORT_LOOKUPS
+                or "import" not in _RESOURCE_HANDLERS.get(rtype, {})):
+            continue
+        # Only a name written as a literal counts; one from a Ref or Fn::Sub is created.
+        props = template["Resources"][logical_id].get("Properties") or {}
+        keys = _IMPORT_LOOKUPS[rtype][0]
+        if not all(isinstance(props.get(key), str) and props[key] for key in keys):
+            continue
+        entry = {"ResourceType": rtype, "LogicalResourceId": logical_id,
+                 "ResourceIdentifier": {key: props[key] for key in keys}}
+        if _import_not_found([entry]) is None:
+            found.append(entry)
+    return found
+
+
+def _unretained_import_reason(entries, template):
+    """AWS's StatusReason when an existing resource to import is not retained, or None."""
+    declared = template.get("Resources", {})
+    unretained = [
+        f"{e['LogicalResourceId']} ({{{', '.join(f'{k}={v}' for k, v in e['ResourceIdentifier'].items())}}})"
+        for e in sorted(entries, key=lambda e: list(declared).index(e["LogicalResourceId"]))
+        if declared[e["LogicalResourceId"]].get("DeletionPolicy") not in ("Retain", "RetainExceptOnCreate")
+    ]
+    if not unretained:
+        return None
+    return ("CloudFormation is attempting to import some resources because they already exist in "
+            "your account. The resources must have the DeletionPolicy attribute set to 'Retain' or "
+            "'RetainExceptOnCreate' in the template for successful import. The affected resources "
+            f"are {', '.join(unretained)}")
 
 
 def _import_ref(rtype, value):
@@ -491,6 +533,8 @@ def _create_change_set(params):
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
+    import_existing = (cs_type in ("CREATE", "UPDATE")
+                       and _p(params, "ImportExistingResources", "false").lower() == "true")
 
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -686,6 +730,15 @@ def _create_change_set(params):
                 import_failure = _import_owner(resources_to_import)
         if import_failure is not None:
             changes = []
+    existing = []
+    if import_existing:
+        with _stack_region_context(stack, stack_id):
+            existing = _existing_resources(changes, template)
+            import_failure = _unretained_import_reason(existing, template) or _import_owner(existing)
+        if import_failure is not None:
+            changes = []
+        adopted = {e["LogicalResourceId"]: _import_change(e) for e in existing}
+        changes = [adopted.get(c["ResourceChange"]["LogicalResourceId"], c) for c in changes]
 
     cs_id = (
         f"arn:aws:cloudformation:{_stack_region(stack, stack_id)}:{get_account_id()}:"
@@ -739,6 +792,8 @@ def _create_change_set(params):
         "_template_body": template_body,
         "_resolved_params": param_values,
         "_resources_to_import": resources_to_import,
+        "_import_existing": {e["LogicalResourceId"]: e["ResourceIdentifier"] for e in existing},
+        "ImportExistingResources": import_existing,
     }
     _change_sets[cs_id] = change_set
 
@@ -826,6 +881,10 @@ def _describe_change_set(params):
             "</member>"
         )
 
+    import_existing_xml = (
+        "<ImportExistingResources>true</ImportExistingResources>"
+        if cs.get("ImportExistingResources") else ""
+    )
     inner = (
         f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
         f"<ChangeSetName>{_esc(cs['ChangeSetName'])}</ChangeSetName>"
@@ -837,6 +896,7 @@ def _describe_change_set(params):
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
         f"<ChangeSetType>{cs.get('ChangeSetType', '')}</ChangeSetType>"
+        f"{import_existing_xml}"
         "<Capabilities>"
         + "".join(f"<member>{_esc(c)}</member>" for c in cs.get("Capabilities", []))
         + "</Capabilities>"
@@ -962,7 +1022,8 @@ def _execute_change_set(params):
                                      param_values, disable_rollback, tags,
                                      is_update=is_update,
                                      previous_stack=previous_stack,
-                                     retain_except_on_create=retain_except_on_create)
+                                     retain_except_on_create=retain_except_on_create,
+                                     imports=cs.get("_import_existing"))
         if on_stack_failure == "DELETE" and not is_update:
             deploy = _create_then_delete_on_failure(real_stack_name, stack_id, deploy)
         _create_stack_task_in_region(
@@ -1024,7 +1085,7 @@ async def _import_resources_async(cs, stack, new_stack):
         entry = entries[logical_id]
         rtype = entry["ResourceType"]
         started.append(logical_id)
-        event(logical_id, "IMPORT_IN_PROGRESS", "Resource import started.")
+        event(logical_id, "IMPORT_IN_PROGRESS", _IMPORT_STARTED)
         failure = _import_not_found([entry])
         if failure is None:
             try:
@@ -1039,7 +1100,7 @@ async def _import_resources_async(cs, stack, new_stack):
             event(logical_id, "IMPORT_FAILED", failure)
             break
         event(logical_id, "IMPORT_IN_PROGRESS", physical_id=physical_id)
-        event(logical_id, "IMPORT_COMPLETE", "Resource import completed.", physical_id)
+        event(logical_id, "IMPORT_COMPLETE", _IMPORT_COMPLETED, physical_id)
         resources[logical_id] = {
             "PhysicalResourceId": physical_id,
             "ResourceType": rtype,
@@ -1070,9 +1131,7 @@ async def _import_resources_async(cs, stack, new_stack):
 
     for logical_id in order:
         record = resources[logical_id]
-        event(logical_id, "UPDATE_IN_PROGRESS",
-              "Apply stack-level tags to imported resource if applicable.",
-              record["PhysicalResourceId"])
+        event(logical_id, "UPDATE_IN_PROGRESS", _IMPORT_TAGS, record["PhysicalResourceId"])
         record["ResourceStatus"] = "UPDATE_COMPLETE"
         event(logical_id, "UPDATE_COMPLETE", physical_id=record["PhysicalResourceId"])
     stack["_template"] = template
