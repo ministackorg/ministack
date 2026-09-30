@@ -82,7 +82,7 @@ async def handle_request(method: str, path: str, headers: dict,
 # The stack operations that take a ClientRequestToken and record stack events.
 _TOKEN_ACTIONS = frozenset({
     "CreateStack", "UpdateStack", "DeleteStack", "ExecuteChangeSet",
-    "ContinueUpdateRollback", "CancelUpdateStack",
+    "ContinueUpdateRollback", "CancelUpdateStack", "RollbackStack",
 })
 
 
