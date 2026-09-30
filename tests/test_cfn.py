@@ -18715,6 +18715,54 @@ def test_cfn_sqs_queue_invalid_attribute_fails_the_resource(cfn, sqs, props, par
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_sqs_queue_generated_fifo_name(cfn, sqs):
+    """FifoQueue without a QueueName creates a FIFO queue with a .fifo name that an update keeps."""
+    stack_name = f"cfn-sqs-gen-{_uuid_mod.uuid4().hex[:8]}-" + "x" * 70
+
+    def tpl(props):
+        return json.dumps({"Resources": {"Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+            "FifoQueue": True, **props}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=tpl({}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _stack_physical_id(cfn, stack_name, "Queue")
+        name = queue_url.rsplit("/", 1)[1]
+        assert len(name) <= 80 and name.endswith(".fifo")
+        attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["FifoQueue"])["Attributes"]
+        assert attrs.get("FifoQueue") == "true"
+        cfn.update_stack(StackName=stack_name, TemplateBody=tpl({"VisibilityTimeout": 60}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _stack_physical_id(cfn, stack_name, "Queue") == queue_url
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("fifo_queue,suffix,message", [
+    (False, ".fifo", "Can only include alphanumeric characters"),
+    (None, ".fifo", "Can only include alphanumeric characters"),
+    (True, "", "The name of a FIFO queue can only include alphanumeric characters"),
+], ids=["false", "unset", "no-suffix"])
+def test_cfn_sqs_queue_name_suffix_must_match_fifo_queue(cfn, sqs, fifo_queue, suffix, message):
+    """A QueueName ending in .fifo needs FifoQueue true, and FifoQueue true needs one."""
+    stack_name = f"cfn-sqs-sfx-{_uuid_mod.uuid4().hex[:8]}"
+    props = {"QueueName": f"{stack_name}-q{suffix}"}
+    if fifo_queue is not None:
+        props["FifoQueue"] = fifo_queue
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl(props)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        failed = [e for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Queue" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed and message in failed[0]["ResourceStatusReason"]
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=props["QueueName"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_logs_log_group_in_place(cfn, logs):
     """A log group's retention updates in place; its streams survive."""
     suffix = _uuid_mod.uuid4().hex[:8]

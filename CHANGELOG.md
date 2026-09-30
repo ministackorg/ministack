@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudFormation — `AWS::SQS::Queue` with `FifoQueue` gets a generated `.fifo` name** — `FifoQueue: true` without a `QueueName` creates a FIFO queue with a generated `.fifo` name instead of a standard queue, and a `QueueName` whose `.fifo` suffix disagrees with `FifoQueue` fails the resource. Contributed by @iot-rocket.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
