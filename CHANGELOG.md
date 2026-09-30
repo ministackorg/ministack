@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — access tokens are verified under `AUTH=true`** — `GetUser` and the other calls that take an `AccessToken` accepted any JWT carrying a user's `sub`, including an ID token, a token with an altered payload and a token revoked by `GlobalSignOut`, `AdminUserGlobalSignOut` or `RevokeToken`; with `AUTH=true` they now answer `NotAuthorizedException` with `Invalid Access Token`, `Could not verify signature for Access Token` or `Access Token has been revoked`, as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.26] — 2026-10-11
 
 ### Fixed

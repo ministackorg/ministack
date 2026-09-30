@@ -1477,6 +1477,109 @@ def test_cognito_revoke_token(cognito_idp):
             AuthParameters={"REFRESH_TOKEN": refresh_token},
         )
 
+
+def _idp_in_process(monkeypatch, auth):
+    """Run IDP actions through the dispatcher on empty stores, with the AUTH switch set."""
+    import ministack.app as app_mod
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    monkeypatch.setattr(mod, "_user_pools", AccountRegionScopedDict())
+    monkeypatch.setattr(mod, "_refresh_tokens", {})
+    monkeypatch.setattr(mod, "_revoked_tokens", set())
+
+    def call(action, **data):
+        status, _, body = asyncio.run(mod._dispatch_idp(action, data))
+        result = json.loads(body) if body else {}
+        if status != 200:
+            return result["__type"].split("#")[-1], result["message"]
+        return result
+
+    return mod, call
+
+
+def _password_client_with_users(call, *usernames, **client_options):
+    """A pool, a USER_PASSWORD_AUTH client and confirmed users; returns (pool id, client id, sign-in)."""
+    pid = call("CreateUserPool", PoolName="AccessTokenPool")["UserPool"]["Id"]
+    cid = call("CreateUserPoolClient", UserPoolId=pid, ClientName="app",
+               ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+               **client_options)["UserPoolClient"]["ClientId"]
+    for name in usernames:
+        call("AdminCreateUser", UserPoolId=pid, Username=name, MessageAction="SUPPRESS")
+        call("AdminSetUserPassword", UserPoolId=pid, Username=name, Password="Passw0rd!", Permanent=True)
+
+    def sign_in(name):
+        return call("InitiateAuth", ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                    AuthParameters={"USERNAME": name, "PASSWORD": "Passw0rd!"})["AuthenticationResult"]
+
+    return pid, cid, sign_in
+
+
+def test_cognito_access_token_must_be_a_signed_access_token_under_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    _, _, sign_in = _password_client_with_users(call, "alice", "bob")
+    alice, bob = sign_in("alice"), sign_in("bob")
+    header, _, signature = alice["AccessToken"].split(".")
+    for token, message in [
+        ("not-a-token", "Invalid Access Token"),
+        (alice["IdToken"], "Invalid Access Token"),
+        (alice["RefreshToken"], "Invalid Access Token"),
+        (f"{header}.{bob['AccessToken'].split('.')[1]}.{signature}", "Could not verify signature for Access Token"),
+        (f"{header}.{alice['IdToken'].split('.')[1]}.{signature}", "Invalid Access Token"),
+    ]:
+        assert call("GetUser", AccessToken=token) == ("NotAuthorizedException", message)
+    assert call("GetUser", AccessToken=alice["AccessToken"])["Username"] == "alice"
+
+
+def test_cognito_sign_out_and_revoke_token_revoke_access_tokens_under_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    pid, cid, sign_in = _password_client_with_users(call, "alice", "bob")
+    revoked = ("NotAuthorizedException", "Access Token has been revoked")
+    a, b, other = sign_in("alice"), sign_in("alice"), sign_in("bob")
+    refreshed = call("InitiateAuth", ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                     AuthParameters={"REFRESH_TOKEN": b["RefreshToken"]})["AuthenticationResult"]["AccessToken"]
+    assert _decode_jwt_claims(refreshed)["origin_jti"] == _decode_jwt_claims(b["AccessToken"])["origin_jti"]
+    assert _decode_jwt_claims(a["IdToken"])["origin_jti"] == _decode_jwt_claims(a["AccessToken"])["origin_jti"]
+
+    # RevokeToken revokes the access tokens of that refresh token's session only.
+    call("RevokeToken", ClientId=cid, Token=a["RefreshToken"])
+    assert call("GetUser", AccessToken=a["AccessToken"]) == revoked
+    assert call("GetUser", AccessToken=b["AccessToken"])["Username"] == "alice"
+    assert call("GetUser", AccessToken=refreshed)["Username"] == "alice"
+    call("RevokeToken", ClientId=cid, Token=b["RefreshToken"])
+    assert call("GetUser", AccessToken=refreshed) == revoked
+
+    # GlobalSignOut revokes every session of the user, for every access-token call.
+    c = sign_in("alice")["AccessToken"]
+    call("GlobalSignOut", AccessToken=c)
+    for action, kwargs in [
+        ("GetUser", {}),
+        ("UpdateUserAttributes", {"UserAttributes": [{"Name": "name", "Value": "x"}]}),
+        ("ChangePassword", {"PreviousPassword": "Passw0rd!", "ProposedPassword": "Passw0rd!2"}),
+        ("AssociateSoftwareToken", {}),
+        ("GlobalSignOut", {}),
+        ("DeleteUser", {}),
+    ]:
+        assert call(action, AccessToken=c, **kwargs) == revoked
+
+    d = sign_in("alice")["AccessToken"]
+    assert call("GetUser", AccessToken=d)["Username"] == "alice"
+    call("AdminUserGlobalSignOut", UserPoolId=pid, Username="alice")
+    assert call("GetUser", AccessToken=d) == revoked
+    assert call("GetUser", AccessToken=other["AccessToken"])["Username"] == "bob"
+
+
+def test_cognito_access_tokens_not_checked_without_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=False)
+    _, cid, sign_in = _password_client_with_users(call, "alice", "bob")
+    alice, bob = sign_in("alice"), sign_in("bob")
+    header, _, signature = alice["AccessToken"].split(".")
+    call("RevokeToken", ClientId=cid, Token=alice["RefreshToken"])
+    for token in (alice["AccessToken"], alice["IdToken"], f"{header}.{bob['AccessToken'].split('.')[1]}.{signature}"):
+        assert "Username" in call("GetUser", AccessToken=token)
+
+
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="DescribeIdPool",
@@ -6194,8 +6297,8 @@ def test_cognito_unsigned_user_pool_operations_pin_the_owning_region():
         RefreshToken=refresh_token,
     )
     assert refreshed["AuthenticationResult"]["AccessToken"]
-    west.revoke_token(Token=refresh_token, ClientId=client_id)
     west.global_sign_out(AccessToken=access_token)
+    west.revoke_token(Token=refresh_token, ClientId=client_id)
 
     west.admin_create_user(UserPoolId=pool_id, Username="delete-user")
     west.admin_set_user_password(
@@ -6282,7 +6385,7 @@ def test_cognito_client_and_hosted_scans_preserve_account_boundaries():
     ),
 )
 def test_cognito_unsigned_idp_operations_pin_each_payload_path(
-    action, payload_kind
+    action, payload_kind, monkeypatch
 ):
     from ministack.core.responses import (
         get_account_id,
@@ -6292,6 +6395,7 @@ def test_cognito_unsigned_idp_operations_pin_each_payload_path(
     )
 
     mod = _cognito_module()
+    monkeypatch.setattr(mod, "_access_token_error", lambda _data: None)
     original_account = get_account_id()
     original_region = get_region()
     owner_account = "111111111111"
