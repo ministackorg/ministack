@@ -60,8 +60,7 @@ def test_agentcore_runtime_lifecycle():
     rid = created["agentRuntimeId"]
     assert created["status"] == "CREATING"
     assert created["agentRuntimeVersion"] == "1"
-    assert created["agentRuntimeArn"].startswith(
-        "arn:aws:bedrock-agentcore:us-east-1:000000000000:agent/")
+    assert created["agentRuntimeArn"] == f"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/{rid}"
     assert created["workloadIdentityDetails"]["workloadIdentityArn"]
     try:
         got = ctl.get_agent_runtime(agentRuntimeId=rid)
@@ -78,6 +77,9 @@ def test_agentcore_runtime_lifecycle():
         )
         assert updated["agentRuntimeVersion"] == "2"
         assert updated["status"] == "UPDATING"
+        assert updated["agentRuntimeArn"] == created["agentRuntimeArn"]
+        default = ctl.get_agent_runtime_endpoint(agentRuntimeId=rid, endpointName="DEFAULT")
+        assert (default["liveVersion"], default["targetVersion"]) == ("2", "2")
         assert ctl.get_agent_runtime(agentRuntimeId=rid)["agentRuntimeVersion"] == "2"
 
         versions = ctl.list_agent_runtime_versions(agentRuntimeId=rid)["agentRuntimes"]
@@ -99,8 +101,8 @@ def test_agentcore_endpoint_lifecycle():
         ep = ctl.create_agent_runtime_endpoint(agentRuntimeId=rid, name="prod")
         assert ep["endpointName"] == "prod"
         assert ep["status"] == "CREATING"
-        assert ep["agentRuntimeEndpointArn"].startswith(
-            "arn:aws:bedrock-agentcore:us-east-1:000000000000:agentEndpoint/")
+        assert ep["agentRuntimeEndpointArn"] == (
+            f"arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/{rid}/runtime-endpoint/prod")
 
         got = ctl.get_agent_runtime_endpoint(agentRuntimeId=rid, endpointName="prod")
         assert got["status"] == "READY"
@@ -108,7 +110,7 @@ def test_agentcore_endpoint_lifecycle():
 
         names = [e["name"] for e in
                  ctl.list_agent_runtime_endpoints(agentRuntimeId=rid)["runtimeEndpoints"]]
-        assert names == ["prod"]
+        assert sorted(names) == ["DEFAULT", "prod"]
 
         upd = ctl.update_agent_runtime_endpoint(
             agentRuntimeId=rid, endpointName="prod", description="live")
@@ -751,3 +753,53 @@ def test_without_docker_the_invocation_echoes(monkeypatch):
         assert json.loads(body)["input"] == {"prompt": "hi"}
     finally:
         agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
+
+
+def test_agentcore_resource_policy_survives_update_and_default_endpoint_takes_one():
+    ctl = _client("bedrock-agentcore-control")
+    created = _create(ctl, f"rt_{_uuid_mod.uuid4().hex[:8]}")
+    rid, arn = created["agentRuntimeId"], created["agentRuntimeArn"]
+    default_arn = f"{arn}/runtime-endpoint/DEFAULT"
+
+    def policy(resource):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+            "Action": "bedrock-agentcore:InvokeAgentRuntime", "Resource": resource}]})
+
+    try:
+        ctl.put_resource_policy(resourceArn=arn, policy=policy(arn))
+        ctl.put_resource_policy(resourceArn=default_arn, policy=policy(default_arn))
+        ctl.update_agent_runtime(agentRuntimeId=rid, agentRuntimeArtifact=_ARTIFACT,
+                                 roleArn=_ROLE, networkConfiguration=_NET)
+        assert ctl.get_resource_policy(resourceArn=arn)["policy"] == policy(arn)
+        assert ctl.get_resource_policy(resourceArn=default_arn)["policy"] == policy(default_arn)
+    finally:
+        ctl.delete_agent_runtime(agentRuntimeId=rid)
+
+
+def test_agentcore_state_with_legacy_arns_moves_to_aws_arns():
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import bedrock_agentcore as svc
+
+    runtimes, endpoints = AccountRegionScopedDict(), AccountRegionScopedDict()
+    runtimes.set_scoped("000000000000", "us-east-1", "old-AbCdEfGhIj", {
+        "agentRuntimeId": "old-AbCdEfGhIj", "agentRuntimeVersion": "3",
+        "agentRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:agent/1234:3",
+        "_uuid": "1234",
+    })
+    endpoints.set_scoped("000000000000", "us-east-1", "old-AbCdEfGhIj", {"prod": {
+        "name": "prod", "agentRuntimeArn": "x",
+        "agentRuntimeEndpointArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:agentEndpoint/5678",
+    }})
+    saved = svc.get_state()
+    try:
+        svc._restore_state({"runtimes": runtimes, "endpoints": endpoints})
+        runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/old-AbCdEfGhIj"
+        record = svc._runtimes.get_scoped("000000000000", "us-east-1", "old-AbCdEfGhIj")
+        assert record["agentRuntimeArn"] == runtime_arn and "_uuid" not in record
+        eps = svc._endpoints.get_scoped("000000000000", "us-east-1", "old-AbCdEfGhIj")
+        assert eps["prod"]["agentRuntimeEndpointArn"] == f"{runtime_arn}/runtime-endpoint/prod"
+        assert eps["DEFAULT"]["agentRuntimeEndpointArn"] == f"{runtime_arn}/runtime-endpoint/DEFAULT"
+        assert eps["DEFAULT"]["liveVersion"] == "3"
+    finally:
+        svc._restore_state(saved)
