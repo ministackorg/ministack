@@ -7,7 +7,9 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
           ListStackResources, GetTemplate, ValidateTemplate, ListExports,
           CreateChangeSet, DescribeChangeSet, ExecuteChangeSet,
           DeleteChangeSet, ListChangeSets,
-          GetTemplateSummary.
+          GetTemplateSummary, RollbackStack, DetectStackDrift,
+          DescribeStackDriftDetectionStatus, DetectStackResourceDrift,
+          DescribeStackResourceDrifts.
 Uses Query API (Action=...) with form-encoded body.
 """
 

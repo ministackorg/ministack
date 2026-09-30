@@ -459,7 +459,7 @@ subnet = ec2.create_subnet(
 
 | Feature | Details |
 |---------|---------|
-| **Stack Operations** | CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks, DescribeStackEvents, DescribeStackResource, DescribeStackResources, GetTemplate, ValidateTemplate, GetTemplateSummary |
+| **Stack Operations** | CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks, DescribeStackEvents, DescribeStackResource, DescribeStackResources, GetTemplate, ValidateTemplate, GetTemplateSummary, RollbackStack |
 | **Change Sets** | CreateChangeSet, DescribeChangeSet, ExecuteChangeSet, DeleteChangeSet, ListChangeSets |
 | **Exports** | ListExports — cross-stack references via `Fn::ImportValue` |
 | **Template Formats** | JSON and YAML (including `!Ref`, `!Sub`, `!GetAtt` shorthand tags) |
@@ -474,6 +474,8 @@ subnet = ec2.create_subnet(
 | **Stack Deletion** | `RetainResources` and `DeletionMode=FORCE_DELETE_STACK` on a `DELETE_FAILED` stack: the resources that failed to delete, and what they depend on, are retained (`DELETE_SKIPPED`) and the stack reaches `DELETE_COMPLETE` |
 | **Templates** | GetTemplate `TemplateStage` (`Processed`, the default, the template after SAM, `AWS::LanguageExtensions` and `AWS::Include`), `StagesAvailable`, and a change set's template through `ChangeSetName` |
 | **Client Request Tokens** | The `ClientRequestToken` of CreateStack, UpdateStack, DeleteStack, ExecuteChangeSet, ContinueUpdateRollback and CancelUpdateStack is reported on every stack event the operation records |
+| **Rollback** | Configurable via `DisableRollback` — on failure, previously created resources are cleaned up in reverse dependency order; a stack left `CREATE_FAILED` or `UPDATE_FAILED` by `DisableRollback` is rolled back later with RollbackStack (`ROLLBACK_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`, `RetainExceptOnCreate` honoured) |
+| **Drift Detection** | DetectStackDrift, DescribeStackDriftDetectionStatus, DetectStackResourceDrift, DescribeStackResourceDrifts (status filters, `MaxResults`/`NextToken`), and `DriftInformation` on DescribeStacks, ListStacks and the stack resource calls. Detection completes synchronously and compares the properties the template sets with the service's current record. Property-level drift (`PropertyDifferences`, expected and actual properties) for AWS::SQS::Queue, AWS::SSM::Parameter, AWS::SNS::Topic, AWS::Lambda::Function, AWS::IAM::Role, AWS::DynamoDB::Table, AWS::S3::Bucket (name, versioning), AWS::Logs::LogGroup and AWS::SecretsManager::Secret; stack-level tags count toward `Tags`. Existence only (`IN_SYNC` or `DELETED`) for AWS::Kinesis::Stream, AWS::ECR::Repository, AWS::StepFunctions::StateMachine, AWS::Events::Rule and AWS::SNS::Subscription. Every other type is `NOT_CHECKED` |
 | **Async Status** | Stacks deploy asynchronously (`CREATE_IN_PROGRESS` → `CREATE_COMPLETE`) — poll with DescribeStacks |
 | **Quotas** | The template and stack quotas of the CloudFormation quotas page are enforced before a stack exists: 51,200 bytes of `TemplateBody`, 1,000,000 bytes behind `TemplateURL`, 500 resources, 200 parameters / outputs / mappings, 200 attributes per mapping, 255-character names, a 1,024-byte description, 4,096-byte parameter values, and a stack name of up to 128 alphanumeric characters and hyphens starting with a letter |
 
