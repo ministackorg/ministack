@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudFormation — `AWS::S3::MultiRegionAccessPoint` and `AWS::AutoScaling::LaunchConfiguration` are replaced on update** — every property of both types is create-only, so a change now creates the resource under a new generated name and deletes the old one after the update (a `Regions` change was dropped and the stack reported the alias as the physical id, a launch configuration was overwritten under its old name), fails with the custom-named-resource error when the name is explicit, and is reported as `Replacement: True` in a change set.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

@@ -12698,6 +12698,105 @@ def test_s3_mrap_alias_matches_the_documented_pattern():
         assert pattern.fullmatch(alias), alias
 
 
+def _mrap_replace_template(bucket, name=None, fail=False):
+    props = {"Regions": [{"Bucket": bucket}]}
+    if name:
+        props["Name"] = name
+    body = json.dumps({
+        "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint", "Properties": props}},
+        "Outputs": {"Ref": {"Value": {"Ref": "Mrap"}},
+                    "Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+    return _cfn_with_failing_resource(body, "Mrap") if fail else body
+
+
+def _mrap_buckets(s3, uid):
+    """Two buckets, each holding its own name under the key who.txt."""
+    buckets = [f"cfn-mrap-{uid}-one", f"cfn-mrap-{uid}-two"]
+    for bucket in buckets:
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="who.txt", Body=bucket.encode())
+    return buckets
+
+
+def test_cfn_s3_mrap_change_under_generated_name_replaces_it(cfn, s3):
+    """Every property is create-only: a Regions change is a replacement. The
+    new access point gets a new name and alias, and the old one is removed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-mrap-gen-{uid}"
+    one, two = _mrap_buckets(s3, uid)
+    cfn.create_stack(StackName=stack_name, TemplateBody=_mrap_replace_template(one))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_ref, old_alias = _output(stack, "Ref"), _output(stack, "Alias")
+
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="regions",
+                              TemplateBody=_mrap_replace_template(two))
+        change = cfn.describe_change_set(StackName=stack_name, ChangeSetName="regions")
+        assert change["Changes"][0]["ResourceChange"]["Replacement"] == "True"
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="regions")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_ref, new_alias = _output(stack, "Ref"), _output(stack, "Alias")
+        assert new_ref != old_ref and new_alias != old_alias
+        assert _mrap_get(new_alias, "who.txt") == (200, two)
+        with pytest.raises(urllib.error.HTTPError):
+            _mrap_get(old_alias, "who.txt")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3_mrap_change_under_custom_name_fails_loudly(cfn, s3):
+    """With an explicit Name the replacement is refused and the access point
+    keeps its alias and its buckets."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-mrap-named-{uid}"
+    one, two = _mrap_buckets(s3, uid)
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_mrap_replace_template(one, name=f"mrap-{uid}"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        alias = _output(stack, "Alias")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_mrap_replace_template(two, name=f"mrap-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert "custom-named resource requires replacing" in \
+            _stack_event_reasons(cfn, stack_name)
+        assert (_output(stack, "Ref"), _output(stack, "Alias")) == (f"mrap-{uid}", alias)
+        assert _mrap_get(alias, "who.txt") == (200, one)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3_mrap_replacement_rolls_back(cfn, s3):
+    """When a later resource fails, the replacement is deleted and the
+    original access point is still the one the stack reports."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-mrap-rb-{uid}"
+    one, two = _mrap_buckets(s3, uid)
+    cfn.create_stack(StackName=stack_name, TemplateBody=_mrap_replace_template(one))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        before = (_output(stack, "Ref"), _output(stack, "Alias"))
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_mrap_replace_template(two, fail=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert (_output(stack, "Ref"), _output(stack, "Alias")) == before
+        assert _mrap_get(before[1], "who.txt") == (200, one)
+        events = _all_pages(cfn, "describe_stack_events", "StackEvents", StackName=stack_name)
+        assert any(e["LogicalResourceId"] == "Mrap" and e["ResourceStatus"] == "DELETE_COMPLETE"
+                   and e["PhysicalResourceId"] not in ("", *before) for e in events)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
     """Regression: auto-named S3 buckets (no explicit BucketName) must keep
     the same physical resource ID across stack updates.  Before the fix,
@@ -26720,6 +26819,104 @@ def test_cfn_asg_update_keeps_arn_and_created_time(cfn, autoscaling):
         assert after["AutoScalingGroupARN"] == before["AutoScalingGroupARN"], \
             "the group came back under a new ARN"
         assert after["CreatedTime"] == before["CreatedTime"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_lc_template(image, name=None, fail=False):
+    props = {"ImageId": image, "InstanceType": "t3.micro"}
+    if name:
+        props["LaunchConfigurationName"] = name
+    body = json.dumps({
+        "Resources": {
+            "LC": {"Type": "AWS::AutoScaling::LaunchConfiguration", "Properties": props},
+            "ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+                "LaunchConfigurationName": {"Ref": "LC"}, "MinSize": "0", "MaxSize": "1",
+                "AvailabilityZones": ["us-east-1a"]}},
+        },
+        "Outputs": {"LC": {"Value": {"Ref": "LC"}}, "ASG": {"Value": {"Ref": "ASG"}}},
+    })
+    return _cfn_with_failing_resource(body, "ASG") if fail else body
+
+
+def _cfn_lc_images(autoscaling, *names):
+    return [lc["ImageId"] for lc in autoscaling.describe_launch_configurations(
+        LaunchConfigurationNames=list(names))["LaunchConfigurations"]]
+
+
+def _cfn_asg_lc_name(autoscaling, group):
+    return autoscaling.describe_auto_scaling_groups(
+        AutoScalingGroupNames=[group])["AutoScalingGroups"][0]["LaunchConfigurationName"]
+
+
+def test_cfn_launch_configuration_change_under_generated_name_replaces_it(cfn, autoscaling):
+    """Every property is create-only: an ImageId change creates a launch
+    configuration under a new name, the group moves to it, and the old one
+    is removed."""
+    stack_name = f"cfn-lc-gen-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_lc_template("ami-11111111"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old = _output(stack, "LC")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_lc_template("ami-22222222"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new = _output(stack, "LC")
+        assert new != old and new.startswith(f"{stack_name}-LC-")
+        assert _cfn_asg_lc_name(autoscaling, _output(stack, "ASG")) == new
+        assert _cfn_lc_images(autoscaling, new) == ["ami-22222222"]
+        assert _cfn_lc_images(autoscaling, old) == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_launch_configuration_change_under_custom_name_fails_loudly(cfn, autoscaling):
+    """With an explicit LaunchConfigurationName the replacement is refused."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lc-named-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_lc_template("ami-11111111", name=f"lc-{uid}"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_lc_template("ami-22222222", name=f"lc-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert "custom-named resource requires replacing" in \
+            _stack_event_reasons(cfn, stack_name)
+        assert _cfn_lc_images(autoscaling, f"lc-{uid}") == ["ami-11111111"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_launch_configuration_replacement_rolls_back(cfn, autoscaling):
+    """When a later resource fails, the group goes back to the original
+    launch configuration, which kept its properties, and the replacement is
+    deleted."""
+    stack_name = f"cfn-lc-rb-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_lc_template("ami-11111111"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old = _output(stack, "LC")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_lc_template("ami-22222222", fail=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _output(stack, "LC") == old
+        assert _cfn_asg_lc_name(autoscaling, _output(stack, "ASG")) == old
+        names = [lc["LaunchConfigurationName"] for lc in _all_pages(
+            autoscaling, "describe_launch_configurations", "LaunchConfigurations")]
+        assert [n for n in names if n.startswith(f"{stack_name}-LC-")] == [old]
+        assert _cfn_lc_images(autoscaling, old) == ["ami-11111111"]
+        events = _all_pages(cfn, "describe_stack_events", "StackEvents", StackName=stack_name)
+        assert any(e["LogicalResourceId"] == "LC" and e["ResourceStatus"] == "DELETE_COMPLETE"
+                   and e["PhysicalResourceId"] not in ("", old) for e in events)
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
