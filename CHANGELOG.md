@@ -7,20 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **CloudFormation — `AWS::SQS::Queue` applies every queue property** — `RedrivePolicy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled`, `DeduplicationScope` and `FifoThroughputLimit` were dropped on create and update, so a dead-letter queue declared in a template never received messages, and a value SQS refuses now fails the resource instead of being stored. Contributed by @iot-rocket.
-- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early. Timeout updates recycle warm containers so the RIE deadline follows the new configuration (#1844).
-- **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
-- **CloudFormation — a nested stack's update deletes the resources its template drops** — a resource removed from the child template, or created by a failed child update that was rolled back, stayed in its service and in the nested stack's resource list. Contributed by @iot-rocket.
 ### Added
 
+- **RDS — IAM database authentication for MySQL and Aurora MySQL** — users created `IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'` log in with an SDK-generated token over `mysql_clear_password`, as on AWS. The instance or cluster must have `IAMDatabaseAuthenticationEnabled`; with `AUTH=true` the token and the `rds-db:connect` policy are verified too. `ModifyDBInstance` accepts `EnableIAMDatabaseAuthentication`. Contributed by @Areson.
 - **KMS — grants** — `CreateGrant`, `RevokeGrant` and `RetireGrant`; `ListGrants` now returns the grants they create, filtered by `GrantId` / `GranteePrincipal` and paged with `Limit` / `Marker`. `CreateGrant` follows the key state, rejects operations the key type cannot perform, and is idempotent for a named grant. Grants persist with the key and are not evaluated for authorization. Contributed by @DaviReisVieira.
 
 ### Fixed
 
 - **KMS — `KeyMaterialId`** — `GenerateDataKey`, `GenerateDataKeyWithoutPlaintext`, `GenerateDataKeyPair`, `GenerateDataKeyPairWithoutPlaintext`, `Decrypt`, `ImportKeyMaterial` and `DeleteImportedKeyMaterial` return the identifier of the key material they used, and `DescribeKey` reports it as `CurrentKeyMaterialId` for symmetric keys. The identifier stays the same until the key material changes. Contributed by @zlberto.
 - **Lambda — VPC configuration includes `VpcId`** — `CreateFunction`, `GetFunction`, `GetFunctionConfiguration`, and `UpdateFunctionConfiguration` now report the VPC of the configured subnets. Previously, VPC-attached functions returned only subnet and security group IDs. Contributed by @jayjanssen.
+- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early. Timeout updates recycle warm containers so the RIE deadline follows the new configuration. Contributed by @gakuto-cw21.
+- **Lambda — a Docker invocation that reaches its timeout fails** — the emulator's plain-text `Task timed out` reply was returned as a successful payload, so Step Functions recorded `TaskSucceeded` and skipped `Catch`. Contributed by @drakeo338.
+- **CloudFormation — `AWS::SQS::Queue` applies every queue property** — `RedrivePolicy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled`, `DeduplicationScope` and `FifoThroughputLimit` were dropped on create and update, so a dead-letter queue declared in a template never received messages, and a value SQS refuses now fails the resource instead of being stored. A queue from a template also defaults to a 1 MiB `MaximumMessageSize` and SSE-SQS encryption, as on AWS. Contributed by @iot-rocket.
+- **CloudFormation — a nested stack's update deletes the resources its template drops** — a resource removed from the child template, or created by a failed child update that was rolled back, stayed in its service and in the nested stack's resource list. A dropped resource with a `Retain` or `Snapshot` `DeletionPolicy` is kept or snapshotted first, as on AWS. Contributed by @iot-rocket.
+- **RDS — a persisted instance stays reachable after a restart** — when its saved host port was taken, the instance moved to a new port but `Endpoint.Port` kept the old one.
+- **RDS — pending boolean modifications read as `true`** — `PendingModifiedValues` wrote Python `True`/`False`, which the SDKs parse as `false`.
 
 ## [1.5.18] — 2026-09-28
 
