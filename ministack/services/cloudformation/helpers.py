@@ -303,12 +303,13 @@ def _extract_string_members(params, prefix):
 PAGE_SIZE = 100
 
 
-def _page(items, params, action):
+def _page(items, params, action, page_size=PAGE_SIZE):
     """Cut ``items`` down to the page a request asks for.
 
     Real CloudFormation pages ``ListExports`` at 100 values and the other
     list and describe actions at 1 MB of output; here every one of them pages
-    at 100 items. The token is ``<Action>:<offset of the next page>``, so a
+    at 100 items, or at ``page_size`` for an action with a ``MaxResults``
+    parameter. The token is ``<Action>:<offset of the next page>``, so a
     token of one action is refused by another. Returns
     ``(page, next_token_xml, error)`` — ``next_token_xml`` is empty on the
     last page and ``error`` is the response for a token the service did not
@@ -325,8 +326,8 @@ def _page(items, params, action):
         if tagged != action or not offset.isdigit():
             return [], "", _error("ValidationError", "Invalid NextToken")
         start = int(offset)
-    page = items[start:start + PAGE_SIZE]
+    page = items[start:start + page_size]
     next_token_xml = ""
-    if start + PAGE_SIZE < len(items):
-        next_token_xml = f"<NextToken>{action}:{start + PAGE_SIZE}</NextToken>"
+    if start + page_size < len(items):
+        next_token_xml = f"<NextToken>{action}:{start + page_size}</NextToken>"
     return page, next_token_xml, None

@@ -87,6 +87,27 @@ def _restore_state(data):
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
+    _migrate_legacy_arns()
+
+
+def _migrate_legacy_arns():
+    """State saved before runtimes had AWS-shaped ARNs (``agent/{uuid}:{version}``)."""
+    for key, runtime in list(_runtimes._data.items()):
+        old = runtime.get("agentRuntimeArn", "")
+        if ":agent/" not in old:
+            continue
+        account_id, region = key[0], key[1]
+        new = f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime['agentRuntimeId']}"
+        runtime["agentRuntimeArn"] = new
+        runtime.pop("_uuid", None)
+        endpoints = _endpoints.get_scoped(account_id, region, runtime["agentRuntimeId"]) or {}
+        for name, endpoint in endpoints.items():
+            endpoint["agentRuntimeArn"] = new
+            endpoint["agentRuntimeEndpointArn"] = _endpoint_arn(new, name)
+        if "DEFAULT" not in endpoints:
+            with request_scope(account_id, region):
+                endpoints["DEFAULT"] = _endpoint_record(runtime, "DEFAULT", runtime["agentRuntimeVersion"])
+            _endpoints.set_scoped(account_id, region, runtime["agentRuntimeId"], endpoints)
 
 
 
@@ -115,14 +136,28 @@ def _resource_id(name: str) -> str:
     return f"{name}-{_rand_suffix()}"
 
 
-def _runtime_arn(runtime_uuid: str, version: str) -> str:
-    return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
-            f"agent/{runtime_uuid}:{version}")
+def _runtime_arn(runtime_id: str) -> str:
+    return f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:runtime/{runtime_id}"
 
 
-def _endpoint_arn(endpoint_uuid: str) -> str:
-    return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
-            f"agentEndpoint/{endpoint_uuid}")
+def _endpoint_arn(runtime_arn: str, name: str) -> str:
+    return f"{runtime_arn}/runtime-endpoint/{name}"
+
+
+def _endpoint_record(runtime, name, version, description=""):
+    now = now_iso()
+    return {
+        "name": name,
+        "id": _resource_id(name),
+        "agentRuntimeEndpointArn": _endpoint_arn(runtime["agentRuntimeArn"], name),
+        "agentRuntimeArn": runtime["agentRuntimeArn"],
+        "targetVersion": version,
+        "liveVersion": version,
+        "status": "READY",
+        "description": description,
+        "createdAt": now,
+        "lastUpdatedAt": now,
+    }
 
 
 def _arn_owner(resource_arn: str) -> tuple[str, str] | None:
@@ -271,11 +306,10 @@ def _create_agent_runtime(body):
     if any(r.get("agentRuntimeName") == name for r in _runtimes.values()):
         return _conflict(f"Agent runtime with name {name} already exists")
 
-    runtime_uuid = new_uuid()
     runtime_id = _resource_id(name)
     version = "1"
     now = now_iso()
-    arn = _runtime_arn(runtime_uuid, version)
+    arn = _runtime_arn(runtime_id)
     workload = {"workloadIdentityArn": _workload_identity_arn(name)}
     record = {
         "agentRuntimeArn": arn,
@@ -289,7 +323,6 @@ def _create_agent_runtime(body):
         "status": "READY",
         "agentRuntimeArtifact": data["agentRuntimeArtifact"],
         "workloadIdentityDetails": workload,
-        "_uuid": runtime_uuid,
     }
     for opt in ("description", "protocolConfiguration", "environmentVariables",
                 "authorizerConfiguration", "requestHeaderConfiguration",
@@ -298,7 +331,8 @@ def _create_agent_runtime(body):
         if opt in data:
             record[opt] = data[opt]
     _runtimes[runtime_id] = record
-    _endpoints[runtime_id] = {}
+    # AWS creates the DEFAULT endpoint with the runtime, pointing at the latest version.
+    _endpoints[runtime_id] = {"DEFAULT": _endpoint_record(record, "DEFAULT", version)}
 
     # AWS returns CREATING at create time; the runtime settles to READY.
     return json_response({
@@ -359,12 +393,12 @@ def _update_agent_runtime(runtime_id, body):
         if not data.get(field):
             return _validation(f"{field} is required")
     _stop_container(runtime_id)
-    old_arn = record["agentRuntimeArn"]
     now = now_iso()
     new_version = str(int(record["agentRuntimeVersion"]) + 1)
     record["agentRuntimeVersion"] = new_version
-    record["agentRuntimeArn"] = _runtime_arn(record["_uuid"], new_version)
-    _resource_policies.pop(old_arn, None)
+    default = (_endpoints.get(runtime_id) or {}).get("DEFAULT")
+    if default:
+        default.update(targetVersion=new_version, liveVersion=new_version, lastUpdatedAt=now)
     record["lastUpdatedAt"] = now
     record["status"] = "READY"
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
@@ -415,20 +449,8 @@ def _create_agent_runtime_endpoint(runtime_id, body):
     if name in endpoints:
         return _conflict(f"Endpoint {name} already exists")
     target_version = data.get("agentRuntimeVersion") or runtime["agentRuntimeVersion"]
-    endpoint_uuid = new_uuid()
-    now = now_iso()
-    record = {
-        "name": name,
-        "id": _resource_id(name),
-        "agentRuntimeEndpointArn": _endpoint_arn(endpoint_uuid),
-        "agentRuntimeArn": runtime["agentRuntimeArn"],
-        "targetVersion": target_version,
-        "liveVersion": target_version,
-        "status": "READY",
-        "description": data.get("description", ""),
-        "createdAt": now,
-        "lastUpdatedAt": now,
-    }
+    record = _endpoint_record(runtime, name, target_version, data.get("description", ""))
+    now = record["createdAt"]
     endpoints[name] = record
     return json_response({
         "targetVersion": target_version,
@@ -536,8 +558,6 @@ def _find_runtime(runtime_arn):
             record
             for record in _runtimes.values_scoped(account_id, region)
             if record["agentRuntimeArn"] == runtime_arn
-            or record["agentRuntimeArn"].rsplit(":", 1)[0]
-            == runtime_arn.rsplit(":", 1)[0]
         ),
         None,
     )
@@ -545,8 +565,9 @@ def _find_runtime(runtime_arn):
 
 
 def _endpoint_for_qualifier(runtime, account_id, region, qualifier):
-    if not qualifier:
+    if runtime is None:
         return None
+    qualifier = qualifier or "DEFAULT"
     endpoints = _endpoints.get_scoped(account_id, region, runtime["agentRuntimeId"], {})
     return endpoints.get(qualifier)
 
@@ -680,14 +701,14 @@ def _invoke_agent_runtime(runtime_arn, headers, body, query_params=None):
         return _not_found(f"Agent runtime endpoint {qualifier} not found")
 
     from ministack.app import AUTH
-    from ministack.core.iam_evaluator import pin_request_caller
+    from ministack.core.iam_evaluator import caller_arn, pin_request_caller
     pin_request_caller(headers, query_params or {})
     if AUTH and not _resource_policy_allows_invocation(
         runtime, owner_account, owner_region, qualifier, headers, query_params
     ):
         return error_response_json(
             "AccessDeniedException",
-            f"User: {get_account_id()} is not authorized to perform: "
+            f"User: {caller_arn()} is not authorized to perform: "
             f"bedrock-agentcore:InvokeAgentRuntime on resource: {runtime_arn}",
             403,
         )
