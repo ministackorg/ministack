@@ -692,6 +692,11 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
+    "AWS::IAM::Role": {"name": "RoleName"},
+    "AWS::IAM::ManagedPolicy": {
+        "name": "ManagedPolicyName",
+        "exists": "A policy called {name} already exists. Duplicate names are not allowed.",
+    },
     "AWS::IoT::ProvisioningTemplate": {
         "name": "TemplateName",
         "requires_replacement": lambda old, new: (
@@ -2251,7 +2256,7 @@ def _lambda_url_delete(physical_id, props):
 
 def _iam_role_create(logical_id, props, stack_name):
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
-    arn = f"arn:aws:iam::{get_account_id()}:role/{name}"
+    arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
     assume_doc = props.get("AssumeRolePolicyDocument", {})
     if isinstance(assume_doc, dict):
@@ -2300,9 +2305,8 @@ def _iam_role_create(logical_id, props, stack_name):
 def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a role in place, keeping its ARN and RoleId.
 
-    RoleName is create-only (a change replaces the role; AWS sanctions the
-    rename); Path also requires replacement, which AWS refuses for an
-    explicitly-named role. Everything else — assume-role document, inline
+    RoleName and Path are create-only: ``_update_resource`` replaces the
+    role before this runs. Everything else — assume-role document, inline
     Policies, ManagedPolicyArns, Description, MaxSessionDuration, Tags —
     updates in place, so policies attached from outside the template survive
     (the create fallback used to rebuild the record and drop them).
@@ -2318,15 +2322,6 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     )
     if replaced is not None:
         return replaced
-
-    if new_props.get("Path", "/") != old_props.get("Path", "/"):
-        if old_props.get("RoleName"):
-            raise ValueError(
-                "CloudFormation cannot update a stack when a custom-named "
-                f"resource requires replacing. Rename {name} and update the "
-                "stack again."
-            )
-        return _iam_role_create(logical_id or physical_id, new_props, stack_name)
 
     assume_doc = new_props.get("AssumeRolePolicyDocument", {})
     if isinstance(assume_doc, dict):
@@ -6737,9 +6732,9 @@ def _codebuild_project_delete(physical_id, props):
 # --- IAM ManagedPolicy provisioner ---
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
-    name = props.get("ManagedPolicyName", f"{stack_name}-{logical_id}")
+    name = props.get("ManagedPolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:policy/{name}"
+    arn = f"arn:aws:iam::{get_account_id()}:policy{path}{name}"
     record = _iam.store_policy(arn, name, path, props.get("PolicyDocument", {}),
                                description=props.get("Description", ""))
     _attach_policy_to_entities(arn, props)
@@ -6767,28 +6762,9 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
     version at the five-version cap first, like the CFN handler), and the
     Roles / Users / Groups lists reconcile through attach/detach. The
     create-only properties (ManagedPolicyName, Path, Description) replace the
-    policy; under an unchanged custom name that replacement is refused, as
-    real CloudFormation refuses it."""
-    name = new_props.get("ManagedPolicyName", f"{stack_name}-{logical_id or physical_id}")
+    policy in ``_update_resource`` before this runs."""
     record = _iam._policies.get(physical_id)
-    replaced = _rename_replacement(
-        physical_id, old_props, new_props, stack_name, logical_id,
-        name, record.get("PolicyName") if record else None,
-        _iam_managed_policy_create, _iam_managed_policy_delete,
-    )
-    if replaced is not None:
-        return replaced
-
-    if (new_props.get("Path", "/") != old_props.get("Path", "/")
-            or new_props.get("Description", "") != old_props.get("Description", "")):
-        # Path and Description are create-only too, but the name didn't
-        # change, so the replacement cannot move to a new ARN.
-        if old_props.get("ManagedPolicyName"):
-            raise ValueError(
-                "CloudFormation cannot update a stack when a custom-named "
-                f"resource requires replacing. Rename {name} and update the "
-                "stack again."
-            )
+    if record is None:
         return _iam_managed_policy_create(logical_id or physical_id, new_props, stack_name)
 
     if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
@@ -12340,6 +12316,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
+    "AWS::IAM::Role": ("RoleName", "Path"),
+    "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (

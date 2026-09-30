@@ -22842,6 +22842,106 @@ def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
         _cfn_policy_test_roles_cleanup(iam, [role])
 
 
+def _cfn_iam_replacement_template(role_name="", path="/", policy_name="", description="one",
+                                  policy_path="/"):
+    """A managed policy and a role it is attached to, named or generated."""
+    policy = {"Description": description, "Path": policy_path, "PolicyDocument": {
+        "Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}}
+    role = {"Path": path, "ManagedPolicyArns": [{"Ref": "Pol"}], "AssumeRolePolicyDocument": {
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}}
+    if policy_name:
+        policy["ManagedPolicyName"] = policy_name
+    if role_name:
+        role["RoleName"] = role_name
+    return json.dumps({
+        "Resources": {"Pol": {"Type": "AWS::IAM::ManagedPolicy", "Properties": policy},
+                      "R": {"Type": "AWS::IAM::Role", "Properties": role}},
+        "Outputs": {"Role": {"Value": {"Ref": "R"}}, "Policy": {"Value": {"Ref": "Pol"}}},
+    })
+
+
+def test_cfn_iam_create_only_changes_under_generated_names_replace(cfn, iam):
+    """A managed policy Description change and a role Path change replace
+    them under new generated names: the role attaches the new policy, and
+    the old policy and role are deleted."""
+    stack_name = f"cfn-iam-repl-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_iam_replacement_template(),
+                     Capabilities=["CAPABILITY_IAM"])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_role, old_policy = _output(stack, "Role"), _output(stack, "Policy")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_iam_replacement_template(
+            description="two"), Capabilities=["CAPABILITY_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        policy = _output(stack, "Policy")
+        assert policy != old_policy
+        assert iam.get_policy(PolicyArn=policy)["Policy"]["Description"] == "two"
+        assert [p["PolicyArn"] for p in iam.list_attached_role_policies(
+            RoleName=old_role)["AttachedPolicies"]] == [policy]
+        with pytest.raises(ClientError):
+            iam.get_policy(PolicyArn=old_policy)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_iam_replacement_template(
+            path="/moved/", description="two"), Capabilities=["CAPABILITY_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        role = _output(stack, "Role")
+        assert role != old_role
+        described = iam.get_role(RoleName=role)["Role"]
+        assert described["Path"] == "/moved/"
+        assert described["Arn"].endswith(f":role/moved/{role}")
+        with pytest.raises(ClientError):
+            iam.get_role(RoleName=old_role)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_create_only_changes_under_custom_names_fail(cfn, iam):
+    """Under explicit names a role Path change is refused as a custom-named
+    replacement, and a managed policy Description or Path change fails on
+    the policy name the replacement would reuse; both keep what they had."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, role, policy = f"cfn-iam-named-{uid}", f"cfn-iam-role-{uid}", f"cfn-iam-pol-{uid}"
+    template = _cfn_iam_replacement_template
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(role, "/", policy),
+                     Capabilities=["CAPABILITY_NAMED_IAM"])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        policy_arn = _output(stack, "Policy")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(role, "/moved/", policy),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert (f"requires replacing. Rename {role} and update the stack again."
+                in _stack_event_reasons(cfn, stack_name))
+        assert iam.get_role(RoleName=role)["Role"]["Path"] == "/"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(role, "/", policy, "two"),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert (f"A policy called {policy} already exists. Duplicate names are not allowed."
+                in _stack_event_reasons(cfn, stack_name))
+        assert iam.get_policy(PolicyArn=policy_arn)["Policy"]["Description"] == "one"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            role, "/", policy, policy_path="/moved/"), Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Policy") == policy_arn
+        assert [p["Arn"] for p in _all_pages(iam, "list_policies", "Policies", Scope="Local")
+                if p["PolicyName"] == policy] == [policy_arn]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _cfn_instance_profile_template(uid, profile_props):
     def role(name):
         return {"Type": "AWS::IAM::Role", "Properties": {

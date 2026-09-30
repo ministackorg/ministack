@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — IAM roles and managed policies are replaced** — a `Path` change on `AWS::IAM::Role` and a `Path` or `Description` change on `AWS::IAM::ManagedPolicy` replace the resource under a new generated name, a named role refuses it as a custom-named replacement, a named policy fails with the IAM duplicate-name error as on AWS, also when only its `Path` changes, generated policy names get the suffix other generated names have, and both ARNs include the `Path`.
 - **CloudFormation — stack updates replace resources** — a change to a property the change set reports as `RequiresRecreation: Always` now creates a new resource under a new generated name, points its dependents at it and deletes the old one after the update succeeds (a rollback deletes the new one instead). With an explicit, unchanged name the update fails with the AWS message naming the physical id; this now also covers `AWS::Lambda::Function`. A named SQS queue or SNS topic fails with AWS's already-exists error instead and keeps its messages or subscriptions.
 
 ## [1.5.20] — 2026-10-01
