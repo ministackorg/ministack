@@ -5010,6 +5010,15 @@ def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
             400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", '{"name":"x"}',
                            json_header) == (200, '{"ok":true}')
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        for path in ("/val", "/val?q=1"):
+            with pytest.raises(_urlerr.HTTPError) as exc:
+                _urlreq.urlopen(_urlreq.Request(
+                    f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p{path}",
+                    method="POST", data=b"{}", headers=dict(json_header)))
+            assert exc.value.headers["x-amzn-ErrorType"] == "BadRequestException"
         apigw_v1.put_gateway_response(
             restApiId=api_id, responseType="BAD_REQUEST_BODY", responseTemplates={
                 "application/json":

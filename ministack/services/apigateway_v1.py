@@ -225,6 +225,8 @@ _GATEWAY_RESPONSE_ERROR_TYPES = {
     "AUTHORIZER_FAILURE": "AuthorizerConfigurationException",
     "AUTHORIZER_CONFIGURATION_ERROR": "AuthorizerConfigurationException",
     "API_CONFIGURATION_ERROR": "InternalServerErrorException",
+    "BAD_REQUEST_PARAMETERS": "BadRequestException",
+    "BAD_REQUEST_BODY": "BadRequestException",
     "DEFAULT_5XX": "InternalServerErrorException",
 }
 
