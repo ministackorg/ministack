@@ -141,6 +141,24 @@ def test_iot_update_thing_increments_version(iot_client):
     iot_client.delete_thing(thingName=name)
 
 
+def test_iot_update_thing_remove_thing_type_keeps_attributes(iot_client):
+    type_name = _unique("type")
+    name = _unique("thing")
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(
+        thingName=name, thingTypeName=type_name,
+        attributePayload={"attributes": {"k": "v"}},
+    )
+    iot_client.update_thing(thingName=name, removeThingType=True)
+    desc = iot_client.describe_thing(thingName=name)
+    assert desc.get("thingTypeName") is None
+    assert desc["attributes"] == {"k": "v"}
+    assert desc["version"] == 2
+    iot_client.delete_thing(thingName=name)
+    iot_client.deprecate_thing_type(thingTypeName=type_name)
+    iot_client.delete_thing_type(thingTypeName=type_name)
+
+
 def test_iot_list_things_filter_by_attribute(iot_client):
     a = _unique("thing")
     b = _unique("thing")
@@ -5686,6 +5704,7 @@ def test_iot_thing_events_and_type_associations():
             "thingTypeName": "ev-type-b",
             "attributePayload": {"attributes": {"b": "2"}, "merge": True},
         })
+        await call("PATCH", "/things/ev-thing", {"removeThingType": True})
         await call("DELETE", "/things/ev-thing")
 
     events = _registry_events(calls, enable=("THING", "THING_TYPE_ASSOCIATION"))
@@ -5694,12 +5713,13 @@ def test_iot_thing_events_and_type_associations():
     assert [t for t, _e in events] == [
         f"{base}/created", f"{assoc}/ev-type-a/added",
         f"{base}/updated", f"{assoc}/ev-type-b/added", f"{assoc}/ev-type-a/removed",
-        f"{base}/deleted", f"{assoc}/ev-type-b/removed",
+        f"{base}/updated", f"{assoc}/ev-type-b/removed",
+        f"{base}/deleted",
     ]
     # One operation's thing and association events share an eventId.
     assert len({e.pop("eventId") for _t, e in events[:2]}) == 1
     assert len({e.pop("eventId") for _t, e in events[2:5]}) == 1
-    assert len({e.pop("eventId") for _t, e in events[5:]}) == 1
+    assert len({e.pop("eventId") for _t, e in events[5:7]}) == 1
     thing = {"eventType": "THING_EVENT", "thingId": ids["thing"],
              "thingName": "ev-thing", "billinGroupName": None}
     assert events[0][1] == {**thing, "operation": "CREATED", "versionNumber": 1,
@@ -5707,8 +5727,12 @@ def test_iot_thing_events_and_type_associations():
     assert events[2][1] == {**thing, "operation": "UPDATED", "versionNumber": 2,
                             "thingTypeName": "ev-type-b",
                             "attributes": {"a": "1", "b": "2"}}
-    assert events[5][1] == {**thing, "operation": "DELETED", "versionNumber": 2,
-                            "thingTypeName": "ev-type-b",
+    assert events[5][1] == {**thing, "operation": "UPDATED", "versionNumber": 3,
+                            "thingTypeName": None,
+                            "attributes": {"a": "1", "b": "2"}}
+    events[7][1].pop("eventId")
+    assert events[7][1] == {**thing, "operation": "DELETED", "versionNumber": 3,
+                            "thingTypeName": None,
                             "attributes": {"a": "1", "b": "2"}}
     assert events[4][1] == {
         "eventType": "THING_TYPE_ASSOCIATION_EVENT", "operation": "REMOVED",

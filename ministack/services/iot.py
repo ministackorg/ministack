@@ -820,11 +820,11 @@ def _update_thing(name: str, payload: dict) -> tuple:
             else:
                 merged[k] = v
         thing["attributes"] = merged
-    else:
+    elif "attributePayload" in payload:
         thing["attributes"] = dict(new_attrs)
 
     old_type = thing.get("thingTypeName")
-    new_type = payload.get("thingTypeName")
+    new_type = "" if payload.get("removeThingType") else payload.get("thingTypeName")
     if new_type is not None:
         if new_type and new_type not in _thing_types:
             return _error_not_found("ThingType", new_type)
