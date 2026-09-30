@@ -7,7 +7,9 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
           ListStackResources, GetTemplate, ValidateTemplate, ListExports,
           CreateChangeSet, DescribeChangeSet, ExecuteChangeSet,
           DeleteChangeSet, ListChangeSets,
-          GetTemplateSummary.
+          GetTemplateSummary, RollbackStack, DetectStackDrift,
+          DescribeStackDriftDetectionStatus, DetectStackResourceDrift,
+          DescribeStackResourceDrifts.
 Uses Query API (Action=...) with form-encoded body.
 """
 
@@ -80,7 +82,7 @@ async def handle_request(method: str, path: str, headers: dict,
 # The stack operations that take a ClientRequestToken and record stack events.
 _TOKEN_ACTIONS = frozenset({
     "CreateStack", "UpdateStack", "DeleteStack", "ExecuteChangeSet",
-    "ContinueUpdateRollback", "CancelUpdateStack",
+    "ContinueUpdateRollback", "CancelUpdateStack", "RollbackStack",
 })
 
 
