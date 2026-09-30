@@ -53,7 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, execute_api_route_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -879,7 +879,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
     HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
-    / `$stageVariables.*` (unlike REST's `method.request.*`). Returns whether
+    / `$stageVariables.*` (unlike REST's `method.request.*`), WebSocket APIs
+    `route.request.header.*` / `route.request.querystring.*` / `stageVariables.*`. Returns whether
     every declared source is present+non-empty and the ordered values (used
     for the cache-key). Mirrors apigateway_v1._request_identity_sources.
     """
@@ -888,6 +889,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
     for src in (identity_source or []):
         if not isinstance(src, str):
             continue
+        if src.startswith(("route.request.", "stageVariables.")):
+            src = "$" + src.removeprefix("route.")
         val = ""
         if src.startswith("$request.header."):
             val = headers.get(src[len("$request.header."):].lower()) or ""
@@ -940,7 +943,7 @@ def _cache_authorizer_result(key, expires_at, result, context):
 
 
 async def _invoke_request_authorizer_lambda(authorizer, event, account_id, region):
-    """Invoke a REQUEST authorizer's Lambda and return its raw execution result dict."""
+    """Invoke a REQUEST authorizer's Lambda; its response object, or None if it failed or answered no object."""
     from ministack.services import lambda_svc
 
     lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
@@ -950,10 +953,21 @@ async def _invoke_request_authorizer_lambda(authorizer, event, account_id, regio
     if func_data is None or func_config is None:
         return None
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    return await run_reentrant(
+    result = await run_reentrant(
         lambda_svc._execute_function_with_config_scope, exec_record, event,
         thread_name="ministack-apigw-authorizer",
     )
+    if not result or result.get("error"):
+        return None
+    payload = result.get("body")
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    return payload if isinstance(payload, dict) else None
 
 
 async def _authorize_request_v2(
@@ -1082,22 +1096,8 @@ async def _authorize_request_v2(
             cached = (hit[1], hit[2])
 
     if cached is None:
-        result = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
-        if result is None:
-            # Authorizer Lambda unresolved / not found -> connection failure.
-            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
-        if result.get("error"):
-            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
-
-        payload = result.get("body")
-        if isinstance(payload, (str, bytes)):
-            if isinstance(payload, bytes):
-                payload = payload.decode("utf-8", errors="replace")
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = None
-        if not isinstance(payload, dict):
+        payload = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
+        if payload is None:
             return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
 
         raw_ctx = payload.get("context") or {}
@@ -2553,6 +2553,41 @@ def _evaluate_route_selection(expr: str, payload_text: str) -> str:
     return "$default"
 
 
+def _ws_request_context(api_id: str, route_key: str, stage: str, connection_id: str, event_type: str,
+                        request_id: str, source_ip: str, headers: dict) -> dict:
+    """requestContext of a WebSocket event, shared by route integrations and the $connect authorizer."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "routeKey": route_key,
+        "eventType": event_type,
+        "extendedRequestId": new_uuid(),
+        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+        "stage": stage,
+        "connectedAt": now_ms,
+        "requestTimeEpoch": now_ms,
+        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
+        "requestId": request_id,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "connectionId": connection_id,
+        "apiId": api_id,
+    }
+
+
+def _ws_connect_fields(headers: dict, query_params: dict | None) -> dict:
+    """Handshake headers and query string as a $connect event carries them."""
+    # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
+    return {
+        "headers": dict(headers),
+        "multiValueHeaders": {k: [v] for k, v in headers.items()},
+        "queryStringParameters": {
+            k: (v[-1] if isinstance(v, list) else v) for k, v in query_params.items()
+        } if query_params else None,
+        "multiValueQueryStringParameters": {
+            k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()
+        } if query_params else None,
+    }
+
+
 async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: dict, stage: str,
                             connection_id: str, event_type: str, message_id: str,
                             body_text: str, source_ip: str, headers: dict,
@@ -2620,20 +2655,11 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
     if func_data is None or func_config is None:
         return None
 
-    request_context = {
-        "routeKey": route.get("routeKey", "$default"),
-        "eventType": event_type,
-        "extendedRequestId": new_uuid(),
-        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
-        "stage": stage,
-        "connectedAt": int(time.time() * 1000),
-        "requestTimeEpoch": int(time.time() * 1000),
-        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
-        "requestId": message_id,
-        "domainName": f"{api_id}.execute-api.{_HOST}",
-        "connectionId": connection_id,
-        "apiId": api_id,
-    }
+    request_context = _ws_request_context(
+        api_id, route.get("routeKey", "$default"), stage, connection_id, event_type, message_id, source_ip, headers,
+    )
+    if kwargs.get("authorizer") is not None:
+        request_context["authorizer"] = kwargs["authorizer"]
     if event_type == "DISCONNECT":
         # Populated by handle_websocket from the ASGI disconnect message.
         request_context["disconnectReason"] = kwargs.get("disconnect_reason", "")
@@ -2647,21 +2673,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         "isBase64Encoded": False,
     }
     if event_type == "CONNECT":
-        event["headers"] = dict(headers)
-        event["multiValueHeaders"] = {k: [v] for k, v in headers.items()}
-        if query_params:
-            # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
-            event["queryStringParameters"] = {
-                k: (v[-1] if isinstance(v, list) else v)
-                for k, v in query_params.items()
-            }
-            event["multiValueQueryStringParameters"] = {
-                k: (v if isinstance(v, list) else [v])
-                for k, v in query_params.items()
-            }
-        else:
-            event["queryStringParameters"] = None
-            event["multiValueQueryStringParameters"] = None
+        event.update(_ws_connect_fields(headers, query_params))
         authorizer_claims = kwargs.get("authorizer_claims")
         if authorizer_claims is not None:
             request_context["authorizer"] = {
@@ -2698,6 +2710,58 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         return result.get("result", {})
     # Image/unsupported runtime stub — success without body.
     return {"statusCode": 200, "body": ""}
+
+
+_WS_DENY_REASONS = {
+    "Deny": "with an explicit deny in an identity-based policy",
+    "NoMatch": "because no identity-based policy allows the execute-api:Invoke action",
+}
+
+
+async def _authorize_ws_connect(api_id, route, request_context, headers, query_params, account_id, region):
+    """Run the $connect REQUEST authorizer: ``(refusal, context)``, a refusal being ``(status, message)``."""
+    from ministack.services.apigateway_v1 import _stringify_context
+
+    authorizer = _authorizers.get(api_id, {}).get(route.get("authorizerId") or "")
+    if not authorizer:
+        return (500, ""), None
+    stage = request_context["stage"]
+    stage_vars = _get_stage_variables(api_id, stage)
+    present, _values = _request_authorizer_identity_sources(
+        authorizer.get("identitySource"), headers, query_params, stage_vars,
+    )
+    if not present:
+        return (401, "Unauthorized"), None
+    method_arn = execute_api_route_arn(region, account_id, api_id, stage, "$connect")
+    event = {
+        "type": "REQUEST",
+        "methodArn": method_arn,
+        **_ws_connect_fields(headers, query_params),
+        "stageVariables": stage_vars,
+        "requestContext": {**request_context, "messageDirection": "IN"},
+    }
+    payload = await _invoke_request_authorizer_lambda(authorizer, event, account_id, region)
+    policy = (payload or {}).get("policyDocument")
+    if not isinstance(policy, dict) or not isinstance(payload.get("context") or {}, dict):
+        return (500, ""), None
+    decision = _evaluate_authorizer_policy(policy, method_arn)
+    if decision != "Allow":
+        return (403, f"User is not authorized to access this resource {_WS_DENY_REASONS[decision]}"), None
+    context = _stringify_context(payload.get("context"))
+    if payload.get("principalId") is not None:
+        context["principalId"] = str(payload["principalId"])
+    return None, context
+
+
+async def _refuse_ws_handshake(scope, send, status, message, connection_id, request_id):
+    """Answer the upgrade with an HTTP error response, as API Gateway does."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": message, "connectionId": connection_id, "requestId": request_id}).encode()
+    await send({"type": "websocket.http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
 
 
 async def handle_websocket(scope, receive, send, api_id: str, path_override: str | None = None):
@@ -2769,11 +2833,24 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
     try:
         # $connect hook
         connect_route = _match_ws_route(api_id, "$connect")
+        authorizer_context = None
         if connect_route is not None:
-            # JWT authorizer validation (mirrors the HTTP API path).
             auth_type = (connect_route.get("authorizationType") or "NONE").upper()
             ws_authorizer_claims = None
             ws_authorizer_scopes = []
+            connect_request_id = new_uuid()
+            refusal = None
+            if auth_type == "CUSTOM":
+                refusal, authorizer_context = await _authorize_ws_connect(
+                    api_id, connect_route,
+                    _ws_request_context(api_id, "$connect", stage, connection_id, "CONNECT",
+                                        connect_request_id, source_ip, headers),
+                    headers, query_params, account_id, owner_region,
+                )
+            if refusal:
+                await _refuse_ws_handshake(scope, send, *refusal, connection_id, connect_request_id)
+                return
+            # JWT authorizer validation (mirrors the HTTP API path).
             if auth_type == "JWT":
                 authorizer_id = connect_route.get("authorizerId")
                 authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
@@ -2791,10 +2868,11 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
 
             resp = await _invoke_ws_lambda(
                 api_id, account_id, owner_region, connect_route, stage, connection_id,
-                "CONNECT", new_uuid(), "", source_ip, headers,
+                "CONNECT", connect_request_id, "", source_ip, headers,
                 query_params=query_params,
                 authorizer_claims=ws_authorizer_claims,
                 authorizer_scopes=ws_authorizer_scopes,
+                authorizer=authorizer_context,
             )
             status = int((resp or {}).get("statusCode", 200))
             if status < 200 or status >= 300:
@@ -2869,7 +2947,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 msg_id = new_uuid()
                 resp = await _invoke_ws_lambda(
                     api_id, account_id, owner_region, route, stage, connection_id, "MESSAGE",
-                    msg_id, payload, source_ip, headers,
+                    msg_id, payload, source_ip, headers, authorizer=authorizer_context,
                 )
                 if resp is None:
                     continue
@@ -2897,6 +2975,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                         "DISCONNECT", new_uuid(), "", source_ip, headers,
                         disconnect_code=disconnect_code,
                         disconnect_reason=disconnect_reason,
+                        authorizer=authorizer_context,
                     )
                 except Exception:
                     logger.exception("error firing $disconnect")
