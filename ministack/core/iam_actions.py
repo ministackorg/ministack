@@ -1915,6 +1915,9 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
         action = f"SNS:{name}"
     elif service == "s3":
         resource_arn = f'"{resource_arn}"'
+    elif service == "apigateway":
+        account = resource_arn.split(":")[4]
+        resource_arn = resource_arn.replace(f":{account}:", f":********{account[-4:]}:", 1)
     return (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
             "with an explicit deny in a resource-based policy")
 

@@ -765,6 +765,7 @@ _RESOURCE_POLICY_LOOKUPS = {
     "secretsmanager": ("secretsmanager", "secret_policy_for_arn"),
     "ecr": ("ecr", "repository_policy_for_arn"),
     "kms": ("kms", "key_policy_for_arn"),
+    "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
 }
 
 # A key policy must allow even the owner's own users and roles.
