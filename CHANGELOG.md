@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Cognito — token lifetimes follow the app client** — access and ID tokens, `ExpiresIn` and the `/oauth2/token` `expires_in` were always one hour; they now follow the client's `AccessTokenValidity`, `IdTokenValidity` and `TokenValidityUnits` (one hour when unset, as on AWS), a client created without the two validities no longer reports `60` for them, and an expired token is refused by API Gateway's Cognito and JWT authorizers and, with `AUTH=true`, an expired access token by Cognito with `Access Token has expired`. Contributed by @iot-rocket.
 - **Cognito — access tokens are verified under `AUTH=true`** — `GetUser` and the other calls that take an `AccessToken` accepted any JWT carrying a user's `sub`, including an ID token, a token with an altered payload and a token revoked by `GlobalSignOut`, `AdminUserGlobalSignOut` or `RevokeToken`; with `AUTH=true` they now answer `NotAuthorizedException` with `Invalid Access Token`, `Could not verify signature for Access Token` or `Access Token has been revoked`, as AWS does. Contributed by @iot-rocket.
 
 ## [1.5.26] — 2026-10-11

@@ -1570,6 +1570,24 @@ def test_cognito_sign_out_and_revoke_token_revoke_access_tokens_under_auth(monke
     assert call("GetUser", AccessToken=other["AccessToken"])["Username"] == "bob"
 
 
+def test_cognito_expired_access_token_refused_under_auth(monkeypatch):
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    _, cid, sign_in = _password_client_with_users(
+        call, "alice", AccessTokenValidity=5, TokenValidityUnits={"AccessToken": "minutes"})
+    issued = time.time() - 301
+    with monkeypatch.context() as m:
+        m.setattr(mod.time, "time", lambda: issued)
+        expired, revoked = sign_in("alice"), sign_in("alice")
+    call("RevokeToken", ClientId=cid, Token=revoked["RefreshToken"])
+    message = ("NotAuthorizedException", "Access Token has expired")
+    assert call("GetUser", AccessToken=expired["AccessToken"]) == message
+    assert call("GlobalSignOut", AccessToken=expired["AccessToken"]) == message
+    assert call("GetUser", AccessToken=revoked["AccessToken"]) == message
+    refreshed = call("InitiateAuth", ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                     AuthParameters={"REFRESH_TOKEN": expired["RefreshToken"]})["AuthenticationResult"]
+    assert call("GetUser", AccessToken=refreshed["AccessToken"])["Username"] == "alice"
+
+
 def test_cognito_access_tokens_not_checked_without_auth(monkeypatch):
     _, call = _idp_in_process(monkeypatch, auth=False)
     _, cid, sign_in = _password_client_with_users(call, "alice", "bob")
@@ -1578,6 +1596,40 @@ def test_cognito_access_tokens_not_checked_without_auth(monkeypatch):
     call("RevokeToken", ClientId=cid, Token=alice["RefreshToken"])
     for token in (alice["AccessToken"], alice["IdToken"], f"{header}.{bob['AccessToken'].split('.')[1]}.{signature}"):
         assert "Username" in call("GetUser", AccessToken=token)
+
+
+def test_cognito_token_lifetimes_follow_client_validity(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="TokenValidityPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="alice", Password="Passw0rd!", Permanent=True)
+    flows = ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+    for settings, access, id_token in [
+        ({}, 3600, 3600),
+        ({"AccessTokenValidity": 2, "IdTokenValidity": 3}, 7200, 10800),
+        ({"AccessTokenValidity": 5, "IdTokenValidity": 90,
+          "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}}, 300, 5400),
+        ({"AccessTokenValidity": 1, "IdTokenValidity": 3600,
+          "TokenValidityUnits": {"AccessToken": "days", "IdToken": "seconds"}}, 86400, 3600),
+    ]:
+        client = cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="app", ExplicitAuthFlows=flows, **settings)["UserPoolClient"]
+        described = cognito_idp.describe_user_pool_client(
+            UserPoolId=pid, ClientId=client["ClientId"])["UserPoolClient"]
+        assert described.get("AccessTokenValidity") == settings.get("AccessTokenValidity")
+        assert described.get("IdTokenValidity") == settings.get("IdTokenValidity")
+        result = cognito_idp.initiate_auth(
+            ClientId=client["ClientId"], AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "alice", "PASSWORD": "Passw0rd!"})["AuthenticationResult"]
+        refreshed = cognito_idp.initiate_auth(
+            ClientId=client["ClientId"], AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": result["RefreshToken"]})["AuthenticationResult"]
+        for tokens in (result, refreshed):
+            access_claims = _decode_jwt_claims(tokens["AccessToken"])
+            id_claims = _decode_jwt_claims(tokens["IdToken"])
+            assert tokens["ExpiresIn"] == access_claims["exp"] - access_claims["iat"] == access
+            assert id_claims["exp"] - id_claims["iat"] == id_token
+        refresh_claims = _decode_jwt_claims(result["RefreshToken"])
+        assert refresh_claims["exp"] - refresh_claims["iat"] == 30 * 86400
 
 
 def test_cognito_describe_identity(cognito_identity):
@@ -4309,6 +4361,27 @@ def test_oauth2_token_client_credentials():
     # client_credentials should NOT return id_token or refresh_token
     assert 'id_token' not in resp
     assert 'refresh_token' not in resp
+
+
+def test_oauth2_token_client_credentials_expires_with_the_client():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
+    cognito_idp.update_user_pool_client(
+        UserPoolId=pool_id, ClientId=client['ClientId'],
+        AccessTokenValidity=5, TokenValidityUnits={'AccessToken': 'minutes'},
+    )
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'client_credentials',
+        'client_id': client['ClientId'],
+        'client_secret': client['ClientSecret'],
+        'scope': 'openid',
+    })
+
+    assert status == 200
+    resp = json.loads(body)
+    claims = _decode_jwt_claims(resp['access_token'])
+    assert resp['expires_in'] == claims['exp'] - claims['iat'] == 300
 
 
 def test_oauth2_token_client_auth_basic():

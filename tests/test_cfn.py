@@ -22152,7 +22152,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         if declared:
             props.update({"CallbackURLs": ["https://example.com/cb"],
                           "PreventUserExistenceErrors": "ENABLED",
-                          "RefreshTokenValidity": 10})
+                          "RefreshTokenValidity": 10, "AccessTokenValidity": 2})
         return json.dumps({
             "Resources": {
                 "Pool": {"Type": "AWS::Cognito::UserPool",
@@ -22174,6 +22174,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         assert client["CallbackURLs"] == ["https://example.com/cb"]
         assert client["PreventUserExistenceErrors"] == "ENABLED"
         assert client["RefreshTokenValidity"] == 10
+        assert client["AccessTokenValidity"] == 2
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
         stack = _wait_stack(cfn, stack_name)
@@ -22185,6 +22186,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         assert client.get("CallbackURLs", []) == []
         assert client["PreventUserExistenceErrors"] == "LEGACY"
         assert client["RefreshTokenValidity"] == 30
+        assert "AccessTokenValidity" not in client
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 

@@ -6764,14 +6764,14 @@ def _cognito_user_pool_delete(physical_id, props):
 # UpdateUserPoolClient's parameters, with the value a dropped property
 # reverts to: what the service's CreateUserPoolClient fills in when the
 # request omits it, since the resource reference says a parameter without a
-# value is set to its default. None clears AnalyticsConfiguration, which the
-# client record omits on read. RefreshTokenRotation has no field on the
-# record and is not modelled.
+# value is set to its default. None clears AnalyticsConfiguration and the
+# access and ID token validities, which the client record omits on read.
+# RefreshTokenRotation has no field on the record and is not modelled.
 _COGNITO_USER_POOL_CLIENT_UPDATABLE = {
     "ClientName": "",
     "RefreshTokenValidity": 30,
-    "AccessTokenValidity": 60,
-    "IdTokenValidity": 60,
+    "AccessTokenValidity": None,
+    "IdTokenValidity": None,
     "TokenValidityUnits": {},
     "ReadAttributes": [],
     "WriteAttributes": [],

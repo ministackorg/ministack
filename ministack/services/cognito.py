@@ -745,6 +745,19 @@ def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
     return pool_id
 
 
+_VALIDITY_UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+
+
+def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
+    """Seconds a token of this app client is valid, by its settings or the AWS default."""
+    client = ((_user_pools.get(pool_id) or {}).get("_clients") or {}).get(client_id) or {}
+    kind, value, unit = {"id": ("IdToken", 1, "hours"), "refresh": ("RefreshToken", 30, "days")}.get(
+        token_type, ("AccessToken", 1, "hours"))
+    value = client.get(f"{kind}Validity") or value
+    unit = (client.get("TokenValidityUnits") or {}).get(kind) or unit
+    return int(value) * _VALIDITY_UNIT_SECONDS.get(unit, 3600)
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
@@ -767,7 +780,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
         "token_use": token_type,
         "iat": now,
-        "exp": now + 3600,
+        "exp": now + _token_validity(pool_id, client_id, token_type),
         "jti": new_uuid(),
     }
     if token_type == "id":
@@ -1149,6 +1162,8 @@ def _access_token_error(data: dict):
         message = "Invalid Access Token"
     elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
         message = "Could not verify signature for Access Token"
+    elif not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]:
+        message = "Access Token has expired"
     elif claims.get("origin_jti") in _revoked_tokens:
         message = "Access Token has been revoked"
     else:
@@ -2778,8 +2793,8 @@ def _create_user_pool_client(data):
         "CreationDate": now,
         "LastModifiedDate": now,
         "RefreshTokenValidity": data.get("RefreshTokenValidity", 30),
-        "AccessTokenValidity": data.get("AccessTokenValidity", 60),
-        "IdTokenValidity": data.get("IdTokenValidity", 60),
+        "AccessTokenValidity": data.get("AccessTokenValidity"),
+        "IdTokenValidity": data.get("IdTokenValidity"),
         "TokenValidityUnits": data.get("TokenValidityUnits", {}),
         "ReadAttributes": data.get("ReadAttributes", []),
         "WriteAttributes": data.get("WriteAttributes", []),
@@ -3829,7 +3844,7 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
                                client_metadata=client_metadata, origin_jti=origin_jti),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti),
         "TokenType": "Bearer",
-        "ExpiresIn": 3600,
+        "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
 
 
@@ -6793,7 +6808,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "id_token": result["IdToken"],
                 "refresh_token": refresh_val,
                 "token_type": "Bearer",
-                "expires_in": 3600,
+                "expires_in": result["ExpiresIn"],
             }
             return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
@@ -6835,7 +6850,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
-                "expires_in": 3600,
+                "expires_in": _token_validity(pool_id, effective_client_id, "access"),
             })
 
         return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
@@ -6871,7 +6886,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
                                      trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, client_id, "access"),
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
@@ -6906,7 +6921,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, cid, "access"),
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
