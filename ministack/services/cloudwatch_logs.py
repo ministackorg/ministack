@@ -13,6 +13,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           TagResource, UntagResource, ListTagsForResource,
           PutDestination, DeleteDestination, DescribeDestinations,
           PutDestinationPolicy,
+          PutResourcePolicy, DescribeResourcePolicies, DeleteResourcePolicy,
           PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters,
           StartQuery, GetQueryResults, StopQuery,
           PutDeliverySource, GetDeliverySource, DeleteDeliverySource, DescribeDeliverySources,
@@ -66,6 +67,10 @@ _log_groups = AccountRegionScopedDict()
 _destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
+_resource_policies = AccountRegionScopedDict()
+# policy_name -> {policyName, policyDocument, resourceArn, policyScope,
+#                  lastUpdatedTime, revisionId}
+
 _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
@@ -109,6 +114,7 @@ def get_state():
     return {
         "log_groups": copy.deepcopy(_log_groups),
         "destinations": copy.deepcopy(_destinations),
+        "resource_policies": copy.deepcopy(_resource_policies),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
         "log_records": copy.deepcopy(_log_records),
@@ -199,6 +205,7 @@ def _restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
         _restore_queries(data.get("queries", {}))
         _log_records.update(data.get("log_records", {}))
@@ -308,6 +315,9 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteDestination": _delete_destination,
         "DescribeDestinations": _describe_destinations,
         "PutDestinationPolicy": _put_destination_policy,
+        "PutResourcePolicy": _put_resource_policy,
+        "DescribeResourcePolicies": _describe_resource_policies,
+        "DeleteResourcePolicy": _delete_resource_policy,
         "PutMetricFilter": _put_metric_filter,
         "DeleteMetricFilter": _delete_metric_filter,
         "DescribeMetricFilters": _describe_metric_filters,
@@ -1573,6 +1583,65 @@ def _put_destination_policy(data):
     return json_response({})
 
 
+def _format_resource_policy(policy):
+    return {
+        "policyName": policy["policyName"],
+        "policyDocument": policy["policyDocument"],
+        "lastUpdatedTime": policy["lastUpdatedTime"],
+        "policyScope": policy.get("policyScope", "ACCOUNT"),
+        "resourceArn": policy.get("resourceArn"),
+        "revisionId": policy["revisionId"],
+    }
+
+
+def _put_resource_policy(data):
+    name = data.get("policyName")
+    document = data.get("policyDocument")
+    if not name or not document:
+        return error_response_json(
+            "InvalidParameterException",
+            "policyName and policyDocument are required.", 400,
+        )
+    expected_revision = data.get("expectedRevisionId")
+    existing = _resource_policies.get(name)
+    if expected_revision is not None and (not existing or existing["revisionId"] != expected_revision):
+        return error_response_json(
+            "OperationAbortedException",
+            "The revision id does not match the latest revision id.", 400,
+        )
+    policy = {
+        "policyName": name,
+        "policyDocument": document,
+        "resourceArn": data.get("resourceArn"),
+        "policyScope": data.get("policyScope", "ACCOUNT"),
+        "lastUpdatedTime": int(time.time() * 1000),
+        "revisionId": new_uuid(),
+    }
+    _resource_policies[name] = policy
+    formatted = _format_resource_policy(policy)
+    return json_response({"resourcePolicy": formatted, "revisionId": policy["revisionId"]})
+
+
+def _describe_resource_policies(data):
+    resource_arn = data.get("resourceArn")
+    policies = [
+        _format_resource_policy(p) for p in _resource_policies.values()
+        if not resource_arn or p.get("resourceArn") == resource_arn
+    ]
+    return json_response({"resourcePolicies": policies})
+
+
+def _delete_resource_policy(data):
+    name = data.get("policyName")
+    if not name or name not in _resource_policies:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The specified resource policy does not exist: {name}", 400,
+        )
+    del _resource_policies[name]
+    return json_response({})
+
+
 # ---------------------------------------------------------------------------
 # Metric Filters
 # ---------------------------------------------------------------------------
@@ -2023,6 +2092,7 @@ def _stop_query(data):
 def reset():
     _log_groups.clear()
     _destinations.clear()
+    _resource_policies.clear()
     _metric_filters.clear()
     _queries.clear()
     _log_records.clear()
