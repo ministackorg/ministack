@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **IoT — MQTT publish, subscribe and receive evaluate IoT policies under `AUTH=true`** — after the CONNECT a certificate session could publish, subscribe and receive on any topic; it now needs `iot:Publish` on the topic (and `iot:RetainPublish` for a retained message or will), `iot:Subscribe` per topic filter and `iot:Receive` per delivered message. A refused PUBLISH or SUBSCRIBE closes an MQTT 3.1.1 connection (disconnect reason `CLIENT_ERROR`), MQTT 5 answers PUBACK 0x87, DISCONNECT 0x87 at QoS 0 (`AUTH_ERROR`) or 0x87 for the refused filter, which the `subscribed` event leaves out (no event when none is granted), a refused will refuses the CONNECT, and a message the subscriber may not receive is dropped. Contributed by @iot-rocket.
 - **IoT — MQTT connections evaluate `iot:Connect` under `AUTH=true`** — a device certificate on the mTLS listener connected under any client id, with or without a policy; with `AUTH=true` the CONNECT now needs an attached policy that allows `iot:Connect` on `client/<client id>` and none that denies it, with `${iot:ClientId}`, `${iot:Connection.Thing.ThingName}`, `iot:Connection.Thing.IsAttached` and `${iot:Certificate.Subject.CommonName}` resolved. A refusal closes an MQTT 3.1.1 connection without a CONNACK, answers MQTT 5 with CONNACK 0x87 and publishes `$aws/events/presence/connect_failed/{clientId}`. Contributed by @iot-rocket.
 
 ## [1.5.25] — 2026-10-10
