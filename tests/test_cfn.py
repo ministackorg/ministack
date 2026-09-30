@@ -29219,6 +29219,167 @@ def test_cfn_import_of_a_type_without_an_adopter_is_not_executable(cfn, eb):
         eb.delete_event_bus(Name=bus)
 
 
+def test_cfn_import_adopts_keys_pool_members_and_apis(cfn, sns, kms_client, iot_client, cognito_idp,
+                                                      cognito_identity, apigw_v1):
+    uid = _uuid_mod.uuid4().hex[:8]
+    name, stack = f"cfn-imp-two-{uid}", f"cfn-imp-two-{uid}"
+    topic = sns.create_topic(Name=name)["TopicArn"]
+    key = kms_client.create_key(Description=name)["KeyMetadata"]
+    alias = f"alias/{name}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=key["KeyId"])
+    thing_type = iot_client.create_thing_type(thingTypeName=name)
+    pool = cognito_idp.create_user_pool(PoolName=name)["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(UserPoolId=pool, ClientName=name)["UserPoolClient"]["ClientId"]
+    cognito_idp.create_group(UserPoolId=pool, GroupName="admins")
+    cognito_idp.create_resource_server(UserPoolId=pool, Identifier="https://api.example.com", Name=name)
+    identity_pool = cognito_identity.create_identity_pool(
+        IdentityPoolName=name.replace("-", "_"), AllowUnauthenticatedIdentities=False)["IdentityPoolId"]
+    api = apigw_v1.create_rest_api(name=name)["id"]
+    root = next(r["id"] for r in apigw_v1.get_resources(restApiId=api)["items"] if r["path"] == "/")
+    apigw_v1.put_method(restApiId=api, resourceId=root, httpMethod="GET", authorizationType="NONE")
+    apigw_v1.put_integration(restApiId=api, resourceId=root, httpMethod="GET", type="MOCK")
+    deployment = apigw_v1.create_deployment(restApiId=api, stageName="live")["id"]
+    # (type, identifier, properties, physical id, {attribute: live value})
+    cases = {
+        "S": ("AWS::SNS::Topic", {"TopicArn": topic}, {"TopicName": name}, topic,
+              {"TopicArn": topic, "TopicName": name}),
+        "K": ("AWS::KMS::Key", {"KeyId": key["KeyId"]}, {"Description": name}, key["KeyId"],
+              {"Arn": key["Arn"], "KeyId": key["KeyId"]}),
+        "A": ("AWS::KMS::Alias", {"AliasName": alias}, {"AliasName": alias, "TargetKeyId": key["KeyId"]},
+              alias, {}),
+        "TT": ("AWS::IoT::ThingType", {"ThingTypeName": name}, {"ThingTypeName": name}, name,
+               {"Arn": thing_type["thingTypeArn"], "Id": thing_type["thingTypeId"]}),
+        "UC": ("AWS::Cognito::UserPoolClient", {"UserPoolId": pool, "ClientId": client},
+               {"UserPoolId": pool, "ClientName": name}, client, {"ClientId": client, "Name": name}),
+        "UG": ("AWS::Cognito::UserPoolGroup", {"UserPoolId": pool, "GroupName": "admins"},
+               {"UserPoolId": pool, "GroupName": "admins"}, "admins", {}),
+        "RS": ("AWS::Cognito::UserPoolResourceServer", {"UserPoolId": pool, "Identifier": "https://api.example.com"},
+               {"UserPoolId": pool, "Identifier": "https://api.example.com", "Name": name},
+               "https://api.example.com", {}),
+        "IDP": ("AWS::Cognito::IdentityPool", {"Id": identity_pool},
+                {"IdentityPoolName": name.replace("-", "_"), "AllowUnauthenticatedIdentities": False},
+                identity_pool, {"Id": identity_pool, "Name": name.replace("-", "_")}),
+        "API": ("AWS::ApiGateway::RestApi", {"RestApiId": api}, {"Name": name}, api,
+                {"RestApiId": api, "RootResourceId": root}),
+        "STG": ("AWS::ApiGateway::Stage", {"RestApiId": api, "StageName": "live"},
+                {"RestApiId": api, "StageName": "live", "DeploymentId": deployment}, "live", {}),
+    }
+    resources = {lid: {"Type": t, "DeletionPolicy": "Retain", "Properties": props}
+                 for lid, (t, _i, props, _p, _a) in cases.items()}
+    to_import = [{"ResourceType": t, "LogicalResourceId": lid, "ResourceIdentifier": ident}
+                 for lid, (t, ident, _props, _p, _a) in cases.items()]
+    try:
+        for entry in to_import:
+            if len(entry["ResourceIdentifier"]) == 2:
+                parent, last = entry["ResourceIdentifier"]
+                lid = entry["LogicalResourceId"]
+                with pytest.raises(ClientError) as exc:
+                    _cfn_import(cfn, stack, {lid: resources[lid]}, [
+                        {**entry, "ResourceIdentifier": {last: entry["ResourceIdentifier"][last]}}])
+                assert exc.value.response["Error"]["Message"] == (
+                    f"Invalid resource identifier for resource type {entry['ResourceType']}. "
+                    f"Expected [{parent}, {last}]")
+        cs = _cfn_import(cfn, stack, resources, to_import)
+        assert cs["ExecutionStatus"] == "AVAILABLE", cs["StatusReason"]
+        expected = {lid: pid for lid, (_t, _i, _props, pid, _a) in cases.items()}
+        assert {c["ResourceChange"]["LogicalResourceId"]: c["ResourceChange"]["PhysicalResourceId"]
+                for c in cs["Changes"]} == expected
+        final, _events = _cfn_execute_import(cfn, stack)
+        assert final["StackStatus"] == "IMPORT_COMPLETE", final.get("StackStatusReason")
+        assert {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                for r in cfn.describe_stack_resources(StackName=stack)["StackResources"]} == expected
+        outputs = {f"{lid}Ref": {"Value": {"Ref": lid}} for lid in cases}
+        outputs.update({f"{lid}{attr}": {"Value": {"Fn::GetAtt": [lid, attr]}}
+                        for lid, (_t, _i, _p, _pid, attrs) in cases.items() for attr in attrs})
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps({"Resources": resources, "Outputs": outputs}))
+        final = _wait_stack(cfn, stack)
+        assert final["StackStatus"] == "UPDATE_COMPLETE", final.get("StackStatusReason")
+        values = {f"{lid}Ref": pid for lid, pid in expected.items()}
+        values.update({f"{lid}{attr}": value
+                       for lid, (_t, _i, _p, _pid, attrs) in cases.items() for attr, value in attrs.items()})
+        assert {o["OutputKey"]: o["OutputValue"] for o in final["Outputs"]} == values
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        apigw_v1.delete_rest_api(restApiId=api)
+        cognito_identity.delete_identity_pool(IdentityPoolId=identity_pool)
+        cognito_idp.delete_user_pool(UserPoolId=pool)
+        iot_client.deprecate_thing_type(thingTypeName=name)
+        iot_client.delete_thing_type(thingTypeName=name)
+        kms_client.delete_alias(AliasName=alias)
+        sns.delete_topic(TopicArn=topic)
+
+
+def test_cfn_import_of_a_missing_key_pool_member_or_api_fails_the_change_set(cfn, cognito_idp, apigw_v1):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-imp-gone-two-{uid}", f"cfn-imp-gone-two-{uid}"
+    pool = cognito_idp.create_user_pool(PoolName=name)["UserPool"]["Id"]
+    api = apigw_v1.create_rest_api(name=name)["id"]
+    ghost = str(_uuid_mod.uuid4())
+    sdk = r" \(Service: {}, Status Code: {}, Request ID: [0-9a-f-]+\) \(SDK Attempt Count: 1\)"
+    cases = [
+        ("AWS::KMS::Key", {"KeyId": ghost},
+         rf"Key 'arn:aws:kms:[a-z0-9-]+:\d{{12}}:key/{ghost}' does not exist" + sdk.format("Kms", 400)),
+        ("AWS::KMS::Alias", {"AliasName": f"alias/{name}"}, ""),
+        ("AWS::IoT::ThingType", {"ThingTypeName": name},
+         rf"Resource of type 'AWS::IoT::ThingType' with identifier '{name}' was not found\."),
+        ("AWS::Cognito::UserPoolClient", {"UserPoolId": pool, "ClientId": "nope"},
+         r"User pool client does not exist\." + sdk.format("CognitoIdentityProvider", 400)),
+        ("AWS::Cognito::UserPoolGroup", {"UserPoolId": pool, "GroupName": "nope"},
+         r"Group not found\." + sdk.format("CognitoIdentityProvider", 400)),
+        ("AWS::Cognito::UserPoolResourceServer", {"UserPoolId": pool, "Identifier": "nope"},
+         rf"nope does not exist in user pool {pool}\." + sdk.format("CognitoIdentityProvider", 400)),
+        ("AWS::Cognito::IdentityPool", {"Id": f"us-east-1:{ghost}"},
+         rf"IdentityPool 'us-east-1:{ghost}' not found\." + sdk.format("CognitoIdentity", 400)),
+        ("AWS::ApiGateway::RestApi", {"RestApiId": "nope"},
+         r"Invalid API identifier specified \d{12}:nope" + sdk.format("ApiGateway", 404)),
+        ("AWS::ApiGateway::Stage", {"RestApiId": api, "StageName": "nope"},
+         r"Invalid stage identifier specified" + sdk.format("ApiGateway", 404)),
+    ]
+    try:
+        for rtype, identifier, reason in cases:
+            cs = _cfn_import(cfn, stack, {"R": {"Type": rtype, "DeletionPolicy": "Retain"}},
+                             [{"ResourceType": rtype, "LogicalResourceId": "R", "ResourceIdentifier": identifier}])
+            assert (cs["Status"], cs["ExecutionStatus"]) == ("FAILED", "UNAVAILABLE"), rtype
+            assert re.fullmatch(reason, cs["StatusReason"]), (rtype, cs["StatusReason"])
+            _delete_cfn_test_stack(cfn, stack)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        apigw_v1.delete_rest_api(restApiId=api)
+        cognito_idp.delete_user_pool(UserPoolId=pool)
+
+
+def test_cfn_import_of_a_pool_member_another_stack_holds_fails(cfn, cognito_idp):
+    uid = _uuid_mod.uuid4().hex[:8]
+    held, stack = f"cfn-imp-held-{uid}", f"cfn-imp-take-{uid}"
+    other = cognito_idp.create_user_pool(PoolName=f"cfn-imp-other-{uid}")["UserPool"]["Id"]
+    cognito_idp.create_group(UserPoolId=other, GroupName="admins")
+    cfn.create_stack(StackName=held, TemplateBody=json.dumps({"Resources": {
+        "UP": {"Type": "AWS::Cognito::UserPool", "Properties": {"UserPoolName": held}},
+        "UG": {"Type": "AWS::Cognito::UserPoolGroup",
+               "Properties": {"UserPoolId": {"Ref": "UP"}, "GroupName": "admins"}}}}))
+    try:
+        owner = _wait_stack(cfn, held)
+        assert owner["StackStatus"] == "CREATE_COMPLETE"
+        pool = cfn.describe_stack_resource(StackName=held, LogicalResourceId="UP")[
+            "StackResourceDetail"]["PhysicalResourceId"]
+        for pool_id, status, reason in (
+                (pool, "FAILED", f"{pool}|admins already exists in stack {owner['StackId']}"),
+                (other, "CREATE_COMPLETE", None)):
+            group = {"UserPoolId": pool_id, "GroupName": "admins"}
+            cs = _cfn_import(cfn, stack, {"UG": {"Type": "AWS::Cognito::UserPoolGroup",
+                                                 "DeletionPolicy": "Retain", "Properties": group}},
+                             [{"ResourceType": "AWS::Cognito::UserPoolGroup", "LogicalResourceId": "UG",
+                               "ResourceIdentifier": group}])
+            assert cs["Status"] == status
+            if reason:
+                assert cs["StatusReason"] == reason
+            cfn.delete_change_set(StackName=stack, ChangeSetName="imp")
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        _delete_cfn_test_stack(cfn, held)
+        cognito_idp.delete_user_pool(UserPoolId=other)
+
+
 # ---------------------------------------------------------------------------
 # OnFailure, OnStackFailure, DeletionMode, TemplateStage, ClientRequestToken
 # ---------------------------------------------------------------------------

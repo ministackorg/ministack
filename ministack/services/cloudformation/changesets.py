@@ -9,11 +9,13 @@ import copy
 import json
 import logging
 
+import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.cloudwatch_logs as _cw_logs
 import ministack.services.cognito as _cognito
 import ministack.services.dynamodb as _dynamodb
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
+import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
 import ministack.services.s3 as _s3
 import ministack.services.sns as _sns
@@ -191,24 +193,102 @@ def _user_pool_import_problem(pool_id):
     return None
 
 
+def _kms_key_import_problem(key_id):
+    if key_id not in _kms._keys:
+        arn = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
+        return _sdk_error(f"Key '{arn}' does not exist", "Kms", 400)
+    return None
+
+
+def _kms_alias_import_problem(name):
+    # AWS fails the change set without a StatusReason.
+    return None if _kms._alias_arn(name) in _kms._aliases else ""
+
+
+def _thing_type_import_problem(name):
+    if name not in _iot._thing_types:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::ThingType", value=name)
+    return None
+
+
+def _cognito_error(message):
+    return _sdk_error(message, "CognitoIdentityProvider", 400)
+
+
+def _user_pool_client_import_problem(pool_id, client_id):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if client_id not in _cognito._user_pools[pool_id]["_clients"]:
+        return _cognito_error("User pool client does not exist.")
+    return None
+
+
+def _user_pool_group_import_problem(pool_id, group_name):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if group_name not in _cognito._user_pools[pool_id]["_groups"]:
+        return _cognito_error("Group not found.")
+    return None
+
+
+def _resource_server_import_problem(pool_id, identifier):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if identifier not in _cognito._pool_resource_servers(_cognito._user_pools[pool_id]):
+        return _cognito_error(f"{identifier} does not exist in user pool {pool_id}.")
+    return None
+
+
+def _identity_pool_import_problem(pool_id):
+    if pool_id not in _cognito._identity_pools:
+        return _sdk_error(f"IdentityPool '{pool_id}' not found.", "CognitoIdentity", 400)
+    return None
+
+
+def _rest_api_import_problem(api_id):
+    if api_id not in _apigw_v1._rest_apis:
+        return _sdk_error(f"Invalid API identifier specified {get_account_id()}:{api_id}",
+                          "ApiGateway", 404)
+    return None
+
+
+def _stage_import_problem(api_id, stage_name):
+    if api_id not in _apigw_v1._rest_apis:
+        return _rest_api_import_problem(api_id)
+    if stage_name not in _apigw_v1._stages_v1.get(api_id, {}):
+        return _sdk_error("Invalid stage identifier specified", "ApiGateway", 404)
+    return None
+
+
 # The resource types an IMPORT change set looks up before it describes the
-# import: the one ResourceIdentifier key AWS expects, and a lookup in this
+# import: the ResourceIdentifier keys AWS expects, and a lookup in this
 # emulator's own store that returns the StatusReason of the FAILED change set
 # AWS leaves behind when the identifier is invalid or names nothing (measured
 # for a missing value, and for the first five also a blank and an empty one).
-# Types not listed are accepted without a lookup.
+# AWS reports the value of the last key as the change's physical id. Types
+# not listed are accepted without a lookup.
 _IMPORT_LOOKUPS = {
-    "AWS::SQS::Queue": ("QueueUrl", _queue_import_problem),
-    "AWS::SNS::Topic": ("TopicArn", _topic_import_problem),
-    "AWS::S3::Bucket": ("BucketName", _bucket_import_problem),
-    "AWS::DynamoDB::Table": ("TableName", _table_import_problem),
-    "AWS::SSM::Parameter": ("Name", _parameter_import_problem),
-    "AWS::IAM::Role": ("RoleName", _role_import_problem),
-    "AWS::Logs::LogGroup": ("LogGroupName", _log_group_import_problem),
-    "AWS::Lambda::Function": ("FunctionName", _function_import_problem),
-    "AWS::IoT::Policy": ("Id", _iot_policy_import_problem),
-    "AWS::IoT::CACertificate": ("Id", _ca_certificate_import_problem),
-    "AWS::Cognito::UserPool": ("UserPoolId", _user_pool_import_problem),
+    "AWS::SQS::Queue": (("QueueUrl",), _queue_import_problem),
+    "AWS::SNS::Topic": (("TopicArn",), _topic_import_problem),
+    "AWS::S3::Bucket": (("BucketName",), _bucket_import_problem),
+    "AWS::DynamoDB::Table": (("TableName",), _table_import_problem),
+    "AWS::SSM::Parameter": (("Name",), _parameter_import_problem),
+    "AWS::IAM::Role": (("RoleName",), _role_import_problem),
+    "AWS::Logs::LogGroup": (("LogGroupName",), _log_group_import_problem),
+    "AWS::Lambda::Function": (("FunctionName",), _function_import_problem),
+    "AWS::IoT::Policy": (("Id",), _iot_policy_import_problem),
+    "AWS::IoT::CACertificate": (("Id",), _ca_certificate_import_problem),
+    "AWS::Cognito::UserPool": (("UserPoolId",), _user_pool_import_problem),
+    "AWS::KMS::Key": (("KeyId",), _kms_key_import_problem),
+    "AWS::KMS::Alias": (("AliasName",), _kms_alias_import_problem),
+    "AWS::IoT::ThingType": (("ThingTypeName",), _thing_type_import_problem),
+    "AWS::Cognito::UserPoolClient": (("UserPoolId", "ClientId"), _user_pool_client_import_problem),
+    "AWS::Cognito::UserPoolGroup": (("UserPoolId", "GroupName"), _user_pool_group_import_problem),
+    "AWS::Cognito::UserPoolResourceServer": (
+        ("UserPoolId", "Identifier"), _resource_server_import_problem),
+    "AWS::Cognito::IdentityPool": (("Id",), _identity_pool_import_problem),
+    "AWS::ApiGateway::RestApi": (("RestApiId",), _rest_api_import_problem),
+    "AWS::ApiGateway::Stage": (("RestApiId", "StageName"), _stage_import_problem),
 }
 
 
@@ -244,9 +324,10 @@ def _import_changes(resources_to_import, template, diff):
     for entry in resources_to_import:
         logical, rtype = entry["LogicalResourceId"], entry.get("ResourceType")
         identifier = entry.get("ResourceIdentifier") or {}
-        if rtype in _IMPORT_LOOKUPS and list(identifier) != [_IMPORT_LOOKUPS[rtype][0]]:
+        keys = _IMPORT_LOOKUPS[rtype][0] if rtype in _IMPORT_LOOKUPS else None
+        if keys and sorted(identifier) != sorted(keys):
             raise ValueError(f"Invalid resource identifier for resource type {rtype}. "
-                             f"Expected [{_IMPORT_LOOKUPS[rtype][0]}]")
+                             f"Expected [{', '.join(keys)}]")
         if rtype != declared[logical].get("Type"):
             raise ValueError(
                 f"Resource type of [{logical}] passed in ResourceToImport does not match with "
@@ -286,12 +367,13 @@ def _import_changes(resources_to_import, template, diff):
             "Scope": [],
             "Details": [],
         }
-        # AWS reports the identifier value as the physical id (measured for the
-        # five types in _IMPORT_LOOKUPS). How it joins a multi-key identifier
-        # (AWS::IAM::RolePolicy's PolicyName + RoleName, say) is unmeasured, so
-        # none is invented for one.
-        if len(entry["ResourceIdentifier"]) == 1:
-            change["PhysicalResourceId"] = next(iter(entry["ResourceIdentifier"].values()))
+        # How AWS joins the keys of an unlisted multi-key type (AWS::IAM::RolePolicy's
+        # PolicyName + RoleName, say) is unmeasured, so none is invented for one.
+        identifier = entry["ResourceIdentifier"]
+        if entry["ResourceType"] in _IMPORT_LOOKUPS:
+            change["PhysicalResourceId"] = identifier[_IMPORT_LOOKUPS[entry["ResourceType"]][0][-1]]
+        elif len(identifier) == 1:
+            change["PhysicalResourceId"] = next(iter(identifier.values()))
         changes.append({"ResourceChange": change})
     return changes
 
@@ -312,16 +394,23 @@ def _import_owner(resources_to_import):
     from ministack.services.cloudformation import _stacks
     for entry in resources_to_import:
         rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
-        if len(identifier) != 1:
+        if rtype in _IMPORT_LOOKUPS:
+            keys = _IMPORT_LOOKUPS[rtype][0]
+        elif len(identifier) == 1:
+            keys = tuple(identifier)
+        else:
             continue
-        value = next(iter(identifier.values()))
-        ref = _import_ref(rtype, value)
+        # The last key is the physical id; the others are the resource's properties.
+        *parents, last = keys
+        ref = _import_ref(rtype, identifier[last])
         for stack in _stacks.values():
             if stack.get("StackStatus") == "DELETE_COMPLETE":
                 continue
             for res in stack.get("_resources", {}).values():
-                pid = res.get("PhysicalResourceId")
-                if res.get("ResourceType") == rtype and pid and _import_ref(rtype, pid) == ref:
+                pid, props = res.get("PhysicalResourceId"), res.get("Properties") or {}
+                if (res.get("ResourceType") == rtype and pid and _import_ref(rtype, pid) == ref
+                        and all(props.get(key) == identifier[key] for key in parents)):
+                    value = "|".join(identifier[key] for key in keys)
                     return f"{value} already exists in stack {stack['StackId']}"
     return None
 
@@ -336,9 +425,9 @@ def _import_not_found(resources_to_import):
     for entry in resources_to_import:
         rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
         if rtype in _IMPORT_LOOKUPS:
-            key, problem = _IMPORT_LOOKUPS[rtype]
-            reason = problem(identifier[key])
-            if reason:
+            keys, problem = _IMPORT_LOOKUPS[rtype]
+            reason = problem(*(identifier[key] for key in keys))
+            if reason is not None:
                 return reason
             continue
         # A blank name can name nothing, whatever the type.
@@ -592,9 +681,10 @@ def _create_change_set(params):
         with _stack_region_context(stack, stack_id):
             # AWS looks the resource up before it asks whether a stack holds
             # it: a stack's queue deleted behind its back is "not found".
-            import_failure = (_import_not_found(resources_to_import)
-                              or _import_owner(resources_to_import))
-        if import_failure:
+            import_failure = _import_not_found(resources_to_import)
+            if import_failure is None:
+                import_failure = _import_owner(resources_to_import)
+        if import_failure is not None:
             changes = []
 
     cs_id = (
@@ -602,7 +692,7 @@ def _create_change_set(params):
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
-    if import_failure:
+    if import_failure is not None:
         # AWS accepts an import of a resource that does not exist and fails
         # the change set, with no changes, once it looks the resource up.
         _cs_status, _cs_exec, _cs_reason = "FAILED", "UNAVAILABLE", import_failure

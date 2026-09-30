@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — more `IMPORT` types** — SNS topics, KMS keys and aliases, IoT thing types, Cognito user pool clients, groups, resource servers and identity pools, and API Gateway REST APIs and stages can be imported too, identifiers with two keys included, and `Fn::GetAtt` on an identity pool's `Id` resolves.
 - **CloudFormation — `IMPORT` change sets execute** — existing SQS queues, SSM parameters, S3 buckets, DynamoDB tables, IAM roles, log groups, Lambda functions, IoT policies, IoT CA certificates and Cognito user pools are adopted into a new or existing stack without being changed (`IMPORT_IN_PROGRESS` to `IMPORT_COMPLETE`, or a rollback when a resource is gone), and an import that changes `Outputs` or stack tags is refused, as on AWS.
 
 ## [1.5.20] — 2026-10-01
