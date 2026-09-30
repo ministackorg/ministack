@@ -14383,8 +14383,8 @@ def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs, rollback)
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
-    """Logs resource policies expose their policy name without enforcing it."""
+def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn, logs):
+    """Logs resource policies provision through the CloudWatch Logs API."""
     suffix = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-logs-policy-{suffix}"
     policy_name = f"logs-policy-{suffix}"
@@ -14422,6 +14422,8 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
     assert stack["Outputs"][0]["OutputValue"] == policy_name
+    created = {p["policyName"]: p for p in logs.describe_resource_policies()["resourcePolicies"]}
+    assert "InitialPolicy" in created[policy_name]["policyDocument"]
 
     cfn.update_stack(
         StackName=stack_name,
@@ -14439,10 +14441,14 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
     assert stack["Outputs"][0]["OutputValue"] == updated_name
+    names = [p["policyName"] for p in logs.describe_resource_policies()["resourcePolicies"]]
+    assert updated_name in names and policy_name not in names
 
     cfn.delete_stack(StackName=stack_name)
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "DELETE_COMPLETE"
+    names = [p["policyName"] for p in logs.describe_resource_policies()["resourcePolicies"]]
+    assert updated_name not in names
 
 
 def test_cfn_kinesisfirehose_delivery_stream_shares_firehose_state(cfn, fh):

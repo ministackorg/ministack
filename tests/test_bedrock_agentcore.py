@@ -793,7 +793,7 @@ def test_agentcore_state_with_legacy_arns_moves_to_aws_arns():
     }})
     saved = svc.get_state()
     try:
-        svc._restore_state({"runtimes": runtimes, "endpoints": endpoints})
+        svc.load_persisted_state({"runtimes": runtimes, "endpoints": endpoints})
         runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/old-AbCdEfGhIj"
         record = svc._runtimes.get_scoped("000000000000", "us-east-1", "old-AbCdEfGhIj")
         assert record["agentRuntimeArn"] == runtime_arn and "_uuid" not in record
@@ -802,4 +802,4 @@ def test_agentcore_state_with_legacy_arns_moves_to_aws_arns():
         assert eps["DEFAULT"]["agentRuntimeEndpointArn"] == f"{runtime_arn}/runtime-endpoint/DEFAULT"
         assert eps["DEFAULT"]["liveVersion"] == "3"
     finally:
-        svc._restore_state(saved)
+        svc.load_persisted_state(saved)

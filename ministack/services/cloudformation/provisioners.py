@@ -3087,8 +3087,12 @@ def _cwlogs_resource_policy_create(logical_id, props, stack_name):
     policy_name = props.get("PolicyName")
     if not policy_name:
         raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
-    # Local log delivery is intentionally permissive, so the policy only needs
-    # its CloudFormation identity rather than a data-plane enforcement store.
+    document = props.get("PolicyDocument")
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    resp = _cw_logs._put_resource_policy({"policyName": policy_name, "policyDocument": document})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::ResourcePolicy create failed: {resp[2]!r}")
     return policy_name, {}
 
 
@@ -3097,7 +3101,7 @@ def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name
 
 
 def _cwlogs_resource_policy_delete(physical_id, props):
-    pass
+    _cw_logs._delete_resource_policy({"policyName": physical_id})
 
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---

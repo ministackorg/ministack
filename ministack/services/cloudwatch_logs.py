@@ -68,8 +68,10 @@ _destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
 _resource_policies = AccountRegionScopedDict()
-# policy_name -> {policyName, policyDocument, resourceArn, policyScope,
-#                  lastUpdatedTime, revisionId}
+# policy_name -> {policyName, policyDocument, policyScope, lastUpdatedTime, revisionId}
+_log_group_policies = AccountRegionScopedDict()
+# log_group_name -> the one RESOURCE-scoped policy a log group can have
+_MAX_ACCOUNT_RESOURCE_POLICIES = 10
 
 _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
@@ -115,6 +117,7 @@ def get_state():
         "log_groups": copy.deepcopy(_log_groups),
         "destinations": copy.deepcopy(_destinations),
         "resource_policies": copy.deepcopy(_resource_policies),
+        "log_group_policies": copy.deepcopy(_log_group_policies),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
         "log_records": copy.deepcopy(_log_records),
@@ -206,6 +209,7 @@ def _restore_state(data):
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
         _resource_policies.update(data.get("resource_policies", {}))
+        _log_group_policies.update(data.get("log_group_policies", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
         _restore_queries(data.get("queries", {}))
         _log_records.update(data.get("log_records", {}))
@@ -396,6 +400,7 @@ def _delete_log_group(data):
         )
     _forget_log_records_for_group(name)
     del _log_groups[name]
+    _log_group_policies.pop(name, None)
     return json_response({})
 
 
@@ -1594,6 +1599,13 @@ def _format_resource_policy(policy):
     }
 
 
+def _revision_mismatch():
+    return error_response_json(
+        "OperationAbortedException",
+        "The revision id does not match the latest revision id.", 400,
+    )
+
+
 def _put_resource_policy(data):
     name = data.get("policyName")
     document = data.get("policyDocument")
@@ -1602,37 +1614,71 @@ def _put_resource_policy(data):
             "InvalidParameterException",
             "policyName and policyDocument are required.", 400,
         )
+    resource_arn = data.get("resourceArn")
     expected_revision = data.get("expectedRevisionId")
-    existing = _resource_policies.get(name)
-    if expected_revision is not None and (not existing or existing["revisionId"] != expected_revision):
-        return error_response_json(
-            "OperationAbortedException",
-            "The revision id does not match the latest revision id.", 400,
-        )
     policy = {
         "policyName": name,
         "policyDocument": document,
-        "resourceArn": data.get("resourceArn"),
-        "policyScope": data.get("policyScope", "ACCOUNT"),
         "lastUpdatedTime": int(time.time() * 1000),
         "revisionId": new_uuid(),
     }
-    _resource_policies[name] = policy
-    formatted = _format_resource_policy(policy)
-    return json_response({"resourcePolicy": formatted, "revisionId": policy["revisionId"]})
+    if resource_arn:
+        # RESOURCE scope: one policy per existing log group, guarded by its revision.
+        group = _resolve_group_by_arn(resource_arn)
+        if group is None:
+            return error_response_json(
+                "ResourceNotFoundException", "The specified log group does not exist.", 400)
+        existing = _log_group_policies.get(group)
+        if (existing["revisionId"] if existing else None) != expected_revision:
+            return _revision_mismatch()
+        policy.update(policyScope="RESOURCE", resourceArn=resource_arn)
+        _log_group_policies[group] = policy
+    else:
+        existing = _resource_policies.get(name)
+        if expected_revision is not None and (not existing or existing["revisionId"] != expected_revision):
+            return _revision_mismatch()
+        if existing is None and len(_resource_policies) >= _MAX_ACCOUNT_RESOURCE_POLICIES:
+            return error_response_json(
+                "LimitExceededException",
+                f"Resource limit exceeded. An account can have at most "
+                f"{_MAX_ACCOUNT_RESOURCE_POLICIES} resource policies.", 400)
+        policy["policyScope"] = "ACCOUNT"
+        _resource_policies[name] = policy
+    return json_response({"resourcePolicy": _format_resource_policy(policy),
+                          "revisionId": policy["revisionId"]})
 
 
 def _describe_resource_policies(data):
     resource_arn = data.get("resourceArn")
-    policies = [
-        _format_resource_policy(p) for p in _resource_policies.values()
-        if not resource_arn or p.get("resourceArn") == resource_arn
-    ]
-    return json_response({"resourcePolicies": policies})
+    scope = data.get("policyScope") or "ACCOUNT"
+    if scope not in ("ACCOUNT", "RESOURCE"):
+        return error_response_json(
+            "InvalidParameterException", f"Invalid policyScope: {scope}", 400)
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        found = _log_group_policies.get(group) if group else None
+        policies = [found] if found else []
+    elif scope == "RESOURCE":
+        policies = list(_log_group_policies.values())
+    else:
+        policies = list(_resource_policies.values())
+    return json_response({"resourcePolicies": [_format_resource_policy(p) for p in policies]})
 
 
 def _delete_resource_policy(data):
     name = data.get("policyName")
+    resource_arn = data.get("resourceArn")
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        existing = _log_group_policies.get(group) if group else None
+        if existing is None:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified resource policy does not exist: {name}", 400)
+        if data.get("expectedRevisionId") != existing["revisionId"]:
+            return _revision_mismatch()
+        del _log_group_policies[group]
+        return json_response({})
     if not name or name not in _resource_policies:
         return error_response_json(
             "ResourceNotFoundException",
@@ -2093,6 +2139,7 @@ def reset():
     _log_groups.clear()
     _destinations.clear()
     _resource_policies.clear()
+    _log_group_policies.clear()
     _metric_filters.clear()
     _queries.clear()
     _log_records.clear()
