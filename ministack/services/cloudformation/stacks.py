@@ -933,11 +933,15 @@ _DIFFED_ATTRIBUTES = (
 )
 
 
+_POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
+                   "Snapshot": "Snapshot"}
+
+
 def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
-    """The PolicyAction member of a change that deletes the old resource, else none."""
-    if res_def.get(attribute, _default_resource_policy(res_def, attribute)) != "Delete":
-        return {}
-    return {"PolicyAction": prefix + "Delete"}
+    """The PolicyAction member for the policy in effect on the old resource."""
+    policy = res_def.get(attribute, _default_resource_policy(res_def, attribute))
+    action = _POLICY_ACTIONS.get(policy) if isinstance(policy, str) else None
+    return {"PolicyAction": prefix + action} if action else {}
 
 
 def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:

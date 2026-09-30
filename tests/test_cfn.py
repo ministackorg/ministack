@@ -25199,6 +25199,35 @@ def test_change_set_members_follow_the_action(cfn, stack, edit, logical, action,
     assert {d["Target"].get("RequiresRecreation") for d in change["Details"]} == recreation
 
 
+@pytest.mark.parametrize("policies,rtype,expected", [
+    ({"DeletionPolicy": "Retain"}, "AWS::SSM::Parameter", "Retain"),
+    ({"DeletionPolicy": "RetainExceptOnCreate"}, "AWS::SSM::Parameter", "Retain"),
+    ({"DeletionPolicy": "Snapshot"}, "AWS::EC2::Volume", "Snapshot"),
+    ({}, "AWS::RDS::DBCluster", "Snapshot"),
+    ({"DeletionPolicy": {"Fn::If": ["C", "Retain", "Delete"]}}, "AWS::SSM::Parameter", None),
+], ids=["retain", "retain-except-on-create", "snapshot", "rds-default", "intrinsic"])
+def test_change_set_remove_reports_the_deletion_policy(policies, rtype, expected):
+    from ministack.services.cloudformation.stacks import _diff_resources
+
+    old = {"Resources": {"R": {"Type": rtype, "Properties": {}, **policies}}}
+    change = _diff_resources(old, {"Resources": {}})[0]["ResourceChange"]
+    assert change.get("PolicyAction") == expected
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("Retain", "ReplaceAndRetain"), ("Snapshot", "ReplaceAndSnapshot"), ("Delete", "ReplaceAndDelete"),
+])
+def test_change_set_replacement_reports_the_update_replace_policy(policy, expected):
+    from ministack.services.cloudformation.stacks import _diff_resources
+
+    def template(name):
+        return {"Resources": {"Q": {"Type": "AWS::SQS::Queue", "UpdateReplacePolicy": policy,
+                                    "Properties": {"QueueName": name}}}}
+
+    change = _diff_resources(template("a"), template("b"))[0]["ResourceChange"]
+    assert (change["Replacement"], change.get("PolicyAction")) == ("True", expected)
+
+
 def test_cfn_appconfig_application_updates_in_place(cfn, appconfig_client):
     """An application update keeps its id."""
     suffix = _uuid_mod.uuid4().hex[:8]
