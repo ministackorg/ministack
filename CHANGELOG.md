@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **ECS — `DescribeClusters` statistics** — `include=["STATISTICS"]` returns the sixteen running/pending task and active/draining service counters per launch type instead of an empty list.
 - **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
 
 ## [1.5.20] — 2026-10-01
