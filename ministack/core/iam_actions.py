@@ -696,8 +696,6 @@ def extract_iam_action(service: str, method: str, path: str,
             return f"lambda:{action_name}"
 
     if service == "bedrock-agentcore" and method == "POST":
-        # AgentCore runtime ARNs contain slashes and SDKs percent-encode them
-        # into the path label. Match only InvokeAgentRuntime's data-plane URI.
         if _agentcore_runtime_arn(path):
             return "bedrock-agentcore:InvokeAgentRuntime"
 
@@ -862,9 +860,6 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "bedrock-agentcore" and method == "POST":
-        # InvokeAgentRuntime addresses a specific runtime in the URI. The ARN
-        # itself contains slashes and is percent-encoded by SDKs, so decode it
-        # before returning it to IAM policy evaluation.
         return _agentcore_runtime_arn(path) or "*"
 
     if service == "lambda":
