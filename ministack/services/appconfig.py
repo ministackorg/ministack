@@ -204,6 +204,13 @@ def _update_application(app_id, body):
     return _json(200, app)
 
 
+def _drop_deployments(prefix):
+    """Drop the deployments under an application or environment key prefix, with their tags."""
+    for key in [k for k in _deployments if k.startswith(prefix)]:
+        del _deployments[key]
+        _tags.pop(_deployment_arn(*key.split("/")), None)
+
+
 def _delete_application(app_id):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
@@ -221,9 +228,7 @@ def _delete_application(app_id):
     keys_to_remove = [k for k in _hosted_version_counters if k.startswith(f"{app_id}/")]
     for k in keys_to_remove:
         _hosted_version_counters.pop(k, None)
-    keys_to_remove = [k for k in _deployments if k.startswith(f"{app_id}/")]
-    for k in keys_to_remove:
-        _deployments.pop(k, None)
+    _drop_deployments(f"{app_id}/")
     return _json(204, {})
 
 
@@ -287,6 +292,7 @@ def _delete_environment(app_id, env_id):
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
     del _environments[key]
     _tags.pop(_env_arn(app_id, env_id), None)
+    _drop_deployments(f"{key}/")
     return _json(204, {})
 
 

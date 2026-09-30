@@ -140,6 +140,28 @@ def test_appconfig_delete_environment(appconfig_client):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_appconfig_delete_environment_drops_its_deployments(appconfig_client):
+    """A deployment of a deleted environment is not found."""
+    app = appconfig_client.create_application(Name="env-delete-deploy-app")
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="to-delete")
+    profile = appconfig_client.create_configuration_profile(
+        ApplicationId=app["Id"], Name="env-delete-deploy-profile", LocationUri="hosted")
+    appconfig_client.create_hosted_configuration_version(
+        ApplicationId=app["Id"], ConfigurationProfileId=profile["Id"],
+        Content=b"config", ContentType="text/plain")
+    strategy = appconfig_client.create_deployment_strategy(
+        Name="env-delete-deploy-strat", DeploymentDurationInMinutes=0,
+        GrowthFactor=100.0, ReplicateTo="NONE")
+    ids = {"ApplicationId": app["Id"], "EnvironmentId": env["Id"]}
+    number = appconfig_client.start_deployment(
+        **ids, DeploymentStrategyId=strategy["Id"], ConfigurationProfileId=profile["Id"],
+        ConfigurationVersion="1")["DeploymentNumber"]
+    appconfig_client.delete_environment(**ids)
+    with pytest.raises(ClientError) as exc:
+        appconfig_client.get_deployment(**ids, DeploymentNumber=number)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # Configuration Profiles
 # ---------------------------------------------------------------------------

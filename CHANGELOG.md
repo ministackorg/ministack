@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — a deleted `AWS::AppConfig::Deployment` stays in `ListDeployments`** — the stack delete removed the deployment, so a replaced deployment left the environment's history and the next one reused its number; it now stays until its environment is deleted, which, through the API or with its stack, also removes its deployments and their tags.
 - **AppConfig — hosted configuration version numbers are never reused** — a version created after a delete, and the replacement CloudFormation makes for a changed `HostedConfigurationVersion`, get the next unused number instead of overwriting the live one, and a `LatestVersionNumber` mismatch reports the AWS message.
 - **EventBridge — `PutEvents` refuses `aws.*` sources** — an entry whose `Source` starts with `aws.` now fails with `NotAuthorizedForSourceException` in its result entry and counts in `FailedEntryCount`, while the other entries of the batch are still delivered; previously it was dispatched to rules and archives like a custom event.
 - **Bedrock AgentCore — `InvokeAgentRuntime` enforces IAM policies** — with `AUTH=true`, runtime invocations now resolve to `bedrock-agentcore:InvokeAgentRuntime` and authorize against the ARN in the request path, so a policy can allow one runtime and deny another. Previously, the action was not extracted and the request bypassed identity-policy evaluation.

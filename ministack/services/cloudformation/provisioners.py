@@ -2718,6 +2718,7 @@ def _appconfig_application_update(physical_id, old_props, new_props, stack_name,
 def _appconfig_application_delete(physical_id, props):
     _appconfig._applications.pop(physical_id, None)
     _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
+    _appconfig._drop_deployments(f"{physical_id}/")
 
 
 # --- AppConfig Environment ---
@@ -2779,6 +2780,7 @@ def _appconfig_environment_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._environments.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._env_arn(app_id, physical_id), None)
+    _appconfig._drop_deployments(f"{app_id}/{physical_id}/")
 
 
 # --- AppConfig ConfigurationProfile ---
@@ -3015,18 +3017,6 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
     # value on the AWS CFN page; we return the deploy_num as the physical id
     # so CDK templates that Ref a Deployment still resolve.
     return str(deploy_num), {"DeploymentNumber": deploy_num, "State": "COMPLETE"}
-
-
-def _appconfig_deployment_delete(physical_id, props):
-    app_id = props.get("ApplicationId", "")
-    env_id = props.get("EnvironmentId", "")
-    _appconfig._deployments.pop(f"{app_id}/{env_id}/{physical_id}", None)
-    deploy_arn = (
-        f"arn:aws:appconfig:{_appconfig.get_region()}:"
-        f"{_appconfig.get_account_id()}:application/{app_id}/"
-        f"environment/{env_id}/deployment/{physical_id}"
-    )
-    _appconfig._tags.pop(deploy_arn, None)
 
 
 # --- CloudWatch Logs LogGroup ---
@@ -11361,7 +11351,8 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AppConfig::Deployment": {
         "create": _appconfig_deployment_create,
-        "delete": _appconfig_deployment_delete,
+        # A deleted deployment stays in ListDeployments, and its number stays taken.
+        "delete": _cfn_noop_delete,
     },
     "AWS::Logs::LogGroup": {
         "create": _cwlogs_create,
