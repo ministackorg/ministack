@@ -9,13 +9,14 @@ Covers the two AgentCore services, which both sign as ``bedrock-agentcore``:
     UpdateAgentRuntime, DeleteAgentRuntime, ListAgentRuntimeVersions,
     CreateAgentRuntimeEndpoint, GetAgentRuntimeEndpoint,
     ListAgentRuntimeEndpoints, UpdateAgentRuntimeEndpoint,
-    DeleteAgentRuntimeEndpoint.
+    DeleteAgentRuntimeEndpoint, PutResourcePolicy, GetResourcePolicy,
+    DeleteResourcePolicy.
   * ``bedrock-agentcore`` (rest-json) — data plane: InvokeAgentRuntime.
 
 Deterministic and stateful: resources provision instantly (``READY``) and
 InvokeAgentRuntime returns a deterministic echo response, so teams can test
-runtime lifecycle, endpoint wiring, and Invoke request/response contracts
-locally without live AWS.
+runtime lifecycle, endpoint wiring, resource-policy authorization, and Invoke
+request/response contracts locally without live AWS.
 
 Shapes, HTTP methods, URIs, ARN/ID patterns, and status enums are verified
 against botocore ``bedrock-agentcore-control`` / ``bedrock-agentcore``
@@ -45,6 +46,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 
 logger = logging.getLogger("bedrock_agentcore")
@@ -55,6 +57,7 @@ logger = logging.getLogger("bedrock_agentcore")
 
 _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
+_resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
 _containers = {}  # (account, region, runtime id) -> Docker container
 _container_lock = threading.RLock()
 
@@ -64,7 +67,11 @@ _NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,47}$")
 
 
 def get_state():
-    return copy.deepcopy({"runtimes": _runtimes, "endpoints": _endpoints})
+    return copy.deepcopy({
+        "runtimes": _runtimes,
+        "endpoints": _endpoints,
+        "resourcePolicies": _resource_policies,
+    })
 
 
 def load_persisted_state(data):
@@ -76,8 +83,10 @@ def _restore_state(data):
         return
     _runtimes.clear()
     _endpoints.clear()
+    _resource_policies.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
+    _resource_policies.update(data.get("resourcePolicies", {}))
 
 
 
@@ -89,6 +98,7 @@ def reset():
         _containers.clear()
     _runtimes.clear()
     _endpoints.clear()
+    _resource_policies.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +123,100 @@ def _runtime_arn(runtime_uuid: str, version: str) -> str:
 def _endpoint_arn(endpoint_uuid: str) -> str:
     return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
             f"agentEndpoint/{endpoint_uuid}")
+
+
+def _arn_owner(resource_arn: str) -> tuple[str, str] | None:
+    """Return the account and region encoded in an ARN."""
+    parts = resource_arn.split(":")
+    if len(parts) < 6 or parts[0] != "arn" or not parts[3] or not parts[4]:
+        return None
+    return parts[4], parts[3]
+
+
+def _resource_exists(resource_arn: str, account_id: str, region: str) -> bool:
+    """Whether a Runtime or Endpoint with this exact ARN exists."""
+    if any(r.get("agentRuntimeArn") == resource_arn
+           for r in _runtimes.values_scoped(account_id, region)):
+        return True
+    for endpoints in _endpoints.values_scoped(account_id, region):
+        if any(e.get("agentRuntimeEndpointArn") == resource_arn
+               for e in endpoints.values()):
+            return True
+    return False
+
+
+def _policy_validation(resource_arn: str, policy: str) -> str | None:
+    """Validate AgentCore's resource-policy-specific constraints."""
+    from ministack.core.iam_evaluator import validate_policy_document
+
+    if len(policy) > 20_480:
+        return "policy exceeds the maximum length of 20480 characters"
+    error = validate_policy_document(policy)
+    if error:
+        return error
+    try:
+        document = json.loads(policy)
+    except json.JSONDecodeError:
+        return "Policy document is not valid JSON"
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    for index, statement in enumerate(statements):
+        if "Principal" not in statement:
+            return f"Statement {index} must contain a Principal element"
+        if "NotPrincipal" in statement:
+            return "NotPrincipal is not supported by MiniStack AgentCore policies"
+        resources = statement.get("Resource")
+        if isinstance(resources, str):
+            resources = [resources]
+        if not isinstance(resources, list) or resources != [resource_arn]:
+            return (
+                f"Statement {index} Resource must contain exactly "
+                f"{resource_arn}"
+            )
+    return None
+
+
+def _put_resource_policy(resource_arn: str, body):
+    data = _parse_body(body)
+    policy = data.get("policy")
+    owner = _arn_owner(resource_arn)
+    if not isinstance(policy, str) or not policy:
+        return _validation("policy is required")
+    if owner is None:
+        return _validation("resourceArn must be a valid ARN")
+    account_id, region = owner
+    if not _resource_exists(resource_arn, account_id, region):
+        return _not_found(f"Resource {resource_arn} not found")
+    error = _policy_validation(resource_arn, policy)
+    if error:
+        return _validation(error)
+    _resource_policies.set_scoped(account_id, region, resource_arn, policy)
+    return json_response({"policy": policy}, status=201)
+
+
+def _get_resource_policy(resource_arn: str):
+    owner = _arn_owner(resource_arn)
+    if owner is None:
+        return _validation("resourceArn must be a valid ARN")
+    if not _resource_exists(resource_arn, *owner):
+        return _not_found(f"Resource {resource_arn} not found")
+    policy = _resource_policies.get_scoped(*owner, resource_arn)
+    if policy is None:
+        return _not_found(f"Resource policy for {resource_arn} not found")
+    return json_response({"policy": policy})
+
+
+def _delete_resource_policy(resource_arn: str):
+    owner = _arn_owner(resource_arn)
+    if owner is None:
+        return _validation("resourceArn must be a valid ARN")
+    if not _resource_exists(resource_arn, *owner):
+        return _not_found(f"Resource {resource_arn} not found")
+    deleted = _resource_policies.pop_scoped(*owner, resource_arn, None)
+    if deleted is None:
+        return _not_found(f"Resource policy for {resource_arn} not found")
+    return 204, {"Content-Type": "application/json"}, b""
 
 
 def _workload_identity_arn(name: str) -> str:
@@ -255,10 +359,12 @@ def _update_agent_runtime(runtime_id, body):
         if not data.get(field):
             return _validation(f"{field} is required")
     _stop_container(runtime_id)
+    old_arn = record["agentRuntimeArn"]
     now = now_iso()
     new_version = str(int(record["agentRuntimeVersion"]) + 1)
     record["agentRuntimeVersion"] = new_version
     record["agentRuntimeArn"] = _runtime_arn(record["_uuid"], new_version)
+    _resource_policies.pop(old_arn, None)
     record["lastUpdatedAt"] = now
     record["status"] = "READY"
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
@@ -285,6 +391,9 @@ def _delete_agent_runtime(runtime_id):
     if record is None:
         return _not_found(f"Agent runtime {runtime_id} not found")
     _stop_container(runtime_id)
+    _resource_policies.pop(record["agentRuntimeArn"], None)
+    for endpoint in (_endpoints.get(runtime_id) or {}).values():
+        _resource_policies.pop(endpoint.get("agentRuntimeEndpointArn"), None)
     _runtimes.pop(runtime_id, None)
     _endpoints.pop(runtime_id, None)
     return json_response({"status": "DELETING", "agentRuntimeId": runtime_id})
@@ -402,7 +511,9 @@ def _delete_agent_runtime_endpoint(runtime_id, endpoint_name):
     endpoints = _endpoints.get(runtime_id) or {}
     if endpoint_name not in endpoints:
         return _not_found(f"Endpoint {endpoint_name} not found")
-    endpoints.pop(endpoint_name, None)
+    endpoint = endpoints.pop(endpoint_name, None)
+    if endpoint:
+        _resource_policies.pop(endpoint.get("agentRuntimeEndpointArn"), None)
     return json_response({
         "status": "DELETING",
         "agentRuntimeId": runtime_id,
@@ -414,14 +525,178 @@ def _delete_agent_runtime_endpoint(runtime_id, endpoint_name):
 # Data plane — InvokeAgentRuntime
 # ---------------------------------------------------------------------------
 
-def _invoke_agent_runtime(runtime_arn, headers, body):
-    # The runtime is addressed by ARN; resolve it in this account+region.
-    runtime = next((r for r in _runtimes.values()
-                    if r["agentRuntimeArn"] == runtime_arn
-                    or r["agentRuntimeArn"].rsplit(":", 1)[0] == runtime_arn.rsplit(":", 1)[0]),
-                   None)
+def _find_runtime(runtime_arn):
+    """Resolve a runtime by the owner account encoded in its ARN."""
+    owner = _arn_owner(runtime_arn)
+    if owner is None:
+        return None, None, None
+    account_id, region = owner
+    runtime = next(
+        (
+            record
+            for record in _runtimes.values_scoped(account_id, region)
+            if record["agentRuntimeArn"] == runtime_arn
+            or record["agentRuntimeArn"].rsplit(":", 1)[0]
+            == runtime_arn.rsplit(":", 1)[0]
+        ),
+        None,
+    )
+    return runtime, account_id, region
+
+
+def _endpoint_for_qualifier(runtime, account_id, region, qualifier):
+    if not qualifier:
+        return None
+    endpoints = _endpoints.get_scoped(account_id, region, runtime["agentRuntimeId"], {})
+    return endpoints.get(qualifier)
+
+
+def _principal_context(action, resource_arn, region):
+    from ministack.core.iam_evaluator import caller_arn
+
+    principal = caller_arn()
+    parts = principal.split(":")
+    account_id = parts[4] if len(parts) > 4 else get_account_id()
+    if ":assumed-role/" in principal:
+        principal_type = "AssumedRole"
+    elif ":user/" in principal:
+        principal_type = "User"
+    else:
+        principal_type = "Root"
+    from ministack.core.iam_evaluator import EvalContext
+
+    return EvalContext(
+        principal_arn=principal,
+        principal_type=principal_type,
+        principal_account=account_id,
+        action=action,
+        resource_arn=resource_arn,
+        region=region,
+    )
+
+
+def _resource_policy_decision(resource_arn, account_id, region, action):
+    from ministack.core.iam_evaluator import evaluate_resource_policy
+
+    policy = _resource_policies.get_scoped(account_id, region, resource_arn)
+    if policy is None:
+        return None
+    return evaluate_resource_policy(
+        policy, _principal_context(action, resource_arn, region)
+    )
+
+
+def _resource_policy_allows_invocation(
+    runtime, account_id, region, qualifier, headers, query_params
+):
+    from ministack.core.iam_evaluator import resource_policy_allows
+
+    action = "bedrock-agentcore:InvokeAgentRuntime"
+    runtime_arn = runtime["agentRuntimeArn"]
+    principal = _principal_context(action, runtime_arn, region)
+    same_account = principal.principal_account == account_id
+    runtime_policy = _resource_policies.get_scoped(account_id, region, runtime_arn)
+    if not resource_policy_allows(runtime_policy, principal, same_account):
+        return False
+
+    # A named endpoint is an additional policy resource. AWS requires both the
+    # runtime and endpoint policies for cross-account invocation.
+    endpoint = _endpoint_for_qualifier(runtime, account_id, region, qualifier)
+    if qualifier and endpoint is None:
+        return False
+    if not same_account and endpoint is None:
+        return False
+    if endpoint is not None:
+        endpoint_arn = endpoint["agentRuntimeEndpointArn"]
+        endpoint_policy = _resource_policies.get_scoped(
+            account_id, region, endpoint_arn
+        )
+        endpoint_context = _principal_context(action, endpoint_arn, region)
+        if not resource_policy_allows(
+            endpoint_policy, endpoint_context, same_account
+        ):
+            return False
+        if not same_account:
+            from ministack.core.iam_evaluator import enforce
+            from ministack.core.router import extract_access_key_id
+
+            identity_result = enforce(
+                extract_access_key_id(headers, query_params or {}),
+                action,
+                "bedrock-agentcore",
+                region,
+                resource_arn=endpoint_arn,
+            )
+            if identity_result is not None:
+                return False
+    return True
+
+
+def resource_policy_allows_without_identity(path, query_params):
+    """Return whether a same-account resource policy can replace an identity Allow."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return False
+    inner = path.strip("/")
+    if not (inner.startswith("runtimes/") and inner.endswith("/invocations")):
+        return False
+    runtime_arn = unquote(inner[len("runtimes/"):-len("/invocations")])
+    runtime, account_id, region = _find_runtime(runtime_arn)
+    if runtime is None:
+        return False
+    principal = _principal_context(
+        "bedrock-agentcore:InvokeAgentRuntime", runtime_arn, region
+    )
+    if principal.principal_account != account_id:
+        return False
+    runtime_decision = _resource_policy_decision(
+        runtime_arn, account_id, region, "bedrock-agentcore:InvokeAgentRuntime"
+    )
+    if runtime_decision is None or runtime_decision.decision != "Allow":
+        return False
+    qualifier = query_params.get("qualifier") if query_params else None
+    if isinstance(qualifier, list):
+        qualifier = qualifier[0] if qualifier else None
+    endpoint = _endpoint_for_qualifier(runtime, account_id, region, qualifier)
+    if endpoint is None:
+        return True
+    endpoint_decision = _resource_policy_decision(
+        endpoint["agentRuntimeEndpointArn"], account_id, region,
+        "bedrock-agentcore:InvokeAgentRuntime",
+    )
+    return endpoint_decision is not None and endpoint_decision.decision == "Allow"
+
+
+def _invoke_agent_runtime(runtime_arn, headers, body, query_params=None):
+    runtime, owner_account, owner_region = _find_runtime(runtime_arn)
     if runtime is None:
         return _not_found(f"Agent runtime {runtime_arn} not found")
+
+    qualifier = query_params.get("qualifier") if query_params else None
+    if isinstance(qualifier, list):
+        qualifier = qualifier[0] if qualifier else None
+    endpoint = _endpoint_for_qualifier(runtime, owner_account, owner_region, qualifier)
+    if qualifier and endpoint is None:
+        return _not_found(f"Agent runtime endpoint {qualifier} not found")
+
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import pin_request_caller
+    pin_request_caller(headers, query_params or {})
+    if AUTH and not _resource_policy_allows_invocation(
+        runtime, owner_account, owner_region, qualifier, headers, query_params
+    ):
+        return error_response_json(
+            "AccessDeniedException",
+            f"User: {get_account_id()} is not authorized to perform: "
+            f"bedrock-agentcore:InvokeAgentRuntime on resource: {runtime_arn}",
+            403,
+        )
+
+    with request_scope(owner_account, owner_region):
+        return _invoke_agent_runtime_in_owner(runtime, headers, body)
+
+
+def _invoke_agent_runtime_in_owner(runtime, headers, body):
 
     session_id = (headers.get("x-amzn-bedrock-agentcore-runtime-session-id")
                   or new_uuid())
@@ -651,13 +926,27 @@ def _invoke_container(url, body, headers, content_type, session_id):
 
 async def handle_request(method, path, headers, body, query_params):
     inner = path.strip("/")
+    if inner.startswith("resourcepolicy/"):
+        resource_arn = unquote(inner[len("resourcepolicy/"):])
+        if method == "PUT":
+            return _put_resource_policy(resource_arn, body)
+        if method == "GET":
+            return _get_resource_policy(resource_arn)
+        if method == "DELETE":
+            return _delete_resource_policy(resource_arn)
+        return error_response_json(
+            "InvalidAction", f"Unsupported AgentCore request: {method} {path}", 400
+        )
+
     # InvokeAgentRuntime: POST /runtimes/{agentRuntimeArn}/invocations. The ARN
     # is a single path label but carries literal '/' and ':' (agent/{uuid}:{ver}),
     # so match the suffix before splitting on '/'.
     if (method == "POST" and inner.startswith("runtimes/")
             and inner.endswith("/invocations")):
         arn = inner[len("runtimes/"):-len("/invocations")]
-        return await asyncio.to_thread(_invoke_agent_runtime, unquote(arn), headers, body)
+        return await asyncio.to_thread(
+            _invoke_agent_runtime, unquote(arn), headers, body, query_params
+        )
 
     parts = [p for p in inner.split("/") if p]
     # All remaining AgentCore paths are rooted at /runtimes.
@@ -682,7 +971,9 @@ async def handle_request(method, path, headers, body, query_params):
     elif n == 3:
         seg = parts[2]
         if seg == "invocations" and method == "POST":
-            return await asyncio.to_thread(_invoke_agent_runtime, unquote(parts[1]), headers, body)
+            return await asyncio.to_thread(
+                _invoke_agent_runtime, unquote(parts[1]), headers, body, query_params
+            )
         runtime_id = unquote(parts[1])
         if seg == "versions" and method == "POST":
             return _list_agent_runtime_versions(runtime_id, body)

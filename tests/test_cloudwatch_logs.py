@@ -971,6 +971,78 @@ def test_logs_put_destination_policy(logs):
 
 
 # ---------------------------------------------------------------------------
+# Account-level resource policies (PutResourcePolicy / DescribeResourcePolicies
+# / DeleteResourcePolicy) - distinct from PutDestinationPolicy above (which
+# sets accessPolicy on one classic Destination) and from
+# PutDeliveryDestinationPolicy (which authorizes the vended-logs delivery
+# service for one DeliveryDestination). This family grants log-group-level
+# actions such as PutSubscriptionFilter, CreateExportTask or the
+# CloudWatch Logs Resource Policy Crossplane manages for cross-service log
+# delivery, to any principal named in the policy document.
+# ---------------------------------------------------------------------------
+
+def test_logs_resource_policy_crud(logs):
+    """Put/Describe/Delete round-trip for an account-level resource policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"intg-resource-policy-{uid}"
+    document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowLogsDelivery",
+                    "Effect": "Allow",
+                    "Principal": {"Service": "delivery.logs.amazonaws.com"},
+                    "Action": "logs:PutSubscriptionFilter",
+                    "Resource": "*",
+                }
+            ],
+        }
+    )
+
+    put_resp = logs.put_resource_policy(policyName=name, policyDocument=document)
+    assert put_resp["resourcePolicy"]["policyName"] == name
+    assert put_resp["resourcePolicy"]["policyDocument"] == document
+    assert put_resp["resourcePolicy"]["revisionId"] == put_resp["revisionId"]
+
+    describe_resp = logs.describe_resource_policies()
+    policy = next(p for p in describe_resp["resourcePolicies"] if p["policyName"] == name)
+    assert policy["policyDocument"] == document
+
+    logs.delete_resource_policy(policyName=name)
+    describe_resp = logs.describe_resource_policies()
+    assert not any(p["policyName"] == name for p in describe_resp["resourcePolicies"])
+
+
+def test_logs_resource_policy_requires_name_and_document(logs):
+    with pytest.raises(ClientError) as exc:
+        logs.put_resource_policy(policyName="", policyDocument="{}")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_logs_delete_resource_policy_requires_existing(logs):
+    with pytest.raises(ClientError) as exc:
+        logs.delete_resource_policy(policyName="does-not-exist")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_logs_put_resource_policy_rejects_stale_revision(logs):
+    """expectedRevisionId lets a caller detect concurrent modification."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"intg-resource-policy-rev-{uid}"
+    put_resp = logs.put_resource_policy(policyName=name, policyDocument="{}")
+    stale_revision = put_resp["revisionId"] + "-stale"
+
+    with pytest.raises(ClientError) as exc:
+        logs.put_resource_policy(
+            policyName=name, policyDocument="{}", expectedRevisionId=stale_revision,
+        )
+    assert exc.value.response["Error"]["Code"] == "OperationAbortedException"
+
+    logs.delete_resource_policy(policyName=name)
+
+
+# ---------------------------------------------------------------------------
 # ARN-based tagging operations (TagResource / UntagResource)
 # ---------------------------------------------------------------------------
 

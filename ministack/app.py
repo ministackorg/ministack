@@ -2412,9 +2412,10 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
         )
-        from ministack.core.iam_evaluator import AuthError, enforce
+        from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
 
+        pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
@@ -2462,6 +2463,18 @@ async def _dispatch_service_request(
                     )
                     if denied:
                         break
+            if (
+                denied
+                and service == "bedrock-agentcore"
+                and iam_action == "bedrock-agentcore:InvokeAgentRuntime"
+                and not isinstance(denied, AuthError)
+            ):
+                from ministack.services import bedrock_agentcore
+
+                if bedrock_agentcore.resource_policy_allows_without_identity(
+                    path, query_params
+                ):
+                    denied = None
             if denied:
                 if isinstance(denied, AuthError):
                     return access_denied_response(
