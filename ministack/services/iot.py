@@ -6443,7 +6443,9 @@ async def broker_publish(
                 continue
             if sub.no_local and client_id is not None and sub.client_id == client_id:
                 continue
-            if _topic_matches(sub.filter_prefixed, scoped):
+            if _topic_matches(
+                _unscope_topic(sub.account_id, sub.region, sub.filter_prefixed), topic
+            ):
                 # Retain As Published forwards the publisher's flag; without
                 # it the flag is cleared, so a subscriber can tell a live
                 # message from a retained one (§3.3.1.3).
@@ -6475,8 +6477,7 @@ async def broker_publish(
             if _is_session_expired(ps):
                 continue
             for filt in ps.subscriptions:
-                scoped_filter = _scoped_topic(ps_account_id, ps_region, filt)
-                if _topic_matches(scoped_filter, scoped):
+                if _topic_matches(filt, topic):
                     ps.queued_messages.append((topic, payload, qos))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
@@ -6564,7 +6565,7 @@ async def broker_subscribe(
                 r
                 for k, r in _retained.items()
                 if k.startswith(scope_prefix)
-                and _topic_matches(filter_prefixed, k)
+                and _topic_matches(topic_filter, k[len(scope_prefix):])
             ]
         else:
             retained_to_send = []

@@ -2086,6 +2086,26 @@ def test_iot_broker_region_wildcards_cannot_bypass_isolation(
     reset()
 
 
+def test_iot_broker_wildcard_region_does_not_widen_its_own_filters():
+    """A ``#`` region in the scope prefix must not turn a filter into ``#``."""
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        received = []
+
+        async def callback(topic, payload, qos):
+            received.append(topic)
+
+        await broker_subscribe(account_id, "#", "sensors/temp", callback)
+        await broker_publish(account_id, "#", "other/topic", b"x")
+        await broker_publish(account_id, "#", "sensors/temp", b"x")
+        assert received == ["sensors/temp"]
+
+    asyncio.run(_run())
+    reset()
+
+
 def test_iot_broker_persistent_sessions_are_region_isolated():
     reset()
 
