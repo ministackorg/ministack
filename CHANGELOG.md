@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — EKS cluster and node group updates** — `AWS::EKS::Cluster` applies `Version`, `Logging`, `ResourcesVpcConfig`, `AccessConfig.AuthenticationMode` and `Tags` in place and `AWS::EKS::Nodegroup` applies `ScalingConfig`, `Labels`, `Taints`, `UpdateConfig`, `LaunchTemplate`, `Version`, `ReleaseVersion` and `Tags`, where every such change used to report `UPDATE_COMPLETE` and was dropped.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
