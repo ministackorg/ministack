@@ -2377,16 +2377,6 @@ def _start_rds_container_for_instance(db_id, instance):
     # Legacy instances persisted before `_HostPort` was stored fall back to a
     # fresh free port from `_next_port()`.
     host_port = instance.get("_HostPort") or _next_port()
-    # If the stored host port was claimed by something else between
-    # restarts (another ministack, another db instance, a user app),
-    # docker bind would fail with "port is already allocated". Fall
-    # back to a fresh free port and persist it so subsequent restarts
-    # converge on a stable mapping again.
-    if not _is_host_port_free(host_port):
-        logger.info("RDS: persisted host port %d for %s is in use; "
-                    "allocating fresh free port", host_port, db_id)
-        host_port = _next_port()
-    instance["_HostPort"] = host_port
 
     image, env_vars, container_port, data_path = _docker_image_for_engine(
         engine, engine_version, master_user, master_pass, db_name,
@@ -2428,6 +2418,18 @@ def _start_rds_container_for_instance(db_id, instance):
                 pass  # Good — name is gone.
         except Exception:
             pass  # No existing container with that name — fine
+
+    # Checked after our own stale container is gone. If the port is still
+    # taken, move and republish it so the endpoint stays reachable.
+    if not _is_host_port_free(host_port):
+        logger.info("RDS: persisted host port %d for %s is in use; "
+                    "allocating fresh free port", host_port, db_id)
+        if endpoint.get("Port") == host_port:
+            endpoint["Port"] = _next_port()
+            host_port = endpoint["Port"]
+        else:
+            host_port = _next_port()
+    instance["_HostPort"] = host_port
 
     ms_network = _get_ministack_network(docker_client)
     container_kwargs = dict(

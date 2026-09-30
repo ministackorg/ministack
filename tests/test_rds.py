@@ -12818,6 +12818,93 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
         _delete_global_cluster(east, global_id)
 
 
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora global replication",
+)
+def test_aurora_mysql_global_secondary_iam_login():
+    import pymysql
+
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:10]
+    global_id = f"global-iam-{suffix}"
+    primary_id = f"global-iam-primary-{suffix}"
+    primary_instance_id = f"{primary_id}-writer"
+    secondary_id = f"global-iam-secondary-{suffix}"
+    secondary_instance_id = f"{secondary_id}-reader"
+    engine_version = "8.0.mysql_aurora.3.10.3"
+    user = f"iam_{suffix}"
+    primary_arn = secondary_arn = None
+    try:
+        primary_arn = east.create_db_cluster(
+            DBClusterIdentifier=primary_id, Engine="aurora-mysql", EngineVersion=engine_version,
+            MasterUsername="admin", MasterUserPassword=PASSWORD, DatabaseName=DATABASE,
+            EnableIAMDatabaseAuthentication=True,
+        )["DBCluster"]["DBClusterArn"]
+        east.create_db_instance(
+            DBInstanceIdentifier=primary_instance_id, DBClusterIdentifier=primary_id,
+            DBInstanceClass="db.r6g.large", Engine="aurora-mysql",
+        )
+        primary_instance = _wait_for_instance(east, primary_instance_id)
+        east.create_global_cluster(GlobalClusterIdentifier=global_id, SourceDBClusterIdentifier=primary_arn)
+        secondary_arn = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id, Engine="aurora-mysql", EngineVersion=engine_version,
+            GlobalClusterIdentifier=global_id, MasterUsername="admin", MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE, EnableIAMDatabaseAuthentication=True,
+        )["DBCluster"]["DBClusterArn"]
+        west.create_db_instance(
+            DBInstanceIdentifier=secondary_instance_id, DBClusterIdentifier=secondary_id,
+            DBInstanceClass="db.r6g.large", Engine="aurora-mysql",
+        )
+        secondary_instance = _wait_for_instance(west, secondary_instance_id)
+        with _aurora_connect(primary_instance["Endpoint"]) as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+            )
+            if cursor.fetchone()[0] == 0:
+                pytest.skip("matching AWSAuthenticationPlugin artifact is absent")
+            # Created on the primary; replication carries it to the secondary.
+            cursor.execute(f"CREATE USER `{user}`@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'")
+
+        endpoint = secondary_instance["Endpoint"]
+        host, port = _host_dialable(endpoint)
+        token = west.generate_db_auth_token(
+            DBHostname=endpoint["Address"], Port=endpoint["Port"], DBUsername=user,
+        )
+
+        def iam_login():
+            return pymysql.connect(host=host, port=port, user=user, password=token, connect_timeout=5)
+
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                with iam_login() as conn, conn.cursor() as cursor:
+                    cursor.execute("SELECT CURRENT_USER()")
+                    assert cursor.fetchone() == (f"{user}@%",)
+                break
+            except pymysql.MySQLError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
+        west.modify_db_cluster(DBClusterIdentifier=secondary_id,
+                               EnableIAMDatabaseAuthentication=False, ApplyImmediately=True)
+        with pytest.raises(pymysql.err.OperationalError):
+            iam_login()
+    finally:
+        if secondary_arn:
+            _remove_global_member(east, global_id, secondary_arn)
+        if primary_arn:
+            _remove_global_member(east, global_id, primary_arn)
+        _delete_instance(west, secondary_instance_id)
+        _delete_instance(east, primary_instance_id)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+        _delete_global_cluster(east, global_id)
+
+
 # ---------------------------------------------------------------------------
 # ManageMasterUserPassword — RDS-managed master user secrets
 # ---------------------------------------------------------------------------
