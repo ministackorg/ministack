@@ -2106,6 +2106,95 @@ def test_iot_broker_wildcard_region_does_not_widen_its_own_filters():
     reset()
 
 
+def test_iot_broker_leading_wildcard_does_not_match_aws_events():
+    """``#`` and ``+/...`` get ``$aws/things`` but not ``$aws/events``, live and queued."""
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        offline = _WSSession(send, "123456789012")
+        await offline.handle_packet(
+            PKT_CONNECT, 0, _build_connect_body("offline-hash", clean_session=False)
+        )
+        await offline.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("#", 1)])
+        )
+        await offline.cleanup()
+
+        received = {}
+        for topic_filter in ("#", "+/#", "$aws/events/#"):
+            async def callback(topic, payload, qos, key=topic_filter):
+                received.setdefault(key, []).append(topic)
+
+            await subscribe("123456789012", topic_filter, callback)
+
+        await publish("123456789012", "$aws/events/presence/connected/dev", b"{}", qos=1)
+        await publish("123456789012", "$aws/things/dev/shadow/get/rejected", b"{}", qos=1)
+
+        assert received == {
+            "#": ["$aws/things/dev/shadow/get/rejected"],
+            "+/#": ["$aws/things/dev/shadow/get/rejected"],
+            "$aws/events/#": ["$aws/events/presence/connected/dev"],
+        }
+        queued = _persistent_sessions[("123456789012", _TEST_REGION, "offline-hash")]
+        assert [m[0] for m in queued.queued_messages] == [
+            "$aws/things/dev/shadow/get/rejected"
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_iot_topic_rule_leading_wildcard_does_not_match_aws_events(monkeypatch):
+    """A ``#`` rule fires on ``$aws/things`` but, as on AWS, not on ``$aws/events``."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    filters = (
+        "#",
+        "+/events/presence/#",
+        "$aws/events/presence/connected/+",
+        "$aws/things/+/shadow/update/accepted",
+    )
+    for i, topic_filter in enumerate(filters):
+        iot_module._topic_rules.set_scoped(account_id, _TEST_REGION, f"r{i}", {
+            "ruleName": f"r{i}",
+            "sql": f"SELECT * FROM '{topic_filter}'",
+            "ruleDisabled": False,
+            "actions": [],
+        })
+    fired = []
+
+    async def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
+    ):
+        fired.append((rule["ruleName"], topic))
+
+    monkeypatch.setattr(iot_module, "_run_rule_actions", _capture_rule_action)
+
+    async def _run():
+        for topic in (
+            "sensors/temp",
+            "$aws/events/presence/connected/dev",
+            "$aws/things/dev/shadow/update/accepted",
+        ):
+            await broker_publish(account_id, _TEST_REGION, topic, b"{}")
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+    assert sorted(fired) == [
+        ("r0", "$aws/things/dev/shadow/update/accepted"),
+        ("r0", "sensors/temp"),
+        ("r2", "$aws/events/presence/connected/dev"),
+        ("r3", "$aws/things/dev/shadow/update/accepted"),
+    ]
+
+
 def test_iot_broker_persistent_sessions_are_region_isolated():
     reset()
 
@@ -5250,6 +5339,175 @@ def test_connectivity_reconnect_clears_the_previous_disconnect_reason():
         assert doc["connected"] is True
         assert "disconnectReason" not in doc
         await second.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+async def _watch_lifecycle_events():
+    """Subscribe to ``$aws/events/#`` and return the list the events land in."""
+    events = []
+
+    async def callback(topic, payload, qos):
+        events.append((topic, json.loads(payload)))
+
+    await subscribe(_ACCT, "$aws/events/#", callback)
+    return events
+
+
+def test_lifecycle_events_for_connect_subscribe_unsubscribe_disconnect():
+    """Payload keys and topics as AWS publishes them for one session."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+        send, _sent = _mock_send()
+        session = _IoTWSSession(send, _ACCT, _TEST_REGION, principal="c0ffee")
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-life"))
+        await session.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("a", 0), ("b/#", 1)])
+        )
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(2, ["a", "never"])
+        )
+        await session.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session.cleanup()
+
+        assert [topic for topic, _event in events] == [
+            "$aws/events/presence/connected/dev-life",
+            "$aws/events/subscriptions/subscribed/dev-life",
+            "$aws/events/subscriptions/unsubscribed/dev-life",
+            "$aws/events/presence/disconnected/dev-life",
+        ]
+        connected, subscribed, unsubscribed, disconnected = [e for _t, e in events]
+        common = {
+            "clientId": "dev-life",
+            "principalIdentifier": "c0ffee",
+            "sessionIdentifier": connected["sessionIdentifier"],
+        }
+        for event in (connected, subscribed, unsubscribed, disconnected):
+            assert isinstance(event.pop("timestamp"), int)
+        assert connected == {
+            **common, "eventType": "connected", "ipAddress": "127.0.0.1",
+            "versionNumber": 0,
+        }
+        assert subscribed == {**common, "eventType": "subscribed", "topics": ["a", "b/#"]}
+        assert unsubscribed == {
+            **common, "eventType": "unsubscribed", "topics": ["a", "never"],
+        }
+        assert disconnected == {
+            **common, "eventType": "disconnected", "clientInitiatedDisconnect": True,
+            "disconnectReason": "CLIENT_INITIATED_DISCONNECT", "versionNumber": 0,
+        }
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_events_skip_client_ids_with_wildcards():
+    """AWS documents that client ids containing # or + receive no lifecycle events."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+        for client_id in ("dev#hash", "dev+plus", "dev-plain"):
+            send, _sent = _mock_send()
+            session = _IoTWSSession(send, _ACCT, _TEST_REGION, principal="c0ffee")
+            await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
+            await session.handle_packet(
+                PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("a", 0)])
+            )
+            await session.handle_packet(PKT_DISCONNECT, 0, b"")
+            await session.cleanup()
+
+        assert [topic for topic, _event in events] == [
+            "$aws/events/presence/connected/dev-plain",
+            "$aws/events/subscriptions/subscribed/dev-plain",
+            "$aws/events/presence/disconnected/dev-plain",
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_version_numbers_and_disconnect_reasons():
+    """Connects and disconnects each advance versionNumber; a takeover allocates first."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+
+        async def connect():
+            send, _sent = _mock_send()
+            session = _WSSession(send, _ACCT)
+            await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-ver"))
+            return session
+
+        first = await connect()
+        await first.handle_packet(PKT_DISCONNECT, 0, b"")
+        await first.cleanup()
+        dropped = await connect()
+        await dropped.cleanup()
+        evicted = await connect()
+        taker = await connect()
+        await evicted.cleanup()
+        await taker.handle_packet(PKT_DISCONNECT, 0, b"")
+        await taker.cleanup()
+
+        assert [
+            (
+                e["eventType"], e["versionNumber"], e.get("disconnectReason"),
+                e.get("clientInitiatedDisconnect"), e["principalIdentifier"],
+            )
+            for _t, e in events
+        ] == [
+            ("connected", 0, None, None, _ACCT),
+            ("disconnected", 0, "CLIENT_INITIATED_DISCONNECT", True, _ACCT),
+            ("connected", 2, None, None, _ACCT),
+            ("disconnected", 2, "CONNECTION_LOST", False, _ACCT),
+            ("connected", 4, None, None, _ACCT),
+            ("disconnected", 4, "DUPLICATE_CLIENTID", False, _ACCT),
+            ("connected", 5, None, None, _ACCT),
+            ("disconnected", 5, "CLIENT_INITIATED_DISCONNECT", True, _ACCT),
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_resumed_session_keeps_its_session_identifier():
+    """A resumed persistent session reuses sessionIdentifier and raises no subscribed event."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+
+        async def connect(clean_session):
+            send, _sent = _mock_send()
+            session = _WSSession(send, _ACCT)
+            await session.handle_packet(
+                PKT_CONNECT, 0,
+                _build_connect_body("dev-resume", clean_session=clean_session),
+            )
+            return session
+
+        first = await connect(False)
+        await first.handle_packet(PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("p", 1)]))
+        await first.handle_packet(PKT_DISCONNECT, 0, b"")
+        await first.cleanup()
+        resumed = await connect(False)
+        await resumed.handle_packet(PKT_DISCONNECT, 0, b"")
+        await resumed.cleanup()
+        fresh = await connect(True)
+        await fresh.cleanup()
+
+        kinds = [(e["eventType"], e["sessionIdentifier"]) for _t, e in events]
+        original = kinds[0][1]
+        assert [k for k, _s in kinds] == [
+            "connected", "subscribed", "disconnected",
+            "connected", "disconnected", "connected", "disconnected",
+        ]
+        assert [s == original for _k, s in kinds] == [True] * 5 + [False] * 2
 
     asyncio.run(_run())
     reset()
