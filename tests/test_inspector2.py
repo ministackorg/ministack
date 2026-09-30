@@ -3,6 +3,8 @@ Integration tests for the Inspector2 emulator.
 """
 
 
+import json
+
 import boto3
 import pytest
 from botocore.config import Config
@@ -911,3 +913,56 @@ class TestBatchGetFindingDetails:
         assert len(resp["findingDetails"]) == 0
         assert len(resp["errors"]) == 1
         assert resp["errors"][0]["errorCode"] == "RESOURCE_NOT_FOUND"
+
+
+def _raw_body(client, operation, method, **kwargs):
+    """The JSON body MiniStack answered with, before botocore parses it."""
+    captured = {}
+
+    def grab(http_response, **_):
+        captured["body"] = json.loads(http_response.content)
+
+    event = f"after-call.inspector2.{operation}"
+    client.meta.events.register(event, grab)
+    try:
+        getattr(client, method)(**kwargs)
+    finally:
+        client.meta.events.unregister(event, grab)
+    return captured["body"]
+
+
+class TestSdkShapes:
+    def test_timestamps_are_epoch_seconds(self, inspector2):
+        inspector2.enable(resourceTypes=["ECR"])
+        findings = _raw_body(inspector2, "ListFindings", "list_findings")["findings"]
+        assert findings
+        for key in ("firstObservedAt", "lastObservedAt", "updatedAt"):
+            assert isinstance(findings[0][key], (int, float)), key
+        covered = _raw_body(inspector2, "ListCoverage", "list_coverage")["coveredResources"]
+        assert covered
+        assert isinstance(covered[0]["lastScannedAt"], (int, float))
+
+    def test_list_coverage_scan_status_code(self, inspector2):
+        inspector2.enable(resourceTypes=["ECR"])
+        inspector2.list_findings()
+        status = inspector2.list_coverage()["coveredResources"][0]["scanStatus"]
+        assert status["statusCode"] == "ACTIVE"
+        assert status["reason"] == "SUCCESSFUL"
+        filtered = inspector2.list_coverage(
+            filterCriteria={"scanStatusCode": [{"comparison": "EQUALS", "value": "ACTIVE"}]}
+        )["coveredResources"]
+        assert filtered
+
+    def test_list_filters_returns_filter_shape(self, inspector2):
+        criteria = {"severity": [{"comparison": "EQUALS", "value": "HIGH"}]}
+        created = inspector2.create_filter(name="sdk-shape-filter", action="NONE", filterCriteria=criteria)
+        try:
+            listed = [f for f in inspector2.list_filters()["filters"] if f["arn"] == created["arn"]]
+            assert len(listed) == 1
+            filt = listed[0]
+            assert filt["criteria"] == criteria
+            assert "findingCriteria" not in filt
+            assert filt["ownerId"]
+            assert filt["createdAt"] and filt["updatedAt"]
+        finally:
+            inspector2.delete_filter(arn=created["arn"])

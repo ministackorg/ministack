@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Inspector2 — responses aws-sdk-go-v2 can read** — timestamps (`firstObservedAt`, `lastScannedAt`, `vendorCreatedAt`, …) are epoch seconds, as the rest-json protocol has them, instead of ISO strings that made `ListFindings` and `ListCoverage` fail to deserialize in Go (and Terraform). `ListFilters` returns the criteria under `criteria` with `ownerId`, `createdAt` and `updatedAt`, `CreateFilter` answers the filter ARN, and coverage reports `scanStatus.statusCode` with a `reason` from the model. Contributed by @IamYipi.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 
