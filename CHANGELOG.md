@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudTrail — new trails start with logging off** — `CreateTrail` left a new trail logging, and `GetTrailStatus` reported a `StartLoggingTime` an hour back and a `LatestDeliveryTime` of now. A new trail now reports `IsLogging` false until `StartLogging`, and `GetTrailStatus` returns only the `StartLoggingTime` and `StopLoggingTime` of calls made (a restart keeps the last stop time), without `LatestDeliveryTime` or empty error strings. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
