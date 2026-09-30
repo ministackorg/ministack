@@ -471,6 +471,54 @@ class TestConditions:
         assert evaluate(ctx, [stmts]).decision == "ImplicitDeny"
 
 
+# Measured with iam simulate-custom-policy: Allow *, plus a Deny under the one
+# condition. D = explicit deny, A = allowed, for the key absent / matching / other.
+_ARN = "arn:aws:sns:eu-central-1:111122223333:topic"
+_KEY_PRESENCE_CASES = [
+    ("StringNotEquals", "blue", "blue", "red", "DAD"),
+    ("StringNotEqualsIgnoreCase", "BLUE", "blue", "red", "DAD"),
+    ("StringNotLike", "bl*", "blue", "red", "DAD"),
+    ("NumericNotEquals", "10", "10", "5", "DAD"),
+    ("DateNotEquals", "2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z", "DAD"),
+    ("ArnNotEquals", _ARN, _ARN, _ARN + "-other", "DAD"),
+    ("ArnNotLike", "arn:aws:sns:*:111122223333:top*", _ARN, _ARN[:-5] + "other", "DAD"),
+    ("NotIpAddress", "10.0.0.0/8", "10.1.2.3", "192.168.1.1", "DAD"),
+    ("ForAnyValue:StringNotEquals", ["team"], ["team"], ["other"], "AAD"),
+    ("ForAllValues:StringNotEquals", ["team"], ["team"], ["other"], "DAD"),
+    ("ForAnyValue:StringNotLike", ["te*"], ["team"], ["other"], "AAD"),
+    ("ForAllValues:StringNotLike", ["te*"], ["team"], ["other"], "DAD"),
+    ("StringNotEqualsIfExists", "blue", "blue", "red", "DAD"),
+    ("StringEquals", "blue", "blue", "red", "ADA"),
+    ("StringLike", "bl*", "blue", "red", "ADA"),
+    ("NumericLessThan", "10", "5", "20", "ADA"),
+    ("DateGreaterThan", "2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z", "2029-01-01T00:00:00Z", "ADA"),
+    ("ArnLike", "arn:aws:sns:*:111122223333:top*", _ARN, _ARN[:-5] + "other", "ADA"),
+    ("IpAddress", "10.0.0.0/8", "10.1.2.3", "192.168.1.1", "ADA"),
+    ("Bool", "true", "true", "false", "ADA"),
+    ("ForAnyValue:StringEquals", ["team"], ["team"], ["other"], "ADA"),
+    ("ForAllValues:StringEquals", ["team"], ["team"], ["other"], "DDA"),
+    ("StringEqualsIfExists", "blue", "blue", "red", "DDA"),
+    ("Null", "true", "blue", "blue", "DAA"),
+]
+
+
+@pytest.mark.parametrize("state", range(3), ids=["absent", "matching", "other"])
+@pytest.mark.parametrize("operator, policy_value, matching, other, measured", [
+    pytest.param(*case, id=case[0]) for case in _KEY_PRESENCE_CASES
+])
+def test_condition_operator_by_key_presence(operator, policy_value, matching, other, measured, state):
+    ctx = _ctx()
+    value = (None, matching, other)[state]
+    if value is not None:
+        ctx.service_context = {"test:key": value}
+    stmts = parse_policy_document({"Statement": [
+        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "*", "Resource": "*",
+         "Condition": {operator: {"test:key": policy_value}}},
+    ]})
+    expected = "Deny" if measured[state] == "D" else "Allow"
+    assert evaluate(ctx, [stmts]).decision == expected
+
 
 class TestResourceAccountCondition:
     """``aws:ResourceAccount`` (and the ``s3:ResourceAccount`` alias) resolve to the

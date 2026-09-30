@@ -4015,9 +4015,10 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             if function_error is not None:
                 result["error"] = True
                 result["function_error"] = function_error
-                if isinstance(parsed, str):
+                if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
                     # A bare timeout string: same shape as _rie_terminal_result.
                     result["body"] = {"errorMessage": parsed, "errorType": "Runtime.ExitError"}
+                    result["timeout"] = True
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
             if not _rie_failure_is_retryable(exc):

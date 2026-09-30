@@ -17915,11 +17915,12 @@ def _sqs_stack_attrs(sqs, cfn, stack_name):
     ({"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": 600},
      {"KmsMasterKeyId": "alias/aws/sqs", "KmsDataKeyReusePeriodSeconds": "600"}),
     ({"SqsManagedSseEnabled": False}, {"SqsManagedSseEnabled": "false"}),
+    ({}, {"SqsManagedSseEnabled": "true", "MaximumMessageSize": "1048576"}),
     ({"FifoQueue": True, "ContentBasedDeduplication": True,
       "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"},
      {"FifoQueue": "true", "ContentBasedDeduplication": "true",
       "DeduplicationScope": "messageGroup", "FifoThroughputLimit": "perMessageGroupId"}),
-], ids=["redrive", "kms", "sse", "fifo"])
+], ids=["redrive", "kms", "sse", "defaults", "fifo"])
 def test_cfn_sqs_queue_properties_reach_the_queue(cfn, sqs, props, expected):
     """Each queue property shows up in GetQueueAttributes, Json ones as compact JSON."""
     stack_name = f"cfn-sqs-attrs-{_uuid_mod.uuid4().hex[:8]}"
@@ -22747,6 +22748,45 @@ def test_cfn_nested_stack_update_deletes_what_the_child_no_longer_has(
         s3.delete_bucket(Bucket=bucket)
 
 
+def test_cfn_nested_stack_update_keeps_a_retained_resource_it_drops(cfn, s3, ssm):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-nested-retain-{suffix}"
+    name = f"/cfn-nested-retain-{suffix}/Kept"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    keep = {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-nested-retain-{suffix}/Keep", "Type": "String", "Value": "v"}}
+    kept = {"Type": "AWS::SSM::Parameter", "DeletionPolicy": "Retain",
+            "Properties": {"Name": name, "Type": "String", "Value": "v"}}
+
+    def parent(key):
+        return json.dumps({
+            "Resources": {"Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{key}"}}},
+            "Outputs": {"NestedId": {"Value": {"Ref": "Nested"}}},
+        })
+
+    stack_name = f"cfn-nested-retain-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="v1.json",
+                      Body=json.dumps({"Resources": {"Keep": keep, "Kept": kept}}).encode())
+        s3.put_object(Bucket=bucket, Key="v2.json", Body=json.dumps({"Resources": {"Keep": keep}}).encode())
+        cfn.create_stack(StackName=stack_name, TemplateBody=parent("v1.json"))
+        nested_id = _output(_wait_stack(cfn, stack_name), "NestedId")
+        cfn.update_stack(StackName=stack_name, TemplateBody=parent("v2.json"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        listed = cfn.describe_stack_resources(StackName=nested_id)["StackResources"]
+        assert [r["LogicalResourceId"] for r in listed] == ["Keep"]
+        ssm.get_parameter(Name=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        ssm.delete_parameter(Name=name)
+        for key in ("v1.json", "v2.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
 def test_cfn_apigw_api_key_rename_replaces_it(cfn, apigw_v1):
     """Name is Replacement on AWS::ApiGateway::ApiKey: the renamed key is
     created before the old one is removed, so Ref moves to a new key id and
@@ -25124,6 +25164,68 @@ def test_sqs_change_set_reports_the_issue_reproduction(cfn, stack):
     change = _change(cfn, stack(old), new)
     assert change["Replacement"] == "True"
     assert _requirements(change) == {"QueueName": "Always", "DelaySeconds": "Never"}
+
+
+@pytest.mark.parametrize("edit,logical,action,replacement,policy,recreation", [
+    (lambda r, name: r.update(Extra={"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name + "-b"}}),
+     "Extra", "Add", None, None, set()),
+    (lambda r, name: r.pop("Param"), "Param", "Remove", None, "Delete", set()),
+    (lambda r, name: r["Queue"]["Properties"].update(QueueName=name + "-new"),
+     "Queue", "Modify", "True", "ReplaceAndDelete", {"Always"}),
+    (lambda r, name: r["Param"]["Properties"].update(Value="b"), "Param", "Modify", "False", None, {"Never"}),
+    (lambda r, name: r["Param"].update(Metadata={"owner": "review"}), "Param", "Modify", "False", None, {"Never"}),
+], ids=["add", "remove", "modify-replace", "modify-in-place", "modify-metadata"])
+def test_change_set_members_follow_the_action(cfn, stack, edit, logical, action, replacement,
+                                              policy, recreation):
+    """Replacement, PhysicalResourceId, PolicyAction and RequiresRecreation are sent as AWS sends them."""
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+
+    def template():
+        return {"Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name}},
+            "Param": {"Type": "AWS::SSM::Parameter", "Properties": {"Name": name, "Type": "String", "Value": "a"}},
+        }}
+
+    stack_name = stack(template())
+    physical = {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+    new = template()
+    edit(new["Resources"], name)
+    change = _change(cfn, stack_name, new)
+    assert (change["LogicalResourceId"], change["Action"]) == (logical, action)
+    assert change.get("Replacement") == replacement
+    assert change.get("PolicyAction") == policy
+    assert change.get("PhysicalResourceId") == physical.get(logical)
+    assert {d["Target"].get("RequiresRecreation") for d in change["Details"]} == recreation
+
+
+@pytest.mark.parametrize("policies,rtype,expected", [
+    ({"DeletionPolicy": "Retain"}, "AWS::SSM::Parameter", "Retain"),
+    ({"DeletionPolicy": "RetainExceptOnCreate"}, "AWS::SSM::Parameter", "Retain"),
+    ({"DeletionPolicy": "Snapshot"}, "AWS::EC2::Volume", "Snapshot"),
+    ({}, "AWS::RDS::DBCluster", "Snapshot"),
+    ({"DeletionPolicy": {"Fn::If": ["C", "Retain", "Delete"]}}, "AWS::SSM::Parameter", None),
+], ids=["retain", "retain-except-on-create", "snapshot", "rds-default", "intrinsic"])
+def test_change_set_remove_reports_the_deletion_policy(policies, rtype, expected):
+    from ministack.services.cloudformation.stacks import _diff_resources
+
+    old = {"Resources": {"R": {"Type": rtype, "Properties": {}, **policies}}}
+    change = _diff_resources(old, {"Resources": {}})[0]["ResourceChange"]
+    assert change.get("PolicyAction") == expected
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("Retain", "ReplaceAndRetain"), ("Snapshot", "ReplaceAndSnapshot"), ("Delete", "ReplaceAndDelete"),
+])
+def test_change_set_replacement_reports_the_update_replace_policy(policy, expected):
+    from ministack.services.cloudformation.stacks import _diff_resources
+
+    def template(name):
+        return {"Resources": {"Q": {"Type": "AWS::SQS::Queue", "UpdateReplacePolicy": policy,
+                                    "Properties": {"QueueName": name}}}}
+
+    change = _diff_resources(template("a"), template("b"))[0]["ResourceChange"]
+    assert (change["Replacement"], change.get("PolicyAction")) == ("True", expected)
 
 
 def test_cfn_appconfig_application_updates_in_place(cfn, appconfig_client):

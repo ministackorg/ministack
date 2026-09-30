@@ -364,6 +364,13 @@ _CONDITION_OPS: dict[str, Any] = {
     "binaryequals": _op_string_equals,
 }
 
+# Operators that require the key NOT to match
+_NEGATED_OPS = frozenset({
+    "stringnotequals", "stringnotequalsignorecase", "stringnotlike",
+    "numericnotequals", "datenotequals", "arnnotequals", "arnnotlike",
+    "notipaddress",
+})
+
 
 def _evaluate_single_condition(operator: str, actual: Any,
                                expected_values: list[str]) -> bool:
@@ -397,7 +404,9 @@ def _evaluate_single_condition(operator: str, actual: Any,
         return False
 
     if actual is None:
-        return if_exists or for_all  # ForAllValues on missing key = true (empty set)
+        # An absent key satisfies ...IfExists, ForAllValues (empty set) and a
+        # negated single-valued operator; ForAnyValue and affirmative ones fail.
+        return if_exists or for_all or (not for_any and op_lower in _NEGATED_OPS)
 
     # Multi-valued context key
     if isinstance(actual, list):
