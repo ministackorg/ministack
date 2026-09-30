@@ -760,6 +760,7 @@ _RESOURCE_POLICY_LOOKUPS = {
     "s3": ("s3", "bucket_policy_for_arn"),
     "lambda": ("lambda_svc", "function_policy_for_arn"),
     "secretsmanager": ("secretsmanager", "secret_policy_for_arn"),
+    "ecr": ("ecr", "repository_policy_for_arn"),
 }
 
 
