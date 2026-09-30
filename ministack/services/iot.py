@@ -69,6 +69,7 @@ import base64
 import contextlib
 import contextvars
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -84,6 +85,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.iam_evaluator import EvalContext, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -96,6 +98,7 @@ from ministack.core.responses import (
     request_scope,
 )
 from ministack.core.x509_utils import (
+    certificate_common_name,
     certificate_is_signed_by,
     generate_ca,
     get_certificate_id,
@@ -6992,6 +6995,56 @@ def _reserved_topic_publish_allowed(topic: str) -> bool:
     return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
 
 
+_POLICY_VARIABLE_RE = re.compile(r"\$\{(iot:[A-Za-z.]+)\}")
+
+
+def _mqtt_policy_context(account_id: str, region: str, certificate_id: str, client_id: str) -> dict:
+    """The policy variables of a certificate session, keyed in lower case."""
+    with request_scope(account_id, region):
+        record = _certificates.get(certificate_id) or {}
+        attached = client_id in _things and _thing_arn(client_id) in record.get("attachedThings", [])
+    context = {"iot:clientid": client_id, "iot:connection.thing.isattached": str(attached).lower()}
+    if attached:
+        context["iot:connection.thing.thingname"] = client_id
+    common_name = certificate_common_name(record["certificatePem"]) if record.get("certificatePem") else None
+    if common_name is not None:
+        context["iot:certificate.subject.commonname"] = common_name
+    return context
+
+
+@functools.lru_cache(maxsize=1024)
+def _parsed_iot_policy(document: str, context: tuple) -> list:
+    """The statements of an IoT policy document with the policy variables in ``context`` substituted."""
+    values = dict(context)
+
+    def substitute(match: re.Match) -> str:
+        value = values.get(match.group(1).lower())
+        return match.group(0) if value is None else json.dumps(value)[1:-1]
+
+    return parse_policy_document(_POLICY_VARIABLE_RE.sub(substitute, document))
+
+
+def _mqtt_policy_allows(
+    account_id: str, region: str, certificate_id: str, context: dict, action: str, resource: str
+) -> bool:
+    """Whether the policies attached to the certificate allow ``action`` on ``resource``."""
+    with request_scope(account_id, region):
+        record = _certificates.get(certificate_id) or {}
+        policies = [_policies.get(name) for name in record.get("attachedPolicies", [])]
+    documents = [p["versions"][p["defaultVersionId"]]["document"] for p in policies if p]
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iot:{region}:{account_id}:cert/{certificate_id}",
+        principal_type="Certificate",
+        principal_account=account_id,
+        action=action,
+        resource_arn=f"arn:aws:iot:{region}:{account_id}:{resource}",
+        region=region,
+        service_context=context,
+    )
+    variables = tuple(sorted(context.items()))
+    return evaluate(ctx, [_parsed_iot_policy(doc, variables) for doc in documents]).decision == "Allow"
+
+
 # ---------------------------------------------------------------------------
 # Broker public API (consumed by iot_data.py and handle_websocket)
 # ---------------------------------------------------------------------------
@@ -8639,6 +8692,10 @@ class _WSSession:
         # Set when the broker itself ends the session, overriding whatever the
         # socket then looks like from the client's side.
         self._forced_disconnect_reason: str | None = None
+        # The client certificate of an mTLS session; its policies are evaluated
+        # under AUTH=true.
+        self.certificate_id: str | None = None
+        self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
         """Why this session ended, in AWS's disconnect-reason vocabulary.
@@ -8666,7 +8723,7 @@ class _WSSession:
         lifecycle events, so none is published for them."""
         if "#" in self._client_id or "+" in self._client_id:
             return
-        group ="presence" if event_type.endswith("connected") else "subscriptions"
+        group = "subscriptions" if event_type.endswith("subscribed") else "presence"
         await _publish_event(
             self.account_id,
             self.region,
@@ -8812,6 +8869,33 @@ class _WSSession:
                     return_code=CONNACK_311_ACCEPTED, session_present=session_present
                 )
             )
+
+    def _evaluates_policies(self) -> bool:
+        """Whether this session is held to its certificate's IoT policies (AUTH=true only)."""
+        from ministack import app
+
+        return app.AUTH and self.certificate_id is not None
+
+    def _policy_allows(self, action: str, resource: str) -> bool:
+        """Whether this session may do ``action`` on ``resource``."""
+        return not self._evaluates_policies() or _mqtt_policy_allows(
+            self.account_id, self.region, self.certificate_id, self._policy_context, action, resource
+        )
+
+    async def _refuse_connect(self, denied: str) -> bool:
+        """Refuse a CONNECT: CONNACK 0x87 on MQTT 5, a plain close on 3.1.1, and a connect_failed event."""
+        _broker_logger.warning(
+            "IoT broker: CONNECT from %r refused, the attached policies do not allow %s", self._client_id, denied
+        )
+        self._session_identifier = str(uuid.uuid4())
+        await self._publish_lifecycle(
+            "connect_failed", connectFailureReason="AUTHORIZATION_FAILED", ipAddress=_publish_source_ip.get()
+        )
+        self._client_id = ""
+        self._will_topic = None
+        if self.protocol_version == MQTT_5:
+            await self.send_bytes(_make_connack(return_code=RC5_NOT_AUTHORIZED, protocol_version=MQTT_5))
+        return False
 
     async def _reject_malformed_packet(self, pkt_type: int, exc: Exception) -> None:
         """Answer a packet this broker could not parse, then let the caller close.
@@ -8959,6 +9043,13 @@ class _WSSession:
                 self._will_qos = 0
                 self._will_retain = False
                 self._will_properties = b""
+
+            if self._evaluates_policies():
+                self._policy_context = _mqtt_policy_context(
+                    self.account_id, self.region, self.certificate_id, client_id
+                )
+            if not self._policy_allows("iot:Connect", f"client/{client_id}"):
+                return await self._refuse_connect(f"iot:Connect on client/{client_id}")
 
             self._graceful_disconnect = False
             self._forced_disconnect_reason = None
@@ -9389,6 +9480,9 @@ async def handle_websocket(
 #   mean anything and what real AWS IoT does. The ambiguous case cannot be
 #   attributed at all: two registrations see byte-identical bytes, so any
 #   tie-break would award the session to whoever registered the copy.
+# * with ``AUTH=true``, a session under a certificate is also held to the IoT
+#   policies attached to it, as on AWS: ``iot:Connect`` on the client id at
+#   CONNECT. Without it no policy is evaluated.
 # * just-in-time registration, as on AWS: a certificate that is unknown, or
 #   still PENDING_ACTIVATION, and signed by a registered CA that is ACTIVE
 #   with auto-registration enabled is created PENDING_ACTIVATION in that CA's
@@ -10030,9 +10124,9 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
     account_token = _request_account_id.set(account_id)
     region_token = _request_region.set(region)
-    session = _WSSession(
-        _tcp_send, account_id, region, hashlib.sha256(der).hexdigest() if der else None
-    )
+    certificate_id = hashlib.sha256(der).hexdigest() if der else None
+    session = _WSSession(_tcp_send, account_id, region, certificate_id)
+    session.certificate_id = certificate_id
     max_buffer = _max_frame_buffer_bytes()
     _mtls_logger.info(
         "IoT mTLS: connection from %s serving %s/%s (%s)",

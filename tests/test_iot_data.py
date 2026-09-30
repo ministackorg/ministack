@@ -3539,6 +3539,40 @@ def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_auth_evaluates_iot_connect(tmp_path):
+    """With AUTH=true a device certificate connects only under a policy that
+    allows iot:Connect on its client id; otherwise the 3.1.1 CONNECT is closed
+    without a CONNACK. A private instance, because AUTH is read at startup."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    proc = _spawn({"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port)
+        iot = private.client("iot")
+        cert_id, cert_pem, key_pem = _new_cert(private)
+        client_id = _unique("device")
+        assert _refused_below_mqtt(private, cert_pem, key_pem, tmp_path, client_id)
+
+        policy = _unique("connect")
+        iot.create_policy(policyName=policy, policyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{client_id}"}
+            ],
+        }))
+        arn = iot.describe_certificate(certificateId=cert_id)["certificateDescription"]["certificateArn"]
+        iot.attach_policy(policyName=policy, target=arn)
+        peer = _Peer(_mtls_connect(private, cert_pem, key_pem, tmp_path))
+        try:
+            _assert_connack(peer.connect(client_id))
+        finally:
+            peer.close()
+        assert _refused_below_mqtt(private, cert_pem, key_pem, tmp_path, _unique("other"))
+    finally:
+        _terminate(proc)
+
+
 def test_mtls_registered_cert_connects_whatever_its_ca(broker, tmp_path):
     """An ACTIVE device certificate connects after its CA is deactivated or
     deleted, and when it was registered without a CA, as on AWS; only its own

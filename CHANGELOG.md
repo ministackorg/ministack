@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — MQTT connections evaluate `iot:Connect` under `AUTH=true`** — a device certificate on the mTLS listener connected under any client id, with or without a policy; with `AUTH=true` the CONNECT now needs an attached policy that allows `iot:Connect` on `client/<client id>` and none that denies it, with `${iot:ClientId}`, `${iot:Connection.Thing.ThingName}`, `iot:Connection.Thing.IsAttached` and `${iot:Certificate.Subject.CommonName}` resolved. A refusal closes an MQTT 3.1.1 connection without a CONNACK, answers MQTT 5 with CONNACK 0x87 and publishes `$aws/events/presence/connect_failed/{clientId}`. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
