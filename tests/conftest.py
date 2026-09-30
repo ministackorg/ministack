@@ -131,6 +131,14 @@ def iam_user(identity_policy=None):
     return key, arn
 
 
+@pytest.fixture
+def auth(monkeypatch):
+    """AUTH=true for the in-process app."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+
 def routed_request(key, service, method, path, body=b"", headers=None, host="localhost:4566"):
     """One in-process request through the whole app, SigV4-signed with *key* ``(key id, secret)`` unless it is None."""
     import asyncio

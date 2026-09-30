@@ -1911,6 +1911,8 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
         action = f"{prefix}:{name.lower()}"
     elif service == "sns":
         action = f"SNS:{name}"
+    elif service == "s3":
+        resource_arn = f'"{resource_arn}"'
     return (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
             "with an explicit deny in a resource-based policy")
 
