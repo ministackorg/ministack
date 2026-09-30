@@ -5765,6 +5765,55 @@ def test_cfn_ecr_repository_rename_deletes_the_old_repository(cfn, ecr):
                 pass
 
 
+def _cfn_ecr_encryption_template(encryption, name=None):
+    props = {"EncryptionConfiguration": {"EncryptionType": encryption}}
+    if name:
+        props["RepositoryName"] = name
+    return json.dumps({"Resources": {"Repo": {"Type": "AWS::ECR::Repository", "Properties": props}},
+                       "Outputs": {"Repo": {"Value": {"Ref": "Repo"}}}})
+
+
+def test_cfn_ecr_repository_encryption_change_replaces_a_generated_name(cfn, ecr):
+    """EncryptionConfiguration is create-only: under a generated name the
+    change creates a repository with a new name and deletes the old one."""
+    stack_name = f"cfn-ecr-enc-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ecr_encryption_template("AES256"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        old_name = _output(stack, "Repo")
+        assert old_name.startswith(f"{stack_name}-repo-")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ecr_encryption_template("KMS"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        new_name = _output(stack, "Repo")
+        assert new_name != old_name
+        repo = ecr.describe_repositories(repositoryNames=[new_name])["repositories"][0]
+        assert repo["encryptionConfiguration"]["encryptionType"] == "KMS"
+        with pytest.raises(ClientError):
+            ecr.describe_repositories(repositoryNames=[old_name])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ecr_repository_encryption_change_under_custom_name_is_refused(cfn, ecr):
+    """Under an explicit, unchanged RepositoryName the replacement is refused."""
+    name = f"cfn-ecr-enc-named-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, TemplateBody=_cfn_ecr_encryption_template("AES256", name))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_ecr_encryption_template("KMS", name))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert (f"requires replacing. Rename {name} and update the stack again."
+                in _stack_event_reasons(cfn, name))
+        repo = ecr.describe_repositories(repositoryNames=[name])["repositories"][0]
+        assert repo["encryptionConfiguration"]["encryptionType"] == "AES256"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_ec2_launch_template(cfn, ec2):
     """CloudFormation should provision and delete an EC2 LaunchTemplate."""
     template = {
