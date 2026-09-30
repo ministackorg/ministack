@@ -1509,6 +1509,13 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
 
+    def test_lambda_function_named_by_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        path = "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Amy-func/invocations"
+        assert extract_resource_arn(
+            "lambda", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:lambda:us-east-1:123:function:my-func"
+
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
         url = "http://localhost:4566/000000000000/my-queue"

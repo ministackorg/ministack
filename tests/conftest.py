@@ -14,7 +14,7 @@ import time
 import urllib.request
 import uuid
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import boto3
 import pytest
@@ -161,7 +161,7 @@ def routed_request(key, service, method, path, body=b"", headers=None, host="loc
         sent.append(message)
 
     asyncio.run(app_mod.app({
-        "type": "http", "method": method, "path": path, "raw_path": path.encode(), "query_string": b"",
+        "type": "http", "method": method, "path": unquote(path), "raw_path": path.encode(), "query_string": b"",
         "headers": [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]}, receive, send))
     return (sent[0]["status"], {k.decode().lower(): v.decode() for k, v in sent[0].get("headers", [])},
             b"".join(m.get("body", b"") for m in sent[1:]))

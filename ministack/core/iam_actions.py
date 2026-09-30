@@ -903,7 +903,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         if "functions" in path_parts:
             fi = path_parts.index("functions")
             if fi + 1 < len(path_parts):
-                func_name = path_parts[fi + 1]
+                func_name = unquote(path_parts[fi + 1])
+                if func_name.startswith("arn:"):
+                    return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")

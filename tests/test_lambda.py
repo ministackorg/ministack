@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import io
 import json
@@ -14,7 +15,7 @@ import uuid as _uuid_mod
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import boto3
 import pytest
@@ -25,8 +26,10 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
+    iam_user,
     make_probe_lambda,
     patch_endpoint_dns,
+    routed_request,
 )
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
@@ -4956,6 +4959,54 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     finally:
         for store, name, _record in seeded:
             store.pop_scoped(_CALLER_ACCOUNT, None, name, None)
+
+
+@pytest.fixture
+def granted_function(monkeypatch):
+    """A function whose policy grants lambda:GetFunction to the given principal, under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services import lambda_svc
+
+    names = []
+
+    def make(principal):
+        name = f"rp-fn-{_uuid_mod.uuid4().hex[:8]}"
+        names.append(name)
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert lambda_svc._create_function({
+            "FunctionName": name, "Runtime": "python3.12", "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+            "Code": {"ZipFile": base64.b64encode(_make_zip("def handler(e, c): return 1")).decode()}})[0] == 201
+        lambda_svc._add_permission(name, {"StatementId": "s", "Action": "lambda:GetFunction", "Principal": principal})
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        return name
+
+    yield make
+    for name in names:
+        lambda_svc._functions.pop(name, None)
+
+
+def test_function_policy_naming_the_user_allows_without_identity_policy(granted_function):
+    key, user = iam_user()
+    name = granted_function(user)
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
+    status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}/configuration")
+    assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
+
+
+def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_function):
+    key, user = iam_user()
+    name = granted_function(user)
+    arn = quote(f"arn:aws:lambda:us-east-1:000000000000:function:{name}", safe="")
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{arn}")[0] == 200
+
+
+def test_function_policy_naming_the_account_needs_an_identity_policy(granted_function):
+    name = granted_function("000000000000")
+    key, _user = iam_user()
+    status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")
+    assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
+    key, _user = iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
 
 
 @pytest.fixture

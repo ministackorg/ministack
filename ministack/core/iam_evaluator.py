@@ -758,6 +758,7 @@ _RESOURCE_POLICY_LOOKUPS = {
     "sqs": ("sqs", "queue_policy_for_arn"),
     "sns": ("sns", "topic_policy_for_arn"),
     "s3": ("s3", "bucket_policy_for_arn"),
+    "lambda": ("lambda_svc", "function_policy_for_arn"),
 }
 
 
