@@ -509,7 +509,10 @@ def _create_change_set(params):
     with _stack_region_context(stack, stack_id):
         old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
-    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"))
+    changed_params = {k for k, v in param_values.items()
+                      if old_params.get(k, {}).get("Value") != v.get("Value")}
+    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"),
+                              template, changed_params)
     import_failure = None
     if cs_type == "IMPORT":
         # An import describes the resources being adopted, not the template
@@ -616,11 +619,16 @@ def _describe_change_set(params):
                     f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
                     "</RequiresRecreation>"
                 )
+            causing_xml = (
+                f"<CausingEntity>{_esc(d['CausingEntity'])}</CausingEntity>"
+                if d.get("CausingEntity") else ""
+            )
             details_xml += (
                 "<member>"
                 f"<Target>{target_xml}</Target>"
                 f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
                 f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                f"{causing_xml}"
                 "</member>"
             )
         # botocore reads an empty element as "", so a member the change does

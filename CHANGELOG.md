@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudFormation — change sets list what a change reaches** — a resource that references a replaced resource, an attribute of a modified resource or a changed parameter is now listed as a `Modify` whose detail names the cause (`ChangeSource` `ResourceReference`, `ResourceAttribute` or `ParameterReference`, with `CausingEntity`). Contributed by @iot-rocket.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

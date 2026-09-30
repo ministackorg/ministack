@@ -17,6 +17,7 @@ from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
     _extract_deps,
+    _intrinsic_references,
     _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
@@ -1090,22 +1091,104 @@ def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
     return {"PolicyAction": prefix + action} if action else {}
 
 
-def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:
+def _replacement(details: list, type_changed: bool) -> str:
+    """The Replacement of a Modify that carries these details."""
+    recreation = {(d["Target"]["RequiresRecreation"], d["Evaluation"]) for d in details}
+    if type_changed or ("Always", "Static") in recreation:
+        return "True"
+    if any(r != "Never" for r, _ in recreation):
+        return "Conditional"
+    return "False"
+
+
+def _reference_details(res_def: dict, replacements: dict, changed_params) -> dict:
+    """Details per property for its references to changed parameters and resources."""
+    rtype = res_def.get("Type", "")
+    found: dict = {}
+    for name, value in (res_def.get("Properties") or {}).items():
+        for ref, attr in _intrinsic_references(value):
+            if ref in changed_params and attr is None:
+                source, entity, evaluation = "ParameterReference", ref, "Static"
+            elif ref in replacements and (attr or replacements[ref] != "False"):
+                source = "ResourceAttribute" if attr else "ResourceReference"
+                entity = f"{ref}.{attr}" if attr else ref
+                evaluation = "Static" if replacements[ref] == "True" else "Dynamic"
+            else:
+                continue
+            detail = {
+                "Target": {"Attribute": "Properties", "Name": name,
+                           "RequiresRecreation": _property_recreation(rtype, name)},
+                "Evaluation": evaluation,
+                "ChangeSource": source,
+                "CausingEntity": entity,
+            }
+            if detail not in found.setdefault(name, []):
+                found[name].append(detail)
+    return found
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None,
+                    template: dict | None = None, changed_params=()) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    A property that references a changed parameter, a replaced resource or an
+    attribute of a modified resource in ``template`` (the unresolved new
+    template, ``new_template`` by default) gets a detail naming that cause.
     ``resources`` are the stack's provisioned resources, whose physical ids a
     ``Remove`` or ``Modify`` reports.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
+    raw_res = (template or new_template).get("Resources", {})
     changes = []
 
-    all_keys = old_res.keys() | new_res.keys()
-    for key in sorted(all_keys):
+    common = old_res.keys() & new_res.keys()
+    changed_props, attr_details, type_changed = {}, {}, {}
+    for key in common:
+        old_props = old_res[key].get("Properties", {}) or {}
+        new_props = new_res[key].get("Properties", {}) or {}
+        changed_props[key] = {name for name in set(old_props) | set(new_props)
+                              if old_props.get(name) != new_props.get(name)}
+        attr_details[key] = [
+            {"Target": {"Attribute": attr, "RequiresRecreation": "Never"},
+             "Evaluation": "Static", "ChangeSource": "DirectModification"}
+            for attr in _DIFFED_ATTRIBUTES
+            if old_res[key].get(attr) != new_res[key].get(attr)
+        ]
+        type_changed[key] = old_res[key].get("Type") != new_res[key].get("Type")
+
+    def _modify_details(key, refs):
+        details = []
+        rtype = new_res[key].get("Type", "")
+        for name in sorted(changed_props[key] | set(refs)):
+            if name in changed_props[key]:
+                details.append({
+                    "Target": {"Attribute": "Properties", "Name": name,
+                               "RequiresRecreation": _property_recreation(rtype, name)},
+                    "Evaluation": "Dynamic" if refs.get(name) else "Static",
+                    "ChangeSource": "DirectModification",
+                })
+            details.extend(refs.get(name, []))
+        return details + attr_details[key]
+
+    # A replaced or modified resource changes what references it, which can in
+    # turn replace or modify the referencing resource.
+    refs: dict = {}
+    while True:
+        details = {key: _modify_details(key, refs.get(key, {})) for key in common}
+        replacements = {key: _replacement(d, type_changed[key])
+                        for key, d in details.items() if d or type_changed[key]}
+        found = {key: _reference_details(raw_res.get(key, {}), replacements, changed_params)
+                 for key in common}
+        if found == refs:
+            break
+        refs = found
+
+    for key in sorted(old_res.keys() | new_res.keys()):
         pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
         physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
@@ -1126,42 +1209,12 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     **_policy_action(old_res[key], "DeletionPolicy"),
                 }
             })
-        else:
-            details = []
-            old_props = old_res[key].get("Properties", {}) or {}
-            new_props = new_res[key].get("Properties", {}) or {}
-            rtype = new_res[key].get("Type", "")
-            if old_props != new_props:
-                for name in sorted(set(old_props) | set(new_props)):
-                    if old_props.get(name) != new_props.get(name):
-                        details.append({
-                            "Target": {"Attribute": "Properties", "Name": name,
-                                       "RequiresRecreation":
-                                           _property_recreation(rtype, name)},
-                            "Evaluation": "Static",
-                            "ChangeSource": "DirectModification",
-                        })
-            for attr in _DIFFED_ATTRIBUTES:
-                if old_res[key].get(attr) != new_res[key].get(attr):
-                    details.append({
-                        "Target": {"Attribute": attr, "RequiresRecreation": "Never"},
-                        "Evaluation": "Static",
-                        "ChangeSource": "DirectModification",
-                    })
-            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
-            if not details and not type_changed:
-                continue
+        elif key in replacements:
             scope = []
-            for d in details:
+            for d in details[key]:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            recreation = {d["Target"].get("RequiresRecreation") for d in details}
-            if type_changed or "Always" in recreation:
-                replacement = "True"
-            elif "Conditionally" in recreation:
-                replacement = "Conditional"
-            else:
-                replacement = "False"
+            replacement = replacements[key]
             changes.append({
                 "ResourceChange": {
                     "Action": "Modify",
@@ -1172,7 +1225,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
                        if replacement == "True" else {}),
                     "Scope": scope,
-                    "Details": details,
+                    "Details": details[key],
                 }
             })
     return changes

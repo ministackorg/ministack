@@ -25999,6 +25999,63 @@ def test_change_set_replacement_reports_the_update_replace_policy(policy, expect
     assert (change["Replacement"], change.get("PolicyAction")) == ("True", expected)
 
 
+_DIRECT_STATIC = ("DirectModification", "Static", None)
+
+
+@pytest.mark.parametrize("edit,params,expected", [
+    (lambda r: r["Queue"]["Properties"].update(QueueName=r["Queue"]["Properties"]["QueueName"] + "-new"), [], {
+        "Queue": ("True", {_DIRECT_STATIC}),
+        "ByRef": ("False", {("ResourceReference", "Static", "Queue")}),
+        "ByArn": ("False", {("ResourceAttribute", "Static", "Queue.Arn")}),
+        "Chained": ("False", {("ResourceAttribute", "Dynamic", "ByRef.Value")}),
+        "Named": ("True", {("ResourceAttribute", "Static", "Queue.QueueName")}),
+        "ByNamed": ("False", {("ResourceReference", "Static", "Named")}),
+    }),
+    (lambda r: r["Queue"]["Properties"].update(VisibilityTimeout=60), [], {
+        "Queue": ("False", {_DIRECT_STATIC}),
+        "ByArn": ("False", {("ResourceAttribute", "Dynamic", "Queue.Arn")}),
+        "Named": ("Conditional", {("ResourceAttribute", "Dynamic", "Queue.QueueName")}),
+        "ByNamed": ("False", {("ResourceReference", "Dynamic", "Named")}),
+    }),
+    (lambda r: None, [{"ParameterKey": "Val", "ParameterValue": "two"}], {
+        "ByParam": ("False", {("ParameterReference", "Static", "Val"),
+                              ("DirectModification", "Dynamic", None)}),
+    }),
+], ids=["replace", "modify-in-place", "parameter"])
+def test_change_set_lists_what_a_change_reaches(cfn, stack, edit, params, expected):
+    """Resources that reference a changed resource or parameter are listed with the cause."""
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+
+    def param(value):
+        return {"Type": "AWS::SSM::Parameter", "Properties": {"Type": "String", "Value": value}}
+
+    def template():
+        return {"Parameters": {"Val": {"Type": "String", "Default": "one"}}, "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name}},
+            "ByRef": param({"Ref": "Queue"}),
+            "ByArn": param({"Fn::GetAtt": ["Queue", "Arn"]}),
+            "Chained": param({"Fn::GetAtt": ["ByRef", "Value"]}),
+            "Named": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": {"Fn::Sub": "/" + name + "/${Queue.QueueName}"}, "Type": "String", "Value": "v"}},
+            "ByNamed": param({"Ref": "Named"}),
+            "ByParam": param({"Ref": "Val"}),
+            "Static": param("static"),
+        }}
+
+    stack_name = stack(template())
+    new = template()
+    edit(new["Resources"])
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", TemplateBody=json.dumps(new),
+                          Parameters=params)
+    cfn.get_waiter("change_set_create_complete").wait(
+        StackName=stack_name, ChangeSetName="cs", WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+    changes = cfn.describe_change_set(StackName=stack_name, ChangeSetName="cs")["Changes"]
+    assert {c["ResourceChange"]["LogicalResourceId"]: (
+        c["ResourceChange"]["Replacement"],
+        {(d["ChangeSource"], d["Evaluation"], d.get("CausingEntity")) for d in c["ResourceChange"]["Details"]},
+    ) for c in changes} == expected
+
+
 def test_cfn_appconfig_application_updates_in_place(cfn, appconfig_client):
     """An application update keeps its id."""
     suffix = _uuid_mod.uuid4().hex[:8]
