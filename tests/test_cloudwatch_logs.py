@@ -6,7 +6,10 @@ import uuid as _uuid_mod
 
 import boto3
 import pytest
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 
 from ministack import app as _app_mod
@@ -2170,16 +2173,15 @@ def logs_auth(monkeypatch):
         async def send(message):
             sent.append(message)
 
+        host = f"_logs_svc.{request_region}.amazonaws.com"
+        request = AWSRequest(method="POST", url=f"https://{host}/", data=body, headers={
+            "x-amz-target": f"Logs_20140328.{action}", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(account if root else key, "test"), "logs", request_region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", f"_logs_svc.{request_region}.amazonaws.com".encode()),
-                (b"x-amz-target", f"Logs_20140328.{action}".encode()),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={account if root else key}"
-                    f"/20261006/{request_region}/logs/aws4_request"
-                ).encode()),
+            "headers": [(b"host", host.encode())] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(_app_mod.app(scope, receive, send))

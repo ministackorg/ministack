@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 logger = logging.getLogger("ministack")
@@ -1043,16 +1043,17 @@ def _is_root_key(access_key_id: str) -> bool:
 
 
 def resolve_principal(access_key_id: str,
-                      account_id: str) -> PrincipalInfo | AuthError:
+                      account_id: str, credential: ResolvedCredential | None = None) -> PrincipalInfo | AuthError:
     """Resolve an access key to a principal and their policies.
 
     Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
     authentication fails (unknown key, inactive key, expired session).
+    A ``credential`` the caller already resolved skips the key lookup.
     """
     from ministack.core.responses import _account_from_sts_session
 
     account_id = _account_from_sts_session(access_key_id) or account_id
-    credential = resolve_credential(access_key_id, account_id)
+    credential = credential or resolve_credential(access_key_id, account_id)
     if isinstance(credential, CredentialResolutionError):
         return AuthError(credential.code, credential.message)
     if credential.principal_type == "Root":
@@ -1076,6 +1077,69 @@ def resolve_principal(access_key_id: str,
     )
 
 
+@dataclass(frozen=True)
+class SignedRequest:
+    """A header-signed request as it arrived."""
+
+    access_key_id: str
+    method: str
+    raw_path: str
+    query_params: dict
+    headers: dict
+    body: bytes = b""
+
+
+_signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
+    "ministack_signed_request", default=None)
+
+
+def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_headers: list) -> None:
+    """Keep a request header-signed with an IAM user or STS session key as sent, for its signature check."""
+    from ministack.core.router import extract_access_key_id
+    from ministack.core.sigv4 import decode_header_value
+
+    authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
+    access_key_id = extract_access_key_id({"authorization": authorization})
+    if not authorization.startswith("AWS4-HMAC-SHA256") or _is_root_key(access_key_id):
+        _signed_request.set(None)
+        return
+    headers: dict[str, str] = {}
+    for name, value in raw_headers:
+        key, text = name.decode("latin-1").lower(), decode_header_value(value)
+        # SigV4 signs a header sent on several lines as its values joined by a bare comma.
+        headers[key] = f"{headers[key]},{text}" if key in headers else text
+    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers))
+
+
+def pin_signed_body(body: bytes) -> None:
+    """Add the body as it arrived, before any decoding, to the pinned request."""
+    request = _signed_request.get()
+    if request is not None:
+        _signed_request.set(replace(request, body=body))
+
+
+def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
+    """Verify the pinned signature of the request's key: its credential, a failure, or None if nothing is pinned."""
+    from ministack.core.responses import _account_from_sts_session
+    from ministack.core.sigv4 import header_signature_failure, parse_header_signature
+
+    request = _signed_request.get()
+    if request is None or request.access_key_id != access_key_id:
+        return None
+    _signed_request.set(None)  # checked once; the request's later checks skip it
+    signature = parse_header_signature(request.headers)
+    if isinstance(signature, tuple):
+        return AuthError(*signature)
+    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    failure = header_signature_failure(
+        signature, credential.secret_access_key, request.method, request.raw_path,
+        request.query_params, request.headers, request.body,
+    )
+    return AuthError(*failure) if failure else credential
+
+
 # ---------------------------------------------------------------------------
 # Top-level enforcement entry point
 # ---------------------------------------------------------------------------
@@ -1090,7 +1154,7 @@ _ALWAYS_ALLOWED_ACTIONS = frozenset({
 
 def resolve_caller_identity(access_key_id: str) -> dict | None:
     """Display identity for a caller's access key — no signature verification
-    (never modeled) and no policy evaluation, just the same key resolution the
+    and no policy evaluation, just the same key resolution the
     evaluator uses, shaped for API Gateway's IAM-authorized proxy events.
 
     Returns None for an unknown key. The ``session`` value is the raw
@@ -1148,14 +1212,18 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
     or an ``EvalResult`` for authorization denials.
     """
+    from ministack.core.responses import get_account_id
+
+    account_id = get_account_id()
+    checked = authenticate(access_key_id or "", account_id)
+    if isinstance(checked, AuthError):
+        return checked
+
     # Actions that AWS never denies, regardless of policies
     if iam_action in _ALWAYS_ALLOWED_ACTIONS:
         return None
 
-    from ministack.core.responses import get_account_id
-
-    account_id = get_account_id()
-    principal = resolve_principal(access_key_id or "", account_id)
+    principal = resolve_principal(access_key_id or "", account_id, checked)
 
     # Authentication failure
     if isinstance(principal, AuthError):

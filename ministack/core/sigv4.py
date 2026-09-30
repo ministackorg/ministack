@@ -5,14 +5,26 @@ responsible for validating their own credential scope, resolving secrets, and
 mapping verification failures to service-specific responses.
 """
 
+import base64
 import datetime as dt
+import functools
 import hashlib
 import hmac
 from collections.abc import Mapping
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
 UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+
+
+def decode_header_value(value: bytes) -> str:
+    """Decode a raw header value as UTF-8, or as Latin-1 when it is not valid UTF-8."""
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return value.decode("latin-1")
 
 
 def uri_encode(value: str, encode_slash: bool = True) -> str:
@@ -132,3 +144,126 @@ def presigned_request_is_expired(
 def signatures_match(computed: str, provided: str) -> bool:
     """Compare signatures without leaking a mismatch position through timing."""
     return hmac.compare_digest(computed, provided)
+
+
+SIGNATURE_MISMATCH = (
+    "The request signature we calculated does not match the signature you provided. "
+    "Check your AWS Secret Access Key and signing method. Consult the service documentation for details."
+)
+
+
+@dataclass(frozen=True)
+class HeaderSignature:
+    """The parts of an ``Authorization: AWS4-HMAC-SHA256`` header and the request date."""
+
+    access_key_id: str
+    date_stamp: str
+    region: str
+    service: str
+    signed_headers: str
+    signature: str
+    amz_date: str
+
+
+def _incomplete(authorization: str, reason: str, code: str = "IncompleteSignature") -> tuple[str, str]:
+    digest = base64.b64encode(hashlib.sha256(authorization.encode("utf-8")).digest()).decode()
+    return code, f"{reason} (Hashed with SHA-256 and encoded with Base64) Authorization={digest}"
+
+
+def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tuple[str, str]:
+    """Split a header signature into its parts, or name the part that is missing."""
+    authorization = headers.get("authorization", "")
+    fields = dict(part.strip().partition("=")[::2] for part in authorization.split(" ", 1)[-1].split(","))
+    for name in ("Credential", "SignedHeaders", "Signature"):
+        if not fields.get(name):
+            return _incomplete(
+                authorization, f"Authorization header requires '{name}' parameter.", "MissingAuthorizationParameter")
+    scope = fields["Credential"].split("/")
+    if len(scope) != 5:
+        return "IncompleteSignature", (
+            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
+            f"got '{fields['Credential']}'"
+        )
+    amz_date = headers.get("x-amz-date", "")
+    if not amz_date and headers.get("date"):
+        try:
+            signed_at = parsedate_to_datetime(headers["date"]).astimezone(dt.timezone.utc)
+            amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
+        except (TypeError, ValueError):
+            pass
+    if not amz_date:
+        return _incomplete(
+            authorization, "Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header."
+        )
+    return HeaderSignature(*scope[:4], fields["SignedHeaders"], fields["Signature"], amz_date)
+
+
+def _remove_dot_segments(path: str) -> str:
+    segments = []
+    for segment in path.split("/"):
+        if segment == "..":
+            if segments:
+                segments.pop()
+        elif segment and segment != ".":
+            segments.append(segment)
+    return "/" + "/".join(segments) + ("/" if path.endswith("/") and segments else "")
+
+
+_cached_signing_key = functools.lru_cache(maxsize=256)(derive_signing_key)
+
+
+def header_signature_failure(
+    signature: HeaderSignature,
+    secret: str,
+    method: str,
+    raw_path: str,
+    query_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+    body: bytes,
+) -> tuple[str, str] | None:
+    """Recompute a header signature; S3 signs its path as sent, other services the normalized path encoded again."""
+    if signature.date_stamp != signature.amz_date[:8]:
+        return "CredentialDateMismatch", (
+            "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
+    path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
+    payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
+    canonical_request = "\n".join([
+        method, path, build_canonical_query_string(query_params, exclude=()),
+        build_canonical_headers(headers, signature.signed_headers), signature.signed_headers, payload_hash,
+    ])
+    string_to_sign = build_string_to_sign(
+        signature.amz_date, signature.date_stamp, signature.region, signature.service, canonical_request
+    )
+    key = _cached_signing_key(secret, signature.date_stamp, signature.region, signature.service)
+    computed = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not signatures_match(computed, signature.signature) or (
+        payload_hash.startswith("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        and not _chunk_signatures_match(body, computed, signature, key)
+    ):
+        return "SignatureDoesNotMatch", SIGNATURE_MISMATCH
+    return None
+
+
+def _chunk_signatures_match(body: bytes, seed: str, signature: HeaderSignature, key: bytes) -> bool:
+    """Check each aws-chunked chunk signature, chained from the seed signature."""
+    scope = f"{signature.date_stamp}/{signature.region}/{signature.service}/aws4_request"
+    empty = hashlib.sha256(b"").hexdigest()
+    previous, pos = seed, 0
+    while (end := body.find(b"\r\n", pos)) >= 0:
+        size, _, provided = body[pos:end].decode("ascii", "replace").partition(";chunk-signature=")
+        try:
+            size = int(size, 16)
+        except ValueError:
+            return False
+        chunk = body[end + 2:end + 2 + size]
+        string_to_sign = "\n".join([
+            "AWS4-HMAC-SHA256-PAYLOAD", signature.amz_date, scope, previous, empty,
+            hashlib.sha256(chunk).hexdigest(),
+        ])
+        previous = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not signatures_match(previous, provided.strip()):
+            return False
+        if size == 0:
+            return True
+        pos = end + 2 + size + 2
+    return False

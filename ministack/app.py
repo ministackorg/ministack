@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
@@ -218,6 +218,8 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
+    pin_signed_body,
+    pin_signed_request,
 )
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
@@ -227,6 +229,7 @@ from ministack.core.responses import (
     set_request_region,
 )
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
+from ministack.core.sigv4 import decode_header_value
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
@@ -725,6 +728,7 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
             if not message.get("more_body", False):
                 break
         body = b"".join(chunks)
+    pin_signed_body(body)
     content_length = headers.get("content-length")
     if content_length is not None:
         content_length = content_length.strip()
@@ -2832,10 +2836,7 @@ async def app(scope, receive, send):
     headers = {}
     for name, value in scope.get("headers", []):
         key = name.decode("latin-1").lower()
-        try:
-            decoded = value.decode("utf-8")
-        except UnicodeDecodeError:
-            decoded = value.decode("latin-1")
+        decoded = decode_header_value(value)
         if key in headers:
             # A field repeated across lines carries the same meaning as one
             # comma-joined value (RFC 9110 5.2), and dropping either line
@@ -2896,6 +2897,9 @@ async def app(scope, receive, send):
     ):
         return
 
+    if AUTH:
+        raw_path = scope.get("raw_path") or quote(path).encode()
+        pin_signed_request(method, raw_path.decode("latin-1"), query_params, scope.get("headers", []))
     try:
         body = await _read_request_body(receive, method, headers)
     except _RequestBodyDisconnected:

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Auth — header signatures are verified for IAM user and STS session keys** — under `AUTH=true` a request signed with such a key and the wrong secret, or changed after signing, was served; it now answers `SignatureDoesNotMatch` (or the service's `InvalidSignatureException`), an `Authorization` header without its `Signature` or `SignedHeaders` answers `IncompleteSignature` (Lambda `MissingAuthenticationTokenException`, S3 `AuthorizationHeaderMalformed`) and a credential date other than the request date `SignatureDoesNotMatch` (S3 `AuthorizationHeaderMalformed`), S3 unsigned, streaming and signed-chunk payloads are checked the same way, and the root key still accepts any secret. Contributed by @iot-rocket.
+
 ### Fixed
 - **Auth — credential failures in the service's protocol** — under `AUTH=true` an unknown, inactive or expired access key answered `UnrecognizedClientException` 403 from every service; it now gets the code, status and `Content-Type` AWS sends for the service's protocol, for example `InvalidClientTokenId` 403 from IAM and SQS, `UnrecognizedClientException` 400 from DynamoDB, `InvalidAccessKeyId` 403 from S3 and `AuthFailure` 401 from EC2. Contributed by @iot-rocket.
 

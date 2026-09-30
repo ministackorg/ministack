@@ -1842,6 +1842,11 @@ _UNKNOWN_KEY = (
     "InvalidClientTokenId", 403, "UnrecognizedClientException",
     ("InvalidAccessKeyId", 403, "The AWS Access Key Id you provided does not exist in our records."),
 )
+_INCOMPLETE = (
+    "IncompleteSignature", 400, "IncompleteSignatureException",
+    ("AuthorizationHeaderMalformed", 400, "The authorization header is malformed; the authorization header "
+                                          "requires three components: Credential, SignedHeaders, and Signature."),
+)
 _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
     "UnrecognizedClientException": _UNKNOWN_KEY,
     "InvalidClientTokenId": _UNKNOWN_KEY,
@@ -1849,6 +1854,18 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
         "ExpiredToken", 403, "ExpiredTokenException",
         ("ExpiredToken", 400, "The provided token has expired."),
     ),
+    "SignatureDoesNotMatch": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("SignatureDoesNotMatch", 403, "The request signature we calculated does not match the signature "
+                                       "you provided. Check your key and signing method."),
+    ),
+    "CredentialDateMismatch": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AuthorizationHeaderMalformed", 400, "The authorization header is malformed; Invalid credential date. "
+                                              "Date is not the same as X-Amz-Date."),
+    ),
+    "IncompleteSignature": _INCOMPLETE,
+    "MissingAuthorizationParameter": _INCOMPLETE,
 }
 
 _QUERY_COMPATIBLE = frozenset({"sqs"})
@@ -1859,6 +1876,8 @@ _EC2_FAILURES = {"ExpiredTokenException": ("RequestExpired", 400, "Request has e
 
 def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple[str, int, str]:
     """The code, status and message a service answers for a failed authentication."""
+    if service == "lambda" and code == "MissingAuthorizationParameter":
+        return "MissingAuthenticationTokenException", 403, "Missing Authentication Token"
     query_code, query_status, json_code, s3_failure = _AUTH_FAILURES[code]
     protocol = _SERVICE_PROTOCOL.get(service)
     if service == "s3":

@@ -13,6 +13,7 @@ the MiniStack server and work with AUTH=false.
 import asyncio
 import io
 import json
+import re
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
@@ -3466,6 +3467,10 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
     monkeypatch, policy_mode,
 ):
     """Run the real ASGI route, IAM evaluator, and SSM tag handlers."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     from ministack import app as app_mod
     from ministack.services import iam as iam_svc
     from ministack.services import ssm as ssm_svc
@@ -3500,15 +3505,14 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
         async def send(message):
             sent.append(message)
 
+        request = AWSRequest(method="POST", url=f"https://ssm.{region}.amazonaws.com/", data=body, headers={
+            "x-amz-target": f"AmazonSSM.{action}", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(key, "test-secret"), "ssm", region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", b"ssm.us-east-1.amazonaws.com"),
-                (b"x-amz-target", f"AmazonSSM.{action}".encode()),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
-                ).encode()),
+            "headers": [(b"host", b"ssm.us-east-1.amazonaws.com")] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(app_mod.app(scope, receive, send))
@@ -3608,6 +3612,10 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
 
 
 def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region(monkeypatch):
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     from ministack import app as app_mod
     from ministack.services import iam as iam_svc
     from ministack.services import ssm as ssm_svc
@@ -3636,15 +3644,14 @@ def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region
         async def send(message):
             sent.append(message)
 
+        request = AWSRequest(method="POST", url=f"https://ssm.{region}.amazonaws.com/", data=body, headers={
+            "x-amz-target": "AmazonSSM.AddTagsToResource", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(key, "test-secret"), "ssm", region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", f"ssm.{region}.amazonaws.com".encode()),
-                (b"x-amz-target", b"AmazonSSM.AddTagsToResource"),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
-                ).encode()),
+            "headers": [(b"host", f"ssm.{region}.amazonaws.com".encode())] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(app_mod.app(scope, receive, send))
@@ -4174,7 +4181,7 @@ class _Body(io.BytesIO):
         yield self.getvalue()
 
 
-def _asgi_send(request, **_):
+def _asgi_send(request, extra_headers=(), **_):
     """Serve a botocore request with the in-process app instead of the network."""
     from urllib.parse import unquote, urlsplit
 
@@ -4190,7 +4197,7 @@ def _asgi_send(request, **_):
                    for k, v in request.headers.items())
     scope = {"type": "http", "method": request.method, "path": unquote(url.path) or "/",
              "raw_path": url.path.encode(), "query_string": url.query.encode(),
-             "headers": [(k.encode("latin-1"), v) for k, v in headers.items()]}
+             "headers": [(k.encode("latin-1"), v) for k, v in headers.items()] + list(extra_headers)}
     sent = []
 
     async def receive():
@@ -4205,14 +4212,14 @@ def _asgi_send(request, **_):
                        _Body(b"".join(m.get("body", b"") for m in sent[1:])))
 
 
-def _local_client(service, key="test", secret="test", token=None):
+def _local_client(service, key="test", secret="test", token=None, **s3_config):
     import boto3
     from botocore.config import Config
 
     client = boto3.client(
         service, endpoint_url="http://localhost:4566", region_name="us-east-1",
         aws_access_key_id=key, aws_secret_access_key=secret, aws_session_token=token,
-        config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}),
+        config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path", **s3_config}),
     )
     client.meta.events.register("before-send", _asgi_send)
     return client
@@ -4299,6 +4306,218 @@ class TestCredentialErrors:
         })
         client = _local_client(service, "ASIAEXPIREDSESSION01", "session-secret", "session-token")
         assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+
+@pytest.fixture
+def user_key(monkeypatch):
+    """An IAM user allowed everything, created through the app under AUTH=true."""
+    from ministack import app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam = _local_client("iam")
+    name = f"signer-{time.time_ns()}"
+    iam.create_user(UserName=name)
+    iam.put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps(
+        {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    yield key["AccessKeyId"], key["SecretAccessKey"]
+    iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+    iam.delete_user_policy(UserName=name, PolicyName="all")
+    iam.delete_user(UserName=name)
+
+
+def _chunked_put(key, secret, url, data, *, bad_chunk=False):
+    """A PutObject streamed as signed aws-chunked chunks, as the Java and Go SDKs send it."""
+    import datetime as dt
+    import hashlib
+    import hmac
+
+    from botocore.awsrequest import AWSRequest
+
+    from ministack.core.sigv4 import derive_signing_key
+
+    amz_date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    scope = f"{amz_date[:8]}/us-east-1/s3/aws4_request"
+    signing_key = derive_signing_key(secret, amz_date[:8], "us-east-1", "s3")
+    chunks = [data, b""]
+    headers = {
+        "content-encoding": "aws-chunked", "host": "localhost:4566", "x-amz-date": amz_date,
+        "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "x-amz-decoded-content-length": str(len(data)),
+    }
+    signed = ";".join(sorted(headers))
+    path = url.split("localhost:4566", 1)[1]
+    canonical = "\n".join(["PUT", path, "", "".join(f"{h}:{headers[h]}\n" for h in sorted(headers)), signed,
+                           headers["x-amz-content-sha256"]])
+    string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    previous = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={signed}, Signature={previous}")
+    body = b""
+    for chunk in chunks:
+        previous = hmac.new(signing_key, "\n".join([
+            "AWS4-HMAC-SHA256-PAYLOAD", amz_date, scope, previous, hashlib.sha256(b"").hexdigest(),
+            hashlib.sha256(chunk).hexdigest()]).encode(), hashlib.sha256).hexdigest()
+        signature = "0" * 64 if bad_chunk and chunk else previous
+        body += f"{len(chunk):x};chunk-signature={signature}\r\n".encode() + chunk + b"\r\n"
+    return _asgi_send(AWSRequest(method="PUT", url=url, headers=headers, data=body).prepare())
+
+
+class TestHeaderSignatures:
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "SignatureDoesNotMatch", 403),
+        ("sqs", "SignatureDoesNotMatch", 403),
+        ("dynamodb", "InvalidSignatureException", 400),
+        ("lambda", "InvalidSignatureException", 403),
+        ("s3", "SignatureDoesNotMatch", 403),
+        ("ec2", "AuthFailure", 401),
+    ])
+    def test_wrong_secret_answers_the_protocols_code(self, user_key, service, code, status):
+        client = _local_client(service, user_key[0], "wrong-secret")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    def test_get_caller_identity_checks_the_signature(self, user_key):
+        client = _local_client("sts", user_key[0], "wrong-secret")
+        assert _failure(client.get_caller_identity) == ("SignatureDoesNotMatch", 403)
+        assert ":user/signer-" in _local_client("sts", *user_key).get_caller_identity()["Arn"]
+
+    @pytest.mark.parametrize("service", sorted(_LIST_CALLS))
+    def test_right_secret_passes(self, user_key, service):
+        _LIST_CALLS[service](_local_client(service, *user_key))
+
+    def test_paths_and_queries_sign_as_the_sdk_encodes_them(self, user_key):
+        s3 = _local_client("s3", *user_key)
+        bucket = f"signed-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            s3.put_object(Bucket=bucket, Key="dir/a b+c=ü.txt", Body=b"x")
+            assert s3.get_object(Bucket=bucket, Key="dir/a b+c=ü.txt")["Body"].read() == b"x"
+            assert s3.list_objects_v2(Bucket=bucket, Prefix="dir/a b")["KeyCount"] == 1
+        finally:
+            s3.delete_object(Bucket=bucket, Key="dir/a b+c=ü.txt")
+            s3.delete_bucket(Bucket=bucket)
+        lam = _local_client("lambda", *user_key)
+        function = "arn:aws:lambda:us-east-1:000000000000:function:a b"
+        assert _failure(lambda: lam.get_function(FunctionName=function)) != ("InvalidSignatureException", 403)
+        lam.list_functions(MaxItems=5, FunctionVersion="ALL")
+
+    @pytest.mark.parametrize("key", ["a%2Fb", "caf%c3%a9", "x%7Ey"])
+    def test_s3_signs_the_path_as_sent(self, user_key, key):
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        s3 = _local_client("s3", *user_key)
+        bucket = f"raw-path-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            request = AWSRequest(method="PUT", url=f"http://localhost:4566/{bucket}/{key}", data=b"x")
+            S3SigV4Auth(Credentials(*user_key), "s3", "us-east-1").add_auth(request)
+            assert _asgi_send(request.prepare()).status_code == 200
+        finally:
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_pin_holds_no_root_key_request_and_ends_with_the_check(self, user_key):
+        from ministack.core import iam_evaluator
+
+        def pin(key):
+            iam_evaluator.pin_signed_request("GET", "/", {}, [
+                (b"host", b"localhost:4566"),
+                (b"authorization", f"AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/sts/aws4_request, "
+                                   "SignedHeaders=host, Signature=0".encode()),
+            ])
+            return iam_evaluator._signed_request.get()
+
+        assert pin("test") is None
+        assert pin(user_key[0]) is not None
+        assert isinstance(iam_evaluator.authenticate(user_key[0], "000000000000"), iam_evaluator.AuthError)
+        assert iam_evaluator._signed_request.get() is None
+
+    def test_request_changed_after_signing_is_refused(self, user_key):
+        client = _local_client("dynamodb", *user_key)
+        client.meta.events.register_first(
+            "before-send", lambda request, **_: setattr(request, "body", b'{"Limit": 2}'))
+        assert _failure(lambda: client.list_tables(Limit=1)) == ("InvalidSignatureException", 400)
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "IncompleteSignature", 400),
+        ("dynamodb", "IncompleteSignatureException", 400),
+        ("lambda", "MissingAuthenticationTokenException", 403),
+        ("s3", "AuthorizationHeaderMalformed", 400),
+    ])
+    def test_incomplete_authorization_header_is_refused(self, user_key, service, code, status):
+        client = _local_client(service, *user_key)
+
+        def drop_signature(request, **_):
+            request.headers["Authorization"] = request.headers["Authorization"].split(b", Signature=")[0]
+
+        client.meta.events.register_first("before-send", drop_signature)
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "SignatureDoesNotMatch", 403),
+        ("dynamodb", "InvalidSignatureException", 400),
+        ("s3", "AuthorizationHeaderMalformed", 400),
+    ])
+    def test_credential_date_must_match_the_request_date(self, user_key, service, code, status):
+        client = _local_client(service, *user_key)
+
+        def move_scope_date(request, **_):
+            request.headers["Authorization"] = re.sub(
+                rb"/\d{8}/", b"/20200101/", request.headers["Authorization"], count=1)
+
+        client.meta.events.register_first("before-send", move_scope_date)
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    def test_header_sent_on_two_lines_signs_as_its_comma_joined_value(self, user_key):
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        s3 = _local_client("s3", *user_key)
+        bucket = f"lines-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            request = AWSRequest(method="PUT", url=f"http://localhost:4566/{bucket}/k", data=b"x",
+                                 headers={"x-amz-meta-list": "a,b"})
+            S3SigV4Auth(Credentials(*user_key), "s3", "us-east-1").add_auth(request)
+            del request.headers["x-amz-meta-list"]
+            lines = [(b"x-amz-meta-list", b"a"), (b"x-amz-meta-list", b"b")]
+            assert _asgi_send(request.prepare(), lines).status_code == 200
+        finally:
+            s3.delete_object(Bucket=bucket, Key="k")
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_s3_unsigned_and_chunked_payloads(self, user_key):
+        s3 = _local_client("s3", *user_key)
+        bucket = f"payloads-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            unsigned = _local_client("s3", *user_key, payload_signing_enabled=False)
+            unsigned.put_object(Bucket=bucket, Key="unsigned", Body=b"abc")
+            wrong = _local_client("s3", user_key[0], "wrong-secret", payload_signing_enabled=False)
+            assert _failure(lambda: wrong.put_object(Bucket=bucket, Key="unsigned", Body=b"abc")) == (
+                "SignatureDoesNotMatch", 403)
+            url = f"http://localhost:4566/{bucket}/chunked"
+            assert _chunked_put(*user_key, url, b"hello chunks").status_code == 200
+            assert s3.get_object(Bucket=bucket, Key="chunked")["Body"].read() == b"hello chunks"
+            assert _chunked_put(user_key[0], "wrong-secret", url, b"x").status_code == 403
+            assert _chunked_put(*user_key, url, b"x", bad_chunk=True).status_code == 403
+        finally:
+            for name in ("unsigned", "chunked"):
+                s3.delete_object(Bucket=bucket, Key=name)
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_root_key_signs_with_any_secret(self, user_key):
+        assert _local_client("dynamodb", "test", "anything").list_tables()["TableNames"] is not None
+
+    def test_signature_is_not_checked_without_auth(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        _local_client("dynamodb", user_key[0], "wrong-secret").list_tables()
 
 
 # ---------------------------------------------------------------------------
