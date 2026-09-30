@@ -617,8 +617,7 @@ def _register_task_definition(data):
         cdef.setdefault("cpu", 0)
         cdef.setdefault("essential", True)
 
-    rev = _task_def_latest.get(family, 0) + 1
-    _task_def_latest[family] = rev
+    rev = _next_task_def_revision(family)
     td_key = f"{family}:{rev}"
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
 
@@ -662,6 +661,13 @@ def _register_task_definition(data):
     if req_tags:
         _tags[arn] = list(req_tags)
     return json_response({"taskDefinition": td, "tags": req_tags})
+
+
+def _next_task_def_revision(family):
+    """Reserve the family's next revision number; numbers are never reused."""
+    rev = _task_def_latest.get(family, 0) + 1
+    _task_def_latest[family] = rev
+    return rev
 
 
 def _deregister_task_definition(data):

@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — `AWS::ECS::Cluster` and `AWS::ECS::TaskDefinition` update in place** — cluster tags now reach `ListTagsForResource` and a settings, configuration, capacity provider or tag change keeps the cluster, while a task definition change registers the next revision of the family and deregisters the old one instead of overwriting revision 1 under the same ARN. Contributed by @iot-rocket.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

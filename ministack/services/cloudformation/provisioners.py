@@ -7569,9 +7569,25 @@ def _ec2_subnet_rtb_assoc_delete(physical_id, props):
 
 # --- ECS resource provisioners ---
 
+def _ecs_cluster_fields(props):
+    """The cluster members a template sets, for create and update alike."""
+    fields = {
+        "capacityProviders": props.get("CapacityProviders", []),
+        "defaultCapacityProviderStrategy": _pascal_to_camel(
+            props.get("DefaultCapacityProviderStrategy") or []),
+    }
+    # Removing either from the template leaves the cluster's value as it is.
+    if props.get("ClusterSettings"):
+        fields["settings"] = _pascal_to_camel(props["ClusterSettings"])
+    if props.get("Configuration"):
+        fields["configuration"] = _pascal_to_camel(props["Configuration"])
+    return fields
+
+
 def _ecs_cluster_create(logical_id, props, stack_name):
     name = props.get("ClusterName", f"{stack_name}-{logical_id}")
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
+    tags = _pascal_to_camel(props.get("Tags") or [])
     _ecs._clusters[name] = {
         "clusterArn": arn,
         "clusterName": name,
@@ -7580,19 +7596,34 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "runningTasksCount": 0,
         "pendingTasksCount": 0,
         "activeServicesCount": 0,
-        "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
-        "capacityProviders": props.get("CapacityProviders", []),
-        "defaultCapacityProviderStrategy": _pascal_to_camel(
-            props.get("DefaultCapacityProviderStrategy") or []),
-        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+        "settings": [],
+        "tags": tags,
+        **_ecs_cluster_fields(props),
     }
-    if props.get("Configuration"):
-        _ecs._clusters[name]["configuration"] = _pascal_to_camel(props["Configuration"])
+    _ecs._tags[arn] = list(tags)
     return name, {"Arn": arn, "ClusterName": name}
 
 
+def _ecs_cluster_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """ClusterName replaces; the rest updates in place (aws-resource-ecs-cluster)."""
+    name = new_props.get("ClusterName", f"{stack_name}-{logical_id or physical_id}")
+    cluster = _ecs._clusters.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, cluster["clusterName"] if cluster else None,
+        _ecs_cluster_create, _ecs_cluster_delete,
+    )
+    if replaced is not None:
+        return replaced
+    cluster.update(_ecs_cluster_fields(new_props))
+    arn = cluster["clusterArn"]
+    _reconcile_tag_list(_ecs._tags.setdefault(arn, []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"Arn": arn, "ClusterName": physical_id}
+
+
 def _ecs_cluster_delete(physical_id, props):
-    _ecs._clusters.pop(physical_id, None)
+    _ecs._delete_cluster({"cluster": physical_id})
 
 
 def _cfn_to_camel(key):
@@ -7626,7 +7657,7 @@ def _normalize_container_defs(cdefs):
 
 def _ecs_task_def_create(logical_id, props, stack_name):
     family = props.get("Family", f"{stack_name}-{logical_id}")
-    revision = 1
+    revision = _ecs._next_task_def_revision(family)
     td_key = f"{family}:{revision}"
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
     compat = props.get("RequiresCompatibilities", ["EC2"])
@@ -7652,14 +7683,22 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         if prop in props:
             td[key] = props[prop]
     _ecs._task_defs[td_key] = td
-    _ecs._task_def_latest[family] = revision
+    _ecs._tags[arn] = _pascal_to_camel(props.get("Tags") or [])
     return arn, {"TaskDefinitionArn": arn}
 
 
+def _ecs_task_def_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Tags update in place; any other change registers the next revision."""
+    if ({k: v for k, v in old_props.items() if k != "Tags"}
+            != {k: v for k, v in new_props.items() if k != "Tags"}):
+        return _ecs_task_def_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_list(_ecs._tags.setdefault(physical_id, []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"TaskDefinitionArn": physical_id}
+
+
 def _ecs_task_def_delete(physical_id, props):
-    # physical_id is the ARN; _task_defs is keyed by "family:revision"
-    td_key = physical_id.split("/")[-1] if "/" in physical_id else physical_id
-    _ecs._task_defs.pop(td_key, None)
+    _ecs._deregister_task_definition({"taskDefinition": physical_id})
 
 
 def _ecs_deployment_configuration(props):
@@ -12974,8 +13013,18 @@ _RESOURCE_HANDLERS = {
         "delete": _ec2_route_delete,
     },
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
-    "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
-    "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
+    "AWS::ECS::Cluster": {
+        "create": _ecs_cluster_create,
+        "update": _ecs_cluster_update,
+        "update_with_logical_id": True,
+        "delete": _ecs_cluster_delete,
+    },
+    "AWS::ECS::TaskDefinition": {
+        "create": _ecs_task_def_create,
+        "update": _ecs_task_def_update,
+        "update_with_logical_id": True,
+        "delete": _ecs_task_def_delete,
+    },
     "AWS::ECS::Service": {
         "create": _ecs_service_create,
         "update": _ecs_service_update,
