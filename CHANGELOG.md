@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Bedrock AgentCore — `InvokeAgentRuntime` enforces IAM policies** — with `AUTH=true`, runtime invocations now resolve to `bedrock-agentcore:InvokeAgentRuntime` and authorize against the ARN in the request path, so a policy can allow one runtime and deny another. Previously, the action was not extracted and the request bypassed identity-policy evaluation.
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 

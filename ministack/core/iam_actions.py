@@ -40,7 +40,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock": "bedrock",
     "bedrock-agent": "bedrock",
     "bedrock-agent-runtime": "bedrock",
-    "bedrock-agentcore": "bedrock",
+    "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
@@ -456,7 +456,9 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    "bedrock-agentcore": [],  # no botocore model yet
+    # InvokeAgentRuntime is mapped explicitly below so AUTH works even with
+    # Botocore versions that predate the AgentCore service model.
+    "bedrock-agentcore": [],
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -687,6 +689,12 @@ def extract_iam_action(service: str, method: str, path: str,
         if action_name:
             return f"lambda:{action_name}"
 
+    if service == "bedrock-agentcore" and method == "POST":
+        # AgentCore runtime ARNs contain slashes and SDKs percent-encode them
+        # into the path label. Match only InvokeAgentRuntime's data-plane URI.
+        if re.fullmatch(r"/runtimes/.+?/invocations/?", unquote(path)):
+            return "bedrock-agentcore:InvokeAgentRuntime"
+
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
@@ -845,6 +853,15 @@ def extract_resource_arn(service: str, method: str, path: str,
         resources = dynamodb_resource_arns(body, region, account_id)
         if resources:
             return resources[0]
+        return "*"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        # InvokeAgentRuntime addresses a specific runtime in the URI. The ARN
+        # itself contains slashes and is percent-encoded by SDKs, so decode it
+        # before returning it to IAM policy evaluation.
+        match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
+        if match:
+            return match.group(1)
         return "*"
 
     if service == "lambda":
