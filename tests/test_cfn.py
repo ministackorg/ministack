@@ -18117,6 +18117,56 @@ def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ecs_cluster_include_gated_fields(cfn, ecs):
+    """Template tags come back under TAGS and the default containerInsights setting under SETTINGS."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-incl-{suffix}"
+    tagged, bare = f"cfn-ecs-incl-t-{suffix}", f"cfn-ecs-incl-b-{suffix}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Tagged": {"Type": "AWS::ECS::Cluster", "Properties": {
+            "ClusterName": tagged, "Tags": [{"Key": "k", "Value": "v"}]}},
+        "Bare": {"Type": "AWS::ECS::Cluster", "Properties": {"ClusterName": bare}},
+    }}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        full = {c["clusterName"]: c for c in ecs.describe_clusters(
+            clusters=[tagged, bare], include=["SETTINGS", "TAGS"])["clusters"]}
+        assert {"key": "k", "value": "v"} in full[tagged]["tags"]
+        assert full[bare]["settings"] == [{"name": "containerInsights", "value": "disabled"}]
+        for c in ecs.describe_clusters(clusters=[tagged, bare])["clusters"]:
+            assert c["tags"] == [] and c["settings"] == [] and c["statistics"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ecs_cluster_update_keeps_tags_added_outside_the_template(cfn, ecs):
+    """A stack update that runs the cluster create again keeps a TagResource tag next to the template tags."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = cluster = f"cfn-ecs-oob-{suffix}"
+
+    def template(insights):
+        return json.dumps({"Resources": {"Cluster": {"Type": "AWS::ECS::Cluster", "Properties": {
+            "ClusterName": cluster, "Tags": [{"Key": "stage", "Value": "v1"}],
+            "ClusterSettings": [{"Name": "containerInsights", "Value": insights}]}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("disabled"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = ecs.describe_clusters(clusters=[cluster])["clusters"][0]["clusterArn"]
+        ecs.tag_resource(resourceArn=arn, tags=[{"key": "oob", "value": "1"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("enabled"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        tags = ecs.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert {t["key"]: t["value"] for t in tags if not t["key"].startswith("aws:")} == {
+            "stage": "v1", "oob": "1"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ecs_service_network_and_load_balancers_read_back_in_the_api_shape(cfn, ecs, elbv2):
     """NetworkConfiguration and LoadBalancers read back in camelCase, on create and on update."""
     suffix = _uuid_mod.uuid4().hex[:8]

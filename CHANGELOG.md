@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

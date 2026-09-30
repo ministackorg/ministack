@@ -7571,28 +7571,29 @@ def _ec2_subnet_rtb_assoc_delete(physical_id, props):
 
 def _ecs_cluster_create(logical_id, props, stack_name):
     name = props.get("ClusterName", f"{stack_name}-{logical_id}")
-    arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
-    _ecs._clusters[name] = {
-        "clusterArn": arn,
+    tags = _pascal_to_camel(props.get("Tags") or [])
+    # A stack update runs the create again; tags added outside the template stay.
+    old = _ecs._clusters.get(name)
+    foreign = []
+    if old:
+        template_keys = {t["key"] for t in old["tags"] + tags}
+        foreign = [t for t in _ecs._tags.get(old["clusterArn"], []) if t["key"] not in template_keys]
+    cluster = _ecs._put_cluster({
         "clusterName": name,
-        "status": "ACTIVE",
-        "registeredContainerInstancesCount": 0,
-        "runningTasksCount": 0,
-        "pendingTasksCount": 0,
-        "activeServicesCount": 0,
+        "tags": tags,
         "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
         "defaultCapacityProviderStrategy": _pascal_to_camel(
             props.get("DefaultCapacityProviderStrategy") or []),
-        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-    }
-    if props.get("Configuration"):
-        _ecs._clusters[name]["configuration"] = _pascal_to_camel(props["Configuration"])
-    return name, {"Arn": arn, "ClusterName": name}
+        "configuration": _pascal_to_camel(props.get("Configuration") or {}),
+    })
+    if old:
+        _ecs._tags[cluster["clusterArn"]] = tags + foreign
+    return name, {"Arn": cluster["clusterArn"], "ClusterName": name}
 
 
 def _ecs_cluster_delete(physical_id, props):
-    _ecs._clusters.pop(physical_id, None)
+    _ecs._delete_cluster({"cluster": physical_id})
 
 
 def _cfn_to_camel(key):
