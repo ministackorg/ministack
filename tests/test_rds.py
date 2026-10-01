@@ -864,6 +864,37 @@ def test_rds_global_cluster_lifecycle(rds):
         rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
+def test_rds_describe_global_clusters_member_element(rds):
+    """Each cluster in DescribeGlobalClusters is a <GlobalClusterMember> element.
+
+    botocore reads the items of a list whatever their element name, so boto3
+    cannot tell; SDKs that match the name, such as aws-sdk-go-v2, found no
+    clusters when they were <GlobalCluster> elements.
+    """
+    import xml.etree.ElementTree as ET
+
+    import requests
+    rds.create_global_cluster(
+        GlobalClusterIdentifier="test-global-wire",
+        Engine="aurora-postgresql",
+        EngineVersion="15.13",
+    )
+    try:
+        response = requests.post(
+            ENDPOINT,
+            data={"Action": "DescribeGlobalClusters", "Version": "2014-10-31",
+                  "GlobalClusterIdentifier": "test-global-wire"},
+            headers={"Authorization": "AWS4-HMAC-SHA256 "
+                     "Credential=test/20260930/us-east-1/rds/aws4_request"},
+            timeout=10,
+        )
+        assert response.status_code == 200
+        clusters = ET.fromstring(response.content).find(".//{*}GlobalClusters")
+        assert [child.tag.rpartition("}")[2] for child in clusters] == ["GlobalClusterMember"]
+        assert clusters[0].findtext("{*}GlobalClusterIdentifier") == "test-global-wire"
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier="test-global-wire")
+
 def test_rds_global_cluster_with_source(rds):
     """CreateGlobalCluster with SourceDBClusterIdentifier picks up engine from source."""
     rds.create_db_cluster(

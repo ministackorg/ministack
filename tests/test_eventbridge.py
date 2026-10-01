@@ -933,6 +933,21 @@ def test_eventbridge_create_event_bus_v2(eb):
     updated = eb.describe_event_bus(Name="eb-bus-v2")
     assert updated["Description"] == "updated description"
 
+def test_eventbridge_update_event_bus_returns_bus(eb):
+    created = eb.create_event_bus(Name="eb-bus-update-resp")
+    try:
+        resp = eb.update_event_bus(
+            Name="eb-bus-update-resp",
+            Description="new description",
+            DeadLetterConfig={"Arn": "arn:aws:sqs:us-east-1:000000000000:eb-dlq"},
+        )
+        assert resp["Arn"] == created["EventBusArn"]
+        assert resp["Name"] == "eb-bus-update-resp"
+        assert resp["Description"] == "new description"
+        assert resp["DeadLetterConfig"] == {"Arn": "arn:aws:sqs:us-east-1:000000000000:eb-dlq"}
+    finally:
+        eb.delete_event_bus(Name="eb-bus-update-resp")
+
 def test_eventbridge_put_rule_v2(eb):
     eb.create_event_bus(Name="eb-rule-bus")
     resp = eb.put_rule(
