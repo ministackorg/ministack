@@ -520,6 +520,114 @@ def test_condition_operator_by_key_presence(operator, policy_value, matching, ot
     assert evaluate(ctx, [stmts]).decision == expected
 
 
+_NEGATED_VALUE_LIST_CASES = [
+    ("StringNotEquals", ["qualification", "recovery"], "qualification", "recovery", "neighbor"),
+    ("StringNotEqualsIgnoreCase", ["QUALIFICATION", "RECOVERY"], "qualification", "recovery", "neighbor"),
+    ("StringNotLike", ["qual*", "rec*"], "qualification", "recovery", "neighbor"),
+    ("NumericNotEquals", ["10", "20"], "10", "20", "30"),
+    ("DateNotEquals", ["2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z"],
+     "2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z", "2032-01-01T00:00:00Z"),
+    ("ArnNotEquals", [_ARN, _ARN + "-recovery"], _ARN, _ARN + "-recovery", _ARN + "-neighbor"),
+    ("ArnNotLike", [_ARN + "*", "arn:aws:sqs:*:111122223333:recovery*"],
+     _ARN, "arn:aws:sqs:eu-central-1:111122223333:recovery", "arn:aws:sqs:eu-central-1:111122223333:neighbor"),
+    ("NotIpAddress", ["10.0.0.0/8", "192.168.0.0/16"], "10.1.2.3", "192.168.1.1", "172.16.1.1"),
+]
+
+
+class TestConditionValueLists:
+    @pytest.mark.parametrize("operator, policy_values, first, second, other", [
+        pytest.param(*case, id=case[0]) for case in _NEGATED_VALUE_LIST_CASES
+    ])
+    @pytest.mark.parametrize("state", range(3), ids=["first-listed", "second-listed", "unlisted"])
+    @pytest.mark.parametrize("suffix", ["", "IfExists"])
+    def test_negated_deny_matches_none_of_the_policy_values(
+        self, operator, policy_values, first, second, other, state, suffix
+    ):
+        # AWS docs: policy values for a negated matching operator use NOR.
+        ctx = _ctx()
+        ctx.service_context = {"test:key": (first, second, other)[state]}
+        stmts = parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "*", "Resource": "*",
+             "Condition": {operator + suffix: {"test:key": policy_values}}},
+        ]})
+        assert evaluate(ctx, [stmts]).decision == ("Deny" if state == 2 else "Allow")
+
+    @pytest.mark.parametrize("operator", ["StringNotEquals", "StringNotLike"])
+    @pytest.mark.parametrize("quantifier", ["ForAnyValue", "ForAllValues"])
+    @pytest.mark.parametrize("request_values, any_denies, all_denies", [
+        (["qualification", "recovery"], False, False),
+        (["qualification", "neighbor"], True, False),
+        (["neighbor", "other"], True, True),
+        ([], False, True),
+        (None, False, True),
+    ])
+    def test_negated_set_quantifiers(self, operator, quantifier, request_values, any_denies, all_denies):
+        ctx = _ctx()
+        if request_values is not None:
+            ctx.service_context = {"test:key": request_values}
+        values = ["qual*", "rec*"] if operator == "StringNotLike" else ["qualification", "recovery"]
+        stmts = parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "*", "Resource": "*",
+             "Condition": {f"{quantifier}:{operator}": {"test:key": values}}},
+        ]})
+        denies = any_denies if quantifier == "ForAnyValue" else all_denies
+        assert evaluate(ctx, [stmts]).decision == ("Deny" if denies else "Allow")
+
+    @pytest.mark.parametrize("policy_key", [
+        "aws:RequestTag/Environment", "aws:RequestTag/environment", "AWS:REQUESTTAG/ENVIRONMENT",
+    ])
+    @pytest.mark.parametrize("tag_value, expected", [("production", "Allow"), ("Production", "ImplicitDeny")])
+    def test_request_tag_keys_ignore_case_but_string_equals_values_do_not(self, policy_key, tag_value, expected):
+        ctx = _ctx()
+        ctx.request_tags = {"Environment": tag_value}
+        ctx.tag_keys = ["Environment"]
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {"StringEquals": {policy_key: "production"}},
+        }]})
+        assert evaluate(ctx, [stmts]).decision == expected
+
+    @pytest.mark.parametrize("policy_key, expected", [("Environment", "Allow"), ("environment", "ImplicitDeny")])
+    def test_tag_keys_string_equals_preserves_case(self, policy_key, expected):
+        ctx = _ctx()
+        ctx.request_tags = {"Environment": "production"}
+        ctx.tag_keys = ["Environment"]
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {"ForAllValues:StringEquals": {"aws:TagKeys": [policy_key]}},
+        }]})
+        assert evaluate(ctx, [stmts]).decision == expected
+
+    @pytest.mark.parametrize("policy_key", ["Environment", "environment", "ENVIRONMENT"])
+    @pytest.mark.parametrize("quantifier", ["", "ForAnyValue:", "ForAllValues:"])
+    @pytest.mark.parametrize("operator", ["StringEquals", "StringLike", "StringNotEquals", "StringNotLike"])
+    @pytest.mark.parametrize("suffix", ["", "IfExists"])
+    @pytest.mark.parametrize("tag_values", [
+        ("production", "test"), ("production", "production"), ("test", "dev"),
+    ], ids=["mixed", "both-match", "none-match"])
+    @pytest.mark.parametrize("reverse_tags", [False, True])
+    def test_case_colliding_request_tags_match_all_case_variants(
+        self, policy_key, quantifier, operator, suffix, tag_values, reverse_tags
+    ):
+        # Live AWS, us-west-2: signed SQS CreateQueue with a disposable IAM
+        # user's policy. An affirmative operator matches any case variant;
+        # a negated operator matches only if none of the variants match.
+        tags = list(zip(["Environment", "environment"], tag_values))
+        ctx = _ctx()
+        ctx.request_tags = dict(reversed(tags) if reverse_tags else tags)
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {quantifier + operator + suffix: {f"aws:RequestTag/{policy_key}": "production"}},
+        }]})
+        matches = "production" in tag_values
+        if operator in ("StringNotEquals", "StringNotLike"):
+            matches = not matches
+        assert evaluate(ctx, [stmts]).decision == ("Allow" if matches else "ImplicitDeny")
+
+
+
 class TestResourceAccountCondition:
     """``aws:ResourceAccount`` (and the ``s3:ResourceAccount`` alias) resolve to the
     account that owns the resource. The emulator hosts one account per request and
@@ -2768,6 +2876,21 @@ class TestAccessDeniedResponse:
                                           message="Token expired")
         assert b"ExpiredTokenException" in b
 
+    @pytest.mark.parametrize("action", (
+        "AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource",
+    ))
+    def test_ssm_tag_credential_error_keeps_authentication_status(self, action):
+        from ministack.core.iam_actions import access_denied_response
+
+        status, _, body = access_denied_response(
+            "ssm", f"ssm:{action}", "", "r1",
+            error_code="UnrecognizedClientException", message="Invalid signing credentials",
+        )
+        assert status == 403
+        assert json.loads(body) == {
+            "__type": "UnrecognizedClientException", "message": "Invalid signing credentials",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Integration: SimulateCustomPolicy (runs against server, AUTH=false OK)
@@ -2980,10 +3103,302 @@ class TestExtractResourceArn:
         assert self._arn("ssm", body=body) == (
             "arn:aws:ssm:us-east-1:000000000000:parameter/app/db")
 
+    @pytest.mark.parametrize("action", (
+        "AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource",
+    ))
+    @pytest.mark.parametrize("resource_id", ("app/db", "/app/db"))
+    def test_ssm_parameter_tags_use_resource_id(self, action, resource_id):
+        from ministack.core.iam_actions import extract_resource_arn
+
+        body = json.dumps({
+            "ResourceType": "Parameter", "ResourceId": resource_id,
+            "Name": "/wrong/parameter",
+        }).encode()
+        assert extract_resource_arn(
+            "ssm", "POST", "/", {"x-amz-target": f"AmazonSSM.{action}"},
+            body, {}, self.REGION, self.ACCOUNT,
+        ) == "arn:aws:ssm:us-east-1:000000000000:parameter/app/db"
+
+    def test_ssm_tag_arn_input_and_other_resource_types(self):
+        from ministack.core.iam_actions import extract_resource_arn
+
+        arn = "arn:aws:ssm:us-west-2:111111111111:parameter/app/db"
+        headers = {"x-amz-target": "AmazonSSM.ListTagsForResource"}
+        for local_alias in (
+            "arn:aws:ssm:us-east-1:000000000000:parameter//app/db",
+            "arn:aws:ssm:us-east-1:000000000000:parameterapp/db",
+        ):
+            assert extract_resource_arn(
+                "ssm", "POST", "/", headers,
+                json.dumps({"ResourceId": local_alias}).encode(),
+                {}, self.REGION, self.ACCOUNT,
+            ) == "arn:aws:ssm:us-east-1:000000000000:parameter/app/db"
+        assert extract_resource_arn(
+            "ssm", "POST", "/", headers,
+            json.dumps({"ResourceType": "Parameter", "ResourceId": arn}).encode(),
+            {}, self.REGION, self.ACCOUNT,
+        ) == arn
+        for foreign_arn in (
+            "arn:aws:ssm:us-west-2:000000000000:parameter/app/db",
+            "arn:aws:ssm:us-east-1:111111111111:parameter/app/db",
+            "arn:aws:ssm:us-east-1:000000000000:document/app/db",
+        ):
+            assert extract_resource_arn(
+                "ssm", "POST", "/", headers,
+                json.dumps({"ResourceType": "Parameter", "ResourceId": foreign_arn}).encode(),
+                {}, self.REGION, self.ACCOUNT,
+            ) == foreign_arn
+        assert extract_resource_arn(
+            "ssm", "POST", "/", headers,
+            json.dumps({
+                "ResourceType": "Document", "ResourceId": "/app/db", "Name": "/app/db",
+            }).encode(), {}, self.REGION, self.ACCOUNT,
+        ) == "*"
+        assert extract_resource_arn(
+            "ssm", "POST", "/", headers,
+            json.dumps({"ResourceType": "Parameter", "Name": "/app/db"}).encode(),
+            {}, self.REGION, self.ACCOUNT,
+        ) == "*"
+
     def test_cloudwatch_alarm_name_from_json_body(self):
         body = json.dumps({"AlarmName": "cpu-high"}).encode()
         assert self._arn("monitoring", body=body) == (
             "arn:aws:cloudwatch:us-east-1:000000000000:alarm:cpu-high")
+
+
+@pytest.mark.parametrize("policy_mode", ("exact", "explicit-deny", "action-only"))
+def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_tags(
+    monkeypatch, policy_mode,
+):
+    """Run the real ASGI route, IAM evaluator, and SSM tag handlers."""
+    from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import ssm as ssm_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    account, region = "123456789012", "us-east-1"
+    key, user = "AKIASSMTAGAUTHCASE", "ssm-tag-auth-case"
+    name_a, name_b = "/iam-ssm-tag/a", "/iam-ssm-tag/b"
+    legacy_name = "iam-ssm-tag/legacy"
+    arn_a = f"arn:aws:ssm:{region}:{account}:parameter/iam-ssm-tag/a"
+    arn_b = f"arn:aws:ssm:{region}:{account}:parameter/iam-ssm-tag/b"
+    legacy_arn = f"arn:aws:ssm:{region}:{account}:parameteriam-ssm-tag/legacy"
+    canonical_legacy_arn = f"arn:aws:ssm:{region}:{account}:parameter/iam-ssm-tag/legacy"
+    iam_svc._users.set_scoped(account, None, user, {"UserName": user, "AttachedPolicies": []})
+    iam_svc._access_keys.set_scoped(account, None, key, {
+        "AccessKeyId": key, "SecretAccessKey": "test-secret", "Status": "Active",
+        "UserName": user,
+    })
+    for name, arn in ((name_a, arn_a), (name_b, arn_b), (legacy_name, legacy_arn)):
+        ssm_svc._parameters.set_scoped(account, region, name, {"ARN": arn})
+    ssm_svc._tags.set_scoped(account, region, arn_b, {"existing": "before"})
+    ssm_svc._tags.set_scoped(account, region, legacy_arn, {"existing": "legacy"})
+
+    def call(action, resource_id, *, with_headers=False, **extra):
+        payload = {"ResourceType": "Parameter", "ResourceId": resource_id, **extra}
+        body = json.dumps(payload).encode()
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http", "method": "POST", "path": "/", "query_string": b"",
+            "headers": [
+                (b"host", b"ssm.us-east-1.amazonaws.com"),
+                (b"x-amz-target", f"AmazonSSM.{action}".encode()),
+                (b"content-type", b"application/x-amz-json-1.1"),
+                (b"authorization", (
+                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
+                ).encode()),
+            ],
+        }
+        asyncio.run(app_mod.app(scope, receive, send))
+        response = sent[0]["status"], json.loads(sent[1]["body"])
+        if with_headers:
+            return *response, {name.lower(): value for name, value in sent[0]["headers"]}
+        return response
+
+    def policy(*statements):
+        iam_svc._user_inline_policies.set_scoped(account, None, user, {
+            "tag-access": {"Version": "2012-10-17", "Statement": list(statements)},
+        })
+
+    actions = ["ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"]
+    try:
+        if policy_mode == "exact":
+            policy({"Effect": "Allow", "Action": actions, "Resource": arn_a})
+            assert call("AddTagsToResource", name_a, Tags=[{"Key": "team", "Value": "a"}])[0] == 200
+            assert call("ListTagsForResource", "iam-ssm-tag/a") == (
+                200, {"TagList": [{"Key": "team", "Value": "a"}]},
+            )
+            assert call("RemoveTagsFromResource", arn_a, TagKeys=["team"])[0] == 200
+            assert call("ListTagsForResource", name_a) == (200, {"TagList": []})
+            for action, extra in (
+                ("AddTagsToResource", {"Tags": [{"Key": "new", "Value": "bad"}]}),
+                ("RemoveTagsFromResource", {"TagKeys": ["existing"]}),
+                ("ListTagsForResource", {}),
+            ):
+                status, denied, response_headers = call(
+                    action, name_b, Name=name_a, with_headers=True, **extra,
+                )
+                assert status == 400 and denied["__type"] == "AccessDeniedException"
+                assert f"on resource: {arn_b}" in denied["Message"]
+                assert f"because no identity-based policy allows the ssm:{action} action" in denied["Message"]
+                assert response_headers[b"content-type"] == b"application/x-amz-json-1.1"
+                assert b"x-amzn-errortype" not in response_headers
+                assert ssm_svc._tags.get_scoped(account, region, arn_b) == {"existing": "before"}
+            for foreign_arn in (
+                f"arn:aws:ssm:us-west-2:{account}:parameter/iam-ssm-tag/a",
+                f"arn:aws:ssm:{region}:111111111111:parameter/iam-ssm-tag/a",
+            ):
+                status, denied = call("ListTagsForResource", foreign_arn)
+                assert status == 400 and denied["__type"] == "AccessDeniedException"
+            status, denied = call(
+                "AddTagsToResource", name_a, ResourceType="Document",
+                Tags=[{"Key": "new", "Value": "bad"}],
+            )
+            assert status == 400 and denied["__type"] == "AccessDeniedException"
+            assert ssm_svc._tags.get_scoped(account, region, name_a) is None
+        elif policy_mode == "explicit-deny":
+            policy(
+                {"Effect": "Allow", "Action": actions, "Resource": "*"},
+                {"Effect": "Deny", "Action": actions, "Resource": arn_b},
+            )
+            for action, extra in (
+                ("AddTagsToResource", {"Tags": [{"Key": "new", "Value": "bad"}]}),
+                ("RemoveTagsFromResource", {"TagKeys": ["existing"]}),
+                ("ListTagsForResource", {}),
+            ):
+                for resource_id in (
+                    name_b, "iam-ssm-tag/b", arn_b,
+                    f"arn:aws:ssm:{region}:{account}:parameter//iam-ssm-tag/b",
+                ):
+                    status, denied = call(action, resource_id, **extra)
+                    assert status == 400 and denied["__type"] == "AccessDeniedException"
+                    assert f"on resource: {arn_b}" in denied["Message"]
+                    assert "with an explicit deny in an identity-based policy" in denied["Message"]
+                    assert ssm_svc._tags.get_scoped(account, region, arn_b) == {"existing": "before"}
+            policy(
+                {"Effect": "Allow", "Action": actions, "Resource": "*"},
+                {"Effect": "Deny", "Action": actions, "Resource": canonical_legacy_arn},
+            )
+            status, denied = call(
+                "RemoveTagsFromResource", legacy_arn, TagKeys=["existing"],
+            )
+            assert status == 400 and denied["__type"] == "AccessDeniedException"
+            assert ssm_svc._tags.get_scoped(account, region, legacy_arn) == {"existing": "legacy"}
+        else:
+            policy({"Effect": "Allow", "Action": "ssm:ListTagsForResource", "Resource": arn_a})
+            assert call("ListTagsForResource", name_a) == (200, {"TagList": []})
+            for action, extra in (
+                ("AddTagsToResource", {"Tags": [{"Key": "new", "Value": "bad"}]}),
+                ("RemoveTagsFromResource", {"TagKeys": ["existing"]}),
+            ):
+                status, denied = call(action, name_a, **extra)
+                assert status == 400 and denied["__type"] == "AccessDeniedException"
+                assert f"ssm:{action}" in denied["Message"]
+            assert ssm_svc._tags.get_scoped(account, region, arn_a) is None
+    finally:
+        iam_svc._user_inline_policies.pop_scoped(account, None, user, None)
+        iam_svc._access_keys.pop_scoped(account, None, key, None)
+        iam_svc._users.pop_scoped(account, None, user, None)
+        for name in (name_a, name_b, legacy_name):
+            ssm_svc._parameters.pop_scoped(account, region, name, None)
+        for arn in (arn_a, arn_b, legacy_arn):
+            ssm_svc._tags.pop_scoped(account, region, arn, None)
+
+
+def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region(monkeypatch):
+    from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import ssm as ssm_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    name = "/iam-ssm-tag/scoped"
+    tenants = (
+        ("123456789012", "us-east-1", "AKIASSMTAGEAST", "ssm-tag-east"),
+        ("123456789012", "us-west-2", "AKIASSMTAGWEST", "ssm-tag-west"),
+        ("210987654321", "us-east-1", "AKIASSMTAGOTHER", "ssm-tag-other"),
+    )
+
+    def arn(account, region):
+        return f"arn:aws:ssm:{region}:{account}:parameter/iam-ssm-tag/scoped"
+
+    def call(account, region, key, resource_id):
+        body = json.dumps({
+            "ResourceType": "Parameter", "ResourceId": resource_id,
+            "Tags": [{"Key": "owner", "Value": key}],
+        }).encode()
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http", "method": "POST", "path": "/", "query_string": b"",
+            "headers": [
+                (b"host", f"ssm.{region}.amazonaws.com".encode()),
+                (b"x-amz-target", b"AmazonSSM.AddTagsToResource"),
+                (b"content-type", b"application/x-amz-json-1.1"),
+                (b"authorization", (
+                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
+                ).encode()),
+            ],
+        }
+        asyncio.run(app_mod.app(scope, receive, send))
+        return sent[0]["status"]
+
+    try:
+        for account, region, key, user in tenants:
+            parameter_arn = arn(account, region)
+            iam_svc._users.set_scoped(account, None, user, {
+                "UserName": user, "AttachedPolicies": [],
+            })
+            iam_svc._access_keys.set_scoped(account, None, key, {
+                "AccessKeyId": key, "SecretAccessKey": "test-secret", "Status": "Active",
+                "UserName": user,
+            })
+            iam_svc._user_inline_policies.set_scoped(account, None, user, {
+                "tag-access": {"Statement": [{
+                    "Effect": "Allow", "Action": "ssm:AddTagsToResource", "Resource": parameter_arn,
+                }]},
+            })
+            ssm_svc._parameters.set_scoped(account, region, name, {"ARN": parameter_arn})
+            ssm_svc._tags.set_scoped(account, region, parameter_arn, {"owner": "before"})
+
+        for account, region, key, _ in tenants:
+            assert call(account, region, key, name) == 200
+            assert ssm_svc._tags.get_scoped(account, region, arn(account, region)) == {
+                "owner": key,
+            }
+
+        for account, region, key, _ in tenants:
+            for other_account, other_region, _, _ in tenants:
+                if (account, region) == (other_account, other_region):
+                    continue
+                before = {
+                    (a, r): ssm_svc._tags.get_scoped(a, r, arn(a, r)).copy()
+                    for a, r, _, _ in tenants
+                }
+                assert call(account, region, key, arn(other_account, other_region)) == 400
+                assert all(
+                    ssm_svc._tags.get_scoped(a, r, arn(a, r)) == before[a, r]
+                    for a, r, _, _ in tenants
+                )
+    finally:
+        for account, region, key, user in tenants:
+            iam_svc._user_inline_policies.pop_scoped(account, None, user, None)
+            iam_svc._access_keys.pop_scoped(account, None, key, None)
+            iam_svc._users.pop_scoped(account, None, user, None)
+            ssm_svc._parameters.pop_scoped(account, region, name, None)
+            ssm_svc._tags.pop_scoped(account, region, arn(account, region), None)
 
 
 # ---------------------------------------------------------------------------

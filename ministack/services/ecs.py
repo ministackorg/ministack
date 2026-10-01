@@ -642,9 +642,6 @@ def _register_task_definition(data):
         "volumes": data.get("volumes", []),
         "placementConstraints": data.get("placementConstraints", []),
         "networkMode": network_mode,
-        "requiresCompatibilities": compat,
-        "cpu": data.get("cpu", "256"),
-        "memory": data.get("memory", "512"),
         "executionRoleArn": data.get("executionRoleArn", ""),
         "taskRoleArn": data.get("taskRoleArn", ""),
         "pidMode": data.get("pidMode", ""),
@@ -656,6 +653,9 @@ def _register_task_definition(data):
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
     }
+    for field in ("requiresCompatibilities", "cpu", "memory"):
+        if field in data:
+            td[field] = data[field]
     _task_defs[td_key] = td
 
     req_tags = data.get("tags", [])
