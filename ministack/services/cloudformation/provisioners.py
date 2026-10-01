@@ -1387,7 +1387,7 @@ def _sqs_create(logical_id, props, stack_name):
     name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
     is_fifo = name.endswith(".fifo")
     attributes = _sqs_queue_fields(props, is_fifo)
-    url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{get_account_id()}/{name}"
+    url = _sqs._queue_url_for_account(get_account_id(), name)
     arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
     now_ts = str(int(time.time()))
     attributes.update(QueueArn=arn, CreatedTimestamp=now_ts, LastModifiedTimestamp=now_ts)
