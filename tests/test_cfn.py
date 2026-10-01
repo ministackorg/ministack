@@ -26204,6 +26204,158 @@ def test_cfn_appconfig_deployment_strategy_update_and_rename(cfn, appconfig_clie
         _delete_cfn_test_stack(cfn, f"cfn-ac-strat-{suffix}")
 
 
+def test_cfn_appconfig_hosted_version_replacement_takes_a_new_number(cfn, appconfig_client):
+    """Every replacement is a new version number, a rolled-back one included."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-hcv-{suffix}"
+
+    def template(content):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "text/plain", "Content": content}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "ProfileId": {"Value": {"Ref": "Profile"}},
+                        "Version": {"Value": {"Ref": "HCV"}}},
+        })
+
+    def update(body):
+        cfn.update_stack(StackName=stack_name, TemplateBody=body)
+        return _wait_stack(cfn, stack_name)["StackStatus"]
+
+    def versions():
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "ConfigurationProfileId": _cfn_output(cfn, stack_name, "ProfileId")}
+        version = int(_cfn_output(cfn, stack_name, "Version"))
+        content = appconfig_client.get_hosted_configuration_version(
+            **ids, VersionNumber=version)["Content"].read()
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        return version, content, [i["VersionNumber"] for i in listed]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert versions() == (1, b"v1", [1])
+        assert update(template("v2")) == "UPDATE_COMPLETE"
+        assert versions() == (2, b"v2", [2])
+        assert update(template("v3")) == "UPDATE_COMPLETE"
+        assert versions() == (3, b"v3", [3]), "the replacement overwrote the live version"
+        assert update(_cfn_with_failing_resource(template("v4"), "HCV")) == "UPDATE_ROLLBACK_COMPLETE"
+        assert versions() == (3, b"v3", [3])
+        assert update(template("v5")) == "UPDATE_COMPLETE"
+        assert versions() == (5, b"v5", [5])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_hosted_version_lock_checks_the_latest_existing_version(cfn, appconfig_client):
+    """LatestVersionNumber must name the highest existing version, not the last issued."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    app = appconfig_client.create_application(Name=f"cfn-ac-lock-{suffix}")
+    ids = {"ApplicationId": app["Id"],
+           "ConfigurationProfileId": appconfig_client.create_configuration_profile(
+               ApplicationId=app["Id"], Name=f"cfn-ac-lock-{suffix}", LocationUri="hosted")["Id"]}
+    for content in (b"v1", b"v2", b"v3"):
+        appconfig_client.create_hosted_configuration_version(
+            **ids, Content=content, ContentType="text/plain")
+    for number in (3, 1):
+        appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=number)
+
+    def create(lock):
+        stack_name = f"cfn-ac-lock{lock}-{suffix}"
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"HCV": {
+            "Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                **ids, "ContentType": "text/plain", "Content": "locked",
+                "LatestVersionNumber": lock}}}}))
+        return stack_name, _wait_stack(cfn, stack_name)["StackStatus"]
+
+    stacks = []
+    try:
+        for lock, status in ((3, "ROLLBACK_COMPLETE"), (2, "CREATE_COMPLETE")):
+            stack_name, actual = create(lock)
+            stacks.append(stack_name)
+            assert actual == status
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        assert sorted(i["VersionNumber"] for i in listed) == [2, 4]
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appconfig_client):
+    """A replaced deployment stays listed until its environment is deleted with the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-dep-{suffix}"
+
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "Strategy": {"Type": "AWS::AppConfig::DeploymentStrategy", "Properties": {
+                    "Name": stack_name, "DeploymentDurationInMinutes": 0,
+                    "FinalBakeTimeInMinutes": 0, "GrowthFactor": 100,
+                    "ReplicateTo": "NONE"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "application/json", "Content": "{}"}},
+                "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "DeploymentStrategyId": {"Ref": "Strategy"},
+                    "ConfigurationVersion": {"Ref": "HCV"},
+                    "Description": description, "Tags": [{"Key": "k", "Value": "v"}]}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "EnvId": {"Value": {"Ref": "Env"}},
+                        "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+        })
+
+    def deployments():
+        listed = appconfig_client.list_deployments(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"))["Items"]
+        return (int(_cfn_output(cfn, stack_name, "Number")),
+                sorted((i["DeploymentNumber"], i["State"]) for i in listed))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("d1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert deployments() == (1, [(1, "COMPLETE")])
+        for number, description in ((2, "d2"), (3, "d3")):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(description))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            assert deployments() == (
+                number, [(n, "COMPLETE") for n in range(1, number + 1)])
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "EnvironmentId": _cfn_output(cfn, stack_name, "EnvId")}
+        arn = (f"arn:aws:appconfig:us-east-1:000000000000:application/{ids['ApplicationId']}/"
+               f"environment/{ids['EnvironmentId']}/deployment/3")
+        assert appconfig_client.list_tags_for_resource(ResourceArn=arn)["Tags"]["k"] == "v"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    for call in (lambda: appconfig_client.get_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.stop_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.list_tags_for_resource(ResourceArn=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
     """A GraphQL API update keeps its id and its data sources."""
     suffix = _uuid_mod.uuid4().hex[:8]
