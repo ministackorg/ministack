@@ -2820,33 +2820,34 @@ def test_ecs_awsvpc_attachment_carries_the_subnet_it_was_placed_in(monkeypatch):
     assert details["privateIPv4Address"] == "172.30.0.11"
 
 
-def test_ecs_awsvpc_attachment_reads_the_cloudformation_casing(monkeypatch):
-    """A CloudFormation service replays its template's `NetworkConfiguration`.
-
-    The AWS::ECS::Service handler stores the template block verbatim, so it
-    reaches RunTask in PascalCase. Reading only the SDK's casing would leave
-    every CFN-defined service's tasks without a subnet.
-    """
+def test_ecs_cloudformation_service_places_and_registers_its_tasks(monkeypatch):
+    """A CloudFormation service's tasks get the template's subnet and join its target group."""
+    from ministack.services import alb as _alb
     from ministack.services import ecs as _ecs
+    from ministack.services.cloudformation.provisioners import _RESOURCE_HANDLERS
 
     monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.41"))
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-cfncase/abc123"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
     _ecs._register_task_definition({
         "family": "eni-cfncase-td",
         "networkMode": "awsvpc",
         "containerDefinitions": [{"name": "web", "image": "busybox"}],
     })
-    task_arn = json.loads(_ecs._run_task({
-        "cluster": "eni-cfncase-c",
-        "taskDefinition": "eni-cfncase-td",
-        "networkConfiguration": {"AwsvpcConfiguration": {
-            "Subnets": ["subnet-cfn00001"],
-        }},
-    })[2])["tasks"][0]["taskArn"]
-
-    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
-    details = {d["name"]: d["value"]
-               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    _RESOURCE_HANDLERS["AWS::ECS::Service"]["create"]("Service", {
+        "Cluster": "eni-cfncase-c",
+        "ServiceName": "eni-cfncase-svc",
+        "TaskDefinition": "eni-cfncase-td",
+        "DesiredCount": 1,
+        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["subnet-cfn00001"]}},
+        "LoadBalancers": [{"TargetGroupArn": tg_arn, "ContainerName": "web", "ContainerPort": 80}],
+    }, "eni-cfncase")
+    _wait_until(lambda: _alb._targets.get(tg_arn) == [{"Id": "172.30.0.41", "Port": 80}])
+    task = next(t for t in _ecs._tasks.values() if t.get("group") == "service:eni-cfncase-svc")
+    details = {d["name"]: d["value"] for d in task["attachments"][0]["details"]}
     assert details["subnetId"] == "subnet-cfn00001"
+    _ecs._delete_service({"cluster": "eni-cfncase-c", "service": "eni-cfncase-svc", "force": True})
 
 
 @pytest.mark.parametrize("network_configuration", [

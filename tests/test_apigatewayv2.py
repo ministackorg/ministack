@@ -1105,6 +1105,44 @@ def test_apigw_path_param_route(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_execute_leading_double_slash_selects_route(apigw, lam):
+    """A doubled leading slash still selects the route, as on AWS."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-dbl-slash-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    api_id = apigw.create_api(Name=f"dbl-slash-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="ANY /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    resp = _urlreq.urlopen(f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/$default//items/abc123")
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"proxy": "abc123"}
+
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
 def test_apigw_path_parameters_in_event(apigw, lam):
     """API Gateway v2 should populate pathParameters in the Lambda event."""
     import urllib.request as _urlreq

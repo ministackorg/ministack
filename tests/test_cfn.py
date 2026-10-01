@@ -6286,6 +6286,315 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
 
 
 # ---------------------------------------------------------------------------
+# AWS::ServiceDiscovery::* (#1876). Ref, Fn::GetAtt and replacement properties
+# follow the CloudFormation Template Reference pages for the five types.
+# ---------------------------------------------------------------------------
+
+
+def _sd_physical_ids(cfn, stack_name):
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    return {r["LogicalResourceId"]: r["PhysicalResourceId"] for r in resources}
+
+
+def _sd_stack_template(uid, ns_name=None, ns_description="ns", soa_ttl=100,
+                       svc_description="svc", dns_ttl=60, svc_attributes=None,
+                       health_threshold=1, instance_id=None, instance_ip="10.0.0.1"):
+    """A private namespace, a service in it and one instance in the service."""
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Ns": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {
+                    "Name": ns_name or f"sd{uid}.local",
+                    "Vpc": "vpc-12345",
+                    "Description": ns_description,
+                    "Properties": {"DnsProperties": {"SOA": {"TTL": soa_ttl}}},
+                },
+            },
+            "Svc": {
+                "Type": "AWS::ServiceDiscovery::Service",
+                "Properties": {
+                    "Name": "api",
+                    "Description": svc_description,
+                    "DnsConfig": {
+                        "NamespaceId": {"Fn::GetAtt": ["Ns", "Id"]},
+                        "DnsRecords": [{"Type": "A", "TTL": dns_ttl}],
+                        "RoutingPolicy": "MULTIVALUE",
+                    },
+                    "HealthCheckCustomConfig": {"FailureThreshold": health_threshold},
+                    "ServiceAttributes": svc_attributes or {"team": "a"},
+                },
+            },
+            "Inst": {
+                "Type": "AWS::ServiceDiscovery::Instance",
+                "Properties": {
+                    "ServiceId": {"Ref": "Svc"},
+                    "InstanceId": instance_id or "inst-1",
+                    "InstanceAttributes": {"AWS_INSTANCE_IPV4": instance_ip, "port": 8080},
+                },
+            },
+        },
+    }
+
+
+def test_cfn_servicediscovery_validate_template(cfn):
+    template = _sd_stack_template(_uuid_mod.uuid4().hex[:8])
+    template["Resources"]["Http"] = {
+        "Type": "AWS::ServiceDiscovery::HttpNamespace",
+        "Properties": {"Name": "http-ns"},
+    }
+    template["Resources"]["Pub"] = {
+        "Type": "AWS::ServiceDiscovery::PublicDnsNamespace",
+        "Properties": {"Name": "pub.example.com"},
+    }
+    cfn.validate_template(TemplateBody=json.dumps(template))
+
+
+def test_cfn_servicediscovery_namespaces_create(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-ns-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Http": {
+                "Type": "AWS::ServiceDiscovery::HttpNamespace",
+                "Properties": {"Name": f"http-{uid}", "Description": "http"},
+            },
+            "Priv": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {"Name": f"priv{uid}.local", "Vpc": "vpc-12345"},
+            },
+            "Pub": {
+                "Type": "AWS::ServiceDiscovery::PublicDnsNamespace",
+                "Properties": {"Name": f"pub{uid}.example.com"},
+            },
+        },
+        "Outputs": {
+            "HttpRef": {"Value": {"Ref": "Http"}},
+            "HttpArn": {"Value": {"Fn::GetAtt": ["Http", "Arn"]}},
+            "PrivId": {"Value": {"Fn::GetAtt": ["Priv", "Id"]}},
+            "PrivZone": {"Value": {"Fn::GetAtt": ["Priv", "HostedZoneId"]}},
+            "PubRef": {"Value": {"Ref": "Pub"}},
+            "PubZone": {"Value": {"Fn::GetAtt": ["Pub", "HostedZoneId"]}},
+        },
+    }
+    cfn.create_stack(
+        StackName=stack_name, TemplateBody=json.dumps(template),
+        Tags=[{"Key": "env", "Value": "test"}],
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    http = sd.get_namespace(Id=outputs["HttpRef"])["Namespace"]
+    assert http["Type"] == "HTTP"
+    assert http["Arn"] == outputs["HttpArn"]
+    assert http["Description"] == "http"
+    assert "DnsProperties" not in http["Properties"]
+
+    priv = sd.get_namespace(Id=outputs["PrivId"])["Namespace"]
+    assert priv["Type"] == "DNS_PRIVATE"
+    assert priv["Properties"]["DnsProperties"]["HostedZoneId"] == outputs["PrivZone"]
+    assert r53.get_hosted_zone(Id=outputs["PrivZone"])["HostedZone"]["Config"]["PrivateZone"] is True
+
+    pub = sd.get_namespace(Id=outputs["PubRef"])["Namespace"]
+    assert pub["Type"] == "DNS_PUBLIC"
+    assert r53.get_hosted_zone(Id=outputs["PubZone"])["HostedZone"]["Config"]["PrivateZone"] is False
+
+    tags = sd.list_tags_for_resource(ResourceARN=http["Arn"])["Tags"]
+    assert {"Key": "env", "Value": "test"} in tags
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_service_and_instance(cfn, sd):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-svc-{uid}"
+    template = _sd_stack_template(uid)
+    template["Outputs"] = {
+        "SvcRef": {"Value": {"Ref": "Svc"}},
+        "SvcArn": {"Value": {"Fn::GetAtt": ["Svc", "Arn"]}},
+        "SvcName": {"Value": {"Fn::GetAtt": ["Svc", "Name"]}},
+        "InstRef": {"Value": {"Ref": "Inst"}},
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    svc = sd.get_service(Id=outputs["SvcRef"])["Service"]
+    assert svc["Arn"] == outputs["SvcArn"]
+    assert svc["Name"] == outputs["SvcName"] == "api"
+    assert svc["NamespaceId"] == _sd_physical_ids(cfn, stack_name)["Ns"]
+    attrs = sd.get_service_attributes(ServiceId=svc["Id"])["ServiceAttributes"]["Attributes"]
+    assert attrs == {"team": "a"}
+
+    assert outputs["InstRef"] == "inst-1"
+    found = sd.discover_instances(NamespaceName=f"sd{uid}.local", ServiceName="api")["Instances"]
+    assert [i["InstanceId"] for i in found] == ["inst-1"]
+    assert found[0]["Attributes"] == {"AWS_INSTANCE_IPV4": "10.0.0.1", "port": "8080"}
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_update_in_place(cfn, sd):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-upd-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    before = _sd_physical_ids(cfn, stack_name)
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, ns_description="ns2", soa_ttl=60, svc_description="svc2", dns_ttl=30,
+        svc_attributes={"owner": "b"}, instance_ip="10.0.0.2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _sd_physical_ids(cfn, stack_name) == before
+
+    ns = sd.get_namespace(Id=before["Ns"])["Namespace"]
+    assert ns["Description"] == "ns2"
+    assert ns["Properties"]["DnsProperties"]["SOA"]["TTL"] == 60
+
+    svc = sd.get_service(Id=before["Svc"])["Service"]
+    assert svc["Description"] == "svc2"
+    assert svc["DnsConfig"]["DnsRecords"] == [{"Type": "A", "TTL": 30}]
+    attrs = sd.get_service_attributes(ServiceId=before["Svc"])["ServiceAttributes"]["Attributes"]
+    assert attrs == {"owner": "b"}
+
+    inst = sd.get_instance(ServiceId=before["Svc"], InstanceId="inst-1")["Instance"]
+    assert inst["Attributes"]["AWS_INSTANCE_IPV4"] == "10.0.0.2"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_update_replacement(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-repl-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    first = _sd_physical_ids(cfn, stack_name)
+
+    # HealthCheckCustomConfig and InstanceId both require replacement.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, health_threshold=2, instance_id="inst-2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    second = _sd_physical_ids(cfn, stack_name)
+    assert second["Ns"] == first["Ns"]
+    assert second["Svc"] != first["Svc"]
+    assert second["Inst"] == "inst-2"
+    with pytest.raises(ClientError) as exc:
+        sd.get_service(Id=first["Svc"])
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFound"
+    svc = sd.get_service(Id=second["Svc"])["Service"]
+    assert svc["HealthCheckCustomConfig"] == {"FailureThreshold": 2}
+    instances = sd.list_instances(ServiceId=second["Svc"])["Instances"]
+    assert [i["Id"] for i in instances] == ["inst-2"]
+
+    # A new namespace Name replaces the namespace, and through Ref the
+    # service and the instance (same InstanceId, new ServiceId).
+    old_zone = sd.get_namespace(Id=first["Ns"])["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, ns_name=f"sd{uid}-b.local", health_threshold=2, instance_id="inst-2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    third = _sd_physical_ids(cfn, stack_name)
+    assert third["Ns"] != first["Ns"]
+    assert third["Svc"] != second["Svc"]
+    assert third["Inst"] == "inst-2"
+    with pytest.raises(ClientError) as exc:
+        sd.get_namespace(Id=first["Ns"])
+    assert exc.value.response["Error"]["Code"] == "NamespaceNotFound"
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=old_zone)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+    assert sd.get_service(Id=third["Svc"])["Service"]["NamespaceId"] == third["Ns"]
+    found = sd.discover_instances(NamespaceName=f"sd{uid}-b.local", ServiceName="api")["Instances"]
+    assert [i["InstanceId"] for i in found] == ["inst-2"]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_delete_stack(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-del-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    ids = _sd_physical_ids(cfn, stack_name)
+    zone_id = sd.get_namespace(Id=ids["Ns"])["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    with pytest.raises(ClientError) as exc:
+        sd.get_instance(ServiceId=ids["Svc"], InstanceId=ids["Inst"])
+    assert exc.value.response["Error"]["Code"] == "InstanceNotFound"
+    with pytest.raises(ClientError) as exc:
+        sd.get_service(Id=ids["Svc"])
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFound"
+    with pytest.raises(ClientError) as exc:
+        sd.get_namespace(Id=ids["Ns"])
+    assert exc.value.response["Error"]["Code"] == "NamespaceNotFound"
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+
+
+def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
+    """The shape the CDK ECS constructs emit for a Cloud Map namespace and a
+    service with cloudMapOptions (taken from the construct library, not a
+    synthesized app): the namespace's Vpc comes from a VPC in the stack and
+    the service has no Name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-cdk-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.0.0.0/16"}},
+            "ClusterDefaultServiceDiscoveryNamespace": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {"Name": f"cdk{uid}.local", "Vpc": {"Ref": "Vpc"}},
+            },
+            "ServiceCloudmapService": {
+                "Type": "AWS::ServiceDiscovery::Service",
+                "Properties": {
+                    "DnsConfig": {
+                        "DnsRecords": [{"TTL": 60, "Type": "A"}],
+                        "NamespaceId": {"Fn::GetAtt": ["ClusterDefaultServiceDiscoveryNamespace", "Id"]},
+                        "RoutingPolicy": "MULTIVALUE",
+                    },
+                    "HealthCheckCustomConfig": {"FailureThreshold": 1},
+                    "NamespaceId": {"Fn::GetAtt": ["ClusterDefaultServiceDiscoveryNamespace", "Id"]},
+                },
+            },
+        },
+        "Outputs": {
+            "SvcName": {"Value": {"Fn::GetAtt": ["ServiceCloudmapService", "Name"]}},
+            "SvcArn": {"Value": {"Fn::GetAtt": ["ServiceCloudmapService", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    ids = _sd_physical_ids(cfn, stack_name)
+
+    svc = sd.get_service(Id=ids["ServiceCloudmapService"])["Service"]
+    assert svc["Name"] == outputs["SvcName"]
+    assert svc["Arn"] == outputs["SvcArn"]
+    assert svc["NamespaceId"] == ids["ClusterDefaultServiceDiscoveryNamespace"]
+    assert svc["HealthCheckCustomConfig"] == {"FailureThreshold": 1}
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+# ---------------------------------------------------------------------------
 # Update handlers, batch 5: the twelve types of #1601 C1 whose stack update
 # fell through to the create handler and lost what the resource was holding.
 # ---------------------------------------------------------------------------
@@ -17709,6 +18018,72 @@ def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ecs_service_network_and_load_balancers_read_back_in_the_api_shape(cfn, ecs, elbv2):
+    """NetworkConfiguration and LoadBalancers read back in camelCase, on create and on update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-svc-shape-{suffix}"
+    tg_arn = elbv2.create_target_group(
+        Name=f"cfn-ecs-shape-{suffix}", Protocol="HTTP", Port=80,
+        VpcId="vpc-00000000", TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+
+    def template(public):
+        return json.dumps({
+            "Resources": {
+                "Cluster": {"Type": "AWS::ECS::Cluster",
+                            "Properties": {"ClusterName": stack_name}},
+                "TD": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": stack_name,
+                        "NetworkMode": "awsvpc",
+                        "ContainerDefinitions": [{"Name": "app", "Image": "nginx", "Memory": 128}],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": stack_name,
+                        "TaskDefinition": {"Ref": "TD"},
+                        "DesiredCount": 0,
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {
+                            "Subnets": ["subnet-0a1b2c3d"],
+                            "SecurityGroups": ["sg-0a1b2c3d"],
+                            "AssignPublicIp": public,
+                        }},
+                        "LoadBalancers": [{"TargetGroupArn": tg_arn,
+                                           "ContainerName": "app", "ContainerPort": 80}],
+                    },
+                },
+            },
+        })
+
+    def described():
+        return ecs.describe_services(cluster=stack_name, services=[stack_name])["services"][0]
+
+    def network(public):
+        return {"awsvpcConfiguration": {"subnets": ["subnet-0a1b2c3d"],
+                                        "securityGroups": ["sg-0a1b2c3d"],
+                                        "assignPublicIp": public}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("DISABLED"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        service = described()
+        assert service["networkConfiguration"] == network("DISABLED")
+        assert service["loadBalancers"] == [
+            {"targetGroupArn": tg_arn, "containerName": "app", "containerPort": 80}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ENABLED"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert described()["networkConfiguration"] == network("ENABLED")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
 # ===========================================================================
 # In-place update handlers — deploy, update a mutable property, assert the
 # physical id survived and the new value is visible through the service API
@@ -23493,6 +23868,40 @@ def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, i
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
+    """A stack whose thing group still has a child group created outside the
+    stack lands in DELETE_FAILED with the service message and keeps the group;
+    once the child is gone a retried delete removes it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-tg-held-{uid}"
+    parent, child = f"cfn-tg-held-p-{uid}", f"cfn-tg-held-c-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Parent": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parent}}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        iot_client.create_thing_group(thingGroupName=child, parentGroupName=parent)
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert stack["StackStatusReason"] == "The following resource(s) failed to delete: [Parent]."
+        assert (f"Cannot delete thing group : {parent} when there are still child groups attached to it"
+                in _stack_event_reasons(cfn, stack_name))
+        iot_client.describe_thing_group(thingGroupName=parent)
+
+        iot_client.delete_thing_group(thingGroupName=child)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_thing_group(thingGroupName=parent)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            iot_client.delete_thing_group(thingGroupName=child)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
@@ -25711,6 +26120,158 @@ def test_cfn_appconfig_deployment_strategy_update_and_rename(cfn, appconfig_clie
             "the predecessor survived")
     finally:
         _delete_cfn_test_stack(cfn, f"cfn-ac-strat-{suffix}")
+
+
+def test_cfn_appconfig_hosted_version_replacement_takes_a_new_number(cfn, appconfig_client):
+    """Every replacement is a new version number, a rolled-back one included."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-hcv-{suffix}"
+
+    def template(content):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "text/plain", "Content": content}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "ProfileId": {"Value": {"Ref": "Profile"}},
+                        "Version": {"Value": {"Ref": "HCV"}}},
+        })
+
+    def update(body):
+        cfn.update_stack(StackName=stack_name, TemplateBody=body)
+        return _wait_stack(cfn, stack_name)["StackStatus"]
+
+    def versions():
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "ConfigurationProfileId": _cfn_output(cfn, stack_name, "ProfileId")}
+        version = int(_cfn_output(cfn, stack_name, "Version"))
+        content = appconfig_client.get_hosted_configuration_version(
+            **ids, VersionNumber=version)["Content"].read()
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        return version, content, [i["VersionNumber"] for i in listed]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert versions() == (1, b"v1", [1])
+        assert update(template("v2")) == "UPDATE_COMPLETE"
+        assert versions() == (2, b"v2", [2])
+        assert update(template("v3")) == "UPDATE_COMPLETE"
+        assert versions() == (3, b"v3", [3]), "the replacement overwrote the live version"
+        assert update(_cfn_with_failing_resource(template("v4"), "HCV")) == "UPDATE_ROLLBACK_COMPLETE"
+        assert versions() == (3, b"v3", [3])
+        assert update(template("v5")) == "UPDATE_COMPLETE"
+        assert versions() == (5, b"v5", [5])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_hosted_version_lock_checks_the_latest_existing_version(cfn, appconfig_client):
+    """LatestVersionNumber must name the highest existing version, not the last issued."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    app = appconfig_client.create_application(Name=f"cfn-ac-lock-{suffix}")
+    ids = {"ApplicationId": app["Id"],
+           "ConfigurationProfileId": appconfig_client.create_configuration_profile(
+               ApplicationId=app["Id"], Name=f"cfn-ac-lock-{suffix}", LocationUri="hosted")["Id"]}
+    for content in (b"v1", b"v2", b"v3"):
+        appconfig_client.create_hosted_configuration_version(
+            **ids, Content=content, ContentType="text/plain")
+    for number in (3, 1):
+        appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=number)
+
+    def create(lock):
+        stack_name = f"cfn-ac-lock{lock}-{suffix}"
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"HCV": {
+            "Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                **ids, "ContentType": "text/plain", "Content": "locked",
+                "LatestVersionNumber": lock}}}}))
+        return stack_name, _wait_stack(cfn, stack_name)["StackStatus"]
+
+    stacks = []
+    try:
+        for lock, status in ((3, "ROLLBACK_COMPLETE"), (2, "CREATE_COMPLETE")):
+            stack_name, actual = create(lock)
+            stacks.append(stack_name)
+            assert actual == status
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        assert sorted(i["VersionNumber"] for i in listed) == [2, 4]
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appconfig_client):
+    """A replaced deployment stays listed until its environment is deleted with the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-dep-{suffix}"
+
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "Strategy": {"Type": "AWS::AppConfig::DeploymentStrategy", "Properties": {
+                    "Name": stack_name, "DeploymentDurationInMinutes": 0,
+                    "FinalBakeTimeInMinutes": 0, "GrowthFactor": 100,
+                    "ReplicateTo": "NONE"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "application/json", "Content": "{}"}},
+                "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "DeploymentStrategyId": {"Ref": "Strategy"},
+                    "ConfigurationVersion": {"Ref": "HCV"},
+                    "Description": description, "Tags": [{"Key": "k", "Value": "v"}]}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "EnvId": {"Value": {"Ref": "Env"}},
+                        "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+        })
+
+    def deployments():
+        listed = appconfig_client.list_deployments(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"))["Items"]
+        return (int(_cfn_output(cfn, stack_name, "Number")),
+                sorted((i["DeploymentNumber"], i["State"]) for i in listed))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("d1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert deployments() == (1, [(1, "COMPLETE")])
+        for number, description in ((2, "d2"), (3, "d3")):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(description))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            assert deployments() == (
+                number, [(n, "COMPLETE") for n in range(1, number + 1)])
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "EnvironmentId": _cfn_output(cfn, stack_name, "EnvId")}
+        arn = (f"arn:aws:appconfig:us-east-1:000000000000:application/{ids['ApplicationId']}/"
+               f"environment/{ids['EnvironmentId']}/deployment/3")
+        assert appconfig_client.list_tags_for_resource(ResourceArn=arn)["Tags"]["k"] == "v"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    for call in (lambda: appconfig_client.get_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.stop_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.list_tags_for_resource(ResourceArn=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):

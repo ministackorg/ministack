@@ -2006,7 +2006,7 @@ def _execute_choice(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input)
 
     for choice in state_def.get("Choices", []):
-        if _evaluate_rule(choice, effective):
+        if _evaluate_rule(choice, effective, ctx):
             return _apply_output_path(state_def, effective), choice["Next"]
 
     default = state_def.get("Default")
@@ -2031,18 +2031,24 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
     return _truthy(condition)
 
 
-def _evaluate_rule(rule, data):
+def _resolve_choice_path(path, data, ctx):
+    if path.startswith("$$."):
+        return _resolve_ctx_path(path, ctx or {})
+    return _resolve_path(path, data)
+
+
+def _evaluate_rule(rule, data, ctx=None):
     if "And" in rule:
-        return all(_evaluate_rule(r, data) for r in rule["And"])
+        return all(_evaluate_rule(r, data, ctx) for r in rule["And"])
     if "Or" in rule:
-        return any(_evaluate_rule(r, data) for r in rule["Or"])
+        return any(_evaluate_rule(r, data, ctx) for r in rule["Or"])
     if "Not" in rule:
-        return not _evaluate_rule(rule["Not"], data)
+        return not _evaluate_rule(rule["Not"], data, ctx)
 
     variable = rule.get("Variable")
     if not variable:
         return False
-    value = _resolve_path(variable, data)
+    value = _resolve_choice_path(variable, data, ctx)
 
     # --- type checks ---
     if "IsPresent" in rule:
@@ -2062,7 +2068,7 @@ def _evaluate_rule(rule, data):
     if "StringEquals" in rule:
         return value == rule["StringEquals"]
     if "StringEqualsPath" in rule:
-        return value == _resolve_path(rule["StringEqualsPath"], data)
+        return value == _resolve_choice_path(rule["StringEqualsPath"], data, ctx)
     if "StringLessThan" in rule:
         return isinstance(value, str) and value < rule["StringLessThan"]
     if "StringGreaterThan" in rule:
@@ -2079,7 +2085,7 @@ def _evaluate_rule(rule, data):
     if "NumericEquals" in rule:
         return _is_num(value) and value == rule["NumericEquals"]
     if "NumericEqualsPath" in rule:
-        return _is_num(value) and value == _resolve_path(rule["NumericEqualsPath"], data)
+        return _is_num(value) and value == _resolve_choice_path(rule["NumericEqualsPath"], data, ctx)
     if "NumericLessThan" in rule:
         return _is_num(value) and value < rule["NumericLessThan"]
     if "NumericGreaterThan" in rule:
@@ -2089,23 +2095,23 @@ def _evaluate_rule(rule, data):
     if "NumericGreaterThanEquals" in rule:
         return _is_num(value) and value >= rule["NumericGreaterThanEquals"]
     if "NumericLessThanPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanPath"], data)
+        rhs = _resolve_choice_path(rule["NumericLessThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value < rhs
     if "NumericGreaterThanPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanPath"], data)
+        rhs = _resolve_choice_path(rule["NumericGreaterThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value > rhs
     if "NumericLessThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanEqualsPath"], data)
+        rhs = _resolve_choice_path(rule["NumericLessThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value <= rhs
     if "NumericGreaterThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanEqualsPath"], data)
+        rhs = _resolve_choice_path(rule["NumericGreaterThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value >= rhs
 
     # --- boolean ---
     if "BooleanEquals" in rule:
         return value is rule["BooleanEquals"] or value == rule["BooleanEquals"]
     if "BooleanEqualsPath" in rule:
-        return value == _resolve_path(rule["BooleanEqualsPath"], data)
+        return value == _resolve_choice_path(rule["BooleanEqualsPath"], data, ctx)
 
     # --- timestamp ---
     for op, cmp_fn in [("TimestampEquals", lambda a, b: a == b),
