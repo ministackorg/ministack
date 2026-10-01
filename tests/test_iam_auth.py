@@ -520,6 +520,114 @@ def test_condition_operator_by_key_presence(operator, policy_value, matching, ot
     assert evaluate(ctx, [stmts]).decision == expected
 
 
+_NEGATED_VALUE_LIST_CASES = [
+    ("StringNotEquals", ["qualification", "recovery"], "qualification", "recovery", "neighbor"),
+    ("StringNotEqualsIgnoreCase", ["QUALIFICATION", "RECOVERY"], "qualification", "recovery", "neighbor"),
+    ("StringNotLike", ["qual*", "rec*"], "qualification", "recovery", "neighbor"),
+    ("NumericNotEquals", ["10", "20"], "10", "20", "30"),
+    ("DateNotEquals", ["2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z"],
+     "2030-01-01T00:00:00Z", "2031-01-01T00:00:00Z", "2032-01-01T00:00:00Z"),
+    ("ArnNotEquals", [_ARN, _ARN + "-recovery"], _ARN, _ARN + "-recovery", _ARN + "-neighbor"),
+    ("ArnNotLike", [_ARN + "*", "arn:aws:sqs:*:111122223333:recovery*"],
+     _ARN, "arn:aws:sqs:eu-central-1:111122223333:recovery", "arn:aws:sqs:eu-central-1:111122223333:neighbor"),
+    ("NotIpAddress", ["10.0.0.0/8", "192.168.0.0/16"], "10.1.2.3", "192.168.1.1", "172.16.1.1"),
+]
+
+
+class TestConditionValueLists:
+    @pytest.mark.parametrize("operator, policy_values, first, second, other", [
+        pytest.param(*case, id=case[0]) for case in _NEGATED_VALUE_LIST_CASES
+    ])
+    @pytest.mark.parametrize("state", range(3), ids=["first-listed", "second-listed", "unlisted"])
+    @pytest.mark.parametrize("suffix", ["", "IfExists"])
+    def test_negated_deny_matches_none_of_the_policy_values(
+        self, operator, policy_values, first, second, other, state, suffix
+    ):
+        # AWS docs: policy values for a negated matching operator use NOR.
+        ctx = _ctx()
+        ctx.service_context = {"test:key": (first, second, other)[state]}
+        stmts = parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "*", "Resource": "*",
+             "Condition": {operator + suffix: {"test:key": policy_values}}},
+        ]})
+        assert evaluate(ctx, [stmts]).decision == ("Deny" if state == 2 else "Allow")
+
+    @pytest.mark.parametrize("operator", ["StringNotEquals", "StringNotLike"])
+    @pytest.mark.parametrize("quantifier", ["ForAnyValue", "ForAllValues"])
+    @pytest.mark.parametrize("request_values, any_denies, all_denies", [
+        (["qualification", "recovery"], False, False),
+        (["qualification", "neighbor"], True, False),
+        (["neighbor", "other"], True, True),
+        ([], False, True),
+        (None, False, True),
+    ])
+    def test_negated_set_quantifiers(self, operator, quantifier, request_values, any_denies, all_denies):
+        ctx = _ctx()
+        if request_values is not None:
+            ctx.service_context = {"test:key": request_values}
+        values = ["qual*", "rec*"] if operator == "StringNotLike" else ["qualification", "recovery"]
+        stmts = parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "*", "Resource": "*",
+             "Condition": {f"{quantifier}:{operator}": {"test:key": values}}},
+        ]})
+        denies = any_denies if quantifier == "ForAnyValue" else all_denies
+        assert evaluate(ctx, [stmts]).decision == ("Deny" if denies else "Allow")
+
+    @pytest.mark.parametrize("policy_key", [
+        "aws:RequestTag/Environment", "aws:RequestTag/environment", "AWS:REQUESTTAG/ENVIRONMENT",
+    ])
+    @pytest.mark.parametrize("tag_value, expected", [("production", "Allow"), ("Production", "ImplicitDeny")])
+    def test_request_tag_keys_ignore_case_but_string_equals_values_do_not(self, policy_key, tag_value, expected):
+        ctx = _ctx()
+        ctx.request_tags = {"Environment": tag_value}
+        ctx.tag_keys = ["Environment"]
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {"StringEquals": {policy_key: "production"}},
+        }]})
+        assert evaluate(ctx, [stmts]).decision == expected
+
+    @pytest.mark.parametrize("policy_key, expected", [("Environment", "Allow"), ("environment", "ImplicitDeny")])
+    def test_tag_keys_string_equals_preserves_case(self, policy_key, expected):
+        ctx = _ctx()
+        ctx.request_tags = {"Environment": "production"}
+        ctx.tag_keys = ["Environment"]
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {"ForAllValues:StringEquals": {"aws:TagKeys": [policy_key]}},
+        }]})
+        assert evaluate(ctx, [stmts]).decision == expected
+
+    @pytest.mark.parametrize("policy_key", ["Environment", "environment", "ENVIRONMENT"])
+    @pytest.mark.parametrize("quantifier", ["", "ForAnyValue:", "ForAllValues:"])
+    @pytest.mark.parametrize("operator", ["StringEquals", "StringLike", "StringNotEquals", "StringNotLike"])
+    @pytest.mark.parametrize("suffix", ["", "IfExists"])
+    @pytest.mark.parametrize("tag_values", [
+        ("production", "test"), ("production", "production"), ("test", "dev"),
+    ], ids=["mixed", "both-match", "none-match"])
+    @pytest.mark.parametrize("reverse_tags", [False, True])
+    def test_case_colliding_request_tags_match_all_case_variants(
+        self, policy_key, quantifier, operator, suffix, tag_values, reverse_tags
+    ):
+        # Live AWS, us-west-2: signed SQS CreateQueue with a disposable IAM
+        # user's policy. An affirmative operator matches any case variant;
+        # a negated operator matches only if none of the variants match.
+        tags = list(zip(["Environment", "environment"], tag_values))
+        ctx = _ctx()
+        ctx.request_tags = dict(reversed(tags) if reverse_tags else tags)
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "*", "Resource": "*",
+            "Condition": {quantifier + operator + suffix: {f"aws:RequestTag/{policy_key}": "production"}},
+        }]})
+        matches = "production" in tag_values
+        if operator in ("StringNotEquals", "StringNotLike"):
+            matches = not matches
+        assert evaluate(ctx, [stmts]).decision == ("Allow" if matches else "ImplicitDeny")
+
+
+
 class TestResourceAccountCondition:
     """``aws:ResourceAccount`` (and the ``s3:ResourceAccount`` alias) resolve to the
     account that owns the resource. The emulator hosts one account per request and
