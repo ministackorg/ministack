@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -11,6 +12,11 @@ import pytest
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+# AWS's CloudFront edge domain shape: 'd' + 13 lowercase alphanumerics +
+# '.cloudfront.net' (e.g. d111111abcdef8.cloudfront.net), unrelated to the
+# distribution's own Id.
+_CF_DOMAIN_RE = re.compile(r"^d[a-z0-9]{13}\.cloudfront\.net$")
 
 _CF_DIST_CONFIG = {
     "CallerReference": "cf-test-ref-1",
@@ -87,7 +93,7 @@ def test_cloudfront_create_distribution(cloudfront):
     resp = cloudfront.create_distribution(DistributionConfig=_CF_DIST_CONFIG)
     dist = resp["Distribution"]
     assert dist["Id"]
-    assert dist["DomainName"].endswith(".cloudfront.net")
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
     assert dist["Status"] == "Deployed"
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
 
@@ -107,7 +113,7 @@ def test_cloudfront_create_distribution_with_tags(cloudfront):
     dist = resp["Distribution"]
     dist_id = dist["Id"]
     dist_arn = dist["ARN"]
-    assert dist["DomainName"].endswith(".cloudfront.net")
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
     tags = cloudfront.list_tags_for_resource(Resource=dist_arn)["Tags"]["Items"]
     assert any(t["Key"] == "env" and t["Value"] == "test" for t in tags)
     etag = resp["ETag"]
@@ -135,10 +141,34 @@ def test_cloudfront_get_distribution(cloudfront):
     resp = cloudfront.get_distribution(Id=dist_id)
     dist = resp["Distribution"]
     assert dist["Id"] == dist_id
-    assert dist["DomainName"] == f"{dist_id}.cloudfront.net"
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
+    assert dist_id not in dist["DomainName"]
     assert dist["Status"] == "Deployed"
     # terraform-provider-aws v6+ dereferences OriginGroups without a nil check
     assert dist["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
+
+
+def test_cloudfront_distribution_domain_name_like_aws(cloudfront):
+    """DomainName is 'd' + 13 lowercase alphanumerics, like real AWS, and is
+    stable across Get/Update/List — not derived from the distribution's Id."""
+    cfg = {**_CF_DIST_CONFIG, "CallerReference": f"cf-domain-{_uuid_mod.uuid4().hex[:12]}"}
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    domain = create_resp["Distribution"]["DomainName"]
+    assert _CF_DOMAIN_RE.match(domain)
+    assert dist_id not in domain
+
+    get_domain = cloudfront.get_distribution(Id=dist_id)["Distribution"]["DomainName"]
+    assert get_domain == domain
+
+    disabled_cfg = {**cfg, "Enabled": False}
+    upd = cloudfront.update_distribution(
+        DistributionConfig=disabled_cfg, Id=dist_id, IfMatch=create_resp["ETag"]
+    )
+    assert upd["Distribution"]["DomainName"] == domain
+
+    listed = {d["Id"]: d["DomainName"] for d in cloudfront.list_distributions()["DistributionList"]["Items"]}
+    assert listed[dist_id] == domain
 
 
 def test_cloudfront_get_distribution_config(cloudfront):

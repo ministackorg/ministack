@@ -273,8 +273,21 @@ def _conn_group_id() -> str:
     return "cg_" + "".join(random.choices(_KSUID_CHARS, k=27))
 
 
-def _routing_endpoint() -> str:
+def _cloudfront_domain() -> str:
+    """AWS's edge domain shape: 'd' + 13 lowercase alphanumerics +
+    '.cloudfront.net' (e.g. d111111abcdef8.cloudfront.net) — assigned to both
+    a distribution's DomainName and a connection group's RoutingEndpoint."""
     return "d" + "".join(random.choices(string.ascii_lowercase + string.digits, k=13)) + ".cloudfront.net"
+
+
+def _new_distribution_domain() -> str:
+    """A `_cloudfront_domain()` value not already used by a distribution in
+    this account."""
+    existing = {d["DomainName"] for d in _distributions.values()}
+    domain = _cloudfront_domain()
+    while domain in existing:
+        domain = _cloudfront_domain()
+    return domain
 
 
 def _now_iso() -> str:
@@ -2828,7 +2841,7 @@ def _create_distribution(headers, body):
         "Id": dist_id,
         "ARN": f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}",
         "Status": "Deployed",
-        "DomainName": f"{dist_id}.cloudfront.net",
+        "DomainName": _new_distribution_domain(),
         "LastModifiedTime": now,
         "ETag": etag,
         "CallerReference": caller_ref,
@@ -3861,7 +3874,7 @@ def _create_connection_group(body):
         "CreatedTime": now,
         "LastModifiedTime": now,
         "Ipv6Enabled": _xbool(el, "Ipv6Enabled", True),
-        "RoutingEndpoint": _routing_endpoint(),
+        "RoutingEndpoint": _cloudfront_domain(),
         "AnycastIpListId": _opt_text(el, "AnycastIpListId"),
         "Enabled": _xbool(el, "Enabled", True),
         "IsDefault": False,
@@ -3886,7 +3899,7 @@ def _default_connection_group():
         "CreatedTime": now,
         "LastModifiedTime": now,
         "Ipv6Enabled": True,
-        "RoutingEndpoint": _routing_endpoint(),
+        "RoutingEndpoint": _cloudfront_domain(),
         "AnycastIpListId": None,
         "Enabled": True,
         "IsDefault": True,
