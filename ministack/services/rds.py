@@ -92,11 +92,10 @@ BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
-# When set, skip ministack's own Docker network auto-detect so DescribeDBInstances
-# returns {MINISTACK_HOST, host_port} — the address that's actually reachable
-# from outside the Docker network (remote ministack deployments, host-side
-# clients of a containerised ministack). Off by default: existing in-network
-# behavior unchanged.
+# When set, DescribeDBInstances returns {MINISTACK_HOST, host_port} — the
+# address that's actually reachable from outside the Docker network (remote
+# ministack deployments, host-side clients of a containerised ministack).
+# Off by default: existing in-network behavior unchanged.
 RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 # Opt-in: per-instance Aurora PostgreSQL reader containers backed by real
 # streaming replication (#1325). Scoped to aurora-postgresql by name and by
@@ -1372,13 +1371,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(ms_network, {}).get("IPAddress", "")
             if container_ip:
-                # Report the alias, not the address behind it. An address changes
+                # Report the alias (or, under MINISTACK_RDS_PUBLIC_ENDPOINT, the
+                # published port), not the address behind it. An address changes
                 # when the container is replaced, and every consumer holding the
                 # old one is then pointing at whatever took over that IP. Internal
                 # wiring and the readiness probe keep using the address.
-                endpoint_host = (endpoint_aliases[0] if endpoint_aliases
-                                 else container_ip)
-                endpoint_port = container_port
+                endpoint_host, endpoint_port = _reported_endpoint(
+                    endpoint_aliases[0] if endpoint_aliases else container_ip,
+                    container_port, host_port)
                 internal_host = container_ip
                 internal_port = container_port
                 readiness_host = container_ip
@@ -1614,8 +1614,8 @@ def _start_pg_reader_container(db_id, cluster):
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
-            endpoint_port = container_port
+            endpoint_host, endpoint_port = _reported_endpoint(
+                container_ip, container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
     except Exception:
@@ -2285,13 +2285,13 @@ def _restart_cluster_shared_container(cluster_id, cluster):
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            # Report the alias, not the address behind it — same rule as first
-            # launch. StopDBCluster/StartDBCluster must not rewrite a stored
+            # Report the alias (or the published port), not the address behind
+            # it — same rule as first launch. StopDBCluster/StartDBCluster must not rewrite a stored
             # DNS name into a raw address: the name keeps resolving to the
             # restarted container, while the address may not survive.
-            endpoint_host = (endpoint_aliases[0] if endpoint_aliases
-                             else container_ip)
-            endpoint_port = container_port
+            endpoint_host, endpoint_port = _reported_endpoint(
+                endpoint_aliases[0] if endpoint_aliases else container_ip,
+                container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
             readiness_host = container_ip
@@ -2501,8 +2501,9 @@ def _start_rds_container_for_instance(db_id, instance):
             if container_ip:
                 internal_host = container_ip
                 internal_port = container_port
-                instance.setdefault("Endpoint", {})["Address"] = container_ip
-                instance["Endpoint"]["Port"] = container_port
+                endpoint = instance.setdefault("Endpoint", {})
+                endpoint["Address"], endpoint["Port"] = _reported_endpoint(
+                    container_ip, container_port, host_port)
         except Exception:
             pass
     instance["_internal_address"] = internal_host
@@ -2552,17 +2553,15 @@ def _get_docker():
 def _get_ministack_network(docker_client):
     """Detect the Docker network MiniStack is running on (if containerised).
 
-    Honors MINISTACK_RDS_PUBLIC_ENDPOINT — when set, returns None so the
-    DescribeDBInstances endpoint resolves to {MINISTACK_HOST, host_port}
-    instead of the container-internal address (useful for remote-ministack
-    deployments where external clients can't reach the Docker network).
+    Under MINISTACK_RDS_PUBLIC_ENDPOINT the database containers join the
+    network only when MiniStack itself is containerised, so readiness and
+    internal wiring can reach them while _reported_endpoint reports the
+    published port.
     """
     global _ministack_network
-    if RDS_PUBLIC_ENDPOINT:
-        return None
     if _ministack_network is not None:
         return _ministack_network or None
-    if DOCKER_NETWORK:
+    if DOCKER_NETWORK and not RDS_PUBLIC_ENDPOINT:
         _ministack_network = DOCKER_NETWORK
         logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
         return DOCKER_NETWORK
@@ -2572,7 +2571,8 @@ def _get_ministack_network(docker_client):
         nets = list(
             self_container.attrs["NetworkSettings"]["Networks"].keys())
         if nets:
-            _ministack_network = nets[0]
+            _ministack_network = (DOCKER_NETWORK if DOCKER_NETWORK in nets
+                                  else nets[0])
             logger.debug("RDS: detected MiniStack network: %s",
                          _ministack_network)
             return _ministack_network
@@ -2581,6 +2581,13 @@ def _get_ministack_network(docker_client):
                      "using localhost")
     _ministack_network = ""
     return None
+
+
+def _reported_endpoint(host, port, host_port):
+    """The endpoint DescribeDB* report for a container on MiniStack's network."""
+    if RDS_PUBLIC_ENDPOINT:
+        return _MINISTACK_HOST, host_port
+    return host, port
 
 
 def _wait_for_port(host, port, timeout=60):
@@ -4443,6 +4450,10 @@ def _sync_cluster_endpoints(cluster):
                 reader_address = writer_address.replace(
                     ".cluster-", ".cluster-ro-", 1,
                 )
+        elif RDS_PUBLIC_ENDPOINT:
+            # The internal address is not reachable by the clients the
+            # published endpoint is reported to.
+            reader_address = writer_address
         else:
             reader_address = (
                 cluster.get("_shared_internal_address")
@@ -4767,8 +4778,8 @@ def _create_db_instance_impl(p):
                     if container_ip:
                         internal_host = container_ip
                         internal_port = container_port
-                        endpoint_host = container_ip
-                        endpoint_port = container_port
+                        endpoint_host, endpoint_port = _reported_endpoint(
+                            container_ip, container_port, host_port)
                         readiness_host = container_ip
                         readiness_port = container_port
                     else:

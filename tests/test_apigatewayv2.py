@@ -2275,6 +2275,30 @@ def test_apigwv2_created_date_is_unix_timestamp(apigw):
     apigw.delete_api(ApiId=resp["ApiId"])
 
 
+@pytest.mark.parametrize("use_ssl, http_scheme, ws_scheme", [("1", "https", "wss"), ("", "http", "http")])
+def test_apigwv2_endpoint_scheme_follows_tls(monkeypatch, use_ssl, http_scheme, ws_scheme):
+    """Under USE_SSL=1 the gateway serves only HTTPS, so apiEndpoint is https:// (wss:// for a WebSocket API), as on
+    AWS; without it both keep http://."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    for protocol, scheme in (("HTTP", http_scheme), ("WEBSOCKET", ws_scheme)):
+        status, body = _payload(_apigw._create_api({"name": f"scheme-{protocol}", "protocolType": protocol}))
+        assert status == 201
+        assert body["apiEndpoint"].startswith(f"{scheme}://"), body["apiEndpoint"]
+        _apigw._delete_api(body["apiId"])
+
+
+def test_apigwv2_cfn_api_endpoint_follows_tls(monkeypatch):
+    """The AWS::ApiGatewayV2::Api provisioner builds the same apiEndpoint as CreateApi."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    api_id, attrs = provisioners._apigw_v2_api_create("Api", {"Name": "cfn-tls", "ProtocolType": "WEBSOCKET"}, "stack")
+    try:
+        assert attrs["ApiEndpoint"].startswith("wss://"), attrs["ApiEndpoint"]
+    finally:
+        _apigw._delete_api(api_id)
+
+
 # ========== from test_apigwv2_websocket.py ==========
 
 """API Gateway v2 WebSocket — end-to-end tests.
