@@ -903,6 +903,62 @@ def test_iot_indexing_configuration_rejects_impossible_modes():
     ] == "OFF"
 
 
+_EVENT_TYPES = (
+    "THING", "THING_GROUP", "THING_TYPE", "THING_GROUP_MEMBERSHIP",
+    "THING_GROUP_HIERARCHY", "THING_TYPE_ASSOCIATION", "JOB", "JOB_EXECUTION",
+    "POLICY", "CERTIFICATE", "CA_CERTIFICATE",
+)
+
+
+def _enabled_event_types(client) -> set:
+    configs = client.describe_event_configurations()["eventConfigurations"]
+    assert set(configs) == set(_EVENT_TYPES)
+    return {t for t, c in configs.items() if c["Enabled"]}
+
+
+def test_iot_event_configurations_default_all_disabled():
+    client = _iot_client_for_fresh_account()
+    resp = client.describe_event_configurations()
+    assert resp["eventConfigurations"] == {t: {"Enabled": False} for t in _EVENT_TYPES}
+    assert "creationDate" not in resp and "lastModifiedDate" not in resp
+
+
+def test_iot_update_event_configurations_changes_only_named_types():
+    client = _iot_client_for_fresh_account()
+    client.update_event_configurations(eventConfigurations={"THING": {"Enabled": True}})
+    first = client.describe_event_configurations()
+    assert _enabled_event_types(client) == {"THING"}
+
+    client.update_event_configurations(
+        eventConfigurations={"THING_GROUP": {"Enabled": True}}
+    )
+    assert _enabled_event_types(client) == {"THING", "THING_GROUP"}
+    second = client.describe_event_configurations()
+    assert second["creationDate"] == first["creationDate"]
+    assert second["lastModifiedDate"] >= first["lastModifiedDate"]
+
+    # A type named without Enabled is turned off, as on AWS.
+    client.update_event_configurations(eventConfigurations={"THING": {}})
+    assert _enabled_event_types(client) == {"THING_GROUP"}
+
+
+def test_iot_update_event_configurations_rejects_bad_requests():
+    client = _iot_client_for_fresh_account()
+    with pytest.raises(ClientError) as ei:
+        client.update_event_configurations()
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == "Configuration cannot be null"
+    with pytest.raises(ClientError) as ei:
+        client.update_event_configurations(
+            eventConfigurations={"THING": {"Enabled": True}, "BOGUS": {"Enabled": True}}
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    # A refused update changes nothing.
+    assert _enabled_event_types(client) == set()
+    assert "creationDate" not in client.describe_event_configurations()
+
+
 def test_iot_search_index_requires_indexing_enabled():
     """Searching an account that never enabled indexing is a 404 on AWS."""
     client = _iot_client_for_fresh_account()
