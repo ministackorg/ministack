@@ -14,6 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EventBridge — `UpdateEventBus` returns the bus** — it answered `EventBusArn` and `LastModifiedTime`, which are not response members, so SDKs returned nothing; it now returns `Arn`, `Name` and the bus's `Description`, `KmsKeyIdentifier`, `DeadLetterConfig` and `LogConfig`. Contributed by @IamYipi.
 - **CloudFormation — `AWS::CodeBuild::Project` stores `Source`, `Artifacts` and `Environment` under CodeBuild API names** — the template's PascalCase members and `BuildSpec` were stored as written, so `BatchGetProjects` dropped them and a build of a stack's project found no buildspec, image or environment variables. Contributed by @IamYipi.
 - **Inspector2 — responses aws-sdk-go-v2 can read** — timestamps are epoch seconds, `ListFilters` returns `criteria`, `ownerId`, `createdAt` and `updatedAt`, `CreateFilter` returns `arn`, and coverage `scanStatus` is `{statusCode, reason}`. Saved state is converted on restore. Contributed by @IamYipi.
+- **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
 
 ## [1.5.19] — 2026-09-30
 
