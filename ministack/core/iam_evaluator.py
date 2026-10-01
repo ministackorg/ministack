@@ -797,14 +797,13 @@ def _resolve_managed_policy_document(policy_arn: str,
             return ver.get("Document")
         return None
 
-    # Customer-managed policy — look up by ARN
-    # The _policies dict is keyed by policy name; .items() returns current account's
-    for _name, policy in iam_svc._policies.items():
-        if policy.get("Arn") == policy_arn:
-            default_vid = policy.get("DefaultVersionId", "v1")
-            versions = policy.get("Versions", {})
-            ver = versions.get(default_vid, {})
-            return ver.get("Document")
+    # Customer-managed policies are keyed by full ARN in the owner's account.
+    policy = iam_svc._policies.get_scoped(account_id, None, policy_arn)
+    if policy:
+        default_vid = policy.get("DefaultVersionId", "v1")
+        versions = policy.get("Versions", {})
+        ver = versions.get(default_vid, {})
+        return ver.get("Document")
     return None
 
 

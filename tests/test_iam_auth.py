@@ -1082,6 +1082,72 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+class TestCustomerManagedPolicyResolution:
+    """Customer policies belong to the explicit account and use full ARNs."""
+
+    OWNER = "111111111111"
+    OTHER = "222222222222"
+    ARN = f"arn:aws:iam::{OWNER}:policy/team/connect"
+    DOCUMENT = {"Statement": [{"Effect": "Allow", "Action": "rds-db:connect", "Resource": "*"}]}
+
+    @pytest.fixture
+    def policy(self, monkeypatch):
+        from ministack.core.responses import AccountScopedDict, request_scope
+        from ministack.services import iam as iam_svc
+
+        monkeypatch.setattr(iam_svc, "_policies", AccountScopedDict())
+        with request_scope(self.OWNER, "us-east-1"):
+            return iam_svc.store_policy(self.ARN, "connect", "/team/", self.DOCUMENT)
+
+    @pytest.mark.parametrize("requested,ambient,found", [
+        (OWNER, OTHER, True),
+        (OTHER, OWNER, False),
+    ])
+    def test_uses_explicit_account_and_preserves_context(self, policy, requested, ambient, found):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        from ministack.core.responses import get_account_id, get_region, request_scope
+
+        with request_scope(ambient, "eu-west-1"):
+            document = _resolve_managed_policy_document(self.ARN, requested)
+            assert document == (policy["Versions"]["v1"]["Document"] if found else None)
+            assert (get_account_id(), get_region()) == (ambient, "eu-west-1")
+
+    @pytest.mark.parametrize("arn", [
+        ARN.replace("policy/team/", "policy/"),
+        ARN.replace("policy/team/", "policy/other/"),
+        ARN.replace(OWNER, OTHER),
+        ARN + "-missing",
+    ])
+    def test_requires_complete_matching_arn(self, policy, arn):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        from ministack.core.responses import request_scope
+
+        with request_scope(self.OWNER, "us-east-1"):
+            assert _resolve_managed_policy_document(arn, self.OWNER) is None
+
+    def test_current_default_version_supplies_role_permissions(self, policy, monkeypatch):
+        from ministack.core.iam_evaluator import _gather_role_policies
+        from ministack.core.responses import AccountScopedDict, get_account_id, get_region, request_scope
+        from ministack.services import iam as iam_svc
+
+        monkeypatch.setattr(iam_svc, "_roles", AccountScopedDict())
+        iam_svc._roles.set_scoped(self.OWNER, None, "app", {"AttachedPolicies": [self.ARN]})
+        policy["Versions"]["v2"] = {"Document": json.dumps({"Statement": [
+            {"Effect": "Deny", "Action": "rds-db:connect", "Resource": "*"},
+        ]})}
+        ctx = EvalContext(
+            principal_arn=f"arn:aws:iam::{self.OWNER}:role/app", principal_type="AssumedRole",
+            principal_account=self.OWNER, action="rds-db:connect", resource_arn="*", region="us-east-1",
+        )
+        with request_scope(self.OTHER, "eu-west-1"):
+            assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Allow"
+            policy["DefaultVersionId"] = "v2"
+            assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Deny"
+            policy["DefaultVersionId"] = "v1"
+            assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Allow"
+            assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
+
+
 class TestSeededAwsManagedPolicies:
     """The AWS-managed policies CDK, SAM and Serverless attach by their real ARNs
     resolve to a document: the service-role/* path is the only one AWS has for the
