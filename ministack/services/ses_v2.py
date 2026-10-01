@@ -169,8 +169,13 @@ def _page_size(query_params, default, maximum=100):
     return size, None
 
 
-def _paginate(items, query_params, default_size):
-    size, err = _page_size(query_params, default_size)
+def _body_paging(data):
+    """NextToken / PageSize sent in a JSON body, in the query-parameter form."""
+    return {k: str(data[k]) for k in ("NextToken", "PageSize") if data.get(k) is not None}
+
+
+def _paginate(items, query_params, default_size, maximum=100):
+    size, err = _page_size(query_params, default_size, maximum)
     if err:
         return [], None, err
     start, err = _decode_page_token(_first_query_value(query_params, "NextToken"))
@@ -467,14 +472,27 @@ async def handle_request(method, path, headers, body, query_params):
             "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
         })
 
-    # GET /v2/email/identities  (ListEmailIdentities)
-    if sub == "/identities" and method == "GET":
-        return json_response({
-            "EmailIdentities": [
-                {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True}
-                for k, v in _identities.items()
-            ],
-        })
+    # ListEmailIdentities: GET /v2/email/identities, or POST /v2/email/list-identities
+    # with paging and Filter in the body (newer SDKs)
+    if (sub == "/identities" and method == "GET") or (sub == "/list-identities" and method == "POST"):
+        params = query_params if method == "GET" else _body_paging(data)
+        wanted = (data.get("Filter") or {}) if method == "POST" else {}
+        items = [
+            {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True,
+             "VerificationStatus": "SUCCESS"}
+            for k, v in _identities.items()
+        ]
+        items = [i for i in items
+                 if wanted.get("IDENTITY_NAME_CONTAINS", "") in i["IdentityName"]
+                 and wanted.get("IDENTITY_TYPE", i["IdentityType"]) == i["IdentityType"]
+                 and wanted.get("VERIFICATION_STATUS", "SUCCESS") == "SUCCESS"]
+        page, next_token, err = _paginate(items, params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"EmailIdentities": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET /v2/email/identities/{identity}
     m = re.match(r"^/identities/(.+)$", sub)
@@ -498,9 +516,21 @@ async def handle_request(method, path, headers, body, query_params):
         _ses_tags[_resource_arn("configuration-set", name)] = list(data.get("Tags", []))
         return json_response({})
 
-    # GET /v2/email/configuration-sets  (ListConfigurationSets)
-    if sub == "/configuration-sets" and method == "GET":
-        return json_response({"ConfigurationSets": list(_config_sets.keys())})
+    # ListConfigurationSets: GET /v2/email/configuration-sets, or
+    # POST /v2/email/list-configuration-sets with paging and Filter in the body
+    if ((sub == "/configuration-sets" and method == "GET")
+            or (sub == "/list-configuration-sets" and method == "POST")):
+        params = query_params if method == "GET" else _body_paging(data)
+        contains = ((data.get("Filter") or {}).get("CONFIGURATION_SET_NAME_CONTAINS", "")
+                    if method == "POST" else "")
+        page, next_token, err = _paginate(
+            [n for n in _config_sets if contains in n], params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"ConfigurationSets": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET/DELETE /v2/email/configuration-sets/{name}
     m = re.match(r"^/configuration-sets/([^/]+)$", sub)
