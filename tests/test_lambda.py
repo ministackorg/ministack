@@ -4875,7 +4875,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
@@ -7594,7 +7594,7 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
 # ──────────────────── host.docker.internal → host-gateway ────────────────────
 
 
-def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_overrides=None):
     """Spawn one Lambda container against fakes and return the docker kwargs.
 
     Captures both entry points: the DinD path uses ``containers.create`` (code
@@ -7619,14 +7619,66 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
-    lsvc._spawn_lambda_container(
-        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
-         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
-         "MemorySize": 128,
-         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
-        _make_zip("def handler(e, c): pass"),
-    )
+    config = {
+        "FunctionName": "test-hg-fn", "Runtime": "python3.12",
+        "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+        "MemorySize": 128,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn",
+    }
+    config.update(config_overrides or {})
+    lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
     return captured
+
+
+@pytest.mark.parametrize("timeout", [3, 301, 900])
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("in_container", [False, True])
+def test_lambda_container_passes_configured_timeout_to_rie(monkeypatch, timeout, package_type, in_container):
+    """RIE reads AWS_LAMBDA_FUNCTION_TIMEOUT, otherwise it defaults to 300s (#1844)."""
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: in_container)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566",
+        config_overrides={
+            "Timeout": timeout,
+            "PackageType": package_type,
+            "ImageUri": "public.ecr.aws/lambda/python:3.12",
+            "Environment": {"Variables": {
+                "AWS_LAMBDA_FUNCTION_TIMEOUT": "1",
+                "_LAMBDA_TIMEOUT": "1",
+            }},
+        },
+    )
+    assert captured["environment"]["AWS_LAMBDA_FUNCTION_TIMEOUT"] == str(timeout)
+    assert captured["environment"]["_LAMBDA_TIMEOUT"] == str(timeout)
+
+
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_timeout_update_evicts_warm_container(monkeypatch, package_type, old_timeout, new_timeout):
+    """A warm RIE container must not keep its previous invocation deadline."""
+    name = f"lam-timeout-update-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name, "Timeout": old_timeout, "PackageType": package_type,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+        "ImageUri": "public.ecr.aws/lambda/python:3.12",
+    }
+    monkeypatch.setattr(lsvc, "_functions", {name: {"config": config}})
+    monkeypatch.setattr(lsvc, "invalidate_worker", Mock())
+    monkeypatch.setattr(lsvc, "_schedule_state_transition", Mock())
+    key = lsvc._warm_pool_key(name, config)
+    container = _mk_container()
+    entry = lsvc._pool_register(key, container, None)
+    lsvc._pool_release(entry)
+
+    response = lsvc._update_config(name, {"Timeout": new_timeout})
+
+    assert response[0] == 200
+    assert config["Timeout"] == new_timeout
+    acquired, reason = lsvc._pool_acquire(key, max_concurrency=None)
+    assert acquired is None
+    assert reason == "spawn"
+    container.stop.assert_called_once()
+    container.remove.assert_called_once()
 
 
 def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
@@ -10826,6 +10878,71 @@ def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
 @pytest.mark.data_plane
+def test_lambda_docker_rie_uses_configured_deadline(lam):
+    """Check the real RIE deadline without waiting for its old 300s limit (#1844)."""
+    fname = f"lam-rie-deadline-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=900,
+        Code={"ZipFile": _make_zip(
+            "def handler(event, context):\n"
+            "    return {'remaining_ms': context.get_remaining_time_in_millis()}\n"
+        )},
+    )
+    try:
+        # Both cold and warm invocations must receive the configured deadline.
+        for _ in range(2):
+            resp, payload = _invoke_lambda_payload(lam, fname, {})
+            assert not resp.get("FunctionError"), payload
+            assert 850_000 < payload["remaining_ms"] <= 900_000, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_docker_timeout_update_changes_rie_deadline(lam, old_timeout, new_timeout):
+    """Timeout updates replace the warm container and reach the real RIE."""
+    fname = f"lam-rie-update-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=old_timeout,
+        Code={"ZipFile": _make_zip(
+            "import time\n"
+            "def handler(event, context):\n"
+            "    remaining = context.get_remaining_time_in_millis()\n"
+            "    time.sleep(event.get('sleep', 0))\n"
+            "    return {'remaining_ms': remaining, 'ok': True}\n"
+        )},
+    )
+    try:
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert payload["ok"] is True
+        lam.update_function_configuration(FunctionName=fname, Timeout=new_timeout)
+        lam.get_waiter("function_updated_v2").wait(
+            FunctionName=fname, WaiterConfig={"Delay": 1, "MaxAttempts": 10},
+        )
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert new_timeout * 500 < payload["remaining_ms"] <= new_timeout * 1000, payload
+        if new_timeout > old_timeout:
+            resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": old_timeout + 1})
+            assert not resp.get("FunctionError"), payload
+            assert isinstance(payload, dict) and payload.get("ok") is True, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -13700,7 +13817,7 @@ def test_provided_env_uses_execution_role_credentials(monkeypatch):
     assert {key: env[key] for key in credentials} == credentials
 
 
-@pytest.mark.parametrize("operation", ["code", "configuration", "delete"])
+@pytest.mark.parametrize("operation", ["code", "configuration", "timeout", "delete"])
 def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool, operation):
     config = _provided_dispatch_config()
     name = config["FunctionName"]
@@ -13716,6 +13833,8 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
         result = lambda_svc._update_code(name, {})
     elif operation == "configuration":
         result = lambda_svc._update_config(name, {"Environment": {"Variables": {"UPDATED": "yes"}}})
+    elif operation == "timeout":
+        result = lambda_svc._update_config(name, {"Timeout": config["Timeout"] + 1})
     else:
         result = lambda_svc._delete_function(name, {})
     assert result[0] in (200, 204)
@@ -13974,3 +14093,38 @@ def test_proxy_via_apigw_aws_proxy_integration(proxy_server):
     forwarded = json.loads(_ProxyHandler.received[-1]["body"])
     assert forwarded.get("rawPath") == "/hello"
     assert forwarded.get("requestContext", {}).get("http", {}).get("method") == "GET"
+
+
+def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
+    """RIE can end a run with a plain-text "Task timed out" body and HTTP 200.
+
+    That body is not JSON, so it reached callers as a successful payload:
+    Step Functions recorded TaskSucceeded and never ran Catch. It must take
+    the same shape as the read-timeout path.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return b"Task timed out after 300.00 seconds"
+
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _FakeResp()):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"] == {
+        "errorMessage": "Task timed out after 300.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    assert result["timeout"] is True
+
+
+def test_classify_function_error_bare_timeout_string_is_unhandled():
+    import ministack.services.lambda_svc as lsvc
+
+    assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
+    # Only the exact runtime message counts; other handler strings stay successes.
+    assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None

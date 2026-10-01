@@ -364,6 +364,13 @@ _CONDITION_OPS: dict[str, Any] = {
     "binaryequals": _op_string_equals,
 }
 
+# Operators that require the key NOT to match
+_NEGATED_OPS = frozenset({
+    "stringnotequals", "stringnotequalsignorecase", "stringnotlike",
+    "numericnotequals", "datenotequals", "arnnotequals", "arnnotlike",
+    "notipaddress",
+})
+
 
 def _evaluate_single_condition(operator: str, actual: Any,
                                expected_values: list[str]) -> bool:
@@ -397,7 +404,9 @@ def _evaluate_single_condition(operator: str, actual: Any,
         return False
 
     if actual is None:
-        return if_exists or for_all  # ForAllValues on missing key = true (empty set)
+        # An absent key satisfies ...IfExists, ForAllValues (empty set) and a
+        # negated single-valued operator; ForAnyValue and affirmative ones fail.
+        return if_exists or for_all or (not for_any and op_lower in _NEGATED_OPS)
 
     # Multi-valued context key
     if isinstance(actual, list):
@@ -1270,6 +1279,16 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
                 continue
             if fnmatch_iam(caller_arn, p):
                 return True
+            # A resource policy names an IAM role ARN, while a request made
+            # after AssumeRole carries the matching STS assumed-role ARN.
+            # AWS treats those as the same principal for resource policies.
+            if ":role/" in p and ":assumed-role/" in caller_arn:
+                principal_account = p.split(":")[4]
+                caller_account = caller_arn.split(":")[4]
+                role_name = p.rsplit("/", 1)[-1]
+                assumed_role = caller_arn.split(":assumed-role/", 1)[1].split("/", 1)[0]
+                if principal_account == caller_account and role_name == assumed_role:
+                    return True
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True

@@ -23,6 +23,7 @@ from .engine import (
     validate_template_support,
 )
 from .helpers import (
+    ON_FAILURE_VALUES,
     _error,
     _esc,
     _extract_members,
@@ -32,12 +33,14 @@ from .helpers import (
     _request_problems,
     _resolve_template,
     _xml,
+    enum_problems,
     stack_name_problems,
     validation_error_message,
 )
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
+    _create_then_delete_on_failure,
     _deploy_stack_async,
     _diff_resources,
     _stack_region,
@@ -355,6 +358,15 @@ def _create_change_set(params):
         # The request-level constraints of a new stack, joined as the API does.
         if request_error := _request_problems(params, stack_name):
             return request_error
+    if problems := enum_problems(params, "OnStackFailure", "onStackFailure",
+                                 ON_FAILURE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
+    on_stack_failure = _p(params, "OnStackFailure")
+    # "DELETE ... is only valid when the ChangeSetType parameter is set to
+    # CREATE" (API_CreateChangeSet); the error wording is not measured.
+    if on_stack_failure == "DELETE" and cs_type != "CREATE":
+        return _error("ValidationError",
+                      "OnStackFailure DELETE is only valid when ChangeSetType is CREATE.")
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
@@ -497,7 +509,7 @@ def _create_change_set(params):
     with _stack_region_context(stack, stack_id):
         old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
-    changes = _diff_resources(old_resolved, new_resolved)
+    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"))
     import_failure = None
     if cs_type == "IMPORT":
         # An import describes the resources being adopted, not the template
@@ -555,6 +567,7 @@ def _create_change_set(params):
         ],
         "Tags": tags,
         "Capabilities": _extract_string_members(params, "Capabilities"),
+        "OnStackFailure": on_stack_failure,
         "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
@@ -611,14 +624,17 @@ def _describe_change_set(params):
                 "</member>"
             )
         # botocore reads an empty element as "", so a member the change does
-        # not carry (an Import's Replacement, a Remove's unknown physical id)
-        # is left out instead of written empty.
+        # not carry (an Import's Replacement, an Add's physical id) is left
+        # out instead of written empty.
         physical_xml = (
             f"<PhysicalResourceId>{_esc(rc['PhysicalResourceId'])}</PhysicalResourceId>"
             if rc.get("PhysicalResourceId") else ""
         )
         replacement_xml = (
             f"<Replacement>{rc['Replacement']}</Replacement>" if "Replacement" in rc else ""
+        )
+        policy_xml = (
+            f"<PolicyAction>{rc['PolicyAction']}</PolicyAction>" if "PolicyAction" in rc else ""
         )
         # "Resource" is the one ChangeType, and AWS reports it on every change.
         changes_xml += (
@@ -628,6 +644,7 @@ def _describe_change_set(params):
             f"{physical_xml}"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"{replacement_xml}"
+            f"{policy_xml}"
             f"<Scope>{scope_xml}</Scope>"
             f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
@@ -660,6 +677,8 @@ def _describe_change_set(params):
         f"<Changes>{changes_xml}</Changes>"
         f"<Tags>{tags_xml}</Tags>"
     )
+    if cs.get("OnStackFailure"):
+        inner += f"<OnStackFailure>{cs['OnStackFailure']}</OnStackFailure>"
 
     return _xml(200, "DescribeChangeSetResponse",
                 f"<DescribeChangeSetResult>{inner}</DescribeChangeSetResult>")
@@ -679,7 +698,9 @@ async def _track_change_set_execution(change_set, stack, deploy_coro):
         await deploy_coro
     finally:
         status = stack.get("StackStatus", "")
-        if status.endswith("_COMPLETE") and "ROLLBACK" not in status:
+        # A DELETE_* status is the OnStackFailure=DELETE cleanup of a failed create.
+        if (status.endswith("_COMPLETE") and "ROLLBACK" not in status
+                and not status.startswith("DELETE")):
             change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
         else:
             change_set["ExecutionStatus"] = "EXECUTE_FAILED"
@@ -706,6 +727,21 @@ def _execute_change_set(params):
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
+
+    # DisableRollback "can't be specified when the OnStackFailure parameter to
+    # the CreateChangeSet API operation was specified" (API_ExecuteChangeSet);
+    # the error wording is not measured.
+    on_stack_failure = cs.get("OnStackFailure", "")
+    if on_stack_failure and "DisableRollback" in params:
+        return _error("ValidationError",
+                      "You can't specify DisableRollback when the change set was "
+                      "created with OnStackFailure.")
+    # DO_NOTHING is DisableRollback=true, ROLLBACK is false, DELETE rolls back
+    # and then deletes the new stack. Without either, the stack rolls back as
+    # it always did here; the API reference says "Default: True" for
+    # DisableRollback, which is not measured and not followed.
+    disable_rollback = (on_stack_failure == "DO_NOTHING"
+                        or _p(params, "DisableRollback", "false").lower() == "true")
 
     cs["ExecutionStatus"] = "EXECUTE_IN_PROGRESS"
     real_stack_name = cs["StackName"]
@@ -738,6 +774,8 @@ def _execute_change_set(params):
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     status_prefix = "UPDATE" if is_update else "CREATE"
+    if not is_update:
+        stack["DisableRollback"] = disable_rollback
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
@@ -757,16 +795,15 @@ def _execute_change_set(params):
                    "AWS::CloudFormation::Stack", f"{status_prefix}_IN_PROGRESS",
                    physical_id=stack_id)
 
+        deploy = _deploy_stack_async(real_stack_name, stack_id, template,
+                                     param_values, disable_rollback, tags,
+                                     is_update=is_update,
+                                     previous_stack=previous_stack,
+                                     retain_except_on_create=retain_except_on_create)
+        if on_stack_failure == "DELETE" and not is_update:
+            deploy = _create_then_delete_on_failure(real_stack_name, stack_id, deploy)
         _create_stack_task_in_region(
-            _track_change_set_execution(
-                cs,
-                stack,
-                _deploy_stack_async(real_stack_name, stack_id, template,
-                                    param_values, False, tags,
-                                    is_update=is_update,
-                                    previous_stack=previous_stack,
-                                    retain_except_on_create=retain_except_on_create),
-            ),
+            _track_change_set_execution(cs, stack, deploy),
             stack,
             stack_id,
         )

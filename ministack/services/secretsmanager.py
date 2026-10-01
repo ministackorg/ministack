@@ -485,6 +485,12 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidRequestException", f"Unknown action: {action}", 400)
+    if action == "BatchGetSecretValue":
+        from ministack.app import AUTH
+        from ministack.core.router import extract_access_key_id
+
+        access_key = (extract_access_key_id(headers, query_params) or "") if AUTH else None
+        return handler(data, access_key)
     return handler(data)
 
 
@@ -601,15 +607,51 @@ def _get_secret_value(data):
     return json_response(result)
 
 
-def _batch_get_secret_value(data):
+def _batch_get_secret_value(data, access_key=None):
+    """``access_key`` is None without AUTH. With it, a request by ``Filters``
+    also needs ``secretsmanager:ListSecrets``, and a secret the caller holds no
+    ``secretsmanager:GetSecretValue`` on is reported in ``Errors``. The primary
+    check has already authenticated the key, so only policy denials occur."""
+    from ministack.core.iam_actions import access_denied_response
+    from ministack.core.iam_evaluator import enforce
+
     secret_ids = data.get("SecretIdList", [])
     results = []
     errors = []
 
-    targets = secret_ids if secret_ids else sorted(
-        n for n, s in _secrets.items() if not s.get("DeletedDate"))
+    def authorize(action, resource_arn):
+        if access_key is None:
+            return None
+        return enforce(access_key, action, "secretsmanager", get_region(), resource_arn=resource_arn)
+
+    if secret_ids:
+        targets = secret_ids
+    else:
+        denied = authorize("secretsmanager:ListSecrets", "*")
+        if denied:
+            return access_denied_response("secretsmanager", "secretsmanager:ListSecrets",
+                                          getattr(denied, "principal_arn", ""), new_uuid())
+        names = sorted(n for n, s in _secrets.items() if not s.get("DeletedDate"))
+        targets = [_secrets[n]["ARN"] for n in _filter_secret_names(names, data.get("Filters", []))]
 
     for sid in targets:
+        _, secret = _resolve(sid)
+        resource_arn = secret["ARN"] if secret else (
+            sid if sid.startswith("arn:")
+            else f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{sid}")
+        denied = authorize("secretsmanager:GetSecretValue", resource_arn)
+        if denied:
+            principal = getattr(denied, "principal_arn", "")
+            errors.append({
+                "SecretId": sid,
+                "ErrorCode": "AccessDeniedException",
+                "Message": (
+                    f"User: {principal} is not authorized to perform: "
+                    f"secretsmanager:GetSecretValue on resource: {sid} because no "
+                    "identity-based policy allows the secretsmanager:GetSecretValue action"
+                ),
+            })
+            continue
         resp = _get_secret_value({"SecretId": sid})
         status, _, body = resp
         parsed = json.loads(body) if isinstance(body, bytes) else json.loads(body)
@@ -631,25 +673,10 @@ def _list_secrets(data):
     filters = data.get("Filters", [])
     include_planned_deletion = bool(data.get("IncludePlannedDeletion", False))
 
-    names = sorted(
+    names = _filter_secret_names(sorted(
         n for n, s in _secrets.items()
         if include_planned_deletion or not s.get("DeletedDate")
-    )
-
-    for f in filters:
-        key = f.get("Key", "")
-        values = [v.lower() for v in f.get("Values", [])]
-        if key == "name":
-            names = [n for n in names if any(v in n.lower() for v in values)]
-        elif key == "tag-key":
-            names = [n for n in names
-                     if any(t.get("Key", "").lower() in values for t in _secrets[n].get("Tags", []))]
-        elif key == "tag-value":
-            names = [n for n in names
-                     if any(t.get("Value", "").lower() in values for t in _secrets[n].get("Tags", []))]
-        elif key == "description":
-            names = [n for n in names
-                     if any(v in _secrets[n].get("Description", "").lower() for v in values)]
+    ), filters)
 
     start = 0
     if next_token:
@@ -684,6 +711,25 @@ def _list_secrets(data):
     if end < len(names):
         resp["NextToken"] = base64.b64encode(str(end).encode()).decode()
     return json_response(resp)
+
+
+def _filter_secret_names(names, filters):
+    """The ``names`` that pass every ListSecrets-style filter."""
+    for f in filters:
+        key = f.get("Key", "")
+        values = [v.lower() for v in f.get("Values", [])]
+        if key == "name":
+            names = [n for n in names if any(v in n.lower() for v in values)]
+        elif key == "tag-key":
+            names = [n for n in names
+                     if any(t.get("Key", "").lower() in values for t in _secrets[n].get("Tags", []))]
+        elif key == "tag-value":
+            names = [n for n in names
+                     if any(t.get("Value", "").lower() in values for t in _secrets[n].get("Tags", []))]
+        elif key == "description":
+            names = [n for n in names
+                     if any(v in _secrets[n].get("Description", "").lower() for v in values)]
+    return names
 
 
 def _delete_secret(data):

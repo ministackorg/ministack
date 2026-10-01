@@ -250,6 +250,15 @@ def _arn(key_id):
     return f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
 
 
+def _key_material_id(rec):
+    """Stable for a key's symmetric material; changes when the material does."""
+    return hmac.new(
+        rec["_symmetric_key"],
+        b"ministack:kms:key-material-id:" + rec["KeyId"].encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _key_metadata(rec):
     metadata = {
         "KeyId": rec["KeyId"],
@@ -273,6 +282,8 @@ def _key_metadata(rec):
     # that is, when its KeyState is PendingDeletion."
     if "DeletionDate" in rec:
         metadata["DeletionDate"] = rec["DeletionDate"]
+    if "_symmetric_key" in rec and rec["Origin"] in ("AWS_KMS", "EXTERNAL"):
+        metadata["CurrentKeyMaterialId"] = _key_material_id(rec)
     # Both are reported only for a key with imported material.
     if "ExpirationModel" in rec:
         metadata["ExpirationModel"] = rec["ExpirationModel"]
@@ -1174,13 +1185,16 @@ def _decrypt(data):
             400,
         )
 
-    return json_response({
+    response = {
         "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(plaintext).decode(),
         "EncryptionAlgorithm": data.get(
             "EncryptionAlgorithm", "SYMMETRIC_DEFAULT"
         ),
-    })
+    }
+    if "_symmetric_key" in rec and "Recipient" not in data:
+        response["KeyMaterialId"] = _key_material_id(rec)
+    return json_response(response)
 
 
 def _generate_data_key_common(data, action="GenerateDataKey"):
@@ -1238,13 +1252,7 @@ def _generate_data_key(data):
         "CiphertextBlob": base64.b64encode(result).decode(),
     }
     if "Recipient" not in data:
-        # Derive an emulator identifier from the wrapping material and key ID.
-        # Both survive persistence and are shared by multi-Region replicas.
-        response["KeyMaterialId"] = hmac.new(
-            rec["_symmetric_key"],
-            b"ministack:kms:key-material-id:" + rec["KeyId"].encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+        response["KeyMaterialId"] = _key_material_id(rec)
 
     return json_response(response)
 
@@ -1342,6 +1350,7 @@ def _generate_data_key_pair_common(data, action):
         "KeyPairSpec": spec,
         "PrivateKeyCiphertextBlob": base64.b64encode(ciphertext).decode(),
         "PublicKey": base64.b64encode(public_der).decode(),
+        "KeyMaterialId": _key_material_id(rec),
     }
     return payload, private_der, None
 
@@ -1381,6 +1390,7 @@ def _generate_data_key_without_plaintext(data):
     return json_response({
         "KeyId": rec["Arn"],
         "CiphertextBlob": base64.b64encode(result).decode(),
+        "KeyMaterialId": _key_material_id(rec),
     })
 
 
@@ -1651,7 +1661,7 @@ def _revoke_grant(data):
     grant_id = data.get("GrantId", "")
     grant = _find_grant(rec, grant_id)
     if not grant:
-        return error_response_json("NotFoundException", f"Grant {grant_id} not found", 400)
+        return error_response_json("NotFoundException", f"Grant does not exist: {grant_id}", 400)
     if data.get("DryRun"):
         return _dry_run_error("RevokeGrant")
     del _grants[grant_id]
@@ -1679,7 +1689,7 @@ def _retire_grant(data):
             return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
         grant = _find_grant(rec, grant_id)
         if not grant:
-            return error_response_json("NotFoundException", f"Grant {grant_id} not found", 400)
+            return error_response_json("NotFoundException", f"Grant does not exist: {grant_id}", 400)
     if data.get("DryRun"):
         return _dry_run_error("RetireGrant")
     del _grants[grant["GrantId"]]
@@ -2122,7 +2132,10 @@ def _import_key_material(data):
                   "_import_token_expires"):
         rec.pop(field, None)
     logger.info("ImportKeyMaterial: %s", rec["KeyId"])
-    return json_response({"KeyId": rec["Arn"]})
+    response = {"KeyId": rec["Arn"]}
+    if "_symmetric_key" in rec:
+        response["KeyMaterialId"] = _key_material_id(rec)
+    return json_response(response)
 
 
 def _delete_imported_key_material(data):
@@ -2137,13 +2150,16 @@ def _delete_imported_key_material(data):
     if rec["KeyState"] == "PendingDeletion":
         return error_response_json(
             "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    response = {"KeyId": rec["Arn"]}
+    if "_symmetric_key" in rec:
+        response["KeyMaterialId"] = _key_material_id(rec)
     for field in ("_symmetric_key", "_hmac_key", "_private_key", "_public_key_der"):
         rec.pop(field, None)
     rec.pop("ValidTo", None)
     rec["KeyState"] = "PendingImport"
     rec["Enabled"] = False
     logger.info("DeleteImportedKeyMaterial: %s", rec["KeyId"])
-    return json_response({"KeyId": rec["Arn"]})
+    return json_response(response)
 
 
 def _tag_resource(data):

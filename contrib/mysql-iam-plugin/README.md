@@ -3,90 +3,19 @@
 This directory contains MiniStack's server-side compatibility plugin for
 Aurora MySQL users declared with `AWSAuthenticationPlugin`.
 
-The initial L0 implementation deliberately rejects every login, matching
-MySQL's `mysql_no_login` behavior. It supports provider workflows that create,
-alter, grant, revoke, inspect, and drop IAM-authenticated users without
-enabling direct IAM logins before the isolated proxy topology is provisioned.
+Like AWS's plugin, it asks the client for `mysql_clear_password` and reads the
+RDS IAM token as the password, so the `mysql` client needs
+`--enable-cleartext-plugin`. The plugin POSTs the user and token to MiniStack's
+broker (`/_ministack/rds/iam-auth`) using the address and per-resource
+capability MiniStack writes to `/etc/ministack/rds-iam.conf` when the container
+is ready. It accepts only an explicit allow; a missing config, a timeout or a
+malformed answer denies, and MySQL returns its own `1045 Access denied`.
 
-## Stage 7: inactive Python gatekeeper
-
-`ministack/core/mysqlproxy.py` implements the narrow MySQL connection adapter.
-It relays ordinary password authentication to MySQL and delegates IAM admission
-to a caller-supplied Python authorizer. No C++ HTTP callback or libcurl dependency
-is needed. The opt-in connection fixture uses the existing `rds_iam._decision`
-implementation with a resource capability and SDK-signed tokens; it does not
-duplicate SigV4 or IAM policy evaluation.
-
-`aws_auth_plugin.cc` is the single plugin implementation. Its minimal accepting
-path is enabled by `-DMINISTACK_IAM_PROXY_AUTH=1` only in the isolated live test
-fixture. This compile-time switch defaults to zero; it is not a runtime setting
-or a second AUTH flag. **Normal builds do not enable acceptance.**
-`Dockerfile.full` continues to build the default reject-all mode from that source.
-The accepting variant must never replace that artifact while MySQL is directly
-reachable. A caller inside the trusted backend namespace can bypass the proxy;
-the tests demonstrate both that bypass and denial from outside the namespace.
-
-MySQL selects the private `ministack_iam_gate_v1` client method for IAM accounts.
-The adapter rejects client claims of that method and translates the backend's
-auth switch to `mysql_clear_password`. Account creation and changes between IAM
-and password methods therefore require no cached user list. MySQL still owns
-account locks, SQL identity, grants, and password verification.
-
-The SSLRequest and subsequent login must declare identical capabilities and
-character sets. Usernames are restricted to 1–32 printable, non-space ASCII
-characters without single quotes, with handshake collation IDs 8, 33, 45, 46 or
-255. Other forms fail closed instead of risking a different identity after
-MySQL's charset conversion, quote removal or truncation. Broader username and
-encoding support is deferred; these restrictions also apply to password users.
-
-With `AUTH=true`, IAM admission requires frontend TLS before requesting a token
-and applies the existing token/policy decision. False or unset remains permissive
-for IAM credentials and transport. Valid resource capability, current binding,
-and resource IAM enablement remain required by the authorizer in either mode.
-Password users retain MySQL's password checks and account-specific SSL rules.
-
-### Validation and limits
-
-Offline handshake tests run in the normal Python test lane without image builds:
-
-```sh
-uv run --extra dev pytest tests/test_mysqlproxy.py tests/test_rds_iam.py tests/test_rds_iam_plugin.py -q
-```
-
-The opt-in live tests compile both modes of the original plugin and connect through the Python
-adapter to MySQL 8.0 and 8.4. They cover signed-token acceptance/rejection,
-password users, account changes, grants, TLS rules, method spoofing, disabled
-LOCAL INFILE, and backend isolation. They are not part of normal PR CI and do
-not rebuild plugin images there. On the existing ARM64 validation environment:
-
-```sh
-docker build -f Dockerfile.full --target plugin-build-80 -t ministack-spike-compiler80:local .
-docker build -f Dockerfile.full --target plugin-build -t ministack-iam-stage7-build:local .
-uv run --extra dev pytest contrib/mysql-iam-plugin/tests/test_connections.py -q
-```
-
-Requires Docker, OpenSSL, a native `mysql` client on PATH, and the repo's dev
-dependencies. The Python helper image is `ghcr.io/ministackorg/ministack:full`;
-local source is mounted read-only. Fixtures own and remove their containers,
-volumes and network; Compose is unnecessary. The native client covers cold-cache
-plaintext RSA authentication because the installed PyMySQL 1.2.3 cold RSA path
-returns no packet to its caller. PyMySQL covers TLS and warmed password logins.
-
-This is not yet a provisioned integration. The adapter only forwards QUERY,
-QUIT, INIT_DB and PING; reauthentication, prepared statements and compression
-are unsupported. Frames are capped at 1 MiB, socket operations at five seconds,
-and idle sessions at ten seconds. These bounds are not a whole-handshake
-deadline or a concurrency limit. Backend TLS is encrypted but its certificate
-is not verified. Host-specific account selection is unproven: fixtures use `%`
-accounts and MySQL sees the proxy's loopback address. Broader client compatibility
-and fragmentation/multi-statement behavior still need validation.
-
-Item 8 of #1744 must provide isolated backend networking, endpoint/resource and
-capability provisioning, lifecycle handling, TLS certificates, and tests through
-normal MiniStack provisioning before activating the accepting shim. It should
-expose a supported internal decision API rather than the fixture's private seam.
-The authorizer fixture creates local state; it is not production provisioning
-or validation against AWS. Token expiry affects new logins, not existing sessions.
+The broker always requires `IAMDatabaseAuthenticationEnabled` on the instance or
+cluster. With `AUTH=true` it also verifies the token and evaluates
+`rds-db:connect`. Password users, TLS (`REQUIRE SSL`), account locks and grants
+stay MySQL's own. The broker call is plain HTTP, so IAM logins fail closed when
+MiniStack serves HTTPS only (`USE_SSL=1`).
 
 ## Bundled compatibility artifact
 

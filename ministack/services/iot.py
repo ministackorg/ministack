@@ -1624,24 +1624,87 @@ def _handle_registration_code(method: str) -> tuple:
     DELETE discards it; the next GET mints a fresh one.
     """
     if method == "GET":
-        code = _registration_codes.get("code")
-        if not code:
-            code = hashlib.sha256(os.urandom(32)).hexdigest()
-            _registration_codes["code"] = code
-        return json_response({"registrationCode": code})
+        return json_response({"registrationCode": _registration_code()})
     # DELETE
     _registration_codes.pop("code", None)
     return json_response({})
+
+
+def _registration_code() -> str:
+    """The account/region registration code, minted on first use."""
+    code = _registration_codes.get("code")
+    if not code:
+        code = hashlib.sha256(os.urandom(32)).hexdigest()
+        _registration_codes["code"] = code
+    return code
+
+
+def _verification_certificate_error(
+    ca_pem: str, verification_pem: str | None, certificate_mode: str
+) -> tuple | None:
+    """Error response for a verification certificate the mode refuses, else None."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    if certificate_mode == "SNI_ONLY":
+        if not verification_pem:
+            return None
+        return error_response_json(
+            "InvalidRequestException",
+            "Cannot provide verification certificate for registering CA "
+            "Certificates in SNI_ONLY mode",
+            400,
+        )
+    if not verification_pem:
+        return error_response_json(
+            "InvalidRequestException",
+            "Need to provide verification certificate for registering CA "
+            "Certificates in DEFAULT mode",
+            400,
+        )
+    try:
+        cert = x509.load_pem_x509_certificate(verification_pem.encode("utf-8"))
+        ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
+    except Exception:
+        return error_response_json(
+            "InvalidRequestException",
+            "Contents of the Verification Certificate are not correct",
+            400,
+        )
+    if cert.issuer != ca.subject:
+        return error_response_json(
+            "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the "
+            "provided CA certificate.",
+            400,
+        )
+    if not certificate_is_signed_by(verification_pem, ca_pem):
+        return error_response_json(
+            "CertificateValidationException",
+            "The signature of the certificate failed verification against the "
+            "provided CA certificate.",
+            400,
+        )
+    common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if [a.value for a in common_names] != [_registration_code()]:
+        return error_response_json(
+            "RegistrationCodeValidationException",
+            "Registration code provided in the CN field of verification "
+            "certificate is invalid.",
+            400,
+        )
+    return None
 
 
 def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     """``POST /cacertificate`` (``RegisterCACertificate``).
 
     Body members per the botocore model: ``caCertificate`` (required),
-    ``verificationCertificate`` (accepted; the registration-code CN handshake
-    is not enforced locally) and ``certificateMode`` (``DEFAULT`` when
-    omitted, as on AWS). ``setAsActive`` / ``allowAutoRegistration`` ride as
-    query-string booleans, as on AWS.
+    ``verificationCertificate`` (required in ``DEFAULT`` mode: signed by the
+    CA, with the registration code as its CN; refused in ``SNI_ONLY`` mode)
+    and ``certificateMode`` (``DEFAULT`` when omitted, as on AWS).
+    ``setAsActive`` / ``allowAutoRegistration`` ride as query-string booleans,
+    as on AWS.
     """
     ca_pem = payload.get("caCertificate")
     if not ca_pem:
@@ -1668,6 +1731,11 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
             f"Invalid CA certificate PEM: {e}",
             400,
         )
+    refused = _verification_certificate_error(
+        ca_pem, payload.get("verificationCertificate"), certificate_mode
+    )
+    if refused is not None:
+        return refused
     if ca_id in _ca_certificates:
         return _certificate_already_exists(ca_id, _ca_cert_arn(ca_id))
     set_active = _qp_bool(qp, "setAsActive")

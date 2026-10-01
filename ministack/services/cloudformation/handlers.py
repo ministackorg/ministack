@@ -9,6 +9,7 @@ import json
 import logging
 
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
+from ministack.services.cloudformation import drift as _drift
 from ministack.services.cloudformation import wait_conditions as _wc
 
 from .changesets import (
@@ -31,6 +32,9 @@ from .engine import (
     validate_template_support,
 )
 from .helpers import (
+    DELETION_MODE_VALUES,
+    ON_FAILURE_VALUES,
+    TEMPLATE_STAGE_VALUES,
     _error,
     _esc,
     _extract_members,
@@ -41,13 +45,18 @@ from .helpers import (
     _request_problems,
     _resolve_template,
     _xml,
+    enum_problems,
+    validation_error_message,
 )
 from .stacks import (
+    CLIENT_REQUEST_TOKEN,
     _add_event,
     _continue_update_rollback_async,
     _create_stack_task_in_region,
+    _create_then_delete_on_failure,
     _delete_stack_async,
     _deploy_stack_async,
+    _roll_back_operation,
     _stack_region_context,
 )
 
@@ -253,6 +262,14 @@ def _create_stack(params):
     # The request-level constraints, joined into one message as the API does.
     if request_error := _request_problems(params, stack_name):
         return request_error
+    if problems := enum_problems(params, "OnFailure", "onFailure", ON_FAILURE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
+    on_failure = _p(params, "OnFailure")
+    # "You can specify either OnFailure or DisableRollback, but not both"
+    # (API_CreateStack); the error wording is not measured.
+    if on_failure and "DisableRollback" in params:
+        return _error("ValidationError",
+                      "You can specify either DisableRollback or OnFailure, but not both.")
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
@@ -275,7 +292,10 @@ def _create_stack(params):
     except Exception as e:
         return _error("ValidationError", f"Template format error: {e}")
     tags = _extract_members(params, "Tags")
-    disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    # OnFailure=DO_NOTHING is DisableRollback=true; DELETE rolls back and then
+    # deletes the stack; ROLLBACK is the default.
+    disable_rollback = (_p(params, "DisableRollback", "false").lower() == "true"
+                        or on_failure == "DO_NOTHING")
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
     from .helpers import _validate_stack_tags
     tags_error = _validate_stack_tags(tags)
@@ -348,13 +368,12 @@ def _create_stack(params):
                "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
                physical_id=stack_id)
 
-    _create_stack_task_in_region(
-        _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags,
-                            retain_except_on_create=retain_except_on_create),
-        stack,
-        stack_id,
-    )
+    deploy = _deploy_stack_async(stack_name, stack_id, template,
+                                 param_values, disable_rollback, tags,
+                                 retain_except_on_create=retain_except_on_create)
+    if on_failure == "DELETE":
+        deploy = _create_then_delete_on_failure(stack_name, stack_id, deploy)
+    _create_stack_task_in_region(deploy, stack, stack_id)
 
     return _xml(200, "CreateStackResponse",
                 f"<CreateStackResult><StackId>{stack_id}</StackId></CreateStackResult>")
@@ -456,6 +475,8 @@ def _describe_stacks(params):
 
         caps_xml = "".join(
             f"<member>{_esc(c)}</member>" for c in s.get("Capabilities", []))
+        deletion_mode_xml = (f"<DeletionMode>{s['DeletionMode']}</DeletionMode>"
+                             if s.get("DeletionMode") else "")
 
         members += (
             "<member>"
@@ -470,10 +491,12 @@ def _describe_stacks(params):
             "<EnableTerminationProtection>"
             f"{str(s.get('EnableTerminationProtection', False)).lower()}"
             "</EnableTerminationProtection>"
+            f"{deletion_mode_xml}"
             f"<Capabilities>{caps_xml}</Capabilities>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
             f"<Tags>{tags_xml}</Tags>"
+            f"{_stack_drift_information_xml(s)}"
             "</member>"
         )
 
@@ -511,6 +534,7 @@ def _list_stacks(params):
             entry += f"<StackStatusReason>{_esc(s['StackStatusReason'])}</StackStatusReason>"
         if s.get("DeletionTime"):
             entry += f"<DeletionTime>{s['DeletionTime']}</DeletionTime>"
+        entry += _stack_drift_information_xml(s)
         entry += "</member>"
         summaries += entry
 
@@ -547,6 +571,8 @@ def _describe_stack_events(params):
 
     members = ""
     for e in events_sorted:
+        token_xml = (f"<ClientRequestToken>{_esc(e['ClientRequestToken'])}</ClientRequestToken>"
+                     if e.get("ClientRequestToken") else "")
         members += (
             "<member>"
             f"<StackId>{_esc(e.get('StackId', ''))}</StackId>"
@@ -558,6 +584,7 @@ def _describe_stack_events(params):
             f"<ResourceStatus>{e.get('ResourceStatus', '')}</ResourceStatus>"
             f"<ResourceStatusReason>{_esc(e.get('ResourceStatusReason', ''))}</ResourceStatusReason>"
             f"<Timestamp>{e.get('Timestamp', '')}</Timestamp>"
+            f"{token_xml}"
             "</member>"
         )
 
@@ -628,6 +655,7 @@ def _describe_stack_resource(params):
         f"<StackName>{_esc(stack_name)}</StackName>"
         f"<StackId>{_esc(stack['StackId'])}</StackId>"
         f"{_resource_metadata_xml(stack, logical_id)}"
+        f"{_resource_drift_information_xml(res)}"
     )
 
     return _xml(200, "DescribeStackResourceResponse",
@@ -670,6 +698,7 @@ def _describe_stack_resources(params):
             f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
             f"<StackName>{_esc(stack_name)}</StackName>"
             f"<StackId>{_esc(stack['StackId'])}</StackId>"
+            f"{_resource_drift_information_xml(res)}"
             "</member>"
         )
 
@@ -704,6 +733,7 @@ def _list_stack_resources(params):
             f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
             f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
             f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
+            f"{_resource_drift_information_xml(res)}"
             "</member>"
         )
 
@@ -715,18 +745,60 @@ def _list_stack_resources(params):
 
 # --- GetTemplate ---
 
+def _processed_template_body(record):
+    """The ``Processed`` stage of a stack's or change set's template: the
+    template after its transforms (SAM, ``AWS::LanguageExtensions``,
+    ``AWS::Include``) as JSON. A template that declares no transform is
+    returned as it was sent: "If the template doesn't include transforms,
+    Original and Processed return the same template" (API_GetTemplate)."""
+    body = record.get("_template_body") or "{}"
+    try:
+        uses_transform = _uses_macro(_parse_template(body))
+    except Exception:
+        uses_transform = False
+    if not uses_transform or not record.get("_template"):
+        return body
+    return json.dumps(record["_template"], default=str)
+
+
 def _get_template(params):
+    from .changesets import _find_change_set
+    if problems := enum_problems(params, "TemplateStage", "templateStage",
+                                 TEMPLATE_STAGE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
     stack_name = _p(params, "StackName")
+    cs_name = _p(params, "ChangeSetName")
 
-    stack = _resolve_stack(stack_name)
-    if not stack:
-        return _error("ValidationError",
-                      f"Stack [{stack_name}] does not exist")
+    if cs_name:
+        # "If you specify a name, you must also specify the StackName"
+        # (API_GetTemplate); the error wording is not measured.
+        if not stack_name and not cs_name.startswith("arn:"):
+            return _error("ValidationError",
+                          "StackName must be specified if ChangeSetName is not specified as an ARN.")
+        stack = _resolve_stack(stack_name) if stack_name else None
+        _, record = _find_change_set(
+            cs_name, stack.get("StackName", stack_name) if stack else stack_name)
+        if not record:
+            return _error("ChangeSetNotFound",
+                          f"ChangeSet [{cs_name}] does not exist", 404)
+    else:
+        record = _resolve_stack(stack_name)
+        if not record:
+            return _error("ValidationError",
+                          f"Stack [{stack_name}] does not exist")
 
-    template_body = stack.get("_template_body", "{}")
+    if _p(params, "TemplateStage", "Processed") == "Processed":
+        template_body = _processed_template_body(record)
+    else:
+        template_body = record.get("_template_body") or "{}"
+    # Both stages of a stack are always available; a change set's Processed
+    # stage is available once it is created, which CreateChangeSet finishes
+    # before it answers.
+    stages_xml = "".join(f"<member>{s}</member>" for s in TEMPLATE_STAGE_VALUES)
     return _xml(200, "GetTemplateResponse",
                 f"<GetTemplateResult>"
                 f"<TemplateBody>{_esc(template_body)}</TemplateBody>"
+                f"<StagesAvailable>{stages_xml}</StagesAvailable>"
                 f"</GetTemplateResult>")
 
 
@@ -773,6 +845,9 @@ def _delete_stack(params):
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
+    if problems := enum_problems(params, "DeletionMode", "deletionMode", DELETION_MODE_VALUES):
+        return _error("ValidationError", validation_error_message(problems))
+    force = _p(params, "DeletionMode") == "FORCE_DELETE_STACK"
 
     stack = _resolve_stack(stack_name)
     if not stack:
@@ -811,6 +886,15 @@ def _delete_stack(params):
 
     stack_id = stack["StackId"]
 
+    # FORCE_DELETE_STACK: only for a DELETE_FAILED stack. The wording is the
+    # one a third party recorded from AWS (DevelopersIO, ap-northeast-3),
+    # not measured here.
+    if force and stack.get("StackStatus") != "DELETE_FAILED":
+        return _error("ValidationError",
+                      f"Invalid operation on stack [{stack_id}]. You can activate "
+                      "DeletionMode FORCE_DELETE_STACK in a delete stack operation only "
+                      "when the stack is in the DELETE_FAILED state.")
+
     # RetainResources: only for a DELETE_FAILED stack, only its own resources.
     retain = _extract_string_members(params, "RetainResources")
     if retain:
@@ -832,8 +916,11 @@ def _delete_stack(params):
                  if v.get("StackId") == stack_id]:
         _change_sets.pop(_cid, None)
 
+    if _p(params, "DeletionMode"):
+        stack["DeletionMode"] = _p(params, "DeletionMode")
+
     _create_stack_task_in_region(
-        _delete_stack_async(stack_name, stack_id, frozenset(retain)),
+        _delete_stack_async(stack_name, stack_id, frozenset(retain), force=force),
         stack,
         stack_id,
     )
@@ -1252,8 +1339,10 @@ def _cancel_update_stack(params):
     if stack.get("StackStatus") != "UPDATE_IN_PROGRESS":
         return _error("ValidationError",
                       "CancelUpdateStack cannot be called from current stack status")
-    # The running update checks the flag before each resource and rolls back.
+    # The running update checks the flag before each resource and rolls back;
+    # the rollback events carry the cancel's ClientRequestToken.
     stack["_cancel_requested"] = True
+    stack["_cancel_token"] = CLIENT_REQUEST_TOKEN.get()
     return _xml(200, "CancelUpdateStackResponse", "")
 
 
@@ -1287,6 +1376,285 @@ def _continue_update_rollback(params):
     )
     return _xml(200, "ContinueUpdateRollbackResponse",
                 "<ContinueUpdateRollbackResult></ContinueUpdateRollbackResult>")
+
+
+# --- RollbackStack ---
+
+def _rollback_stack(params):
+    """RollbackStack: roll a stack that failed with ``DisableRollback`` back
+    to its last known stable state. ``CREATE_FAILED`` has none, so what the
+    create made is deleted and the stack ends ``ROLLBACK_COMPLETE``;
+    ``UPDATE_FAILED`` goes back to the stack as it was before the update and
+    ends ``UPDATE_ROLLBACK_COMPLETE`` (API_RollbackStack). ``RoleARN`` is
+    accepted and not used."""
+    stack_name = _p(params, "StackName")
+    if not stack_name:
+        return _error("ValidationError", "StackName is required")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
+    status = stack.get("StackStatus", "")
+    if status not in ("CREATE_FAILED", "UPDATE_FAILED"):
+        return _error("ValidationError",
+                      "RollbackStack cannot be called from current stack status")
+    operation = stack.get("_failed_operation") or {
+        # A record without the failed operation (saved before RollbackStack
+        # existed): nothing is known to undo, so the stack keeps what it has
+        # and only the status settles.
+        "is_update": status == "UPDATE_FAILED",
+        "previous_stack": {
+            key: copy.deepcopy(stack.get(key)) for key in (
+                "_resources", "_template", "_template_body", "_resolved_params",
+                "Parameters", "Tags", "Outputs") if key in stack
+        } if status == "UPDATE_FAILED" else None,
+        "template": stack.get("_template") or {},
+        "param_values": stack.get("_resolved_params") or {},
+    }
+    if "RetainExceptOnCreate" in params:
+        operation = {**operation, "retain_except_on_create":
+                     _p(params, "RetainExceptOnCreate", "false").lower() == "true"}
+    stack_id = stack["StackId"]
+    stack["StackStatus"] = ("UPDATE_ROLLBACK_IN_PROGRESS" if operation.get("is_update")
+                            else "ROLLBACK_IN_PROGRESS")
+    _create_stack_task_in_region(
+        _roll_back_operation(stack_name, stack_id, stack, operation,
+                             reason_override="User Initiated"),
+        stack,
+        stack_id,
+    )
+    return _xml(200, "RollbackStackResponse",
+                f"<RollbackStackResult><StackId>{_esc(stack_id)}</StackId></RollbackStackResult>")
+
+
+# --- Drift detection ---
+
+# Detection records kept per stack; the API says the number of retained
+# results "may vary".
+_DRIFT_DETECTIONS_KEPT = 10
+
+
+def _stack_drift_information_xml(stack):
+    """``DriftInformation`` of a stack: ``NOT_CHECKED`` until a detection ran."""
+    info = stack.get("DriftInformation") or {}
+    status = info.get("StackDriftStatus", "NOT_CHECKED")
+    checked = info.get("LastCheckTimestamp")
+    ts = f"<LastCheckTimestamp>{checked}</LastCheckTimestamp>" if checked else ""
+    return (f"<DriftInformation><StackDriftStatus>{status}</StackDriftStatus>{ts}"
+            "</DriftInformation>")
+
+
+def _resource_drift_information_xml(res):
+    """``DriftInformation`` of a stack resource: ``NOT_CHECKED`` until its
+    type was checked (and for good for a type without drift support)."""
+    info = res.get("DriftInformation") or {}
+    status = info.get("StackResourceDriftStatus", "NOT_CHECKED")
+    checked = info.get("LastCheckTimestamp")
+    ts = f"<LastCheckTimestamp>{checked}</LastCheckTimestamp>" if checked else ""
+    return (f"<DriftInformation><StackResourceDriftStatus>{status}"
+            f"</StackResourceDriftStatus>{ts}</DriftInformation>")
+
+
+def _stack_resource_drift_xml(drift):
+    diffs = "".join(
+        "<member>"
+        f"<PropertyPath>{_esc(d['PropertyPath'])}</PropertyPath>"
+        f"<ExpectedValue>{_esc(d['ExpectedValue'])}</ExpectedValue>"
+        f"<ActualValue>{_esc(d['ActualValue'])}</ActualValue>"
+        f"<DifferenceType>{d['DifferenceType']}</DifferenceType>"
+        "</member>"
+        for d in drift.get("PropertyDifferences", []))
+    out = (
+        f"<StackId>{_esc(drift['StackId'])}</StackId>"
+        f"<LogicalResourceId>{_esc(drift['LogicalResourceId'])}</LogicalResourceId>"
+        f"<PhysicalResourceId>{_esc(drift.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
+        f"<ResourceType>{_esc(drift['ResourceType'])}</ResourceType>"
+        f"<StackResourceDriftStatus>{drift['StackResourceDriftStatus']}</StackResourceDriftStatus>"
+        f"<Timestamp>{drift['Timestamp']}</Timestamp>"
+    )
+    for key in ("ExpectedProperties", "ActualProperties", "DriftStatusReason"):
+        if key in drift:
+            out += f"<{key}>{_esc(drift[key])}</{key}>"
+    if diffs:
+        out += f"<PropertyDifferences>{diffs}</PropertyDifferences>"
+    return out
+
+
+def _drift_target(stack_name):
+    """The stack a drift call names, or the error: it has to exist and be in
+    one of the statuses the drift user guide lists."""
+    if not stack_name:
+        return None, _error("ValidationError", "StackName is required")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return None, _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    status = stack.get("StackStatus", "")
+    if status not in _drift.DRIFT_DETECTABLE_STATUSES:
+        return None, _error(
+            "ValidationError",
+            f"Stack [{stack.get('StackName', stack_name)}] is in {status} state; drift "
+            "detection is available in CREATE_COMPLETE, UPDATE_COMPLETE, "
+            "UPDATE_ROLLBACK_COMPLETE and UPDATE_ROLLBACK_FAILED")
+    return stack, None
+
+
+def _detect_stack_drift(params):
+    """DetectStackDrift: check every resource (or the ``LogicalResourceIds``)
+    whose type has a reader against its service store, synchronously; the
+    detection is ``DETECTION_COMPLETE`` by the time the call returns."""
+    stack, err = _drift_target(_p(params, "StackName"))
+    if err:
+        return err
+    resources = stack.get("_resources", {})
+    wanted = _extract_string_members(params, "LogicalResourceIds")
+    unknown = sorted(set(wanted) - set(resources))
+    if unknown:
+        return _error("ValidationError",
+                      f"Resource(s) [{', '.join(unknown)}] do not exist in stack "
+                      f"[{stack['StackName']}]")
+    timestamp = now_iso()
+    detection_id = new_uuid()
+    drifted = 0
+    failed = []
+    for logical_id, record in resources.items():
+        if wanted and logical_id not in wanted:
+            continue
+        if not _drift.supports_drift(record.get("ResourceType", "")):
+            continue
+        drift = _drift.detect_resource_drift(stack, logical_id, record, timestamp)
+        _drift.record_resource_drift(record, drift)
+        if drift["StackResourceDriftStatus"] in ("MODIFIED", "DELETED"):
+            drifted += 1
+        elif drift["StackResourceDriftStatus"] == "UNKNOWN":
+            failed.append(logical_id)
+    if drifted:
+        stack_status = "DRIFTED"
+    elif failed:
+        stack_status = "UNKNOWN"
+    else:
+        stack_status = "IN_SYNC"
+    detection = {
+        "StackId": stack["StackId"],
+        "StackDriftDetectionId": detection_id,
+        "StackDriftStatus": stack_status,
+        "DetectionStatus": "DETECTION_FAILED" if failed else "DETECTION_COMPLETE",
+        "Timestamp": timestamp,
+    }
+    if failed:
+        detection["DetectionStatusReason"] = (
+            f"Failed to detect drift on resources [{', '.join(sorted(failed))}]")
+    else:
+        detection["DriftedStackResourceCount"] = drifted
+    stack["DriftInformation"] = {"StackDriftStatus": stack_status,
+                                 "LastCheckTimestamp": timestamp}
+    detections = stack.setdefault("_drift_detections", {})
+    detections[detection_id] = detection
+    while len(detections) > _DRIFT_DETECTIONS_KEPT:
+        detections.pop(next(iter(detections)))
+    return _xml(200, "DetectStackDriftResponse",
+                "<DetectStackDriftResult>"
+                f"<StackDriftDetectionId>{detection_id}</StackDriftDetectionId>"
+                "</DetectStackDriftResult>")
+
+
+def _describe_stack_drift_detection_status(params):
+    from ministack.services.cloudformation import _stacks
+    detection_id = _p(params, "StackDriftDetectionId")
+    if not detection_id:
+        return _error("ValidationError", "StackDriftDetectionId is required")
+    detection = None
+    for stack in _stacks.values():
+        detection = (stack.get("_drift_detections") or {}).get(detection_id)
+        if detection:
+            break
+    if not detection:
+        return _error("ValidationError",
+                      f"Drift detection with id [{detection_id}] does not exist")
+    body = (
+        f"<StackId>{_esc(detection['StackId'])}</StackId>"
+        f"<StackDriftDetectionId>{detection_id}</StackDriftDetectionId>"
+        f"<StackDriftStatus>{detection['StackDriftStatus']}</StackDriftStatus>"
+        f"<DetectionStatus>{detection['DetectionStatus']}</DetectionStatus>"
+        f"<Timestamp>{detection['Timestamp']}</Timestamp>"
+    )
+    if detection.get("DetectionStatusReason"):
+        body += (f"<DetectionStatusReason>{_esc(detection['DetectionStatusReason'])}"
+                 "</DetectionStatusReason>")
+    if "DriftedStackResourceCount" in detection:
+        body += (f"<DriftedStackResourceCount>{detection['DriftedStackResourceCount']}"
+                 "</DriftedStackResourceCount>")
+    return _xml(200, "DescribeStackDriftDetectionStatusResponse",
+                f"<DescribeStackDriftDetectionStatusResult>{body}"
+                "</DescribeStackDriftDetectionStatusResult>")
+
+
+def _detect_stack_resource_drift(params):
+    stack, err = _drift_target(_p(params, "StackName"))
+    if err:
+        return err
+    logical_id = _p(params, "LogicalResourceId")
+    if not logical_id:
+        return _error("ValidationError", "LogicalResourceId is required")
+    record = stack.get("_resources", {}).get(logical_id)
+    if not record:
+        return _error("ValidationError",
+                      f"Resource [{logical_id}] does not exist in stack [{stack['StackName']}]")
+    rtype = record.get("ResourceType", "")
+    if not _drift.supports_drift(rtype):
+        # "Resources that don't currently support drift detection can't be checked."
+        return _error("ValidationError",
+                      f"Drift detection is not supported for resource type [{rtype}]")
+    timestamp = now_iso()
+    drift = _drift.detect_resource_drift(stack, logical_id, record, timestamp)
+    _drift.record_resource_drift(record, drift)
+    # The stack's LastCheckTimestamp covers a check of any of its resources.
+    info = stack.setdefault("DriftInformation", {"StackDriftStatus": "NOT_CHECKED"})
+    info["LastCheckTimestamp"] = timestamp
+    return _xml(200, "DetectStackResourceDriftResponse",
+                "<DetectStackResourceDriftResult><StackResourceDrift>"
+                f"{_stack_resource_drift_xml(drift)}"
+                "</StackResourceDrift></DetectStackResourceDriftResult>")
+
+
+def _describe_stack_resource_drifts(params):
+    stack_name = _p(params, "StackName")
+    if not stack_name:
+        return _error("ValidationError", "StackName is required")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    filters = _extract_string_members(params, "StackResourceDriftStatusFilters")
+    bad = [f for f in filters if f not in _drift.RESOURCE_DRIFT_STATUSES]
+    if bad:
+        return _error(
+            "ValidationError",
+            f"1 validation error detected: Value '[{', '.join(filters)}]' at "
+            "'stackResourceDriftStatusFilters' failed to satisfy constraint: Member "
+            "must satisfy enum value set: [" + ", ".join(_drift.RESOURCE_DRIFT_STATUSES) + "]")
+    page_size = 100
+    max_results = _p(params, "MaxResults")
+    if max_results:
+        if not max_results.isdigit() or not 1 <= int(max_results) <= 100:
+            return _error(
+                "ValidationError",
+                f"1 validation error detected: Value '{max_results}' at 'maxResults' "
+                "failed to satisfy constraint: Member must have value between 1 and 100")
+        page_size = int(max_results)
+    # Only the resources that were checked are listed (API reference).
+    drifts = [
+        res["_drift"] for res in stack.get("_resources", {}).values()
+        if res.get("_drift")
+        and (not filters or res["_drift"]["StackResourceDriftStatus"] in filters)
+    ]
+    drifts, next_token_xml, err = _page(drifts, params, "DescribeStackResourceDrifts",
+                                        page_size)
+    if err:
+        return err
+    members = "".join(f"<member>{_stack_resource_drift_xml(d)}</member>" for d in drifts)
+    return _xml(200, "DescribeStackResourceDriftsResponse",
+                "<DescribeStackResourceDriftsResult>"
+                f"<StackResourceDrifts>{members}</StackResourceDrifts>"
+                f"{next_token_xml}</DescribeStackResourceDriftsResult>")
 
 
 # --- SignalResource ---
@@ -1353,5 +1721,10 @@ _ACTION_HANDLERS = {
     "GetStackPolicy": _get_stack_policy,
     "CancelUpdateStack": _cancel_update_stack,
     "ContinueUpdateRollback": _continue_update_rollback,
+    "RollbackStack": _rollback_stack,
     "SignalResource": _signal_resource,
+    "DetectStackDrift": _detect_stack_drift,
+    "DescribeStackDriftDetectionStatus": _describe_stack_drift_detection_status,
+    "DetectStackResourceDrift": _detect_stack_resource_drift,
+    "DescribeStackResourceDrifts": _describe_stack_resource_drifts,
 }
