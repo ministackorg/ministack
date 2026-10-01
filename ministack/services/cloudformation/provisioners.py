@@ -50,6 +50,7 @@ import ministack.services.route53 as _r53
 import ministack.services.s3 as _s3
 import ministack.services.s3tables as _s3tables
 import ministack.services.secretsmanager as _sm
+import ministack.services.servicediscovery as _sd
 import ministack.services.ses as _ses
 import ministack.services.ses_v2 as _ses_v2
 import ministack.services.sns as _sns
@@ -993,6 +994,10 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::SSM::Parameter": ("Tags", "map"),
     "AWS::Scheduler::ScheduleGroup": ("Tags", "list"),
     "AWS::SecretsManager::Secret": ("Tags", "list"),
+    "AWS::ServiceDiscovery::HttpNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::PrivateDnsNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::PublicDnsNamespace": ("Tags", "list"),
+    "AWS::ServiceDiscovery::Service": ("Tags", "list"),
     "AWS::StepFunctions::StateMachine": ("Tags", "list"),
 }
 
@@ -8728,6 +8733,231 @@ def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
 
 
 # ---------------------------------------------------------------------------
+# Cloud Map (AWS::ServiceDiscovery::*)
+#
+# Every handler goes through the servicediscovery module's own functions, so a
+# stack-created namespace gets its Route 53 hosted zone and a service or
+# instance the same record the API writes. Ref, Fn::GetAtt and the
+# replacement properties follow the CloudFormation Template Reference pages for
+# the five types. Tags are "Updates are not supported" on every taggable type,
+# so an update leaves them as created.
+# ---------------------------------------------------------------------------
+
+_SD_NAMESPACE_TYPES = {
+    "HTTP": "AWS::ServiceDiscovery::HttpNamespace",
+    "DNS_PRIVATE": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+    "DNS_PUBLIC": "AWS::ServiceDiscovery::PublicDnsNamespace",
+}
+
+
+def _sd_result(response, what, missing_ok=False):
+    """The parsed body of a servicediscovery call, or ValueError naming
+    ``what``. With ``missing_ok`` a 404 (resource already gone) returns None."""
+    status, _, body = response
+    if status == 404 and missing_ok:
+        return None
+    if status >= 400:
+        raise ValueError(f"{what} failed: {body!r}")
+    return json.loads(body) if body else {}
+
+
+def _sd_soa_ttl(props):
+    return ((((props.get("Properties") or {}).get("DnsProperties") or {})
+             .get("SOA") or {}).get("TTL"))
+
+
+def _sd_namespace_attrs(namespace):
+    attrs = {"Id": namespace["Id"], "Arn": namespace["Arn"]}
+    zone_id = (namespace.get("Properties") or {}).get("DnsProperties", {}).get("HostedZoneId")
+    if zone_id:
+        attrs["HostedZoneId"] = zone_id
+    return attrs
+
+
+def _sd_namespace_create_for(ns_type):
+    """The create handler for one of the three namespace types."""
+    resource_type = _SD_NAMESPACE_TYPES[ns_type]
+
+    def create(logical_id, props, stack_name):
+        name = props.get("Name")
+        if not name:
+            raise ValueError(f"{resource_type} requires Name")
+        namespace, err = _sd._create_namespace_record(
+            name, ns_type, props.get("Description"), props.get("Tags"),
+            _sd_soa_ttl(props) if ns_type != "HTTP" else None,
+        )
+        if err:
+            raise ValueError(f"{resource_type} create failed: {err[2]!r}")
+        return namespace["Id"], _sd_namespace_attrs(namespace)
+
+    return create
+
+
+def _sd_namespace_update_for(ns_type):
+    """The update handler for one of the three namespace types. Name, and Vpc
+    on a private namespace, require replacement; the namespace id is
+    generated, so the new namespace is created before the old one is
+    removed. Description and the SOA TTL change in place."""
+    resource_type = _SD_NAMESPACE_TYPES[ns_type]
+    create = _sd_namespace_create_for(ns_type)
+
+    def update(physical_id, old_props, new_props, stack_name, logical_id=None):
+        namespace = _sd._namespaces.get(physical_id)
+        if (namespace is None or new_props.get("Name") != namespace["Name"]
+                or new_props.get("Vpc") != old_props.get("Vpc")):
+            created = create(logical_id or physical_id, new_props, stack_name)
+            if namespace is not None:
+                _delete_predecessor(_sd_namespace_delete, physical_id, old_props)
+            return created
+        change = {}
+        if "Description" in new_props or "Description" in old_props:
+            change["Description"] = new_props.get("Description")
+        ttl = _sd_soa_ttl(new_props)
+        if ttl is not None and ns_type != "HTTP":
+            change["Properties"] = {"DnsProperties": {"SOA": {"TTL": ttl}}}
+        if change:
+            _sd_result(_sd._update_namespace({"Id": physical_id, "Namespace": change}),
+                       f"{resource_type} update")
+        return physical_id, _sd_namespace_attrs(namespace)
+
+    return update
+
+
+def _sd_namespace_delete(physical_id, props):
+    _sd_result(_sd._delete_namespace({"Id": physical_id}),
+               "AWS::ServiceDiscovery namespace delete", missing_ok=True)
+
+
+# UpdateService's members, each reverting to None when the template drops it.
+_SD_SERVICE_UPDATABLE = {"Description": None, "DnsConfig": None, "HealthCheckConfig": None}
+
+
+def _sd_string_map(values):
+    """A Cloud Map attribute map: string keys and string values."""
+    return {str(k): str(v) for k, v in (values or {}).items()}
+
+
+def _sd_service_name(props, stack_name, logical_id):
+    # Inference: AWS documents no format for a generated service name; a
+    # Cloud Map DNS label is at most 63 characters.
+    return props.get("Name") or _physical_name(stack_name, logical_id, max_len=63)
+
+
+def _sd_service_namespace_id(props):
+    return props.get("NamespaceId") or (props.get("DnsConfig") or {}).get("NamespaceId")
+
+
+def _sd_service_attrs(service):
+    return {"Id": service["Id"], "Arn": service["Arn"], "Name": service["Name"]}
+
+
+def _sd_service_create(logical_id, props, stack_name):
+    payload = {
+        key: props[key]
+        for key in ("Description", "DnsConfig", "HealthCheckConfig", "HealthCheckCustomConfig", "Tags")
+        if key in props
+    }
+    payload["Name"] = _sd_service_name(props, stack_name, logical_id)
+    payload["NamespaceId"] = _sd_service_namespace_id(props)
+    service = _sd_result(_sd._create_service(payload),
+                         "AWS::ServiceDiscovery::Service create")["Service"]
+    if props.get("ServiceAttributes"):
+        _sd_result(_sd._update_service_attributes({
+            "ServiceId": service["Id"],
+            "Attributes": _sd_string_map(props["ServiceAttributes"]),
+        }), "AWS::ServiceDiscovery::Service ServiceAttributes")
+    return service["Id"], _sd_service_attrs(service)
+
+
+def _sd_service_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Name, NamespaceId, Type and HealthCheckCustomConfig require
+    replacement; the service id is generated, so the new service is created
+    before the old one is removed. Description, DnsConfig, HealthCheckConfig
+    and ServiceAttributes change in place."""
+    logical_id = logical_id or physical_id
+    service = _sd._services.get(physical_id)
+    if (service is None
+            or _sd_service_name(new_props, stack_name, logical_id) != service["Name"]
+            or _sd_service_namespace_id(new_props) != service["NamespaceId"]
+            or new_props.get("Type") != old_props.get("Type")
+            or new_props.get("HealthCheckCustomConfig") != old_props.get("HealthCheckCustomConfig")):
+        created = _sd_service_create(logical_id, new_props, stack_name)
+        if service is not None:
+            _delete_predecessor(_sd_service_delete, physical_id, old_props)
+        return created
+    change = _declared_or_default(old_props, new_props, _SD_SERVICE_UPDATABLE)
+    if change:
+        _sd_result(_sd._update_service({"Id": physical_id, "Service": change}),
+                   "AWS::ServiceDiscovery::Service update")
+    old_attrs = _sd_string_map(old_props.get("ServiceAttributes"))
+    new_attrs = _sd_string_map(new_props.get("ServiceAttributes"))
+    dropped = sorted(old_attrs.keys() - new_attrs.keys())
+    if dropped:
+        _sd_result(_sd._delete_service_attributes({"ServiceId": physical_id, "Attributes": dropped}),
+                   "AWS::ServiceDiscovery::Service ServiceAttributes")
+    if new_attrs and new_attrs != old_attrs:
+        _sd_result(_sd._update_service_attributes({"ServiceId": physical_id, "Attributes": new_attrs}),
+                   "AWS::ServiceDiscovery::Service ServiceAttributes")
+    return physical_id, _sd_service_attrs(service)
+
+
+def _sd_service_delete(physical_id, props):
+    _sd_result(_sd._delete_service({"Id": physical_id}),
+               "AWS::ServiceDiscovery::Service delete", missing_ok=True)
+
+
+def _sd_instance_id(props, stack_name, logical_id):
+    # Inference: AWS documents no format for a generated instance id.
+    return props.get("InstanceId") or _physical_name(stack_name, logical_id, max_len=64)
+
+
+def _sd_register_instance(instance_id, props):
+    _sd_result(_sd._register_instance({
+        "ServiceId": props.get("ServiceId", ""),
+        "InstanceId": instance_id,
+        "Attributes": _sd_string_map(props.get("InstanceAttributes")),
+    }), "AWS::ServiceDiscovery::Instance register")
+
+
+def _sd_instance_create(logical_id, props, stack_name):
+    """Register the instance. An id already registered in the service is
+    refused, so a template cannot take over an instance registered outside
+    the stack (inference: RegisterInstance upserts, and AWS documents no
+    CloudFormation behaviour for an existing id)."""
+    instance_id = _sd_instance_id(props, stack_name, logical_id)
+    service_id = props.get("ServiceId", "")
+    if instance_id in _sd._instances.get(service_id, {}):
+        raise ValueError(
+            f"AWS::ServiceDiscovery::Instance {instance_id} is already registered "
+            f"in service {service_id}"
+        )
+    _sd_register_instance(instance_id, props)
+    return instance_id, {}
+
+
+def _sd_instance_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """InstanceId and ServiceId require replacement. A ServiceId change keeps
+    a user-chosen InstanceId, so the predecessor delete is queued even when
+    the physical id is unchanged; the engine treats that as a replacement.
+    InstanceAttributes re-register the instance in place."""
+    logical_id = logical_id or physical_id
+    instance_id = _sd_instance_id(new_props, stack_name, logical_id)
+    if instance_id != physical_id or new_props.get("ServiceId") != old_props.get("ServiceId"):
+        created = _sd_instance_create(logical_id, new_props, stack_name)
+        _delete_predecessor(_sd_instance_delete, physical_id, old_props)
+        return created
+    _sd_register_instance(physical_id, new_props)
+    return physical_id, {}
+
+
+def _sd_instance_delete(physical_id, props):
+    _sd_result(_sd._deregister_instance({
+        "ServiceId": props.get("ServiceId", ""),
+        "InstanceId": physical_id,
+    }), "AWS::ServiceDiscovery::Instance deregister", missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Route53 HostedZone
 # ---------------------------------------------------------------------------
 
@@ -11840,6 +12070,36 @@ _RESOURCE_HANDLERS = {
         "delete": _r53_hosted_zone_delete,
     },
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
+    "AWS::ServiceDiscovery::HttpNamespace": {
+        "create": _sd_namespace_create_for("HTTP"),
+        "update": _sd_namespace_update_for("HTTP"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::PrivateDnsNamespace": {
+        "create": _sd_namespace_create_for("DNS_PRIVATE"),
+        "update": _sd_namespace_update_for("DNS_PRIVATE"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::PublicDnsNamespace": {
+        "create": _sd_namespace_create_for("DNS_PUBLIC"),
+        "update": _sd_namespace_update_for("DNS_PUBLIC"),
+        "update_with_logical_id": True,
+        "delete": _sd_namespace_delete,
+    },
+    "AWS::ServiceDiscovery::Service": {
+        "create": _sd_service_create,
+        "update": _sd_service_update,
+        "update_with_logical_id": True,
+        "delete": _sd_service_delete,
+    },
+    "AWS::ServiceDiscovery::Instance": {
+        "create": _sd_instance_create,
+        "update": _sd_instance_update,
+        "update_with_logical_id": True,
+        "delete": _sd_instance_delete,
+    },
     "AWS::ApiGatewayV2::Api": {
         "create": _apigw_v2_api_create,
         "update": _apigw_v2_api_update,

@@ -6286,6 +6286,315 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
 
 
 # ---------------------------------------------------------------------------
+# AWS::ServiceDiscovery::* (#1876). Ref, Fn::GetAtt and replacement properties
+# follow the CloudFormation Template Reference pages for the five types.
+# ---------------------------------------------------------------------------
+
+
+def _sd_physical_ids(cfn, stack_name):
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    return {r["LogicalResourceId"]: r["PhysicalResourceId"] for r in resources}
+
+
+def _sd_stack_template(uid, ns_name=None, ns_description="ns", soa_ttl=100,
+                       svc_description="svc", dns_ttl=60, svc_attributes=None,
+                       health_threshold=1, instance_id=None, instance_ip="10.0.0.1"):
+    """A private namespace, a service in it and one instance in the service."""
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Ns": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {
+                    "Name": ns_name or f"sd{uid}.local",
+                    "Vpc": "vpc-12345",
+                    "Description": ns_description,
+                    "Properties": {"DnsProperties": {"SOA": {"TTL": soa_ttl}}},
+                },
+            },
+            "Svc": {
+                "Type": "AWS::ServiceDiscovery::Service",
+                "Properties": {
+                    "Name": "api",
+                    "Description": svc_description,
+                    "DnsConfig": {
+                        "NamespaceId": {"Fn::GetAtt": ["Ns", "Id"]},
+                        "DnsRecords": [{"Type": "A", "TTL": dns_ttl}],
+                        "RoutingPolicy": "MULTIVALUE",
+                    },
+                    "HealthCheckCustomConfig": {"FailureThreshold": health_threshold},
+                    "ServiceAttributes": svc_attributes or {"team": "a"},
+                },
+            },
+            "Inst": {
+                "Type": "AWS::ServiceDiscovery::Instance",
+                "Properties": {
+                    "ServiceId": {"Ref": "Svc"},
+                    "InstanceId": instance_id or "inst-1",
+                    "InstanceAttributes": {"AWS_INSTANCE_IPV4": instance_ip, "port": 8080},
+                },
+            },
+        },
+    }
+
+
+def test_cfn_servicediscovery_validate_template(cfn):
+    template = _sd_stack_template(_uuid_mod.uuid4().hex[:8])
+    template["Resources"]["Http"] = {
+        "Type": "AWS::ServiceDiscovery::HttpNamespace",
+        "Properties": {"Name": "http-ns"},
+    }
+    template["Resources"]["Pub"] = {
+        "Type": "AWS::ServiceDiscovery::PublicDnsNamespace",
+        "Properties": {"Name": "pub.example.com"},
+    }
+    cfn.validate_template(TemplateBody=json.dumps(template))
+
+
+def test_cfn_servicediscovery_namespaces_create(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-ns-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Http": {
+                "Type": "AWS::ServiceDiscovery::HttpNamespace",
+                "Properties": {"Name": f"http-{uid}", "Description": "http"},
+            },
+            "Priv": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {"Name": f"priv{uid}.local", "Vpc": "vpc-12345"},
+            },
+            "Pub": {
+                "Type": "AWS::ServiceDiscovery::PublicDnsNamespace",
+                "Properties": {"Name": f"pub{uid}.example.com"},
+            },
+        },
+        "Outputs": {
+            "HttpRef": {"Value": {"Ref": "Http"}},
+            "HttpArn": {"Value": {"Fn::GetAtt": ["Http", "Arn"]}},
+            "PrivId": {"Value": {"Fn::GetAtt": ["Priv", "Id"]}},
+            "PrivZone": {"Value": {"Fn::GetAtt": ["Priv", "HostedZoneId"]}},
+            "PubRef": {"Value": {"Ref": "Pub"}},
+            "PubZone": {"Value": {"Fn::GetAtt": ["Pub", "HostedZoneId"]}},
+        },
+    }
+    cfn.create_stack(
+        StackName=stack_name, TemplateBody=json.dumps(template),
+        Tags=[{"Key": "env", "Value": "test"}],
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    http = sd.get_namespace(Id=outputs["HttpRef"])["Namespace"]
+    assert http["Type"] == "HTTP"
+    assert http["Arn"] == outputs["HttpArn"]
+    assert http["Description"] == "http"
+    assert "DnsProperties" not in http["Properties"]
+
+    priv = sd.get_namespace(Id=outputs["PrivId"])["Namespace"]
+    assert priv["Type"] == "DNS_PRIVATE"
+    assert priv["Properties"]["DnsProperties"]["HostedZoneId"] == outputs["PrivZone"]
+    assert r53.get_hosted_zone(Id=outputs["PrivZone"])["HostedZone"]["Config"]["PrivateZone"] is True
+
+    pub = sd.get_namespace(Id=outputs["PubRef"])["Namespace"]
+    assert pub["Type"] == "DNS_PUBLIC"
+    assert r53.get_hosted_zone(Id=outputs["PubZone"])["HostedZone"]["Config"]["PrivateZone"] is False
+
+    tags = sd.list_tags_for_resource(ResourceARN=http["Arn"])["Tags"]
+    assert {"Key": "env", "Value": "test"} in tags
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_service_and_instance(cfn, sd):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-svc-{uid}"
+    template = _sd_stack_template(uid)
+    template["Outputs"] = {
+        "SvcRef": {"Value": {"Ref": "Svc"}},
+        "SvcArn": {"Value": {"Fn::GetAtt": ["Svc", "Arn"]}},
+        "SvcName": {"Value": {"Fn::GetAtt": ["Svc", "Name"]}},
+        "InstRef": {"Value": {"Ref": "Inst"}},
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    svc = sd.get_service(Id=outputs["SvcRef"])["Service"]
+    assert svc["Arn"] == outputs["SvcArn"]
+    assert svc["Name"] == outputs["SvcName"] == "api"
+    assert svc["NamespaceId"] == _sd_physical_ids(cfn, stack_name)["Ns"]
+    attrs = sd.get_service_attributes(ServiceId=svc["Id"])["ServiceAttributes"]["Attributes"]
+    assert attrs == {"team": "a"}
+
+    assert outputs["InstRef"] == "inst-1"
+    found = sd.discover_instances(NamespaceName=f"sd{uid}.local", ServiceName="api")["Instances"]
+    assert [i["InstanceId"] for i in found] == ["inst-1"]
+    assert found[0]["Attributes"] == {"AWS_INSTANCE_IPV4": "10.0.0.1", "port": "8080"}
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_update_in_place(cfn, sd):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-upd-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    before = _sd_physical_ids(cfn, stack_name)
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, ns_description="ns2", soa_ttl=60, svc_description="svc2", dns_ttl=30,
+        svc_attributes={"owner": "b"}, instance_ip="10.0.0.2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _sd_physical_ids(cfn, stack_name) == before
+
+    ns = sd.get_namespace(Id=before["Ns"])["Namespace"]
+    assert ns["Description"] == "ns2"
+    assert ns["Properties"]["DnsProperties"]["SOA"]["TTL"] == 60
+
+    svc = sd.get_service(Id=before["Svc"])["Service"]
+    assert svc["Description"] == "svc2"
+    assert svc["DnsConfig"]["DnsRecords"] == [{"Type": "A", "TTL": 30}]
+    attrs = sd.get_service_attributes(ServiceId=before["Svc"])["ServiceAttributes"]["Attributes"]
+    assert attrs == {"owner": "b"}
+
+    inst = sd.get_instance(ServiceId=before["Svc"], InstanceId="inst-1")["Instance"]
+    assert inst["Attributes"]["AWS_INSTANCE_IPV4"] == "10.0.0.2"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_update_replacement(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-repl-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    first = _sd_physical_ids(cfn, stack_name)
+
+    # HealthCheckCustomConfig and InstanceId both require replacement.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, health_threshold=2, instance_id="inst-2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    second = _sd_physical_ids(cfn, stack_name)
+    assert second["Ns"] == first["Ns"]
+    assert second["Svc"] != first["Svc"]
+    assert second["Inst"] == "inst-2"
+    with pytest.raises(ClientError) as exc:
+        sd.get_service(Id=first["Svc"])
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFound"
+    svc = sd.get_service(Id=second["Svc"])["Service"]
+    assert svc["HealthCheckCustomConfig"] == {"FailureThreshold": 2}
+    instances = sd.list_instances(ServiceId=second["Svc"])["Instances"]
+    assert [i["Id"] for i in instances] == ["inst-2"]
+
+    # A new namespace Name replaces the namespace, and through Ref the
+    # service and the instance (same InstanceId, new ServiceId).
+    old_zone = sd.get_namespace(Id=first["Ns"])["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(
+        uid, ns_name=f"sd{uid}-b.local", health_threshold=2, instance_id="inst-2",
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    third = _sd_physical_ids(cfn, stack_name)
+    assert third["Ns"] != first["Ns"]
+    assert third["Svc"] != second["Svc"]
+    assert third["Inst"] == "inst-2"
+    with pytest.raises(ClientError) as exc:
+        sd.get_namespace(Id=first["Ns"])
+    assert exc.value.response["Error"]["Code"] == "NamespaceNotFound"
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=old_zone)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+    assert sd.get_service(Id=third["Svc"])["Service"]["NamespaceId"] == third["Ns"]
+    found = sd.discover_instances(NamespaceName=f"sd{uid}-b.local", ServiceName="api")["Instances"]
+    assert [i["InstanceId"] for i in found] == ["inst-2"]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_servicediscovery_delete_stack(cfn, sd, r53):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-del-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sd_stack_template(uid)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    ids = _sd_physical_ids(cfn, stack_name)
+    zone_id = sd.get_namespace(Id=ids["Ns"])["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    with pytest.raises(ClientError) as exc:
+        sd.get_instance(ServiceId=ids["Svc"], InstanceId=ids["Inst"])
+    assert exc.value.response["Error"]["Code"] == "InstanceNotFound"
+    with pytest.raises(ClientError) as exc:
+        sd.get_service(Id=ids["Svc"])
+    assert exc.value.response["Error"]["Code"] == "ServiceNotFound"
+    with pytest.raises(ClientError) as exc:
+        sd.get_namespace(Id=ids["Ns"])
+    assert exc.value.response["Error"]["Code"] == "NamespaceNotFound"
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchHostedZone"
+
+
+def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
+    """The shape the CDK ECS constructs emit for a Cloud Map namespace and a
+    service with cloudMapOptions (taken from the construct library, not a
+    synthesized app): the namespace's Vpc comes from a VPC in the stack and
+    the service has no Name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sd-cdk-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.0.0.0/16"}},
+            "ClusterDefaultServiceDiscoveryNamespace": {
+                "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+                "Properties": {"Name": f"cdk{uid}.local", "Vpc": {"Ref": "Vpc"}},
+            },
+            "ServiceCloudmapService": {
+                "Type": "AWS::ServiceDiscovery::Service",
+                "Properties": {
+                    "DnsConfig": {
+                        "DnsRecords": [{"TTL": 60, "Type": "A"}],
+                        "NamespaceId": {"Fn::GetAtt": ["ClusterDefaultServiceDiscoveryNamespace", "Id"]},
+                        "RoutingPolicy": "MULTIVALUE",
+                    },
+                    "HealthCheckCustomConfig": {"FailureThreshold": 1},
+                    "NamespaceId": {"Fn::GetAtt": ["ClusterDefaultServiceDiscoveryNamespace", "Id"]},
+                },
+            },
+        },
+        "Outputs": {
+            "SvcName": {"Value": {"Fn::GetAtt": ["ServiceCloudmapService", "Name"]}},
+            "SvcArn": {"Value": {"Fn::GetAtt": ["ServiceCloudmapService", "Arn"]}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    ids = _sd_physical_ids(cfn, stack_name)
+
+    svc = sd.get_service(Id=ids["ServiceCloudmapService"])["Service"]
+    assert svc["Name"] == outputs["SvcName"]
+    assert svc["Arn"] == outputs["SvcArn"]
+    assert svc["NamespaceId"] == ids["ClusterDefaultServiceDiscoveryNamespace"]
+    assert svc["HealthCheckCustomConfig"] == {"FailureThreshold": 1}
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+# ---------------------------------------------------------------------------
 # Update handlers, batch 5: the twelve types of #1601 C1 whose stack update
 # fell through to the create handler and lost what the resource was holding.
 # ---------------------------------------------------------------------------

@@ -551,6 +551,11 @@ subnet = ec2.create_subnet(
 | `AWS::StepFunctions::StateMachine` | State machine ARN | Arn, Name |
 | `AWS::Route53::HostedZone` | Zone ID | Id, NameServers |
 | `AWS::Route53::RecordSet` | Record FQDN (trailing dot) | Name |
+| `AWS::ServiceDiscovery::HttpNamespace` | Namespace ID | Arn, Id |
+| `AWS::ServiceDiscovery::PrivateDnsNamespace` | Namespace ID | Arn, HostedZoneId, Id |
+| `AWS::ServiceDiscovery::PublicDnsNamespace` | Namespace ID | Arn, HostedZoneId, Id |
+| `AWS::ServiceDiscovery::Service` | Service ID | Arn, Id, Name |
+| `AWS::ServiceDiscovery::Instance` | Instance ID | — |
 | `AWS::ApiGatewayV2::Api` | API ID | ApiId, ApiEndpoint |
 | `AWS::ApiGatewayV2::Stage` | Stage ID | StageName |
 | `AWS::ApiGatewayV2::Integration` | Integration ID | IntegrationId |
