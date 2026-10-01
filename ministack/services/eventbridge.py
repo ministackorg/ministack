@@ -976,7 +976,8 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
-def _put_events(data):
+def _put_events(data, allow_aws_source=False):
+    """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -995,6 +996,14 @@ def _put_events(data):
         if bus_error:
             code, message = bus_error
             results.append({"ErrorCode": code, "ErrorMessage": message})
+            failed += 1
+            continue
+        source = entry.get("Source")
+        if not allow_aws_source and isinstance(source, str) and source.startswith("aws."):
+            results.append({
+                "ErrorCode": "NotAuthorizedForSourceException",
+                "ErrorMessage": "Not authorized for the source.",
+            })
             failed += 1
             continue
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds

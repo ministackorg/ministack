@@ -1009,7 +1009,8 @@ def test_apigw_execute_lambda_proxy_binary_request_body(apigw, lam):
     lam.delete_function(FunctionName=fname)
 
 def test_apigw_execute_no_route(apigw):
-    """execute-api returns 404 when no matching route exists."""
+    """execute-api returns 404 when no matching route exists, with AWS's
+    exact compact-JSON body (no space after the colon)."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -1023,6 +1024,7 @@ def test_apigw_execute_no_route(apigw):
         assert False, "Expected 404"
     except _urlerr.HTTPError as e:
         assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
