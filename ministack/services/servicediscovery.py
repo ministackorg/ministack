@@ -353,6 +353,9 @@ def _delete_namespace(data):
         return error_response_json("InvalidInput", "Id is required", 400)
     if ns_id not in _namespaces:
         return error_response_json("NamespaceNotFound", "Namespace not found", 404)
+    if any(s.get("NamespaceId") == ns_id for s in _services.values()):
+        return error_response_json(
+            "ResourceInUse", "Namespace has associated services; delete the services before deleting the namespace", 400)
 
     namespace = _namespaces.pop(ns_id)
     _resource_tags.pop(namespace.get("Arn", ""), None)

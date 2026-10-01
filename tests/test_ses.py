@@ -236,6 +236,41 @@ def test_ses_v2_configuration_set_crud(sesv2):
     lst2 = sesv2.list_configuration_sets()
     assert "my-cfg-set" not in lst2["ConfigurationSets"]
 
+def test_ses_v2_list_routes_old_and_new(sesv2):
+    """SDKs since botocore 1.43.106 list with POST /v2/email/list-identities and
+    /list-configuration-sets (paging and Filter in the body); older ones GET."""
+    import urllib.request
+
+    from conftest import ENDPOINT
+    uid = _uuid_mod.uuid4().hex[:8]
+    names = [f"list-{uid}-{i}.example.com" for i in range(3)] + [f"user-{uid}@example.com"]
+    for name in names:
+        sesv2.create_email_identity(EmailIdentity=name)
+    sesv2.create_configuration_set(ConfigurationSetName=f"cfg-{uid}")
+    try:
+        domains = sesv2.list_email_identities(
+            Filter={"IDENTITY_NAME_CONTAINS": uid, "IDENTITY_TYPE": "DOMAIN"}, PageSize=2)
+        first = [e["IdentityName"] for e in domains["EmailIdentities"]]
+        rest = sesv2.list_email_identities(
+            Filter={"IDENTITY_NAME_CONTAINS": uid, "IDENTITY_TYPE": "DOMAIN"},
+            PageSize=2, NextToken=domains["NextToken"])
+        assert sorted(first + [e["IdentityName"] for e in rest["EmailIdentities"]]) == names[:3]
+        assert "NextToken" not in rest
+        assert sesv2.list_configuration_sets(
+            Filter={"CONFIGURATION_SET_NAME_CONTAINS": uid})["ConfigurationSets"] == [f"cfg-{uid}"]
+
+        auth = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20261001/us-east-1/ses/aws4_request"}
+        for path, key, expected in (("/v2/email/identities", "EmailIdentities", names[0]),
+                                    ("/v2/email/configuration-sets", "ConfigurationSets", f"cfg-{uid}")):
+            with urllib.request.urlopen(urllib.request.Request(ENDPOINT + path, headers=auth)) as r:
+                listed = json.loads(r.read())[key]
+            assert expected in [i["IdentityName"] if isinstance(i, dict) else i for i in listed]
+    finally:
+        for name in names:
+            sesv2.delete_email_identity(EmailIdentity=name)
+        sesv2.delete_configuration_set(ConfigurationSetName=f"cfg-{uid}")
+
+
 def test_ses_v2_get_account(sesv2):
     resp = sesv2.get_account()
     assert resp["SendingEnabled"] is True

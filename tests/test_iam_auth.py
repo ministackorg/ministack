@@ -2876,6 +2876,20 @@ class TestAccessDeniedResponse:
                                           message="Token expired")
         assert b"ExpiredTokenException" in b
 
+    def test_ssm_denial_shape_applies_to_every_ssm_action(self):
+        """Not only the tag actions: AWS answers e.g. GetParameters denials with
+        HTTP 400 and the resource in the message."""
+        from ministack.core.iam_actions import access_denied_response
+
+        arn = "arn:aws:ssm:us-east-1:123456789012:parameter/app/db"
+        status, headers, body = access_denied_response(
+            "ssm", "ssm:GetParameter", "arn:aws:iam::123456789012:user/a", "r1", resource_arn=arn)
+        assert status == 400
+        assert headers["Content-Type"] == "application/x-amz-json-1.1"
+        denied = json.loads(body)
+        assert denied["__type"] == "AccessDeniedException"
+        assert f"ssm:GetParameter on resource: {arn} because" in denied["Message"]
+
     @pytest.mark.parametrize("action", (
         "AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource",
     ))

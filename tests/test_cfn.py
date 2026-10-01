@@ -2476,6 +2476,23 @@ def test_cfn_stack_and_change_set_report_their_capabilities(cfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_empty_capabilities_list_is_accepted(cfn):
+    """botocore sends an empty Capabilities list as a bare ``Capabilities=``,
+    which is what ``aws cloudformation deploy`` does without --capabilities."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = json.dumps({"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}})
+    stack_name, cs_stack = f"cfn-caps-empty-{uid}", f"cfn-caps-empty-cs-{uid}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template, Capabilities=[])
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_change_set(StackName=cs_stack, ChangeSetName="cs", ChangeSetType="CREATE",
+                              TemplateBody=template, Capabilities=[])
+        assert _wait_change_set(cfn, cs_stack, "cs")["Status"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_cfn_test_stack(cfn, cs_stack)
+
+
 def test_cfn_unknown_capability_is_refused(cfn):
     """Capabilities is an enum of three values, so a fourth is a parameter
     validation error rather than something the stack silently keeps, on
@@ -8554,6 +8571,62 @@ def test_cfn_codebuild_project_basic(cfn, codebuild):
     _wait_stack(cfn, "cfn-cb-t01")
     result = codebuild.batch_get_projects(names=["cfn-cb-t01"])
     assert len(result["projects"]) == 0
+
+
+def test_cfn_codebuild_project_uses_api_member_names(cfn, codebuild):
+    """Source, Artifacts and Environment are stored with the CodeBuild API's
+    member names, on create and on update: the template's BuildSpec is the
+    API's buildspec, and the other PascalCase members are camelCase."""
+    buildspec = "version: 0.2\nphases:\n  build:\n    commands:\n      - echo hi\n"
+
+    def template(image):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Project": {
+                    "Type": "AWS::CodeBuild::Project",
+                    "Properties": {
+                        "Name": "cfn-cb-api-names",
+                        "Source": {"Type": "NO_SOURCE", "BuildSpec": buildspec},
+                        "Artifacts": {"Type": "NO_ARTIFACTS"},
+                        "Environment": {
+                            "Type": "LINUX_CONTAINER",
+                            "Image": image,
+                            "ComputeType": "BUILD_GENERAL1_SMALL",
+                            "PrivilegedMode": True,
+                            "EnvironmentVariables": [
+                                {"Name": "STAGE", "Value": "test", "Type": "PLAINTEXT"},
+                            ],
+                        },
+                        "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                    },
+                }
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-cb-api-names", TemplateBody=template("aws/codebuild/standard:7.0"))
+    try:
+        assert _wait_stack(cfn, "cfn-cb-api-names")["StackStatus"] == "CREATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-api-names"])["projects"][0]
+        assert project["source"]["type"] == "NO_SOURCE"
+        assert project["source"]["buildspec"] == buildspec
+        assert project["artifacts"]["type"] == "NO_ARTIFACTS"
+        assert project["environment"]["type"] == "LINUX_CONTAINER"
+        assert project["environment"]["image"] == "aws/codebuild/standard:7.0"
+        assert project["environment"]["computeType"] == "BUILD_GENERAL1_SMALL"
+        assert project["environment"]["privilegedMode"] is True
+        assert project["environment"]["environmentVariables"] == [
+            {"name": "STAGE", "value": "test", "type": "PLAINTEXT"},
+        ]
+
+        cfn.update_stack(StackName="cfn-cb-api-names", TemplateBody=template("aws/codebuild/standard:6.0"))
+        assert _wait_stack(cfn, "cfn-cb-api-names")["StackStatus"] == "UPDATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-api-names"])["projects"][0]
+        assert project["environment"]["image"] == "aws/codebuild/standard:6.0"
+        assert project["source"]["buildspec"] == buildspec
+    finally:
+        cfn.delete_stack(StackName="cfn-cb-api-names")
+        _wait_stack(cfn, "cfn-cb-api-names")
 
 
 def test_cfn_codebuild_project_auto_name(cfn, codebuild):
@@ -17941,6 +18014,32 @@ def _cfn_appsync_members_template(name, api_props, oidc):
     })
 
 
+def test_cfn_ecs_task_definition_keeps_omitted_fields_omitted(cfn, ecs):
+    """Cpu, Memory and RequiresCompatibilities are stored only when the template sets them."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-td-{suffix}"
+    family = f"cfn-ecs-td-{suffix}"
+    container = [{"Name": "app", "Image": "nginx:latest", "Memory": 128}]
+    template = json.dumps({"Resources": {
+        "Bare": {"Type": "AWS::ECS::TaskDefinition",
+                 "Properties": {"Family": family, "ContainerDefinitions": container}},
+        "Sized": {"Type": "AWS::ECS::TaskDefinition",
+                  "Properties": {"Family": f"{family}-f", "ContainerDefinitions": container,
+                                 "Cpu": "512", "Memory": "1024",
+                                 "RequiresCompatibilities": ["FARGATE"], "NetworkMode": "awsvpc"}},
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        bare = ecs.describe_task_definition(taskDefinition=family)["taskDefinition"]
+        assert not {"cpu", "memory", "requiresCompatibilities"} & set(bare)
+        sized = ecs.describe_task_definition(taskDefinition=f"{family}-f")["taskDefinition"]
+        assert (sized["cpu"], sized["memory"], sized["requiresCompatibilities"]) == (
+            "512", "1024", ["FARGATE"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
     """ClusterSettings, DefaultCapacityProviderStrategy and Configuration read back in camelCase."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -18016,6 +18115,72 @@ def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
         assert after["activeServicesCount"] == 1
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ecs_service_network_and_load_balancers_read_back_in_the_api_shape(cfn, ecs, elbv2):
+    """NetworkConfiguration and LoadBalancers read back in camelCase, on create and on update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-svc-shape-{suffix}"
+    tg_arn = elbv2.create_target_group(
+        Name=f"cfn-ecs-shape-{suffix}", Protocol="HTTP", Port=80,
+        VpcId="vpc-00000000", TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+
+    def template(public):
+        return json.dumps({
+            "Resources": {
+                "Cluster": {"Type": "AWS::ECS::Cluster",
+                            "Properties": {"ClusterName": stack_name}},
+                "TD": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": stack_name,
+                        "NetworkMode": "awsvpc",
+                        "ContainerDefinitions": [{"Name": "app", "Image": "nginx", "Memory": 128}],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": stack_name,
+                        "TaskDefinition": {"Ref": "TD"},
+                        "DesiredCount": 0,
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {
+                            "Subnets": ["subnet-0a1b2c3d"],
+                            "SecurityGroups": ["sg-0a1b2c3d"],
+                            "AssignPublicIp": public,
+                        }},
+                        "LoadBalancers": [{"TargetGroupArn": tg_arn,
+                                           "ContainerName": "app", "ContainerPort": 80}],
+                    },
+                },
+            },
+        })
+
+    def described():
+        return ecs.describe_services(cluster=stack_name, services=[stack_name])["services"][0]
+
+    def network(public):
+        return {"awsvpcConfiguration": {"subnets": ["subnet-0a1b2c3d"],
+                                        "securityGroups": ["sg-0a1b2c3d"],
+                                        "assignPublicIp": public}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("DISABLED"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        service = described()
+        assert service["networkConfiguration"] == network("DISABLED")
+        assert service["loadBalancers"] == [
+            {"targetGroupArn": tg_arn, "containerName": "app", "containerPort": 80}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ENABLED"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert described()["networkConfiguration"] == network("ENABLED")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
 
 
 # ===========================================================================
@@ -23802,6 +23967,40 @@ def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, i
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
+    """A stack whose thing group still has a child group created outside the
+    stack lands in DELETE_FAILED with the service message and keeps the group;
+    once the child is gone a retried delete removes it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-tg-held-{uid}"
+    parent, child = f"cfn-tg-held-p-{uid}", f"cfn-tg-held-c-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Parent": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parent}}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        iot_client.create_thing_group(thingGroupName=child, parentGroupName=parent)
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert stack["StackStatusReason"] == "The following resource(s) failed to delete: [Parent]."
+        assert (f"Cannot delete thing group : {parent} when there are still child groups attached to it"
+                in _stack_event_reasons(cfn, stack_name))
+        iot_client.describe_thing_group(thingGroupName=parent)
+
+        iot_client.delete_thing_group(thingGroupName=child)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_thing_group(thingGroupName=parent)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            iot_client.delete_thing_group(thingGroupName=child)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
@@ -26022,6 +26221,158 @@ def test_cfn_appconfig_deployment_strategy_update_and_rename(cfn, appconfig_clie
         _delete_cfn_test_stack(cfn, f"cfn-ac-strat-{suffix}")
 
 
+def test_cfn_appconfig_hosted_version_replacement_takes_a_new_number(cfn, appconfig_client):
+    """Every replacement is a new version number, a rolled-back one included."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-hcv-{suffix}"
+
+    def template(content):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "text/plain", "Content": content}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "ProfileId": {"Value": {"Ref": "Profile"}},
+                        "Version": {"Value": {"Ref": "HCV"}}},
+        })
+
+    def update(body):
+        cfn.update_stack(StackName=stack_name, TemplateBody=body)
+        return _wait_stack(cfn, stack_name)["StackStatus"]
+
+    def versions():
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "ConfigurationProfileId": _cfn_output(cfn, stack_name, "ProfileId")}
+        version = int(_cfn_output(cfn, stack_name, "Version"))
+        content = appconfig_client.get_hosted_configuration_version(
+            **ids, VersionNumber=version)["Content"].read()
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        return version, content, [i["VersionNumber"] for i in listed]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert versions() == (1, b"v1", [1])
+        assert update(template("v2")) == "UPDATE_COMPLETE"
+        assert versions() == (2, b"v2", [2])
+        assert update(template("v3")) == "UPDATE_COMPLETE"
+        assert versions() == (3, b"v3", [3]), "the replacement overwrote the live version"
+        assert update(_cfn_with_failing_resource(template("v4"), "HCV")) == "UPDATE_ROLLBACK_COMPLETE"
+        assert versions() == (3, b"v3", [3])
+        assert update(template("v5")) == "UPDATE_COMPLETE"
+        assert versions() == (5, b"v5", [5])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_hosted_version_lock_checks_the_latest_existing_version(cfn, appconfig_client):
+    """LatestVersionNumber must name the highest existing version, not the last issued."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    app = appconfig_client.create_application(Name=f"cfn-ac-lock-{suffix}")
+    ids = {"ApplicationId": app["Id"],
+           "ConfigurationProfileId": appconfig_client.create_configuration_profile(
+               ApplicationId=app["Id"], Name=f"cfn-ac-lock-{suffix}", LocationUri="hosted")["Id"]}
+    for content in (b"v1", b"v2", b"v3"):
+        appconfig_client.create_hosted_configuration_version(
+            **ids, Content=content, ContentType="text/plain")
+    for number in (3, 1):
+        appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=number)
+
+    def create(lock):
+        stack_name = f"cfn-ac-lock{lock}-{suffix}"
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"HCV": {
+            "Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                **ids, "ContentType": "text/plain", "Content": "locked",
+                "LatestVersionNumber": lock}}}}))
+        return stack_name, _wait_stack(cfn, stack_name)["StackStatus"]
+
+    stacks = []
+    try:
+        for lock, status in ((3, "ROLLBACK_COMPLETE"), (2, "CREATE_COMPLETE")):
+            stack_name, actual = create(lock)
+            stacks.append(stack_name)
+            assert actual == status
+        listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+        assert sorted(i["VersionNumber"] for i in listed) == [2, 4]
+    finally:
+        for stack_name in stacks:
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appconfig_client):
+    """A replaced deployment stays listed until its environment is deleted with the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ac-dep-{suffix}"
+
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "App": {"Type": "AWS::AppConfig::Application",
+                        "Properties": {"Name": stack_name}},
+                "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name}},
+                "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "Name": stack_name,
+                    "LocationUri": "hosted"}},
+                "Strategy": {"Type": "AWS::AppConfig::DeploymentStrategy", "Properties": {
+                    "Name": stack_name, "DeploymentDurationInMinutes": 0,
+                    "FinalBakeTimeInMinutes": 0, "GrowthFactor": 100,
+                    "ReplicateTo": "NONE"}},
+                "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                    "ApplicationId": {"Ref": "App"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "ContentType": "application/json", "Content": "{}"}},
+                "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                    "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                    "ConfigurationProfileId": {"Ref": "Profile"},
+                    "DeploymentStrategyId": {"Ref": "Strategy"},
+                    "ConfigurationVersion": {"Ref": "HCV"},
+                    "Description": description, "Tags": [{"Key": "k", "Value": "v"}]}},
+            },
+            "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                        "EnvId": {"Value": {"Ref": "Env"}},
+                        "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+        })
+
+    def deployments():
+        listed = appconfig_client.list_deployments(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"))["Items"]
+        return (int(_cfn_output(cfn, stack_name, "Number")),
+                sorted((i["DeploymentNumber"], i["State"]) for i in listed))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("d1"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert deployments() == (1, [(1, "COMPLETE")])
+        for number, description in ((2, "d2"), (3, "d3")):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(description))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            assert deployments() == (
+                number, [(n, "COMPLETE") for n in range(1, number + 1)])
+        ids = {"ApplicationId": _cfn_output(cfn, stack_name, "AppId"),
+               "EnvironmentId": _cfn_output(cfn, stack_name, "EnvId")}
+        arn = (f"arn:aws:appconfig:us-east-1:000000000000:application/{ids['ApplicationId']}/"
+               f"environment/{ids['EnvironmentId']}/deployment/3")
+        assert appconfig_client.list_tags_for_resource(ResourceArn=arn)["Tags"]["k"] == "v"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    for call in (lambda: appconfig_client.get_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.stop_deployment(**ids, DeploymentNumber=3),
+                 lambda: appconfig_client.list_tags_for_resource(ResourceArn=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
     """A GraphQL API update keeps its id and its data sources."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -27861,6 +28212,23 @@ def _cfn_igw_vpcs(ec2, igw_id):
         InternetGatewayIds=[igw_id])["InternetGateways"][0].get("Attachments", [])]
 
 
+def test_cfn_ec2_gateway_attachment_keeps_the_first_vpc(cfn, ec2):
+    """An internet gateway attaches to one VPC at a time. CloudFormation ignores the
+    Resource.AlreadyAssociated of a second attachment, so the gateway keeps its first VPC."""
+    stack_name = f"cfn-gwa-two-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.loads(_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+    template["Resources"]["Attach2"] = {
+        "Type": "AWS::EC2::VPCGatewayAttachment", "DependsOn": "Attach",
+        "Properties": {"VpcId": {"Ref": "Vpc2"}, "InternetGatewayId": {"Ref": "Igw1"}}}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1"))
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_gateway_attachment_swaps_the_internet_gateway_in_place(cfn, ec2):
     """A new InternetGatewayId moves the attachment under the same IGW|vpc id."""
     stack_name = f"cfn-gwa-igw-{_uuid_mod.uuid4().hex[:8]}"
@@ -29346,3 +29714,751 @@ def test_describe_stack_resource_drifts_pagination(cfn):
         assert exc.value.response["Error"]["Code"] == "ValidationError"
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+# ===========================================================================
+# AWS::Glue::* resource types
+# ===========================================================================
+
+_GLUE_ROLE = "arn:aws:iam::000000000000:role/glue-cfn-role"
+
+
+def _glue_create(cfn, name, template):
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+
+def _glue_update(cfn, name, template):
+    cfn.update_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+
+def _glue_outputs(cfn, name):
+    stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def _glue_not_found(call):
+    with pytest.raises(ClientError) as exc:
+        call()
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+def _glue_arn(sts, kind, name):
+    account = sts.get_caller_identity()["Account"]
+    return f"arn:aws:glue:us-east-1:{account}:{kind}/{name}"
+
+
+def _glue_data_lake(s, *, table_description="raw events", crawler_schedule=True,
+               job_tags=True, trigger_description="nightly", partition_location="p1"):
+    crawler = {
+        "Name": f"crawler-{s}",
+        "Role": _GLUE_ROLE,
+        "DatabaseName": {"Ref": "Db"},
+        "Targets": {"S3Targets": [{"Path": f"s3://lake-{s}/events/"}]},
+        "Tags": {"team": "data"},
+    }
+    if crawler_schedule:
+        crawler["Schedule"] = {"ScheduleExpression": "cron(0 2 * * ? *)"}
+    job = {
+        "Name": f"job-{s}",
+        "Role": _GLUE_ROLE,
+        "Command": {"Name": "pythonshell", "ScriptLocation": f"s3://lake-{s}/etl.py"},
+        "DefaultArguments": {"--stage": "dev"},
+        "MaxRetries": 1,
+    }
+    if job_tags:
+        job["Tags"] = [{"Key": "owner", "Value": "etl"}]
+    return {
+        "Resources": {
+            "Db": {
+                "Type": "AWS::Glue::Database",
+                "Properties": {
+                    "CatalogId": {"Ref": "AWS::AccountId"},
+                    "DatabaseInput": {"Name": f"lake_{s}", "Description": "data lake"},
+                },
+            },
+            "Events": {
+                "Type": "AWS::Glue::Table",
+                "Properties": {
+                    "CatalogId": {"Ref": "AWS::AccountId"},
+                    "DatabaseName": {"Ref": "Db"},
+                    "TableInput": {
+                        "Name": "events",
+                        "Description": table_description,
+                        "TableType": "EXTERNAL_TABLE",
+                        "PartitionKeys": [{"Name": "dt", "Type": "string"}],
+                        "StorageDescriptor": {
+                            "Columns": [{"Name": "id", "Type": "string"}],
+                            "Location": f"s3://lake-{s}/events/",
+                        },
+                    },
+                },
+            },
+            "Day": {
+                "Type": "AWS::Glue::Partition",
+                "Properties": {
+                    "CatalogId": {"Ref": "AWS::AccountId"},
+                    "DatabaseName": {"Ref": "Db"},
+                    "TableName": {"Ref": "Events"},
+                    "PartitionInput": {
+                        "Values": ["2026-10-01"],
+                        "StorageDescriptor": {"Location": f"s3://lake-{s}/events/{partition_location}/"},
+                    },
+                },
+            },
+            "Jdbc": {
+                "Type": "AWS::Glue::Connection",
+                "Properties": {
+                    "CatalogId": {"Ref": "AWS::AccountId"},
+                    "ConnectionInput": {
+                        "Name": f"conn-{s}",
+                        "ConnectionType": "JDBC",
+                        "ConnectionProperties": {"JDBC_CONNECTION_URL": "jdbc:postgresql://db:5432/app"},
+                    },
+                },
+            },
+            "Crawler": {"Type": "AWS::Glue::Crawler", "Properties": crawler},
+            "Job": {"Type": "AWS::Glue::Job", "Properties": job},
+            "Trigger": {
+                "Type": "AWS::Glue::Trigger",
+                "Properties": {
+                    "Name": f"trigger-{s}",
+                    "Type": "SCHEDULED",
+                    "Schedule": "cron(0 3 * * ? *)",
+                    "Description": trigger_description,
+                    "Actions": [{"JobName": {"Ref": "Job"}}],
+                },
+            },
+        },
+        "Outputs": {
+            key: {"Value": {"Ref": key}}
+            for key in ("Db", "Events", "Day", "Jdbc", "Crawler", "Job", "Trigger")
+        } | {
+            "JdbcName": {"Value": {"Fn::GetAtt": ["Jdbc", "Name"]}},
+            "DayValues": {"Value": {"Fn::GetAtt": ["Day", "IdentifierPartitionInputValues"]}},
+        },
+    }
+
+
+def test_cfn_glue_data_lake_stack_create_and_delete(cfn, glue, sts):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-lake-{s}"
+    _glue_create(cfn, stack, _glue_data_lake(s))
+    db, conn, crawler, job, trigger = f"lake_{s}", f"conn-{s}", f"crawler-{s}", f"job-{s}", f"trigger-{s}"
+
+    out = _glue_outputs(cfn, stack)
+    assert out["Db"] == db
+    assert out["Events"] == "events"
+    assert out["Jdbc"] == out["JdbcName"] == conn
+    assert out["Crawler"] == crawler
+    assert out["Job"] == job
+    assert out["Trigger"] == trigger
+    # The partition's Ref is its compound primary identifier joined with "|".
+    account = sts.get_caller_identity()["Account"]
+    assert out["Day"] == f"{account}|{db}|events|{out['DayValues']}"
+
+    assert glue.get_database(Name=db)["Database"]["Description"] == "data lake"
+    table = glue.get_table(DatabaseName=db, Name="events")["Table"]
+    assert table["Description"] == "raw events"
+    assert table["PartitionKeys"] == [{"Name": "dt", "Type": "string"}]
+    partition = glue.get_partition(DatabaseName=db, TableName="events",
+                                   PartitionValues=["2026-10-01"])["Partition"]
+    assert partition["StorageDescriptor"]["Location"] == f"s3://lake-{s}/events/p1/"
+    assert glue.get_connection(Name=conn)["Connection"]["ConnectionType"] == "JDBC"
+    got_crawler = glue.get_crawler(Name=crawler)["Crawler"]
+    assert got_crawler["DatabaseName"] == db
+    assert got_crawler["Schedule"]["ScheduleExpression"] == "cron(0 2 * * ? *)"
+    assert glue.get_job(JobName=job)["Job"]["Command"]["Name"] == "pythonshell"
+    assert glue.get_trigger(Name=trigger)["Trigger"]["Actions"] == [{"JobName": job}]
+    # Tags given as a map (crawler) and as a Tag list (job) both land.
+    assert glue.get_tags(ResourceArn=_glue_arn(sts, "crawler", crawler))["Tags"] == {"team": "data"}
+    assert glue.get_tags(ResourceArn=_glue_arn(sts, "job", job))["Tags"] == {"owner": "etl"}
+
+    _delete_cfn_test_stack(cfn, stack)
+    _glue_not_found(lambda: glue.get_database(Name=db))
+    _glue_not_found(lambda: glue.get_table(DatabaseName=db, Name="events"))
+    _glue_not_found(lambda: glue.get_connection(Name=conn))
+    _glue_not_found(lambda: glue.get_crawler(Name=crawler))
+    _glue_not_found(lambda: glue.get_job(JobName=job))
+    _glue_not_found(lambda: glue.get_trigger(Name=trigger))
+
+
+def test_cfn_glue_update_in_place(cfn, glue, sts):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-upd-{s}"
+    _glue_create(cfn, stack, _glue_data_lake(s))
+    db, crawler, job, trigger = f"lake_{s}", f"crawler-{s}", f"job-{s}", f"trigger-{s}"
+    created = glue.get_table(DatabaseName=db, Name="events")["Table"]["CreateTime"]
+    try:
+        _glue_update(cfn, stack, _glue_data_lake(
+            s, table_description="cleaned events", crawler_schedule=False, job_tags=False,
+            trigger_description="hourly", partition_location="p2"))
+
+        table = glue.get_table(DatabaseName=db, Name="events")["Table"]
+        assert table["Description"] == "cleaned events"
+        assert table["CreateTime"] == created
+        assert table["VersionId"] == "2"
+        partition = glue.get_partition(DatabaseName=db, TableName="events",
+                                       PartitionValues=["2026-10-01"])["Partition"]
+        assert partition["StorageDescriptor"]["Location"] == f"s3://lake-{s}/events/p2/"
+        # A property the template dropped is cleared, not left at its old value.
+        assert not glue.get_crawler(Name=crawler)["Crawler"].get("Schedule")
+        assert glue.get_tags(ResourceArn=_glue_arn(sts, "job", job))["Tags"] == {}
+        assert glue.get_trigger(Name=trigger)["Trigger"]["Description"] == "hourly"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_table_rename_replaces(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-ren-{s}"
+    template = _glue_data_lake(s)
+    _glue_create(cfn, stack, template)
+    db = f"lake_{s}"
+    try:
+        template["Resources"]["Events"]["Properties"]["TableInput"]["Name"] = "events_v2"
+        # The partition follows its table through Ref, which replaces it too.
+        _glue_update(cfn, stack, template)
+        assert _glue_outputs(cfn, stack)["Events"] == "events_v2"
+        assert glue.get_table(DatabaseName=db, Name="events_v2")["Table"]["Name"] == "events_v2"
+        _glue_not_found(lambda: glue.get_table(DatabaseName=db, Name="events"))
+        glue.get_partition(DatabaseName=db, TableName="events_v2", PartitionValues=["2026-10-01"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_partition_values_change_replaces(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-pv-{s}"
+    template = _glue_data_lake(s)
+    _glue_create(cfn, stack, template)
+    db = f"lake_{s}"
+    before = _glue_outputs(cfn, stack)["Day"]
+    try:
+        template["Resources"]["Day"]["Properties"]["PartitionInput"]["Values"] = ["2026-10-02"]
+        _glue_update(cfn, stack, template)
+        assert _glue_outputs(cfn, stack)["Day"] != before
+        glue.get_partition(DatabaseName=db, TableName="events", PartitionValues=["2026-10-02"])
+        _glue_not_found(lambda: glue.get_partition(
+            DatabaseName=db, TableName="events", PartitionValues=["2026-10-01"]))
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_database_input_name_change_fails_and_rolls_back(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-dbn-{s}"
+
+    def template(name, description):
+        return {
+            "Resources": {"Db": {"Type": "AWS::Glue::Database", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"},
+                "DatabaseInput": {"Name": name, "Description": description}}}},
+            "Outputs": {"Db": {"Value": {"Ref": "Db"}}},
+        }
+
+    _glue_create(cfn, stack, template(f"first_{s}", "one"))
+    try:
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(template(f"second_{s}", "two")))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "")
+                   for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Db" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert any(f"Database second_{s} not found" in r for r in reasons), reasons
+        assert _glue_outputs(cfn, stack)["Db"] == f"first_{s}"
+        assert glue.get_database(Name=f"first_{s}")["Database"]["Description"] == "one"
+        _glue_not_found(lambda: glue.get_database(Name=f"second_{s}"))
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_table_moves_database(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-mv-{s}"
+
+    def template(db_ref):
+        return {"Resources": {
+            "A": {"Type": "AWS::Glue::Database", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"}, "DatabaseInput": {"Name": f"a_{s}"}}},
+            "B": {"Type": "AWS::Glue::Database", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"}, "DatabaseInput": {"Name": f"b_{s}"}}},
+            "T": {"Type": "AWS::Glue::Table", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"}, "DatabaseName": {"Ref": db_ref},
+                "TableInput": {"Name": "t"}}},
+        }}
+
+    _glue_create(cfn, stack, template("A"))
+    try:
+        _glue_update(cfn, stack, template("B"))
+        glue.get_table(DatabaseName=f"b_{s}", Name="t")
+        _glue_not_found(lambda: glue.get_table(DatabaseName=f"a_{s}", Name="t"))
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_named_trigger_type_change_is_refused(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"glue-trg-{s}"
+
+    def template(trigger_type):
+        props = {"Name": f"trigger-{s}", "Type": trigger_type,
+                 "Actions": [{"JobName": f"job-{s}"}]}
+        if trigger_type == "SCHEDULED":
+            props["Schedule"] = "cron(0 3 * * ? *)"
+        return {"Resources": {"T": {"Type": "AWS::Glue::Trigger", "Properties": props}}}
+
+    _glue_create(cfn, stack, template("ON_DEMAND"))
+    try:
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(template("SCHEDULED")))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+        reasons = [e.get("ResourceStatusReason", "") for e in events if e["LogicalResourceId"] == "T"]
+        assert any("custom-named resource requires replacing" in r for r in reasons)
+        assert glue.get_trigger(Name=f"trigger-{s}")["Trigger"]["Type"] == "ON_DEMAND"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_glue_generated_names(cfn, glue):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"Glue-Gen-{s}"
+    template = {
+        "Resources": {
+            "Db": {"Type": "AWS::Glue::Database", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"}, "DatabaseInput": {}}},
+            "Tbl": {"Type": "AWS::Glue::Table", "Properties": {
+                "CatalogId": {"Ref": "AWS::AccountId"}, "DatabaseName": {"Ref": "Db"},
+                "TableInput": {"TableType": "EXTERNAL_TABLE"}}},
+            "Job": {"Type": "AWS::Glue::Job", "Properties": {
+                "Role": _GLUE_ROLE, "Command": {"Name": "pythonshell", "ScriptLocation": "s3://b/k.py"}}},
+        },
+        "Outputs": {k: {"Value": {"Ref": k}} for k in ("Db", "Tbl", "Job")},
+    }
+    _glue_create(cfn, stack, template)
+    try:
+        out = _glue_outputs(cfn, stack)
+        # Glue folds catalog names to lowercase, so generated ones start that way.
+        assert out["Db"] == out["Db"].lower() and out["Db"].startswith(f"glue-gen-{s}-db-")
+        assert out["Tbl"] == out["Tbl"].lower()
+        assert out["Job"].startswith(f"{stack}-Job-")
+        glue.get_table(DatabaseName=out["Db"], Name=out["Tbl"])
+        glue.get_job(JobName=out["Job"])
+        # An update under a generated name keeps the same resource.
+        template["Resources"]["Job"]["Properties"]["MaxRetries"] = 2
+        _glue_update(cfn, stack, template)
+        assert _glue_outputs(cfn, stack)["Job"] == out["Job"]
+        assert glue.get_job(JobName=out["Job"])["Job"]["MaxRetries"] == 2
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+@pytest.mark.parametrize("rtype,old,new,expected", [
+    ("AWS::Glue::Database", {"DatabaseName": "a"}, {"DatabaseName": "b"}, "Always"),
+    ("AWS::Glue::Database", {"DatabaseInput": {"Name": "a"}}, {"DatabaseInput": {"Name": "b"}}, "Never"),
+    ("AWS::Glue::Job", {"Name": "a"}, {"Name": "b"}, "Always"),
+    ("AWS::Glue::Job", {"MaxRetries": 0}, {"MaxRetries": 1}, "Never"),
+    ("AWS::Glue::Trigger", {"Type": "ON_DEMAND"}, {"Type": "SCHEDULED"}, "Always"),
+    ("AWS::Glue::Crawler", {"Description": "a"}, {"Description": "b"}, "Never"),
+    ("AWS::Glue::Partition", {"TableName": "a"}, {"TableName": "b"}, "Conditionally"),
+])
+def test_cfn_glue_change_set_recreation(rtype, old, new, expected):
+    def tmpl(props):
+        return {"Resources": {"R": {"Type": rtype, "Properties": props}}}
+
+    change = _diff_resources(tmpl(old), tmpl(new))[0]["ResourceChange"]
+    targets = {d["Target"]["Name"]: d["Target"]["RequiresRecreation"]
+               for d in change.get("Details", []) if d["Target"].get("Name")}
+    assert set(targets.values()) == {expected}
+
+
+# ===========================================================================
+# AWS::ElastiCache::* resource types
+# ===========================================================================
+
+_EC_LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
+_ec_requires_docker = pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set - skipping network connectivity test",
+)
+
+
+def _ec_create(cfn, name, template):
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name, timeout=120)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+
+def _ec_update(cfn, name, template):
+    cfn.update_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name, timeout=120)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+
+def _ec_outputs(cfn, name):
+    stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def _ec_reasons(cfn, name, logical_id):
+    events = cfn.describe_stack_events(StackName=name)["StackEvents"]
+    return [e.get("ResourceStatusReason", "") for e in events
+            if e["LogicalResourceId"] == logical_id]
+
+
+def _ec_error_code(call):
+    with pytest.raises(ClientError) as exc:
+        call()
+    return exc.value.response["Error"]["Code"]
+
+
+def _ec_params(ec, group):
+    return {p["ParameterName"]: p["ParameterValue"]
+            for p in ec.describe_cache_parameters(CacheParameterGroupName=group)["Parameters"]}
+
+
+def _ec_cache_stack(s, *, rg_description="sessions", num_cache_clusters=2,
+                 params=None, subnet_description="cache subnets",
+                 access_string="on ~app:* +@all", extra_user=False,
+                 cluster_nodes=1, rg_tags=None):
+    resources = {
+        "Subnets": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
+            "CacheSubnetGroupName": f"subnets-{s}",
+            "Description": subnet_description,
+            "SubnetIds": ["subnet-aaa", "subnet-bbb"],
+        }},
+        "Params": {"Type": "AWS::ElastiCache::ParameterGroup", "Properties": {
+            "CacheParameterGroupFamily": "redis7",
+            "Description": "app params",
+            "Properties": params if params is not None else {
+                "maxmemory-policy": "allkeys-lru", "timeout": "300"},
+        }},
+        "User": {"Type": "AWS::ElastiCache::User", "Properties": {
+            "UserId": f"app-{s}", "UserName": f"app-{s}", "Engine": "redis",
+            "AccessString": access_string, "Passwords": ["correct-horse-battery"],
+        }},
+        "Users": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": f"users-{s}", "Engine": "redis",
+            "UserIds": [{"Ref": "User"}] + ([{"Ref": "Other"}] if extra_user else []),
+        }},
+        "Cache": {"Type": "AWS::ElastiCache::ReplicationGroup", "Properties": {
+            "ReplicationGroupId": f"cache-{s}",
+            "ReplicationGroupDescription": rg_description,
+            "Engine": "redis",
+            "CacheNodeType": "cache.t3.micro",
+            "NumCacheClusters": num_cache_clusters,
+            "CacheSubnetGroupName": {"Ref": "Subnets"},
+            "CacheParameterGroupName": {"Ref": "Params"},
+            "UserGroupIds": [{"Ref": "Users"}],
+            "TransitEncryptionEnabled": True,
+            "Tags": rg_tags if rg_tags is not None else [{"Key": "team", "Value": "data"}],
+        }},
+        "Single": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
+            "ClusterName": f"single-{s}",
+            "Engine": "redis",
+            "CacheNodeType": "cache.t3.micro",
+            "NumCacheNodes": cluster_nodes,
+            "PreferredAvailabilityZone": "us-east-1a",
+            "CacheSubnetGroupName": {"Ref": "Subnets"},
+        }},
+    }
+    if extra_user:
+        resources["Other"] = {"Type": "AWS::ElastiCache::User", "Properties": {
+            "UserId": f"other-{s}", "UserName": f"other-{s}", "Engine": "redis",
+            "AccessString": "on ~* +@read", "NoPasswordRequired": True,
+        }}
+    outputs = {k: {"Value": {"Ref": k}} for k in resources}
+
+    def att(logical_id, attr):
+        return {"Value": {"Fn::GetAtt": [logical_id, attr]}}
+
+    outputs.update({
+        "ParamsName": att("Params", "CacheParameterGroupName"),
+        "UserArn": att("User", "Arn"),
+        "UsersArn": att("Users", "Arn"),
+        "PrimaryAddress": att("Cache", "PrimaryEndPoint.Address"),
+        "PrimaryPort": att("Cache", "PrimaryEndPoint.Port"),
+        "ReaderAddress": att("Cache", "ReaderEndPoint.Address"),
+        "ReadAddresses": att("Cache", "ReadEndPoint.Addresses"),
+        "SingleAddress": att("Single", "RedisEndpoint.Address"),
+        "SinglePort": att("Single", "RedisEndpoint.Port"),
+    })
+    return {"Resources": resources, "Outputs": outputs}
+
+
+def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-full-{s}"
+    _ec_create(cfn, stack, _ec_cache_stack(s))
+    out = _ec_outputs(cfn, stack)
+    assert out["Subnets"] == f"subnets-{s}"
+    assert out["Cache"] == f"cache-{s}"
+    assert out["Single"] == f"single-{s}"
+    assert out["User"] == f"app-{s}" and out["Users"] == f"users-{s}"
+    # The parameter group's name is read-only in the schema: always generated.
+    assert out["Params"] == out["ParamsName"] == out["Params"].lower()
+    try:
+        groups = ec.describe_cache_subnet_groups(CacheSubnetGroupName=f"subnets-{s}")
+        subnets = groups["CacheSubnetGroups"][0]["Subnets"]
+        assert [n["SubnetIdentifier"] for n in subnets] == ["subnet-aaa", "subnet-bbb"]
+        assert _ec_params(ec, out["Params"])["maxmemory-policy"] == "allkeys-lru"
+
+        user = ec.describe_users(UserId=f"app-{s}")["Users"][0]
+        assert user["ARN"] == out["UserArn"]
+        assert user["AccessString"] == "on ~app:* +@all"
+        group = ec.describe_user_groups(UserGroupId=f"users-{s}")["UserGroups"][0]
+        assert group["ARN"] == out["UsersArn"]
+        assert group["UserIds"] == [f"app-{s}"]
+        assert group["ReplicationGroups"] == [f"cache-{s}"]
+
+        # The stack's endpoints are the ones the API reports for the same group.
+        rg = ec.describe_replication_groups(ReplicationGroupId=f"cache-{s}")["ReplicationGroups"][0]
+        primary = rg["NodeGroups"][0]["PrimaryEndpoint"]
+        assert (out["PrimaryAddress"], out["PrimaryPort"]) == (primary["Address"], str(primary["Port"]))
+        assert out["ReaderAddress"] == rg["NodeGroups"][0]["ReaderEndpoint"]["Address"]
+        replicas = [m for m in rg["NodeGroups"][0]["NodeGroupMembers"] if m["CurrentRole"] == "replica"]
+        assert out["ReadAddresses"] == ",".join(m["ReadEndpoint"]["Address"] for m in replicas)
+        assert rg["CacheNodeType"] == "cache.t3.micro"
+        assert rg["TransitEncryptionEnabled"] is True
+        tags = ec.list_tags_for_resource(ResourceName=rg["ARN"])["TagList"]
+        assert {"Key": "team", "Value": "data"} in tags
+
+        cluster = ec.describe_cache_clusters(
+            CacheClusterId=f"single-{s}", ShowCacheNodeInfo=True)["CacheClusters"][0]
+        node = cluster["CacheNodes"][0]["Endpoint"]
+        assert (out["SingleAddress"], out["SinglePort"]) == (node["Address"], str(node["Port"]))
+        assert cluster["CacheSubnetGroupName"] == f"subnets-{s}"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+    assert _ec_error_code(lambda: ec.describe_replication_groups(
+        ReplicationGroupId=f"cache-{s}")) == "ReplicationGroupNotFoundFault"
+    assert _ec_error_code(lambda: ec.describe_cache_clusters(
+        CacheClusterId=f"single-{s}")) == "CacheClusterNotFound"
+    assert _ec_error_code(lambda: ec.describe_cache_subnet_groups(
+        CacheSubnetGroupName=f"subnets-{s}")) == "CacheSubnetGroupNotFoundFault"
+    assert _ec_error_code(lambda: ec.describe_cache_parameter_groups(
+        CacheParameterGroupName=out["Params"])) == "CacheParameterGroupNotFound"
+    assert _ec_error_code(lambda: ec.describe_users(UserId=f"app-{s}")) == "UserNotFound"
+    assert _ec_error_code(lambda: ec.describe_user_groups(
+        UserGroupId=f"users-{s}")) == "UserGroupNotFound"
+
+
+def test_cfn_elasticache_update_in_place(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-upd-{s}"
+    _ec_create(cfn, stack, _ec_cache_stack(s))
+    before = _ec_outputs(cfn, stack)
+    try:
+        _ec_update(cfn, stack, _ec_cache_stack(
+            s, rg_description="sessions v2", num_cache_clusters=3,
+            params={"maxmemory-policy": "volatile-ttl"}, subnet_description="new subnets",
+            access_string="on ~* +@all", extra_user=True, cluster_nodes=2,
+            rg_tags=[{"Key": "team", "Value": "platform"}]))
+        after = _ec_outputs(cfn, stack)
+        for key in ("Subnets", "Params", "User", "Users", "Cache", "Single"):
+            assert after[key] == before[key], key
+
+        rg = ec.describe_replication_groups(ReplicationGroupId=f"cache-{s}")["ReplicationGroups"][0]
+        assert rg["Description"] == "sessions v2"
+        assert len(rg["NodeGroups"][0]["NodeGroupMembers"]) == 3
+        tags = ec.list_tags_for_resource(ResourceName=rg["ARN"])["TagList"]
+        assert {"Key": "team", "Value": "platform"} in tags
+
+        params = _ec_params(ec, before["Params"])
+        assert params["maxmemory-policy"] == "volatile-ttl"
+        # A parameter the template dropped goes back to its default.
+        assert params["timeout"] == "0"
+        group = ec.describe_cache_subnet_groups(CacheSubnetGroupName=f"subnets-{s}")
+        assert group["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "new subnets"
+        assert ec.describe_users(UserId=f"app-{s}")["Users"][0]["AccessString"] == "on ~* +@all"
+        users = ec.describe_user_groups(UserGroupId=f"users-{s}")["UserGroups"][0]["UserIds"]
+        assert sorted(users) == sorted([f"app-{s}", f"other-{s}"])
+        cluster = ec.describe_cache_clusters(CacheClusterId=f"single-{s}")["CacheClusters"][0]
+        assert cluster["NumCacheNodes"] == 2
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_elasticache_replication_group_rename_replaces(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-ren-{s}"
+
+    def template(rg_id):
+        return {"Resources": {"Rg": {"Type": "AWS::ElastiCache::ReplicationGroup", "Properties": {
+            "ReplicationGroupId": rg_id, "ReplicationGroupDescription": "rename",
+            "Engine": "redis", "CacheNodeType": "cache.t3.micro"}}}}
+
+    _ec_create(cfn, stack, template(f"first-{s}"))
+    try:
+        _ec_update(cfn, stack, template(f"second-{s}"))
+        ec.describe_replication_groups(ReplicationGroupId=f"second-{s}")
+        assert _ec_error_code(lambda: ec.describe_replication_groups(
+            ReplicationGroupId=f"first-{s}")) == "ReplicationGroupNotFoundFault"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_elasticache_generated_cluster_replaced_on_create_only_change(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"Ec-Gen-{s}"
+
+    def template(subnet_ref):
+        return {
+            "Resources": {
+                "A": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
+                    "Description": "a", "SubnetIds": ["subnet-a"]}},
+                "B": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
+                    "Description": "b", "SubnetIds": ["subnet-b"]}},
+                "C": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
+                    "Engine": "redis", "CacheNodeType": "cache.t3.micro", "NumCacheNodes": 1,
+                    "CacheSubnetGroupName": {"Ref": subnet_ref}}},
+            },
+            "Outputs": {k: {"Value": {"Ref": k}} for k in ("A", "B", "C")},
+        }
+
+    _ec_create(cfn, stack, template("A"))
+    try:
+        out = _ec_outputs(cfn, stack)
+        # Generated names are lowercase, as ElastiCache stores them, and a
+        # cluster name fits the 50-character limit.
+        assert out["A"] == out["A"].lower() and out["A"].startswith(f"ec-gen-{s}-a-")
+        assert out["C"] == out["C"].lower() and len(out["C"]) <= 50
+        first = ec.describe_cache_clusters(CacheClusterId=out["C"])["CacheClusters"][0]
+        # CacheSubnetGroupName is create-only: the cluster is replaced and
+        # takes its generated name back.
+        _ec_update(cfn, stack, template("B"))
+        assert _ec_outputs(cfn, stack)["C"] == out["C"]
+        second = ec.describe_cache_clusters(CacheClusterId=out["C"])["CacheClusters"][0]
+        assert second["CacheSubnetGroupName"] == out["B"]
+        assert second["CacheClusterCreateTime"] >= first["CacheClusterCreateTime"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_elasticache_named_cluster_engine_change_is_refused(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-ref-{s}"
+
+    def template(engine):
+        return {"Resources": {"C": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
+            "ClusterName": f"named-{s}", "Engine": engine,
+            "CacheNodeType": "cache.t3.micro", "NumCacheNodes": 1}}}}
+
+    _ec_create(cfn, stack, template("redis"))
+    try:
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(template("memcached")))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any("custom-named resource requires replacing" in r
+                   for r in _ec_reasons(cfn, stack, "C"))
+        cluster = ec.describe_cache_clusters(CacheClusterId=f"named-{s}")["CacheClusters"][0]
+        assert cluster["Engine"] == "redis"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_elasticache_configuration_endpoint_needs_cluster_mode(cfn):
+    # "Fn::GetAtt returns a value for this attribute only if the replication
+    # group is clustered. Otherwise, Fn::GetAtt fails."
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-cfg-{s}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({
+        "Resources": {"Rg": {"Type": "AWS::ElastiCache::ReplicationGroup", "Properties": {
+            "ReplicationGroupDescription": "no cluster mode", "Engine": "redis",
+            "CacheNodeType": "cache.t3.micro"}}},
+        "Outputs": {"Cfg": {"Value": {"Fn::GetAtt": ["Rg", "ConfigurationEndPoint.Address"]}}},
+    }))
+    try:
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "ROLLBACK_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_elasticache_memcached_configuration_endpoint(cfn, ec):
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-mc-{s}"
+    _ec_create(cfn, stack, {
+        "Resources": {"Mc": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
+            "ClusterName": f"mc-{s}", "Engine": "memcached", "EngineVersion": "1.6.17",
+            "CacheNodeType": "cache.t3.micro", "NumCacheNodes": 1}}},
+        "Outputs": {"Address": {"Value": {"Fn::GetAtt": ["Mc", "ConfigurationEndpoint.Address"]}},
+                    "Port": {"Value": {"Fn::GetAtt": ["Mc", "ConfigurationEndpoint.Port"]}}},
+    })
+    try:
+        out = _ec_outputs(cfn, stack)
+        node = ec.describe_cache_clusters(
+            CacheClusterId=f"mc-{s}", ShowCacheNodeInfo=True)["CacheClusters"][0]["CacheNodes"][0]
+        assert (out["Address"], out["Port"]) == (node["Endpoint"]["Address"], str(node["Endpoint"]["Port"]))
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+@pytest.mark.parametrize("rtype,old,new,expected", [
+    ("AWS::ElastiCache::CacheCluster", {"Engine": "redis"}, {"Engine": "memcached"}, "Always"),
+    ("AWS::ElastiCache::CacheCluster", {"NumCacheNodes": 1}, {"NumCacheNodes": 2}, "Conditionally"),
+    ("AWS::ElastiCache::CacheCluster", {"IpDiscovery": "ipv4"}, {"IpDiscovery": "ipv6"}, "Never"),
+    ("AWS::ElastiCache::ReplicationGroup", {"Port": 6379}, {"Port": 6380}, "Always"),
+    ("AWS::ElastiCache::ReplicationGroup", {"AuthToken": "a" * 16}, {"AuthToken": "b" * 16}, "Conditionally"),
+    ("AWS::ElastiCache::ReplicationGroup", {"CacheNodeType": "cache.t3.micro"},
+     {"CacheNodeType": "cache.t3.small"}, "Never"),
+    ("AWS::ElastiCache::ParameterGroup", {"CacheParameterGroupFamily": "redis6.x"},
+     {"CacheParameterGroupFamily": "redis7"}, "Always"),
+    ("AWS::ElastiCache::User", {"UserName": "a"}, {"UserName": "b"}, "Always"),
+    ("AWS::ElastiCache::UserGroup", {"UserIds": ["a"]}, {"UserIds": ["b"]}, "Never"),
+])
+def test_cfn_elasticache_change_set_recreation(rtype, old, new, expected):
+    def tmpl(props):
+        return {"Resources": {"R": {"Type": rtype, "Properties": props}}}
+
+    change = _diff_resources(tmpl(old), tmpl(new))[0]["ResourceChange"]
+    targets = {d["Target"]["Name"]: d["Target"]["RequiresRecreation"]
+               for d in change.get("Details", []) if d["Target"].get("Name")}
+    assert set(targets.values()) == {expected}
+
+
+@_ec_requires_docker
+@pytest.mark.data_plane
+def test_cfn_elasticache_lambda_reaches_replication_group(cfn, lam):
+    """The issue's use case: a stack passes PrimaryEndPoint into a function's
+    environment, and the function talks to the container behind it."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-lam-{s}"
+    code = (
+        "import os, socket\n"
+        "def handler(event, context):\n"
+        "    s = socket.create_connection((os.environ['REDIS_HOST'], int(os.environ['REDIS_PORT'])), timeout=5)\n"
+        "    s.sendall(b'PING\\r\\n')\n"
+        "    reply = s.recv(64).decode()\n"
+        "    s.close()\n"
+        "    return {'reply': reply.strip()}\n"
+    )
+    _ec_create(cfn, stack, {
+        "Resources": {
+            "Cache": {"Type": "AWS::ElastiCache::ReplicationGroup", "Properties": {
+                "ReplicationGroupDescription": "lambda", "Engine": "redis",
+                "CacheNodeType": "cache.t3.micro"}},
+            "Fn": {"Type": "AWS::Lambda::Function", "Properties": {
+                "FunctionName": f"ec-ping-{s}", "Runtime": "python3.12",
+                "Handler": "index.handler", "Role": _EC_LAMBDA_ROLE, "Timeout": 15,
+                "Code": {"ZipFile": code},
+                "Environment": {"Variables": {
+                    "REDIS_HOST": {"Fn::GetAtt": ["Cache", "PrimaryEndPoint.Address"]},
+                    "REDIS_PORT": {"Fn::GetAtt": ["Cache", "PrimaryEndPoint.Port"]},
+                }}}},
+        },
+    })
+    try:
+        import time
+        deadline = time.time() + 60
+        while True:
+            resp = lam.invoke(FunctionName=f"ec-ping-{s}", Payload=b"{}")
+            result = json.loads(resp["Payload"].read())
+            if result.get("reply") == "+PONG" or time.time() > deadline:
+                break
+            time.sleep(1)
+        assert result.get("reply") == "+PONG", result
+    finally:
+        _delete_cfn_test_stack(cfn, stack)

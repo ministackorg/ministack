@@ -1749,11 +1749,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service == "ssm" and not error_code and action in {
-        "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource",
-    }:
-        # Live AWS us-west-2: SSM tag authorization denials are HTTP 400,
-        # JSON 1.1, with a capitalized Message and the authorized resource.
+    if service == "ssm" and not error_code:
+        # SSM authorization denials are HTTP 400, JSON 1.1, with a capitalized
+        # Message naming the resource.
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"

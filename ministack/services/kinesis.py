@@ -333,7 +333,7 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
     shard_id = _route_to_shard(hash_int, stream)
     stream["shards"][shard_id]["records"].append({
         "SequenceNumber": _next_sequence_number(),
-        "ApproximateArrivalTimestamp": int(time.time()),
+        "ApproximateArrivalTimestamp": round(time.time(), 3),
         "Data": base64.b64encode(data).decode("ascii"),
         "PartitionKey": partition_key,
     })
@@ -631,7 +631,7 @@ def _put_record(data):
 
     stream["shards"][shard_id]["records"].append({
         "SequenceNumber": seq,
-        "ApproximateArrivalTimestamp": int(time.time()),
+        "ApproximateArrivalTimestamp": round(time.time(), 3),
         "Data": record_data,
         "PartitionKey": partition_key,
     })
@@ -700,7 +700,7 @@ def _put_records(data):
         seq = _next_sequence_number()
         stream["shards"][sid]["records"].append({
             "SequenceNumber": seq,
-            "ApproximateArrivalTimestamp": int(time.time()),
+            "ApproximateArrivalTimestamp": round(time.time(), 3),
             "Data": rd,
             "PartitionKey": pk,
         })

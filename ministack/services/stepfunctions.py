@@ -1239,8 +1239,8 @@ def _test_state(data):
                 result["nextState"] = next_state
 
         elif state_type == "Succeed":
-            output = _apply_input_path(state_def, input_data)
-            output = _apply_output_path(state_def, output)
+            output = _apply_input_path(state_def, input_data, ctx)
+            output = _apply_output_path(state_def, output, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
@@ -1251,11 +1251,11 @@ def _test_state(data):
             }
 
         elif state_type == "Task":
-            effective = _apply_input_path(state_def, input_data)
+            effective = _apply_input_path(state_def, input_data, ctx)
             effective = _apply_parameters(state_def, effective, ctx)
 
             if inspection_level in ("DEBUG", "TRACE"):
-                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data))
+                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data, ctx))
                 inspection_data["afterParameters"] = json.dumps(effective)
 
             # Mock support
@@ -1310,7 +1310,7 @@ def _test_state(data):
                         mock_result = mock["result"]
                     task_result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, input_data, task_result)
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1331,7 +1331,7 @@ def _test_state(data):
                     if inspection_level in ("DEBUG", "TRACE"):
                         inspection_data["afterResultPath"] = json.dumps(output)
 
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1532,8 +1532,8 @@ def _run_execution(exec_arn):
             })
 
             if state_type == "Succeed":
-                current_input = _apply_input_path(state_def, current_input)
-                current_input = _apply_output_path(state_def, current_input)
+                current_input = _apply_input_path(state_def, current_input, ctx)
+                current_input = _apply_output_path(state_def, current_input, ctx)
                 _add_event(execution, "SucceedStateExited", {
                     "stateExitedEventDetails": {
                         "name": current_name,
@@ -1620,13 +1620,13 @@ def _execute_pass(state_def, raw_input, ctx=None):
         _apply_state_assign(state_def, raw_input, ctx, result=output)
         return output, _next_or_end(state_def)
 
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
     result = state_def.get("Result", effective)
     result = _apply_result_selector(state_def, result)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -1670,7 +1670,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 else:
                     result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, raw_input, result)
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                 return output, _next_or_end(state_def)
 
     if is_callback:
@@ -1678,7 +1678,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
 
     effective = None
     if query_language != "JSONata":
-        effective = _apply_input_path(state_def, raw_input)
+        effective = _apply_input_path(state_def, raw_input, ctx)
         effective = _apply_parameters(state_def, effective, ctx)
 
     retriers = state_def.get("Retry", [])
@@ -1728,7 +1728,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
+                output = _apply_output_path(state_def, output, ctx)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -2003,15 +2003,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
         raise _ExecutionError("States.NoChoiceMatched",
                               "No choice rule matched and no Default")
 
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     for choice in state_def.get("Choices", []):
-        if _evaluate_rule(choice, effective):
-            return _apply_output_path(state_def, effective), choice["Next"]
+        if _evaluate_rule(choice, effective, ctx):
+            return _apply_output_path(state_def, effective, ctx), choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective), default
+        return _apply_output_path(state_def, effective, ctx), default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -2031,18 +2031,24 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
     return _truthy(condition)
 
 
-def _evaluate_rule(rule, data):
+def _resolve_path_or_ctx(path, data, ctx):
+    if path.startswith("$$."):
+        return _resolve_ctx_path(path, ctx or {})
+    return _resolve_path(path, data)
+
+
+def _evaluate_rule(rule, data, ctx=None):
     if "And" in rule:
-        return all(_evaluate_rule(r, data) for r in rule["And"])
+        return all(_evaluate_rule(r, data, ctx) for r in rule["And"])
     if "Or" in rule:
-        return any(_evaluate_rule(r, data) for r in rule["Or"])
+        return any(_evaluate_rule(r, data, ctx) for r in rule["Or"])
     if "Not" in rule:
-        return not _evaluate_rule(rule["Not"], data)
+        return not _evaluate_rule(rule["Not"], data, ctx)
 
     variable = rule.get("Variable")
     if not variable:
         return False
-    value = _resolve_path(variable, data)
+    value = _resolve_path_or_ctx(variable, data, ctx)
 
     # --- type checks ---
     if "IsPresent" in rule:
@@ -2062,7 +2068,7 @@ def _evaluate_rule(rule, data):
     if "StringEquals" in rule:
         return value == rule["StringEquals"]
     if "StringEqualsPath" in rule:
-        return value == _resolve_path(rule["StringEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["StringEqualsPath"], data, ctx)
     if "StringLessThan" in rule:
         return isinstance(value, str) and value < rule["StringLessThan"]
     if "StringGreaterThan" in rule:
@@ -2079,7 +2085,7 @@ def _evaluate_rule(rule, data):
     if "NumericEquals" in rule:
         return _is_num(value) and value == rule["NumericEquals"]
     if "NumericEqualsPath" in rule:
-        return _is_num(value) and value == _resolve_path(rule["NumericEqualsPath"], data)
+        return _is_num(value) and value == _resolve_path_or_ctx(rule["NumericEqualsPath"], data, ctx)
     if "NumericLessThan" in rule:
         return _is_num(value) and value < rule["NumericLessThan"]
     if "NumericGreaterThan" in rule:
@@ -2089,23 +2095,23 @@ def _evaluate_rule(rule, data):
     if "NumericGreaterThanEquals" in rule:
         return _is_num(value) and value >= rule["NumericGreaterThanEquals"]
     if "NumericLessThanPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value < rhs
     if "NumericGreaterThanPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value > rhs
     if "NumericLessThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanEqualsPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value <= rhs
     if "NumericGreaterThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanEqualsPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value >= rhs
 
     # --- boolean ---
     if "BooleanEquals" in rule:
         return value is rule["BooleanEquals"] or value == rule["BooleanEquals"]
     if "BooleanEqualsPath" in rule:
-        return value == _resolve_path(rule["BooleanEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["BooleanEqualsPath"], data, ctx)
 
     # --- timestamp ---
     for op, cmp_fn in [("TimestampEquals", lambda a, b: a == b),
@@ -2125,7 +2131,7 @@ def _evaluate_rule(rule, data):
 # ---------------------------------------------------------------------------
 
 def _execute_wait(state_def, raw_input, ctx=None):
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
         _scaled_sleep(state_def["Seconds"])
@@ -2140,7 +2146,7 @@ def _execute_wait(state_def, raw_input, ctx=None):
         if isinstance(ts_str, str):
             _sleep_until(ts_str)
 
-    output = _apply_output_path(state_def, effective)
+    output = _apply_output_path(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2165,7 +2171,7 @@ def _sleep_until(iso_ts):
 # ---------------------------------------------------------------------------
 
 def _execute_parallel(state_def, raw_input, execution, ctx):
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
     branches = state_def.get("Branches", [])
@@ -2206,7 +2212,7 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2217,10 +2223,10 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 def _execute_map(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     items_path = state_def.get("ItemsPath", "$")
-    items = _resolve_path(items_path, effective)
+    items = _resolve_path_or_ctx(items_path, effective, ctx)
     if not isinstance(items, list):
         items = [items]
 
@@ -2266,7 +2272,7 @@ def _execute_map(state_def, raw_input, execution, ctx):
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2289,7 +2295,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
 
         if state_type == "Succeed":
             return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input))
+                                      _apply_input_path(state_def, current_input, ctx), ctx)
         if state_type == "Fail":
             raise _ExecutionError(
                 state_def.get("Error", "States.Fail"),
@@ -2322,18 +2328,18 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
 # Path / Parameter processing
 # ===================================================================
 
-def _apply_input_path(state_def, data):
+def _apply_input_path(state_def, data, ctx=None):
     ip = state_def.get("InputPath", "$")
     if ip is None:
         return {}
-    return _resolve_path(ip, data)
+    return _resolve_path_or_ctx(ip, data, ctx)
 
 
-def _apply_output_path(state_def, data):
+def _apply_output_path(state_def, data, ctx=None):
     op = state_def.get("OutputPath", "$")
     if op is None:
         return {}
-    return _resolve_path(op, data)
+    return _resolve_path_or_ctx(op, data, ctx)
 
 
 def _apply_parameters(state_def, data, ctx=None):
@@ -3708,7 +3714,7 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
     "OptionGroupMemberships", "OptionGroupsList", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
-    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers", "GlobalClusters",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
     "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",

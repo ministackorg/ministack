@@ -518,6 +518,7 @@ def test_lambda_direct_arn_version_delete_rejects_weighted_alias_version():
         Code={"ZipFile": _region_marker_code("latest")},
     )
     primary = lam.publish_version(FunctionName=name)
+    lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("weighted"))
     weighted = lam.publish_version(FunctionName=name)
     lam.create_alias(
         FunctionName=name,
@@ -1268,6 +1269,22 @@ def test_lambda_list_versions(lam):
     resp = lam.list_versions_by_function(FunctionName="lam-invoke-test")
     versions = resp["Versions"]
     assert any(v["Version"] == "$LATEST" for v in versions)
+
+def test_lambda_publish_version_of_an_unchanged_function_returns_the_latest(lam):
+    """Lambda doesn't publish a version when code and configuration are unchanged."""
+    name = f"lambda-publish-unchanged-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": _region_marker_code("one")})
+    try:
+        first = lam.publish_version(FunctionName=name, Description="one")
+        again = lam.publish_version(FunctionName=name, Description="two")
+        assert (again["Version"], again["Description"]) == (first["Version"], "one")
+        lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("two"))
+        second = lam.publish_version(FunctionName=name)
+        assert int(second["Version"]) == int(first["Version"]) + 1
+    finally:
+        lam.delete_function(FunctionName=name)
+
 
 def test_lambda_publish_version(lam):
     resp = lam.publish_version(
@@ -7681,6 +7698,16 @@ def test_lambda_timeout_update_evicts_warm_container(monkeypatch, package_type, 
     container.remove.assert_called_once()
 
 
+@pytest.mark.parametrize("use_ssl, scheme", [("1", "https"), ("", "http")])
+def test_lambda_container_default_endpoint_follows_gateway_scheme(monkeypatch, use_ssl, scheme):
+    """With no endpoint configured, a Docker Lambda is pointed at the gateway with the scheme it serves."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    captured = _spawn_capture_run_kwargs(monkeypatch, endpoint="")
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == f"{scheme}://host.docker.internal:4566"
+
+
 def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
     """A container pointed at host.docker.internal gets the name mapped.
 
@@ -12533,6 +12560,52 @@ def test_node_context_shim_downgrades_https_to_the_gateway(tmp_path):
         assert seen[-1][2] != f"127.0.0.1:{port + 1}"
         # Every other host keeps real TLS on 443 (here: nothing listens).
         assert "error" in run("localhost.invalid")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
+    """Under USE_SSL the gateway speaks only TLS: the container shim must not downgrade a request to it."""
+    import http.server
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve) => {\n"
+            "  https.get({hostname: '127.0.0.1', port: event.port, path: '/probe'}, (res) => resolve({status: res.statusCode}))\n"
+            "    .on('error', (e) => resolve({error: e.code || String(e)}));\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "index.handler",
+               "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}"}
+        script = ("require(process.argv[1]).handler({port: Number(process.argv[2])}, {})"
+                  ".then((r) => process.stdout.write(JSON.stringify(r)));")
+        proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), str(port)],
+                              env=env, capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        # Still TLS: the plain-HTTP listener never sees the request as HTTP.
+        assert "error" in json.loads(proc.stdout)
+        assert seen == []
     finally:
         server.shutdown()
         server.server_close()

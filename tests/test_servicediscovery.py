@@ -375,6 +375,23 @@ def test_servicediscovery_delete_namespace_removes_hosted_zone(sd, r53):
         r53.get_hosted_zone(Id=zone_id)
 
 
+def test_servicediscovery_delete_namespace_with_services_is_refused(sd, r53):
+    ns_op = sd.create_public_dns_namespace(Name="in-use.example.com")
+    ns_id = sd.get_operation(OperationId=ns_op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+    zone_id = sd.get_namespace(Id=ns_id)["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+    svc_id = sd.create_service(Name="api", NamespaceId=ns_id)["Service"]["Id"]
+
+    with pytest.raises(sd.exceptions.ResourceInUse) as exc:
+        sd.delete_namespace(Id=ns_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceInUse"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    sd.get_namespace(Id=ns_id)
+    r53.get_hosted_zone(Id=zone_id)
+
+    sd.delete_service(Id=svc_id)
+    sd.delete_namespace(Id=ns_id)
+
+
 # ---------------------------------------------------------------------------
 # ARN adoption / tag-API in-process unit tests. Folded from
 # test_servicediscovery_arn_adoption.py (drive the module directly).

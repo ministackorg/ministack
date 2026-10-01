@@ -2550,18 +2550,27 @@ def _get_docker():
     return _docker
 
 
+def _in_container():
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
+
+
 def _get_ministack_network(docker_client):
     """Detect the Docker network MiniStack is running on (if containerised).
 
-    Under MINISTACK_RDS_PUBLIC_ENDPOINT the database containers join the
-    network only when MiniStack itself is containerised, so readiness and
-    internal wiring can reach them while _reported_endpoint reports the
-    published port.
+    Under MINISTACK_RDS_PUBLIC_ENDPOINT a host-run MiniStack keeps its
+    database containers off the network, since it cannot reach their
+    addresses; a containerised one detects its network as usual, so
+    readiness and internal wiring reach them while _reported_endpoint
+    reports the published port.
     """
     global _ministack_network
     if _ministack_network is not None:
         return _ministack_network or None
-    if DOCKER_NETWORK and not RDS_PUBLIC_ENDPOINT:
+    if RDS_PUBLIC_ENDPOINT and not _in_container():
+        _ministack_network = ""
+        return None
+    if DOCKER_NETWORK:
         _ministack_network = DOCKER_NETWORK
         logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
         return DOCKER_NETWORK
@@ -2571,8 +2580,7 @@ def _get_ministack_network(docker_client):
         nets = list(
             self_container.attrs["NetworkSettings"]["Networks"].keys())
         if nets:
-            _ministack_network = (DOCKER_NETWORK if DOCKER_NETWORK in nets
-                                  else nets[0])
+            _ministack_network = nets[0]
             logger.debug("RDS: detected MiniStack network: %s",
                          _ministack_network)
             return _ministack_network
@@ -7795,7 +7803,7 @@ def _describe_global_clusters(p):
         gcs = snapshots
 
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")

@@ -6,6 +6,7 @@ REST-JSON API with deterministic stub vulnerability findings.
 """
 
 import copy
+import datetime
 import json
 import logging
 import time
@@ -31,8 +32,9 @@ _tags = AccountScopedDict()
 _filters = AccountRegionScopedDict()
 
 
-def _now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+def _now():
+    # rest-json timestamps without a timestampFormat are epoch seconds
+    return int(time.time())
 
 
 def _finding_arn(acct_id, finding_id):
@@ -266,7 +268,7 @@ def _build_finding(pkg, resource_type, resource_id, account_id):
                 "imageHash": "sha256:" + uuid.uuid4().hex,
                 "architecture": pkg.get("arch", ""),
                 "platform": "linux",
-                "pushedAt": _now_iso(),
+                "pushedAt": _now(),
             }
         }
     elif resource_type == "AWS_LAMBDA_FUNCTION":
@@ -278,7 +280,7 @@ def _build_finding(pkg, resource_type, resource_id, account_id):
                 "version": "$LATEST",
                 "executionRoleArn": f"arn:aws:iam::{account_id}:role/service-role/test-role",
                 "packageType": "ZIP",
-                "lastModifiedAt": _now_iso(),
+                "lastModifiedAt": _now(),
             }
         }
     elif resource_type == "AWS_EC2_INSTANCE":
@@ -287,7 +289,7 @@ def _build_finding(pkg, resource_type, resource_id, account_id):
                 "type": "t3.medium",
                 "imageId": "ami-0abcdef1234567890",
                 "platform": "linux",
-                "launchedAt": _now_iso(),
+                "launchedAt": _now(),
             }
         }
 
@@ -300,9 +302,9 @@ def _build_finding(pkg, resource_type, resource_id, account_id):
         "description": f"{pkg['vulnId']} — {pkg['cwe']} — in {pkg['name']}@{pkg['version']}",
         "severity": pkg["severity"],
         "status": "ACTIVE",
-        "firstObservedAt": _now_iso(),
-        "lastObservedAt": _now_iso(),
-        "updatedAt": _now_iso(),
+        "firstObservedAt": _now(),
+        "lastObservedAt": _now(),
+        "updatedAt": _now(),
         "inspectorScore": round(risk, 2),
         "fixAvailable": FIX_STATE_MAP.get(fix, "NO"),
         "exploitAvailable": "NO" if pkg["severity"] != "CRITICAL" else "YES",
@@ -321,8 +323,8 @@ def _build_finding(pkg, resource_type, resource_id, account_id):
             "source": "NVD",
             "sourceUrl": f"https://nvd.nist.gov/vuln/detail/{pkg['vulnId']}",
             "vendorSeverity": pkg["severity"],
-            "vendorCreatedAt": _now_iso(),
-            "vendorUpdatedAt": _now_iso(),
+            "vendorCreatedAt": _now(),
+            "vendorUpdatedAt": _now(),
             "referenceUrls": [f"https://nvd.nist.gov/vuln/detail/{pkg['vulnId']}"],
             "relatedVulnerabilities": [],
             "cvss": [
@@ -403,7 +405,7 @@ def _run_scan(account_id):
         for r in f["resources"]:
             resources.add((r["type"], r["id"]))
 
-    timestamp = _now_iso()
+    timestamp = _now()
     _findings[account_id] = findings
     _scan_history[account_id] = {
         "lastScanAt": timestamp,
@@ -420,7 +422,7 @@ def _run_scan(account_id):
                 "resourceId": rid,
                 "resourceType": rtype,
                 "scanType": "PACKAGE",
-                "scanStatus": {"code": "ACTIVE", "reason": "INITIAL_SCAN_COMPLETE"},
+                "scanStatus": {"statusCode": "ACTIVE", "reason": "SUCCESSFUL"},
                 "lastScannedAt": timestamp,
                 "scanMode": "EC2_AGENTLESS",
             }
@@ -680,7 +682,7 @@ def _list_findings(data, account_id):
             sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFORMATIONAL": 4, "UNTRIAGED": 5}
             filtered.sort(key=lambda f: sev_order.get(f.get("severity", ""), 99), reverse=(order == "DESC"))
         elif field == "FIRST_OBSERVED_AT":
-            filtered.sort(key=lambda f: f.get("firstObservedAt", ""), reverse=(order == "DESC"))
+            filtered.sort(key=lambda f: f.get("firstObservedAt", 0), reverse=(order == "DESC"))
         elif field == "INSPECTOR_SCORE":
             filtered.sort(key=lambda f: f.get("inspectorScore", 0), reverse=(order == "DESC"))
 
@@ -705,7 +707,7 @@ def _list_coverage(data, account_id):
         if scan_status_filter:
             filtered = []
             for cov in all_coverage:
-                status_code = cov.get("scanStatus", {}).get("code", "")
+                status_code = cov.get("scanStatus", {}).get("statusCode", "")
                 for cond in scan_status_filter:
                     comparison = cond.get("comparison", "EQUALS")
                     value = cond.get("value", "")
@@ -734,7 +736,7 @@ def _list_coverage_statistics(data, account_id):
 
     for cov in all_coverage:
         rt = cov.get("resourceType", "UNKNOWN")
-        sc = cov.get("scanStatus", {}).get("code", "UNKNOWN")
+        sc = cov.get("scanStatus", {}).get("statusCode", "UNKNOWN")
         counts_by_resource[rt] = counts_by_resource.get(rt, 0) + 1
         counts_by_scan[sc] = counts_by_scan.get(sc, 0) + 1
 
@@ -812,20 +814,20 @@ def _search_vulnerabilities(data, account_id):
                     "source": pvd.get("source", ""),
                     "description": f.get("description", ""),
                     "vendorSeverity": pvd.get("vendorSeverity", ""),
-                    "vendorCreatedAt": pvd.get("vendorCreatedAt", _now_iso()),
-                    "vendorUpdatedAt": pvd.get("vendorUpdatedAt", _now_iso()),
+                    "vendorCreatedAt": pvd.get("vendorCreatedAt", _now()),
+                    "vendorUpdatedAt": pvd.get("vendorUpdatedAt", _now()),
                     "sourceUrl": pvd.get("sourceUrl", ""),
                     "referenceUrls": pvd.get("referenceUrls", []),
                     "relatedVulnerabilities": pvd.get("relatedVulnerabilities", []),
                     "atigData": {
-                        "firstSeen": pvd.get("vendorCreatedAt", _now_iso()),
-                        "lastSeen": pvd.get("vendorUpdatedAt", _now_iso()),
+                        "firstSeen": pvd.get("vendorCreatedAt", _now()),
+                        "lastSeen": pvd.get("vendorUpdatedAt", _now()),
                     },
                     "cvss4": {"baseScore": base_score, "scoringVector": scoring_vector},
                     "cvss3": {"baseScore": base_score, "scoringVector": scoring_vector},
                     "cvss2": {"baseScore": 0.0, "scoringVector": ""},
-                    "cisaData": {"dateAdded": _now_iso(), "dateDue": _now_iso(), "action": ""},
-                    "exploitObserved": {"lastSeen": _now_iso(), "firstSeen": _now_iso()},
+                    "cisaData": {"dateAdded": _now(), "dateDue": _now(), "action": ""},
+                    "exploitObserved": {"lastSeen": _now(), "firstSeen": _now()},
                     "detectionPlatforms": [],
                     "epss": {"score": 0.0},
                     "cwes": [],
@@ -925,15 +927,19 @@ def _create_filter(data, account_id):
     if name in _filters[account_id]:
         return error_response_json("ConflictException", f"Filter {name} already exists", 409)
 
+    now = _now()
     filt = {
         "arn": _filter_arn(account_id, name),
+        "ownerId": account_id,
         "name": name,
         "action": action,
-        "findingCriteria": filter_criteria,
+        "criteria": filter_criteria,
         "description": description,
+        "createdAt": now,
+        "updatedAt": now,
     }
     _filters[account_id][name] = filt
-    return json_response(filt)
+    return json_response({"arn": filt["arn"]})
 
 
 def _list_filters(data, account_id):
@@ -1240,6 +1246,45 @@ def _restore_state(data):
     ):
         _restore_regional_bucket(store, data.get(state_key, {}))
     _restore_account_bucket(_tags, data.get("tags", {}))
+    for store in (_findings, _coverage, _scan_history, _filters):
+        for value in store._data.values():
+            _migrate_legacy_shapes(value)
+
+
+_TIMESTAMP_KEYS = frozenset({
+    "pushedAt", "lastModifiedAt", "launchedAt", "firstObservedAt", "lastObservedAt",
+    "updatedAt", "createdAt", "vendorCreatedAt", "vendorUpdatedAt", "lastScanAt",
+    "lastScannedAt", "firstSeen", "lastSeen", "dateAdded", "dateDue",
+})
+
+
+def _migrate_legacy_shapes(node):
+    """State saved before timestamps were epoch seconds, ``scanStatus`` used
+    ``statusCode`` and filters kept ``criteria``, ``ownerId`` and timestamps."""
+    if isinstance(node, list):
+        for item in node:
+            _migrate_legacy_shapes(item)
+        return
+    if not isinstance(node, dict):
+        return
+    for key, value in list(node.items()):
+        if key in _TIMESTAMP_KEYS and isinstance(value, str):
+            try:
+                node[key] = int(datetime.datetime.fromisoformat(value).timestamp())
+            except ValueError:
+                pass
+        else:
+            _migrate_legacy_shapes(value)
+    status = node.get("scanStatus")
+    if isinstance(status, dict) and "code" in status:
+        status["statusCode"] = status.pop("code")
+        if status.get("reason") == "INITIAL_SCAN_COMPLETE":
+            status["reason"] = "SUCCESSFUL"
+    if "findingCriteria" in node and "arn" in node:
+        node["criteria"] = node.pop("findingCriteria")
+        node.setdefault("ownerId", node["arn"].split(":")[4])
+        node.setdefault("createdAt", _now())
+        node.setdefault("updatedAt", node["createdAt"])
 
 
 def _restore_regional_bucket(store, restored):

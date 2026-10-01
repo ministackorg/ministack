@@ -6,6 +6,8 @@ ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 
 FROM python:3.13-alpine AS builder
 
+# awscli 1.45.x pins botocore exactly and 1.46 bundles its own copy (~120 MB),
+# so the CLI is installed without deps and runs on the botocore pinned here.
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
         "cbor2>=5.4.0" \
@@ -18,7 +20,11 @@ RUN pip install --no-cache-dir --no-compile \
         "boto3>=1.34" \
         "jsonata-python>=0.7.0" \
         "graphql-core==3.2.12" \
-        "awscli==1.45.63"
+        "botocore==1.43.106" \
+        "docutils>=0.18.1,<=0.19" \
+        "colorama>=0.2.5,<0.4.7" \
+        "rsa>=3.1.2,<4.8" \
+    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.63
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
 RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \

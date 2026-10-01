@@ -36,6 +36,7 @@ import ministack.services.dynamodb as _dynamodb
 import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
+import ministack.services.elasticache as _ec
 import ministack.services.eventbridge as _eb
 import ministack.services.firehose as _firehose
 import ministack.services.glue as _glue
@@ -718,6 +719,20 @@ _CUSTOM_NAME_REPLACEMENT = {
         "requires_replacement": lambda old, new: (
             old.get("Scope", "REGIONAL") != new.get("Scope", "REGIONAL")
         ),
+    },
+    # "Update requires: Replacement" in the template reference, the name
+    # itself aside.
+    "AWS::ElastiCache::CacheCluster": {
+        "name": "ClusterName",
+        "requires_replacement": lambda old, new: _ec_cluster_requires_replacement(old, new),
+    },
+    "AWS::ElastiCache::ReplicationGroup": {
+        "name": "ReplicationGroupId",
+        "requires_replacement": lambda old, new: _ec_rg_requires_replacement(old, new),
+    },
+    "AWS::ElastiCache::User": {
+        "name": "UserId",
+        "requires_replacement": lambda old, new: old.get("UserName") != new.get("UserName"),
     },
     # Type and WorkflowName are "Update requires: Replacement" in the
     # aws-resource-glue-trigger reference.
@@ -2736,6 +2751,7 @@ def _appconfig_application_update(physical_id, old_props, new_props, stack_name,
 def _appconfig_application_delete(physical_id, props):
     _appconfig._applications.pop(physical_id, None)
     _appconfig._tags.pop(_appconfig._app_arn(physical_id), None)
+    _appconfig._drop_deployments(f"{physical_id}/")
 
 
 # --- AppConfig Environment ---
@@ -2797,6 +2813,7 @@ def _appconfig_environment_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._environments.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._env_arn(app_id, physical_id), None)
+    _appconfig._drop_deployments(f"{app_id}/{physical_id}/")
 
 
 # --- AppConfig ConfigurationProfile ---
@@ -2873,6 +2890,7 @@ def _appconfig_configuration_profile_update(physical_id, old_props, new_props,
 def _appconfig_configuration_profile_delete(physical_id, props):
     app_id = props.get("ApplicationId", "")
     _appconfig._config_profiles.pop(f"{app_id}/{physical_id}", None)
+    _appconfig._hosted_version_counters.pop(f"{app_id}/{physical_id}", None)
     _appconfig._tags.pop(_appconfig._profile_arn(app_id, physical_id), None)
 
 
@@ -2890,20 +2908,16 @@ def _appconfig_hosted_version_create(logical_id, props, stack_name):
     # CDK / Fn::ToJsonString may pass parsed JSON; AWS wire shape is a string.
     if isinstance(content, (dict, list)):
         content = json.dumps(content)
-    existing = [
-        v for k, v in _appconfig._hosted_versions.items()
-        if k.startswith(f"{app_id}/{profile_id}/")
-    ]
-    version_number = len(existing) + 1
     # AWS optimistic-concurrency: if LatestVersionNumber is supplied, it must
-    # match the most-recent version_number — otherwise reject with a
+    # match the most-recent existing version — otherwise reject with a
     # ConflictException-shape error (mirrors real AppConfig's lock check).
+    latest = _appconfig._latest_hosted_version_number(app_id, profile_id)
     latest_lock = props.get("LatestVersionNumber")
-    if latest_lock is not None and int(latest_lock) != version_number - 1:
+    if latest_lock is not None and int(latest_lock) != latest:
         raise ValueError(
-            f"AWS::AppConfig::HostedConfigurationVersion LatestVersionNumber "
-            f"mismatch: supplied {latest_lock}, current latest is {version_number - 1}"
+            f"Expected latest version {latest_lock} does not match actual latest version {latest}"
         )
+    version_number = _appconfig._next_hosted_version_number(app_id, profile_id)
     _appconfig._hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = {
         "ApplicationId": app_id,
         "ConfigurationProfileId": profile_id,
@@ -3036,18 +3050,6 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
     # value on the AWS CFN page; we return the deploy_num as the physical id
     # so CDK templates that Ref a Deployment still resolve.
     return str(deploy_num), {"DeploymentNumber": deploy_num, "State": "COMPLETE"}
-
-
-def _appconfig_deployment_delete(physical_id, props):
-    app_id = props.get("ApplicationId", "")
-    env_id = props.get("EnvironmentId", "")
-    _appconfig._deployments.pop(f"{app_id}/{env_id}/{physical_id}", None)
-    deploy_arn = (
-        f"arn:aws:appconfig:{_appconfig.get_region()}:"
-        f"{_appconfig.get_account_id()}:application/{app_id}/"
-        f"environment/{env_id}/deployment/{physical_id}"
-    )
-    _appconfig._tags.pop(deploy_arn, None)
 
 
 # --- CloudWatch Logs LogGroup ---
@@ -3767,7 +3769,7 @@ def _cfn_wait_condition_create(logical_id, props, stack_name):
     a FAILURE signal arrived, or the timeout passed. With a ``CreationPolicy``
     the signals come through SignalResource only; otherwise through the
     handle's URL (and SignalResource). Runs on a worker thread (see
-    ``_is_custom_resource`` in stacks.py)."""
+    ``_runs_on_worker_thread`` in stacks.py)."""
     from ministack.services.cloudformation import wait_conditions as _wc
     stack_id = _cr_stack_id(stack_name)
     res_def = _cfn_wait_condition_definition(stack_name, logical_id)
@@ -6668,6 +6670,18 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+def _codebuild_cfn_to_api(value):
+    """Spell a Source, Artifacts or Environment property the way the CodeBuild
+    API does. The template PascalCases the API's camelCase members (Type,
+    Image, EnvironmentVariables, ...) and calls the inline build spec BuildSpec
+    where the API has ``buildspec``; the build runner reads the API names.
+    """
+    value = _pascal_to_camel(value)
+    if isinstance(value, dict) and "buildSpec" in value:
+        value["buildspec"] = value.pop("buildSpec")
+    return value
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -6678,14 +6692,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _codebuild_cfn_to_api(props.get("Source", {"type": "NO_SOURCE"})),
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
+        "artifacts": _codebuild_cfn_to_api(props.get("Artifacts", {"type": "NO_ARTIFACTS"})),
+        "environment": _codebuild_cfn_to_api(props.get("Environment", {
             "type": "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        })),
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -7377,11 +7391,19 @@ def _ec2_vpc_gw_attachment(props):
             {"VpcId": vpc_id, "State": "available"}, f"IGW|{vpc_id}")
 
 
-def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
-    """Attach the gateway; a replaced attachment stays until its own delete."""
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name, replacing=False):
+    """Attach the gateway; a replaced attachment stays until its own delete.
+
+    An internet gateway attaches to one VPC at a time. CloudFormation ignores
+    AttachInternetGateway's Resource.AlreadyAssociated, so a gateway already on
+    another VPC stays there; only this resource's own replacement may briefly
+    hold both until the old attachment is deleted.
+    """
     gateway, attachment, physical_id = _ec2_vpc_gw_attachment(props)
     if gateway:
         _ec2_vpc_gw_attach_delete(physical_id, props)
+        if gateway.get("InternetGatewayId") and gateway["Attachments"] and not replacing:
+            return physical_id, {}
         gateway["Attachments"].append(attachment)
     return physical_id, {}
 
@@ -7391,7 +7413,8 @@ def _ec2_vpc_gw_attach_update(physical_id, old_props, new_props, stack_name, log
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         _ec2_vpc_gw_attachment(new_props)[2], _ec2_vpc_gw_attachment(old_props)[2],
-        _ec2_vpc_gw_attach_create, _ec2_vpc_gw_attach_delete,
+        lambda lid, props, stack: _ec2_vpc_gw_attach_create(lid, props, stack, replacing=True),
+        _ec2_vpc_gw_attach_delete,
     )
     if replaced is not None:
         return replaced
@@ -7613,11 +7636,8 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "revision": revision,
         "status": "ACTIVE",
         "containerDefinitions": _normalize_container_defs(props.get("ContainerDefinitions", [])),
-        "requiresCompatibilities": compat,
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
         "networkMode": props.get("NetworkMode", "bridge"),
-        "cpu": props.get("Cpu", "256"),
-        "memory": props.get("Memory", "512"),
         "executionRoleArn": props.get("ExecutionRoleArn", ""),
         "taskRoleArn": props.get("TaskRoleArn", ""),
         "volumes": props.get("Volumes", []),
@@ -7627,6 +7647,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "registeredAt": now_iso(),
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
+    for prop, key in (("RequiresCompatibilities", "requiresCompatibilities"), ("Cpu", "cpu"),
+                      ("Memory", "memory")):
+        if prop in props:
+            td[key] = props[prop]
     _ecs._task_defs[td_key] = td
     _ecs._task_def_latest[family] = revision
     return arn, {"TaskDefinitionArn": arn}
@@ -7655,8 +7679,8 @@ def _ecs_service_create(logical_id, props, stack_name):
         "taskDefinition": props.get("TaskDefinition", ""),
         "desiredCount": props.get("DesiredCount", 1),
         "launchType": props.get("LaunchType", "EC2"),
-        "loadBalancers": props.get("LoadBalancers", []),
-        "networkConfiguration": props.get("NetworkConfiguration", {}),
+        "loadBalancers": _pascal_to_camel(props.get("LoadBalancers") or []),
+        "networkConfiguration": _pascal_to_camel(props.get("NetworkConfiguration") or {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
     }
     deployment_configuration = _ecs_deployment_configuration(props)
@@ -7683,7 +7707,7 @@ def _ecs_service_update(physical_id, old_props, new_props, stack_name):
     }
     for cf_property, ecs_property in property_map.items():
         if new_props.get(cf_property) != old_props.get(cf_property):
-            request[ecs_property] = new_props.get(cf_property)
+            request[ecs_property] = _pascal_to_camel(new_props.get(cf_property))
 
     if (new_props.get("DeploymentConfiguration")
             != old_props.get("DeploymentConfiguration")):
@@ -10760,13 +10784,468 @@ def _firehose_delivery_stream_delete(physical_id, props):
     _firehose._delete_delivery_stream({"DeliveryStreamName": physical_id})
 
 
+# --- ElastiCache subnet groups, parameter groups, clusters, replication
+#     groups, users and user groups (#1874) ---
+# Each type goes through elasticache.py's own query-protocol functions, so a
+# stack's cluster or replication group gets the same container-backed endpoint
+# CreateCacheCluster / CreateReplicationGroup return. Replacement follows the
+# template reference's "Update requires"; every other property updates in
+# place through the matching Modify call, which, like the API, ignores the
+# members MiniStack does not model. Ref is the resource name for every type.
+
+# A cluster created while its image is still being pulled reports `creating`
+# and publishes its endpoint when the container starts; CloudFormation waits
+# for `available` before the resource completes.
+_EC_AVAILABLE_TIMEOUT = 300
+
+
+def _ec_query(props, renames=None):
+    """Flatten template properties into the query parameters elasticache.py
+    reads: lists as ``.member.N``, structures as ``.Member``, booleans as
+    ``true`` / ``false``."""
+    out = {}
+
+    def put(key, value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                put(f"{key}.{k}", v)
+        elif isinstance(value, list):
+            for i, v in enumerate(value, 1):
+                put(f"{key}.member.{i}", v)
+        elif isinstance(value, bool):
+            out[key] = str(value).lower()
+        elif value is not None:
+            out[key] = str(value)
+
+    for key, value in props.items():
+        put((renames or {}).get(key, key), value)
+    return out
+
+
+def _ec_call(fn, params, resource_type, action):
+    _ec._seed_default_param_groups()
+    status, _headers, body = fn(params)
+    if status >= 400:
+        text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+        code = re.search(r"<Code>(.*?)</Code>", text)
+        message = re.search(r"<Message>(.*?)</Message>", text, re.S)
+        raise ValueError(
+            f"{resource_type} {action} failed: "
+            f"{code.group(1) if code else status}: {message.group(1) if message else text}")
+
+
+def _ec_sync_tags(arn, old_props, new_props, resource_type):
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
+        _ec_call(_ec._remove_tags, {"ResourceName": arn, **_ec_query({"TagKeys": removed})},
+                 resource_type, "untag")
+    changed = {k: v for k, v in new_tags.items() if old_tags.get(k) != v}
+    if changed:
+        _ec_call(_ec._add_tags, {"ResourceName": arn, **_ec_query({
+            "Tags": [{"Key": k, "Value": v} for k, v in changed.items()]})},
+            resource_type, "tag")
+
+
+def _ec_changed(old_props, new_props, names):
+    return {k: new_props[k] for k in names
+            if k in new_props and new_props.get(k) != old_props.get(k)}
+
+
+# SubnetGroup ---------------------------------------------------------------
+
+def _ec_subnet_group_create(logical_id, props, stack_name):
+    name = props.get("CacheSubnetGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _ec_call(_ec._create_subnet_group, {
+        "CacheSubnetGroupName": name,
+        **_ec_query({"CacheSubnetGroupDescription": props.get("Description", ""),
+                     "SubnetIds": props.get("SubnetIds") or []}),
+    }, "AWS::ElastiCache::SubnetGroup", "create")
+    _ec_sync_tags(_ec._arn_subnet_group(name), {}, props, "AWS::ElastiCache::SubnetGroup")
+    return name, {}
+
+
+def _ec_subnet_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = new_props.get("CacheSubnetGroupName") or _physical_name(
+        stack_name, logical_id or physical_id, lowercase=True, max_len=255)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name,
+        physical_id if physical_id in _ec._subnet_groups else None,
+        _ec_subnet_group_create, _ec_subnet_group_delete)
+    if replaced:
+        return replaced
+    _ec_call(_ec._modify_subnet_group, {
+        "CacheSubnetGroupName": name,
+        **_ec_query({"CacheSubnetGroupDescription": new_props.get("Description", ""),
+                     "SubnetIds": new_props.get("SubnetIds") or []}),
+    }, "AWS::ElastiCache::SubnetGroup", "update")
+    _ec_sync_tags(_ec._arn_subnet_group(name), old_props, new_props,
+                  "AWS::ElastiCache::SubnetGroup")
+    return name, {}
+
+
+def _ec_subnet_group_delete(physical_id, props):
+    _ec._delete_subnet_group({"CacheSubnetGroupName": physical_id})
+
+
+# ParameterGroup ------------------------------------------------------------
+# CacheParameterGroupName is read-only in the schema: the name is always
+# generated.
+
+def _ec_parameter_values(names_values):
+    return _ec_query({"ParameterNameValues": [
+        {"ParameterName": k, "ParameterValue": v} for k, v in names_values.items()
+    ]}) if names_values else {}
+
+
+def _ec_parameter_group_query(params):
+    # elasticache.py reads ParameterNameValues.ParameterNameValue.N, the
+    # member name of the API's ParameterNameValueList.
+    return {k.replace("ParameterNameValues.member.", "ParameterNameValues.ParameterNameValue."): v
+            for k, v in params.items()}
+
+
+def _ec_parameter_group_create(logical_id, props, stack_name):
+    name = _physical_name(stack_name, logical_id, lowercase=True, max_len=255)
+    _ec_call(_ec._create_param_group, {
+        "CacheParameterGroupName": name,
+        **_ec_query({"CacheParameterGroupFamily": props.get("CacheParameterGroupFamily", ""),
+                     "Description": props.get("Description", "")}),
+    }, "AWS::ElastiCache::ParameterGroup", "create")
+    values = {str(k): str(v) for k, v in (props.get("Properties") or {}).items()}
+    if values:
+        _ec_call(_ec._modify_cache_parameter_group, {
+            "CacheParameterGroupName": name,
+            **_ec_parameter_group_query(_ec_parameter_values(values)),
+        }, "AWS::ElastiCache::ParameterGroup", "create")
+    _ec_sync_tags(_ec._arn_param_group(name), {}, props, "AWS::ElastiCache::ParameterGroup")
+    return name, {"CacheParameterGroupName": name}
+
+
+def _ec_parameter_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if (physical_id not in _ec._param_groups
+            or old_props.get("CacheParameterGroupFamily") != new_props.get("CacheParameterGroupFamily")):
+        # CacheParameterGroupFamily is the type's create-only property. The
+        # generated name does not change, so the old group goes first.
+        if physical_id in _ec._param_groups:
+            _ec_parameter_group_delete(physical_id, old_props)
+        return _ec_parameter_group_create(logical_id or physical_id, new_props, stack_name)
+    old_values = {str(k): str(v) for k, v in (old_props.get("Properties") or {}).items()}
+    new_values = {str(k): str(v) for k, v in (new_props.get("Properties") or {}).items()}
+    changed = {k: v for k, v in new_values.items() if old_values.get(k) != v}
+    if changed:
+        _ec_call(_ec._modify_cache_parameter_group, {
+            "CacheParameterGroupName": physical_id,
+            **_ec_parameter_group_query(_ec_parameter_values(changed)),
+        }, "AWS::ElastiCache::ParameterGroup", "update")
+    dropped = sorted(old_values.keys() - new_values.keys())
+    if dropped:
+        # A parameter the template no longer sets goes back to its default.
+        _ec_call(_ec._reset_cache_parameter_group, {
+            "CacheParameterGroupName": physical_id,
+            **_ec_parameter_group_query(_ec_parameter_values({k: "" for k in dropped})),
+        }, "AWS::ElastiCache::ParameterGroup", "update")
+    if new_props.get("Description") != old_props.get("Description"):
+        # ModifyCacheParameterGroup has no description member.
+        _ec._param_groups[physical_id]["Description"] = new_props.get("Description", "")
+    _ec_sync_tags(_ec._arn_param_group(physical_id), old_props, new_props,
+                  "AWS::ElastiCache::ParameterGroup")
+    return physical_id, {"CacheParameterGroupName": physical_id}
+
+
+def _ec_parameter_group_delete(physical_id, props):
+    _ec._delete_param_group({"CacheParameterGroupName": physical_id})
+
+
+# CacheCluster --------------------------------------------------------------
+
+_EC_CLUSTER_MODIFIABLE = (
+    "AZMode", "AutoMinorVersionUpgrade", "CacheNodeType", "CacheParameterGroupName",
+    "CacheSecurityGroupNames", "EngineVersion", "IpDiscovery", "LogDeliveryConfigurations",
+    "NotificationTopicArn", "NumCacheNodes", "PreferredAvailabilityZones",
+    "PreferredMaintenanceWindow", "SnapshotRetentionLimit", "SnapshotWindow",
+    "TransitEncryptionEnabled", "VpcSecurityGroupIds",
+)
+# CacheClusterId is ClusterName in the template; the API's SecurityGroupIds
+# is VpcSecurityGroupIds.
+_EC_CLUSTER_RENAMES = {"ClusterName": "CacheClusterId", "VpcSecurityGroupIds": "SecurityGroupIds"}
+
+
+def _ec_wait_available(records, record_id, status_key, resource_type):
+    deadline = time.time() + _EC_AVAILABLE_TIMEOUT
+    while True:
+        rec = records.get(record_id)
+        status = rec.get(status_key) if rec else None
+        if status != "creating":
+            break
+        if time.time() >= deadline:
+            raise ValueError(f"{resource_type} {record_id} did not become available "
+                             f"within {_EC_AVAILABLE_TIMEOUT:.0f}s")
+        time.sleep(0.5)
+    if rec is None or status == "create-failed":
+        raise ValueError(f"{resource_type} {record_id} failed to start")
+    return rec
+
+
+def _ec_cluster_requires_replacement(old, new):
+    # NumCacheNodes replaces when no Availability Zone was given before or now.
+    no_azs = not any(p.get(k) for p in (old, new)
+                     for k in ("PreferredAvailabilityZone", "PreferredAvailabilityZones"))
+    return (any(old.get(p) != new.get(p) for p in (
+                "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName",
+                "Engine", "NetworkType"))
+            or (no_azs and int(old.get("NumCacheNodes") or 1) != int(new.get("NumCacheNodes") or 1)))
+
+
+def _ec_cluster_attrs(cluster_id):
+    rec = _ec._clusters.get(cluster_id) or {}
+    ep = rec.get("_endpoint") or {}
+    address, port = ep.get("Address", ""), str(ep.get("Port", ""))
+    attrs = {"Id": cluster_id}
+    # RedisEndpoint for Valkey / Redis OSS; ConfigurationEndpoint is the
+    # Memcached cluster's. Either one is absent on the other engine, so a
+    # GetAtt on it fails, as the reference says.
+    if rec.get("Engine") == "memcached":
+        attrs["ConfigurationEndpoint.Address"] = address
+        attrs["ConfigurationEndpoint.Port"] = port
+    else:
+        attrs["RedisEndpoint.Address"] = address
+        attrs["RedisEndpoint.Port"] = port
+    return attrs
+
+
+def _ec_cluster_name(logical_id, props, stack_name):
+    return props.get("ClusterName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=50)
+
+
+def _ec_cluster_create(logical_id, props, stack_name):
+    name = _ec_cluster_name(logical_id, props, stack_name)
+    params = _ec_query({**props, "ClusterName": name}, _EC_CLUSTER_RENAMES)
+    _ec_call(_ec._create_cache_cluster, params, "AWS::ElastiCache::CacheCluster", "create")
+    _ec_wait_available(_ec._clusters, name, "CacheClusterStatus", "AWS::ElastiCache::CacheCluster")
+    return name, _ec_cluster_attrs(name)
+
+
+def _ec_cluster_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    name = _ec_cluster_name(logical_id or physical_id, new_props, stack_name)
+    current = physical_id if physical_id in _ec._clusters else None
+    if current is not None and name == physical_id and _requires_replacement(
+            "AWS::ElastiCache::CacheCluster", old_props, new_props):
+        # A create-only change under a generated name: the replacement takes
+        # the same name back, so the old cluster goes first.
+        _ec_cluster_delete(physical_id, old_props)
+        return _ec_cluster_create(logical_id or physical_id, new_props, stack_name)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, name, current,
+        _ec_cluster_create, _ec_cluster_delete)
+    if replaced:
+        return replaced
+    changed = _ec_changed(old_props, new_props, _EC_CLUSTER_MODIFIABLE)
+    if changed:
+        _ec_call(_ec._modify_cache_cluster, {
+            "CacheClusterId": name, **_ec_query(changed, _EC_CLUSTER_RENAMES)},
+            "AWS::ElastiCache::CacheCluster", "update")
+    _ec_sync_tags(_ec._arn_cluster(name), old_props, new_props, "AWS::ElastiCache::CacheCluster")
+    return name, _ec_cluster_attrs(name)
+
+
+def _ec_cluster_delete(physical_id, props):
+    _ec._delete_cache_cluster({"CacheClusterId": physical_id})
+
+
+# ReplicationGroup ----------------------------------------------------------
+
+_EC_RG_MODIFIABLE = (
+    "AutoMinorVersionUpgrade", "AutomaticFailoverEnabled", "CacheNodeType",
+    "CacheParameterGroupName", "ClusterMode", "Engine", "EngineVersion", "IpDiscovery",
+    "LogDeliveryConfigurations", "MultiAZEnabled", "NotificationTopicArn",
+    "PreferredMaintenanceWindow", "PrimaryClusterId", "ReplicationGroupDescription",
+    "SecurityGroupIds", "SnapshotRetentionLimit", "SnapshotWindow", "SnapshottingClusterId",
+    "TransitEncryptionEnabled", "TransitEncryptionMode", "AuthToken",
+)
+
+
+def _ec_rg_requires_replacement(old, new):
+    # The schema's createOnlyProperties, plus its conditional ones: adding an
+    # AuthToken and changing NodeGroupConfiguration replace the group. The
+    # reference also replaces on a NumNodeGroups change unless the
+    # UseOnlineResharding update policy is set, which a handler cannot see.
+    fixed = ("AtRestEncryptionEnabled", "CacheSubnetGroupName", "DataTieringEnabled",
+             "GlobalReplicationGroupId", "KmsKeyId", "NetworkType", "Port",
+             "PreferredCacheClusterAZs", "SnapshotArns", "SnapshotName",
+             "NodeGroupConfiguration")
+    return (any(old.get(p) != new.get(p) for p in fixed)
+            or (not old.get("AuthToken") and bool(new.get("AuthToken")))
+            or int(old.get("NumNodeGroups") or 1) != int(new.get("NumNodeGroups") or 1))
+
+
+def _ec_rg_attrs(rg_id):
+    rg = _ec._replication_groups.get(rg_id) or {}
+    attrs = {}
+    groups = rg.get("NodeGroups") or []
+    if rg.get("ConfigurationEndpoint"):
+        # Only a clustered group has a configuration endpoint; GetAtt on it
+        # fails otherwise, as the reference says.
+        attrs["ConfigurationEndPoint.Address"] = rg["ConfigurationEndpoint"].get("Address", "")
+        attrs["ConfigurationEndPoint.Port"] = str(rg["ConfigurationEndpoint"].get("Port", ""))
+    elif groups:
+        primary = groups[0].get("PrimaryEndpoint") or {}
+        reader = groups[0].get("ReaderEndpoint") or primary
+        replicas = [m.get("ReadEndpoint") or {} for m in groups[0].get("NodeGroupMembers", [])
+                    if m.get("CurrentRole") == "replica"]
+        addresses = [r.get("Address", "") for r in replicas]
+        ports = [str(r.get("Port", "")) for r in replicas]
+        attrs.update({
+            "PrimaryEndPoint.Address": primary.get("Address", ""),
+            "PrimaryEndPoint.Port": str(primary.get("Port", "")),
+            "ReaderEndPoint.Address": reader.get("Address", ""),
+            "ReaderEndPoint.Port": str(reader.get("Port", "")),
+            "ReadEndPoint.Addresses": ",".join(addresses),
+            "ReadEndPoint.Ports": ",".join(ports),
+            "ReadEndPoint.AddressesList": addresses,
+            "ReadEndPoint.PortsList": ports,
+        })
+    return attrs
+
+
+def _ec_rg_id(logical_id, props, stack_name):
+    return props.get("ReplicationGroupId") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=40)
+
+
+def _ec_rg_create(logical_id, props, stack_name):
+    rg_id = _ec_rg_id(logical_id, props, stack_name)
+    _ec_call(_ec._create_replication_group,
+             _ec_query({**props, "ReplicationGroupId": rg_id}),
+             "AWS::ElastiCache::ReplicationGroup", "create")
+    return rg_id, _ec_rg_attrs(rg_id)
+
+
+def _ec_rg_replicas(props):
+    if props.get("ReplicasPerNodeGroup") is not None:
+        return int(props["ReplicasPerNodeGroup"])
+    return max(int(props.get("NumCacheClusters") or 1) - 1, 0)
+
+
+def _ec_rg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    rg_id = _ec_rg_id(logical_id or physical_id, new_props, stack_name)
+    current = physical_id if physical_id in _ec._replication_groups else None
+    if current is not None and rg_id == physical_id and _ec_rg_requires_replacement(
+            old_props, new_props):
+        # As for the cache cluster: a generated id is taken back by the
+        # replacement, so the old group goes first.
+        _ec_rg_delete(physical_id, old_props)
+        return _ec_rg_create(logical_id or physical_id, new_props, stack_name)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id, rg_id, current,
+        _ec_rg_create, _ec_rg_delete)
+    if replaced:
+        return replaced
+    changed = _ec_changed(old_props, new_props, _EC_RG_MODIFIABLE)
+    old_groups = set(old_props.get("UserGroupIds") or [])
+    new_groups = set(new_props.get("UserGroupIds") or [])
+    params = _ec_query(changed)
+    params.update(_ec_query({"UserGroupIdsToAdd": sorted(new_groups - old_groups),
+                             "UserGroupIdsToRemove": sorted(old_groups - new_groups)}))
+    if params:
+        _ec_call(_ec._modify_replication_group, {"ReplicationGroupId": rg_id, **params},
+                 "AWS::ElastiCache::ReplicationGroup", "update")
+    old_replicas, new_replicas = _ec_rg_replicas(old_props), _ec_rg_replicas(new_props)
+    if new_replicas != old_replicas:
+        fn = _ec._increase_replica_count if new_replicas > old_replicas else _ec._decrease_replica_count
+        _ec_call(fn, {"ReplicationGroupId": rg_id, "NewReplicaCount": str(new_replicas),
+                      "ApplyImmediately": "true"},
+                 "AWS::ElastiCache::ReplicationGroup", "update")
+    _ec_sync_tags(_ec._arn_replication_group(rg_id), old_props, new_props,
+                  "AWS::ElastiCache::ReplicationGroup")
+    return rg_id, _ec_rg_attrs(rg_id)
+
+
+def _ec_rg_delete(physical_id, props):
+    _ec._delete_replication_group({"ReplicationGroupId": physical_id})
+
+
+# User and UserGroup --------------------------------------------------------
+
+def _ec_user_attrs(user_id):
+    user = _ec._users.get(user_id) or {}
+    return {"Arn": user.get("ARN", _ec._arn_user(user_id)), "Status": user.get("Status", "active")}
+
+
+def _ec_user_create(logical_id, props, stack_name):
+    user_id = props.get("UserId", "")
+    _ec_call(_ec._create_user, _ec_query(props), "AWS::ElastiCache::User", "create")
+    return user_id, _ec_user_attrs(user_id)
+
+
+def _ec_user_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("UserId", ""),
+        physical_id if physical_id in _ec._users else None,
+        _ec_user_create, _ec_user_delete)
+    if replaced:
+        return replaced
+    changed = _ec_changed(old_props, new_props,
+                          ("AccessString", "AuthenticationMode", "Engine",
+                           "NoPasswordRequired", "Passwords"))
+    if changed:
+        _ec_call(_ec._modify_user, {"UserId": physical_id, **_ec_query(changed)},
+                 "AWS::ElastiCache::User", "update")
+    _ec_sync_tags(_ec._arn_user(physical_id), old_props, new_props, "AWS::ElastiCache::User")
+    return physical_id, _ec_user_attrs(physical_id)
+
+
+def _ec_user_delete(physical_id, props):
+    _ec._delete_user({"UserId": physical_id})
+
+
+def _ec_user_group_attrs(group_id):
+    group = _ec._user_groups.get(group_id) or {}
+    return {"Arn": group.get("ARN", _ec._arn_user_group(group_id)),
+            "Status": group.get("Status", "active")}
+
+
+def _ec_user_group_create(logical_id, props, stack_name):
+    group_id = props.get("UserGroupId", "")
+    _ec_call(_ec._create_user_group, _ec_query(props), "AWS::ElastiCache::UserGroup", "create")
+    return group_id, _ec_user_group_attrs(group_id)
+
+
+def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("UserGroupId", ""),
+        physical_id if physical_id in _ec._user_groups else None,
+        _ec_user_group_create, _ec_user_group_delete)
+    if replaced:
+        return replaced
+    old_users = list(old_props.get("UserIds") or [])
+    new_users = list(new_props.get("UserIds") or [])
+    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in old_users],
+                        "UserIdsToRemove": [u for u in old_users if u not in new_users]})
+    if params:
+        _ec_call(_ec._modify_user_group, {"UserGroupId": physical_id, **params},
+                 "AWS::ElastiCache::UserGroup", "update")
+    _ec_sync_tags(_ec._arn_user_group(physical_id), old_props, new_props,
+                  "AWS::ElastiCache::UserGroup")
+    return physical_id, _ec_user_group_attrs(physical_id)
+
+
+def _ec_user_group_delete(physical_id, props):
+    _ec._delete_user_group({"UserGroupId": physical_id})
+
+
 # --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
 # Each type goes through glue.py's own control-plane functions, so a stack's
 # databases and tables are the catalog Athena and the Glue API read. Crawlers
 # and jobs are records only: a stack never starts a crawl or a job run. Ref
 # is the resource name for every type except the partition, whose Ref is its
-# compound primary identifier. Create-only properties follow the published
-# registry schemas. Deletes ignore EntityNotFound, since deleting a database
+# compound primary identifier. Replacement follows the template reference's
+# "Update requires". Deletes ignore EntityNotFound, since deleting a database
 # already drops its tables and partitions.
 
 
@@ -10818,16 +11297,16 @@ def _glue_database_create(logical_id, props, stack_name):
 
 
 def _glue_database_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    # The registry schema's only create-only property is DatabaseName, and its
-    # update handler is granted glue:UpdateDatabase but neither CreateDatabase
-    # nor DeleteDatabase: a DatabaseInput change, its Name included, updates
-    # the database in place under the same Ref.
     declared = new_props.get("DatabaseName")
     if physical_id not in _glue._databases or (declared and declared != physical_id):
         created = _glue_database_create(logical_id or physical_id, new_props, stack_name)
         if physical_id in _glue._databases and created[0] != physical_id:
             _delete_predecessor(_glue_database_delete, physical_id, old_props)
         return created
+    # AWS updates by the new DatabaseInput.Name, which does not exist yet.
+    requested = (new_props.get("DatabaseInput") or {}).get("Name")
+    if not declared and requested and requested.lower() != physical_id.lower():
+        raise ValueError(f"Database {requested} not found")
     name = physical_id
     db_input = _glue_database_input(name, new_props)
     db_input.update(_glue_reset_dropped(
@@ -11278,7 +11757,9 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
 def _iot_thing_group_delete(physical_id, props):
     rec = _iot_thing_group_record(physical_id)
     if rec is not None:
-        _iot._delete_thing_group(rec["thingGroupName"])
+        resp = _iot._delete_thing_group(rec["thingGroupName"])
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ThingGroup delete failed: {resp[2]!r}")
 
 
 def _iot_policy_document(props):
@@ -11760,7 +12241,10 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            value = new_props[prop]
+            if prop in ("Source", "Artifacts", "Environment"):
+                value = _codebuild_cfn_to_api(value)
+            project[key] = value
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
@@ -11944,10 +12428,21 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
         "Description", "LicenseInfo",
     ),
-    # createOnlyProperties of the published registry schemas. Table,
-    # Partition and Connection are left out: the first replaces on a
-    # TableInput.Name change the schema does not list, and the other two have
-    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    "AWS::ElastiCache::SubnetGroup": ("CacheSubnetGroupName",),
+    "AWS::ElastiCache::ParameterGroup": ("CacheParameterGroupFamily",),
+    "AWS::ElastiCache::CacheCluster": (
+        "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName", "ClusterName",
+        "Engine", "NetworkType",
+    ),
+    "AWS::ElastiCache::ReplicationGroup": (
+        "AtRestEncryptionEnabled", "CacheSubnetGroupName", "DataTieringEnabled",
+        "GlobalReplicationGroupId", "KmsKeyId", "NetworkType", "Port",
+        "PreferredCacheClusterAZs", "ReplicationGroupId", "SnapshotArns", "SnapshotName",
+    ),
+    "AWS::ElastiCache::User": ("UserId", "UserName"),
+    "AWS::ElastiCache::UserGroup": ("UserGroupId",),
+    # Table, Partition and Connection replace on nested members
+    # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
@@ -11958,6 +12453,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
 _CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("KeySchema",),
     "AWS::Lambda::Function": ("DurableConfig",),
+    "AWS::ElastiCache::CacheCluster": ("NumCacheNodes",),
+    "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration", "NumNodeGroups"),
 }
 
 
@@ -11986,6 +12483,42 @@ _RESOURCE_HANDLERS = {
         "create": _s3_bucket_policy_create,
         "update": _s3_bucket_policy_update,
         "delete": _s3_bucket_policy_delete,
+    },
+    "AWS::ElastiCache::SubnetGroup": {
+        "create": _ec_subnet_group_create,
+        "update": _ec_subnet_group_update,
+        "update_with_logical_id": True,
+        "delete": _ec_subnet_group_delete,
+    },
+    "AWS::ElastiCache::ParameterGroup": {
+        "create": _ec_parameter_group_create,
+        "update": _ec_parameter_group_update,
+        "update_with_logical_id": True,
+        "delete": _ec_parameter_group_delete,
+    },
+    "AWS::ElastiCache::CacheCluster": {
+        "create": _ec_cluster_create,
+        "update": _ec_cluster_update,
+        "update_with_logical_id": True,
+        "delete": _ec_cluster_delete,
+    },
+    "AWS::ElastiCache::ReplicationGroup": {
+        "create": _ec_rg_create,
+        "update": _ec_rg_update,
+        "update_with_logical_id": True,
+        "delete": _ec_rg_delete,
+    },
+    "AWS::ElastiCache::User": {
+        "create": _ec_user_create,
+        "update": _ec_user_update,
+        "update_with_logical_id": True,
+        "delete": _ec_user_delete,
+    },
+    "AWS::ElastiCache::UserGroup": {
+        "create": _ec_user_group_create,
+        "update": _ec_user_group_update,
+        "update_with_logical_id": True,
+        "delete": _ec_user_group_delete,
     },
     "AWS::Glue::Database": {
         "create": _glue_database_create,
@@ -12131,7 +12664,8 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AppConfig::Deployment": {
         "create": _appconfig_deployment_create,
-        "delete": _appconfig_deployment_delete,
+        # A deleted deployment stays in ListDeployments, and its number stays taken.
+        "delete": _cfn_noop_delete,
     },
     "AWS::Logs::LogGroup": {
         "create": _cwlogs_create,

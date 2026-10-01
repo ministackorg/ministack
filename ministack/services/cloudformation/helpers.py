@@ -288,7 +288,8 @@ def _extract_string_members(params, prefix):
     protocol sends it as a list under the bare key."""
     direct = params.get(prefix)
     if isinstance(direct, list):
-        return [str(v) for v in direct]
+        # A Query-protocol empty list arrives as a bare ``Name=``.
+        return [str(v) for v in direct if v != ""]
     result = []
     i = 1
     while True:
