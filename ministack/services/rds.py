@@ -2551,8 +2551,8 @@ def _get_docker():
 
 
 def _in_container():
-    """Docker's and Podman's markers, as lambda_svc._running_in_container checks first."""
-    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
 
 
 def _get_ministack_network(docker_client):
