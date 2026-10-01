@@ -971,11 +971,16 @@ async def _authorize_request_v2(
     # there is nothing to key on and every caller would otherwise be served
     # the first caller's result.
     caching = ttl > 0 and bool(identity_source)
-    # A missing declared identity source is a 401 without invoking the
-    # Lambda — same AWS-verified shortcut apigateway_v1 uses for REST
-    # REQUEST authorizers.
-    if caching and not all_present:
-        return _jwt_unauthorized(), None
+    # A declared identity source missing from the request is a 401 without
+    # invoking the Lambda, cached or not, with AWS's compact body (observed on a
+    # deployed HTTP API). $context.* sources are not modeled, so uncached they
+    # never count as missing.
+    modeled_present, _ = _request_authorizer_identity_sources(
+        [s for s in identity_source if not str(s).startswith("$context.")],
+        headers, query_params, stage_vars,
+    )
+    if identity_source and not (all_present if caching else modeled_present):
+        return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
     identity_values = tuple(id_values)
 
     if payload_version == "1.0":
