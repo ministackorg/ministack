@@ -30,6 +30,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`. Contributed by @skialpine.
 - **IAM — condition value lists and request-tag key matching** — negated conditions now match only when none of their policy values match, so a `StringNotEquals` deny listing permitted values no longer denies one of those values. Request-tag condition keys match every tag name without regard to case, including names that differ only by case; affirmative conditions match any of those values and negated conditions match none. Comparisons of tag values keep the selected operator's case rules.
 
+- **SSM — parameter tag actions authorize the parameter named by `ResourceId`** — with `AUTH=true`, `AddTagsToResource`, `RemoveTagsFromResource`, and `ListTagsForResource` checked `Name` instead, so an exact ARN allow could fail and an exact ARN deny could be missed under a broad allow. Accepted parameter-name and ARN aliases now use the canonical parameter ARN for the IAM check. Tag authorization denials now match AWS's HTTP 400 JSON 1.1 response, including the canonical resource and explicit-deny reason.
 
 ## [1.5.19] — 2026-09-30
 
