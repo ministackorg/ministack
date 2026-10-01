@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Kinesis — active subscriptions survive retention pruning** — `SubscribeToShard` tracks its selected sequence boundary instead of a record-list offset, so removing expired records cannot skip newly appended records. The starting boundary and checkpoint are captured before streaming begins and progress remains stable through idle polls and repeated pruning.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added
