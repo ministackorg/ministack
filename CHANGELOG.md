@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **API Gateway v2 (HTTP API) — a missing identity source is a 401 without caching too** — a REQUEST authorizer's short circuit for a declared identity source missing from the request only fired with `authorizerResultTtlInSeconds` caching on; with caching off the authorizer was invoked. AWS answers `401 {"message":"Unauthorized"}` (compact JSON) without invoking it either way, as observed on a deployed HTTP API with a TTL of 0. `$context.*` identity sources, which MiniStack does not model, do not count as missing without caching.
 ### Added
 
 - **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS. Contributed by @iot-rocket.
@@ -14,6 +17,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **Cognito — `USER_SRP_AUTH` checks the password** — `PASSWORD_VERIFIER` answered random `SALT` and `SRP_B` values and accepted any response, so a wrong password, a missing `TIMESTAMP` or a disabled or unconfirmed user all got tokens. The challenge now carries SRP-6a parameters with a stable salt per user, and the response is refused with `NotAuthorizedException` unless its signature proves the stored password. `TIMESTAMP` must read `EEE MMM d HH:mm:ss z yyyy` with `UTC` or `GMT` as the zone, the signature is computed over its canonical form, `PASSWORD_CLAIM_SIGNATURE` must be base64, and a temporary password leads to `NEW_PASSWORD_REQUIRED`. A client without `ALLOW_USER_SRP_AUTH`, an unknown user under `LEGACY`, a disabled and an unconfirmed user are refused at `InitiateAuth`. The built-in `PASSWORD_VERIFIER` step of `CUSTOM_WITH_SRP` gets the same check. Contributed by @iot-rocket.
 - **Cognito — refresh tokens are checked against the pool and client** — `REFRESH_TOKEN_AUTH` (`InitiateAuth`, `AdminInitiateAuth`) and `GetTokensFromRefreshToken` issued tokens for the first user in the pool when the refresh token was malformed, from another pool or of a deleted user, and accepted a token issued to another client; they now answer `NotAuthorizedException` with the message AWS gives for each case, and the refresh token from a SAML or OIDC federated sign-in now refreshes the federated user's session. Contributed by @iot-rocket.
+- **CloudFormation — `AWS::S3Tables::TableBucket` and `AWS::S3Tables::Table` update in place** — a stack update re-ran the create, which reset the bucket's `createdAt` and rebuilt the table with a new `createdAt` and its initial metadata location, dropping committed metadata; a maintenance setting or tag change now keeps both, and a create-only table change under an unchanged name fails with the conflict AWS reports. Contributed by @iot-rocket.
 
 - **RDS — `DescribeGlobalClusters` lists clusters as `GlobalClusterMember`** — each cluster was a `<GlobalCluster>` element, so SDKs that match the list member name, such as aws-sdk-go-v2, found none. Contributed by @IamYipi.
 - **Amazon MQ — `DescribeBrokerInstanceOptions` returns `supportedEngineVersions` as strings** — they were `{"name": ...}` objects, which aws-sdk-go-v2 could not deserialize. Contributed by @IamYipi.
