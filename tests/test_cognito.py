@@ -1,10 +1,14 @@
 """Cognito tests — user pools, identity pools, OAuth2/OIDC flows, auth-code persistence."""
 
 import base64
+import datetime
+import hashlib
+import hmac
 import importlib
 import io
 import json
 import os
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -332,6 +336,26 @@ def test_cognito_initiate_auth_user_password(cognito_idp):
     assert "AccessToken" in result
     assert "IdToken" in result
     assert "RefreshToken" in result
+
+@pytest.mark.parametrize("admin", [False, True], ids=["user-password-auth", "admin-user-password-auth"])
+@pytest.mark.parametrize("password", ["GinaPass1!", "Wrong1!"], ids=["right-password", "wrong-password"])
+def test_cognito_password_auth_unconfirmed_user_is_refused(cognito_idp, admin, password):
+    """An unconfirmed user is refused before the password is checked."""
+    pid = cognito_idp.create_user_pool(PoolName="UnconfirmedPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="UnconfirmedApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.sign_up(ClientId=cid, Username="gina", Password="GinaPass1!")
+    params = {"USERNAME": "gina", "PASSWORD": password}
+    with pytest.raises(ClientError) as exc:
+        if admin:
+            cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                                            AuthParameters=params)
+        else:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)
+    assert exc.value.response["Error"]["Code"] == "UserNotConfirmedException"
+    assert exc.value.response["Error"]["Message"] == "User is not confirmed."
 
 def test_cognito_signup_and_confirm(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="SignupPool")["UserPool"]["Id"]
@@ -6902,31 +6926,89 @@ def test_custom_auth_with_srp_full_flow_issues_tokens(cognito_idp, lam):
         "DefineAuthChallenge": define_arn,
     })
 
-    step1 = cognito_idp.initiate_auth(
-        ClientId=cid,
-        AuthFlow="CUSTOM_AUTH",
-        AuthParameters={
-            "USERNAME": "user@example.com",
-            "CHALLENGE_NAME": "SRP_A",
-            "SRP_A": "ab" * 128,
-        },
-    )
-    assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
-    secret = step1["ChallengeParameters"]["SECRET_BLOCK"]
+    def respond(password):
+        a, big_a = _srp_a()
+        step1 = cognito_idp.initiate_auth(
+            ClientId=cid,
+            AuthFlow="CUSTOM_AUTH",
+            AuthParameters={
+                "USERNAME": "user@example.com",
+                "CHALLENGE_NAME": "SRP_A",
+                "SRP_A": format(big_a, "x"),
+            },
+        )
+        assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
+        return cognito_idp.respond_to_auth_challenge(
+            ClientId=cid,
+            ChallengeName="PASSWORD_VERIFIER",
+            Session=step1["Session"],
+            ChallengeResponses=_srp_responses(pid, step1["ChallengeParameters"], password, a, big_a),
+        )
 
-    step2 = cognito_idp.respond_to_auth_challenge(
-        ClientId=cid,
-        ChallengeName="PASSWORD_VERIFIER",
-        Session=step1["Session"],
-        ChallengeResponses={
-            "USERNAME": "user@example.com",
-            "PASSWORD_CLAIM_SECRET_BLOCK": secret,
-            "PASSWORD_CLAIM_SIGNATURE": "deadbeef",
-            "TIMESTAMP": "Tue Jul 28 17:40:00 UTC 2026",
-        },
-    )
-    assert "AuthenticationResult" in step2
+    step2 = respond("Pass1234!")
     assert "AccessToken" in step2["AuthenticationResult"]
+
+    # The built-in step verifies the proof like USER_SRP_AUTH does.
+    with pytest.raises(ClientError) as exc:
+        respond("Wrong1234!")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+@pytest.mark.parametrize("admin", [False, True], ids=["respond", "admin-respond"])
+@pytest.mark.parametrize("handle", ["user-srp-secret-block", "custom-with-srp-pending-verifier"])
+def test_custom_challenge_refuses_a_session_awaiting_a_password_proof(cognito_idp, lam, handle, admin):
+    """CUSTOM_CHALLENGE only answers a custom challenge: a pending PASSWORD_VERIFIER,
+    whether the USER_SRP_AUTH SECRET_BLOCK or a CUSTOM_WITH_SRP Session, is refused
+    before any trigger runs, so the answer cannot stand in for the password proof."""
+    verify_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['answerCorrect'] = True\n"
+        "    return event\n"
+    )
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    if session and session[-1].get('challengeName') == 'SRP_A':\n"
+        "        event['response']['challengeName'] = 'PASSWORD_VERIFIER'\n"
+        "    elif session and session[-1].get('challengeResult'):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    elif not session:\n"
+        "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    pid, _ = _setup_pool(cognito_idp, "CustomSrpBypassPool", {
+        "VerifyAuthChallengeResponse": _create_lambda(lam, "verify-srp-bypass", verify_handler),
+        "DefineAuthChallenge": _create_lambda(lam, "define-srp-bypass", define_handler),
+    })
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="srp-and-custom",
+        ExplicitAuthFlows=["ALLOW_USER_SRP_AUTH", "ALLOW_CUSTOM_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    srp_a = format(_srp_a()[1], "x")
+    if handle == "user-srp-secret-block":
+        started = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_SRP_AUTH",
+            AuthParameters={"USERNAME": "user@example.com", "SRP_A": srp_a})
+        session = started["ChallengeParameters"]["SECRET_BLOCK"]
+    else:
+        started = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="CUSTOM_AUTH",
+            AuthParameters={"USERNAME": "user@example.com", "CHALLENGE_NAME": "SRP_A", "SRP_A": srp_a})
+        session = started["Session"]
+    assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+
+    respond = {"ClientId": cid, "ChallengeName": "CUSTOM_CHALLENGE", "Session": session,
+               "ChallengeResponses": {"USERNAME": "user@example.com", "ANSWER": "anything"}}
+    with pytest.raises(ClientError) as exc:
+        if admin:
+            cognito_idp.admin_respond_to_auth_challenge(UserPoolId=pid, **respond)
+        else:
+            cognito_idp.respond_to_auth_challenge(**respond)
+    # No AWS measurement of this mismatch; the emulator's error for an unusable session.
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "Session does not exist"
 
 
 def test_custom_auth_define_receives_client_metadata(cognito_idp, lam):
@@ -8053,7 +8135,8 @@ def test_cognito_admin_disable_provider_deactivates_native_user(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="NativeDisablePool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
         UserPoolId=pid, ClientName="c",
-        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
+                           "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="gina", MessageAction="SUPPRESS")
     cognito_idp.admin_set_user_password(
@@ -8074,18 +8157,9 @@ def test_cognito_admin_disable_provider_deactivates_native_user(cognito_idp):
             AuthParameters={"USERNAME": "gina", "PASSWORD": "Passw0rd!"})
     assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
 
-    # SRP is password sign-in too: answering PASSWORD_VERIFIER must refuse.
-    chal = cognito_idp.initiate_auth(
-        ClientId=cid, AuthFlow="USER_SRP_AUTH",
-        AuthParameters={"USERNAME": "gina", "SRP_A": "1" * 16})
+    # SRP is password sign-in too: even a correct PASSWORD_VERIFIER must refuse.
     with pytest.raises(ClientError) as exc:
-        cognito_idp.respond_to_auth_challenge(
-            ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
-            Session=chal["Session"],
-            ChallengeResponses={"USERNAME": "gina",
-                                "PASSWORD_CLAIM_SIGNATURE": "sig",
-                                "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
-                                "TIMESTAMP": "now"})
+        _srp_sign_in(cognito_idp, pid, cid, "gina", "Passw0rd!")
     assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
 
 
@@ -8306,35 +8380,369 @@ def test_cognito_prevent_user_existence_errors_admin_directory_still_reports(cog
 def test_cognito_prevent_user_existence_errors_masks_srp_challenge(cognito_idp):
     """USER_SRP_AUTH must not leak at RespondToAuthChallenge.
 
-    This is the flow a browser SDK uses. InitiateAuth answers a
-    PASSWORD_VERIFIER challenge without resolving the user at all, so masking
-    InitiateAuth alone would leave the whole browser sign-in leaking one step
-    later, where the password proof is checked.
+    This is the flow a browser SDK uses. With ENABLED, InitiateAuth answers an
+    unknown user with a PASSWORD_VERIFIER challenge like a known one, so the
+    refusal comes one step later, where the password proof is checked.
     """
-    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+    pid, cid = _pool_with_client(cognito_idp, "ENABLED")
 
     def srp_failure(username):
-        started = cognito_idp.initiate_auth(
-            ClientId=cid, AuthFlow="USER_SRP_AUTH",
-            AuthParameters={"USERNAME": username, "SRP_A": "ab" * 32},
-        )
-        assert started["ChallengeName"] == "PASSWORD_VERIFIER"
         with pytest.raises(ClientError) as exc:
-            cognito_idp.respond_to_auth_challenge(
-                ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
-                Session=started["Session"],
-                ChallengeResponses={
-                    "USERNAME": username,
-                    "PASSWORD_CLAIM_SIGNATURE": "sig",
-                    "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
-                    "TIMESTAMP": "Mon Aug 31 00:00:00 UTC 2026",
-                },
-            )
+            _srp_sign_in(cognito_idp, pid, cid, username, "Wrong1!")
         err = exc.value.response["Error"]
         return err["Code"], err["Message"]
 
-    assert srp_failure("unknown@example.test") == (
+    assert srp_failure("unknown@example.test") == srp_failure("known@example.test") == (
         "NotAuthorizedException", "Incorrect username or password.")
+
+
+# ── USER_SRP_AUTH: PASSWORD_VERIFIER checks the proof ─────────────────────────
+
+_SRP_N = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C"
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+    16,
+)
+
+
+def _srp_pad(n):
+    return n.to_bytes(n.bit_length() // 8 + 1, "big")
+
+
+def _srp_hash(*parts):
+    return int.from_bytes(hashlib.sha256(b"".join(parts)).digest(), "big")
+
+
+def _srp_a():
+    a = secrets.randbelow(_SRP_N - 2) + 1
+    return a, pow(2, a, _SRP_N)
+
+
+def _srp_timestamp():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return f"{now:%a %b} {now.day} {now:%H:%M:%S} UTC {now:%Y}"
+
+
+def _srp_responses(pool_id, params, password, a, big_a, timestamp=None):
+    """Client side of PASSWORD_VERIFIER, as the AWS SDKs compute it."""
+    timestamp = timestamp or _srp_timestamp()
+    pool_name, user_id = pool_id.split("_", 1)[1], params["USER_ID_FOR_SRP"]
+    big_b, salt = int(params["SRP_B"], 16), int(params["SALT"], 16)
+    k = _srp_hash(_srp_pad(_SRP_N), _srp_pad(2))
+    u = _srp_hash(_srp_pad(big_a), _srp_pad(big_b))
+    x = _srp_hash(_srp_pad(salt), hashlib.sha256(f"{pool_name}{user_id}:{password}".encode()).digest())
+    s = pow(big_b - k * pow(2, x, _SRP_N), a + u * x, _SRP_N)
+    prk = hmac.new(_srp_pad(u), _srp_pad(s), hashlib.sha256).digest()
+    key = hmac.new(prk, b"Caldera Derived Key\x01", hashlib.sha256).digest()[:16]
+    msg = (pool_name + user_id).encode() + base64.b64decode(params["SECRET_BLOCK"]) + timestamp.encode()
+    return {
+        "USERNAME": user_id,
+        "TIMESTAMP": timestamp,
+        "PASSWORD_CLAIM_SECRET_BLOCK": params["SECRET_BLOCK"],
+        "PASSWORD_CLAIM_SIGNATURE": base64.b64encode(hmac.new(key, msg, hashlib.sha256).digest()).decode(),
+    }
+
+
+def _srp_sign_in(cognito_idp, pid, cid, username, password, admin=False, overrides=None):
+    """USER_SRP_AUTH end to end; an override of None drops that response key, a TIMESTAMP one is signed."""
+    a, big_a = _srp_a()
+    auth = {"AuthFlow": "USER_SRP_AUTH", "ClientId": cid,
+            "AuthParameters": {"USERNAME": username, "SRP_A": format(big_a, "x")}}
+    started = (cognito_idp.admin_initiate_auth(UserPoolId=pid, **auth) if admin
+               else cognito_idp.initiate_auth(**auth))
+    assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+    assert "Session" not in started
+    responses = _srp_responses(pid, started["ChallengeParameters"], password, a, big_a,
+                               (overrides or {}).get("TIMESTAMP"))
+    for key, value in (overrides or {}).items():
+        if value is None:
+            responses.pop(key)
+        else:
+            responses[key] = value
+    respond = {"ClientId": cid, "ChallengeName": "PASSWORD_VERIFIER", "ChallengeResponses": responses}
+    if admin:
+        return started, cognito_idp.admin_respond_to_auth_challenge(UserPoolId=pid, **respond)
+    return started, cognito_idp.respond_to_auth_challenge(**respond)
+
+
+def _srp_pool(cognito_idp, flows=("ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH")):
+    pid = cognito_idp.create_user_pool(PoolName="SrpPool", AliasAttributes=["email"])["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="srp", ExplicitAuthFlows=list(flows),
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="srp-user", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "srp@example.test"},
+                        {"Name": "email_verified", "Value": "true"}],
+    )
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="srp-user", Password="Correct1!", Permanent=True)
+    return pid, cid
+
+
+@pytest.mark.parametrize("login,admin,timestamp", [
+    ("srp-user", False, None),
+    ("srp-user", True, None),
+    ("srp@example.test", False, None),
+    # Days old and a single-digit day: no freshness check.
+    ("srp-user", False, "Sat Sep 5 15:34:45 UTC 2026"),
+])
+def test_cognito_srp_correct_password_issues_tokens(cognito_idp, login, admin, timestamp):
+    pid, cid = _srp_pool(cognito_idp)
+    started, result = _srp_sign_in(cognito_idp, pid, cid, login, "Correct1!", admin=admin,
+                                   overrides={"TIMESTAMP": timestamp} if timestamp else None)
+    params = started["ChallengeParameters"]
+    assert params["USER_ID_FOR_SRP"] == params["USERNAME"] == "srp-user"
+    assert "AccessToken" in result["AuthenticationResult"]
+
+    again = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": login, "SRP_A": format(_srp_a()[1], "x")},
+    )["ChallengeParameters"]
+    assert again["SALT"] == params["SALT"]
+    assert again["SRP_B"] != params["SRP_B"]
+
+
+@pytest.mark.parametrize("password,overrides,code,message", [
+    ("Wrong1!", {}, "NotAuthorizedException", "Incorrect username or password."),
+    ("Correct1!", {"PASSWORD_CLAIM_SIGNATURE": base64.b64encode(bytes(32)).decode()},
+     "NotAuthorizedException", "Incorrect username or password."),
+    ("Correct1!", {"PASSWORD_CLAIM_SECRET_BLOCK": base64.b64encode(bytes(32)).decode()},
+     "NotAuthorizedException", "Incorrect username or password."),
+    ("Correct1!", {"PASSWORD_CLAIM_SIGNATURE": "not!base64!!"},
+     "InvalidParameterException", "Invalid PASSWORD_CLAIM_SIGNATURE format. Must be a Base64 string."),
+    ("Correct1!", {"TIMESTAMP": None}, "InvalidParameterException", "Missing required parameter TIMESTAMP"),
+    ("Correct1!", {"PASSWORD_CLAIM_SIGNATURE": None},
+     "InvalidParameterException", "Missing required parameter PASSWORD_CLAIM_SIGNATURE"),
+    ("Correct1!", {"PASSWORD_CLAIM_SECRET_BLOCK": None},
+     "InvalidParameterException", "Missing required parameter PASSWORD_CLAIM_SECRET_BLOCK"),
+    ("Correct1!", {"USERNAME": None}, "InvalidParameterException", "Missing required parameter USERNAME"),
+    ("Correct1!", {"TIMESTAMP": "not-a-timestamp"},
+     "InvalidParameterException", "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english."),
+    ("Correct1!", {"TIMESTAMP": "Tue Sep 015 15:34:45 UTC 2026"},
+     "InvalidParameterException", "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english."),
+    # These parse, but the proof is checked over the canonical timestamp.
+    ("Correct1!", {"TIMESTAMP": "Sat Sep 05 15:34:45 UTC 2026"},
+     "NotAuthorizedException", "Incorrect username or password."),
+    ("Correct1!", {"TIMESTAMP": "Mon Sep 5 15:34:45 UTC 2026"},
+     "NotAuthorizedException", "Incorrect username or password."),
+    # AWS parses the names in any case and GMT as the zone (measured); the proof is over the canonical form.
+    ("Correct1!", {"TIMESTAMP": "wed sep 16 06:04:31 UTC 2026"},
+     "NotAuthorizedException", "Incorrect username or password."),
+    # The zone is the one part AWS reads case-sensitively (measured): lower-casing the whole
+    # stamp is a format error, while lower-casing only the names is not.
+    ("Correct1!", {"TIMESTAMP": "wed sep 16 06:04:31 utc 2026"},
+     "InvalidParameterException", "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english."),
+    ("Correct1!", {"TIMESTAMP": "Wed Sep 16 08:04:31 CEST 2026"},
+     "InvalidParameterException", "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english."),
+    ("Correct1!", {"TIMESTAMP": "Wed Sep 16 06:04:31 Z 2026"},
+     "InvalidParameterException", "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english."),
+    # Several keys missing: AWS names USERNAME, then TIMESTAMP, then the signature, then the block.
+    ("Correct1!", {"TIMESTAMP": None, "PASSWORD_CLAIM_SIGNATURE": None},
+     "InvalidParameterException", "Missing required parameter TIMESTAMP"),
+    ("Correct1!", {"TIMESTAMP": None, "PASSWORD_CLAIM_SIGNATURE": None, "PASSWORD_CLAIM_SECRET_BLOCK": None},
+     "InvalidParameterException", "Missing required parameter TIMESTAMP"),
+    ("Correct1!", {"USERNAME": None, "TIMESTAMP": None},
+     "InvalidParameterException", "Missing required parameter USERNAME"),
+    ("Correct1!", {"PASSWORD_CLAIM_SECRET_BLOCK": None, "PASSWORD_CLAIM_SIGNATURE": None},
+     "InvalidParameterException", "Missing required parameter PASSWORD_CLAIM_SIGNATURE"),
+], ids=["wrong-password", "zeroed-signature", "wrong-secret-block", "signature-not-base64",
+        "timestamp-missing", "signature-missing", "secret-block-missing", "username-missing",
+        "timestamp-malformed", "timestamp-three-digit-day", "timestamp-zero-padded-day", "timestamp-wrong-weekday",
+        "timestamp-lowercase-names", "timestamp-lowercase-zone", "timestamp-cest", "timestamp-z",
+        "timestamp-and-signature-missing",
+        "all-but-username-missing", "username-and-timestamp-missing", "signature-and-block-missing"])
+def test_cognito_srp_bad_proof_is_refused(cognito_idp, password, overrides, code, message):
+    pid, cid = _srp_pool(cognito_idp)
+    with pytest.raises(ClientError) as exc:
+        _srp_sign_in(cognito_idp, pid, cid, "srp-user", password, overrides=overrides)
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def test_cognito_srp_salt_never_starts_with_a_zero_byte():
+    """The JavaScript SDK pads the salt as an integer, pycognito as a string; a
+    leading zero byte is the one case where they disagree, so no salt has one."""
+    from ministack.services import cognito as cognito_module
+
+    seeds = [str(n) for n in range(4000)]
+    salts = [cognito_module._srp_salt(seed) for seed in seeds]
+    assert all(len(salt) == 32 and not salt.startswith("00") for salt in salts)
+    # The loop re-hashes at least once for some seed in this range, so it is exercised.
+    plain = [hashlib.sha256(f"cognito-srp-salt:{seed}".encode()).digest()[:16].hex() for seed in seeds]
+    assert any(p.startswith("00") for p in plain)
+    assert len(set(salts)) == len(salts)
+
+
+def test_cognito_srp_proof_refuses_a_non_hex_srp_a():
+    """CUSTOM_AUTH stores SRP_A as sent; the proof check answers False instead of raising."""
+    from ministack.services import cognito as cognito_module
+
+    state = {"srp_a": "zzz-not-hex", "srp_b": "2", "b": "1", "salt": "00", "secret_block": "YQ=="}
+    assert cognito_module._srp_proof_valid("eu-central-1_pool", {"Username": "u"}, state,
+                                           {"PASSWORD_CLAIM_SECRET_BLOCK": "YQ==", "TIMESTAMP": "x",
+                                            "PASSWORD_CLAIM_SIGNATURE": "YQ=="}) is False
+
+
+@pytest.mark.parametrize("flow", ["USER_SRP_AUTH", "USER_PASSWORD_AUTH", "ADMIN_USER_PASSWORD_AUTH"])
+def test_cognito_disabled_unconfirmed_user_is_refused_as_disabled(cognito_idp, flow):
+    """A user that is both UNCONFIRMED and disabled is refused as disabled in every flow (measured)."""
+    pid, cid = _srp_pool(cognito_idp, ["ALLOW_USER_SRP_AUTH", "ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH"])
+    cognito_idp.sign_up(ClientId=cid, Username="srp-both", Password="Correct1!")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="srp-both")
+    params = {"USERNAME": "srp-both"}
+    params.update({"SRP_A": format(_srp_a()[1], "x")} if flow == "USER_SRP_AUTH" else {"PASSWORD": "Correct1!"})
+    with pytest.raises(ClientError) as exc:
+        if flow == "ADMIN_USER_PASSWORD_AUTH":
+            cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow=flow, AuthParameters=params)
+        else:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow=flow, AuthParameters=params)
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert exc.value.response["Error"]["Message"] == "User is disabled."
+
+
+def test_cognito_srp_empty_challenge_responses(cognito_idp):
+    """No response key at all is its own message on AWS (measured)."""
+    pid, cid = _srp_pool(cognito_idp)
+    started = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_SRP_AUTH",
+                                        AuthParameters={"USERNAME": "srp-user", "SRP_A": format(_srp_a()[1], "x")})
+    assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="PASSWORD_VERIFIER", ChallengeResponses={})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "Missing required parameter challenge responses."
+
+
+@pytest.mark.parametrize("case,code,message", [
+    ("missing SRP_A", "InvalidParameterException", "Missing required parameter SRP_A"),
+    ("non-hex SRP_A", "InvalidParameterException",
+     "1 validation error detected: Value 'zzz-not-hex' at 'sRPA' failed to satisfy constraint: "
+     "Member must satisfy regular expression pattern: ^[0-9a-fA-F]+$"),
+    ("client without SRP", "InvalidParameterException", "USER_SRP_AUTH is not enabled for the client."),
+    ("unknown user", "UserNotFoundException", "User does not exist."),
+    ("sub as username", "UserNotFoundException", "User does not exist."),
+    ("disabled", "NotAuthorizedException", "User is disabled."),
+    ("unconfirmed", "UserNotConfirmedException", "User is not confirmed."),
+], ids=["missing-srp-a", "non-hex-srp-a", "client-without-srp", "unknown-user", "sub-as-username", "disabled", "unconfirmed"])
+def test_cognito_srp_initiate_refusals(cognito_idp, case, code, message):
+    flows = ["ALLOW_USER_PASSWORD_AUTH"] if case == "client without SRP" else ["ALLOW_USER_SRP_AUTH"]
+    pid, cid = _srp_pool(cognito_idp, flows)
+    username, srp_a = "srp-user", format(_srp_a()[1], "x")
+    if case == "missing SRP_A":
+        srp_a = None
+    elif case == "non-hex SRP_A":
+        srp_a = "zzz-not-hex"
+    elif case == "unknown user":
+        username = "ghost"
+    elif case == "sub as username":
+        attrs = cognito_idp.admin_get_user(UserPoolId=pid, Username=username)["UserAttributes"]
+        username = next(a["Value"] for a in attrs if a["Name"] == "sub")
+    elif case == "disabled":
+        cognito_idp.admin_disable_user(UserPoolId=pid, Username=username)
+    elif case == "unconfirmed":
+        username = "srp-unconfirmed"
+        cognito_idp.sign_up(ClientId=cid, Username=username, Password="Correct1!")
+    auth_params = {"USERNAME": username, **({"SRP_A": srp_a} if srp_a else {})}
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters=auth_params)
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def test_cognito_srp_challenge_answers_repeated_proofs(cognito_idp):
+    """A wrong proof does not use up the challenge, and a correct one can be sent twice."""
+    pid, cid = _srp_pool(cognito_idp)
+    a, big_a = _srp_a()
+    params = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": "srp-user", "SRP_A": format(big_a, "x")},
+    )["ChallengeParameters"]
+
+    def respond(password):
+        return cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+            ChallengeResponses=_srp_responses(pid, params, password, a, big_a),
+        )
+
+    with pytest.raises(ClientError) as exc:
+        respond("Wrong1!")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert "AccessToken" in respond("Correct1!")["AuthenticationResult"]
+    assert "AccessToken" in respond("Correct1!")["AuthenticationResult"]
+
+
+@pytest.mark.parametrize("big_a", [0, _SRP_N], ids=["srp-a-zero", "srp-a-equals-n"])
+def test_cognito_srp_degenerate_srp_a_gets_a_challenge_then_fails_the_proof(cognito_idp, big_a):
+    """AWS answers SRP_A = 0 or N with a challenge and refuses the proof (measured)."""
+    pid, cid = _srp_pool(cognito_idp)
+    started = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": "srp-user", "SRP_A": format(big_a, "x")},
+    )
+    assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+    assert "Session" not in started
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+            ChallengeResponses=_srp_responses(pid, started["ChallengeParameters"], "Correct1!", 1, big_a),
+        )
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert exc.value.response["Error"]["Message"] == "Incorrect username or password."
+
+
+@pytest.mark.parametrize("sent,signed", [
+    ("Wed Sep 16 06:04:31 GMT 2026", "Wed Sep 16 06:04:31 UTC 2026"),
+    ("wed sep 16 06:04:31 UTC 2026", "Wed Sep 16 06:04:31 UTC 2026"),
+    ("Sat Sep 05 15:34:45 UTC 2026", "Sat Sep 5 15:34:45 UTC 2026"),
+], ids=["zone-gmt", "lowercase-names", "zero-padded-day"])
+def test_cognito_srp_proof_over_the_canonical_timestamp_issues_tokens(cognito_idp, sent, signed):
+    """The accepting half of the canonical-form rule (measured): a stamp that parses but
+    differs from its canonical form is accepted when the proof is signed over that form."""
+    pid, cid = _srp_pool(cognito_idp)
+    a, big_a = _srp_a()
+    started = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": "srp-user", "SRP_A": format(big_a, "x")},
+    )
+    responses = _srp_responses(pid, started["ChallengeParameters"], "Correct1!", a, big_a, signed)
+    responses["TIMESTAMP"] = sent
+    result = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid, ChallengeName="PASSWORD_VERIFIER", ChallengeResponses=responses)
+    assert "AccessToken" in result["AuthenticationResult"]
+
+
+def test_cognito_srp_client_without_explicit_auth_flows_gets_the_challenge(cognito_idp):
+    """A client created with no ExplicitAuthFlows allows USER_SRP_AUTH (measured)."""
+    pid, _ = _srp_pool(cognito_idp)
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="no-flows")["UserPoolClient"]["ClientId"]
+    started = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": "srp-user", "SRP_A": format(_srp_a()[1], "x")},
+    )
+    assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+    assert "Session" not in started
+
+
+def test_cognito_srp_temporary_password_requires_new_password(cognito_idp):
+    pid, cid = _srp_pool(cognito_idp)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="srp-new", TemporaryPassword="Temp1234!",
+                                  MessageAction="SUPPRESS")
+    _, challenge = _srp_sign_in(cognito_idp, pid, cid, "srp-new", "Temp1234!")
+    assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    assert {"requiredAttributes", "userAttributes"} <= set(challenge["ChallengeParameters"])
+
+    done = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
+        ChallengeResponses={"USERNAME": "srp-new", "NEW_PASSWORD": "Changed1!"},
+    )
+    assert "AccessToken" in done["AuthenticationResult"]
+    _, result = _srp_sign_in(cognito_idp, pid, cid, "srp-new", "Changed1!")
+    assert "AccessToken" in result["AuthenticationResult"]
 
 
 def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
