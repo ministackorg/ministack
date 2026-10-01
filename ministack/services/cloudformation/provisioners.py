@@ -10292,8 +10292,12 @@ def _backup_plan_update(physical_id, old_props, new_props, stack_name,
     }
 
 
+def _s3tables_bucket_name(props, stack_name, logical_id):
+    return props.get("TableBucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+
+
 def _s3tables_bucket_create(logical_id, props, stack_name):
-    name = props.get("TableBucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    name = _s3tables_bucket_name(props, stack_name, logical_id)
     arn = _s3tables._bucket_arn(name)
     _s3tables._table_buckets[name] = {
         "arn": arn, "name": name,
@@ -10302,6 +10306,20 @@ def _s3tables_bucket_create(logical_id, props, stack_name):
     }
     _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
     return arn, {"TableBucketARN": arn}
+
+
+def _s3tables_bucket_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """TableBucketName replaces the bucket; the other properties keep it."""
+    name = physical_id.rsplit("/", 1)[-1]
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _s3tables_bucket_name(new_props, stack_name, logical_id or physical_id),
+        name if name in _s3tables._table_buckets else None,
+        _s3tables_bucket_create, _s3tables_bucket_delete,
+    )
+    if replaced is not None:
+        return replaced
+    return physical_id, {"TableBucketARN": physical_id}
 
 
 def _s3tables_bucket_delete(physical_id, props):
@@ -10328,10 +10346,30 @@ def _s3tables_namespace_delete(physical_id, props):
     _s3tables._namespaces.pop(_s3tables._ns_key(bucket_arn, namespace), None)
 
 
+_S3TABLES_TABLE_CREATE_ONLY = (
+    "TableBucketARN", "OpenTableFormat", "IcebergMetadata", "WithoutMetadata",
+    "StorageClassConfiguration",
+)
+
+
+def _s3tables_table_key(props):
+    return _s3tables._table_key(
+        props.get("TableBucketARN", ""), props.get("Namespace", ""), props.get("TableName", ""))
+
+
+def _s3tables_table_attrs(table):
+    return {"TableARN": table["tableARN"], "TableBucketARN": table["tableBucketARN"],
+            "WarehouseLocation": table["warehouseLocation"], "Namespace": table["namespace"][0],
+            "TableName": table["name"]}
+
+
 def _s3tables_table_create(logical_id, props, stack_name):
     bucket_arn = props.get("TableBucketARN", "")
     namespace = props.get("Namespace", "")
     table_name = props.get("TableName", "")
+    key = _s3tables_table_key(props)
+    if key in _s3tables._tables:
+        raise ValueError("A table with an identical name already exists in the namespace.")
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = f"s3://{bucket_name}/{namespace}/{table_name}"
     # IcebergMetadata.IcebergSchema.SchemaFieldList is how CFN (and CDK's
@@ -10350,7 +10388,6 @@ def _s3tables_table_create(logical_id, props, stack_name):
     iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, schema_fields, location)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
-    key = _s3tables._table_key(bucket_arn, namespace, table_name)
     _s3tables._tables[key] = {
         "name": table_name, "tableARN": table_arn, "namespace": [namespace],
         "tableBucketARN": bucket_arn, "format": "ICEBERG",
@@ -10364,16 +10401,28 @@ def _s3tables_table_create(logical_id, props, stack_name):
         if b["arn"] == bucket_arn:
             b["tableCount"] = b.get("tableCount", 0) + 1
             break
-    return table_arn, {"TableARN": table_arn, "TableBucketARN": bucket_arn,
-                       "WarehouseLocation": location, "Namespace": namespace,
-                       "TableName": table_name}
+    return table_arn, _s3tables_table_attrs(_s3tables._tables[key])
+
+
+def _s3tables_table_update(physical_id, old_props, new_props, stack_name):
+    """Compaction, SnapshotManagement and Tags keep the table; any other change replaces it."""
+    old_key = _s3tables_table_key(old_props)
+    table = _s3tables._tables.get(old_key)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, None,
+        _s3tables_table_key(new_props), old_key if table else None,
+        _s3tables_table_create, _s3tables_table_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if any(old_props.get(p) != new_props.get(p) for p in _S3TABLES_TABLE_CREATE_ONLY):
+        # The replacement is created first, so its unchanged name is refused.
+        return _s3tables_table_create(physical_id, new_props, stack_name)
+    return physical_id, _s3tables_table_attrs(table)
 
 
 def _s3tables_table_delete(physical_id, props):
-    bucket_arn = props.get("TableBucketARN", "")
-    namespace = props.get("Namespace", "")
-    table_name = props.get("TableName", "")
-    _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
+    _s3tables._tables.pop(_s3tables_table_key(props), None)
 
 
 # --- Kinesis Data Firehose DeliveryStream ---
@@ -11271,9 +11320,18 @@ _RESOURCE_HANDLERS = {
         "update": _s3_bucket_policy_update,
         "delete": _s3_bucket_policy_delete,
     },
-    "AWS::S3Tables::TableBucket": {"create": _s3tables_bucket_create, "delete": _s3tables_bucket_delete},
+    "AWS::S3Tables::TableBucket": {
+        "create": _s3tables_bucket_create,
+        "update": _s3tables_bucket_update,
+        "update_with_logical_id": True,
+        "delete": _s3tables_bucket_delete,
+    },
     "AWS::S3Tables::Namespace": {"create": _s3tables_namespace_create, "delete": _s3tables_namespace_delete},
-    "AWS::S3Tables::Table": {"create": _s3tables_table_create, "delete": _s3tables_table_delete},
+    "AWS::S3Tables::Table": {
+        "create": _s3tables_table_create,
+        "update": _s3tables_table_update,
+        "delete": _s3tables_table_delete,
+    },
     "AWS::SQS::Queue": {
         "create": _sqs_create,
         "update": _sqs_update,
