@@ -5773,6 +5773,7 @@ def _publish_version(name: str, data: dict):
     ver_record = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
+        "function_revision": func["config"].get("RevisionId"),
     }
     func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):

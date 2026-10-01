@@ -253,11 +253,7 @@ async def _create_namespace(data):
     ns_name = data.get("Name")
     if not ns_name:
         return error_response_json("InvalidInput", "Name is required", 400)
-    for existing in _namespaces.values():
-        if existing["Name"] == ns_name:
-            return error_response_json("NamespaceAlreadyExists", f"Namespace {ns_name} already exists", 409)
 
-    ns_id = f"ns-{new_uuid()[:8]}"
     action = data.get("_action", "")
 
     # Infer namespace type from action; fallback uses request fields.
@@ -284,61 +280,71 @@ async def _create_namespace(data):
     elif is_http:
         ns_type = "HTTP"
 
+    soa = ((data.get("Properties") or {}).get("DnsProperties") or {}).get("SOA") or {}
+    namespace, err = _create_namespace_record(
+        ns_name, ns_type, data.get("Description"), data.get("Tags", []), soa.get("TTL")
+    )
+    if err:
+        return err
+
+    op_id = _create_operation("CREATE_NAMESPACE", {"NAMESPACE": namespace["Id"]})
+    return json_response({"OperationId": op_id})
+
+
+def _create_namespace_record(name, ns_type, description=None, tags=None, soa_ttl=None):
+    """Create a namespace and, for a DNS type, its hosted zone. Returns
+    (namespace, None), or (None, error response) for the caller to return.
+    Synchronous so the CloudFormation provisioners can call it."""
+    for existing in _namespaces.values():
+        if existing["Name"] == name:
+            return None, error_response_json("NamespaceAlreadyExists", f"Namespace {name} already exists", 409)
+
+    ns_id = f"ns-{new_uuid()[:8]}"
     namespace = {
         "Id": ns_id,
         "Arn": _namespace_arn(ns_id),
-        "Name": ns_name,
+        "Name": name,
         "Type": ns_type,
-        "Description": data.get("Description"),
+        "Description": description,
         "CreateDate": int(time.time()),
     }
 
     if ns_type != "HTTP":
-        zone_name = ns_name if ns_name.endswith(".") else ns_name + "."
+        zone_name = name if name.endswith(".") else name + "."
         xml_body = f"""<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">
             <Name>{zone_name}</Name>
             <CallerReference>{new_uuid()}</CallerReference>
             <HostedZoneConfig>
                 <Comment>Created by Cloud Map</Comment>
-                <PrivateZone>{"true" if is_private else "false"}</PrivateZone>
+                <PrivateZone>{"true" if ns_type == "DNS_PRIVATE" else "false"}</PrivateZone>
             </HostedZoneConfig>
         </CreateHostedZoneRequest>"""
 
-        status, _, body = await route53.handle_request(
-            "POST",
-            "/2013-04-01/hostedzone",
-            {},
-            xml_body.encode("utf-8"),
-            {},
-        )
+        status, _, body = route53._create_hosted_zone(xml_body.encode("utf-8"), {})
         if status >= 300:
-            return error_response_json("InternalFailure", "Failed to create Route53 hosted zone", 500)
+            return None, error_response_json("InternalFailure", "Failed to create Route53 hosted zone", 500)
 
         root = ET.fromstring(body)
         zone_id_el = root.find(".//{https://route53.amazonaws.com/doc/2013-04-01/}Id")
         if zone_id_el is None or not zone_id_el.text:
-            return error_response_json("InternalFailure", "Hosted zone ID missing in Route53 response", 500)
+            return None, error_response_json("InternalFailure", "Hosted zone ID missing in Route53 response", 500)
         zone_id = zone_id_el.text.split("/")[-1]
 
-        namespace["Properties"] = {
-            "DnsProperties": {
-                "HostedZoneId": zone_id,
-            }
-        }
+        dns_properties = {"HostedZoneId": zone_id}
+        if soa_ttl is not None:
+            dns_properties["SOA"] = {"TTL": int(soa_ttl)}
+        namespace["Properties"] = {"DnsProperties": dns_properties}
     else:
         namespace["Properties"] = {
             "HttpProperties": {
-                "HttpName": ns_name,
+                "HttpName": name,
             }
         }
 
     _namespaces[ns_id] = namespace
-    tags = data.get("Tags", [])
     if tags:
         _resource_tags[namespace["Arn"]] = tags
-
-    op_id = _create_operation("CREATE_NAMESPACE", {"NAMESPACE": ns_id})
-    return json_response({"OperationId": op_id})
+    return namespace, None
 
 
 def _delete_namespace(data):
@@ -350,6 +356,15 @@ def _delete_namespace(data):
 
     namespace = _namespaces.pop(ns_id)
     _resource_tags.pop(namespace.get("Arn", ""), None)
+
+    # AWS removes the hosted zone with the namespace. A zone that is already
+    # gone is fine; one holding records outside Cloud Map stays, and the
+    # namespace delete still succeeds.
+    zone_id = ((namespace.get("Properties") or {}).get("DnsProperties") or {}).get("HostedZoneId")
+    if zone_id:
+        status, _, body = route53._delete_hosted_zone(zone_id)
+        if status >= 300 and status != 404:
+            logger.warning("Hosted zone %s of namespace %s not deleted: %s", zone_id, ns_id, body)
 
     op_id = _create_operation("DELETE_NAMESPACE", {"NAMESPACE": ns_id})
     return json_response({"OperationId": op_id})
@@ -667,6 +682,10 @@ def _update_namespace(data):
     namespace_update = data.get("Namespace", {})
     if "Description" in namespace_update:
         ns["Description"] = namespace_update.get("Description")
+    soa = ((namespace_update.get("Properties") or {}).get("DnsProperties") or {}).get("SOA")
+    dns_properties = (ns.get("Properties") or {}).get("DnsProperties")
+    if soa and "TTL" in soa and dns_properties is not None:
+        dns_properties["SOA"] = {"TTL": int(soa["TTL"])}
 
     op_id = _create_operation("UPDATE_NAMESPACE", {"NAMESPACE": ns_id})
     return json_response({"OperationId": op_id})
