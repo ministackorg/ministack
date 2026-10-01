@@ -720,17 +720,11 @@ _CUSTOM_NAME_REPLACEMENT = {
             old.get("Scope", "REGIONAL") != new.get("Scope", "REGIONAL")
         ),
     },
-    # createOnlyProperties of the published registry schemas, the name itself
-    # aside. "If you specify a name, you can't perform updates that require
-    # replacement" (aws-properties-name).
+    # "Update requires: Replacement" in the template reference, the name
+    # itself aside.
     "AWS::ElastiCache::CacheCluster": {
         "name": "ClusterName",
-        "requires_replacement": lambda old, new: any(
-            old.get(p) != new.get(p) for p in (
-                "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName",
-                "Engine", "NetworkType",
-            )
-        ),
+        "requires_replacement": lambda old, new: _ec_cluster_requires_replacement(old, new),
     },
     "AWS::ElastiCache::ReplicationGroup": {
         "name": "ReplicationGroupId",
@@ -10794,15 +10788,15 @@ def _firehose_delivery_stream_delete(physical_id, props):
 #     groups, users and user groups (#1874) ---
 # Each type goes through elasticache.py's own query-protocol functions, so a
 # stack's cluster or replication group gets the same container-backed endpoint
-# CreateCacheCluster / CreateReplicationGroup return. Create-only properties
-# follow the published registry schemas; every other property updates in
+# CreateCacheCluster / CreateReplicationGroup return. Replacement follows the
+# template reference's "Update requires"; every other property updates in
 # place through the matching Modify call, which, like the API, ignores the
 # members MiniStack does not model. Ref is the resource name for every type.
 
 # A cluster created while its image is still being pulled reports `creating`
 # and publishes its endpoint when the container starts; CloudFormation waits
 # for `available` before the resource completes.
-_EC_AVAILABLE_TIMEOUT = float(os.environ.get("MINISTACK_ELASTICACHE_CFN_WAIT", "300"))
+_EC_AVAILABLE_TIMEOUT = 300
 
 
 def _ec_query(props, renames=None):
@@ -10841,27 +10835,6 @@ def _ec_call(fn, params, resource_type, action):
 
 
 def _ec_sync_tags(arn, old_props, new_props, resource_type):
-# --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
-# Each type goes through glue.py's own control-plane functions, so a stack's
-# databases and tables are the catalog Athena and the Glue API read. Crawlers
-# and jobs are records only: a stack never starts a crawl or a job run. Ref
-# is the resource name for every type except the partition, whose Ref is its
-# compound primary identifier. Replacement follows the template reference's
-# "Update requires". Deletes ignore EntityNotFound, since deleting a database
-# already drops its tables and partitions.
-
-
-def _glue_call(fn, data, resource_type, action):
-    status, _headers, body = fn(data)
-    if status >= 400:
-        raise ValueError(f"{resource_type} {action} failed: {body!r}")
-    return json.loads(body or b"{}")
-
-
-def _glue_sync_tags(arn, old_props, new_props, resource_type):
-    """Apply a Tags change through TagResource / UntagResource. The registry
-    schemas type Tags as a map, while the template reference pages say Tag
-    list; _tag_map reads both."""
     old_tags = _tag_map(old_props.get("Tags"))
     new_tags = _tag_map(new_props.get("Tags"))
     removed = sorted(old_tags.keys() - new_tags.keys())
@@ -11014,6 +10987,16 @@ def _ec_wait_available(records, record_id, status_key, resource_type):
     if rec is None or status == "create-failed":
         raise ValueError(f"{resource_type} {record_id} failed to start")
     return rec
+
+
+def _ec_cluster_requires_replacement(old, new):
+    # NumCacheNodes replaces when no Availability Zone was given before or now.
+    no_azs = not any(p.get(k) for p in (old, new)
+                     for k in ("PreferredAvailabilityZone", "PreferredAvailabilityZones"))
+    return (any(old.get(p) != new.get(p) for p in (
+                "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName",
+                "Engine", "NetworkType"))
+            or (no_azs and int(old.get("NumCacheNodes") or 1) != int(new.get("NumCacheNodes") or 1)))
 
 
 def _ec_cluster_attrs(cluster_id):
@@ -11254,6 +11237,33 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
 
 def _ec_user_group_delete(physical_id, props):
     _ec._delete_user_group({"UserGroupId": physical_id})
+
+
+# --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
+# Each type goes through glue.py's own control-plane functions, so a stack's
+# databases and tables are the catalog Athena and the Glue API read. Crawlers
+# and jobs are records only: a stack never starts a crawl or a job run. Ref
+# is the resource name for every type except the partition, whose Ref is its
+# compound primary identifier. Replacement follows the template reference's
+# "Update requires". Deletes ignore EntityNotFound, since deleting a database
+# already drops its tables and partitions.
+
+
+def _glue_call(fn, data, resource_type, action):
+    status, _headers, body = fn(data)
+    if status >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {body!r}")
+    return json.loads(body or b"{}")
+
+
+def _glue_sync_tags(arn, old_props, new_props, resource_type):
+    """Apply a Tags change through TagResource / UntagResource. The registry
+    schemas type Tags as a map, while the template reference pages say Tag
+    list; _tag_map reads both."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
         _glue_call(_glue._untag_resource, {"ResourceArn": arn, "TagsToRemove": removed},
                    resource_type, "untag")
     if new_tags and new_tags != old_tags:
@@ -12418,9 +12428,6 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
         "Description", "LicenseInfo",
     ),
-    # Table, Partition and Connection replace on nested members
-    # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
-    # createOnlyProperties of the published registry schemas.
     "AWS::ElastiCache::SubnetGroup": ("CacheSubnetGroupName",),
     "AWS::ElastiCache::ParameterGroup": ("CacheParameterGroupFamily",),
     "AWS::ElastiCache::CacheCluster": (
@@ -12434,10 +12441,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::User": ("UserId", "UserName"),
     "AWS::ElastiCache::UserGroup": ("UserGroupId",),
-    # createOnlyProperties of the published registry schemas. Table,
-    # Partition and Connection are left out: the first replaces on a
-    # TableInput.Name change the schema does not list, and the other two have
-    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    # Table, Partition and Connection replace on nested members
+    # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
@@ -12448,9 +12453,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
 _CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("KeySchema",),
     "AWS::Lambda::Function": ("DurableConfig",),
-    # conditionalCreateOnlyProperties of the published registry schemas.
-    "AWS::ElastiCache::CacheCluster": ("PreferredAvailabilityZones", "IpDiscovery"),
-    "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration"),
+    "AWS::ElastiCache::CacheCluster": ("NumCacheNodes",),
+    "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration", "NumNodeGroups"),
 }
 
 
@@ -12515,6 +12519,7 @@ _RESOURCE_HANDLERS = {
         "update": _ec_user_group_update,
         "update_with_logical_id": True,
         "delete": _ec_user_group_delete,
+    },
     "AWS::Glue::Database": {
         "create": _glue_database_create,
         "update": _glue_database_update,
