@@ -53,6 +53,19 @@ def _create(ctl, name, artifact=_ARTIFACT):
     )
 
 
+def _collect_pages(operation, result_key, **request):
+    items = []
+    token = None
+    while True:
+        if token:
+            request["nextToken"] = token
+        page = operation(**request)
+        items.extend(page[result_key])
+        token = page.get("nextToken")
+        if not token:
+            return items
+
+
 def test_agentcore_runtime_lifecycle():
     ctl = _client("bedrock-agentcore-control")
     name = f"rt_{_uuid_mod.uuid4().hex[:8]}"
@@ -91,6 +104,60 @@ def test_agentcore_runtime_lifecycle():
     with pytest.raises(ClientError) as exc:
         ctl.get_agent_runtime(agentRuntimeId=rid)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_agentcore_runtime_and_endpoint_lists_paginate():
+    ctl = _client("bedrock-agentcore-control")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    runtimes = []
+    try:
+        for index in range(2):
+            runtime = _create(ctl, f"page_{suffix}_{index}")
+            runtimes.append(runtime["agentRuntimeId"])
+
+        endpoint_names = [f"ep_{suffix}_{index}" for index in range(2)]
+        for name in endpoint_names:
+            ctl.create_agent_runtime_endpoint(
+                agentRuntimeId=runtimes[0], name=name,
+            )
+
+        assert ctl.list_agent_runtimes(maxResults=1).get("nextToken")
+        assert ctl.list_agent_runtime_endpoints(
+            agentRuntimeId=runtimes[0], maxResults=1,
+        ).get("nextToken")
+
+        listed_runtimes = _collect_pages(
+            ctl.list_agent_runtimes, "agentRuntimes", maxResults=1,
+        )
+        listed_runtime_ids = [
+            runtime["agentRuntimeId"] for runtime in listed_runtimes
+        ]
+        assert len(listed_runtime_ids) == len(set(listed_runtime_ids))
+        assert set(runtimes).issubset(listed_runtime_ids)
+
+        listed_endpoints = _collect_pages(
+            ctl.list_agent_runtime_endpoints,
+            "runtimeEndpoints", agentRuntimeId=runtimes[0], maxResults=1,
+        )
+        listed_endpoint_names = [endpoint["name"] for endpoint in listed_endpoints]
+        assert sorted(listed_endpoint_names) == sorted(["DEFAULT", *endpoint_names])
+    finally:
+        for runtime_id in runtimes:
+            ctl.delete_agent_runtime(agentRuntimeId=runtime_id)
+
+
+@pytest.mark.parametrize("query_params", [
+    {"maxResults": ["0"]},
+    {"maxResults": ["101"]},
+    {"maxResults": ["invalid"]},
+    {"nextToken": ["invalid!"]},
+    {"nextToken": ["//8"]},
+])
+def test_agentcore_list_pagination_rejects_invalid_query(query_params):
+    status, _, _ = asyncio.run(agentcore.handle_request(
+        "POST", "/runtimes", {}, b"", query_params,
+    ))
+    assert status == 400
 
 
 def test_agentcore_endpoint_lifecycle():

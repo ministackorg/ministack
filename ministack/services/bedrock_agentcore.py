@@ -23,6 +23,7 @@ against botocore ``bedrock-agentcore-control`` / ``bedrock-agentcore``
 service-2.json.
 """
 import asyncio
+import base64
 import copy
 import datetime
 import json
@@ -291,6 +292,46 @@ def _parse_body(body) -> dict:
         return {}
 
 
+def _agentcore_query_value(query_params, key, default=None):
+    value = (query_params or {}).get(key, default)
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value
+
+
+def _paginate_agentcore_results(items, query_params):
+    raw_limit = _agentcore_query_value(query_params, "maxResults", "10")
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return None, _validation("maxResults must be an integer from 1 to 100")
+    if not 1 <= limit <= 100:
+        return None, _validation("maxResults must be an integer from 1 to 100")
+
+    token = _agentcore_query_value(query_params, "nextToken")
+    offset = 0
+    if token is not None:
+        if not isinstance(token, str) or not token or len(token) > 2048:
+            return None, _validation("nextToken is invalid")
+        try:
+            padded = token + "=" * (-len(token) % 4)
+            token_bytes = base64.b64decode(
+                padded.encode(), altchars=b"-_", validate=True
+            )
+            offset = int(token_bytes.decode())
+            if offset < 0:
+                raise ValueError
+        except (ValueError, TypeError, base64.binascii.Error):
+            return None, _validation("nextToken is invalid")
+
+    page = {"items": items[offset:offset + limit]}
+    if offset + limit < len(items):
+        page["nextToken"] = base64.urlsafe_b64encode(
+            str(offset + limit).encode()
+        ).decode().rstrip("=")
+    return page, None
+
+
 # ---------------------------------------------------------------------------
 # Control plane — AgentRuntime
 # ---------------------------------------------------------------------------
@@ -353,7 +394,7 @@ def _get_agent_runtime(runtime_id):
     return json_response(out)
 
 
-def _list_agent_runtimes(body):
+def _list_agent_runtimes(query_params):
     summaries = []
     for r in _runtimes.values():
         summaries.append({
@@ -365,7 +406,13 @@ def _list_agent_runtimes(body):
             "lastUpdatedAt": _iso(r["lastUpdatedAt"]),
             "status": r["status"],
         })
-    return json_response({"agentRuntimes": summaries})
+    page, error = _paginate_agentcore_results(summaries, query_params)
+    if error:
+        return error
+    return json_response({
+        "agentRuntimes": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _list_agent_runtime_versions(runtime_id, body):
@@ -481,7 +528,7 @@ def _get_agent_runtime_endpoint(runtime_id, endpoint_name):
     })
 
 
-def _list_agent_runtime_endpoints(runtime_id, body):
+def _list_agent_runtime_endpoints(runtime_id, query_params):
     if _runtimes.get(runtime_id) is None:
         return _not_found(f"Agent runtime {runtime_id} not found")
     endpoints = _endpoints.get(runtime_id) or {}
@@ -499,7 +546,13 @@ def _list_agent_runtime_endpoints(runtime_id, body):
             "createdAt": _iso(record["createdAt"]),
             "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         })
-    return json_response({"runtimeEndpoints": items})
+    page, error = _paginate_agentcore_results(items, query_params)
+    if error:
+        return error
+    return json_response({
+        "runtimeEndpoints": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
@@ -980,7 +1033,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "PUT":
             return _create_agent_runtime(body)
         if method == "POST":
-            return _list_agent_runtimes(body)
+            return _list_agent_runtimes(query_params)
     elif n == 2:
         runtime_id = unquote(parts[1])
         if method == "GET":
@@ -1002,7 +1055,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PUT":
                 return _create_agent_runtime_endpoint(runtime_id, body)
             if method == "POST":
-                return _list_agent_runtime_endpoints(runtime_id, body)
+                return _list_agent_runtime_endpoints(runtime_id, query_params)
     elif n == 4 and parts[2] == "runtime-endpoints":
         runtime_id = unquote(parts[1])
         endpoint_name = unquote(parts[3])
