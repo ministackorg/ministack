@@ -17572,6 +17572,32 @@ def _cfn_appsync_members_template(name, api_props, oidc):
     })
 
 
+def test_cfn_ecs_task_definition_keeps_omitted_fields_omitted(cfn, ecs):
+    """Cpu, Memory and RequiresCompatibilities are stored only when the template sets them."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-td-{suffix}"
+    family = f"cfn-ecs-td-{suffix}"
+    container = [{"Name": "app", "Image": "nginx:latest", "Memory": 128}]
+    template = json.dumps({"Resources": {
+        "Bare": {"Type": "AWS::ECS::TaskDefinition",
+                 "Properties": {"Family": family, "ContainerDefinitions": container}},
+        "Sized": {"Type": "AWS::ECS::TaskDefinition",
+                  "Properties": {"Family": f"{family}-f", "ContainerDefinitions": container,
+                                 "Cpu": "512", "Memory": "1024",
+                                 "RequiresCompatibilities": ["FARGATE"], "NetworkMode": "awsvpc"}},
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        bare = ecs.describe_task_definition(taskDefinition=family)["taskDefinition"]
+        assert not {"cpu", "memory", "requiresCompatibilities"} & set(bare)
+        sized = ecs.describe_task_definition(taskDefinition=f"{family}-f")["taskDefinition"]
+        assert (sized["cpu"], sized["memory"], sized["requiresCompatibilities"]) == (
+            "512", "1024", ["FARGATE"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
     """ClusterSettings, DefaultCapacityProviderStrategy and Configuration read back in camelCase."""
     suffix = _uuid_mod.uuid4().hex[:8]

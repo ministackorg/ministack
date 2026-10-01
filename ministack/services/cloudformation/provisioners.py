@@ -7568,11 +7568,8 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "revision": revision,
         "status": "ACTIVE",
         "containerDefinitions": _normalize_container_defs(props.get("ContainerDefinitions", [])),
-        "requiresCompatibilities": compat,
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
         "networkMode": props.get("NetworkMode", "bridge"),
-        "cpu": props.get("Cpu", "256"),
-        "memory": props.get("Memory", "512"),
         "executionRoleArn": props.get("ExecutionRoleArn", ""),
         "taskRoleArn": props.get("TaskRoleArn", ""),
         "volumes": props.get("Volumes", []),
@@ -7582,6 +7579,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "registeredAt": now_iso(),
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
+    for prop, key in (("RequiresCompatibilities", "requiresCompatibilities"), ("Cpu", "cpu"),
+                      ("Memory", "memory")):
+        if prop in props:
+            td[key] = props[prop]
     _ecs._task_defs[td_key] = td
     _ecs._task_def_latest[family] = revision
     return arn, {"TaskDefinitionArn": arn}

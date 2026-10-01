@@ -425,15 +425,17 @@ def _verify_domain_identity(params):
                 f"</VerifyDomainIdentityResult>")
 
 
+def _dkim_tokens(domain):
+    """The three Easy DKIM tokens for a domain identity, stable per domain."""
+    return [hashlib.md5(f"{domain}-dkim-{i}".encode()).hexdigest()[:32] for i in range(3)]
+
+
 def _verify_domain_dkim(params):
     domain = _p(params, "Domain")
     if domain not in _identities:
         _identities[domain] = _make_identity(domain, "Domain")
 
-    tokens = [
-        hashlib.md5(f"{domain}-dkim-{i}".encode()).hexdigest()[:32]
-        for i in range(3)
-    ]
+    tokens = _dkim_tokens(domain)
     _identities[domain]["DkimEnabled"] = True
     _identities[domain]["DkimTokens"] = tokens
     _identities[domain]["DkimVerificationStatus"] = "Success"

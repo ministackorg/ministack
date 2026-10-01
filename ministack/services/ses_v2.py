@@ -15,7 +15,6 @@ Email templates live in the v1 store, so either API version sees the other's.
 
 import base64
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -34,6 +33,7 @@ from ministack.core.responses import (
 )
 from ministack.services.ses import (
     _build_mime_message,
+    _dkim_tokens,
     _parse_raw_mime,
     _render_template,
     _restore_regional_store,
@@ -121,10 +121,7 @@ def _easy_dkim_attributes(identity, identity_type, signing_attributes):
     byodkim = any(signing_attributes.get(k) for k in ("DomainSigningPrivateKey", "DomainSigningSelector"))
     if identity_type != "DOMAIN" or byodkim:
         return {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []}
-    tokens = [
-        hashlib.md5(f"{identity}-dkim-{i}".encode()).hexdigest()[:32]
-        for i in range(3)
-    ]
+    tokens = _dkim_tokens(identity)
     return {
         "SigningEnabled": False,
         "SigningAttributesOrigin": "AWS_SES",
