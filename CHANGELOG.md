@@ -20,6 +20,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Bedrock AgentCore — runtime version history and endpoint pinning** — runtime updates now retain version snapshots, `GetAgentRuntime` retrieves a selected version, and `ListAgentRuntimeVersions` paginates the history. `DEFAULT` advances with the latest version while named endpoints stay pinned until updated; invocations use the selected snapshot, with containers isolated by version. Contributed by @pingedbrain.
+- **CloudFormation — `AWS::Lambda::Version` updates `FunctionScalingConfig` in place** — a stack update re-ran the create, which published a new version for every change; a `FunctionScalingConfig` change now keeps the version, also when the update rolls back. Contributed by @iot-rocket.
 - **botocore 1.43.106** — the service models MiniStack reads move from 1.43.63 to 1.43.106; the images keep `awscli` 1.45.63, installed on the same botocore instead of its pinned one.
 
 ### Fixed

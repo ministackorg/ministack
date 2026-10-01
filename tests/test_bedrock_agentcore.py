@@ -72,7 +72,7 @@ def test_agentcore_runtime_lifecycle():
         assert rid in ids
 
         updated = ctl.update_agent_runtime(
-            agentRuntimeId=rid, agentRuntimeArtifact=_ARTIFACT,
+            agentRuntimeId=rid, agentRuntimeArtifact=_CODE_ARTIFACT,
             roleArn=_ROLE, networkConfiguration=_NET,
         )
         assert updated["agentRuntimeVersion"] == "2"
@@ -81,9 +81,21 @@ def test_agentcore_runtime_lifecycle():
         default = ctl.get_agent_runtime_endpoint(agentRuntimeId=rid, endpointName="DEFAULT")
         assert (default["liveVersion"], default["targetVersion"]) == ("2", "2")
         assert ctl.get_agent_runtime(agentRuntimeId=rid)["agentRuntimeVersion"] == "2"
+        assert ctl.get_agent_runtime(agentRuntimeId=rid, agentRuntimeVersion="1")[
+            "agentRuntimeArtifact"
+        ] == _ARTIFACT
+        assert ctl.get_agent_runtime(agentRuntimeId=rid, agentRuntimeVersion="2")[
+            "agentRuntimeArtifact"
+        ] == _CODE_ARTIFACT
 
-        versions = ctl.list_agent_runtime_versions(agentRuntimeId=rid)["agentRuntimes"]
-        assert versions and versions[0]["agentRuntimeId"] == rid
+        first_page = ctl.list_agent_runtime_versions(
+            agentRuntimeId=rid, maxResults=1
+        )
+        assert first_page["agentRuntimes"][0]["agentRuntimeVersion"] == "2"
+        second_page = ctl.list_agent_runtime_versions(
+            agentRuntimeId=rid, maxResults=1, nextToken=first_page["nextToken"]
+        )
+        assert second_page["agentRuntimes"][0]["agentRuntimeVersion"] == "1"
     finally:
         deleted = ctl.delete_agent_runtime(agentRuntimeId=rid)
         assert deleted["status"] == "DELETING"
@@ -93,12 +105,142 @@ def test_agentcore_runtime_lifecycle():
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_agentcore_invocation_uses_endpoint_version(monkeypatch):
+    runtime_id = None
+    observed_runtimes = []
+
+    def capture(runtime, headers, body):
+        observed_runtimes.append(runtime)
+        return 200, {"Content-Type": "application/json"}, b"{}"
+
+    monkeypatch.setattr(agentcore, "_invoke_agent_runtime_in_owner", capture)
+    monkeypatch.setattr(agentcore, "_resource_policy_allows_invocation", lambda *args: True)
+
+    with agentcore.request_scope("000000000000", "us-east-1"):
+        status, _, payload = agentcore._create_agent_runtime(json.dumps({
+            "agentRuntimeName": f"version_{_uuid_mod.uuid4().hex[:8]}",
+            "agentRuntimeArtifact": _CODE_ARTIFACT,
+            "roleArn": _ROLE,
+            "networkConfiguration": _NET,
+        }).encode())
+        assert status == 200
+        runtime = json.loads(payload)
+        runtime_id = runtime["agentRuntimeId"]
+        arn = runtime["agentRuntimeArn"]
+        try:
+            status, _, _ = agentcore._create_agent_runtime_endpoint(
+                runtime_id, json.dumps({"name": "prod", "agentRuntimeVersion": "1"}).encode()
+            )
+            assert status == 200
+            status, _, _ = agentcore._update_agent_runtime(runtime_id, json.dumps({
+                "agentRuntimeArtifact": _ARTIFACT,
+                "roleArn": _ROLE,
+                "networkConfiguration": _NET,
+            }).encode())
+            assert status == 200
+
+            status, _, v1_payload = asyncio.run(agentcore.handle_request(
+                "GET", f"/runtimes/{runtime_id}", {}, b"", {"version": ["1"]}
+            ))
+            assert status == 200
+            assert json.loads(v1_payload)["agentRuntimeArtifact"] == _CODE_ARTIFACT
+
+            status, _, first_payload = asyncio.run(agentcore.handle_request(
+                "POST", f"/runtimes/{runtime_id}/versions", {}, b"",
+                {"maxResults": ["1"]},
+            ))
+            first_page = json.loads(first_payload)
+            assert status == 200
+            assert first_page["agentRuntimes"][0]["agentRuntimeVersion"] == "2"
+            status, _, second_payload = asyncio.run(agentcore.handle_request(
+                "POST", f"/runtimes/{runtime_id}/versions", {}, b"",
+                {"maxResults": ["1"], "nextToken": [first_page["nextToken"]]},
+            ))
+            second_page = json.loads(second_payload)
+            assert status == 200
+            assert second_page["agentRuntimes"][0]["agentRuntimeVersion"] == "1"
+
+            agentcore._invoke_agent_runtime(arn, {}, b"{}", {"qualifier": ["prod"]})
+            agentcore._invoke_agent_runtime(arn, {}, b"{}", {})
+            assert [item["agentRuntimeVersion"] for item in observed_runtimes] == ["1", "2"]
+            assert observed_runtimes[0]["agentRuntimeArtifact"] == _CODE_ARTIFACT
+            assert observed_runtimes[1]["agentRuntimeArtifact"] == _ARTIFACT
+
+            status, _, _ = agentcore._update_agent_runtime_endpoint(
+                runtime_id, "prod", json.dumps({"agentRuntimeVersion": "2"}).encode()
+            )
+            assert status == 200
+            agentcore._invoke_agent_runtime(arn, {}, b"{}", {"qualifier": ["prod"]})
+            assert [item["agentRuntimeVersion"] for item in observed_runtimes] == ["1", "2", "2"]
+            assert observed_runtimes[-1]["agentRuntimeArtifact"] == _ARTIFACT
+        finally:
+            agentcore._delete_agent_runtime(runtime_id)
+
+
+def test_agentcore_version_errors_and_state_restore():
+    original_state = agentcore.get_state()
+    runtime_id = None
+    try:
+        with agentcore.request_scope("000000000000", "us-east-1"):
+            status, _, payload = agentcore._create_agent_runtime(json.dumps({
+                "agentRuntimeName": f"restore_{_uuid_mod.uuid4().hex[:8]}",
+                "agentRuntimeArtifact": _CODE_ARTIFACT,
+                "roleArn": _ROLE,
+                "networkConfiguration": _NET,
+            }).encode())
+            assert status == 200
+            runtime_id = json.loads(payload)["agentRuntimeId"]
+            status, _, _ = agentcore._update_agent_runtime(runtime_id, json.dumps({
+                "agentRuntimeArtifact": _ARTIFACT,
+                "roleArn": _ROLE,
+                "networkConfiguration": _NET,
+            }).encode())
+            assert status == 200
+
+            saved_state = agentcore.get_state()
+            agentcore.load_persisted_state(saved_state)
+            status, _, versions_payload = agentcore._list_agent_runtime_versions(runtime_id, {})
+            assert status == 200
+            assert [item["agentRuntimeVersion"] for item in json.loads(versions_payload)[
+                "agentRuntimes"
+            ]] == ["2", "1"]
+
+            legacy_state = agentcore.get_state()
+            legacy_runtime = legacy_state["runtimes"].get_scoped(
+                "000000000000", "us-east-1", runtime_id
+            )
+            legacy_runtime.pop("_versions")
+            agentcore.load_persisted_state(legacy_state)
+            status, _, versions_payload = agentcore._list_agent_runtime_versions(runtime_id, {})
+            assert status == 200
+            versions = json.loads(versions_payload)["agentRuntimes"]
+            assert [item["agentRuntimeVersion"] for item in versions] == ["2"]
+
+            status, _, _ = agentcore._get_agent_runtime(runtime_id, {"version": ["99"]})
+            assert status == 404
+            status, _, _ = agentcore._create_agent_runtime_endpoint(
+                runtime_id, json.dumps({"name": "missing", "agentRuntimeVersion": "99"}).encode()
+            )
+            assert status == 400
+            _, error = agentcore._paginate([], {"maxResults": ["101"]})
+            assert error[0] == 400
+            _, error = agentcore._paginate([], {"nextToken": ["invalid!"]})
+            assert error[0] == 400
+    finally:
+        if runtime_id is not None:
+            with agentcore.request_scope("000000000000", "us-east-1"):
+                agentcore._delete_agent_runtime(runtime_id)
+        agentcore.load_persisted_state(original_state)
+
+
 def test_agentcore_endpoint_lifecycle():
     ctl = _client("bedrock-agentcore-control")
     name = f"rt_{_uuid_mod.uuid4().hex[:8]}"
     rid = _create(ctl, name)["agentRuntimeId"]
     try:
-        ep = ctl.create_agent_runtime_endpoint(agentRuntimeId=rid, name="prod")
+        ep = ctl.create_agent_runtime_endpoint(
+            agentRuntimeId=rid, name="prod", agentRuntimeVersion="1"
+        )
         assert ep["endpointName"] == "prod"
         assert ep["status"] == "CREATING"
         assert ep["agentRuntimeEndpointArn"] == (
@@ -107,14 +249,25 @@ def test_agentcore_endpoint_lifecycle():
         got = ctl.get_agent_runtime_endpoint(agentRuntimeId=rid, endpointName="prod")
         assert got["status"] == "READY"
         assert got["name"] == "prod"
+        assert got["liveVersion"] == got["targetVersion"] == "1"
 
         names = [e["name"] for e in
                  ctl.list_agent_runtime_endpoints(agentRuntimeId=rid)["runtimeEndpoints"]]
         assert sorted(names) == ["DEFAULT", "prod"]
 
+        ctl.update_agent_runtime(
+            agentRuntimeId=rid, agentRuntimeArtifact=_CODE_ARTIFACT,
+            roleArn=_ROLE, networkConfiguration=_NET,
+        )
+        got = ctl.get_agent_runtime_endpoint(agentRuntimeId=rid, endpointName="prod")
+        assert got["liveVersion"] == got["targetVersion"] == "1"
+
         upd = ctl.update_agent_runtime_endpoint(
-            agentRuntimeId=rid, endpointName="prod", description="live")
+            agentRuntimeId=rid, endpointName="prod",
+            agentRuntimeVersion="2", description="live",
+        )
         assert upd["status"] == "UPDATING"
+        assert (upd["liveVersion"], upd["targetVersion"]) == ("2", "2")
 
         assert ctl.delete_agent_runtime_endpoint(
             agentRuntimeId=rid, endpointName="prod")["status"] == "DELETING"
@@ -574,12 +727,18 @@ def test_container_image_invoked_and_removed(monkeypatch):
         _, _, second_body = _invoke(runtime["agentRuntimeArn"])
         asyncio.run(second_body.runner(_discard, None))
         assert len(started) == 1
+        version_two = dict(agentcore._runtimes[runtime["agentRuntimeId"]])
+        version_two["agentRuntimeVersion"] = "2"
+        agentcore._container_invocations_url(version_two)
+        assert len(started) == 2
+        assert [item[1]["labels"]["ministack.agentcore.runtime-version"]
+                for item in started] == ["1", "2"]
     finally:
         agentcore._delete_agent_runtime(runtime["agentRuntimeId"])
         server.shutdown()
         server.server_close()
         thread.join()
-    assert removed == [True]
+    assert removed == [True, True]
 
 
 def test_container_joins_ministack_network(monkeypatch):
