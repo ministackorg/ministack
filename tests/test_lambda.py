@@ -518,6 +518,7 @@ def test_lambda_direct_arn_version_delete_rejects_weighted_alias_version():
         Code={"ZipFile": _region_marker_code("latest")},
     )
     primary = lam.publish_version(FunctionName=name)
+    lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("weighted"))
     weighted = lam.publish_version(FunctionName=name)
     lam.create_alias(
         FunctionName=name,
@@ -1268,6 +1269,22 @@ def test_lambda_list_versions(lam):
     resp = lam.list_versions_by_function(FunctionName="lam-invoke-test")
     versions = resp["Versions"]
     assert any(v["Version"] == "$LATEST" for v in versions)
+
+def test_lambda_publish_version_of_an_unchanged_function_returns_the_latest(lam):
+    """Lambda doesn't publish a version when code and configuration are unchanged."""
+    name = f"lambda-publish-unchanged-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": _region_marker_code("one")})
+    try:
+        first = lam.publish_version(FunctionName=name, Description="one")
+        again = lam.publish_version(FunctionName=name, Description="two")
+        assert (again["Version"], again["Description"]) == (first["Version"], "one")
+        lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("two"))
+        second = lam.publish_version(FunctionName=name)
+        assert int(second["Version"]) == int(first["Version"]) + 1
+    finally:
+        lam.delete_function(FunctionName=name)
+
 
 def test_lambda_publish_version(lam):
     resp = lam.publish_version(

@@ -5755,6 +5755,11 @@ def _publish_version(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    # "Lambda doesn't publish a version if the function's configuration and code
+    # haven't changed since the last version": the latest version comes back.
+    latest = max(func["versions"], key=int, default=None)
+    if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
+        return json_response(func["versions"][latest]["config"], 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
