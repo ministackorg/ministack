@@ -50,6 +50,7 @@ _applications = AccountRegionScopedDict()
 _environments = AccountRegionScopedDict()          # "{app_id}/{env_id}" -> record
 _config_profiles = AccountRegionScopedDict()       # "{app_id}/{profile_id}" -> record
 _hosted_versions = AccountRegionScopedDict()       # "{app_id}/{profile_id}/{version}" -> record
+_hosted_version_counters = AccountRegionScopedDict()  # "{app_id}/{profile_id}" -> last issued version
 _deployment_strategies = AccountRegionScopedDict()
 _deployments = AccountRegionScopedDict()           # "{app_id}/{env_id}/{deploy_num}" -> record
 _tags = AccountRegionScopedDict()                  # arn -> {key: value}
@@ -66,6 +67,7 @@ def get_state():
         "environments": _environments,
         "config_profiles": _config_profiles,
         "hosted_versions": _hosted_versions,
+        "hosted_version_counters": _hosted_version_counters,
         "deployment_strategies": _deployment_strategies,
         "deployments": _deployments,
         "tags": _tags,
@@ -81,6 +83,7 @@ def _restore_state(data):
     _environments.update(data.get("environments", {}))
     _config_profiles.update(data.get("config_profiles", {}))
     _hosted_versions.update(data.get("hosted_versions", {}))
+    _hosted_version_counters.update(data.get("hosted_version_counters", {}))
     _deployment_strategies.update(data.get("deployment_strategies", {}))
     _deployments.update(data.get("deployments", {}))
     _tags.update(data.get("tags", {}))
@@ -201,6 +204,13 @@ def _update_application(app_id, body):
     return _json(200, app)
 
 
+def _drop_deployments(prefix):
+    """Drop the deployments under an application or environment key prefix, with their tags."""
+    for key in [k for k in _deployments if k.startswith(prefix)]:
+        del _deployments[key]
+        _tags.pop(_deployment_arn(*key.split("/")), None)
+
+
 def _delete_application(app_id):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
@@ -215,9 +225,10 @@ def _delete_application(app_id):
     keys_to_remove = [k for k in _hosted_versions if k.startswith(f"{app_id}/")]
     for k in keys_to_remove:
         _hosted_versions.pop(k, None)
-    keys_to_remove = [k for k in _deployments if k.startswith(f"{app_id}/")]
+    keys_to_remove = [k for k in _hosted_version_counters if k.startswith(f"{app_id}/")]
     for k in keys_to_remove:
-        _deployments.pop(k, None)
+        _hosted_version_counters.pop(k, None)
+    _drop_deployments(f"{app_id}/")
     return _json(204, {})
 
 
@@ -281,6 +292,7 @@ def _delete_environment(app_id, env_id):
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
     del _environments[key]
     _tags.pop(_env_arn(app_id, env_id), None)
+    _drop_deployments(f"{key}/")
     return _json(204, {})
 
 
@@ -343,6 +355,7 @@ def _delete_configuration_profile(app_id, profile_id):
     if key not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
     del _config_profiles[key]
+    _hosted_version_counters.pop(key, None)
     _tags.pop(_profile_arn(app_id, profile_id), None)
     keys_to_remove = [k for k in _hosted_versions if k.startswith(f"{app_id}/{profile_id}/")]
     for k in keys_to_remove:
@@ -355,15 +368,27 @@ def _delete_configuration_profile(app_id, profile_id):
 # ---------------------------------------------------------------------------
 
 
+def _latest_hosted_version_number(app_id, profile_id):
+    """The highest existing version number of a profile, 0 when it has none."""
+    prefix = f"{app_id}/{profile_id}/"
+    return max((v["VersionNumber"] for k, v in _hosted_versions.items()
+                if k.startswith(prefix)), default=0)
+
+
+def _next_hosted_version_number(app_id, profile_id):
+    """Issue a profile's next version number; a deleted number is never reused."""
+    key = f"{app_id}/{profile_id}"
+    number = max(_hosted_version_counters.get(key, 0),
+                 _latest_hosted_version_number(app_id, profile_id)) + 1
+    _hosted_version_counters[key] = number
+    return number
+
+
 def _create_hosted_configuration_version(app_id, profile_id, body, content_type):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
 
-    existing = [
-        v for k, v in _hosted_versions.items()
-        if k.startswith(f"{app_id}/{profile_id}/")
-    ]
-    version_number = len(existing) + 1
+    version_number = _next_hosted_version_number(app_id, profile_id)
 
     record = {
         "ApplicationId": app_id,
@@ -980,6 +1005,7 @@ def reset():
     _environments.clear()
     _config_profiles.clear()
     _hosted_versions.clear()
+    _hosted_version_counters.clear()
     _deployment_strategies.clear()
     _deployments.clear()
     _tags.clear()

@@ -642,9 +642,6 @@ def _register_task_definition(data):
         "volumes": data.get("volumes", []),
         "placementConstraints": data.get("placementConstraints", []),
         "networkMode": network_mode,
-        "requiresCompatibilities": compat,
-        "cpu": data.get("cpu", "256"),
-        "memory": data.get("memory", "512"),
         "executionRoleArn": data.get("executionRoleArn", ""),
         "taskRoleArn": data.get("taskRoleArn", ""),
         "pidMode": data.get("pidMode", ""),
@@ -656,6 +653,9 @@ def _register_task_definition(data):
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
     }
+    for field in ("requiresCompatibilities", "cpu", "memory"):
+        if field in data:
+            td[field] = data[field]
     _task_defs[td_key] = td
 
     req_tags = data.get("tags", [])
@@ -738,19 +738,14 @@ def _requested_subnet(data):
     Nothing else read the request's network configuration until now, so this
     cannot assume the shape the SDK would have sent: a body that names it as
     anything but the documented object has no subnet to report.
-
-    Both casings are read. A service created through CloudFormation keeps the
-    template's `NetworkConfiguration` verbatim (provisioners.py, the
-    AWS::ECS::Service handler) and replays it here, so the camelCase lookup
-    alone would miss every CFN-defined service.
     """
     network = data.get("networkConfiguration")
     if not isinstance(network, dict):
         return None
-    config = network.get("awsvpcConfiguration") or network.get("AwsvpcConfiguration")
+    config = network.get("awsvpcConfiguration")
     if not isinstance(config, dict):
         return None
-    subnets = config.get("subnets") or config.get("Subnets")
+    subnets = config.get("subnets")
     if not isinstance(subnets, list) or not subnets:
         return None
     return subnets[0] if isinstance(subnets[0], str) else None

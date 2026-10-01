@@ -971,11 +971,16 @@ async def _authorize_request_v2(
     # there is nothing to key on and every caller would otherwise be served
     # the first caller's result.
     caching = ttl > 0 and bool(identity_source)
-    # A missing declared identity source is a 401 without invoking the
-    # Lambda — same AWS-verified shortcut apigateway_v1 uses for REST
-    # REQUEST authorizers.
-    if caching and not all_present:
-        return _jwt_unauthorized(), None
+    # A declared identity source missing from the request is a 401 without
+    # invoking the Lambda, cached or not, with AWS's compact body (observed on a
+    # deployed HTTP API). $context.* sources are not modeled, so uncached they
+    # never count as missing.
+    modeled_present, _ = _request_authorizer_identity_sources(
+        [s for s in identity_source if not str(s).startswith("$context.")],
+        headers, query_params, stage_vars,
+    )
+    if identity_source and not (all_present if caching else modeled_present):
+        return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
     identity_values = tuple(id_values)
 
     if payload_version == "1.0":
@@ -1294,9 +1299,16 @@ async def _handle_execute_in_scope(
     if stage not in api_stages and stage != "$default":
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage}' not found"}).encode()
 
-    route = _match_route(api_id, method, path)
+    # AWS selects the route of a path with extra leading slashes as if it had one.
+    route_path_in = "/" + path.lstrip("/")
+    route = _match_route(api_id, method, route_path_in)
     if not route:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "No route found"}).encode()
+        # AWS's body for an unmatched HTTP API route: compact JSON.
+        return (
+            404,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": "Not Found"}, separators=(",", ":")).encode(),
+        )
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")
@@ -1304,7 +1316,7 @@ async def _handle_execute_in_scope(
     rk_parts = route_key.split(" ", 1)
     if len(rk_parts) == 2:
         route_path = rk_parts[1]
-    path_params = _extract_path_params(route_path, path) if route_path else {}
+    path_params = _extract_path_params(route_path, route_path_in) if route_path else {}
 
     stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()
@@ -1761,6 +1773,15 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> s
     return str(custom)
 
 
+def _api_endpoint_scheme(protocol):
+    """AWS's apiEndpoint scheme once the gateway serves TLS; http otherwise."""
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return "http"
+    return "wss" if protocol == "WEBSOCKET" else "https"
+
+
 def _create_api(data):
     tags = data.get("tags", {})
     try:
@@ -1777,7 +1798,7 @@ def _create_api(data):
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
+        "apiEndpoint": f"{_api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "routeSelectionExpression": data.get("routeSelectionExpression", default_rse),
         "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),

@@ -340,6 +340,41 @@ def test_servicediscovery_update_public_dns_namespace(sd):
     sd.delete_namespace(Id=ns_id)
 
 
+def test_servicediscovery_soa_ttl_create_and_update(sd):
+    ns_op = sd.create_private_dns_namespace(
+        Name="soa-ttl.example.local",
+        Vpc="vpc-12345",
+        Properties={"DnsProperties": {"SOA": {"TTL": 100}}},
+    )
+    ns_id = sd.get_operation(OperationId=ns_op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+    dns = sd.get_namespace(Id=ns_id)["Namespace"]["Properties"]["DnsProperties"]
+    assert dns["SOA"]["TTL"] == 100
+    zone_id = dns["HostedZoneId"]
+
+    sd.update_private_dns_namespace(
+        Id=ns_id,
+        UpdaterRequestId="soa-ttl-1",
+        Namespace={"Properties": {"DnsProperties": {"SOA": {"TTL": 60}}}},
+    )
+    dns = sd.get_namespace(Id=ns_id)["Namespace"]["Properties"]["DnsProperties"]
+    assert dns["SOA"]["TTL"] == 60
+    assert dns["HostedZoneId"] == zone_id
+
+    sd.delete_namespace(Id=ns_id)
+
+
+def test_servicediscovery_delete_namespace_removes_hosted_zone(sd, r53):
+    ns_op = sd.create_public_dns_namespace(Name="hz-cleanup.example.com")
+    ns_id = sd.get_operation(OperationId=ns_op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+    zone_id = sd.get_namespace(Id=ns_id)["Namespace"]["Properties"]["DnsProperties"]["HostedZoneId"]
+    r53.get_hosted_zone(Id=zone_id)
+
+    sd.delete_namespace(Id=ns_id)
+
+    with pytest.raises(r53.exceptions.NoSuchHostedZone):
+        r53.get_hosted_zone(Id=zone_id)
+
+
 # ---------------------------------------------------------------------------
 # ARN adoption / tag-API in-process unit tests. Folded from
 # test_servicediscovery_arn_adoption.py (drive the module directly).

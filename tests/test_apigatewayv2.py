@@ -1009,7 +1009,8 @@ def test_apigw_execute_lambda_proxy_binary_request_body(apigw, lam):
     lam.delete_function(FunctionName=fname)
 
 def test_apigw_execute_no_route(apigw):
-    """execute-api returns 404 when no matching route exists."""
+    """execute-api returns 404 when no matching route exists, with AWS's
+    exact compact-JSON body (no space after the colon)."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -1023,6 +1024,7 @@ def test_apigw_execute_no_route(apigw):
         assert False, "Expected 404"
     except _urlerr.HTTPError as e:
         assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
@@ -1099,6 +1101,44 @@ def test_apigw_path_param_route(apigw, lam):
     assert resp.status == 200
     body = json.loads(resp.read())
     assert body["rawPath"] == "/items/abc123"
+
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_leading_double_slash_selects_route(apigw, lam):
+    """A doubled leading slash still selects the route, as on AWS."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-dbl-slash-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    api_id = apigw.create_api(Name=f"dbl-slash-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="ANY /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    resp = _urlreq.urlopen(f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/$default//items/abc123")
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"proxy": "abc123"}
 
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
@@ -2273,6 +2313,30 @@ def test_apigwv2_created_date_is_unix_timestamp(apigw):
         f"CreatedDate should be datetime (parsed from Unix int), got {type(created)}"
     )
     apigw.delete_api(ApiId=resp["ApiId"])
+
+
+@pytest.mark.parametrize("use_ssl, http_scheme, ws_scheme", [("1", "https", "wss"), ("", "http", "http")])
+def test_apigwv2_endpoint_scheme_follows_tls(monkeypatch, use_ssl, http_scheme, ws_scheme):
+    """Under USE_SSL=1 the gateway serves only HTTPS, so apiEndpoint is https:// (wss:// for a WebSocket API), as on
+    AWS; without it both keep http://."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    for protocol, scheme in (("HTTP", http_scheme), ("WEBSOCKET", ws_scheme)):
+        status, body = _payload(_apigw._create_api({"name": f"scheme-{protocol}", "protocolType": protocol}))
+        assert status == 201
+        assert body["apiEndpoint"].startswith(f"{scheme}://"), body["apiEndpoint"]
+        _apigw._delete_api(body["apiId"])
+
+
+def test_apigwv2_cfn_api_endpoint_follows_tls(monkeypatch):
+    """The AWS::ApiGatewayV2::Api provisioner builds the same apiEndpoint as CreateApi."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    api_id, attrs = provisioners._apigw_v2_api_create("Api", {"Name": "cfn-tls", "ProtocolType": "WEBSOCKET"}, "stack")
+    try:
+        assert attrs["ApiEndpoint"].startswith("wss://"), attrs["ApiEndpoint"]
+    finally:
+        _apigw._delete_api(api_id)
 
 
 # ========== from test_apigwv2_websocket.py ==========
@@ -4158,6 +4222,59 @@ def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, s
         status, _ = _v2_auth_http(url, headers={"Authorization": "deny-me"})
         assert status == 403, "the first caller's Allow must not answer a second token"
         assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw, lam, sqs):
+    """A declared identity source missing from the request is a 401 without
+    invoking the Lambda, even with caching disabled (``AuthorizerResultTtlInSeconds=0``).
+
+    AWS applies this identity-source short circuit independent of caching;
+    it is not only a caching optimization. The body matches AWS's own
+    compact-JSON gateway response exactly (no space after the colon).
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url)  # no Authorization header sent
+        assert status == 401
+        assert body == b'{"message":"Unauthorized"}'
+        assert _v2_auth_count(sqs, qname) == 0, "the authorizer Lambda must not be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs):
+    """A $context.* identity source, which MiniStack does not model, is not a missing source: uncached, the
+    authorizer is still invoked."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$context.identity.sourceIp"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+        assert status != 401
+        assert _v2_auth_count(sqs, qname) == 1, "the authorizer Lambda must be invoked"
     finally:
         _v2_auth_drop_api(apigw, api_id)
         _v2_auth_drop_lambda(lam, backend)

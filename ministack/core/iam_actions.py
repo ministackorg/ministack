@@ -1261,6 +1261,29 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "ssm":
+        action = _action_from_target(headers)
+        if action in {"AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource"}:
+            try:
+                data = json.loads(body) if body else {}
+            except (json.JSONDecodeError, TypeError):
+                return "*"
+            if not isinstance(data, dict) or data.get("ResourceType", "Parameter") != "Parameter":
+                return "*"
+            resource_id = data.get("ResourceId", "")
+            if not isinstance(resource_id, str) or not resource_id:
+                return "*"
+            if resource_id.startswith("arn:"):
+                # The handler also accepts parameter ARN aliases. Authorize
+                # accepted local aliases as the canonical parameter resource,
+                # while retaining foreign and malformed ARNs as supplied.
+                from ministack.services.ssm import _parameter_name_from_arn
+
+                parsed = _parameter_name_from_arn(resource_id)
+                if parsed and parsed[0] == account_id and parsed[1] == region:
+                    resource_id = parsed[2]
+                else:
+                    return resource_id
+            return f"arn:aws:ssm:{region}:{account_id}:parameter/{resource_id.lstrip('/')}"
         name = _param(body, query_params, "Name")
         if name:
             return f"arn:aws:ssm:{region}:{account_id}:parameter{name if name.startswith('/') else '/' + name}"
@@ -1717,14 +1740,32 @@ def dynamodb_service_context(body: bytes) -> dict:
 
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
-                           message: str = "", headers: dict | None = None) -> tuple:
-    """Format a 403 error response matching the service's protocol.
+                           message: str = "", headers: dict | None = None,
+                           resource_arn: str = "*", explicit_deny: bool = False) -> tuple:
+    """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
     surfaces as a bare 403 with the code buried in an unread body, so a client
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
+    if service == "ssm" and not error_code and action in {
+        "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource",
+    }:
+        # Live AWS us-west-2: SSM tag authorization denials are HTTP 400,
+        # JSON 1.1, with a capitalized Message and the authorized resource.
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
+        )
+        message = (
+            f"User: {principal_arn} is not authorized to perform: {action} "
+            f"on resource: {resource_arn} {reason}"
+        )
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
     if not message:
         message = (
             f"User: {principal_arn} is not authorized to perform: {action} "
