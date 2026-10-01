@@ -15,6 +15,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Cloud Map — `DeleteNamespace` refuses a namespace that still has services** — it deleted the namespace (and now its hosted zone) anyway. It answers `400 ResourceInUse` "Namespace has associated services; delete the services before deleting the namespace", as on AWS.
 - **CloudFormation — `AWS::Lambda::Version` publishes through `PublishVersion`** — the version takes its `Description`, a version of a function unchanged since its latest version fails with the `AlreadyExists` error AWS reports, `FunctionScalingConfig` on a function without a capacity provider is refused, and a function keeps its `CapacityProviderConfig`. Contributed by @iot-rocket.
 - **Lambda — `PublishVersion` of an unchanged function returns the latest version** — it published a new version every time; AWS doesn't publish when the code and configuration haven't changed since the last version, and returns that version with its original description.
 - **CloudFormation — `AWS::EC2::VPCGatewayAttachment` updates in place** — a changed `InternetGatewayId` or `VpnGatewayId` moves the attachment under the same `IGW|vpc-…` / `VGW|vpc-…` physical id, `VpnGatewayId` is attached at all, and a `VpcId` change leaves the gateway attached to the new VPC, or to the old one when the update rolls back. `AttachInternetGateway` on a gateway already attached to a VPC answers `Resource.AlreadyAssociated`, and a stack attaching it to a second VPC leaves it on the first, as AWS does. Contributed by @iot-rocket.
