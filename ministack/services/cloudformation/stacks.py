@@ -68,15 +68,19 @@ def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None 
         asyncio.get_event_loop().create_task(coro)
 
 
-def _is_custom_resource(resource_type: str) -> bool:
-    """The types whose provisioning blocks on a callback into this server, so
-    they run on a worker thread: custom resources wait for the ResponseURL
-    PUT, a WaitCondition for the signals on its handle, and a nested stack
-    deploys inline and may contain either."""
+def _runs_on_worker_thread(resource_type: str) -> bool:
+    """The types whose provisioning blocks, so they run on a worker thread:
+    custom resources wait for the ResponseURL PUT, a WaitCondition for the
+    signals on its handle, and a nested stack deploys inline and may contain
+    either. ElastiCache clusters and replication groups start and stop their
+    containers through the Docker daemon, the calls elasticache.py itself
+    keeps off the event loop."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
-                                 "AWS::CloudFormation::Stack"))
+                                 "AWS::CloudFormation::Stack",
+                                 "AWS::ElastiCache::CacheCluster",
+                                 "AWS::ElastiCache::ReplicationGroup"))
 
 
 # ===========================================================================
@@ -235,7 +239,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
                physical_id=physical_id)
     try:
-        if _is_custom_resource(rtype):
+        if _runs_on_worker_thread(rtype):
             new_pid, new_attrs = await run_reentrant(
                 _update_resource, rtype, physical_id, applied_props,
                 previous_props, stack_name, logical_id, attrs)
@@ -290,7 +294,7 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
                 still_failed[logical_id] = res
             continue
         try:
-            if _is_custom_resource(rtype):
+            if _runs_on_worker_thread(rtype):
                 await run_reentrant(_delete_resource, rtype, pid,
                                     res.get("Properties", {}), stack_name, logical_id)
             else:
@@ -460,7 +464,7 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
-            if _is_custom_resource(rtype):
+            if _runs_on_worker_thread(rtype):
                 await run_reentrant(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id
@@ -673,7 +677,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         resource_type, old_tagged, new_tagged):
                     update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
-                    if _is_custom_resource(resource_type):
+                    if _runs_on_worker_thread(resource_type):
                         physical_id, attrs = await run_reentrant(
                             _update_resource, resource_type, old_pid, old_tagged,
                             new_tagged, stack_name, logical_id, old_attrs
@@ -698,7 +702,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
                     stack_name, stack_id, logical_id)
-                if _is_custom_resource(resource_type):
+                if _runs_on_worker_thread(resource_type):
                     physical_id, attrs = await run_reentrant(
                         _provision_resource, resource_type, logical_id, new_tagged, stack_name
                     )
@@ -788,7 +792,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     delete_fn(*args, **kwargs)
                 if new_pid == old_pid:
                     continue
-                if _is_custom_resource(rtype):
+                if _runs_on_worker_thread(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, old_pid, old_props,
                         stack_name, logical_id
@@ -831,7 +835,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             try:
                 if policy == "Snapshot":
                     _snapshot_resource(rtype, pid, old_props)
-                if _is_custom_resource(rtype):
+                if _runs_on_worker_thread(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
@@ -979,7 +983,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         try:
             if policy == "Snapshot":
                 _snapshot_resource(rtype, pid, res_props)
-            if _is_custom_resource(rtype):
+            if _runs_on_worker_thread(rtype):
                 await run_reentrant(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id

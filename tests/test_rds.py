@@ -864,6 +864,37 @@ def test_rds_global_cluster_lifecycle(rds):
         rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
+def test_rds_describe_global_clusters_member_element(rds):
+    """Each cluster in DescribeGlobalClusters is a <GlobalClusterMember> element.
+
+    botocore reads the items of a list whatever their element name, so boto3
+    cannot tell; SDKs that match the name, such as aws-sdk-go-v2, found no
+    clusters when they were <GlobalCluster> elements.
+    """
+    import xml.etree.ElementTree as ET
+
+    import requests
+    rds.create_global_cluster(
+        GlobalClusterIdentifier="test-global-wire",
+        Engine="aurora-postgresql",
+        EngineVersion="15.13",
+    )
+    try:
+        response = requests.post(
+            ENDPOINT,
+            data={"Action": "DescribeGlobalClusters", "Version": "2014-10-31",
+                  "GlobalClusterIdentifier": "test-global-wire"},
+            headers={"Authorization": "AWS4-HMAC-SHA256 "
+                     "Credential=test/20260930/us-east-1/rds/aws4_request"},
+            timeout=10,
+        )
+        assert response.status_code == 200
+        clusters = ET.fromstring(response.content).find(".//{*}GlobalClusters")
+        assert [child.tag.rpartition("}")[2] for child in clusters] == ["GlobalClusterMember"]
+        assert clusters[0].findtext("{*}GlobalClusterIdentifier") == "test-global-wire"
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier="test-global-wire")
+
 def test_rds_global_cluster_with_source(rds):
     """CreateGlobalCluster with SourceDBClusterIdentifier picks up engine from source."""
     rds.create_db_cluster(
@@ -16161,31 +16192,37 @@ def test_rds_server_certificate_without_cryptography_raises(monkeypatch):
         rds_service._pg_server_material(["localhost"], [])
 
 
-def _fake_docker_self(networks):
-    """A Docker client whose HOSTNAME lookup finds MiniStack's own container."""
+class _FailedSelfLookup:
+    """MiniStack's container under a Compose `hostname:`: HOSTNAME names no container."""
 
-    class FakeContainers:
-        def get(self, _identifier):
-            if networks is None:
-                raise Exception("not a container")
-            return types.SimpleNamespace(
-                attrs={"NetworkSettings": {"Networks": {n: {} for n in networks}}})
-
-    class FakeDocker:
-        containers = FakeContainers()
-
-    return FakeDocker()
+    class containers:
+        @staticmethod
+        def get(_identifier):
+            raise Exception("no such container")
 
 
-def test_rds_public_endpoint_containerised_ministack_joins_its_network(monkeypatch):
+class _FoundSelfLookup:
+    """MiniStack's own container, found by HOSTNAME, on the network `ms_net`."""
+
+    class containers:
+        @staticmethod
+        def get(_identifier):
+            return types.SimpleNamespace(attrs={"NetworkSettings": {"Networks": {"ms_net": {}}}})
+
+
+@pytest.mark.parametrize("docker_network, client, expected", [
+    ("compose_default", _FailedSelfLookup(), "compose_default"),
+    ("", _FoundSelfLookup(), "ms_net"),
+])
+def test_rds_public_endpoint_containerised_ministack_joins_its_network(monkeypatch, docker_network, client, expected):
     """#1884: the database container must stay reachable from a containerised MiniStack."""
     from ministack.services import rds as m
 
     monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
-    monkeypatch.setattr(m, "DOCKER_NETWORK", "compose_default")
+    monkeypatch.setattr(m, "DOCKER_NETWORK", docker_network)
     monkeypatch.setattr(m, "_ministack_network", None)
-    client = _fake_docker_self(["bridge", "compose_default"])
-    assert m._get_ministack_network(client) == "compose_default"
+    monkeypatch.setattr(m, "_in_container", lambda: True)
+    assert m._get_ministack_network(client) == expected
 
 
 def test_rds_public_endpoint_host_run_ministack_stays_off_network(monkeypatch):
@@ -16195,7 +16232,8 @@ def test_rds_public_endpoint_host_run_ministack_stays_off_network(monkeypatch):
     monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
     monkeypatch.setattr(m, "DOCKER_NETWORK", "compose_default")
     monkeypatch.setattr(m, "_ministack_network", None)
-    assert m._get_ministack_network(_fake_docker_self(None)) is None
+    monkeypatch.setattr(m, "_in_container", lambda: False)
+    assert m._get_ministack_network(_FailedSelfLookup()) is None
 
 
 def test_rds_public_endpoint_reports_published_port_probes_container(monkeypatch):

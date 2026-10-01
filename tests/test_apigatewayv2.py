@@ -1025,6 +1025,18 @@ def test_apigw_execute_no_route(apigw):
     except _urlerr.HTTPError as e:
         assert e.code == 404
         assert e.read() == b'{"message":"Not Found"}'
+    # No stage matches and there is no $default stage: the same body.
+    staged = apigw.create_api(Name="no-stage-api", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=staged, StageName="prod")
+    req = _urlreq.Request(f"http://{staged}.execute-api.localhost:{_EXECUTE_PORT}/dev/x", method="GET")
+    req.add_header("Host", f"{staged}.execute-api.localhost:{_EXECUTE_PORT}")
+    try:
+        _urlreq.urlopen(req)
+        assert False, "Expected 404"
+    except _urlerr.HTTPError as e:
+        assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
+    apigw.delete_api(ApiId=staged)
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
@@ -1101,6 +1113,44 @@ def test_apigw_path_param_route(apigw, lam):
     assert resp.status == 200
     body = json.loads(resp.read())
     assert body["rawPath"] == "/items/abc123"
+
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_leading_double_slash_selects_route(apigw, lam):
+    """A doubled leading slash still selects the route, as on AWS."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-dbl-slash-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    api_id = apigw.create_api(Name=f"dbl-slash-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="ANY /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    resp = _urlreq.urlopen(f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/$default//items/abc123")
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"proxy": "abc123"}
 
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
@@ -1326,6 +1376,47 @@ def test_apigw_raw_query_string_percent_encoded(apigw, lam):
         body = json.loads(resp.read())
         assert "openid%20profile" in body["rawQs"]
         assert "openid profile" not in body["rawQs"]  # no literal space
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_raw_path_keeps_percent25_escape(apigw, lam):
+    """rawPath decodes escapes but never %25, so a%252Eb is not turned into a%2Eb."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawpath-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawPath': event.get('rawPath')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawpath-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    def raw_path(segment):
+        req = _urlreq.Request(f"http://{host}/$default/items/{segment}", method="GET")
+        req.add_header("Host", host)
+        return json.loads(_urlreq.urlopen(req).read())["rawPath"]
+
+    try:
+        assert raw_path("a%252Eb") == "/items/a%252Eb"
+        assert raw_path("a%2Eb") == "/items/a.b"
+        req = _urlreq.Request(f"http://{host}/items/a%252Eb", method="GET")
+        req.add_header("Host", host)
+        assert json.loads(_urlreq.urlopen(req).read())["rawPath"] == "/items/a%252Eb"
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=fname)
@@ -4184,6 +4275,65 @@ def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, s
         status, _ = _v2_auth_http(url, headers={"Authorization": "deny-me"})
         assert status == 403, "the first caller's Allow must not answer a second token"
         assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw, lam, sqs):
+    """A declared identity source missing from the request is a 401 without
+    invoking the Lambda, even with caching disabled (``AuthorizerResultTtlInSeconds=0``).
+
+    AWS applies this identity-source short circuit independent of caching;
+    it is not only a caching optimization. The body matches AWS's own
+    compact-JSON gateway response exactly (no space after the colon).
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url)  # no Authorization header sent
+        assert status == 401
+        assert body == b'{"message":"Unauthorized"}'
+        assert _v2_auth_count(sqs, qname) == 0, "the authorizer Lambda must not be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+@pytest.mark.parametrize("source,ttl,calls,invocations", [
+    ("$context.identity.sourceIp", 0, 1, 1),
+    # "To cache responses per route, add $context.routeKey to your authorizer's identity sources."
+    ("$context.routeKey", 300, 2, 1),
+])
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs, source, ttl,
+                                                                  calls, invocations):
+    """A $context.* identity source is resolved from the request, so it is never missing and,
+    cached, keys the authorizer cache."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=[source], AuthorizerResultTtlInSeconds=ttl),
+    )
+    try:
+        for _ in range(calls):
+            status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+            assert status != 401
+        assert _v2_auth_count(sqs, qname) == invocations
     finally:
         _v2_auth_drop_api(apigw, api_id)
         _v2_auth_drop_lambda(lam, backend)

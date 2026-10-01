@@ -209,7 +209,10 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         return ctx.tag_keys
     if k.startswith("aws:requesttag/"):
         tag_key = key[len("aws:RequestTag/"):]
-        return ctx.request_tags.get(tag_key)
+        values = [value for name, value in ctx.request_tags.items() if name.lower() == tag_key.lower()]
+        if len(values) == 1:
+            return values[0]
+        return values if values else None
     if k in ("aws:resourceaccount", "s3:resourceaccount"):
         # The account that owns the resource. The emulator hosts one account
         # per request and models no cross-account access, so it is the
@@ -374,7 +377,7 @@ _NEGATED_OPS = frozenset({
 
 def _evaluate_single_condition(operator: str, actual: Any,
                                expected_values: list[str]) -> bool:
-    """One condition key vs its expected values.  Values are OR'd."""
+    """Compare policy values using OR for affirmative operators and NOR for negated ones."""
     op_lower = operator.lower()
 
     # Null check: tests key presence/absence
@@ -415,29 +418,22 @@ def _evaluate_single_condition(operator: str, actual: Any,
         actual_list = [str(actual)]
 
     expected_str = [str(v) for v in expected_values]
+    combine = all if op_lower in _NEGATED_OPS else any
+
+    def matches_expected(value: str) -> bool:
+        return combine(op_func(value, expected) for expected in expected_str)
 
     if for_all:
-        # Every actual value must match at least one expected value
-        return all(
-            any(op_func(av, ev) for ev in expected_str)
-            for av in actual_list
-        )
+        return all(matches_expected(value) for value in actual_list)
     if for_any:
-        # At least one actual value must match at least one expected value
-        return any(
-            any(op_func(av, ev) for ev in expected_str)
-            for av in actual_list
-        )
+        return any(matches_expected(value) for value in actual_list)
 
-    # Standard: any expected value matching any actual value satisfies the condition
-    return any(
-        op_func(str(actual), ev) for ev in expected_str
-    )
+    return matches_expected(str(actual))
 
 
 def _conditions_met(conditions: dict, ctx: EvalContext) -> bool:
     """All condition blocks must be satisfied (AND between operators).
-    Multiple values within a key are OR'd."""
+    Policy values use OR for affirmative operators and NOR for negated ones."""
     if not conditions:
         return True
     for operator, key_values in conditions.items():
@@ -449,6 +445,23 @@ def _conditions_met(conditions: dict, ctx: EvalContext) -> bool:
                 expected = [expected]
             elif not isinstance(expected, list):
                 expected = [str(expected)]
+            if key.lower().startswith("aws:requesttag/") and isinstance(actual, list):
+                # Case variants are distinct request tags, each with one
+                # value. Evaluate even set operators against each individual
+                # tag, then match any variant for affirmative operators and
+                # none for negated operators, as AWS does.
+                op = operator.lower()
+                if op.endswith("ifexists"):
+                    op = op[:-8]
+                if op.startswith("foranyvalue:"):
+                    op = op[12:]
+                elif op.startswith("forallvalues:"):
+                    op = op[13:]
+                combine = all if op in _NEGATED_OPS else any
+                if not combine(_evaluate_single_condition(operator, value, expected)
+                               for value in actual):
+                    return False
+                continue
             if not _evaluate_single_condition(operator, actual, expected):
                 return False
     return True
@@ -784,14 +797,13 @@ def _resolve_managed_policy_document(policy_arn: str,
             return ver.get("Document")
         return None
 
-    # Customer-managed policy — look up by ARN
-    # The _policies dict is keyed by policy name; .items() returns current account's
-    for _name, policy in iam_svc._policies.items():
-        if policy.get("Arn") == policy_arn:
-            default_vid = policy.get("DefaultVersionId", "v1")
-            versions = policy.get("Versions", {})
-            ver = versions.get(default_vid, {})
-            return ver.get("Document")
+    # Customer-managed policies are keyed by full ARN in the owner's account.
+    policy = iam_svc._policies.get_scoped(account_id, None, policy_arn)
+    if policy:
+        default_vid = policy.get("DefaultVersionId", "v1")
+        versions = policy.get("Versions", {})
+        ver = versions.get(default_vid, {})
+        return ver.get("Document")
     return None
 
 

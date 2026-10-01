@@ -68,6 +68,30 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
 
+_PCT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def decode_http_api_path(raw_path: str) -> str:
+    """Decode a request path the way an HTTP API builds ``rawPath``: every escape
+    decodes except ``%25``, so ``a%252Eb`` arrives as ``a%252Eb``, not ``a%2Eb``."""
+
+    def _decode(match):
+        run, out, pending = match.group(0), [], bytearray()
+        for i in range(0, len(run), 3):
+            byte = int(run[i + 1 : i + 3], 16)
+            if byte == 0x25:
+                if pending:
+                    out.append(pending.decode("utf-8", "replace"))
+                    pending.clear()
+                out.append("%25")
+            else:
+                pending.append(byte)
+        if pending:
+            out.append(pending.decode("utf-8", "replace"))
+        return "".join(out)
+
+    return _PCT_RUN_RE.sub(_decode, raw_path)
+
 
 def _timeout_from_env(env_name: str, default_seconds: float) -> float:
     """Read a positive float timeout from an env var; fall back on missing /
@@ -850,7 +874,8 @@ def _evaluate_authorizer_policy(policy_doc, route_arn):
     return "Allow" if allow else "NoMatch"
 
 
-def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
+def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars,
+                                        context=None):
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
     HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
@@ -872,7 +897,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
             val = (qv[0] if isinstance(qv, list) else qv) or ""
         elif src.startswith("$stageVariables."):
             val = (stage_vars or {}).get(src[len("$stageVariables."):]) or ""
-        # $context.* identity sources are not modeled; treated as absent.
+        elif src.startswith("$context."):
+            val = (context or {}).get(src[len("$context."):]) or ""
         values.append(val)
         if not val:
             present = False
@@ -963,19 +989,24 @@ async def _authorize_request_v2(
     ttl = _authorizer_ttl(authorizer)
 
     identity_source = authorizer.get("identitySource") or []
+    context = {
+        "routeKey": route.get("routeKey", "$default"), "stage": stage, "apiId": api_id,
+        "accountId": owner_account_id, "httpMethod": method, "path": path,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "identity.sourceIp": "127.0.0.1", "identity.userAgent": headers.get("user-agent", ""),
+    }
     all_present, id_values = _request_authorizer_identity_sources(
-        identity_source, headers, query_params, stage_vars
+        identity_source, headers, query_params, stage_vars, context
     )
     # "To enable caching, your authorizer must have at least one identity
     # source": the identity values ARE the cache key, so with none declared
     # there is nothing to key on and every caller would otherwise be served
     # the first caller's result.
     caching = ttl > 0 and bool(identity_source)
-    # A missing declared identity source is a 401 without invoking the
-    # Lambda — same AWS-verified shortcut apigateway_v1 uses for REST
-    # REQUEST authorizers.
-    if caching and not all_present:
-        return _jwt_unauthorized(), None
+    # A declared identity source missing from the request is a 401 without
+    # invoking the Lambda, cached or not.
+    if identity_source and not all_present:
+        return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
     identity_values = tuple(id_values)
 
     if payload_version == "1.0":
@@ -1258,7 +1289,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     """Execute an API request through a deployed API (data plane)."""
     scope = find_api_scope(api_id)
     if scope is None:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
     owner_account_id, owner_region = scope
 
     from ministack.core.responses import _request_account_id, _request_region
@@ -1275,13 +1306,18 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
         _request_region.reset(region_token)
 
 
+def _http_api_not_found():
+    """AWS's 404 for a request no stage or route of an HTTP API matches."""
+    return 404, {"Content-Type": "application/json"}, b'{"message":"Not Found"}'
+
+
 async def _handle_execute_in_scope(
     api_id, stage, path, method, headers, body, query_params,
     owner_account_id, owner_region,
 ):
     api = _apis.get(api_id)
     if not api:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
 
     # CORS preflight: served from the API's corsConfiguration before any route
     # matching, because AWS responds to OPTIONS itself without invoking the
@@ -1292,16 +1328,13 @@ async def _handle_execute_in_scope(
 
     api_stages = _stages.get(api_id, {})
     if stage not in api_stages and stage != "$default":
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage}' not found"}).encode()
+        return _http_api_not_found()
 
-    route = _match_route(api_id, method, path)
+    # AWS selects the route of a path with extra leading slashes as if it had one.
+    route_path_in = "/" + path.lstrip("/")
+    route = _match_route(api_id, method, route_path_in)
     if not route:
-        # AWS's body for an unmatched HTTP API route: compact JSON.
-        return (
-            404,
-            {"Content-Type": "application/json"},
-            json.dumps({"message": "Not Found"}, separators=(",", ":")).encode(),
-        )
+        return _http_api_not_found()
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")
@@ -1309,7 +1342,7 @@ async def _handle_execute_in_scope(
     rk_parts = route_key.split(" ", 1)
     if len(rk_parts) == 2:
         route_path = rk_parts[1]
-    path_params = _extract_path_params(route_path, path) if route_path else {}
+    path_params = _extract_path_params(route_path, route_path_in) if route_path else {}
 
     stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()

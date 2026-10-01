@@ -1183,7 +1183,13 @@ class Worker:
         # already present; setdefault only fills in the default when neither
         # the function nor the host set one.
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        spawn_env.setdefault("AWS_ENDPOINT_URL", f"http://127.0.0.1:{port}")
+        from ministack.core import tls as _tls
+        if "AWS_ENDPOINT_URL" not in spawn_env:
+            if _tls.use_ssl_enabled():
+                spawn_env["AWS_ENDPOINT_URL"] = f"https://127.0.0.1:{port}"
+                _tls.trust_gateway_cert(spawn_env)
+            else:
+                spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)

@@ -460,10 +460,11 @@ def _update_event_bus(data):
 
     bus["LastModifiedTime"] = now
 
-    return json_response({
-        "EventBusArn": bus["Arn"],
-        "LastModifiedTime": bus["LastModifiedTime"],
-    })
+    out = {"Arn": bus["Arn"], "Name": bus["Name"]}
+    for k in ("Description", "KmsKeyIdentifier", "DeadLetterConfig", "LogConfig"):
+        if k in bus:
+            out[k] = bus[k]
+    return json_response(out)
 
 
 # ---------------------------------------------------------------------------

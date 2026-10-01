@@ -1223,7 +1223,29 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_elasticache_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_elasticache_ca_request(method: str, path: str):
+    """`GET /_ministack/elasticache/ca.pem` returns the CA that signs serverless
+    cache certificates; a client trusts it to connect with TLS."""
+    if path != "/_ministack/elasticache/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import elasticache
+
+        cert_pem = elasticache.serverless_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, cert_pem.encode())
 
 
 def _handle_rds_ca_request(method: str, path: str):
@@ -1711,7 +1733,8 @@ def _resolve_custom_domain_request(host: str, path: str):
 
 
 async def _handle_execute_api_request(
-    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
+    raw_path: str | None = None,
 ):
     """Handle API Gateway execute-api data plane requests (Host-based,
     path-based, and registered custom domains)."""
@@ -1774,6 +1797,13 @@ async def _handle_execute_api_request(
         apigw_v2 = _get_module("apigateway")
         if apigw_v2.find_api_scope(api_id) is None:
             return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        if raw_path is not None and path.endswith(execute_path):
+            # `path` is the server's full decode, which also turns %25 into "%";
+            # an HTTP API keeps that one escape in rawPath.
+            prefix = path[: len(path) - len(execute_path)]
+            http_api_path = apigw_v2.decode_http_api_path(raw_path)
+            if http_api_path.startswith(prefix):
+                execute_path = http_api_path[len(prefix):]
         return await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
@@ -2091,6 +2121,7 @@ async def _handle_special_data_plane_request(
     body: bytes,
     query_params: dict,
     request_id: str,
+    raw_path: str | None = None,
 ):
     """Handle special-case service entrypoints before the generic router."""
     # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
@@ -2125,7 +2156,9 @@ async def _handle_special_data_plane_request(
         return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
-    if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
+    if response := await _handle_execute_api_request(
+        host, path, method, headers, body, query_params, raw_path=raw_path
+    ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
@@ -2491,7 +2524,10 @@ async def _dispatch_service_request(
                         message=denied.message,
                         headers=headers,
                     )
-                return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers)
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id, headers=headers,
+                    resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                )
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
@@ -2688,7 +2724,10 @@ async def app(scope, receive, send):
 
     if await _send_if_handled(
         send,
-        await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id),
+        await _handle_special_data_plane_request(
+            method, path, headers, body, query_params, request_id,
+            raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+        ),
         receive,
     ):
         return
