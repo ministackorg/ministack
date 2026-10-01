@@ -7,7 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+
 ### Added
+
+- **CloudFormation — `AWS::EC2::VPCGatewayAttachment` updates in place** — a changed `InternetGatewayId` or `VpnGatewayId` moves the attachment under the same `IGW|vpc-…` / `VGW|vpc-…` physical id, `VpnGatewayId` is attached at all, and a `VpcId` change leaves the gateway attached to the new VPC, or to the old one when the update rolls back.
+
 
 - **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS. Contributed by @iot-rocket.
 

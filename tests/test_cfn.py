@@ -27494,6 +27494,141 @@ def test_cfn_ec2_internet_gateway_tag_change_is_rolled_back(cfn, ec2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_gateway_attachment_template(gateway, vpc="Vpc", failing=False):
+    """Two VPCs, two internet gateways and an attachment of ``gateway`` to ``vpc``."""
+    template = {
+        "Parameters": {"Vgw1": {"Type": "String", "Default": ""},
+                       "Vgw2": {"Type": "String", "Default": ""}},
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+            "Vpc2": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.54.0.0/16"}},
+            "Igw1": {"Type": "AWS::EC2::InternetGateway"},
+            "Igw2": {"Type": "AWS::EC2::InternetGateway"},
+            "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                "VpcId": {"Ref": vpc}, gateway[0]: {"Ref": gateway[1]}}},
+        },
+        "Outputs": {k: {"Value": {"Ref": k}} for k in ("Vpc", "Vpc2", "Igw1", "Igw2", "Attach")},
+    }
+    body = json.dumps(template)
+    return _cfn_with_failing_resource(body, "Attach") if failing else body
+
+
+def _cfn_igw_vpcs(ec2, igw_id):
+    return [a["VpcId"] for a in ec2.describe_internet_gateways(
+        InternetGatewayIds=[igw_id])["InternetGateways"][0].get("Attachments", [])]
+
+
+def test_cfn_ec2_gateway_attachment_swaps_the_internet_gateway_in_place(cfn, ec2):
+    """A new InternetGatewayId moves the attachment under the same IGW|vpc id."""
+    stack_name = f"cfn-gwa-igw-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1, igw2 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1", "Igw2"))
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw2")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == []
+        assert _cfn_igw_vpcs(ec2, igw2) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_attaches_and_swaps_a_vpn_gateway(cfn, ec2):
+    """VpnGatewayId attaches the virtual private gateway; a new one swaps in place."""
+    stack_name = f"cfn-gwa-vgw-{_uuid_mod.uuid4().hex[:8]}"
+    vgws = [ec2.create_vpn_gateway(Type="ipsec.1")["VpnGateway"]["VpnGatewayId"] for _ in range(2)]
+    params = [{"ParameterKey": f"Vgw{i}", "ParameterValue": v} for i, v in enumerate(vgws, 1)]
+
+    def vpcs(vgw):
+        return [a["VpcId"] for a in ec2.describe_vpn_gateways(
+            VpnGatewayIds=[vgw])["VpnGateways"][0].get("VpcAttachments", [])
+            if a["State"] == "attached"]
+
+    try:
+        cfn.create_stack(StackName=stack_name, Parameters=params,
+                         TemplateBody=_cfn_gateway_attachment_template(("VpnGatewayId", "Vgw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc = _cfn_output(cfn, stack_name, "Vpc")
+        assert _cfn_output(cfn, stack_name, "Attach") == f"VGW|{vpc}"
+        assert vpcs(vgws[0]) == [vpc]
+
+        cfn.update_stack(StackName=stack_name, Parameters=params,
+                         TemplateBody=_cfn_gateway_attachment_template(("VpnGatewayId", "Vgw2")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Attach") == f"VGW|{vpc}"
+        assert vpcs(vgws[0]) == []
+        assert vpcs(vgws[1]) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for vgw in vgws:
+            ec2.delete_vpn_gateway(VpnGatewayId=vgw)
+
+
+def test_cfn_ec2_gateway_attachment_vpc_change_keeps_the_gateway_attached(cfn, ec2):
+    """A VpcId change replaces the attachment and leaves the gateway on the new VPC."""
+    stack_name = f"cfn-gwa-vpc-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw1"), vpc="Vpc2"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        vpc2, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc2", "Igw1"))
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc2}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc2]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_vpc_change_is_rolled_back(cfn, ec2):
+    """A rolled-back VpcId change leaves the gateway attached to the old VPC."""
+    stack_name = f"cfn-gwa-vrb-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw1"), vpc="Vpc2", failing=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_swap_is_rolled_back(cfn, ec2):
+    """A gateway swap is sent back by the rollback under the same id."""
+    stack_name = f"cfn-gwa-rb-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1, igw2 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1", "Igw2"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw2"), failing=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = [e["ResourceStatus"] for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Attach"]
+        assert events[:4] == ["UPDATE_COMPLETE", "UPDATE_IN_PROGRESS"] * 2
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+        assert _cfn_igw_vpcs(ec2, igw2) == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_route_table_tag_update_keeps_id_and_routes(cfn, ec2):
     """A tag change keeps the table's id and routes."""
     suffix = _uuid_mod.uuid4().hex[:8]
