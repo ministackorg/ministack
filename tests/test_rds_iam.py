@@ -386,7 +386,7 @@ class TestResourceBoundAuthorization:
         else:
             arn = f"arn:aws:iam::{ACCOUNT}:policy/connect"
             iam._users.get_scoped(ACCOUNT, None, "alice")["AttachedPolicies"] = [arn]
-            iam._policies.set_scoped(ACCOUNT, None, "connect", {
+            iam._policies.set_scoped(ACCOUNT, None, arn, {
                 "Arn": arn, "DefaultVersionId": "v1", "Versions": {"v1": {"Document": _authz_policy()}},
             })
         with request_scope(OTHER_ACCOUNT, "eu-west-1"):
