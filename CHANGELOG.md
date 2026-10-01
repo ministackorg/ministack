@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
