@@ -3708,7 +3708,7 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
     "OptionGroupMemberships", "OptionGroupsList", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
-    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers", "GlobalClusters",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
     "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",
