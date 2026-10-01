@@ -10787,8 +10787,8 @@ def _firehose_delivery_stream_delete(physical_id, props):
 # databases and tables are the catalog Athena and the Glue API read. Crawlers
 # and jobs are records only: a stack never starts a crawl or a job run. Ref
 # is the resource name for every type except the partition, whose Ref is its
-# compound primary identifier. Create-only properties follow the published
-# registry schemas. Deletes ignore EntityNotFound, since deleting a database
+# compound primary identifier. Replacement follows the template reference's
+# "Update requires". Deletes ignore EntityNotFound, since deleting a database
 # already drops its tables and partitions.
 
 
@@ -10840,16 +10840,16 @@ def _glue_database_create(logical_id, props, stack_name):
 
 
 def _glue_database_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    # The registry schema's only create-only property is DatabaseName, and its
-    # update handler is granted glue:UpdateDatabase but neither CreateDatabase
-    # nor DeleteDatabase: a DatabaseInput change, its Name included, updates
-    # the database in place under the same Ref.
     declared = new_props.get("DatabaseName")
     if physical_id not in _glue._databases or (declared and declared != physical_id):
         created = _glue_database_create(logical_id or physical_id, new_props, stack_name)
         if physical_id in _glue._databases and created[0] != physical_id:
             _delete_predecessor(_glue_database_delete, physical_id, old_props)
         return created
+    # AWS updates by the new DatabaseInput.Name, which does not exist yet.
+    requested = (new_props.get("DatabaseInput") or {}).get("Name")
+    if not declared and requested and requested.lower() != physical_id.lower():
+        raise ValueError(f"Database {requested} not found")
     name = physical_id
     db_input = _glue_database_input(name, new_props)
     db_input.update(_glue_reset_dropped(
@@ -11969,10 +11969,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
         "Description", "LicenseInfo",
     ),
-    # createOnlyProperties of the published registry schemas. Table,
-    # Partition and Connection are left out: the first replaces on a
-    # TableInput.Name change the schema does not list, and the other two have
-    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    # Table, Partition and Connection replace on nested members
+    # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
