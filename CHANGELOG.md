@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Bedrock AgentCore — runtime version history and endpoint pinning** — runtime updates now retain version snapshots, `GetAgentRuntime` retrieves a selected version, and `ListAgentRuntimeVersions` paginates the history. `DEFAULT` advances with the latest version while named endpoints stay pinned until updated; invocations use the selected snapshot, with containers isolated by version. Contributed by @pingedbrain.
 - **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS. Contributed by @iot-rocket.
 
 ### Fixed
