@@ -172,6 +172,49 @@ def test_ses_v2_identity_tag_resource_uses_parser_backed_resource_arn(ses_v2):
     assert body["Tags"] == [{"Key": "team", "Value": "platform"}]
 
 
+def test_ses_v2_create_domain_identity_returns_easy_dkim_tokens(ses_v2):
+    """A domain created without DkimSigningAttributes gets Easy DKIM tokens (CreateEmailIdentity API reference)."""
+    status, body = _call(
+        ses_v2,
+        "POST",
+        "/v2/email/identities",
+        body={"EmailIdentity": "dkim.example.com"},
+    )
+    assert status == 200
+    dkim = body["DkimAttributes"]
+    assert len(set(dkim["Tokens"])) == 3
+    assert (dkim["SigningAttributesOrigin"], dkim["Status"]) == ("AWS_SES", "PENDING")
+
+    status, body = _call(ses_v2, "GET", "/v2/email/identities/dkim.example.com")
+    assert status == 200
+    assert body["DkimAttributes"]["Tokens"] == dkim["Tokens"]
+
+
+def test_ses_v2_create_byodkim_domain_identity_gets_no_easy_dkim_tokens(ses_v2):
+    """DkimSigningAttributes with a key and selector is BYODKIM, not Easy DKIM."""
+    status, body = _call(
+        ses_v2,
+        "POST",
+        "/v2/email/identities",
+        body={"EmailIdentity": "byodkim.example.com", "DkimSigningAttributes": {
+            "DomainSigningSelector": "sel1", "DomainSigningPrivateKey": "cHJpdmF0ZQ=="}},
+    )
+    assert status == 200
+    assert body["DkimAttributes"].get("SigningAttributesOrigin") != "AWS_SES"
+
+
+def test_ses_v2_create_email_address_identity_has_no_dkim_tokens(ses_v2):
+    status, body = _call(
+        ses_v2,
+        "POST",
+        "/v2/email/identities",
+        body={"EmailIdentity": "person@example.com"},
+    )
+    assert status == 200
+    assert body["DkimAttributes"]["SigningEnabled"] is False
+    assert body["DkimAttributes"]["Tokens"] == []
+
+
 def test_ses_v2_configuration_set_tag_resource_uses_parser_backed_resource_arn(ses_v2):
     config_set_name = "parser-config"
     resource_arn = _arn("configuration-set", config_set_name)

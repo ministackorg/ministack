@@ -74,6 +74,66 @@ def test_ecs_task_def(ecs):
     assert resp["taskDefinition"]["family"] == "test-task"
     assert resp["taskDefinition"]["revision"] == 1
 
+@pytest.mark.parametrize("cpu", [None, "512"])
+@pytest.mark.parametrize("memory", [None, "1024"])
+@pytest.mark.parametrize("requires_compatibilities", [None, ["EC2"]])
+def test_ecs_task_definition_optional_fields_readback(
+    ecs, cpu, memory, requires_compatibilities,
+):
+    # AWS RegisterTaskDefinition documents optional EC2 sizing and omission of
+    # unspecified requiresCompatibilities. Its register/describe/deregister
+    # examples omit task-level sizing when only container resources are given.
+    optional_fields = {
+        field: value for field, value in {
+            "cpu": cpu,
+            "memory": memory,
+            "requiresCompatibilities": requires_compatibilities,
+        }.items() if value is not None
+    }
+    registered = ecs.register_task_definition(
+        family=f"optional-fields-{_uuid_mod.uuid4().hex[:8]}",
+        containerDefinitions=[{
+            "name": "web", "image": "nginx:alpine", "cpu": 128, "memory": 256,
+        }],
+        **optional_fields,
+    )["taskDefinition"]
+    arn = registered["taskDefinitionArn"]
+    described = ecs.describe_task_definition(taskDefinition=arn)["taskDefinition"]
+    deregistered = ecs.deregister_task_definition(taskDefinition=arn)["taskDefinition"]
+
+    for td in (registered, described, deregistered):
+        for field in ("cpu", "memory", "requiresCompatibilities"):
+            if field in optional_fields:
+                assert td[field] == optional_fields[field]
+            else:
+                assert field not in td
+        assert td["containerDefinitions"][0]["cpu"] == 128
+        assert td["containerDefinitions"][0]["memory"] == 256
+        assert td["networkMode"] == "bridge"
+    assert registered["status"] == described["status"] == "ACTIVE"
+    assert deregistered["status"] == "INACTIVE"
+
+
+def test_ecs_task_definition_explicit_fargate_sizing_readback(ecs):
+    registered = ecs.register_task_definition(
+        family=f"explicit-fargate-{_uuid_mod.uuid4().hex[:8]}",
+        containerDefinitions=[{"name": "web", "image": "nginx:alpine"}],
+        networkMode="awsvpc",
+        requiresCompatibilities=["FARGATE"],
+        cpu="512",
+        memory="1024",
+    )["taskDefinition"]
+    arn = registered["taskDefinitionArn"]
+    described = ecs.describe_task_definition(taskDefinition=arn)["taskDefinition"]
+    deregistered = ecs.deregister_task_definition(taskDefinition=arn)["taskDefinition"]
+
+    for td in (registered, described, deregistered):
+        assert td["cpu"] == "512"
+        assert td["memory"] == "1024"
+        assert td["requiresCompatibilities"] == ["FARGATE"]
+        assert td["networkMode"] == "awsvpc"
+
+
 def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
