@@ -3655,22 +3655,9 @@ def _admin_initiate_auth(data):
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        if not refresh_token:
-            return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
-        user = _user_from_token(refresh_token, pool)
-        if not user:
-            # Fall back to first user if token can't be decoded (e.g. externally issued token)
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
-        if _refresh_token_revoked(refresh_token, user):
-            return error_response_json("NotAuthorizedException",
-                                       "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user,
-                                     trigger_source="TokenGeneration_RefreshTokens")
-        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+        result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+        if err:
+            return err
         return json_response({"AuthenticationResult": result})
 
     if auth_flow == "CUSTOM_AUTH":
@@ -3873,13 +3860,20 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     by GetTokensFromRefreshToken so both mint tokens identically."""
     if not refresh_token:
         return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-    # Decode stub token to find the correct user by sub.
+    try:
+        claims = _decode_id_token_unverified(refresh_token)
+    except (ValueError, AttributeError):
+        claims = None
+    if (not isinstance(claims, dict) or claims.get("token_use") != "refresh"
+            or str(claims.get("iss", "")).rsplit("/", 1)[-1] != pid):
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+    if claims.get("client_id") != cid:
+        return None, error_response_json("NotAuthorizedException",
+                                         "Refresh Token has different Client", 400)
     user = _user_from_token(refresh_token, pool)
     if not user:
-        users = list(pool["_users"].values())
-        if not users:
-            return None, error_response_json("NotAuthorizedException", "No users in pool.", 400)
-        user = users[0]
+        return None, error_response_json("NotAuthorizedException",
+                                         "The user has been deleted for the associated refresh token", 400)
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
@@ -6413,7 +6407,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                                         trigger_source="TokenGeneration_HostedAuth")
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
                                     trigger_source="TokenGeneration_HostedAuth")
-            refresh_token = secrets.token_urlsafe(48)
+            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh")
 
             return json_response({
                 "id_token": id_token,
