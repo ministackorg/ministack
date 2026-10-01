@@ -1306,7 +1306,9 @@ async def _handle_execute_in_scope(
     if stage not in api_stages and stage != "$default":
         return _http_api_not_found()
 
-    route = _match_route(api_id, method, path)
+    # AWS selects the route of a path with extra leading slashes as if it had one.
+    route_path_in = "/" + path.lstrip("/")
+    route = _match_route(api_id, method, route_path_in)
     if not route:
         return _http_api_not_found()
 
@@ -1316,7 +1318,7 @@ async def _handle_execute_in_scope(
     rk_parts = route_key.split(" ", 1)
     if len(rk_parts) == 2:
         route_path = rk_parts[1]
-    path_params = _extract_path_params(route_path, path) if route_path else {}
+    path_params = _extract_path_params(route_path, route_path_in) if route_path else {}
 
     stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()
