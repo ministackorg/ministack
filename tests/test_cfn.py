@@ -18100,6 +18100,72 @@ def test_cfn_ecs_cluster_settings_read_back_in_the_api_shape(cfn, ecs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_ecs_service_network_and_load_balancers_read_back_in_the_api_shape(cfn, ecs, elbv2):
+    """NetworkConfiguration and LoadBalancers read back in camelCase, on create and on update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ecs-svc-shape-{suffix}"
+    tg_arn = elbv2.create_target_group(
+        Name=f"cfn-ecs-shape-{suffix}", Protocol="HTTP", Port=80,
+        VpcId="vpc-00000000", TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+
+    def template(public):
+        return json.dumps({
+            "Resources": {
+                "Cluster": {"Type": "AWS::ECS::Cluster",
+                            "Properties": {"ClusterName": stack_name}},
+                "TD": {
+                    "Type": "AWS::ECS::TaskDefinition",
+                    "Properties": {
+                        "Family": stack_name,
+                        "NetworkMode": "awsvpc",
+                        "ContainerDefinitions": [{"Name": "app", "Image": "nginx", "Memory": 128}],
+                    },
+                },
+                "Service": {
+                    "Type": "AWS::ECS::Service",
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "ServiceName": stack_name,
+                        "TaskDefinition": {"Ref": "TD"},
+                        "DesiredCount": 0,
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {
+                            "Subnets": ["subnet-0a1b2c3d"],
+                            "SecurityGroups": ["sg-0a1b2c3d"],
+                            "AssignPublicIp": public,
+                        }},
+                        "LoadBalancers": [{"TargetGroupArn": tg_arn,
+                                           "ContainerName": "app", "ContainerPort": 80}],
+                    },
+                },
+            },
+        })
+
+    def described():
+        return ecs.describe_services(cluster=stack_name, services=[stack_name])["services"][0]
+
+    def network(public):
+        return {"awsvpcConfiguration": {"subnets": ["subnet-0a1b2c3d"],
+                                        "securityGroups": ["sg-0a1b2c3d"],
+                                        "assignPublicIp": public}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("DISABLED"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        service = described()
+        assert service["networkConfiguration"] == network("DISABLED")
+        assert service["loadBalancers"] == [
+            {"targetGroupArn": tg_arn, "containerName": "app", "containerPort": 80}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ENABLED"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert described()["networkConfiguration"] == network("ENABLED")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
 # ===========================================================================
 # In-place update handlers — deploy, update a mutable property, assert the
 # physical id survived and the new value is visible through the service API

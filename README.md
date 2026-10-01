@@ -496,6 +496,13 @@ subnet = ec2.create_subnet(
 | `AWS::Events::EventBus` | EventBus name | Arn, Name |
 | `AWS::Events::Rule` | Rule name | Arn |
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
+| `AWS::Glue::Database` | Database name | — |
+| `AWS::Glue::Table` | Table name | — |
+| `AWS::Glue::Partition` | `<catalog id>\|<database>\|<table>\|<values hash>` | IdentifierPartitionInputValues |
+| `AWS::Glue::Connection` | Connection name | Name |
+| `AWS::Glue::Crawler` | Crawler name | — |
+| `AWS::Glue::Job` | Job name | — |
+| `AWS::Glue::Trigger` | Trigger name | — |
 | `AWS::Lambda::Permission` | Statement ID | — |
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |
