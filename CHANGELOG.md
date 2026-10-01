@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **SES — a sandboxed account sends only to verified or simulator recipients** — SES v2 `PutAccountDetails` with `ProductionAccessEnabled=false` puts the account (per region) in the sandbox, as on AWS, and `GetAccount` reports it with the submitted `Details`. A sandboxed send to a recipient that is neither a verified address or domain identity nor a `@simulator.amazonses.com` address fails with `MessageRejected` "Email address is not verified. The following identities failed the check in region …" for v1 `SendEmail`, `SendRawEmail` and `SendTemplatedEmail` and v2 `SendEmail`; bulk sends reject only the affected entries. Accounts stay in production by default. Reported by @skialpine.
+
+### Fixed
+
+- **SES — a send from an unverified sender is rejected** — v1 `SendEmail`, `SendRawEmail`, `SendTemplatedEmail` and `SendBulkTemplatedEmail` and v2 `SendEmail` and `SendBulkEmail` accepted any `Source` / `FromEmailAddress`. AWS requires the sender to be a verified identity in the account and region, in production as well as the sandbox, and now so does MiniStack: the send fails with `MessageRejected` "Email address is not verified. The following identities failed the check in region …". A verified domain covers its addresses and subdomains, domain names compare case-insensitively and email addresses case-sensitively, as AWS documents. Tests that send from an address they never created as an identity need a `VerifyEmailIdentity` / `CreateEmailIdentity` first. Reported by @skialpine.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
