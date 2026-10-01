@@ -4233,22 +4233,28 @@ def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw,
         _v2_auth_delete_queue(sqs, qname)
 
 
-def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs):
-    """A $context.* identity source, which MiniStack does not model, is not a missing source: uncached, the
-    authorizer is still invoked."""
+@pytest.mark.parametrize("source,ttl,calls,invocations", [
+    ("$context.identity.sourceIp", 0, 1, 1),
+    # "To cache responses per route, add $context.routeKey to your authorizer's identity sources."
+    ("$context.routeKey", 300, 2, 1),
+])
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs, source, ttl,
+                                                                  calls, invocations):
+    """A $context.* identity source is resolved from the request, so it is never missing and,
+    cached, keys the authorizer cache."""
     qname = _v2_auth_counter_queue(sqs)
     backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
     authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
     api_id, _ = _v2_auth_build_api(
         apigw, authz, backend,
         dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
-             IdentitySource=["$context.identity.sourceIp"],
-             AuthorizerResultTtlInSeconds=0),
+             IdentitySource=[source], AuthorizerResultTtlInSeconds=ttl),
     )
     try:
-        status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
-        assert status != 401
-        assert _v2_auth_count(sqs, qname) == 1, "the authorizer Lambda must be invoked"
+        for _ in range(calls):
+            status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+            assert status != 401
+        assert _v2_auth_count(sqs, qname) == invocations
     finally:
         _v2_auth_drop_api(apigw, api_id)
         _v2_auth_drop_lambda(lam, backend)

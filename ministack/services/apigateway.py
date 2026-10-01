@@ -850,7 +850,8 @@ def _evaluate_authorizer_policy(policy_doc, route_arn):
     return "Allow" if allow else "NoMatch"
 
 
-def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
+def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars,
+                                        context=None):
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
     HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
@@ -872,7 +873,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
             val = (qv[0] if isinstance(qv, list) else qv) or ""
         elif src.startswith("$stageVariables."):
             val = (stage_vars or {}).get(src[len("$stageVariables."):]) or ""
-        # $context.* identity sources are not modeled; treated as absent.
+        elif src.startswith("$context."):
+            val = (context or {}).get(src[len("$context."):]) or ""
         values.append(val)
         if not val:
             present = False
@@ -963,8 +965,14 @@ async def _authorize_request_v2(
     ttl = _authorizer_ttl(authorizer)
 
     identity_source = authorizer.get("identitySource") or []
+    context = {
+        "routeKey": route.get("routeKey", "$default"), "stage": stage, "apiId": api_id,
+        "accountId": owner_account_id, "httpMethod": method, "path": path,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "identity.sourceIp": "127.0.0.1", "identity.userAgent": headers.get("user-agent", ""),
+    }
     all_present, id_values = _request_authorizer_identity_sources(
-        identity_source, headers, query_params, stage_vars
+        identity_source, headers, query_params, stage_vars, context
     )
     # "To enable caching, your authorizer must have at least one identity
     # source": the identity values ARE the cache key, so with none declared
@@ -972,14 +980,8 @@ async def _authorize_request_v2(
     # the first caller's result.
     caching = ttl > 0 and bool(identity_source)
     # A declared identity source missing from the request is a 401 without
-    # invoking the Lambda, cached or not, with AWS's compact body (observed on a
-    # deployed HTTP API). $context.* sources are not modeled, so uncached they
-    # never count as missing.
-    modeled_present, _ = _request_authorizer_identity_sources(
-        [s for s in identity_source if not str(s).startswith("$context.")],
-        headers, query_params, stage_vars,
-    )
-    if identity_source and not (all_present if caching else modeled_present):
+    # invoking the Lambda, cached or not.
+    if identity_source and not all_present:
         return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
     identity_values = tuple(id_values)
 
