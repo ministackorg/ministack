@@ -5690,7 +5690,10 @@ def _registry_events(calls, enable=_EVENT_TYPES) -> list:
     for _topic, event in received:
         assert re.fullmatch(r"[0-9a-f]{32}", event["eventId"])
         assert isinstance(event.pop("timestamp"), int)
-        assert event.pop("accountId") == _EVENTS_ACCOUNT
+        if event["eventType"] == "THING_TYPE_ASSOCIATION_EVENT":
+            assert "accountId" not in event
+        else:
+            assert event.pop("accountId") == _EVENTS_ACCOUNT
     return received
 
 

@@ -2907,7 +2907,7 @@ async def _publish_event(account_id: str, region: str, topic: str, event: dict) 
 
 def _registry_event(
     config_type: str, topic: str, event_type: str, operation: str, fields: dict,
-    event_id: str | None = None,
+    event_id: str | None = None, with_account: bool = True,
 ) -> None:
     """Queue ``$aws/events/{topic}`` when ``config_type`` is enabled for the request's account and region."""
     pending = _pending_events.get()
@@ -2919,7 +2919,7 @@ def _registry_event(
         "eventId": event_id or uuid.uuid4().hex,
         "timestamp": int(time.time() * 1000),
         "operation": operation,
-        "accountId": get_account_id(),
+        **({"accountId": get_account_id()} if with_account else {}),
         **fields,
     }))
 
@@ -2946,7 +2946,7 @@ def _thing_events(operation: str, thing: dict, old_type: str | None) -> None:
                 f"thingTypeAssociation/thing/{name}/thingType/{type_name}/{change.lower()}",
                 "THING_TYPE_ASSOCIATION_EVENT", change,
                 {"thingId": thing["thingId"], "thingName": name, "thingTypeName": type_name},
-                event_id,
+                event_id, with_account=False,
             )
 
 
