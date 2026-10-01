@@ -287,9 +287,9 @@ def test_agentcore_version_errors_and_state_restore():
                 runtime_id, json.dumps({"name": "missing", "agentRuntimeVersion": "99"}).encode()
             )
             assert status == 400
-            _, error = agentcore._paginate([], {"maxResults": ["101"]})
+            _, error = agentcore._paginate_agentcore_results([], {"maxResults": ["101"]})
             assert error[0] == 400
-            _, error = agentcore._paginate([], {"nextToken": ["invalid!"]})
+            _, error = agentcore._paginate_agentcore_results([], {"nextToken": ["invalid!"]})
             assert error[0] == 400
     finally:
         if runtime_id is not None:
