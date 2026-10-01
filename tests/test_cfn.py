@@ -27518,6 +27518,23 @@ def _cfn_igw_vpcs(ec2, igw_id):
         InternetGatewayIds=[igw_id])["InternetGateways"][0].get("Attachments", [])]
 
 
+def test_cfn_ec2_gateway_attachment_keeps_the_first_vpc(cfn, ec2):
+    """An internet gateway attaches to one VPC at a time. CloudFormation ignores the
+    Resource.AlreadyAssociated of a second attachment, so the gateway keeps its first VPC."""
+    stack_name = f"cfn-gwa-two-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.loads(_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+    template["Resources"]["Attach2"] = {
+        "Type": "AWS::EC2::VPCGatewayAttachment", "DependsOn": "Attach",
+        "Properties": {"VpcId": {"Ref": "Vpc2"}, "InternetGatewayId": {"Ref": "Igw1"}}}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1"))
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_gateway_attachment_swaps_the_internet_gateway_in_place(cfn, ec2):
     """A new InternetGatewayId moves the attachment under the same IGW|vpc id."""
     stack_name = f"cfn-gwa-igw-{_uuid_mod.uuid4().hex[:8]}"

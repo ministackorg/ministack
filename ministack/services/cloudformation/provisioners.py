@@ -7354,11 +7354,19 @@ def _ec2_vpc_gw_attachment(props):
             {"VpcId": vpc_id, "State": "available"}, f"IGW|{vpc_id}")
 
 
-def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
-    """Attach the gateway; a replaced attachment stays until its own delete."""
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name, replacing=False):
+    """Attach the gateway; a replaced attachment stays until its own delete.
+
+    An internet gateway attaches to one VPC at a time. CloudFormation ignores
+    AttachInternetGateway's Resource.AlreadyAssociated, so a gateway already on
+    another VPC stays there; only this resource's own replacement may briefly
+    hold both until the old attachment is deleted.
+    """
     gateway, attachment, physical_id = _ec2_vpc_gw_attachment(props)
     if gateway:
         _ec2_vpc_gw_attach_delete(physical_id, props)
+        if gateway.get("InternetGatewayId") and gateway["Attachments"] and not replacing:
+            return physical_id, {}
         gateway["Attachments"].append(attachment)
     return physical_id, {}
 
@@ -7368,7 +7376,8 @@ def _ec2_vpc_gw_attach_update(physical_id, old_props, new_props, stack_name, log
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         _ec2_vpc_gw_attachment(new_props)[2], _ec2_vpc_gw_attachment(old_props)[2],
-        _ec2_vpc_gw_attach_create, _ec2_vpc_gw_attach_delete,
+        lambda lid, props, stack: _ec2_vpc_gw_attach_create(lid, props, stack, replacing=True),
+        _ec2_vpc_gw_attach_delete,
     )
     if replaced is not None:
         return replaced
