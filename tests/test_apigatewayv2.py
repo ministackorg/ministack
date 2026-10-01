@@ -1381,6 +1381,47 @@ def test_apigw_raw_query_string_percent_encoded(apigw, lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_apigw_raw_path_keeps_percent25_escape(apigw, lam):
+    """rawPath decodes escapes but never %25, so a%252Eb is not turned into a%2Eb."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawpath-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawPath': event.get('rawPath')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawpath-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    def raw_path(segment):
+        req = _urlreq.Request(f"http://{host}/$default/items/{segment}", method="GET")
+        req.add_header("Host", host)
+        return json.loads(_urlreq.urlopen(req).read())["rawPath"]
+
+    try:
+        assert raw_path("a%252Eb") == "/items/a%252Eb"
+        assert raw_path("a%2Eb") == "/items/a.b"
+        req = _urlreq.Request(f"http://{host}/items/a%252Eb", method="GET")
+        req.add_header("Host", host)
+        assert json.loads(_urlreq.urlopen(req).read())["rawPath"] == "/items/a%252Eb"
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_multiple_path_parameters(apigw, lam):
     """Multiple path parameters in one route should all be extracted."""
     import urllib.request as _urlreq

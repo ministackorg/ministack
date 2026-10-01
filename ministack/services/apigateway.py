@@ -68,6 +68,30 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
 
+_PCT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def decode_http_api_path(raw_path: str) -> str:
+    """Decode a request path the way an HTTP API builds ``rawPath``: every escape
+    decodes except ``%25``, so ``a%252Eb`` arrives as ``a%252Eb``, not ``a%2Eb``."""
+
+    def _decode(match):
+        run, out, pending = match.group(0), [], bytearray()
+        for i in range(0, len(run), 3):
+            byte = int(run[i + 1 : i + 3], 16)
+            if byte == 0x25:
+                if pending:
+                    out.append(pending.decode("utf-8", "replace"))
+                    pending.clear()
+                out.append("%25")
+            else:
+                pending.append(byte)
+        if pending:
+            out.append(pending.decode("utf-8", "replace"))
+        return "".join(out)
+
+    return _PCT_RUN_RE.sub(_decode, raw_path)
+
 
 def _timeout_from_env(env_name: str, default_seconds: float) -> float:
     """Read a positive float timeout from an env var; fall back on missing /
