@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS. Contributed by @iot-rocket.
+
 ### Fixed
 
 - **RDS — `DescribeGlobalClusters` lists clusters as `GlobalClusterMember`** — each cluster was a `<GlobalCluster>` element, so SDKs that match the list member name, such as aws-sdk-go-v2, found none. Contributed by @IamYipi.
@@ -14,11 +18,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EventBridge — `UpdateEventBus` returns the bus** — it answered `EventBusArn` and `LastModifiedTime`, which are not response members, so SDKs returned nothing; it now returns `Arn`, `Name` and the bus's `Description`, `KmsKeyIdentifier`, `DeadLetterConfig` and `LogConfig`. Contributed by @IamYipi.
 - **CloudFormation — `AWS::CodeBuild::Project` stores `Source`, `Artifacts` and `Environment` under CodeBuild API names** — the template's PascalCase members and `BuildSpec` were stored as written, so `BatchGetProjects` dropped them and a build of a stack's project found no buildspec, image or environment variables. Contributed by @IamYipi.
 - **Inspector2 — responses aws-sdk-go-v2 can read** — timestamps are epoch seconds, `ListFilters` returns `criteria`, `ownerId`, `createdAt` and `updatedAt`, `CreateFilter` returns `arn`, and coverage `scanStatus` is `{statusCode, reason}`. Saved state is converted on restore. Contributed by @IamYipi.
-- **SQS — `QueueUrl` matches the gateway's TLS scheme (`USE_SSL=1`)** — `CreateQueue`/`GetQueueUrl`/`ListQueues` always returned `http://` URLs, and the AWS SDK v3 uses the QueueUrl itself as the request endpoint (`useQueueUrlAsEndpoint` defaults true), so a client handed that URL left the TLS-only gateway. The `AWS::SQS::Queue` CloudFormation provisioner built the same hardcoded scheme and now reuses the shared helper.
-- **API Gateway v2 (HTTP API) — an unmatched route answers AWS's exact 404 body** — a request with no matching route answered `{"message": "No route found"}`; AWS answers `{"message":"Not Found"}` (compact JSON, no space after the colon). REST API (v1) is unaffected — it already answers a route miss with its own `403 MISSING_AUTHENTICATION_TOKEN` gateway response, not this literal.
-- **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
-
-- **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS.
+- **EventBridge — `PutEvents` refuses `aws.*` sources** — an entry whose `Source` starts with `aws.` fails with `NotAuthorizedForSourceException` (`Not authorized for the source.`) in its result entry and counts in `FailedEntryCount`, while the rest of the batch is delivered, as on AWS. Events published with an `aws.*` source through `PutEvents` to simulate AWS services now get this error. Contributed by @iot-rocket.
+- **SQS — `QueueUrl` matches the gateway's TLS scheme (`USE_SSL=1`)** — `CreateQueue`/`GetQueueUrl`/`ListQueues` always returned `http://` URLs, and the AWS SDK v3 uses the QueueUrl itself as the request endpoint (`useQueueUrlAsEndpoint` defaults true), so a client handed that URL left the TLS-only gateway. The `AWS::SQS::Queue` CloudFormation provisioner built the same hardcoded scheme and now reuses the shared helper. Contributed by @skialpine.
+- **API Gateway v2 (HTTP API) — a request no stage or route matches answers AWS's exact 404 body** — an unmatched route answered `{"message": "No route found"}` and an unknown stage `{"message": "Stage '…' not found"}`; both now answer `{"message":"Not Found"}` (compact JSON), as AWS does. Contributed by @skialpine.
+- **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`. Contributed by @skialpine.
 
 ## [1.5.19] — 2026-09-30
 

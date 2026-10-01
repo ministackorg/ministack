@@ -1258,7 +1258,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     """Execute an API request through a deployed API (data plane)."""
     scope = find_api_scope(api_id)
     if scope is None:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
     owner_account_id, owner_region = scope
 
     from ministack.core.responses import _request_account_id, _request_region
@@ -1275,13 +1275,18 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
         _request_region.reset(region_token)
 
 
+def _http_api_not_found():
+    """AWS's 404 for a request no stage or route of an HTTP API matches."""
+    return 404, {"Content-Type": "application/json"}, b'{"message":"Not Found"}'
+
+
 async def _handle_execute_in_scope(
     api_id, stage, path, method, headers, body, query_params,
     owner_account_id, owner_region,
 ):
     api = _apis.get(api_id)
     if not api:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
 
     # CORS preflight: served from the API's corsConfiguration before any route
     # matching, because AWS responds to OPTIONS itself without invoking the
@@ -1292,16 +1297,11 @@ async def _handle_execute_in_scope(
 
     api_stages = _stages.get(api_id, {})
     if stage not in api_stages and stage != "$default":
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage}' not found"}).encode()
+        return _http_api_not_found()
 
     route = _match_route(api_id, method, path)
     if not route:
-        # AWS's body for an unmatched HTTP API route: compact JSON.
-        return (
-            404,
-            {"Content-Type": "application/json"},
-            json.dumps({"message": "Not Found"}, separators=(",", ":")).encode(),
-        )
+        return _http_api_not_found()
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")

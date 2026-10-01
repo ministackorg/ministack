@@ -1025,6 +1025,18 @@ def test_apigw_execute_no_route(apigw):
     except _urlerr.HTTPError as e:
         assert e.code == 404
         assert e.read() == b'{"message":"Not Found"}'
+    # No stage matches and there is no $default stage: the same body.
+    staged = apigw.create_api(Name="no-stage-api", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=staged, StageName="prod")
+    req = _urlreq.Request(f"http://{staged}.execute-api.localhost:{_EXECUTE_PORT}/dev/x", method="GET")
+    req.add_header("Host", f"{staged}.execute-api.localhost:{_EXECUTE_PORT}")
+    try:
+        _urlreq.urlopen(req)
+        assert False, "Expected 404"
+    except _urlerr.HTTPError as e:
+        assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
+    apigw.delete_api(ApiId=staged)
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
