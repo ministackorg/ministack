@@ -1301,7 +1301,12 @@ async def _handle_execute_in_scope(
 
     route = _match_route(api_id, method, path)
     if not route:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "No route found"}).encode()
+        # AWS's body for an unmatched HTTP API route: compact JSON.
+        return (
+            404,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": "Not Found"}, separators=(",", ":")).encode(),
+        )
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")
@@ -1766,6 +1771,15 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> s
     return str(custom)
 
 
+def _api_endpoint_scheme(protocol):
+    """AWS's apiEndpoint scheme once the gateway serves TLS; http otherwise."""
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return "http"
+    return "wss" if protocol == "WEBSOCKET" else "https"
+
+
 def _create_api(data):
     tags = data.get("tags", {})
     try:
@@ -1782,7 +1796,7 @@ def _create_api(data):
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
+        "apiEndpoint": f"{_api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "routeSelectionExpression": data.get("routeSelectionExpression", default_rse),
         "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),

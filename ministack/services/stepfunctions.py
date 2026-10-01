@@ -1455,7 +1455,7 @@ def _emit_execution_status_event(execution) -> None:
                 "Detail": json.dumps(detail),
                 "Resources": [execution["executionArn"]],
             }]
-        })
+        }, allow_aws_source=True)
     except Exception:
         logger.warning("Failed to publish execution status event for %s",
                        execution["executionArn"], exc_info=True)
