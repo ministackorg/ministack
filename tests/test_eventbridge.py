@@ -933,6 +933,21 @@ def test_eventbridge_create_event_bus_v2(eb):
     updated = eb.describe_event_bus(Name="eb-bus-v2")
     assert updated["Description"] == "updated description"
 
+def test_eventbridge_update_event_bus_returns_bus(eb):
+    created = eb.create_event_bus(Name="eb-bus-update-resp")
+    try:
+        resp = eb.update_event_bus(
+            Name="eb-bus-update-resp",
+            Description="new description",
+            DeadLetterConfig={"Arn": "arn:aws:sqs:us-east-1:000000000000:eb-dlq"},
+        )
+        assert resp["Arn"] == created["EventBusArn"]
+        assert resp["Name"] == "eb-bus-update-resp"
+        assert resp["Description"] == "new description"
+        assert resp["DeadLetterConfig"] == {"Arn": "arn:aws:sqs:us-east-1:000000000000:eb-dlq"}
+    finally:
+        eb.delete_event_bus(Name="eb-bus-update-resp")
+
 def test_eventbridge_put_rule_v2(eb):
     eb.create_event_bus(Name="eb-rule-bus")
     resp = eb.put_rule(
@@ -1556,6 +1571,36 @@ def test_eventbridge_put_events_rejects_foreign_region_bus_arn_without_local_fal
     assert response["Entries"][0]["ErrorCode"] == "ResourceNotFoundException"
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert msgs.get("Messages", []) == []
+
+
+def test_eventbridge_put_events_rejects_aws_source_per_entry(eb, sqs):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus_name = f"qa-eb-aws-src-bus-{suffix}"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-aws-src-q-{suffix}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-aws-src-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"detail-type": ["probe"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="qa-eb-aws-src-rule", EventBusName=bus_name, Targets=[{"Id": "t1", "Arn": q_arn}])
+
+    sources = ["myapp", "aws.s3", "aws", "AWS.s3", "aws.partner/example.com/1/x"]
+    response = eb.put_events(Entries=[
+        {"Source": s, "DetailType": "probe", "Detail": "{}", "EventBusName": bus_name} for s in sources
+    ])
+
+    assert response["FailedEntryCount"] == 2
+    denied = {"ErrorCode": "NotAuthorizedForSourceException", "ErrorMessage": "Not authorized for the source."}
+    assert [response["Entries"][i] for i in (1, 4)] == [denied, denied]
+    assert all("EventId" in response["Entries"][i] for i in (0, 2, 3))
+    delivered = []
+    for _ in range(5):
+        msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        delivered += [json.loads(m["Body"])["source"] for m in msgs.get("Messages", [])]
+    assert sorted(delivered) == ["AWS.s3", "aws", "myapp"]
 
 
 def test_eventbridge_cfn_rule_accessible_via_api(eb, sqs, cfn):

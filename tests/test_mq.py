@@ -506,6 +506,20 @@ def test_mq_describe_broker_instance_options(mq):
         assert "SupportedEngineVersions" in option
         assert "SupportedDeploymentModes" in option
 
+def test_mq_describe_broker_instance_options_engine_versions_are_strings(mq):
+    # SupportedEngineVersions is a list of strings; only DescribeBrokerEngineTypes
+    # wraps each version in an object with a Name.
+    engine_versions = {
+        e["EngineType"]: sorted(v["Name"] for v in e["EngineVersions"])
+        for e in mq.describe_broker_engine_types()["BrokerEngineTypes"]
+    }
+    options = mq.describe_broker_instance_options()["BrokerInstanceOptions"]
+    assert options
+    for option in options:
+        versions = option["SupportedEngineVersions"]
+        assert all(isinstance(v, str) for v in versions), versions
+        assert sorted(versions) == engine_versions[option["EngineType"]]
+
 @pytest.mark.parametrize(
     "kwargs,assertions",
     [

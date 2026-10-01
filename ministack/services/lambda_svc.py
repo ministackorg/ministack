@@ -4208,7 +4208,7 @@ def handler(event, context):
 
 _JS_CTX_ARN_SHIM = '''\
 // MiniStack shim: hand user code the control-plane ARN in its context, and
-// reach the gateway over plain HTTP when a library insists on HTTPS.
+// reach the gateway over plain HTTP (without USE_SSL) when a library insists on HTTPS.
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
@@ -4216,7 +4216,7 @@ const https = require("https");
 const REAL = process.env._MS_REAL_HANDLER || "index.handler";
 const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
 const TASK_ROOT = process.env.LAMBDA_TASK_ROOT || "/var/task";
-// The container talks to MiniStack over http://<gateway host>:<port>, but the
+// Without USE_SSL the container talks to MiniStack over http://<gateway host>:<port>, but the
 // response submitters the CDK bundles into its custom-resource handlers
 // (nodejs-entrypoint, the provider framework, AwsCustomResource) build the
 // ResponseURL PUT from the URL's hostname and path only and hand it to
@@ -4258,6 +4258,8 @@ try {
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
       return origHttpsRequest.apply(https, original);
     }
+    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS.
+    if (EP.protocol === "https:") return origHttpsRequest.apply(https, original);
     opts.protocol = "http:";
     opts.hostname = host;
     opts.host = host + ":" + EP_PORT;
@@ -4465,8 +4467,11 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
     if not endpoint:
+        from ministack.core import tls as _tls
+
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        endpoint = f"http://host.docker.internal:{port}"
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        endpoint = f"{scheme}://host.docker.internal:{port}"
     else:
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
@@ -5635,8 +5640,13 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if not endpoint:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
+                from ministack.core import tls as _tls
+
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
-                endpoint = f"http://{_MINISTACK_HOST}:{gateway_port}"
+                scheme = "https" if _tls.use_ssl_enabled() else "http"
+                endpoint = f"{scheme}://{_MINISTACK_HOST}:{gateway_port}"
+                if scheme == "https":
+                    _tls.trust_gateway_cert(env)
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -5755,6 +5765,11 @@ def _publish_version(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    # "Lambda doesn't publish a version if the function's configuration and code
+    # haven't changed since the last version": the latest version comes back.
+    latest = max(func["versions"], key=int, default=None)
+    if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
+        return json_response(func["versions"][latest]["config"], 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
@@ -5768,6 +5783,7 @@ def _publish_version(name: str, data: dict):
     ver_record = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
+        "function_revision": func["config"].get("RevisionId"),
     }
     func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):

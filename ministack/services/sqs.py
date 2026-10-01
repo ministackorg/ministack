@@ -40,6 +40,7 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.tls import use_ssl_enabled
 
 logger = logging.getLogger("sqs")
 
@@ -252,7 +253,8 @@ def _queue_url(name: str) -> str:
 
 
 def _queue_url_for_account(account_id: str, name: str) -> str:
-    return f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/{account_id}/{name}"
+    scheme = "https" if use_ssl_enabled() else "http"
+    return f"{scheme}://{DEFAULT_HOST}:{DEFAULT_PORT}/{account_id}/{name}"
 
 
 def _queue_name_from_arn_spec(spec) -> str | None:

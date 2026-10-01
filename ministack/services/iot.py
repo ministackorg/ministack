@@ -32,6 +32,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - Fleet indexing: ``UpdateIndexingConfiguration`` /
     ``GetIndexingConfiguration`` / ``DescribeIndex`` / ``ListIndices``, and
     ``SearchIndex`` over the live registry, shadows and MQTT connectivity
+  - Registry events: ``DescribeEventConfigurations`` /
+    ``UpdateEventConfigurations``
   - Jobs (control plane): ``CreateJob``, ``DescribeJob``, ``ListJobs``,
     ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
@@ -110,6 +112,8 @@ _topic_rules: AccountRegionScopedDict = AccountRegionScopedDict()
 _shadows: AccountRegionScopedDict = AccountRegionScopedDict()
 # Fleet-indexing configuration, one entry per account+region.
 _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
+# Registry event configuration (UpdateEventConfigurations), one entry per account+region.
+_event_config: AccountRegionScopedDict = AccountRegionScopedDict()
 # CA-certificate registry (RegisterCACertificate & friends): caCertificateId -> record
 _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 # JITR registration code — a single "code" key per account/region
@@ -237,6 +241,7 @@ def get_state() -> dict:
         "topic_rules": copy.deepcopy(_topic_rules),
         "shadows": copy.deepcopy(_shadows),
         "indexing_config": copy.deepcopy(_indexing_config),
+        "event_config": copy.deepcopy(_event_config),
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
@@ -272,6 +277,7 @@ def _restore_state(data: dict | None) -> None:
     _topic_rules.update(data.get("topic_rules", {}))
     _shadows.update(data.get("shadows", {}))
     _indexing_config.update(data.get("indexing_config", {}))
+    _event_config.update(data.get("event_config", {}))
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
@@ -312,6 +318,7 @@ def reset() -> None:
     # gets no warning.
     _warned_sql_funcs.clear()
     _indexing_config.clear()
+    _event_config.clear()
     _ca_certificates.clear()
     _registration_codes.clear()
     _provisioning_templates.clear()
@@ -455,6 +462,21 @@ def _qp_bool(qp: dict, name: str, default: bool = False) -> bool:
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
+    """Route an IoT control-plane request, then publish the registry events it raised."""
+    events: list = []
+    token = _pending_events.set(events)
+    try:
+        response = await _route_request(method, path, headers, body, query_params)
+    finally:
+        _pending_events.reset(token)
+    for account_id, region, topic, event in events:
+        await _publish_event(account_id, region, topic, event)
+    return response
+
+
+async def _route_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict
+) -> tuple:
     """Route an IoT control-plane request to the appropriate handler.
 
     The IoT API is REST-style (not JSON 1.1 with X-Amz-Target). Routing is
@@ -581,6 +603,10 @@ async def handle_request(
         return _list_indices()
     if path.startswith("/indices/") and method == "GET":
         return _describe_index(path)
+    if path == "/event-configurations" and method == "GET":
+        return _describe_event_configurations()
+    if path == "/event-configurations" and method == "PATCH":
+        return _update_event_configurations(_parse_body(body))
     # Jobs (control plane) — CreateJob is PUT /jobs/{jobId} per the botocore
     # `iot` service model; sub-resources (/cancel, /job-document) are
     # dispatched inside _handle_job.
@@ -728,6 +754,7 @@ def _create_thing(name: str, payload: dict) -> tuple:
         "thingGroupNames": [],
     }
     _things[name] = record
+    _thing_events("CREATED", record, None)
     logger.info("IoT Thing created: %s", name)
     return json_response({
         "thingName": name,
@@ -793,10 +820,11 @@ def _update_thing(name: str, payload: dict) -> tuple:
             else:
                 merged[k] = v
         thing["attributes"] = merged
-    else:
+    elif "attributePayload" in payload:
         thing["attributes"] = dict(new_attrs)
 
-    new_type = payload.get("thingTypeName")
+    old_type = thing.get("thingTypeName")
+    new_type = "" if payload.get("removeThingType") else payload.get("thingTypeName")
     if new_type is not None:
         if new_type and new_type not in _thing_types:
             return _error_not_found("ThingType", new_type)
@@ -804,6 +832,7 @@ def _update_thing(name: str, payload: dict) -> tuple:
 
     thing["version"] = thing.get("version", 1) + 1
     _things[name] = thing
+    _thing_events("UPDATED", thing, old_type)
     return json_response({})
 
 
@@ -817,12 +846,14 @@ def _delete_thing(name: str) -> tuple:
         if thing_arn in cert.get("attachedThings", []):
             cert["attachedThings"].remove(thing_arn)
             _certificates[cert_id] = cert
+    _thing_events("DELETED", thing, thing.get("thingTypeName"))
     # Remove from groups
     for gname in list(thing.get("thingGroupNames", [])):
         group = _thing_groups.get(gname)
         if group and name in group.get("things", []):
             group["things"].remove(name)
             _thing_groups[gname] = group
+            _membership_event("REMOVED", group, thing)
     # Drop the thing's job executions with it. Left behind, a live execution
     # for a thing that no longer exists holds its job out of COMPLETED forever,
     # and a later thing of the same name would inherit that stale history.
@@ -926,6 +957,7 @@ def _create_thing_type(name: str, payload: dict) -> tuple:
         },
     }
     _thing_types[name] = record
+    _thing_type_event("CREATED", record)
     logger.info("IoT Thing Type created: %s", name)
     return json_response({
         "thingTypeName": name,
@@ -953,6 +985,7 @@ def _deprecate_thing_type(name: str, payload: dict) -> tuple:
     t["thingTypeMetadata"]["deprecated"] = not undo
     t["thingTypeMetadata"]["deprecationDate"] = None if undo else _now_epoch()
     _thing_types[name] = t
+    _thing_type_event("UPDATED", t)
     return json_response({})
 
 
@@ -967,6 +1000,7 @@ def _delete_thing_type(name: str) -> tuple:
             400,
         )
     del _thing_types[name]
+    _thing_type_event("DELETED", t)
     return json_response({})
 
 
@@ -1030,6 +1064,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
             "creationDate": record["creationDate"],
         }
     _thing_groups[name] = record
+    _thing_group_event("CREATED", record)
+    if parent:
+        _hierarchy_event("ADDED", _thing_groups[parent], record)
     return json_response({
         "thingGroupName": name,
         "thingGroupArn": record["thingGroupArn"],
@@ -1108,6 +1145,7 @@ def _update_thing_group(name: str, payload: dict) -> tuple:
             }
     g["version"] = g.get("version", 1) + 1
     _thing_groups[name] = g
+    _thing_group_event("UPDATED", g)
     return json_response({"version": g["version"]})
 
 
@@ -1115,12 +1153,22 @@ def _delete_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
         return _error_not_found("ThingGroup", name)
+    if any((c.get("thingGroupMetadata") or {}).get("parentGroupName") == name for c in _thing_groups.values()):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Cannot delete thing group : {name} when there are still child groups attached to it", 400,
+        )
     # Remove group from any Things that referenced it
     for tname in list(g.get("things", [])):
         thing = _things.get(tname)
         if thing and name in thing.get("thingGroupNames", []):
             thing["thingGroupNames"].remove(name)
             _things[tname] = thing
+            _membership_event("REMOVED", g, thing)
+    _thing_group_event("DELETED", g)
+    parent = _thing_groups.get((g.get("thingGroupMetadata") or {}).get("parentGroupName") or "")
+    if parent:
+        _hierarchy_event("REMOVED", parent, g)
     del _thing_groups[name]
     return json_response({})
 
@@ -1141,6 +1189,7 @@ def _add_thing_to_group(payload: dict) -> tuple:
     if tname not in group.get("things", []):
         group.setdefault("things", []).append(tname)
         _thing_groups[gname] = group
+        _membership_event("ADDED", group, thing)
     if gname not in thing.get("thingGroupNames", []):
         thing.setdefault("thingGroupNames", []).append(gname)
         _things[tname] = thing
@@ -1159,6 +1208,7 @@ def _remove_thing_from_group(payload: dict) -> tuple:
     if tname in group.get("things", []):
         group["things"].remove(tname)
         _thing_groups[gname] = group
+        _membership_event("REMOVED", group, thing)
     if gname in thing.get("thingGroupNames", []):
         thing["thingGroupNames"].remove(gname)
         _things[tname] = thing
@@ -1403,21 +1453,9 @@ async def _publish_certificate_registered(
         "certificateRegistrationTimestamp": registration_timestamp,
         "sourceIp": source_ip,
     }
-    try:
-        await broker_publish(
-            account_id,
-            region,
-            f"$aws/events/certificates/registered/{ca_id}",
-            json.dumps(event).encode("utf-8"),
-            qos=0,
-        )
-    except Exception:
-        # The certificate is already registered at this point, so a broker
-        # failure must not undo it; the iot-data publish path guards the same
-        # call the same way.
-        logger.warning(
-            "JITR registered-event publish failed for CA %s", ca_id, exc_info=True
-        )
+    await _publish_event(
+        account_id, region, f"$aws/events/certificates/registered/{ca_id}", event
+    )
 
 
 def _create_keys_and_certificate(qp: dict) -> tuple:
@@ -2789,6 +2827,195 @@ def _search_index(payload: dict) -> tuple:
     if end < len(matched):
         body["nextToken"] = _search_next_token(end)
     return json_response(body)
+
+
+# ---------------------------------------------------------------------------
+# Registry event configuration
+# ---------------------------------------------------------------------------
+
+_EVENT_TYPES = (
+    "CA_CERTIFICATE", "CERTIFICATE", "JOB", "JOB_EXECUTION", "POLICY", "THING",
+    "THING_GROUP", "THING_GROUP_HIERARCHY", "THING_GROUP_MEMBERSHIP", "THING_TYPE",
+    "THING_TYPE_ASSOCIATION",
+)
+_EVENT_CONFIG_KEY = "events"
+
+
+def _event_configuration() -> dict:
+    """The account+region's event configuration; every type is off until the first update."""
+    stored = _event_config.get(_EVENT_CONFIG_KEY) or {}
+    return {
+        "eventConfigurations": {
+            t: {"Enabled": t in stored.get("enabled", ())} for t in _EVENT_TYPES
+        },
+        "creationDate": stored.get("creationDate"),
+        "lastModifiedDate": stored.get("lastModifiedDate"),
+    }
+
+
+def _describe_event_configurations() -> tuple:
+    """``GET /event-configurations``."""
+    return json_response(_event_configuration())
+
+
+def _update_event_configurations(payload: dict) -> tuple:
+    """``PATCH /event-configurations`` — types the request names change, the rest keep their state."""
+    configurations = payload.get("eventConfigurations")
+    if not isinstance(configurations, dict):
+        return error_response_json(
+            "InvalidRequestException", "Configuration cannot be null", 400
+        )
+    if set(configurations) - set(_EVENT_TYPES):
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'eventConfigurations' failed to "
+            "satisfy constraint: Map keys must satisfy constraint: [Member must "
+            f"satisfy enum value set: [{', '.join(_EVENT_TYPES)}]]",
+            400,
+        )
+    stored = _event_config.get(_EVENT_CONFIG_KEY) or {}
+    enabled = set(stored.get("enabled", ()))
+    for event_type, configuration in configurations.items():
+        if isinstance(configuration, dict) and configuration.get("Enabled") is True:
+            enabled.add(event_type)
+        else:
+            enabled.discard(event_type)
+    now = _now_epoch()
+    _event_config[_EVENT_CONFIG_KEY] = {
+        "enabled": sorted(enabled),
+        "creationDate": stored.get("creationDate", now),
+        "lastModifiedDate": now,
+    }
+    return json_response({})
+
+
+# Registry events raised while handling a request, published once the handler returns.
+_pending_events: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "iot_pending_events", default=None
+)
+
+
+async def _publish_event(account_id: str, region: str, topic: str, event: dict) -> None:
+    """Publish an ``$aws/events`` message; a broker failure never undoes the operation behind it."""
+    try:
+        await broker_publish(
+            account_id, region, topic, json.dumps(event).encode("utf-8"), qos=0
+        )
+    except Exception:
+        logger.warning("IoT event publish failed on %s", topic, exc_info=True)
+
+
+def _registry_event(
+    config_type: str, topic: str, event_type: str, operation: str, fields: dict,
+    event_id: str | None = None, with_account: bool = True,
+) -> None:
+    """Queue ``$aws/events/{topic}`` when ``config_type`` is enabled for the request's account and region."""
+    pending = _pending_events.get()
+    enabled = (_event_config.get(_EVENT_CONFIG_KEY) or {}).get("enabled", ())
+    if pending is None or config_type not in enabled:
+        return
+    pending.append((get_account_id(), get_region(), f"$aws/events/{topic}", {
+        "eventType": event_type,
+        "eventId": event_id or uuid.uuid4().hex,
+        "timestamp": int(time.time() * 1000),
+        "operation": operation,
+        **({"accountId": get_account_id()} if with_account else {}),
+        **fields,
+    }))
+
+
+def _thing_events(operation: str, thing: dict, old_type: str | None) -> None:
+    """THING event plus the type association changes, which share its eventId."""
+    event_id = uuid.uuid4().hex
+    name = thing["thingName"]
+    _registry_event("THING", f"thing/{name}/{operation.lower()}", "THING_EVENT", operation, {
+        "thingId": thing["thingId"],
+        "thingName": name,
+        "versionNumber": thing.get("version", 1),
+        "thingTypeName": thing.get("thingTypeName"),
+        "billinGroupName": None,
+        "attributes": dict(thing.get("attributes") or {}),
+    }, event_id)
+    new_type = None if operation == "DELETED" else thing.get("thingTypeName")
+    if old_type == new_type:
+        return
+    for type_name, change in ((new_type, "ADDED"), (old_type, "REMOVED")):
+        if type_name:
+            _registry_event(
+                "THING_TYPE_ASSOCIATION",
+                f"thingTypeAssociation/thing/{name}/thingType/{type_name}/{change.lower()}",
+                "THING_TYPE_ASSOCIATION_EVENT", change,
+                {"thingId": thing["thingId"], "thingName": name, "thingTypeName": type_name},
+                event_id, with_account=False,
+            )
+
+
+def _thing_type_event(operation: str, thing_type: dict) -> None:
+    props = thing_type.get("thingTypeProperties") or {}
+    meta = thing_type.get("thingTypeMetadata") or {}
+    deprecated_at = meta.get("deprecationDate")
+    name = thing_type["thingTypeName"]
+    _registry_event("THING_TYPE", f"thingType/{name}/{operation.lower()}", "THING_TYPE_EVENT", operation, {
+        "thingTypeId": thing_type["thingTypeId"],
+        "thingTypeName": name,
+        "isDeprecated": bool(meta.get("deprecated")),
+        "deprecationDate": int(deprecated_at * 1000) if deprecated_at else None,
+        "searchableAttributes": props.get("searchableAttributes") or None,
+        "propagatingAttributes": (props.get("mqtt5Configuration") or {}).get("propagatingAttributes") or None,
+        "description": props.get("thingTypeDescription"),
+    })
+
+
+def _thing_group_event(operation: str, group: dict) -> None:
+    props = group.get("thingGroupProperties") or {}
+    parent_name = (group.get("thingGroupMetadata") or {}).get("parentGroupName")
+    ancestors = []
+    ancestor = _thing_groups.get(parent_name) if parent_name else None
+    while ancestor:
+        ancestors.insert(0, {"groupArn": ancestor["thingGroupArn"], "groupId": ancestor["thingGroupId"]})
+        up = (ancestor.get("thingGroupMetadata") or {}).get("parentGroupName")
+        ancestor = _thing_groups.get(up) if up else None
+    name = group["thingGroupName"]
+    _registry_event("THING_GROUP", f"thingGroup/{name}/{operation.lower()}", "THING_GROUP_EVENT", operation, {
+        "thingGroupId": group["thingGroupId"],
+        "thingGroupName": name,
+        "versionNumber": group.get("version", 1),
+        "parentGroupName": parent_name,
+        "parentGroupId": ancestors[-1]["groupId"] if ancestors else None,
+        "description": props.get("thingGroupDescription"),
+        "rootToParentThingGroups": ancestors or None,
+        "attributes": (props.get("attributePayload") or {}).get("attributes") or None,
+        "dynamicGroupMappingId": None,
+    })
+
+
+def _hierarchy_event(operation: str, parent: dict, child: dict) -> None:
+    _registry_event(
+        "THING_GROUP_HIERARCHY",
+        f"thingGroupHierarchy/thingGroup/{parent['thingGroupName']}"
+        f"/childThingGroup/{child['thingGroupName']}/{operation.lower()}",
+        "THING_GROUP_HIERARCHY_EVENT", operation, {
+            "thingGroupId": parent["thingGroupId"],
+            "thingGroupName": parent["thingGroupName"],
+            "childGroupId": child["thingGroupId"],
+            "childGroupName": child["thingGroupName"],
+        },
+    )
+
+
+def _membership_event(operation: str, group: dict, thing: dict) -> None:
+    _registry_event(
+        "THING_GROUP_MEMBERSHIP",
+        f"thingGroupMembership/thingGroup/{group['thingGroupName']}"
+        f"/thing/{thing['thingName']}/{operation.lower()}",
+        "THING_GROUP_MEMBERSHIP_EVENT", operation, {
+            "groupArn": group["thingGroupArn"],
+            "groupId": group["thingGroupId"],
+            "thingArn": thing["thingArn"],
+            "thingId": thing["thingId"],
+            "membershipId": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{group['thingGroupId']}/{thing['thingId']}")),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

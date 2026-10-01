@@ -3070,6 +3070,11 @@ def _attach_internet_gateway(p):
     if not igw:
         return _error("InvalidInternetGatewayID.NotFound",
                       f"The internet gateway ID '{igw_id}' does not exist", 400)
+    if igw.get("Attachments"):
+        # An internet gateway attaches to one VPC at a time.
+        return _error("Resource.AlreadyAssociated",
+                      f"resource {igw_id} is already attached to network "
+                      f"{igw['Attachments'][0]['VpcId']}", 400)
     igw["Attachments"] = [{"VpcId": vpc_id, "State": "available"}]
     return _xml(200, "AttachInternetGatewayResponse", "<return>true</return>")
 

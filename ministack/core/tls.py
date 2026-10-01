@@ -107,6 +107,21 @@ def _cert_names(cert_path: str, names: "list[str]") -> bool:
     return all(f"DNS:{name}" in (out.stdout or "") for name in names)
 
 
+def trust_gateway_cert(env: dict) -> None:
+    """Have a host process trust the gateway's certificate, unless env already names a CA."""
+    try:
+        cert_path, _key_path = resolve_tls_material()
+    except SystemExit:
+        return
+    if not os.path.exists(cert_path):
+        return
+    env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
+    bundle = ca_bundle_path(cert_path)
+    if bundle:
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+            env.setdefault(var, bundle)
+
+
 def resolve_tls_material() -> "tuple[str, str]":
     """Return (certfile, keyfile) PEM paths.
 

@@ -2254,3 +2254,39 @@ class TestAuthDisabledIsPermissive:
         assert _resp_code(_as(ACCT_A, sns_svc._publish, {
             "TopicArn": topic, "Message": "open"})) == (200, "")
         assert len(_queue_bodies(qarn)) == 1
+
+
+def test_queue_url_scheme_https_when_tls(monkeypatch):
+    """With USE_SSL=1 the gateway serves TLS, so QueueUrl must be https —
+    the AWS SDK v3 uses the QueueUrl itself as the request endpoint
+    (useQueueUrlAsEndpoint defaults true), so an http:// QueueUrl would
+    leave the TLS-only gateway."""
+    monkeypatch.setenv("USE_SSL", "1")
+    name = _uniq("tls-scheme")
+    created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
+    assert created.startswith("https://"), created
+
+    looked_up = _as(ACCT_A, sqs_svc._act_get_queue_url, {"QueueName": name}, "")["QueueUrl"]
+    assert looked_up.startswith("https://"), looked_up
+
+    # A request using the returned https URL resolves the same queue.
+    q = _as(ACCT_A, sqs_svc._get_q, created)
+    assert q["name"] == name
+
+
+def test_cfn_sqs_queue_url_scheme_https_when_tls(monkeypatch):
+    """The AWS::SQS::Queue provisioner builds the same QueueUrl as CreateQueue."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    name = _uniq("cfn-tls-scheme")
+    url, _attrs = provisioners._sqs_create("Queue", {"QueueName": name}, "stack")
+    assert url.startswith("https://"), url
+
+
+def test_queue_url_scheme_http_without_tls(monkeypatch):
+    """Without TLS the QueueUrl keeps http (existing behaviour)."""
+    monkeypatch.delenv("USE_SSL", raising=False)
+    name = _uniq("plain-scheme")
+    created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
+    assert created.startswith("http://"), created
