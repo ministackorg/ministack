@@ -15,6 +15,7 @@ Email templates live in the v1 store, so either API version sees the other's.
 
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -111,6 +112,25 @@ def _json_err(code, message, status=400):
 
 def _resource_arn(kind, name):
     return f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+
+
+def _easy_dkim_attributes(identity, identity_type, signing_attributes):
+    """A DOMAIN identity uses Easy DKIM unless DkimSigningAttributes brings its
+    own key (BYODKIM): three tokens for its CNAME records, verification
+    pending. An EMAIL_ADDRESS identity has no DKIM tokens."""
+    byodkim = any(signing_attributes.get(k) for k in ("DomainSigningPrivateKey", "DomainSigningSelector"))
+    if identity_type != "DOMAIN" or byodkim:
+        return {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []}
+    tokens = [
+        hashlib.md5(f"{identity}-dkim-{i}".encode()).hexdigest()[:32]
+        for i in range(3)
+    ]
+    return {
+        "SigningEnabled": False,
+        "SigningAttributesOrigin": "AWS_SES",
+        "Status": "PENDING",
+        "Tokens": tokens,
+    }
 
 
 def _invalid_resource_arn(arn):
@@ -451,11 +471,13 @@ async def handle_request(method, path, headers, body, query_params):
         if not identity:
             return _json_err("BadRequestException", "EmailIdentity is required")
         identity_type = "DOMAIN" if "." in identity and "@" not in identity else "EMAIL_ADDRESS"
+        dkim_attributes = _easy_dkim_attributes(
+            identity, identity_type, data.get("DkimSigningAttributes") or {})
         _identities[identity] = {
             "EmailIdentity": identity,
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
             "MailFromAttributes": {"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"},
             "Tags": data.get("Tags", []),
             "CreatedTimestamp": now_iso(),
@@ -464,7 +486,7 @@ async def handle_request(method, path, headers, body, query_params):
         return json_response({
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
         })
 
     # GET /v2/email/identities  (ListEmailIdentities)

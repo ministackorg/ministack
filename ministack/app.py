@@ -2491,7 +2491,10 @@ async def _dispatch_service_request(
                         message=denied.message,
                         headers=headers,
                     )
-                return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers)
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id, headers=headers,
+                    resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                )
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:

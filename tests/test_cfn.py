@@ -15733,6 +15733,118 @@ def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
     _wait_stack(cfn, stack_name)
 
 
+def _cfn_s3tables_template(bucket, days=4, target_mb=512, min_snapshots=1, table="t1",
+                           columns=("id",)):
+    return json.dumps({"Resources": {
+        "Bucket": {"Type": "AWS::S3Tables::TableBucket", "Properties": {
+            "TableBucketName": bucket,
+            "UnreferencedFileRemoval": {"Status": "Enabled", "UnreferencedDays": days}}},
+        "Ns": {"Type": "AWS::S3Tables::Namespace", "Properties": {
+            "TableBucketARN": {"Ref": "Bucket"}, "Namespace": "ns1"}},
+        "Table": {"Type": "AWS::S3Tables::Table", "DependsOn": "Ns", "Properties": {
+            "TableBucketARN": {"Ref": "Bucket"}, "Namespace": "ns1", "TableName": table,
+            "OpenTableFormat": "ICEBERG",
+            "IcebergMetadata": {"IcebergSchema": {"SchemaFieldList": [
+                {"Name": c, "Type": "int"} for c in columns]}},
+            "Compaction": {"Status": "enabled", "TargetFileSizeMB": target_mb},
+            "SnapshotManagement": {"Status": "enabled", "MinSnapshotsToKeep": min_snapshots}}},
+    }, "Outputs": {"BucketArn": {"Value": {"Ref": "Bucket"}},
+                   "TableArn": {"Value": {"Ref": "Table"}}}})
+
+
+def _cfn_s3tables_committed_stack(cfn, s3tables, stack_name, bucket):
+    """A created stack whose table has a committed metadata location; returns the bucket ARN."""
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_s3tables_template(bucket))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    bucket_arn = _cfn_output(cfn, stack_name, "BucketArn")
+    current = s3tables.get_table_metadata_location(
+        tableBucketARN=bucket_arn, namespace="ns1", name="t1")
+    s3tables.update_table_metadata_location(
+        tableBucketARN=bucket_arn, namespace="ns1", name="t1",
+        versionToken=current["versionToken"],
+        metadataLocation=current["metadataLocation"].replace("v0", "v1"))
+    return bucket_arn
+
+
+def _cfn_s3tables_identity(s3tables, bucket_arn, table="t1"):
+    t = s3tables.get_table(tableBucketARN=bucket_arn, namespace="ns1", name=table)
+    return (s3tables.get_table_bucket(tableBucketARN=bucket_arn)["createdAt"],
+            t["tableARN"], t["createdAt"], t["metadataLocation"])
+
+
+@pytest.mark.parametrize("change", [
+    {"days": 5}, {"target_mb": 256}, {"min_snapshots": 2}])
+def test_cfn_s3tables_update_keeps_the_bucket_and_table(cfn, s3tables, change):
+    """A mutable property change keeps the bucket and the table with its committed metadata."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, bucket = f"cfn-s3t-upd-{suffix}", f"cfn-s3t-upd-{suffix}"
+    try:
+        bucket_arn = _cfn_s3tables_committed_stack(cfn, s3tables, stack_name, bucket)
+        before = _cfn_s3tables_identity(s3tables, bucket_arn)
+        assert before[3].endswith("/v1.metadata.json")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_s3tables_template(bucket, **change))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_s3tables_identity(s3tables, bucket_arn) == before
+        assert _cfn_output(cfn, stack_name, "TableArn") == before[1]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3tables_update_is_rolled_back(cfn, s3tables):
+    """A rolled-back bucket and table change keeps both as they were."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, bucket = f"cfn-s3t-rb-{suffix}", f"cfn-s3t-rb-{suffix}"
+    try:
+        bucket_arn = _cfn_s3tables_committed_stack(cfn, s3tables, stack_name, bucket)
+        before = _cfn_s3tables_identity(s3tables, bucket_arn)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_with_failing_resource(
+            _cfn_s3tables_template(bucket, days=6, target_mb=128), "Table"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_s3tables_identity(s3tables, bucket_arn) == before
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3tables_table_create_only_change_under_the_same_name_fails(cfn, s3tables):
+    """The replacement table is refused under the unchanged name and the table stays."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, bucket = f"cfn-s3t-co-{suffix}", f"cfn-s3t-co-{suffix}"
+    try:
+        bucket_arn = _cfn_s3tables_committed_stack(cfn, s3tables, stack_name, bucket)
+        before = _cfn_s3tables_identity(s3tables, bucket_arn)
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_s3tables_template(bucket, columns=("id", "v")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "identical name already exists" in _stack_event_reasons(cfn, stack_name)
+        assert _cfn_s3tables_identity(s3tables, bucket_arn) == before
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3tables_table_rename_removes_the_old_name(cfn, s3tables):
+    """A TableName change leaves the table under the new name only."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, bucket = f"cfn-s3t-mv-{suffix}", f"cfn-s3t-mv-{suffix}"
+    try:
+        bucket_arn = _cfn_s3tables_committed_stack(cfn, s3tables, stack_name, bucket)
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_s3tables_template(bucket, table="t2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        tables = s3tables.list_tables(tableBucketARN=bucket_arn)["tables"]
+        assert [t["name"] for t in tables] == ["t2"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 # ── AWS::KMS::Key ───────────────────────────────────────────────────────────
 # Property names, defaults and update behaviour follow the resource reference:
 # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-key.html
@@ -27412,6 +27524,141 @@ def test_cfn_ec2_internet_gateway_tag_change_is_rolled_back(cfn, ec2):
             InternetGatewayIds=[igw_id])["InternetGateways"][0]
         assert described["Attachments"], "the VPC attachment was dropped"
         assert _template_tags(described.get("Tags", [])) == [{"Key": "stage", "Value": "before"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_gateway_attachment_template(gateway, vpc="Vpc", failing=False):
+    """Two VPCs, two internet gateways and an attachment of ``gateway`` to ``vpc``."""
+    template = {
+        "Parameters": {"Vgw1": {"Type": "String", "Default": ""},
+                       "Vgw2": {"Type": "String", "Default": ""}},
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.53.0.0/16"}},
+            "Vpc2": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.54.0.0/16"}},
+            "Igw1": {"Type": "AWS::EC2::InternetGateway"},
+            "Igw2": {"Type": "AWS::EC2::InternetGateway"},
+            "Attach": {"Type": "AWS::EC2::VPCGatewayAttachment", "Properties": {
+                "VpcId": {"Ref": vpc}, gateway[0]: {"Ref": gateway[1]}}},
+        },
+        "Outputs": {k: {"Value": {"Ref": k}} for k in ("Vpc", "Vpc2", "Igw1", "Igw2", "Attach")},
+    }
+    body = json.dumps(template)
+    return _cfn_with_failing_resource(body, "Attach") if failing else body
+
+
+def _cfn_igw_vpcs(ec2, igw_id):
+    return [a["VpcId"] for a in ec2.describe_internet_gateways(
+        InternetGatewayIds=[igw_id])["InternetGateways"][0].get("Attachments", [])]
+
+
+def test_cfn_ec2_gateway_attachment_swaps_the_internet_gateway_in_place(cfn, ec2):
+    """A new InternetGatewayId moves the attachment under the same IGW|vpc id."""
+    stack_name = f"cfn-gwa-igw-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1, igw2 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1", "Igw2"))
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw2")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == []
+        assert _cfn_igw_vpcs(ec2, igw2) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_attaches_and_swaps_a_vpn_gateway(cfn, ec2):
+    """VpnGatewayId attaches the virtual private gateway; a new one swaps in place."""
+    stack_name = f"cfn-gwa-vgw-{_uuid_mod.uuid4().hex[:8]}"
+    vgws = [ec2.create_vpn_gateway(Type="ipsec.1")["VpnGateway"]["VpnGatewayId"] for _ in range(2)]
+    params = [{"ParameterKey": f"Vgw{i}", "ParameterValue": v} for i, v in enumerate(vgws, 1)]
+
+    def vpcs(vgw):
+        return [a["VpcId"] for a in ec2.describe_vpn_gateways(
+            VpnGatewayIds=[vgw])["VpnGateways"][0].get("VpcAttachments", [])
+            if a["State"] == "attached"]
+
+    try:
+        cfn.create_stack(StackName=stack_name, Parameters=params,
+                         TemplateBody=_cfn_gateway_attachment_template(("VpnGatewayId", "Vgw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc = _cfn_output(cfn, stack_name, "Vpc")
+        assert _cfn_output(cfn, stack_name, "Attach") == f"VGW|{vpc}"
+        assert vpcs(vgws[0]) == [vpc]
+
+        cfn.update_stack(StackName=stack_name, Parameters=params,
+                         TemplateBody=_cfn_gateway_attachment_template(("VpnGatewayId", "Vgw2")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_output(cfn, stack_name, "Attach") == f"VGW|{vpc}"
+        assert vpcs(vgws[0]) == []
+        assert vpcs(vgws[1]) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for vgw in vgws:
+            ec2.delete_vpn_gateway(VpnGatewayId=vgw)
+
+
+def test_cfn_ec2_gateway_attachment_vpc_change_keeps_the_gateway_attached(cfn, ec2):
+    """A VpcId change replaces the attachment and leaves the gateway on the new VPC."""
+    stack_name = f"cfn-gwa-vpc-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw1"), vpc="Vpc2"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        vpc2, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc2", "Igw1"))
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc2}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc2]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_vpc_change_is_rolled_back(cfn, ec2):
+    """A rolled-back VpcId change leaves the gateway attached to the old VPC."""
+    stack_name = f"cfn-gwa-vrb-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw1"), vpc="Vpc2", failing=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_ec2_gateway_attachment_swap_is_rolled_back(cfn, ec2):
+    """A gateway swap is sent back by the rollback under the same id."""
+    stack_name = f"cfn-gwa-rb-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack_name,
+                         TemplateBody=_cfn_gateway_attachment_template(("InternetGatewayId", "Igw1")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        vpc, igw1, igw2 = (_cfn_output(cfn, stack_name, k) for k in ("Vpc", "Igw1", "Igw2"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_gateway_attachment_template(
+            ("InternetGatewayId", "Igw2"), failing=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = [e["ResourceStatus"] for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Attach"]
+        assert events[:4] == ["UPDATE_COMPLETE", "UPDATE_IN_PROGRESS"] * 2
+        assert _cfn_output(cfn, stack_name, "Attach") == f"IGW|{vpc}"
+        assert _cfn_igw_vpcs(ec2, igw1) == [vpc]
+        assert _cfn_igw_vpcs(ec2, igw2) == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
