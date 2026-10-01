@@ -193,6 +193,10 @@ def reset():
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
+    # Drop the JS workers so their compiled-function cache does not outlive a
+    # reset (mirrors appsync.reset()'s appsync_js.reset()).
+    from ministack.core import cloudfront_js
+    cloudfront_js.reset()
 
 
 def get_state():
@@ -4552,3 +4556,200 @@ def _list_distributions_by_connection_mode(mode):
         return _error("InvalidArgument", "Invalid ConnectionMode value.", 400)
     items = [d for d in _distributions.values() if _dist_connection_mode(d) == mode]
     return _xml_response("DistributionList", lambda root: _build_distribution_list_xml(root, items))
+
+
+# ---------------------------------------------------------------------------
+# Data-plane support: cloudfront_dataplane serves traffic through this
+# accessor surface rather than the module-private stores directly.
+# ---------------------------------------------------------------------------
+
+
+def find_distribution_for_label(label: str):
+    """The distribution whose DomainName is ``<label>.cloudfront.net``.
+
+    A viewer request carries no credentials, so this scans the ambient
+    account's distributions the same way ``alb.find_lb_for_host`` scans
+    ``_lbs.values()`` for ALB's own host-routed data plane — not a
+    cross-account search, just the same ambient-scoped lookup every other
+    host-routed service uses here.
+    """
+    domain = f"{label}.cloudfront.net"
+    for dist in _distributions.values():
+        if dist.get("DomainName", "").lower() == domain:
+            return dist
+    return None
+
+
+# The regional/legacy REST-endpoint domain shapes an Origin's DomainName
+# takes when the origin is an S3 bucket (CloudFront Developer Guide, "Amazon
+# S3 origin"). A website-endpoint domain (s3-website-*) isn't matched here:
+# AWS itself requires that shape to be configured as a CustomOriginConfig,
+# never S3OriginConfig, so it is correctly left to the custom-origin path.
+_S3_ORIGIN_DOMAIN_RE = re.compile(
+    r"^(?P<bucket>[a-z0-9][a-z0-9.-]*[a-z0-9])\.s3(?:\.[a-z0-9-]+|-[a-z0-9-]+)?\.amazonaws\.com$"
+)
+
+
+def _s3_origin_bucket(domain_name: str):
+    m = _S3_ORIGIN_DOMAIN_RE.match((domain_name or "").strip().lower())
+    return m.group("bucket") if m else None
+
+
+def _dataplane_custom_headers(origin_el):
+    """Origin.CustomHeaders — wire name "CustomHeaders" (CloudFormation's
+    OriginCustomHeaders is a JSON-only rename, see _CFN_DISTRIBUTION_CONFIG_RENAMES
+    above); Items/OriginCustomHeader/{HeaderName,HeaderValue} per the botocore
+    cloudfront service-2.json (2020-05-31) shape."""
+    headers = []
+    ch_el = _find(origin_el, "CustomHeaders")
+    items_el = _find(ch_el, "Items") if ch_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "OriginCustomHeader":
+                name = _text(it, "HeaderName")
+                if name:
+                    headers.append((name, _text(it, "HeaderValue")))
+    return headers
+
+
+def _dataplane_origin(origin_el):
+    custom = _find(origin_el, "CustomOriginConfig")
+    s3cfg = _find(origin_el, "S3OriginConfig")
+    domain_name = _text(origin_el, "DomainName")
+    return {
+        "id": _text(origin_el, "Id"),
+        "domain_name": domain_name,
+        "origin_path": _opt_text(origin_el, "OriginPath") or "",
+        "custom_headers": _dataplane_custom_headers(origin_el),
+        # Origin carries exactly one of S3OriginConfig or CustomOriginConfig
+        # (AWS's schema is mutually exclusive); the bucket name itself is
+        # only ever recoverable from DomainName, never a separate field.
+        "s3_bucket": _s3_origin_bucket(domain_name) if s3cfg is not None else None,
+        "http_port": int(_text(custom, "HTTPPort") or "80") if custom is not None else 80,
+        "https_port": int(_text(custom, "HTTPSPort") or "443") if custom is not None else 443,
+        "protocol_policy": _text(custom, "OriginProtocolPolicy") if custom is not None else "match-viewer",
+        # Response timeout doc ("Origin response timeout"): default 30s.
+        "read_timeout": int(_text(custom, "OriginReadTimeout") or "30") if custom is not None else 30,
+    }
+
+
+def _dataplane_function_associations(behavior_el):
+    associations = {}
+    fa_el = _find(behavior_el, "FunctionAssociations")
+    items_el = _find(fa_el, "Items") if fa_el is not None else None
+    if items_el is None:
+        return associations
+    for it in items_el:
+        if _local_tag_name(it) == "FunctionAssociation":
+            associations[_text(it, "EventType")] = _text(it, "FunctionARN")
+    return associations
+
+
+def _dataplane_forwarded_values(behavior_el):
+    """Legacy ``ForwardedValues`` (botocore cloudfront service-2.json), used
+    by a behavior that has no CachePolicyId. Returns None when the behavior
+    carries no ForwardedValues block either (nothing legacy to forward)."""
+    fv_el = _find(behavior_el, "ForwardedValues")
+    if fv_el is None:
+        return None
+    cookies_el = _find(fv_el, "Cookies")
+    return {
+        "query_string": _xbool(fv_el, "QueryString", False),
+        "headers": _parse_name_items(fv_el, "Headers"),
+        "cookies_forward": _text(cookies_el, "Forward", "none") if cookies_el is not None else "none",
+        "cookies_whitelist": _parse_name_items(cookies_el, "WhitelistedNames") if cookies_el is not None else [],
+    }
+
+
+def _dataplane_allowed_methods(behavior_el):
+    """The behavior's AllowedMethods.Items, or None when the block is absent
+    (nothing to enforce — see cloudfront_dataplane.py's method check)."""
+    am_el = _find(behavior_el, "AllowedMethods")
+    if am_el is None:
+        return None
+    items_el = _find(am_el, "Items")
+    methods = []
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "Method":
+                methods.append(it.text or "")
+    return methods
+
+
+def _dataplane_behavior(behavior_el, path_pattern=None):
+    return {
+        "path_pattern": path_pattern,
+        "target_origin_id": _text(behavior_el, "TargetOriginId"),
+        "viewer_protocol_policy": _text(behavior_el, "ViewerProtocolPolicy", "allow-all"),
+        "allowed_methods": _dataplane_allowed_methods(behavior_el),
+        "cache_policy_id": _opt_text(behavior_el, "CachePolicyId"),
+        "origin_request_policy_id": _opt_text(behavior_el, "OriginRequestPolicyId"),
+        "response_headers_policy_id": _opt_text(behavior_el, "ResponseHeadersPolicyId"),
+        "forwarded_values": _dataplane_forwarded_values(behavior_el),
+        "functions": _dataplane_function_associations(behavior_el),
+    }
+
+
+def parse_distribution_dataplane_config(dist: dict) -> dict:
+    """A distribution's stored config XML, reduced to what the data plane
+    dispatches against: the default root object, origins by id, the default
+    behavior, and ordered behaviors in declaration order (first
+    ``path_pattern`` match wins)."""
+    config_el = _dist_config_el(dist)
+
+    origins = {}
+    origins_el = _find(config_el, "Origins")
+    items_el = _find(origins_el, "Items") if origins_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "Origin":
+                origin = _dataplane_origin(it)
+                origins[origin["id"]] = origin
+
+    default_el = _find(config_el, "DefaultCacheBehavior")
+    default_behavior = _dataplane_behavior(default_el) if default_el is not None else None
+
+    ordered_behaviors = []
+    behaviors_el = _find(config_el, "CacheBehaviors")
+    items_el = _find(behaviors_el, "Items") if behaviors_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "CacheBehavior":
+                ordered_behaviors.append(_dataplane_behavior(it, _text(it, "PathPattern")))
+
+    return {
+        "default_root_object": _opt_text(config_el, "DefaultRootObject") or "",
+        "origins": origins,
+        "default_behavior": default_behavior,
+        "ordered_behaviors": ordered_behaviors,
+    }
+
+
+def cache_policy_params(policy_id):
+    """A cache policy's Parameters dict (managed or custom), or None when the
+    policy has no ParametersInCacheKeyAndForwardedToOrigin block (nothing
+    beyond the defaults CloudFront always includes) or doesn't exist."""
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
+    return policy["Config"].get("Parameters") if policy else None
+
+
+def origin_request_policy_config(policy_id):
+    """A custom or AWS-managed origin request policy's Config dict, or None."""
+    policy = _origin_request_policies.get(policy_id) or _MANAGED_ORIGIN_REQUEST_POLICIES.get(policy_id)
+    return policy["Config"] if policy else None
+
+
+def response_headers_policy_config(policy_id):
+    """A custom or AWS-managed response-headers policy's Config dict, or None."""
+    policy = _response_headers_policies.get(policy_id) or _MANAGED_RESPONSE_HEADERS_POLICIES.get(policy_id)
+    return policy["Config"] if policy else None
+
+
+def live_function_code(function_arn: str):
+    """The published (LIVE) JS body for a FunctionAssociation's FunctionARN,
+    or None when the ARN doesn't resolve to a published function."""
+    name = function_arn.rsplit("/", 1)[-1] if function_arn else ""
+    fn = _functions.get(name)
+    if not fn or not fn.get("live_etag"):
+        return None
+    return _function_view(fn, "LIVE").get("code", fn["code"])
