@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **botocore 1.43.106** — the service models MiniStack reads move from 1.43.63 to 1.43.106; the images keep `awscli` 1.45.63, installed on the same botocore instead of its pinned one.
+
+### Fixed
+
+- **CloudFormation — an empty `Capabilities` list is accepted** — botocore sends it as a bare `Capabilities=`, which was read as one empty value and refused, so `aws cloudformation deploy` without `--capabilities` and `Capabilities=[]` from an SDK failed with a `ValidationError` since 1.5.11.
+- **RDS — `DescribeGlobalClusters` lists clusters as `GlobalClusterMember`** — each cluster was a `<GlobalCluster>` element, so SDKs that match the list member name, such as aws-sdk-go-v2, found none. Contributed by @IamYipi.
+- **Amazon MQ — `DescribeBrokerInstanceOptions` returns `supportedEngineVersions` as strings** — they were `{"name": ...}` objects, which aws-sdk-go-v2 could not deserialize. Contributed by @IamYipi.
+- **EventBridge — `UpdateEventBus` returns the bus** — it answered `EventBusArn` and `LastModifiedTime`, which are not response members, so SDKs returned nothing; it now returns `Arn`, `Name` and the bus's `Description`, `KmsKeyIdentifier`, `DeadLetterConfig` and `LogConfig`. Contributed by @IamYipi.
+- **CloudFormation — `AWS::CodeBuild::Project` stores `Source`, `Artifacts` and `Environment` under CodeBuild API names** — the template's PascalCase members and `BuildSpec` were stored as written, so `BatchGetProjects` dropped them and a build of a stack's project found no buildspec, image or environment variables. Contributed by @IamYipi.
+- **Inspector2 — responses aws-sdk-go-v2 can read** — timestamps are epoch seconds, `ListFilters` returns `criteria`, `ownerId`, `createdAt` and `updatedAt`, `CreateFilter` returns `arn`, and coverage `scanStatus` is `{statusCode, reason}`. Saved state is converted on restore. Contributed by @IamYipi.
+
 ## [1.5.19] — 2026-09-30
 
 ### Added

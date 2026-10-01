@@ -2476,6 +2476,23 @@ def test_cfn_stack_and_change_set_report_their_capabilities(cfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_empty_capabilities_list_is_accepted(cfn):
+    """botocore sends an empty Capabilities list as a bare ``Capabilities=``,
+    which is what ``aws cloudformation deploy`` does without --capabilities."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = json.dumps({"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}})
+    stack_name, cs_stack = f"cfn-caps-empty-{uid}", f"cfn-caps-empty-cs-{uid}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template, Capabilities=[])
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_change_set(StackName=cs_stack, ChangeSetName="cs", ChangeSetType="CREATE",
+                              TemplateBody=template, Capabilities=[])
+        assert _wait_change_set(cfn, cs_stack, "cs")["Status"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_cfn_test_stack(cfn, cs_stack)
+
+
 def test_cfn_unknown_capability_is_refused(cfn):
     """Capabilities is an enum of three values, so a fourth is a parameter
     validation error rather than something the stack silently keeps, on
