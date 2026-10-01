@@ -16,10 +16,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **Inspector2 — responses aws-sdk-go-v2 can read** — timestamps are epoch seconds, `ListFilters` returns `criteria`, `ownerId`, `createdAt` and `updatedAt`, `CreateFilter` returns `arn`, and coverage `scanStatus` is `{statusCode, reason}`. Saved state is converted on restore. Contributed by @IamYipi.
 - **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
 
+- **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS.
+
 ## [1.5.19] — 2026-09-30
 
 ### Added
 
+
+- **RDS — IAM database authentication for MySQL and Aurora MySQL** — users created `IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'` log in with an SDK-generated token over `mysql_clear_password`, as on AWS. The instance or cluster must have `IAMDatabaseAuthenticationEnabled`; with `AUTH=true` the token and the `rds-db:connect` policy are verified too. `ModifyDBInstance` accepts `EnableIAMDatabaseAuthentication`. Contributed by @Areson.
 - **Kinesis — `SubscribeToShard`** — enhanced fan-out: a registered consumer receives the shard's records as `SubscribeToShardEvent`s over an event stream (HTTP/1.1 or HTTP/2) for up to 5 minutes, from any `StartingPosition`, with `ContinuationSequenceNumber` for resuming and `ChildShards` when the shard is split or merged. A second call for the same consumer and shard within 5 seconds is a `ResourceInUseException`; a later one takes the subscription over.
 - **CloudWatch Logs — resource policies** — `PutResourcePolicy`, `DescribeResourcePolicies` and `DeleteResourcePolicy`, account-scoped (up to 10) or scoped to one log group through `resourceArn`, with `expectedRevisionId` checks. `AWS::Logs::ResourcePolicy` stacks now create real policies. Contributed by @fabio-andre-rodrigues.
 - **CloudFormation — `RollbackStack`** — rolls a stack left `CREATE_FAILED` or `UPDATE_FAILED` with rollback disabled back to its last stable state: a failed create ends `ROLLBACK_COMPLETE`, a failed update reverts its changes, deletes what it added and ends `UPDATE_ROLLBACK_COMPLETE`. `RetainExceptOnCreate` is honoured. Contributed by @fabio-andre-rodrigues.
