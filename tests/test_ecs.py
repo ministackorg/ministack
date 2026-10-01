@@ -74,6 +74,66 @@ def test_ecs_task_def(ecs):
     assert resp["taskDefinition"]["family"] == "test-task"
     assert resp["taskDefinition"]["revision"] == 1
 
+@pytest.mark.parametrize("cpu", [None, "512"])
+@pytest.mark.parametrize("memory", [None, "1024"])
+@pytest.mark.parametrize("requires_compatibilities", [None, ["EC2"]])
+def test_ecs_task_definition_optional_fields_readback(
+    ecs, cpu, memory, requires_compatibilities,
+):
+    # AWS RegisterTaskDefinition documents optional EC2 sizing and omission of
+    # unspecified requiresCompatibilities. Its register/describe/deregister
+    # examples omit task-level sizing when only container resources are given.
+    optional_fields = {
+        field: value for field, value in {
+            "cpu": cpu,
+            "memory": memory,
+            "requiresCompatibilities": requires_compatibilities,
+        }.items() if value is not None
+    }
+    registered = ecs.register_task_definition(
+        family=f"optional-fields-{_uuid_mod.uuid4().hex[:8]}",
+        containerDefinitions=[{
+            "name": "web", "image": "nginx:alpine", "cpu": 128, "memory": 256,
+        }],
+        **optional_fields,
+    )["taskDefinition"]
+    arn = registered["taskDefinitionArn"]
+    described = ecs.describe_task_definition(taskDefinition=arn)["taskDefinition"]
+    deregistered = ecs.deregister_task_definition(taskDefinition=arn)["taskDefinition"]
+
+    for td in (registered, described, deregistered):
+        for field in ("cpu", "memory", "requiresCompatibilities"):
+            if field in optional_fields:
+                assert td[field] == optional_fields[field]
+            else:
+                assert field not in td
+        assert td["containerDefinitions"][0]["cpu"] == 128
+        assert td["containerDefinitions"][0]["memory"] == 256
+        assert td["networkMode"] == "bridge"
+    assert registered["status"] == described["status"] == "ACTIVE"
+    assert deregistered["status"] == "INACTIVE"
+
+
+def test_ecs_task_definition_explicit_fargate_sizing_readback(ecs):
+    registered = ecs.register_task_definition(
+        family=f"explicit-fargate-{_uuid_mod.uuid4().hex[:8]}",
+        containerDefinitions=[{"name": "web", "image": "nginx:alpine"}],
+        networkMode="awsvpc",
+        requiresCompatibilities=["FARGATE"],
+        cpu="512",
+        memory="1024",
+    )["taskDefinition"]
+    arn = registered["taskDefinitionArn"]
+    described = ecs.describe_task_definition(taskDefinition=arn)["taskDefinition"]
+    deregistered = ecs.deregister_task_definition(taskDefinition=arn)["taskDefinition"]
+
+    for td in (registered, described, deregistered):
+        assert td["cpu"] == "512"
+        assert td["memory"] == "1024"
+        assert td["requiresCompatibilities"] == ["FARGATE"]
+        assert td["networkMode"] == "awsvpc"
+
+
 def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
@@ -2760,33 +2820,34 @@ def test_ecs_awsvpc_attachment_carries_the_subnet_it_was_placed_in(monkeypatch):
     assert details["privateIPv4Address"] == "172.30.0.11"
 
 
-def test_ecs_awsvpc_attachment_reads_the_cloudformation_casing(monkeypatch):
-    """A CloudFormation service replays its template's `NetworkConfiguration`.
-
-    The AWS::ECS::Service handler stores the template block verbatim, so it
-    reaches RunTask in PascalCase. Reading only the SDK's casing would leave
-    every CFN-defined service's tasks without a subnet.
-    """
+def test_ecs_cloudformation_service_places_and_registers_its_tasks(monkeypatch):
+    """A CloudFormation service's tasks get the template's subnet and join its target group."""
+    from ministack.services import alb as _alb
     from ministack.services import ecs as _ecs
+    from ministack.services.cloudformation.provisioners import _RESOURCE_HANDLERS
 
     monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.41"))
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-cfncase/abc123"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
     _ecs._register_task_definition({
         "family": "eni-cfncase-td",
         "networkMode": "awsvpc",
         "containerDefinitions": [{"name": "web", "image": "busybox"}],
     })
-    task_arn = json.loads(_ecs._run_task({
-        "cluster": "eni-cfncase-c",
-        "taskDefinition": "eni-cfncase-td",
-        "networkConfiguration": {"AwsvpcConfiguration": {
-            "Subnets": ["subnet-cfn00001"],
-        }},
-    })[2])["tasks"][0]["taskArn"]
-
-    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
-    details = {d["name"]: d["value"]
-               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    _RESOURCE_HANDLERS["AWS::ECS::Service"]["create"]("Service", {
+        "Cluster": "eni-cfncase-c",
+        "ServiceName": "eni-cfncase-svc",
+        "TaskDefinition": "eni-cfncase-td",
+        "DesiredCount": 1,
+        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["subnet-cfn00001"]}},
+        "LoadBalancers": [{"TargetGroupArn": tg_arn, "ContainerName": "web", "ContainerPort": 80}],
+    }, "eni-cfncase")
+    _wait_until(lambda: _alb._targets.get(tg_arn) == [{"Id": "172.30.0.41", "Port": 80}])
+    task = next(t for t in _ecs._tasks.values() if t.get("group") == "service:eni-cfncase-svc")
+    details = {d["name"]: d["value"] for d in task["attachments"][0]["details"]}
     assert details["subnetId"] == "subnet-cfn00001"
+    _ecs._delete_service({"cluster": "eni-cfncase-c", "service": "eni-cfncase-svc", "force": True})
 
 
 @pytest.mark.parametrize("network_configuration", [
