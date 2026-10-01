@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **IoT — registry events** — with a type enabled through `UpdateEventConfigurations`, the thing, thing type, thing type association, thing group, thing group hierarchy and thing group membership operations publish the AWS payload to `$aws/events/...`, where MQTT subscribers and topic rules receive it.
 - **CloudFormation — `AWS::Lambda::Version` updates `FunctionScalingConfig` in place** — a stack update re-ran the create, which published a new version for every change; a `FunctionScalingConfig` change now keeps the version, also when the update rolls back. Contributed by @iot-rocket.
 
 ### Fixed

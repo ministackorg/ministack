@@ -11300,7 +11300,9 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
 def _iot_thing_group_delete(physical_id, props):
     rec = _iot_thing_group_record(physical_id)
     if rec is not None:
-        _iot._delete_thing_group(rec["thingGroupName"])
+        resp = _iot._delete_thing_group(rec["thingGroupName"])
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ThingGroup delete failed: {resp[2]!r}")
 
 
 def _iot_policy_document(props):
