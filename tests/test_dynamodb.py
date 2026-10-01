@@ -7345,3 +7345,78 @@ def test_dynamodb_restore_rebuilds_item_store_for_every_account_and_region():
                 assert body["Item"] == {"pk": {"S": "existing"}}
     finally:
         ddb_service.reset()
+
+
+def test_dynamodb_global_table_replica_lifecycle():
+    home, other = _ddb_client("us-east-1"), _ddb_client("us-west-2")
+    name = f"gt-{_uuid_mod.uuid4().hex[:8]}"
+    home.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}])
+    home.put_item(TableName=name, Item={"pk": {"S": "before"}})
+    home.update_time_to_live(TableName=name, TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+    try:
+        home.update_table(TableName=name, ReplicaUpdates=[{"Create": {"RegionName": "us-west-2"}}])
+
+        table = home.describe_table(TableName=name)["Table"]
+        assert table["GlobalTableVersion"] == "2019.11.21"
+        assert table["Replicas"] == [{"RegionName": "us-west-2", "ReplicaStatus": "ACTIVE"}]
+        assert table["StreamSpecification"] == {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+        replica = other.describe_table(TableName=name)["Table"]
+        assert replica["Replicas"] == [{"RegionName": "us-east-1", "ReplicaStatus": "ACTIVE"}]
+        assert replica["TableArn"].startswith("arn:aws:dynamodb:us-west-2:")
+        assert replica["DeletionProtectionEnabled"] is False
+        assert other.describe_time_to_live(TableName=name)["TimeToLiveDescription"]["AttributeName"] == "ttl"
+
+        # Existing items are copied; writes replicate both ways.
+        assert other.get_item(TableName=name, Key={"pk": {"S": "before"}})["Item"]
+        home.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "1"}})
+        assert other.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"] == {"N": "1"}
+        other.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                          ExpressionAttributeValues={":v": {"N": "2"}})
+        assert home.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"] == {"N": "2"}
+        other.delete_item(TableName=name, Key={"pk": {"S": "a"}})
+        assert "Item" not in home.get_item(TableName=name, Key={"pk": {"S": "a"}})
+
+        home.update_table(TableName=name, ReplicaUpdates=[{"Delete": {"RegionName": "us-west-2"}}])
+        with pytest.raises(ClientError) as exc:
+            other.describe_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        table = home.describe_table(TableName=name)["Table"]
+        assert "Replicas" not in table and "GlobalTableVersion" not in table
+    finally:
+        for client in (other, home):
+            with contextlib.suppress(ClientError):
+                client.delete_table(TableName=name)
+
+
+def test_dynamodb_global_table_replica_update_errors():
+    home, other = _ddb_client("us-east-1"), _ddb_client("us-west-2")
+    name = f"gt-err-{_uuid_mod.uuid4().hex[:8]}"
+    spec = dict(BillingMode="PAY_PER_REQUEST",
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}])
+    home.create_table(TableName=name, **spec)
+    other.create_table(TableName=name, **spec)
+    try:
+        cases = [
+            ([{"Create": {"RegionName": "us-east-1"}}],
+             "Cannot add, delete, or update the local region through ReplicaUpdates. "
+             "Use CreateTable, DeleteTable, or UpdateTable as required."),
+            ([{"Create": {"RegionName": "us-west-2"}}],
+             f"Failed to create a the new replica of table with name: '{name}' "
+             "because one or more replicas already existed as tables."),
+            ([{"Delete": {"RegionName": "eu-west-1"}}],
+             "Replica specified in the Replica Update or Replica Delete action of the request was not found."),
+        ]
+        for updates, message in cases:
+            with pytest.raises(ClientError) as exc:
+                home.update_table(TableName=name, ReplicaUpdates=updates)
+            assert exc.value.response["Error"]["Code"] == "ValidationException"
+            assert exc.value.response["Error"]["Message"] == message
+        assert "Replicas" not in home.describe_table(TableName=name)["Table"]
+    finally:
+        for client in (other, home):
+            with contextlib.suppress(ClientError):
+                client.delete_table(TableName=name)
