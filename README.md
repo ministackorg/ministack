@@ -496,6 +496,19 @@ subnet = ec2.create_subnet(
 | `AWS::Events::EventBus` | EventBus name | Arn, Name |
 | `AWS::Events::Rule` | Rule name | Arn |
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
+| `AWS::ElastiCache::SubnetGroup` | Subnet group name | — |
+| `AWS::ElastiCache::ParameterGroup` | Generated parameter group name | CacheParameterGroupName |
+| `AWS::ElastiCache::CacheCluster` | Cluster name | Id, RedisEndpoint.Address, RedisEndpoint.Port (Valkey / Redis OSS), ConfigurationEndpoint.Address, ConfigurationEndpoint.Port (Memcached) |
+| `AWS::ElastiCache::ReplicationGroup` | Replication group id | PrimaryEndPoint.Address, PrimaryEndPoint.Port, ReaderEndPoint.Address, ReaderEndPoint.Port, ReadEndPoint.Addresses, ReadEndPoint.Ports, ReadEndPoint.AddressesList, ReadEndPoint.PortsList (cluster mode disabled); ConfigurationEndPoint.Address, ConfigurationEndPoint.Port (cluster mode enabled) |
+| `AWS::ElastiCache::User` | User id | Arn, Status |
+| `AWS::ElastiCache::UserGroup` | User group id | Arn, Status |
+| `AWS::Glue::Database` | Database name | — |
+| `AWS::Glue::Table` | Table name | — |
+| `AWS::Glue::Partition` | `<catalog id>\|<database>\|<table>\|<values hash>` | IdentifierPartitionInputValues |
+| `AWS::Glue::Connection` | Connection name | Name |
+| `AWS::Glue::Crawler` | Crawler name | — |
+| `AWS::Glue::Job` | Job name | — |
+| `AWS::Glue::Trigger` | Trigger name | — |
 | `AWS::Lambda::Permission` | Statement ID | — |
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |
@@ -551,6 +564,11 @@ subnet = ec2.create_subnet(
 | `AWS::StepFunctions::StateMachine` | State machine ARN | Arn, Name |
 | `AWS::Route53::HostedZone` | Zone ID | Id, NameServers |
 | `AWS::Route53::RecordSet` | Record FQDN (trailing dot) | Name |
+| `AWS::ServiceDiscovery::HttpNamespace` | Namespace ID | Arn, Id |
+| `AWS::ServiceDiscovery::PrivateDnsNamespace` | Namespace ID | Arn, HostedZoneId, Id |
+| `AWS::ServiceDiscovery::PublicDnsNamespace` | Namespace ID | Arn, HostedZoneId, Id |
+| `AWS::ServiceDiscovery::Service` | Service ID | Arn, Id, Name |
+| `AWS::ServiceDiscovery::Instance` | Instance ID | — |
 | `AWS::ApiGatewayV2::Api` | API ID | ApiId, ApiEndpoint |
 | `AWS::ApiGatewayV2::Stage` | Stage ID | StageName |
 | `AWS::ApiGatewayV2::Integration` | Integration ID | IntegrationId |

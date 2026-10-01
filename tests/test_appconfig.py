@@ -140,6 +140,28 @@ def test_appconfig_delete_environment(appconfig_client):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_appconfig_delete_environment_drops_its_deployments(appconfig_client):
+    """A deployment of a deleted environment is not found."""
+    app = appconfig_client.create_application(Name="env-delete-deploy-app")
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="to-delete")
+    profile = appconfig_client.create_configuration_profile(
+        ApplicationId=app["Id"], Name="env-delete-deploy-profile", LocationUri="hosted")
+    appconfig_client.create_hosted_configuration_version(
+        ApplicationId=app["Id"], ConfigurationProfileId=profile["Id"],
+        Content=b"config", ContentType="text/plain")
+    strategy = appconfig_client.create_deployment_strategy(
+        Name="env-delete-deploy-strat", DeploymentDurationInMinutes=0,
+        GrowthFactor=100.0, ReplicateTo="NONE")
+    ids = {"ApplicationId": app["Id"], "EnvironmentId": env["Id"]}
+    number = appconfig_client.start_deployment(
+        **ids, DeploymentStrategyId=strategy["Id"], ConfigurationProfileId=profile["Id"],
+        ConfigurationVersion="1")["DeploymentNumber"]
+    appconfig_client.delete_environment(**ids)
+    with pytest.raises(ClientError) as exc:
+        appconfig_client.get_deployment(**ids, DeploymentNumber=number)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # Configuration Profiles
 # ---------------------------------------------------------------------------
@@ -305,6 +327,28 @@ def test_appconfig_delete_hosted_configuration_version(appconfig_client):
             VersionNumber=1,
         )
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_appconfig_hosted_version_number_is_never_reused(appconfig_client):
+    """A version created after deleting one gets a fresh number."""
+    app = appconfig_client.create_application(Name="hcv-reuse-app")
+    ids = {"ApplicationId": app["Id"],
+           "ConfigurationProfileId": appconfig_client.create_configuration_profile(
+               ApplicationId=app["Id"], Name="hcv-reuse-profile", LocationUri="hosted")["Id"]}
+
+    def create(content):
+        return appconfig_client.create_hosted_configuration_version(
+            **ids, Content=content, ContentType="text/plain")["VersionNumber"]
+
+    assert [create(b"v1"), create(b"v2")] == [1, 2]
+    appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=1)
+    assert create(b"v3") == 3
+    appconfig_client.delete_hosted_configuration_version(**ids, VersionNumber=3)
+    assert create(b"v4") == 4
+    listed = appconfig_client.list_hosted_configuration_versions(**ids)["Items"]
+    assert sorted(i["VersionNumber"] for i in listed) == [2, 4]
+    assert appconfig_client.get_hosted_configuration_version(
+        **ids, VersionNumber=2)["Content"].read() == b"v2"
 
 
 # ---------------------------------------------------------------------------

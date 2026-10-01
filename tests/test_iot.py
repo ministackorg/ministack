@@ -8,6 +8,7 @@ iot-data Publish) is covered separately in ``test_iot_data.py``.
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -138,6 +139,24 @@ def test_iot_update_thing_increments_version(iot_client):
     assert desc["version"] == 2
     assert desc["attributes"] == {"k": "v"}
     iot_client.delete_thing(thingName=name)
+
+
+def test_iot_update_thing_remove_thing_type_keeps_attributes(iot_client):
+    type_name = _unique("type")
+    name = _unique("thing")
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(
+        thingName=name, thingTypeName=type_name,
+        attributePayload={"attributes": {"k": "v"}},
+    )
+    iot_client.update_thing(thingName=name, removeThingType=True)
+    desc = iot_client.describe_thing(thingName=name)
+    assert desc.get("thingTypeName") is None
+    assert desc["attributes"] == {"k": "v"}
+    assert desc["version"] == 2
+    iot_client.delete_thing(thingName=name)
+    iot_client.deprecate_thing_type(thingTypeName=type_name)
+    iot_client.delete_thing_type(thingTypeName=type_name)
 
 
 def test_iot_list_things_filter_by_attribute(iot_client):
@@ -284,6 +303,22 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
 # ---------------------------------------------------------------------------
 # ThingGroup CRUD + membership
 # ---------------------------------------------------------------------------
+
+
+def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
+    parent, child = _unique("parent"), _unique("child")
+    iot_client.create_thing_group(thingGroupName=parent)
+    iot_client.create_thing_group(thingGroupName=child, parentGroupName=parent)
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing_group(thingGroupName=parent)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Cannot delete thing group : {parent} when there are still child groups attached to it"
+    )
+    assert iot_client.describe_thing_group(thingGroupName=child)["thingGroupMetadata"][
+        "parentGroupName"] == parent
+    iot_client.delete_thing_group(thingGroupName=child)
+    iot_client.delete_thing_group(thingGroupName=parent)
 
 
 def test_iot_thing_group_membership(iot_client):
@@ -5610,6 +5645,245 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
         "sourceIp": "192.0.2.10",
     }
     assert second["certificateRegistrationTimestamp"] == str(int(record["creationDate"] * 1000))
+
+
+# ----------------------------------------------------------------------
+# Registry events ($aws/events/...) gated by UpdateEventConfigurations
+# ----------------------------------------------------------------------
+
+_EVENTS_ACCOUNT = "123456789012"
+
+
+def _registry_events(calls, enable=_EVENT_TYPES) -> list:
+    """Run ``calls`` in-process with ``enable`` on and return the ``$aws/events`` messages."""
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    received: list = []
+
+    async def _collect(topic, payload, qos):
+        received.append((topic, json.loads(payload)))
+
+    async def _call(method, path, body=None):
+        status, _, resp = await iot_module.handle_request(
+            method, path, {}, json.dumps(body or {}).encode(), {}
+        )
+        assert status == 200, resp
+        return json.loads(resp or b"{}")
+
+    async def _run():
+        set_request_account_id(_EVENTS_ACCOUNT)
+        set_request_region(_TEST_REGION)
+        await iot_module.broker_subscribe(
+            _EVENTS_ACCOUNT, _TEST_REGION, "$aws/events/#", _collect
+        )
+        await _call("PATCH", "/event-configurations", {
+            "eventConfigurations": {t: {"Enabled": True} for t in enable}
+        })
+        await calls(_call)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+    for _topic, event in received:
+        assert re.fullmatch(r"[0-9a-f]{32}", event["eventId"])
+        assert isinstance(event.pop("timestamp"), int)
+        assert event.pop("accountId") == _EVENTS_ACCOUNT
+    return received
+
+
+def test_iot_registry_events_follow_the_event_configuration():
+    async def calls(call):
+        await call("POST", "/things/ev-thing")
+        await call("POST", "/thing-groups/ev-group")
+        await call("PUT", "/thing-groups/addThingToThingGroup",
+                   {"thingGroupName": "ev-group", "thingName": "ev-thing"})
+
+    assert _registry_events(calls, enable=()) == []
+    assert [t for t, _e in _registry_events(calls, enable=("THING_GROUP",))] == [
+        "$aws/events/thingGroup/ev-group/created",
+    ]
+
+
+def test_iot_thing_events_and_type_associations():
+    ids = {}
+
+    async def calls(call):
+        for type_name in ("ev-type-a", "ev-type-b"):
+            await call("POST", f"/thing-types/{type_name}")
+        ids["thing"] = (await call("POST", "/things/ev-thing", {
+            "thingTypeName": "ev-type-a", "attributePayload": {"attributes": {"a": "1"}},
+        }))["thingId"]
+        await call("PATCH", "/things/ev-thing", {
+            "thingTypeName": "ev-type-b",
+            "attributePayload": {"attributes": {"b": "2"}, "merge": True},
+        })
+        await call("PATCH", "/things/ev-thing", {"removeThingType": True})
+        await call("DELETE", "/things/ev-thing")
+
+    events = _registry_events(calls, enable=("THING", "THING_TYPE_ASSOCIATION"))
+    base = "$aws/events/thing/ev-thing"
+    assoc = "$aws/events/thingTypeAssociation/thing/ev-thing/thingType"
+    assert [t for t, _e in events] == [
+        f"{base}/created", f"{assoc}/ev-type-a/added",
+        f"{base}/updated", f"{assoc}/ev-type-b/added", f"{assoc}/ev-type-a/removed",
+        f"{base}/updated", f"{assoc}/ev-type-b/removed",
+        f"{base}/deleted",
+    ]
+    # One operation's thing and association events share an eventId.
+    assert len({e.pop("eventId") for _t, e in events[:2]}) == 1
+    assert len({e.pop("eventId") for _t, e in events[2:5]}) == 1
+    assert len({e.pop("eventId") for _t, e in events[5:7]}) == 1
+    thing = {"eventType": "THING_EVENT", "thingId": ids["thing"],
+             "thingName": "ev-thing", "billinGroupName": None}
+    assert events[0][1] == {**thing, "operation": "CREATED", "versionNumber": 1,
+                            "thingTypeName": "ev-type-a", "attributes": {"a": "1"}}
+    assert events[2][1] == {**thing, "operation": "UPDATED", "versionNumber": 2,
+                            "thingTypeName": "ev-type-b",
+                            "attributes": {"a": "1", "b": "2"}}
+    assert events[5][1] == {**thing, "operation": "UPDATED", "versionNumber": 3,
+                            "thingTypeName": None,
+                            "attributes": {"a": "1", "b": "2"}}
+    events[7][1].pop("eventId")
+    assert events[7][1] == {**thing, "operation": "DELETED", "versionNumber": 3,
+                            "thingTypeName": None,
+                            "attributes": {"a": "1", "b": "2"}}
+    assert events[4][1] == {
+        "eventType": "THING_TYPE_ASSOCIATION_EVENT", "operation": "REMOVED",
+        "thingId": ids["thing"], "thingName": "ev-thing", "thingTypeName": "ev-type-a",
+    }
+
+
+def test_iot_thing_type_events():
+    ids = {}
+
+    async def calls(call):
+        ids["type"] = (await call("POST", "/thing-types/ev-type", {"thingTypeProperties": {
+            "thingTypeDescription": "d1", "searchableAttributes": ["a"],
+        }}))["thingTypeId"]
+        await call("POST", "/thing-types/ev-type/deprecate", {})
+        await call("POST", "/thing-types/ev-type/deprecate", {"undoDeprecate": True})
+        await call("POST", "/thing-types/ev-type/deprecate", {})
+        await call("DELETE", "/thing-types/ev-type")
+        await call("POST", "/thing-types/ev-bare")
+
+    events = _registry_events(calls, enable=("THING_TYPE",))
+    base = "$aws/events/thingType"
+    assert [t for t, _e in events] == [
+        f"{base}/ev-type/created", f"{base}/ev-type/updated", f"{base}/ev-type/updated",
+        f"{base}/ev-type/updated", f"{base}/ev-type/deleted", f"{base}/ev-bare/created",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+    deprecated_at = events[1][1].pop("deprecationDate")
+    assert isinstance(deprecated_at, int)
+    thing_type = {"eventType": "THING_TYPE_EVENT", "thingTypeId": ids["type"],
+                  "thingTypeName": "ev-type", "searchableAttributes": ["a"],
+                  "propagatingAttributes": None, "description": "d1"}
+    assert events[0][1] == {**thing_type, "operation": "CREATED",
+                            "isDeprecated": False, "deprecationDate": None}
+    assert events[1][1] == {**thing_type, "operation": "UPDATED", "isDeprecated": True}
+    assert events[2][1] == {**thing_type, "operation": "UPDATED",
+                            "isDeprecated": False, "deprecationDate": None}
+    assert events[4][1]["operation"] == "DELETED"
+    assert events[4][1]["isDeprecated"] is True
+    bare = events[5][1]
+    assert (bare["searchableAttributes"], bare["description"]) == (None, None)
+
+
+def test_iot_thing_group_hierarchy_and_membership_events():
+    ids = {}
+
+    async def calls(call):
+        ids["parent"] = (await call("POST", "/thing-groups/ev-parent", {"thingGroupProperties": {
+            "thingGroupDescription": "gd", "attributePayload": {"attributes": {"k": "v"}},
+        }}))["thingGroupId"]
+        ids["child"] = (await call("POST", "/thing-groups/ev-child",
+                                   {"parentGroupName": "ev-parent"}))["thingGroupId"]
+        ids["thing"] = (await call("POST", "/things/ev-thing"))["thingId"]
+        for _ in range(2):
+            await call("PUT", "/thing-groups/addThingToThingGroup",
+                       {"thingGroupName": "ev-child", "thingName": "ev-thing"})
+        await call("PUT", "/thing-groups/removeThingFromThingGroup",
+                   {"thingGroupName": "ev-child", "thingName": "ev-thing"})
+        await call("PATCH", "/thing-groups/ev-parent",
+                   {"thingGroupProperties": {"thingGroupDescription": "gd2"}})
+        await call("DELETE", "/thing-groups/ev-child")
+        await call("PUT", "/thing-groups/addThingToThingGroup",
+                   {"thingGroupName": "ev-parent", "thingName": "ev-thing"})
+        await call("DELETE", "/thing-groups/ev-parent")
+
+    events = _registry_events(
+        calls, enable=("THING_GROUP", "THING_GROUP_HIERARCHY", "THING_GROUP_MEMBERSHIP")
+    )
+    group = "$aws/events/thingGroup"
+    hierarchy = "$aws/events/thingGroupHierarchy/thingGroup/ev-parent/childThingGroup/ev-child"
+    member = "$aws/events/thingGroupMembership/thingGroup"
+    assert [t for t, _e in events] == [
+        f"{group}/ev-parent/created",
+        f"{group}/ev-child/created", f"{hierarchy}/added",
+        f"{member}/ev-child/thing/ev-thing/added",
+        f"{member}/ev-child/thing/ev-thing/removed",
+        f"{group}/ev-parent/updated",
+        f"{group}/ev-child/deleted", f"{hierarchy}/removed",
+        f"{member}/ev-parent/thing/ev-thing/added",
+        f"{member}/ev-parent/thing/ev-thing/removed",
+        f"{group}/ev-parent/deleted",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+    arn = f"arn:aws:iot:{_TEST_REGION}:{_EVENTS_ACCOUNT}"
+    parent = {"eventType": "THING_GROUP_EVENT", "thingGroupId": ids["parent"],
+              "thingGroupName": "ev-parent", "parentGroupName": None,
+              "parentGroupId": None, "rootToParentThingGroups": None,
+              "attributes": {"k": "v"}, "dynamicGroupMappingId": None}
+    assert events[0][1] == {**parent, "operation": "CREATED", "versionNumber": 1,
+                            "description": "gd"}
+    assert events[5][1] == {**parent, "operation": "UPDATED", "versionNumber": 2,
+                            "description": "gd2"}
+    assert events[1][1] == {
+        "eventType": "THING_GROUP_EVENT", "operation": "CREATED",
+        "thingGroupId": ids["child"], "thingGroupName": "ev-child", "versionNumber": 1,
+        "parentGroupName": "ev-parent", "parentGroupId": ids["parent"],
+        "description": None,
+        "rootToParentThingGroups": [
+            {"groupArn": f"{arn}:thinggroup/ev-parent", "groupId": ids["parent"]},
+        ],
+        "attributes": None, "dynamicGroupMappingId": None,
+    }
+    assert events[2][1] == {
+        "eventType": "THING_GROUP_HIERARCHY_EVENT", "operation": "ADDED",
+        "thingGroupId": ids["parent"], "thingGroupName": "ev-parent",
+        "childGroupId": ids["child"], "childGroupName": "ev-child",
+    }
+    added, removed = events[3][1], events[4][1]
+    assert added == {
+        "eventType": "THING_GROUP_MEMBERSHIP_EVENT", "operation": "ADDED",
+        "groupArn": f"{arn}:thinggroup/ev-child", "groupId": ids["child"],
+        "thingArn": f"{arn}:thing/ev-thing", "thingId": ids["thing"],
+        "membershipId": removed["membershipId"],
+    }
+    assert removed["operation"] == "REMOVED"
+    assert events[9][1]["membershipId"] != added["membershipId"]
+
+
+def test_iot_deleting_a_thing_announces_its_group_memberships():
+    async def calls(call):
+        await call("POST", "/things/ev-thing")
+        await call("POST", "/thing-groups/ev-group")
+        await call("PUT", "/thing-groups/addThingToThingGroup",
+                   {"thingGroupName": "ev-group", "thingName": "ev-thing"})
+        await call("DELETE", "/things/ev-thing")
+
+    events = _registry_events(calls, enable=("THING", "THING_GROUP_MEMBERSHIP"))
+    assert [t for t, _e in events] == [
+        "$aws/events/thing/ev-thing/created",
+        "$aws/events/thingGroupMembership/thingGroup/ev-group/thing/ev-thing/added",
+        "$aws/events/thing/ev-thing/deleted",
+        "$aws/events/thingGroupMembership/thingGroup/ev-group/thing/ev-thing/removed",
+    ]
 
 
 # ----------------------------------------------------------------------
