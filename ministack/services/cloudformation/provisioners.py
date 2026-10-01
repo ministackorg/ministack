@@ -9043,7 +9043,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     api = {
         "apiId": api_id,
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "apiEndpoint": f"{_apigw_v2._api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
         "createdDate": now_iso(),
         "tags": dict(props.get("Tags") or {}),
         **_apigw_v2_api_props(props, stack_name, logical_id),
