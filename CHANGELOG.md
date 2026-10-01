@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SESv2 — `CreateEmailIdentity`/`GetEmailIdentity` return Easy DKIM tokens for a DOMAIN identity** — a domain identity created without `DkimSigningAttributes` answered an empty `Tokens` list with `Status: NOT_STARTED`. AWS provides a set of DKIM tokens for its CNAME records in that case (Easy DKIM), so the Terraform `aws_sesv2_email_identity` resource's `dkim_signing_attributes[0].tokens` indexing failed. A DOMAIN identity now gets three tokens, `SigningAttributesOrigin: AWS_SES` and `Status: PENDING`, unless `DkimSigningAttributes` brings its own key (BYODKIM); EMAIL_ADDRESS identities are unchanged.
 - **API Gateway v2 (HTTP API) — a missing identity source is a 401 without caching too** — a REQUEST authorizer's short circuit for a declared identity source missing from the request only fired with `authorizerResultTtlInSeconds` caching on; with caching off the authorizer was invoked. AWS answers `401 {"message":"Unauthorized"}` (compact JSON) without invoking it either way, as observed on a deployed HTTP API with a TTL of 0. `$context.*` identity sources, which MiniStack does not model, do not count as missing without caching.
 ### Added
 
