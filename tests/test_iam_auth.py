@@ -2187,13 +2187,35 @@ class TestActionExtraction:
             service, "POST", "/runtimes//invocations", headers, b"{}", {}
         ) is None
 
+    def test_agentcore_resource_policy_routes_use_control_plane_actions(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+
+        headers = _sigv4_headers(
+            "bedrock-agentcore", "bedrock-agentcore.us-east-1.amazonaws.com"
+        )
+        resource = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
+        path = "/resourcepolicy/" + resource.replace(":", "%3A").replace("/", "%2F")
+        assert extract_iam_action("bedrock-agentcore", "PUT", path, headers, b"{}", {}) == (
+            "bedrock-agentcore:PutResourcePolicy"
+        )
+        assert extract_iam_action("bedrock-agentcore", "GET", path, headers, b"", {}) == (
+            "bedrock-agentcore:GetResourcePolicy"
+        )
+        assert extract_iam_action("bedrock-agentcore", "DELETE", path, headers, b"", {}) == (
+            "bedrock-agentcore:DeleteResourcePolicy"
+        )
+        assert extract_resource_arn(
+            "bedrock-agentcore", "PUT", path, headers, b"{}", {},
+            "us-east-1", "000000000000",
+        ) == resource
+
 
 class TestBedrockAgentCoreAuthorization:
     _RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-example"
     _OTHER_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/rt-other"
 
     @staticmethod
-    def _invoke(path, monkeypatch, policy):
+    def _invoke(path, monkeypatch, policy, query=None):
         import asyncio
 
         import ministack.app as app_mod
@@ -2227,11 +2249,29 @@ class TestBedrockAgentCoreAuthorization:
             "20260101/eu-central-1/", "20260101/us-east-1/"
         )
         response = asyncio.run(
-            app_mod._dispatch_service_request("POST", path, headers, b"{}", {}, "req-agentcore")
+            app_mod._dispatch_service_request("POST", path, headers, b"{}", query or {}, "req-agentcore")
         )
         return response, seen
 
     def test_invoke_allows_the_exact_runtime_resource(self, monkeypatch):
+        path = "/runtimes/" + self._RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"
+        endpoint = self._RUNTIME_ARN + "/runtime-endpoint/DEFAULT"
+        response, seen = self._invoke(
+            path,
+            monkeypatch,
+            {"Statement": [{
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                "Resource": [self._RUNTIME_ARN, endpoint],
+            }]},
+        )
+
+        assert response[0] == 200
+        assert [arn for *_, arn in seen] == [self._RUNTIME_ARN, endpoint]
+
+    @pytest.mark.parametrize("query,endpoint_name", [({}, "DEFAULT"), ({"qualifier": ["prod"]}, "prod")])
+    def test_invoke_also_needs_the_runtime_endpoint(self, monkeypatch, query, endpoint_name):
+        """runtime and runtime-endpoint are both required resources of InvokeAgentRuntime."""
         path = "/runtimes/" + self._RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"
         response, seen = self._invoke(
             path,
@@ -2241,15 +2281,11 @@ class TestBedrockAgentCoreAuthorization:
                 "Action": "bedrock-agentcore:InvokeAgentRuntime",
                 "Resource": self._RUNTIME_ARN,
             }]},
+            query,
         )
 
-        assert response[0] == 200
-        assert seen == [(
-            "bedrock-agentcore:InvokeAgentRuntime",
-            "bedrock-agentcore",
-            "us-east-1",
-            self._RUNTIME_ARN,
-        )]
+        assert response[0] == 403
+        assert seen[-1][3] == f"{self._RUNTIME_ARN}/runtime-endpoint/{endpoint_name}"
 
     def test_invoke_denies_a_different_runtime_resource(self, monkeypatch):
         path = "/runtimes/" + self._OTHER_RUNTIME_ARN.replace(":", "%3A").replace("/", "%2F") + "/invocations"

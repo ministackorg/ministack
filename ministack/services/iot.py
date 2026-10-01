@@ -32,6 +32,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - Fleet indexing: ``UpdateIndexingConfiguration`` /
     ``GetIndexingConfiguration`` / ``DescribeIndex`` / ``ListIndices``, and
     ``SearchIndex`` over the live registry, shadows and MQTT connectivity
+  - Registry events: ``DescribeEventConfigurations`` /
+    ``UpdateEventConfigurations``
   - Jobs (control plane): ``CreateJob``, ``DescribeJob``, ``ListJobs``,
     ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
@@ -110,6 +112,8 @@ _topic_rules: AccountRegionScopedDict = AccountRegionScopedDict()
 _shadows: AccountRegionScopedDict = AccountRegionScopedDict()
 # Fleet-indexing configuration, one entry per account+region.
 _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
+# Registry event configuration (UpdateEventConfigurations), one entry per account+region.
+_event_config: AccountRegionScopedDict = AccountRegionScopedDict()
 # CA-certificate registry (RegisterCACertificate & friends): caCertificateId -> record
 _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 # JITR registration code — a single "code" key per account/region
@@ -237,6 +241,7 @@ def get_state() -> dict:
         "topic_rules": copy.deepcopy(_topic_rules),
         "shadows": copy.deepcopy(_shadows),
         "indexing_config": copy.deepcopy(_indexing_config),
+        "event_config": copy.deepcopy(_event_config),
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
@@ -272,6 +277,7 @@ def _restore_state(data: dict | None) -> None:
     _topic_rules.update(data.get("topic_rules", {}))
     _shadows.update(data.get("shadows", {}))
     _indexing_config.update(data.get("indexing_config", {}))
+    _event_config.update(data.get("event_config", {}))
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
@@ -312,6 +318,7 @@ def reset() -> None:
     # gets no warning.
     _warned_sql_funcs.clear()
     _indexing_config.clear()
+    _event_config.clear()
     _ca_certificates.clear()
     _registration_codes.clear()
     _provisioning_templates.clear()
@@ -581,6 +588,10 @@ async def handle_request(
         return _list_indices()
     if path.startswith("/indices/") and method == "GET":
         return _describe_index(path)
+    if path == "/event-configurations" and method == "GET":
+        return _describe_event_configurations()
+    if path == "/event-configurations" and method == "PATCH":
+        return _update_event_configurations(_parse_body(body))
     # Jobs (control plane) — CreateJob is PUT /jobs/{jobId} per the botocore
     # `iot` service model; sub-resources (/cancel, /job-document) are
     # dispatched inside _handle_job.
@@ -1624,24 +1635,87 @@ def _handle_registration_code(method: str) -> tuple:
     DELETE discards it; the next GET mints a fresh one.
     """
     if method == "GET":
-        code = _registration_codes.get("code")
-        if not code:
-            code = hashlib.sha256(os.urandom(32)).hexdigest()
-            _registration_codes["code"] = code
-        return json_response({"registrationCode": code})
+        return json_response({"registrationCode": _registration_code()})
     # DELETE
     _registration_codes.pop("code", None)
     return json_response({})
+
+
+def _registration_code() -> str:
+    """The account/region registration code, minted on first use."""
+    code = _registration_codes.get("code")
+    if not code:
+        code = hashlib.sha256(os.urandom(32)).hexdigest()
+        _registration_codes["code"] = code
+    return code
+
+
+def _verification_certificate_error(
+    ca_pem: str, verification_pem: str | None, certificate_mode: str
+) -> tuple | None:
+    """Error response for a verification certificate the mode refuses, else None."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    if certificate_mode == "SNI_ONLY":
+        if not verification_pem:
+            return None
+        return error_response_json(
+            "InvalidRequestException",
+            "Cannot provide verification certificate for registering CA "
+            "Certificates in SNI_ONLY mode",
+            400,
+        )
+    if not verification_pem:
+        return error_response_json(
+            "InvalidRequestException",
+            "Need to provide verification certificate for registering CA "
+            "Certificates in DEFAULT mode",
+            400,
+        )
+    try:
+        cert = x509.load_pem_x509_certificate(verification_pem.encode("utf-8"))
+        ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
+    except Exception:
+        return error_response_json(
+            "InvalidRequestException",
+            "Contents of the Verification Certificate are not correct",
+            400,
+        )
+    if cert.issuer != ca.subject:
+        return error_response_json(
+            "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the "
+            "provided CA certificate.",
+            400,
+        )
+    if not certificate_is_signed_by(verification_pem, ca_pem):
+        return error_response_json(
+            "CertificateValidationException",
+            "The signature of the certificate failed verification against the "
+            "provided CA certificate.",
+            400,
+        )
+    common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if [a.value for a in common_names] != [_registration_code()]:
+        return error_response_json(
+            "RegistrationCodeValidationException",
+            "Registration code provided in the CN field of verification "
+            "certificate is invalid.",
+            400,
+        )
+    return None
 
 
 def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     """``POST /cacertificate`` (``RegisterCACertificate``).
 
     Body members per the botocore model: ``caCertificate`` (required),
-    ``verificationCertificate`` (accepted; the registration-code CN handshake
-    is not enforced locally) and ``certificateMode`` (``DEFAULT`` when
-    omitted, as on AWS). ``setAsActive`` / ``allowAutoRegistration`` ride as
-    query-string booleans, as on AWS.
+    ``verificationCertificate`` (required in ``DEFAULT`` mode: signed by the
+    CA, with the registration code as its CN; refused in ``SNI_ONLY`` mode)
+    and ``certificateMode`` (``DEFAULT`` when omitted, as on AWS).
+    ``setAsActive`` / ``allowAutoRegistration`` ride as query-string booleans,
+    as on AWS.
     """
     ca_pem = payload.get("caCertificate")
     if not ca_pem:
@@ -1668,6 +1742,11 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
             f"Invalid CA certificate PEM: {e}",
             400,
         )
+    refused = _verification_certificate_error(
+        ca_pem, payload.get("verificationCertificate"), certificate_mode
+    )
+    if refused is not None:
+        return refused
     if ca_id in _ca_certificates:
         return _certificate_already_exists(ca_id, _ca_cert_arn(ca_id))
     set_active = _qp_bool(qp, "setAsActive")
@@ -2721,6 +2800,66 @@ def _search_index(payload: dict) -> tuple:
     if end < len(matched):
         body["nextToken"] = _search_next_token(end)
     return json_response(body)
+
+
+# ---------------------------------------------------------------------------
+# Registry event configuration
+# ---------------------------------------------------------------------------
+
+_EVENT_TYPES = (
+    "CA_CERTIFICATE", "CERTIFICATE", "JOB", "JOB_EXECUTION", "POLICY", "THING",
+    "THING_GROUP", "THING_GROUP_HIERARCHY", "THING_GROUP_MEMBERSHIP", "THING_TYPE",
+    "THING_TYPE_ASSOCIATION",
+)
+_EVENT_CONFIG_KEY = "events"
+
+
+def _event_configuration() -> dict:
+    """The account+region's event configuration; every type is off until the first update."""
+    stored = _event_config.get(_EVENT_CONFIG_KEY) or {}
+    return {
+        "eventConfigurations": {
+            t: {"Enabled": t in stored.get("enabled", ())} for t in _EVENT_TYPES
+        },
+        "creationDate": stored.get("creationDate"),
+        "lastModifiedDate": stored.get("lastModifiedDate"),
+    }
+
+
+def _describe_event_configurations() -> tuple:
+    """``GET /event-configurations``."""
+    return json_response(_event_configuration())
+
+
+def _update_event_configurations(payload: dict) -> tuple:
+    """``PATCH /event-configurations`` — types the request names change, the rest keep their state."""
+    configurations = payload.get("eventConfigurations")
+    if not isinstance(configurations, dict):
+        return error_response_json(
+            "InvalidRequestException", "Configuration cannot be null", 400
+        )
+    if set(configurations) - set(_EVENT_TYPES):
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'eventConfigurations' failed to "
+            "satisfy constraint: Map keys must satisfy constraint: [Member must "
+            f"satisfy enum value set: [{', '.join(_EVENT_TYPES)}]]",
+            400,
+        )
+    stored = _event_config.get(_EVENT_CONFIG_KEY) or {}
+    enabled = set(stored.get("enabled", ()))
+    for event_type, configuration in configurations.items():
+        if isinstance(configuration, dict) and configuration.get("Enabled") is True:
+            enabled.add(event_type)
+        else:
+            enabled.discard(event_type)
+    now = _now_epoch()
+    _event_config[_EVENT_CONFIG_KEY] = {
+        "enabled": sorted(enabled),
+        "creationDate": stored.get("creationDate", now),
+        "lastModifiedDate": now,
+    }
+    return json_response({})
 
 
 # ---------------------------------------------------------------------------

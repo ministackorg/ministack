@@ -1279,6 +1279,16 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
                 continue
             if fnmatch_iam(caller_arn, p):
                 return True
+            # A resource policy names an IAM role ARN, while a request made
+            # after AssumeRole carries the matching STS assumed-role ARN.
+            # AWS treats those as the same principal for resource policies.
+            if ":role/" in p and ":assumed-role/" in caller_arn:
+                principal_account = p.split(":")[4]
+                caller_account = caller_arn.split(":")[4]
+                role_name = p.rsplit("/", 1)[-1]
+                assumed_role = caller_arn.split(":assumed-role/", 1)[1].split("/", 1)[0]
+                if principal_account == caller_account and role_name == assumed_role:
+                    return True
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True
