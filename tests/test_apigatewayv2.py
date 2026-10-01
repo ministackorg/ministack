@@ -1009,7 +1009,8 @@ def test_apigw_execute_lambda_proxy_binary_request_body(apigw, lam):
     lam.delete_function(FunctionName=fname)
 
 def test_apigw_execute_no_route(apigw):
-    """execute-api returns 404 when no matching route exists."""
+    """execute-api returns 404 when no matching route exists, with AWS's
+    exact compact-JSON body (no space after the colon)."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -1023,6 +1024,7 @@ def test_apigw_execute_no_route(apigw):
         assert False, "Expected 404"
     except _urlerr.HTTPError as e:
         assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
@@ -2273,6 +2275,30 @@ def test_apigwv2_created_date_is_unix_timestamp(apigw):
         f"CreatedDate should be datetime (parsed from Unix int), got {type(created)}"
     )
     apigw.delete_api(ApiId=resp["ApiId"])
+
+
+@pytest.mark.parametrize("use_ssl, http_scheme, ws_scheme", [("1", "https", "wss"), ("", "http", "http")])
+def test_apigwv2_endpoint_scheme_follows_tls(monkeypatch, use_ssl, http_scheme, ws_scheme):
+    """Under USE_SSL=1 the gateway serves only HTTPS, so apiEndpoint is https:// (wss:// for a WebSocket API), as on
+    AWS; without it both keep http://."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    for protocol, scheme in (("HTTP", http_scheme), ("WEBSOCKET", ws_scheme)):
+        status, body = _payload(_apigw._create_api({"name": f"scheme-{protocol}", "protocolType": protocol}))
+        assert status == 201
+        assert body["apiEndpoint"].startswith(f"{scheme}://"), body["apiEndpoint"]
+        _apigw._delete_api(body["apiId"])
+
+
+def test_apigwv2_cfn_api_endpoint_follows_tls(monkeypatch):
+    """The AWS::ApiGatewayV2::Api provisioner builds the same apiEndpoint as CreateApi."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    api_id, attrs = provisioners._apigw_v2_api_create("Api", {"Name": "cfn-tls", "ProtocolType": "WEBSOCKET"}, "stack")
+    try:
+        assert attrs["ApiEndpoint"].startswith("wss://"), attrs["ApiEndpoint"]
+    finally:
+        _apigw._delete_api(api_id)
 
 
 # ========== from test_apigwv2_websocket.py ==========

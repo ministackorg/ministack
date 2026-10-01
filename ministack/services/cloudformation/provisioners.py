@@ -1387,7 +1387,7 @@ def _sqs_create(logical_id, props, stack_name):
     name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
     is_fifo = name.endswith(".fifo")
     attributes = _sqs_queue_fields(props, is_fifo)
-    url = f"http://{_sqs.DEFAULT_HOST}:{_sqs.DEFAULT_PORT}/{get_account_id()}/{name}"
+    url = _sqs._queue_url_for_account(get_account_id(), name)
     arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
     now_ts = str(int(time.time()))
     attributes.update(QueueArn=arn, CreatedTimestamp=now_ts, LastModifiedTimestamp=now_ts)
@@ -3087,8 +3087,12 @@ def _cwlogs_resource_policy_create(logical_id, props, stack_name):
     policy_name = props.get("PolicyName")
     if not policy_name:
         raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
-    # Local log delivery is intentionally permissive, so the policy only needs
-    # its CloudFormation identity rather than a data-plane enforcement store.
+    document = props.get("PolicyDocument")
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    resp = _cw_logs._put_resource_policy({"policyName": policy_name, "policyDocument": document})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::ResourcePolicy create failed: {resp[2]!r}")
     return policy_name, {}
 
 
@@ -3097,7 +3101,7 @@ def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name
 
 
 def _cwlogs_resource_policy_delete(physical_id, props):
-    pass
+    _cw_logs._delete_resource_policy({"policyName": physical_id})
 
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
@@ -9039,7 +9043,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     api = {
         "apiId": api_id,
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "apiEndpoint": f"{_apigw_v2._api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
         "createdDate": now_iso(),
         "tags": dict(props.get("Tags") or {}),
         **_apigw_v2_api_props(props, stack_name, logical_id),

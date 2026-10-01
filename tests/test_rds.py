@@ -16159,3 +16159,191 @@ def test_rds_server_certificate_without_cryptography_raises(monkeypatch):
     monkeypatch.setattr(x509_utils, "HAS_CRYPTO", False)
     with pytest.raises(RuntimeError, match="requires the `cryptography` package"):
         rds_service._pg_server_material(["localhost"], [])
+
+
+def _fake_docker_self(networks):
+    """A Docker client whose HOSTNAME lookup finds MiniStack's own container."""
+
+    class FakeContainers:
+        def get(self, _identifier):
+            if networks is None:
+                raise Exception("not a container")
+            return types.SimpleNamespace(
+                attrs={"NetworkSettings": {"Networks": {n: {} for n in networks}}})
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    return FakeDocker()
+
+
+def test_rds_public_endpoint_containerised_ministack_joins_its_network(monkeypatch):
+    """#1884: the database container must stay reachable from a containerised MiniStack."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "DOCKER_NETWORK", "compose_default")
+    monkeypatch.setattr(m, "_ministack_network", None)
+    client = _fake_docker_self(["bridge", "compose_default"])
+    assert m._get_ministack_network(client) == "compose_default"
+
+
+def test_rds_public_endpoint_host_run_ministack_stays_off_network(monkeypatch):
+    """A MiniStack running on the host keeps probing the published port."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "DOCKER_NETWORK", "compose_default")
+    monkeypatch.setattr(m, "_ministack_network", None)
+    assert m._get_ministack_network(_fake_docker_self(None)) is None
+
+
+def test_rds_public_endpoint_reports_published_port_probes_container(monkeypatch):
+    """#1884: DescribeDBInstances reports {MINISTACK_HOST, host_port}; readiness dials the container."""
+    from ministack.services import rds as m
+
+    container_ip = "10.0.0.9"
+    host_port = 16099
+
+    class FakeContainer:
+        id = "public-endpoint-container"
+        status = "running"
+        attrs = {"NetworkSettings": {"Networks": {"ms_net": {"IPAddress": container_ip}}}}
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeImages:
+        def get(self, _image):
+            return object()
+
+    class FakeDocker:
+        containers = FakeContainers()
+        images = FakeImages()
+
+    readiness_dials = []
+
+    def _fake_wait_ready(host, port, *_args, **_kwargs):
+        readiness_dials.append((host, port))
+        return True
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "ms_net")
+    monkeypatch.setattr(m, "_next_port", lambda: host_port)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _fake_wait_ready)
+
+    m._instances.clear()
+    try:
+        m._create_db_instance({
+            "DBInstanceIdentifier": "public-endpoint-solo",
+            "DBInstanceClass": "db.t3.micro",
+            "Engine": "postgres",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+            "AllocatedStorage": "20",
+        })
+        deadline = time.time() + 2
+        while (time.time() < deadline
+               and m._instances["public-endpoint-solo"]["DBInstanceStatus"] != "available"):
+            time.sleep(0.01)
+        inst = m._instances["public-endpoint-solo"]
+        assert inst["DBInstanceStatus"] == "available"
+        assert (inst["Endpoint"]["Address"], inst["Endpoint"]["Port"]) == (m._MINISTACK_HOST, host_port)
+        assert readiness_dials[-1][0] == container_ip
+    finally:
+        m._instances.clear()
+
+
+def test_rds_public_endpoint_cluster_reports_published_port(monkeypatch):
+    """#1884: an Aurora cluster reports {MINISTACK_HOST, host_port} for writer and reader, before and after restart."""
+    from ministack.services import rds as m
+
+    host_port = 16072
+
+    class FakeContainer:
+        id = "public-endpoint-shared-container"
+        attrs = {"NetworkSettings": {"Networks": {"ms_net": {"IPAddress": "172.31.77.50"}}}}
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            container.status = "running"
+            return container
+
+        def get(self, identifier):
+            if identifier in (container.id, m._rds_cluster_docker_name("public-endpoint-cluster")):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "ms_net")
+    monkeypatch.setattr(m, "_next_port", lambda: host_port)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    def _wait_available(cluster):
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "public-endpoint-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "public-endpoint-writer",
+            "DBClusterIdentifier": "public-endpoint-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters["public-endpoint-cluster"]
+        _wait_available(cluster)
+        published = (m._MINISTACK_HOST, m._MINISTACK_HOST, host_port)
+        assert (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"]) == published
+
+        m._stop_db_cluster({"DBClusterIdentifier": "public-endpoint-cluster"})
+        m._start_db_cluster({"DBClusterIdentifier": "public-endpoint-cluster"})
+        _wait_available(cluster)
+        assert (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"]) == published
+    finally:
+        m._instances.clear()
+        m._clusters.clear()

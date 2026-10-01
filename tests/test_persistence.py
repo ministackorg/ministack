@@ -919,6 +919,47 @@ def test_cloudformation_round_trip():
     _round_trip("cloudformation", "cloudformation", populate, observe)
 
 
+def test_cloudformation_drift_and_failed_operation_round_trip():
+    """Drift results and the failed operation RollbackStack needs live on the
+    stack record, so they survive a PERSIST_STATE stop/restore cycle."""
+    stack_id = "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-drift/rt"
+
+    def populate(mod):
+        drift = {"StackId": stack_id, "LogicalResourceId": "Q", "ResourceType": "AWS::SQS::Queue",
+                 "StackResourceDriftStatus": "MODIFIED", "Timestamp": "2026-09-30T00:00:00.000Z",
+                 "PropertyDifferences": [{"PropertyPath": "/VisibilityTimeout",
+                                          "ExpectedValue": "30", "ActualValue": "60",
+                                          "DifferenceType": "NOT_EQUAL"}]}
+        mod._stacks["stk-drift"] = {
+            "StackName": "stk-drift",
+            "StackId": stack_id,
+            "StackStatus": "UPDATE_FAILED",
+            "DriftInformation": {"StackDriftStatus": "DRIFTED",
+                                 "LastCheckTimestamp": "2026-09-30T00:00:00.000Z"},
+            "_drift_detections": {"det-1": {"StackId": stack_id,
+                                            "StackDriftDetectionId": "det-1",
+                                            "StackDriftStatus": "DRIFTED",
+                                            "DetectionStatus": "DETECTION_COMPLETE",
+                                            "DriftedStackResourceCount": 1,
+                                            "Timestamp": "2026-09-30T00:00:00.000Z"}},
+            "_resources": {"Q": {"ResourceType": "AWS::SQS::Queue", "_drift": drift,
+                                 "DriftInformation": {"StackResourceDriftStatus": "MODIFIED"}}},
+            "_failed_operation": {"is_update": True, "created": ["Q"],
+                                  "failed_update": ["Q", "AWS::SQS::Queue", "url", None, None, None],
+                                  "replaced_ids": [], "previous_stack": {"_resources": {}}},
+        }
+
+    def observe(mod):
+        stack = mod._stacks.get("stk-drift")
+        assert stack["DriftInformation"]["StackDriftStatus"] == "DRIFTED"
+        assert stack["_drift_detections"]["det-1"]["DriftedStackResourceCount"] == 1
+        assert stack["_resources"]["Q"]["_drift"]["PropertyDifferences"][0]["ActualValue"] == "60"
+        assert stack["_failed_operation"]["failed_update"][0] == "Q"
+        assert stack["_failed_operation"]["created"] == ["Q"]
+
+    _round_trip("cloudformation", "cloudformation", populate, observe)
+
+
 def test_backup_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
     import json as _json
 
