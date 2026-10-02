@@ -26927,6 +26927,61 @@ def test_cfn_asg_scaling_policy_keeps_a_template_policy_name(cfn, autoscaling):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_asg_delete_removes_target_tracking_alarms(cfn, autoscaling, cw):
+    """Deleting a template group deletes the policies put on it and their alarms."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-ttdel-{suffix}"
+    group = f"cfn-asg-ttdel-{suffix}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_policy_template(group, {}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        put = autoscaling.put_scaling_policy(
+            AutoScalingGroupName=group, PolicyName="cpu", PolicyType="TargetTrackingScaling",
+            TargetTrackingConfiguration={"PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ASGAverageCPUUtilization"}, "TargetValue": 50.0})
+        assert len(put["Alarms"]) == 2
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert cw.describe_alarms(AlarmNamePrefix=f"TargetTracking-{group}-")["MetricAlarms"] == []
+    assert autoscaling.describe_policies(AutoScalingGroupName=group)["ScalingPolicies"] == []
+
+
+def test_cfn_asg_target_tracking_policy_creates_its_alarms(cfn, autoscaling, cw):
+    """A template target tracking policy creates its alarms, replaces them on update and deletes them with the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-ttal-{suffix}"
+    group = f"cfn-asg-ttal-{suffix}"
+
+    def template(target):
+        return _cfn_asg_policy_template(group, {"Tt": {
+            "PolicyType": "TargetTrackingScaling",
+            "TargetTrackingConfiguration": {
+                "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "ASGAverageCPUUtilization"},
+                "TargetValue": target}}})
+
+    def thresholds():
+        alarms = cw.describe_alarms(AlarmNamePrefix=f"TargetTracking-{group}-")["MetricAlarms"]
+        return sorted(a["Threshold"] for a in alarms)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(50))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _cfn_output(cfn, stack_name, "Tt")
+        assert len(_cfn_asg_policies_by_arn(autoscaling, group)[arn]["Alarms"]) == 2
+        assert thresholds() == [45.0, 50.0]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(60))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert thresholds() == [54.0, 60.0]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert thresholds() == []
+
+
 def test_cfn_asg_scaling_policy_name_change_is_not_applied(cfn, autoscaling):
     """A PolicyName change or removal keeps the policy's name and ARN."""
     suffix = _uuid_mod.uuid4().hex[:8]

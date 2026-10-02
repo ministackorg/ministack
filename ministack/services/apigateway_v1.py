@@ -228,6 +228,7 @@ _GATEWAY_RESPONSE_ERROR_TYPES = {
     "BAD_REQUEST_PARAMETERS": "BadRequestException",
     "BAD_REQUEST_BODY": "BadRequestException",
     "DEFAULT_5XX": "InternalServerErrorException",
+    "THROTTLED": "TooManyRequestsException",
 }
 
 _GATEWAY_TEMPLATE_VARIABLE = re.compile(
@@ -2098,27 +2099,45 @@ def _method_throttle_settings(stage, resource_path, http_method):
     return None
 
 
-def _check_throttle(stage, api_id, stage_name, resource_path, http_method):
-    """Token bucket per method: rate refills, burst caps, 0/0 refuses all."""
-    entry = _method_throttle_settings(stage, resource_path, http_method)
-    if entry is None:
-        return None
-    rate = entry.get("throttlingRateLimit")
-    burst = entry.get("throttlingBurstLimit")
+def _take_token(slot, limits):
+    """Token bucket per slot: rate refills, burst caps, 0/0 refuses all."""
+    rate = limits.get("rateLimit")
+    burst = limits.get("burstLimit")
     if rate is None and burst is None:
-        return None
-    rate = float(rate if rate is not None else 0)
-    burst = float(burst if burst is not None else 0)
+        return True
+    rate = float(rate or 0)
+    burst = float(burst or 0)
     if rate <= 0 and burst <= 0:
-        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
-    slot = (api_id, stage_name, resource_path, http_method)
+        return False
     now = time.time()
     tokens, last = _throttle_state.get(slot, (burst, now))
     tokens = min(burst, tokens + (now - last) * rate)
     if tokens < 1:
         _throttle_state[slot] = (tokens, now)
-        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+        return False
     _throttle_state[slot] = (tokens - 1, now)
+    return True
+
+
+def _check_throttle(stage, api_id, stage_name, resource_path, http_method, key):
+    """Usage-plan limits for the caller's key, then the stage method limit."""
+    buckets = []
+    if key is not None:
+        for plan_id, plan, entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+            buckets.append((("plan", plan_id, key["id"]), plan.get("throttle") or {}))
+            method_limits = (entry.get("throttle") or {}).get(f"{resource_path}/{http_method}")
+            if method_limits:
+                buckets.append((("plan", plan_id, key["id"], api_id, stage_name, resource_path,
+                                 http_method), method_limits))
+    entry = _method_throttle_settings(stage, resource_path, http_method)
+    if entry is not None:
+        buckets.append((("stage", api_id, stage_name, resource_path, http_method), {
+            "rateLimit": entry.get("throttlingRateLimit"),
+            "burstLimit": entry.get("throttlingBurstLimit"),
+        }))
+    for slot, limits in buckets:
+        if not _take_token(slot, limits):
+            return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
     return None
 
 
@@ -2535,7 +2554,8 @@ async def _execute_in_scope(
     if key_error is not None:
         return key_error
     throttle_error = _check_throttle(
-        stage, api_id, stage_name, resource["path"], method)
+        stage, api_id, stage_name, resource["path"], method,
+        api_key or _resolve_api_key(_api_key_from_request(headers)))
     if throttle_error is not None:
         return throttle_error
     quota_error = _check_quota(api_key, api_id, stage_name)
