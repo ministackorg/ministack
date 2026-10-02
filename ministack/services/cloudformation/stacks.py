@@ -17,6 +17,7 @@ from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
     _extract_deps,
+    _intrinsic_references,
     _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
@@ -32,6 +33,7 @@ from .provisioners import (
     _provision_resource,
     _replacing_change,
     _snapshot_resource,
+    _tag_map,
     _update_resource,
     _with_stack_tags,
 )
@@ -1098,6 +1100,19 @@ _DIFFED_ATTRIBUTES = (
     "UpdateReplacePolicy",
 )
 
+# The types a stack-tag change leaves out of a change set; every other
+# resource the stack holds, taggable or not, is a Modify with Scope Tags.
+_UNTAGGED_TYPES = (
+    "AWS::CloudFormation::CustomResource",
+    "AWS::CloudFormation::WaitCondition",
+    "AWS::CloudFormation::WaitConditionHandle",
+)
+
+
+def _stack_tags_changed(stack: dict, tags: list, tags_given: bool) -> bool:
+    """True when a request's stack tags differ from the stack's, order aside."""
+    return bool(tags or tags_given) and _tag_map(tags) != _tag_map(stack.get("Tags"))
+
 
 _POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
                    "Snapshot": "Snapshot"}
@@ -1110,22 +1125,106 @@ def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
     return {"PolicyAction": prefix + action} if action else {}
 
 
-def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:
+def _replacement(details: list, type_changed: bool) -> str:
+    """The Replacement of a Modify that carries these details."""
+    recreation = {(d["Target"]["RequiresRecreation"], d["Evaluation"]) for d in details}
+    if type_changed or ("Always", "Static") in recreation:
+        return "True"
+    if any(r != "Never" for r, _ in recreation):
+        return "Conditional"
+    return "False"
+
+
+def _reference_details(res_def: dict, replacements: dict, changed_params) -> dict:
+    """Details per property for its references to changed parameters and resources."""
+    rtype = res_def.get("Type", "")
+    found: dict = {}
+    for name, value in (res_def.get("Properties") or {}).items():
+        for ref, attr in _intrinsic_references(value):
+            if ref in changed_params and attr is None:
+                source, entity, evaluation = "ParameterReference", ref, "Static"
+            elif ref in replacements and (attr or replacements[ref] != "False"):
+                source = "ResourceAttribute" if attr else "ResourceReference"
+                entity = f"{ref}.{attr}" if attr else ref
+                evaluation = "Static" if replacements[ref] == "True" else "Dynamic"
+            else:
+                continue
+            detail = {
+                "Target": {"Attribute": "Properties", "Name": name,
+                           "RequiresRecreation": _property_recreation(rtype, name)},
+                "Evaluation": evaluation,
+                "ChangeSource": source,
+                "CausingEntity": entity,
+            }
+            if detail not in found.setdefault(name, []):
+                found[name].append(detail)
+    return found
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None,
+                    template: dict | None = None, changed_params=(), retag=()) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    A property that references a changed parameter, a replaced resource or an
+    attribute of a modified resource in ``template`` (the unresolved new
+    template, ``new_template`` by default) gets a detail naming that cause.
     ``resources`` are the stack's provisioned resources, whose physical ids a
     ``Remove`` or ``Modify`` reports.
+    Each resource in ``retag`` (the stack's resources when its tags change)
+    outside ``_UNTAGGED_TYPES`` also gets a ``Tags`` entry.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
+    raw_res = (template or new_template).get("Resources", {})
     changes = []
 
-    all_keys = old_res.keys() | new_res.keys()
-    for key in sorted(all_keys):
+    common = old_res.keys() & new_res.keys()
+    changed_props, attr_details, type_changed = {}, {}, {}
+    for key in common:
+        old_props = old_res[key].get("Properties", {}) or {}
+        new_props = new_res[key].get("Properties", {}) or {}
+        changed_props[key] = {name for name in set(old_props) | set(new_props)
+                              if old_props.get(name) != new_props.get(name)}
+        attr_details[key] = [
+            {"Target": {"Attribute": attr, "RequiresRecreation": "Never"},
+             "Evaluation": "Static", "ChangeSource": "DirectModification"}
+            for attr in _DIFFED_ATTRIBUTES
+            if old_res[key].get(attr) != new_res[key].get(attr)
+        ]
+        type_changed[key] = old_res[key].get("Type") != new_res[key].get("Type")
+
+    def _modify_details(key, refs):
+        details = []
+        rtype = new_res[key].get("Type", "")
+        for name in sorted(changed_props[key] | set(refs)):
+            if name in changed_props[key]:
+                details.append({
+                    "Target": {"Attribute": "Properties", "Name": name,
+                               "RequiresRecreation": _property_recreation(rtype, name)},
+                    "Evaluation": "Dynamic" if refs.get(name) else "Static",
+                    "ChangeSource": "DirectModification",
+                })
+            details.extend(refs.get(name, []))
+        return details + attr_details[key]
+
+    # A replaced or modified resource changes what references it, which can in
+    # turn replace or modify the referencing resource.
+    refs: dict = {}
+    while True:
+        details = {key: _modify_details(key, refs.get(key, {})) for key in common}
+        replacements = {key: _replacement(d, type_changed[key])
+                        for key, d in details.items() if d or type_changed[key]}
+        found = {key: _reference_details(raw_res.get(key, {}), replacements, changed_params)
+                 for key in common}
+        if found == refs:
+            break
+        refs = found
+
+    for key in sorted(old_res.keys() | new_res.keys()):
         pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
         physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
@@ -1147,41 +1246,24 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                 }
             })
         else:
-            details = []
-            old_props = old_res[key].get("Properties", {}) or {}
-            new_props = new_res[key].get("Properties", {}) or {}
             rtype = new_res[key].get("Type", "")
-            if old_props != new_props:
-                for name in sorted(set(old_props) | set(new_props)):
-                    if old_props.get(name) != new_props.get(name):
-                        details.append({
-                            "Target": {"Attribute": "Properties", "Name": name,
-                                       "RequiresRecreation":
-                                           _property_recreation(rtype, name)},
-                            "Evaluation": "Static",
-                            "ChangeSource": "DirectModification",
-                        })
-            for attr in _DIFFED_ATTRIBUTES:
-                if old_res[key].get(attr) != new_res[key].get(attr):
-                    details.append({
-                        "Target": {"Attribute": attr, "RequiresRecreation": "Never"},
-                        "Evaluation": "Static",
-                        "ChangeSource": "DirectModification",
-                    })
-            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
-            if not details and not type_changed:
+            retagged = key in retag and not (
+                rtype.startswith("Custom::") or rtype in _UNTAGGED_TYPES)
+            if key not in replacements and not retagged:
                 continue
             scope = []
-            for d in details:
+            for d in details[key]:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            recreation = {d["Target"].get("RequiresRecreation") for d in details}
-            if type_changed or "Always" in recreation:
-                replacement = "True"
-            elif "Conditionally" in recreation:
-                replacement = "Conditional"
-            else:
-                replacement = "False"
+            replacement = replacements.get(key, "False")
+            if retagged:
+                # Tags comes before the template's own changes in Details, last in
+                # Scope, and has no ChangeSource.
+                details[key].insert(0, {
+                    "Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
+                    "Evaluation": "Static",
+                })
+                scope.append("Tags")
             changes.append({
                 "ResourceChange": {
                     "Action": "Modify",
@@ -1192,7 +1274,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
                        if replacement == "True" else {}),
                     "Scope": scope,
-                    "Details": details,
+                    "Details": details[key],
                 }
             })
     return changes
