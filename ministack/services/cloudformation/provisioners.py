@@ -92,9 +92,7 @@ def _physical_name(stack_name: str, logical_id: str, *,
     orphaning the real one — and anything referencing it via Ref/Fn::GetAtt
     picked up that new (wrong) identity the moment it was reprocessed later in
     the same update. Resource *replacement* (a property change real AWS can't
-    apply in place) is not detected here: a handler that replaces passes
-    ``replacing`` (the predecessor's physical id), so the replacement gets a
-    name of its own.
+    apply in place) is not detected here; a replacing handler passes ``replacing`` for a new name.
 
     Truncates the `{stack}-{logicalId}-` prefix, never the suffix: a naive
     `base[:max_len]` on the full concatenated string drops whatever falls past
@@ -866,8 +864,7 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
 def _replacing_update(create_fn, delete_fn):
     """An update handler for a type whose every property is create-only."""
     def update(physical_id, old_props, new_props, stack_name, logical_id=None):
-        # An unchanged custom name was refused above the handler; a generated
-        # name gets a new one, so the predecessor survives until cleanup.
+        # A custom name was refused above; a generated one gets a new name.
         created = create_fn(logical_id or physical_id, new_props, stack_name,
                             replacing=physical_id)
         _delete_predecessor(delete_fn, physical_id, old_props)

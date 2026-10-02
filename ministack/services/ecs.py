@@ -573,6 +573,8 @@ def _cluster_view(cluster, include):
     c["tags"] = _tags.get(cluster["clusterArn"], []) if "TAGS" in include else []
     if "ATTACHMENTS" in include:
         c["attachments"] = cluster.get("attachments", [])
+        if cluster.get("attachmentsStatus"):
+            c["attachmentsStatus"] = cluster["attachmentsStatus"]
     if "CONFIGURATIONS" in include and "configuration" in cluster:
         c["configuration"] = cluster["configuration"]
     return c
