@@ -4476,6 +4476,29 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None, query_
     return 200, resp_headers, b""
 
 
+def serve_cloudfront_origin_fetch(bucket_name: str, key: str, method: str, headers: dict) -> tuple:
+    """A CloudFront data plane's origin fetch against an S3 origin, served
+    in-process (never a real wire boundary, so no signature to verify —
+    calls ``_get_object``/``_head_object`` directly).
+
+    A missing key answers 403 AccessDenied, not 404 NoSuchKey: the OAC
+    bucket policy CloudFront's console generates grants only
+    ``s3:GetObject``, and per the GetObject API reference's "Permissions"
+    note, without ``s3:ListBucket`` a missing key can't be distinguished
+    from one the caller isn't allowed to see.
+    """
+    headers = dict(headers or {})
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    if key not in bucket["objects"]:
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket_name}/{key}")
+    if method == "HEAD":
+        status, resp_headers, _ = _head_object(bucket_name, key, headers, {})
+        return status, resp_headers, b""
+    return _get_object(bucket_name, key, headers, {})
+
+
 def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     """Remove the current object plus its key-level metadata and on-disk copy."""
     bucket["objects"].pop(key, None)

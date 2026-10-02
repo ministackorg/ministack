@@ -33,6 +33,7 @@ from email import message_from_bytes
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import default as default_policy
+from email.utils import parseaddr
 from urllib.parse import parse_qs
 
 from ministack.core.responses import (
@@ -52,6 +53,9 @@ _identities = AccountRegionScopedDict()
 _sent_emails = AccountRegionScopedDict()
 _templates = AccountRegionScopedDict()
 _configuration_sets = AccountRegionScopedDict()
+# SESv2 PutAccountDetails, under "account": ProductionAccessEnabled and the details.
+_account_details = AccountRegionScopedDict()
+_SIMULATOR_DOMAIN = "simulator.amazonses.com"
 
 
 def _sent_emails_list() -> list:
@@ -71,6 +75,7 @@ def get_state() -> dict:
         "_identities": _identities,
         "_templates": _templates,
         "_configuration_sets": _configuration_sets,
+        "_account_details": _account_details,
     })
 
 
@@ -84,6 +89,7 @@ def _restore_state(data: dict):
     _restore_regional_store(
         _configuration_sets, data.get("_configuration_sets", {})
     )
+    _restore_regional_store(_account_details, data.get("_account_details", {}))
 
 
 def _restore_regional_store(store, restored):
@@ -172,6 +178,9 @@ def _send_email(params):
     to_addrs = _collect_list(params, "Destination.ToAddresses.member")
     cc_addrs = _collect_list(params, "Destination.CcAddresses.member")
     bcc_addrs = _collect_list(params, "Destination.BccAddresses.member")
+    rejected = _message_rejection(source, to_addrs + cc_addrs + bcc_addrs)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     msg_id = _record_send(
         source=source,
@@ -250,6 +259,12 @@ def _send_raw_email(params):
     msg_id = f"{new_uuid()}@email.amazonses.com"
 
     parsed = _parse_raw_mime(raw_b64)
+    rejected = _message_rejection(
+        source or parsed.get("From", ""),
+        _collect_list(params, "Destinations.member")
+        or [a.strip() for h in ("To", "Cc", "Bcc") for a in parsed.get(h, "").split(",") if a.strip()])
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     # Extract from body parts if available
     subject = ""
@@ -316,6 +331,9 @@ def _send_templated_email(params):
     if template_name not in _templates:
         return _error("TemplateDoesNotExist",
                        f"Template {template_name} does not exist", 400)
+    rejected = _message_rejection(source, to_addrs + cc_addrs + bcc_addrs)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     rendered = _render_template(_templates[template_name], template_data)
     msg_id = f"{new_uuid()}@email.amazonses.com"
@@ -369,8 +387,16 @@ def _send_bulk_templated_email(params):
         destinations.append({"To": to_addrs, "TemplateData": replacement})
         i += 1
 
+    rejected = _message_rejection(source)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
     statuses = []
     for dest in destinations:
+        rejected = _message_rejection(None, dest["To"])
+        if rejected:
+            statuses.append(f"<member><Status>MessageRejected</Status>"
+                            f"<Error>{_esc(rejected)}</Error></member>")
+            continue
         msg_id = f"{new_uuid()}@email.amazonses.com"
         rendered = _render_template(template, dest["TemplateData"])
         record = {
@@ -689,6 +715,50 @@ def _update_template(params):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sandbox (SESv2 PutAccountDetails ProductionAccessEnabled=false)
+# ---------------------------------------------------------------------------
+
+def _production_access_enabled() -> bool:
+    return (_account_details.get("account") or {}).get("ProductionAccessEnabled", True)
+
+
+def _identity_verified(address: str, *, simulator: bool = False) -> bool:
+    """A verified address identity (case-sensitive) or a verified domain identity
+    for the address's domain or any parent domain (case-insensitive), in v1 or v2."""
+    from ministack.services import ses_v2
+
+    addr = parseaddr(address)[1]
+    if not addr:
+        return False
+    domain = addr.rpartition("@")[2].lower()
+    if simulator and domain == _SIMULATOR_DOMAIN:
+        return True
+
+    def ok(v1_rec, v2_rec):
+        return ((v1_rec or {}).get("VerificationStatus") == "Success"
+                or bool((v2_rec or {}).get("VerifiedForSendingStatus")))
+
+    if ok(_identities.get(addr), ses_v2._identities.get(addr)):
+        return True
+    v1 = {k.lower(): r for k, r in _identities.items() if "@" not in k}
+    v2 = {k.lower(): r for k, r in ses_v2._identities.items() if "@" not in k}
+    labels = domain.split(".")
+    return any(ok(v1.get(d), v2.get(d)) for d in (".".join(labels[i:]) for i in range(len(labels) - 1)))
+
+
+def _message_rejection(sender, recipients=()) -> str | None:
+    """The MessageRejected message for an unverified sender, or, in the sandbox,
+    unverified recipients."""
+    failed = [sender] if sender and not _identity_verified(sender) else []
+    if not _production_access_enabled():
+        failed += [r for r in recipients if r and not _identity_verified(r, simulator=True)]
+    if not failed:
+        return None
+    return ("Email address is not verified. The following identities failed the check "
+            f"in region {get_region().upper()}: {', '.join(failed)}")
+
+
 def _make_identity(identity, identity_type):
     return {
         "VerificationStatus": "Success",
@@ -880,3 +950,4 @@ def reset():
     _sent_emails.clear()
     _templates.clear()
     _configuration_sets.clear()
+    _account_details.clear()
