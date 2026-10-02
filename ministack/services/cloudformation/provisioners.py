@@ -3562,9 +3562,9 @@ def _eks_cluster_fields(props):
     return fields
 
 
-def _eks_cluster_create(logical_id, props, stack_name):
+def _eks_cluster_create(logical_id, props, stack_name, replacing=""):
     import ministack.services.eks as _eks
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100)
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100, replacing=replacing)
     body = {
         "name": name,
         "roleArn": props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/eks-role"),
@@ -3601,16 +3601,14 @@ def _eks_cluster_update(physical_id, old_props, new_props, stack_name, logical_i
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::EKS::Cluster", old_props, new_props):
-        raise ValueError(
-            f"AWS::EKS::Cluster {name} requires replacement, which MiniStack does not "
-            "perform under a generated name; set a Name to create the replacement."
-        )
+        created = _eks_cluster_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        _delete_predecessor(_eks_cluster_delete, physical_id, old_props)
+        return created
     fields = _eks_cluster_fields(new_props)
     if "Logging" not in new_props:
         # A rollback to a template without Logging leaves the logging as it is.
         del fields["logging"]
-    # A template without the endpoint access members or AuthenticationMode
-    # leaves them as they are, as with Logging; dropped SecurityGroupIds go.
+    # Omitted endpoint access and AuthenticationMode stay; dropped SecurityGroupIds go.
     cluster["resourcesVpcConfig"].update({"securityGroupIds": [], **fields.pop("resourcesVpcConfig")})
     cluster.setdefault("accessConfig", {}).update(fields.pop("accessConfig"))
     cluster.update(fields)
@@ -3644,10 +3642,11 @@ def _eks_nodegroup_attrs(ng):
             "Arn": ng["nodegroupArn"]}
 
 
-def _eks_nodegroup_create(logical_id, props, stack_name):
+def _eks_nodegroup_create(logical_id, props, stack_name, replacing=""):
     import ministack.services.eks as _eks
     cluster_name = props.get("ClusterName", "")
-    ng_name = props.get("NodegroupName") or _physical_name(stack_name, logical_id, max_len=63)
+    ng_name = props.get("NodegroupName") or _physical_name(
+        stack_name, logical_id, max_len=63, replacing=replacing)
     body = {
         "nodegroupName": ng_name,
         "instanceTypes": props.get("InstanceTypes", ["t3.medium"]),
@@ -3684,10 +3683,10 @@ def _eks_nodegroup_update(physical_id, old_props, new_props, stack_name, logical
             "NodeRole", "Subnets", "InstanceTypes", "AmiType", "CapacityType", "DiskSize",
             "RemoteAccess")):
         if not new_props.get("NodegroupName"):
-            raise ValueError(
-                f"AWS::EKS::Nodegroup {ng_name} requires replacement, which MiniStack does not "
-                "perform under a generated name; set a NodegroupName to create the replacement."
-            )
+            created = _eks_nodegroup_create(
+                logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+            _delete_predecessor(_eks_nodegroup_delete, physical_id, old_props)
+            return created
         # The replacement's create meets the name still in use and fails, as on AWS.
         return _eks_nodegroup_create(logical_id or physical_id, new_props, stack_name)
     fields = _eks_nodegroup_fields(new_props)
@@ -5666,8 +5665,8 @@ def _pipes_pipe_fields(props):
     }
 
 
-def _pipes_pipe_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+def _pipes_pipe_create(logical_id, props, stack_name, replacing=""):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64, replacing=replacing)
     fields = _pipes_pipe_fields(props)
     source_params = props.get("SourceParameters", {})
     ddb_params = source_params.get("DynamoDBStreamParameters", {}) if isinstance(source_params, dict) else {}
@@ -5698,10 +5697,9 @@ def _pipes_pipe_update(physical_id, old_props, new_props, stack_name, logical_id
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::Pipes::Pipe", old_props, new_props):
-        # Not routed through _delete_predecessor, like the Location tracker:
-        # the generated name is deterministic, so register_pipe overwrites the
-        # predecessor and retaining it is not possible here.
-        return _pipes_pipe_create(logical_id or physical_id, new_props, stack_name)
+        created = _pipes_pipe_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        _delete_predecessor(_pipes_pipe_delete, physical_id, old_props)
+        return created
     fields = _pipes_pipe_fields(new_props)
     _pipes.check_same_region(fields["Target"])
     status, _headers, body = _pipes._update_pipe(physical_id, fields)

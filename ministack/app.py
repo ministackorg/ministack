@@ -1760,7 +1760,7 @@ async def _handle_cloudfront_dataplane_request(
     Checked before execute-api/lambda-url/S3-vhost/ALB host routing so a
     distribution's own viewer-request function — not the origin it fronts —
     sees the request first, exactly as a real CloudFront edge would. See
-    ``cloudfront_dataplane.handle_request`` for what ``raw_path``/
+    ``cloudfront.handle_viewer_request`` for what ``raw_path``/
     ``raw_query_string`` carry and why."""
     label = _parse_cloudfront_dataplane_host(host)
     if label is None:
@@ -1769,7 +1769,7 @@ async def _handle_cloudfront_dataplane_request(
     if dist is None:
         return None
     try:
-        return await _get_module("cloudfront_dataplane").handle_request(
+        return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
         )
     except Exception as e:
