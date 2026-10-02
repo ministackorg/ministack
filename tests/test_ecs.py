@@ -1107,6 +1107,58 @@ def test_ecs_update_cluster(ecs):
     )
     assert resp["cluster"]["clusterName"] == "upd-cl"
 
+
+@pytest.mark.parametrize("include", [
+    [], ["ATTACHMENTS"], ["CONFIGURATIONS"], ["SETTINGS"], ["STATISTICS"], ["TAGS"],
+])
+def test_ecs_describe_clusters_include_gates_fields(ecs, include):
+    """Each include value returns only its own field; the others stay empty or absent."""
+    name = f"incl-{_uuid_mod.uuid4().hex[:8]}"
+    settings = [{"name": "containerInsights", "value": "enabled"}]
+    tags = [{"key": "k", "value": "v"}]
+    configuration = {"executeCommandConfiguration": {"logging": "DEFAULT"}}
+    ecs.create_cluster(clusterName=name, tags=tags, settings=settings, configuration=configuration)
+    try:
+        c = ecs.describe_clusters(clusters=[name], include=include)["clusters"][0]
+        assert c["settings"] == (settings if "SETTINGS" in include else [])
+        assert c["tags"] == (tags if "TAGS" in include else [])
+        assert c.get("configuration") == (configuration if "CONFIGURATIONS" in include else None)
+        assert ("attachments" in c) == ("ATTACHMENTS" in include)
+        assert "attachmentsStatus" not in c
+        if "STATISTICS" not in include:
+            assert c["statistics"] == []
+    finally:
+        ecs.delete_cluster(cluster=name)
+
+
+def test_ecs_describe_clusters_statistics_count_services_by_launch_type(ecs):
+    """STATISTICS lists the sixteen task and service counters in the AWS order."""
+    name = f"stats-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=name)
+    td = ecs.register_task_definition(
+        family=name, containerDefinitions=[{"name": "app", "image": "alpine", "memory": 128}],
+    )["taskDefinition"]["taskDefinitionArn"]
+    ecs.create_service(cluster=name, serviceName="svc", taskDefinition=td,
+                       desiredCount=0, launchType="EC2")
+    try:
+        stats = ecs.describe_clusters(clusters=[name], include=["STATISTICS"])["clusters"][0]["statistics"]
+        assert [s["name"] for s in stats] == [
+            "runningEC2TasksCount", "runningFargateTasksCount",
+            "pendingEC2TasksCount", "pendingFargateTasksCount",
+            "runningExternalTasksCount", "pendingExternalTasksCount",
+            "runningManagedInstancesTasksCount", "pendingManagedInstancesTasksCount",
+            "activeEC2ServiceCount", "activeFargateServiceCount",
+            "drainingEC2ServiceCount", "drainingFargateServiceCount",
+            "activeExternalServiceCount", "drainingExternalServiceCount",
+            "activeManagedInstancesServiceCount", "drainingManagedInstancesServiceCount",
+        ]
+        assert {s["name"]: s["value"] for s in stats if s["value"] != "0"} == {"activeEC2ServiceCount": "1"}
+    finally:
+        ecs.delete_service(cluster=name, service="svc")
+        ecs.delete_cluster(cluster=name)
+        ecs.deregister_task_definition(taskDefinition=td)
+
+
 def test_ecs_timestamps_are_epoch(ecs):
     """ECS timestamps should be epoch numbers, not ISO strings."""
     ecs.create_cluster(clusterName="ts-test-v44")
@@ -1457,15 +1509,18 @@ def test_ecs_circuit_breaker_reset_on_healthy_task(
         "deployments": [deployment],
     }
     task = {
+        "taskArn": f"arn:aws:ecs:us-east-1:000000000000:task/{cluster}/healthy",
         "taskDefinitionArn": "reset-healthy-td:2",
         "_deployment_id": deployment["id"],
         "lastStatus": "RUNNING",
     }
     _ecs._services[svc_key] = svc
+    _ecs._tasks[task["taskArn"]] = task
     try:
         _ecs._record_service_task_healthy(svc_key, task)
         assert deployment["failedTasks"] == expected_failures
     finally:
+        _ecs._tasks.pop(task["taskArn"], None)
         _ecs._services.pop(svc_key, None)
 
 
@@ -2703,7 +2758,13 @@ def test_ecs_service_registers_tasks_in_target_group(monkeypatch):
             self.n += 1
             return FakeContainer(f"container-{self.n:012d}")
 
-    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+    images = SimpleNamespace(
+        get_registry_data=lambda image: SimpleNamespace(id="sha256:" + "a" * 64),
+        pull=lambda image, **kwargs: SimpleNamespace(tag=lambda repository, **kwargs: True),
+    )
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(
+        containers=FakeContainers(), images=images,
+    ))
 
     tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-reg/abc123"
     _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
@@ -2791,7 +2852,14 @@ def _eni_probe_docker(ip):
         def run(self, image, **kwargs):
             return FakeContainer()
 
-    return SimpleNamespace(containers=FakeContainers())
+    class FakeImages:
+        def get_registry_data(self, image):
+            return SimpleNamespace(id="sha256:" + "a" * 64)
+
+        def pull(self, image, **kwargs):
+            return SimpleNamespace(tag=lambda repository, **kwargs: True)
+
+    return SimpleNamespace(containers=FakeContainers(), images=FakeImages())
 
 
 def test_ecs_awsvpc_attachment_carries_the_subnet_it_was_placed_in(monkeypatch):
@@ -3236,7 +3304,13 @@ def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
             self.n += 1
             return FakeContainer(f"container-{self.n:012d}")
 
-    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+    images = SimpleNamespace(
+        get_registry_data=lambda image: SimpleNamespace(id="sha256:" + "a" * 64),
+        pull=lambda image, **kwargs: SimpleNamespace(tag=lambda repository, **kwargs: True),
+    )
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(
+        containers=FakeContainers(), images=images,
+    ))
 
     tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-shared/def456"
     _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}

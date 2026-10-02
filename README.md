@@ -842,6 +842,28 @@ SDKs running inside the task fetch emulated credentials from the new
 `/v2/credentials/<uuid>` endpoint and route service calls through MiniStack
 end-to-end without any client config.
 
+For rolling (`ECS`) services, deployments pin tagged images to registry manifest
+digests, and `UpdateService(forceNewDeployment=True)` replaces tasks and resolves
+the tag again. `DescribeTasks` retains the original image URI and reports the
+resolved digest in `containers[].imageDigest`. Linux Fargate tag resolution
+requires platform `1.3.0` or newer; Windows Fargate requires `1.0.0` or newer.
+Fargate tasks report the resolved platform version: omitted or `LATEST` selects
+Linux `1.4.0` or Windows `1.0.0`. Linux tasks report platform family `Linux`.
+Both launch types attempt registry pulls, then use an available local image if
+the pull fails, including images tagged with MiniStack ECR URIs. This preserves
+MiniStack's offline execution; real AWS Fargate requires a registry image. Failed
+manifest lookups do not fail a deployment when every unresolved image is cached,
+even with the deployment circuit breaker enabled. Unresolved images do not
+receive an invented `imageDigest`. Offline fallback may use the original cached
+tag if the resolved digest is unavailable locally. Additional EC2 agent pull
+modes are not implemented.
+
+Private registry credentials for rolling services can be supplied through
+`containerDefinitions[].repositoryCredentials.credentialsParameter`, referencing
+a Secrets Manager secret containing JSON `username` and `password` strings.
+These credentials are used for both manifest resolution and image pulling.
+The registry must be reachable by the Docker daemon running the task containers.
+
 ---
 
 ## Configuration
