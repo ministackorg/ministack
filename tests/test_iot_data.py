@@ -3531,13 +3531,60 @@ def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_registered_cert_connects_whatever_its_ca(broker, tmp_path):
+    """An ACTIVE device certificate connects after its CA is deactivated or
+    deleted, and when it was registered without a CA, as on AWS; only its own
+    status refuses it. The CAs change before the first handshake, so none of
+    them was ever loaded while ACTIVE."""
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    iot = broker.client("iot")
+    devices = {}
+    for case in ("inactive-ca", "deleted-ca", "without-ca"):
+        if case == "without-ca":
+            ca_pem, ca_key = generate_ca(common_name=_unique(case))
+            leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name=case)
+            cert_id = iot.register_certificate_without_ca(certificatePem=leaf_pem, status="ACTIVE")[
+                "certificateId"
+            ]
+        else:
+            ca_pem, ca_key, verification_pem = iot_test_ca(
+                iot.get_registration_code()["registrationCode"], _unique(case)
+            )
+            leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name=case)
+            ca_id = iot.register_ca_certificate(
+                caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True
+            )["certificateId"]
+            cert_id = iot.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, setAsActive=True
+            )["certificateId"]
+            iot.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+            if case == "deleted-ca":
+                iot.delete_ca_certificate(certificateId=ca_id)
+        devices[case] = cert_id, leaf_pem, leaf_key
+
+    for case, (_cert_id, leaf_pem, leaf_key) in devices.items():
+        peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path))
+        try:
+            _assert_connack(peer.connect(_unique(case)))
+        finally:
+            peer.close()
+
+    cert_id, leaf_pem, leaf_key = devices["inactive-ca"]
+    iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("inactive-cert")), return_code=5)
+    finally:
+        peer.close()
+
+
 def test_mtls_registered_ca_chain_connects(broker, tmp_path):
     """A leaf signed by a CA registered through the API connects.
 
-    The listener reads its trust anchors out of the IoT CA registry on every
-    handshake, so this pins both properties that follow from that: a CA
-    registered long after the listener bound is trusted without a restart, and
-    only an ACTIVE one is.
+    The listener reads its trust anchors out of the IoT registry on every
+    handshake, so a CA registered long after the listener bound is trusted
+    without a restart.
     """
     from ministack.core.x509_utils import sign_leaf_certificate
 
@@ -3545,24 +3592,15 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
     ca_pem, ca_key, verification_pem = iot_test_ca(
         iot.get_registration_code()["registrationCode"], "Registered Device CA"
     )
-    ca_id = iot.register_ca_certificate(
-        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=False
-    )["certificateId"]
+    iot.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True
+    )
     leaf_pem, leaf_key, _public = sign_leaf_certificate(
         ca_pem, ca_key, common_name="registered-ca-device"
     )
     iot.register_certificate(
         certificatePem=leaf_pem, caCertificatePem=ca_pem, setAsActive=True
     )
-
-    # The leaf itself is registered ACTIVE, so its CA's status is the only thing
-    # left that can refuse it — and an untrusted anchor is refused by TLS,
-    # below MQTT.
-    assert _refused_below_mqtt(
-        broker, leaf_pem, leaf_key, tmp_path, _unique("too-early")
-    ), "a leaf signed by an INACTIVE CA reached the broker"
-
-    iot.update_ca_certificate(certificateId=ca_id, newStatus="ACTIVE")
 
     peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path))
     try:
