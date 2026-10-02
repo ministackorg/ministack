@@ -1080,8 +1080,7 @@ _DIFFED_ATTRIBUTES = (
     "UpdateReplacePolicy",
 )
 
-# The types a stack-tag change leaves out of a change set; every other
-# resource the stack holds, taggable or not, is a Modify with Scope Tags.
+# Types a stack-tag change leaves out of a change set (measured).
 _UNTAGGED_TYPES = (
     "AWS::CloudFormation::CustomResource",
     "AWS::CloudFormation::WaitCondition",
@@ -1149,9 +1148,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
-    A property that references a changed parameter, a replaced resource or an
-    attribute of a modified resource in ``template`` (the unresolved new
-    template, ``new_template`` by default) gets a detail naming that cause.
+    References in ``template`` (unresolved) to changed parameters or resources add their own details.
     ``resources`` are the stack's provisioned resources, whose physical ids a
     ``Remove`` or ``Modify`` reports.
     Each resource in ``retag`` (the stack's resources when its tags change)
@@ -1191,8 +1188,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
             details.extend(refs.get(name, []))
         return details + attr_details[key]
 
-    # A replaced or modified resource changes what references it, which can in
-    # turn replace or modify the referencing resource.
+    # Repeat until no reference adds a detail: a change can cascade to its referrers.
     refs: dict = {}
     while True:
         details = {key: _modify_details(key, refs.get(key, {})) for key in common}
@@ -1237,8 +1233,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     scope.append(d["Target"]["Attribute"])
             replacement = replacements.get(key, "False")
             if retagged:
-                # Tags comes before the template's own changes in Details, last in
-                # Scope, and has no ChangeSource.
+                # First in Details, last in Scope, no ChangeSource (measured).
                 details[key].insert(0, {
                     "Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
                     "Evaluation": "Static",
