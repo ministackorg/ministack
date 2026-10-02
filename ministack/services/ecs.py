@@ -767,6 +767,8 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
         "updatedAt": now,
         "rolloutState": "COMPLETED" if status == "PRIMARY" else "IN_PROGRESS",
         "rolloutStateReason": "ECS deployment completed." if status == "PRIMARY" else "",
+        # A zero-sized deployment cannot establish digests by scaling alone.
+        "_image_resolution_disabled": desired_count == 0,
     }
 
 
@@ -932,7 +934,8 @@ def _refresh_service_state(cluster_name, group):
             state = "pending"
         else:
             continue
-        deployment_id = task.get("_deployment_id")
+        deployment = _deployment_for_task(svc, task)
+        deployment_id = deployment.get("id") if deployment else None
         if deployment_id in deployment_counts:
             deployment_counts[deployment_id][state] += 1
     svc["runningCount"] = running
@@ -975,11 +978,14 @@ def _deployment_for_task(svc, task):
         )
     # Tasks persisted before deployment IDs were recorded still need to be
     # attributed when they stop after a restart.
-    return next(
+    deployment = next(
         (dep for dep in svc.get("deployments", [])
          if dep.get("taskDefinition") == task.get("taskDefinitionArn")),
         None,
     )
+    if deployment:
+        task["_deployment_id"] = deployment["id"]
+    return deployment
 
 
 def _circuit_breaker_threshold(svc):
@@ -997,7 +1003,7 @@ def _circuit_breaker_threshold(svc):
     return min(200, max(3, calculated))
 
 
-def _complete_service_deployment(cluster_name, svc_key):
+def _complete_service_deployment(cluster_name, svc_key, expected_deployment_id=None):
     """Complete a stable PRIMARY rollout, then drain its old deployment.
 
     A completed deployment is the rollback point.  Therefore old tasks stay
@@ -1013,7 +1019,21 @@ def _complete_service_deployment(cluster_name, svc_key):
     with resource_lock("ecs-service", svc_key):
         primary = _primary_deployment(svc)
         if (not primary or primary.get("rolloutState") != "IN_PROGRESS"
+                or (expected_deployment_id is not None
+                    and primary.get("id") != expected_deployment_id)
                 or primary.get("runningCount", 0) < svc.get("desiredCount", 0)):
+            return
+        # A callback can start more tasks during reconciliation. Its own
+        # startup window cannot certify those newly RUNNING replacements.
+        stable_count = sum(
+            1 for task in _tasks.values()
+            if task.get("group") == f"service:{svc_name}"
+            and task.get("clusterArn") == svc.get("clusterArn")
+            and _deployment_for_task(svc, task) is primary
+            and task.get("lastStatus") == "RUNNING"
+            and task.get("_startup_stable", False)
+        )
+        if stable_count < svc.get("desiredCount", 0):
             return
         primary["rolloutState"] = "COMPLETED"
         primary["rolloutStateReason"] = "ECS deployment completed."
@@ -1056,9 +1076,10 @@ def _record_service_task_healthy(svc_key, task):
     """
     with resource_lock("ecs-service", svc_key):
         svc = _services.get(svc_key)
-        if not svc:
+        if not svc or not _task_is_active(task.get("taskArn"), task) or task.get("lastStatus") != "RUNNING":
             return
         deployment = _deployment_for_task(svc, task)
+        task["_startup_stable"] = True
         primary = _primary_deployment(svc)
         breaker = (svc.get("deploymentConfiguration") or {}).get(
             "deploymentCircuitBreaker") or {}
@@ -1076,6 +1097,15 @@ def _schedule_service_deployment_completion(
     if not cluster_name or "/" not in svc_key:
         return
     group = f"service:{svc_key.split('/', 1)[1]}"
+    with resource_lock("ecs-service", svc_key):
+        svc = _services.get(svc_key)
+        deployment = (
+            _deployment_for_task(svc, healthy_task) if svc and healthy_task
+            else _primary_deployment(svc) if svc else None
+        )
+        if not deployment:
+            return
+        deployment_id = deployment["id"]
 
     def _check():
         time.sleep(_ECS_DEPLOYMENT_STEADY_DELAY)
@@ -1084,7 +1114,15 @@ def _schedule_service_deployment_completion(
                 if (healthy_task and healthy_task.get("lastStatus") == "RUNNING"):
                     _record_service_task_healthy(svc_key, healthy_task)
                 _refresh_service_state(cluster_name, group)
-                _complete_service_deployment(cluster_name, svc_key)
+                # The first task establishes image digests before the other
+                # tasks are started. Also progress capacity-limited rollouts
+                # now that this task has survived the startup window.
+                _reconcile_service_tasks(cluster_name, svc_key)
+                # A predecessor's startup callback may run after an update,
+                # while a crashing replacement is briefly RUNNING. Its grace
+                # window cannot establish the replacement's stability.
+                _complete_service_deployment(
+                    cluster_name, svc_key, expected_deployment_id=deployment_id)
 
     spawn_background(
         _check,
@@ -1093,7 +1131,7 @@ def _schedule_service_deployment_completion(
     )
 
 
-def _record_service_task_failure(task):
+def _record_service_task_failure(task, digest_resolution_failed=False):
     """Feed a natural task/startup failure into its deployment circuit breaker."""
     group = task.get("group", "")
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
@@ -1104,6 +1142,10 @@ def _record_service_task_failure(task):
     schedule_completion = False
 
     with resource_lock("ecs-service", svc_key):
+        # A registry lookup can outlive StopTask/reset. Only digest resolution
+        # requires a still-active worker; ordinary task failures arrive stopped.
+        if digest_resolution_failed and not _task_is_active(task.get("taskArn"), task):
+            return
         svc = _services.get(svc_key)
         if not svc or svc.get("status") != "ACTIVE":
             return
@@ -1118,18 +1160,24 @@ def _record_service_task_failure(task):
         # poison the replacement deployment.
         if (deployment is not primary
                 or not deployment
-                or deployment.get("rolloutState") != "IN_PROGRESS"
+                or (deployment.get("rolloutState") != "IN_PROGRESS"
+                    and not digest_resolution_failed)
                 or not is_rolling
                 or not breaker.get("enable", False)):
             should_reconcile = deployment is primary and bool(deployment)
         else:
-            deployment["failedTasks"] = int(deployment.get("failedTasks", 0)) + 1
+            if not digest_resolution_failed:
+                deployment["failedTasks"] = int(deployment.get("failedTasks", 0)) + 1
             deployment["updatedAt"] = _iso()
-            if deployment["failedTasks"] < _circuit_breaker_threshold(svc):
+            if (not digest_resolution_failed
+                    and deployment["failedTasks"] < _circuit_breaker_threshold(svc)):
                 should_reconcile = True
             else:
                 deployment["rolloutState"] = "FAILED"
                 deployment["rolloutStateReason"] = (
+                    "ECS deployment circuit breaker was triggered after "
+                    "three unsuccessful image digest resolution attempts."
+                ) if digest_resolution_failed else (
                     "ECS deployment circuit breaker was triggered after "
                     f"{deployment['failedTasks']} consecutive task failures."
                 )
@@ -1192,12 +1240,29 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     launch_type = svc.get("launchType", "EC2")
     network_cfg = svc.get("networkConfiguration", {})
 
+    if desired == 0:
+        # No replacement worker will schedule completion for an empty rollout.
+        # Stop every deployment's tasks, including predecessors of a force.
+        for task_arn, task in list(_tasks.items()):
+            if (task.get("group") == f"service:{svc_name}"
+                    and task.get("clusterArn") == cluster_arn
+                    and task.get("lastStatus") in _PRE_STOP_STATUSES):
+                _stop_task({"task": task_arn, "cluster": cluster_name,
+                            "reason": "Service scaling down"})
+        _refresh_service_state(cluster_name, f"service:{svc_name}")
+        _recount_cluster(cluster_name)
+        _complete_service_deployment(cluster_name, svc_key)
+        return
+
     # Resolve the target task definition ARN for comparison
     td_key = _resolve_td_key(td_arn)
     td = _task_defs.get(td_key)
     target_td_arn = td["taskDefinitionArn"] if td else td_arn
 
-    # Partition active service tasks into current-TD and stale-TD. A PENDING
+    primary = _primary_deployment(svc)
+    is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
+    # Partition tasks by deployment as well as definition: a forced rollout
+    # uses the same definition but must replace its predecessor's tasks. A PENDING
     # task already counts toward desired capacity, so reconciliation does not
     # launch duplicates while its worker is pulling the image.
     current_tasks = []
@@ -1206,12 +1271,13 @@ def _reconcile_service_tasks(cluster_name, svc_key):
         if (t.get("group") == f"service:{svc_name}"
                 and t.get("clusterArn") == cluster_arn
                 and t.get("lastStatus") in _PRE_STOP_STATUSES):
-            if t.get("taskDefinitionArn") == target_td_arn:
+            if (t.get("taskDefinitionArn") == target_td_arn
+                    and (not is_rolling or not primary
+                         or _deployment_for_task(svc, t) is primary)):
                 current_tasks.append((arn, t))
             else:
                 stale_tasks.append((arn, t))
 
-    primary = _primary_deployment(svc)
     # Keep old tasks alive while a replacement deployment establishes itself.
     # They are drained by _complete_service_deployment after the replacement is
     # stable, or retained for _rollback_failed_deployment if it fails.
@@ -1253,6 +1319,12 @@ def _reconcile_service_tasks(cluster_name, svc_key):
                 })
             to_spawn = max(0, capacity) + to_stop
         if to_spawn > 0:
+            if (is_rolling and primary and _get_docker()
+                    and _deployment_needs_first_task(primary, td, svc)):
+                # Only the first task resolves tags. Its worker releases the
+                # remaining capacity after publishing the deployment's digests.
+                to_spawn = 0 if current_tasks else min(to_spawn, 1)
+        if to_spawn > 0:
             _run_task({
                 "cluster": cluster_name,
                 "taskDefinition": td_arn,
@@ -1260,6 +1332,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
                 "group": f"service:{svc_name}",
                 "startedBy": svc_name,
                 "launchType": launch_type,
+                "platformVersion": svc.get("platformVersion", ""),
                 "networkConfiguration": network_cfg,
                 "enableExecuteCommand": svc.get("enableExecuteCommand", False),
                 "_deploymentId": primary.get("id") if primary else None,
@@ -1460,6 +1533,7 @@ def _update_service(data):
     changed = False
     new_td = data.get("taskDefinition")
     new_desired = data.get("desiredCount")
+    td_arn = svc["taskDefinition"]
 
     if new_td is not None:
         td_key = _resolve_td_key(new_td)
@@ -1467,20 +1541,28 @@ def _update_service(data):
             return error_response_json("ClientException",
                 f"Unable to find task definition: {new_td}", 400)
         td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else new_td
-        if td_arn != svc["taskDefinition"]:
-            for dep in svc["deployments"]:
-                if dep["status"] == "PRIMARY":
-                    dep["status"] = "ACTIVE"
-            new_dep = _make_deployment(td_arn, svc["desiredCount"])
-            # Creation's first deployment is immediately PRIMARY/COMPLETED for
-            # compatibility with the existing service shape.  A replacement,
-            # however, must remain observable as IN_PROGRESS until its tasks
-            # are stable (or its circuit breaker fails it).
-            new_dep["rolloutState"] = "IN_PROGRESS"
-            new_dep["rolloutStateReason"] = ""
-            svc["deployments"].insert(0, new_dep)
-            svc["taskDefinition"] = td_arn
-            changed = True
+
+    is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
+    if (td_arn != svc["taskDefinition"]
+            or (is_rolling and data.get("forceNewDeployment", False))):
+        # Bind legacy persisted tasks before inserting another deployment of
+        # the same definition; afterwards its ARN alone is ambiguous.
+        for task in _tasks.values():
+            if (task.get("group") == f"service:{svc_name}"
+                    and task.get("clusterArn") == svc.get("clusterArn")):
+                _deployment_for_task(svc, task)
+        for dep in svc["deployments"]:
+            if dep["status"] == "PRIMARY":
+                dep["status"] = "ACTIVE"
+        new_dep = _make_deployment(
+            td_arn, new_desired if new_desired is not None else svc["desiredCount"])
+        new_dep["launchType"] = svc.get("launchType", "EC2")
+        # A replacement remains IN_PROGRESS until its own tasks stabilize.
+        new_dep["rolloutState"] = "IN_PROGRESS"
+        new_dep["rolloutStateReason"] = ""
+        svc["deployments"].insert(0, new_dep)
+        svc["taskDefinition"] = td_arn
+        changed = True
 
     if new_desired is not None:
         svc["desiredCount"] = new_desired
@@ -1873,6 +1955,24 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
+def _resolve_repository_credentials(cdef):
+    repository_credentials = cdef.get("repositoryCredentials")
+    if not repository_credentials:
+        return None
+    secret_id = repository_credentials.get("credentialsParameter", "")
+    value = secretsmanager.resolve_secret_string(secret_id) if secret_id else None
+    try:
+        credentials = json.loads(value) if value is not None else None
+    except (TypeError, ValueError):
+        credentials = None
+    if (not isinstance(credentials, dict)
+            or not all(isinstance(credentials.get(key), str) and credentials[key]
+                       for key in ("username", "password"))):
+        # Never put secret values or JSON parser details in task errors/logs.
+        raise _SecretResolutionError("unable to retrieve valid private registry credentials")
+    return {key: credentials[key] for key in ("username", "password")}
+
+
 def _task_status_snapshot(task_arn):
     """``(desiredStatus, lastStatus, {container name: lastStatus})``, or None.
 
@@ -2062,11 +2162,20 @@ def _mark_task_running(task_arn, task):
         task["lastStatus"] = "RUNNING"
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
+        task["_startup_stable"] = False
 
     ecs_metadata.set_task_status(task_arn, known_status="RUNNING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
+        group = task.get("group", "")
+        if group.startswith("service:"):
+            svc_key = f"{cluster_name}/{group.split(':', 1)[1]}"
+            with resource_lock("ecs-service", svc_key):
+                svc = _services.get(svc_key)
+                deployment = _deployment_for_task(svc, task) if svc else None
+                if deployment and "_image_digests" in deployment:
+                    deployment["_image_resolution_complete"] = True
         _recount_cluster(cluster_name)
         _refresh_service_state(cluster_name, task.get("group", ""))
     return True
@@ -2091,11 +2200,156 @@ def _attach_started_container(task, container, index, metadata_token, ecs_networ
     return True
 
 
-def _run_docker_container(docker_client, cdef, run_kwargs):
+def _image_repository(image):
+    repository = image.split("@", 1)[0]
+    if ":" in repository.rsplit("/", 1)[-1]:
+        repository = repository.rsplit(":", 1)[0]
+    return repository
+
+
+def _supports_image_resolution(context, td):
+    if context.get("launchType", "EC2") != "FARGATE":
+        return True
+    platform_version = context.get("platformVersion") or "LATEST"
+    if platform_version == "LATEST":
+        return True
+    try:
+        version = tuple(int(part) for part in platform_version.split("."))
+    except (AttributeError, ValueError):
+        return False
+    os_family = (td.get("runtimePlatform") or {}).get("operatingSystemFamily", "LINUX")
+    minimum = (1, 0, 0) if os_family.startswith("WINDOWS") else (1, 3, 0)
+    return version >= minimum
+
+
+def _deployment_needs_first_task(deployment, td, context=None):
+    if (deployment.get("_image_resolution_disabled")
+            or deployment.get("_image_resolution_complete")
+            or (context is not None and not _supports_image_resolution(context, td))):
+        return False
+    return any(cdef.get("versionConsistency", "enabled") != "disabled"
+               and "@" not in cdef["image"]
+               for cdef in td.get("containerDefinitions", []))
+
+
+def _prepare_service_images(task, td, docker_client):
+    """Establish the first rolling-service task's manifest digests.
+
+    Docker's image ID is a config digest, not a registry manifest digest. Only
+    distribution descriptors are pinned. A failed default-policy manifest
+    lookup permits cached execution, but does not establish a cached digest.
+    Registry/Docker calls run in the task worker, outside resource locks.
+    """
+    group = task.get("group", "")
+    cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
+    if not cluster_name or not group.startswith("service:"):
+        return None
+    svc_key = f"{cluster_name}/{group.split(':', 1)[1]}"
+    svc = _services.get(svc_key)
+    if not svc or (svc.get("deploymentController") or {}).get("type", "ECS") != "ECS":
+        return None
+    deployment = _deployment_for_task(svc, task)
+    if not deployment:
+        return None
+    if not _deployment_needs_first_task(deployment, td, task):
+        return deployment
+
+    digests = dict(deployment.get("_image_digests", {}))
+    unresolved = False
+    unresolved_images_cached = True
+    for cdef in td.get("containerDefinitions", []):
+        name = cdef["name"]
+        if cdef.get("versionConsistency", "enabled") == "disabled" or name in digests:
+            continue
+        image = cdef["image"]
+        digest = image.split("@", 1)[1] if "@" in image else None
+        auth_config = _resolve_repository_credentials(cdef) if not digest else None
+        for _ in range(3):
+            if not _task_is_active(task["taskArn"], task):
+                return None
+            if digest:
+                break
+            try:
+                registry_kwargs = {"auth_config": auth_config} if auth_config else {}
+                digest = docker_client.images.get_registry_data(image, **registry_kwargs).id
+            except Exception:
+                pass
+        if digest:
+            digests[name] = digest
+            task.setdefault("_image_resolution_containers", []).append(name)
+        else:
+            unresolved = True
+            # MiniStack supports offline images for both launch types. A
+            # missing registry manifest is not a deployment failure when
+            # Docker can still run the requested image from its local cache.
+            try:
+                docker_client.images.get(image)
+            except Exception:
+                unresolved_images_cached = False
+
+    with resource_lock("ecs-service", svc_key):
+        if (not _task_is_active(task["taskArn"], task)
+                or _services.get(svc_key) is not svc
+                or deployment not in svc.get("deployments", [])):
+            return None
+        deployment["_image_digests"] = digests
+        if unresolved:
+            # Stop resolving after three failed attempts. The circuit breaker
+            # still applies to images that cannot execute from local cache.
+            deployment["_image_resolution_disabled"] = True
+    if unresolved and not unresolved_images_cached and (svc.get("deploymentConfiguration") or {}).get(
+            "deploymentCircuitBreaker", {}).get("enable", False):
+        _record_service_task_failure(task, digest_resolution_failed=True)
+    return deployment
+
+
+class _ImagePullError(Exception):
+    """An image pull failed and the launch type has no usable cache."""
+
+
+def _run_docker_container(
+        docker_client, cdef, run_kwargs, *, refresh_image=False, allow_cached=True,
+        cache_image=None, fallback_image=None, auth_config=None):
+    def run():
+        create_image = cdef["image"]
+        if refresh_image:
+            try:
+                pull_kwargs = {"platform": run_kwargs["platform"]} if run_kwargs.get("platform") else {}
+                if auth_config:
+                    pull_kwargs["auth_config"] = auth_config
+                pulled = docker_client.images.pull(cdef["image"], **pull_kwargs)
+                if cache_image:
+                    repository = _image_repository(cache_image)
+                    tail = cache_image.rsplit("/", 1)[-1]
+                    tag = tail.rsplit(":", 1)[1] if ":" in tail else "latest"
+                    # The agent tags a successful first-task canonical pull
+                    # back to its requested URI, preserving the default cache.
+                    if not pulled.tag(repository, tag=tag):
+                        raise RuntimeError("unable to tag the pulled container image")
+            except Exception as exc:
+                if not allow_cached:
+                    raise _ImagePullError(str(exc)) from exc
+                logger.warning("ECS: image pull failed for %s; trying the local cache", cdef["image"])
+                # Preserve the resolver's tag fallback. Later tasks prefer the
+                # pinned cache entry, then try the original tag offline.
+                from docker.errors import ImageNotFound
+                for candidate in dict.fromkeys((cache_image or cdef["image"], fallback_image)):
+                    if not candidate:
+                        continue
+                    try:
+                        docker_client.images.get(candidate)
+                    except ImageNotFound:
+                        continue
+                    create_image = candidate
+                    break
+                else:
+                    raise _ImagePullError(str(exc)) from exc
+        return docker_client.containers.run(create_image, **run_kwargs)
+
     container = None
     try:
         try:
-            container = docker_client.containers.run(cdef["image"], **run_kwargs)
+            container = run()
         except Exception as exc:
             # Best-effort platform pin: a host that cannot run the declared
             # runtimePlatform can still use the host architecture, as before.
@@ -2108,7 +2362,7 @@ def _run_docker_container(docker_client, cdef, run_kwargs):
                 "instead. Install a binfmt/qemu handler for real "
                 "cross-architecture execution.",
                 pinned, exc, cdef.get("image"))
-            container = docker_client.containers.run(cdef["image"], **run_kwargs)
+            container = run()
 
         pinned = run_kwargs.get("platform")
         if pinned:
@@ -2136,8 +2390,7 @@ def _run_docker_container(docker_client, cdef, run_kwargs):
                 except Exception:
                     _remove_docker_container(docker_client, container)
                 run_kwargs.pop("platform", None)
-                container = docker_client.containers.run(
-                    cdef["image"], **run_kwargs)
+                container = run()
         return container
     except Exception:
         if container is not None:
@@ -2162,6 +2415,8 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         return
     if not _mark_task_activating(task_arn, task):
         return
+
+    deployment = _prepare_service_images(task, td, docker_client)
 
     ecs_network = None
     ministack_net_ip = None
@@ -2197,6 +2452,17 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         env.update(env_override)
 
         effective_cdef = dict(cdef)
+        digest = deployment.get("_image_digests", {}).get(cdef["name"]) if deployment else None
+        if deployment and "@" in cdef["image"]:
+            digest = cdef["image"].split("@", 1)[1]
+        if digest:
+            effective_cdef["image"] = f"{_image_repository(cdef['image'])}@{digest}"
+            # ECS reports the resolved manifest digest. Under EC2's default
+            # policy it remains that digest even if a pull falls back to the
+            # original tag's cache, as in the agent's state-change payload.
+            with resource_lock("ecs-task", task_arn):
+                if _task_is_active(task_arn, task):
+                    task["containers"][i]["imageDigest"] = digest
         if "command" in container_override:
             effective_cdef["command"] = container_override["command"]
 
@@ -2231,7 +2497,15 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             _cleanup_task_resources(task, docker_client)
             return
 
-        container = _run_docker_container(docker_client, effective_cdef, run_kwargs)
+        container = _run_docker_container(
+            docker_client, effective_cdef, run_kwargs,
+            refresh_image=deployment is not None,
+            cache_image=(cdef["image"] if digest and "@" not in cdef["image"]
+                         and cdef["name"] in task.get("_image_resolution_containers", [])
+                         else None),
+            fallback_image=cdef["image"] if digest and "@" not in cdef["image"] else None,
+            auth_config=_resolve_repository_credentials(cdef) if deployment else None,
+        )
 
         if not _attach_started_container(
                 task, container, i, metadata_token, ecs_network):
@@ -2256,6 +2530,9 @@ def _run_task_worker(task, td, container_overrides, docker_client, account_id, r
                 "registry auth: execution resource retrieval failed: "
                 + str(exc),
             )
+        except _ImagePullError as exc:
+            logger.warning("ECS: image pull failed for %s: %s", task["taskArn"], exc)
+            _fail_task_start(task, docker_client, "CannotPullContainerError: " + str(exc))
         except Exception as exc:
             logger.warning("ECS: Docker start failed for %s: %s", task["taskArn"], exc)
             _fail_task_start(
@@ -2319,6 +2596,14 @@ def _run_task(data):
     )
     container_overrides = copy.deepcopy(overrides.get("containerOverrides", []))
     launch_type = data.get("launchType", "EC2")
+    platform_version = data.get("platformVersion", "")
+    platform_family = ""
+    if launch_type == "FARGATE":
+        os_family = (td.get("runtimePlatform") or {}).get("operatingSystemFamily", "LINUX")
+        if not platform_version or platform_version == "LATEST":
+            platform_version = "1.0.0" if os_family.startswith("WINDOWS") else "1.4.0"
+        if os_family == "LINUX":
+            platform_family = "Linux"
     group = data.get("group", "")
     started_by = data.get("startedBy", "")
     enable_exec = data.get("enableExecuteCommand", False)
@@ -2367,8 +2652,8 @@ def _run_task(data):
             "launchType": launch_type,
             "cpu": td.get("cpu", "256"),
             "memory": td.get("memory", "512"),
-            "platformVersion": data.get("platformVersion", ""),
-            "platformFamily": "",
+            "platformVersion": platform_version,
+            "platformFamily": platform_family,
             "connectivity": "CONNECTED",
             "connectivityAt": now,
             "pullStartedAt": now if not docker_backed else None,
@@ -2393,6 +2678,8 @@ def _run_task(data):
             "ephemeralStorage": td.get("ephemeralStorage", {"sizeInGiB": 20}),
             "_docker_ids": [],
             "_deployment_id": deployment_id,
+            # Metadata-only tasks have no asynchronous startup window.
+            "_startup_stable": not docker_backed,
             "_container_essentials": [
                 bool(container.get("essential", True))
                 for container in td.get("containerDefinitions", [])
