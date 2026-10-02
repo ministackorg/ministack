@@ -71,7 +71,8 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 
 def _physical_name(stack_name: str, logical_id: str, *,
-                   lowercase: bool = False, max_len: int = 128) -> str:
+                   lowercase: bool = False, max_len: int = 128,
+                   replacing: str = "") -> str:
     """Generate an AWS-style physical resource name: {stack}-{logicalId}-{SUFFIX}.
 
     Matches the pattern AWS CloudFormation uses for auto-named resources so that
@@ -91,7 +92,9 @@ def _physical_name(stack_name: str, logical_id: str, *,
     orphaning the real one — and anything referencing it via Ref/Fn::GetAtt
     picked up that new (wrong) identity the moment it was reprocessed later in
     the same update. Resource *replacement* (a property change real AWS can't
-    apply in place) isn't specially detected here — same as before this fix.
+    apply in place) is not detected here: a handler that replaces passes
+    ``replacing`` (the predecessor's physical id), so the replacement gets a
+    name of its own.
 
     Truncates the `{stack}-{logicalId}-` prefix, never the suffix: a naive
     `base[:max_len]` on the full concatenated string drops whatever falls past
@@ -108,7 +111,8 @@ def _physical_name(stack_name: str, logical_id: str, *,
     cut, since the suffix alone (hashed from stack_name *and* logical_id) is
     what actually guarantees uniqueness here.
     """
-    suffix = hashlib.sha256(f"{stack_name}:{logical_id}".encode()).hexdigest()[:13].upper()
+    seed = f"{stack_name}:{logical_id}" + (f":{replacing}" if replacing else "")
+    suffix = hashlib.sha256(seed.encode()).hexdigest()[:13].upper()
     prefix = f"{stack_name}-{logical_id}-"
     available = max(max_len - len(suffix), 0)
     base = prefix[:available] + suffix
@@ -677,6 +681,15 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TrackerName",
         "requires_replacement": lambda old, new: old.get("KmsKeyId") != new.get("KmsKeyId"),
     },
+    # Every property of these two types is create-only.
+    "AWS::S3::MultiRegionAccessPoint": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: old != new,
+    },
+    "AWS::AutoScaling::LaunchConfiguration": {
+        "name": "LaunchConfigurationName",
+        "requires_replacement": lambda old, new: old != new,
+    },
     "AWS::IAM::InstanceProfile": {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
@@ -848,6 +861,18 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
         deferred.append((delete_fn, args, kwargs))
         return
     delete_fn(*args, **kwargs)
+
+
+def _replacing_update(create_fn, delete_fn):
+    """An update handler for a type whose every property is create-only."""
+    def update(physical_id, old_props, new_props, stack_name, logical_id=None):
+        # An unchanged custom name was refused above the handler; a generated
+        # name gets a new one, so the predecessor survives until cleanup.
+        created = create_fn(logical_id or physical_id, new_props, stack_name,
+                            replacing=physical_id)
+        _delete_predecessor(delete_fn, physical_id, old_props)
+        return created
+    return update
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
@@ -1249,7 +1274,7 @@ def _s3_apply_notification(name, notif):
 # S3 Multi-Region Access Point
 # ---------------------------------------------------------------------------
 
-def _s3_mrap_create(logical_id, props, stack_name):
+def _s3_mrap_create(logical_id, props, stack_name, replacing=""):
     """Provision an AWS::S3::MultiRegionAccessPoint.
 
     On AWS this is asynchronous — `CreateMultiRegionAccessPoint` returns a
@@ -1260,7 +1285,8 @@ def _s3_mrap_create(logical_id, props, stack_name):
     `Regions` is a list of `{Bucket}`; the member names are kept so the data
     plane can resolve the alias to one of them.
     """
-    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=50)
+    name = props.get("Name") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=50, replacing=replacing)
     buckets = [
         r.get("Bucket") for r in (props.get("Regions") or [])
         if isinstance(r, dict) and r.get("Bucket")
@@ -1414,9 +1440,23 @@ def _sqs_queue_fields(props, is_fifo):
     return fields
 
 
+def _sqs_queue_name(props, stack_name, logical_id):
+    """The queue name, which ends in .fifo exactly when FifoQueue is true."""
+    is_fifo = _cfn_bool(props.get("FifoQueue"))
+    name = props.get("QueueName")
+    if not name:
+        name = _physical_name(stack_name, logical_id, max_len=75 if is_fifo else 80)
+        name += ".fifo" if is_fifo else ""
+    elif name.endswith(".fifo") != is_fifo:
+        raise _sqs._Err("InvalidParameterValue", (
+            "The name of a FIFO queue can only include alphanumeric characters, hyphens, or "
+            "underscores, must end with .fifo suffix and be 1 to 80 in length." if is_fifo else
+            "Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length"))
+    return name, is_fifo
+
+
 def _sqs_create(logical_id, props, stack_name):
-    name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
-    is_fifo = name.endswith(".fifo")
+    name, is_fifo = _sqs_queue_name(props, stack_name, logical_id)
     attributes = _sqs_queue_fields(props, is_fifo)
     url = _sqs._queue_url_for_account(get_account_id(), name)
     arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
@@ -1443,14 +1483,12 @@ def _sqs_create(logical_id, props, stack_name):
 def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a queue's attributes in place, keeping its messages.
 
-    QueueName (and the .fifo suffix it implies) is create-only on AWS: a
-    change is a replacement, so the new queue is created and the old one
-    removed. Everything else maps onto SetQueueAttributes semantics — the
+    QueueName and FifoQueue are create-only on AWS: a change is a
+    replacement, so the new queue is created and the old one removed.
+    Everything else maps onto SetQueueAttributes semantics — the
     queue record (URL, messages, dedup state) survives.
     """
-    name = new_props.get("QueueName") or _physical_name(
-        stack_name, logical_id or physical_id, max_len=80
-    )
+    name, _ = _sqs_queue_name(new_props, stack_name, logical_id or physical_id)
     queue = _sqs._queues.get(physical_id)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
@@ -7571,28 +7609,29 @@ def _ec2_subnet_rtb_assoc_delete(physical_id, props):
 
 def _ecs_cluster_create(logical_id, props, stack_name):
     name = props.get("ClusterName", f"{stack_name}-{logical_id}")
-    arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
-    _ecs._clusters[name] = {
-        "clusterArn": arn,
+    tags = _pascal_to_camel(props.get("Tags") or [])
+    # A stack update runs the create again; tags added outside the template stay.
+    old = _ecs._clusters.get(name)
+    foreign = []
+    if old:
+        template_keys = {t["key"] for t in old["tags"] + tags}
+        foreign = [t for t in _ecs._tags.get(old["clusterArn"], []) if t["key"] not in template_keys]
+    cluster = _ecs._put_cluster({
         "clusterName": name,
-        "status": "ACTIVE",
-        "registeredContainerInstancesCount": 0,
-        "runningTasksCount": 0,
-        "pendingTasksCount": 0,
-        "activeServicesCount": 0,
+        "tags": tags,
         "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
         "defaultCapacityProviderStrategy": _pascal_to_camel(
             props.get("DefaultCapacityProviderStrategy") or []),
-        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-    }
-    if props.get("Configuration"):
-        _ecs._clusters[name]["configuration"] = _pascal_to_camel(props["Configuration"])
-    return name, {"Arn": arn, "ClusterName": name}
+        "configuration": _pascal_to_camel(props.get("Configuration") or {}),
+    })
+    if old:
+        _ecs._tags[cluster["clusterArn"]] = tags + foreign
+    return name, {"Arn": cluster["clusterArn"], "ClusterName": name}
 
 
 def _ecs_cluster_delete(physical_id, props):
-    _ecs._clusters.pop(physical_id, None)
+    _ecs._delete_cluster({"cluster": physical_id})
 
 
 def _cfn_to_camel(key):
@@ -9577,6 +9616,8 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     route_id = new_uuid()[:8]
     route = {"routeId": route_id, **_apigw_v2_route_props(props)}
+    if message := _apigw_v2._ws_route_authorization_message(api_id, route["routeKey"], route["authorizationType"]):
+        raise ValueError(message)
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
     return physical_id, {"RouteId": route_id}
@@ -9630,6 +9671,8 @@ def _apigw_v2_authorizer_create(logical_id, props, stack_name):
     .Issuer are translated here rather than passed through PascalCase.
     """
     api_id = props.get("ApiId", "")
+    if message := _apigw_v2._ws_authorizer_type_message(api_id, props.get("AuthorizerType", "JWT")):
+        raise ValueError(message)
     auth_id = new_uuid()[:8]
     jwt_cfg = props.get("JwtConfiguration") or {}
     authorizer = {
@@ -9669,6 +9712,8 @@ def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
     authorizer = authorizers.get(physical_id)
     if not authorizer:
         return _apigw_v2_authorizer_create(physical_id, new_props, stack_name)
+    if message := _apigw_v2._ws_authorizer_type_message(api_id, new_props.get("AuthorizerType", "JWT")):
+        raise ValueError(message)
     jwt_cfg = new_props.get("JwtConfiguration") or {}
     authorizer.update({
         "authorizerType": new_props.get("AuthorizerType", "JWT"),
@@ -9956,11 +10001,12 @@ def _cf_distribution_create(logical_id, props, stack_name):
     # missing a member the SDKs expect. The update keeps it.
     caller_reference = new_uuid()
     config_el = _cf_distribution_config(props, caller_reference)
+    domain_name = _cf._new_distribution_domain()
     _cf._distributions[dist_id] = {
         "Id": dist_id,
         "ARN": arn,
         "Status": "Deployed",
-        "DomainName": f"{dist_id}.cloudfront.net",
+        "DomainName": domain_name,
         "LastModifiedTime": _cf._now_iso(),
         "ETag": new_uuid(),
         "CallerReference": caller_reference,
@@ -9969,7 +10015,7 @@ def _cf_distribution_create(logical_id, props, stack_name):
     }
     _cf._invalidations[dist_id] = []
     _cf._tags[arn] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
-    return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
+    return dist_id, {"Arn": arn, "DomainName": domain_name, "Id": dist_id}
 
 
 def _cf_distribution_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -10359,8 +10405,9 @@ def _asg_delete(physical_id, props):
     _asg._delete_group_policies(physical_id)
 
 
-def _asg_lc_create(logical_id, props, stack_name):
-    name = props.get("LaunchConfigurationName") or _physical_name(stack_name, logical_id, max_len=255)
+def _asg_lc_create(logical_id, props, stack_name, replacing=""):
+    name = props.get("LaunchConfigurationName") or _physical_name(
+        stack_name, logical_id, max_len=255, replacing=replacing)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _asg._launch_configs[name] = {
         "LaunchConfigurationName": name,
@@ -12413,6 +12460,14 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IoT::ThingType": ("ThingTypeName",),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
+    "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
+    "AWS::AutoScaling::LaunchConfiguration": (
+        "AssociatePublicIpAddress", "BlockDeviceMappings", "ClassicLinkVPCId",
+        "ClassicLinkVPCSecurityGroups", "EbsOptimized", "IamInstanceProfile", "ImageId",
+        "InstanceId", "InstanceMonitoring", "InstanceType", "KernelId", "KeyName",
+        "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
+        "SecurityGroups", "SpotPrice", "UserData",
+    ),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
@@ -12484,7 +12539,12 @@ _RESOURCE_HANDLERS = {
         "delete": _opensearch_domain_delete,
     },
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
-    "AWS::S3::MultiRegionAccessPoint": {"create": _s3_mrap_create, "delete": _s3_mrap_delete},
+    "AWS::S3::MultiRegionAccessPoint": {
+        "create": _s3_mrap_create,
+        "update": _replacing_update(_s3_mrap_create, _s3_mrap_delete),
+        "update_with_logical_id": True,
+        "delete": _s3_mrap_delete,
+    },
     "AWS::S3::BucketPolicy": {
         "create": _s3_bucket_policy_create,
         "update": _s3_bucket_policy_update,
@@ -13229,7 +13289,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_delete,
     },
-    "AWS::AutoScaling::LaunchConfiguration": {"create": _asg_lc_create, "delete": _asg_lc_delete},
+    "AWS::AutoScaling::LaunchConfiguration": {
+        "create": _asg_lc_create,
+        "update": _replacing_update(_asg_lc_create, _asg_lc_delete),
+        "update_with_logical_id": True,
+        "delete": _asg_lc_delete,
+    },
     "AWS::AutoScaling::ScalingPolicy": {
         "create": _asg_policy_create,
         "update": _asg_policy_update,
