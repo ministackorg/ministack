@@ -407,7 +407,14 @@ def test_ses_smtp_relay_error_is_logged_not_raised():
 # SendEmail with SMTP relay
 # ---------------------------------------------------------------------------
 
+def _verify_example_com(monkeypatch):
+    """Senders must be verified identities, as on AWS."""
+    from ministack.services import ses
+    monkeypatch.setitem(ses._identities, "example.com", ses._make_identity("example.com", "Domain"))
+
+
 def test_ses_smtp_relay_send_email(monkeypatch):
+    _verify_example_com(monkeypatch)
     monkeypatch.setenv('SMTP_HOST', '127.0.0.1:1025')
     from ministack.services.ses import _send_email
     mock_smtp = MagicMock()
@@ -433,7 +440,8 @@ def test_ses_smtp_relay_send_email(monkeypatch):
         assert msg.get_content_type() == 'multipart/alternative'
 
 
-def test_ses_smtp_relay_send_email_no_relay_without_host():
+def test_ses_smtp_relay_send_email_no_relay_without_host(monkeypatch):
+    _verify_example_com(monkeypatch)
     from ministack.services.ses import _send_email
     with patch('ministack.services.ses.smtplib.SMTP') as mock_cls:
         params = {
@@ -452,6 +460,7 @@ def test_ses_smtp_relay_send_email_no_relay_without_host():
 # ---------------------------------------------------------------------------
 
 def test_ses_smtp_relay_send_raw_email(monkeypatch):
+    _verify_example_com(monkeypatch)
     monkeypatch.setenv('SMTP_HOST', 'localhost:2525')
     from ministack.services.ses import _send_raw_email
     mock_smtp = MagicMock()
@@ -483,6 +492,7 @@ def test_ses_smtp_relay_send_raw_email(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_ses_smtp_relay_send_templated_email(monkeypatch):
+    _verify_example_com(monkeypatch)
     monkeypatch.setenv('SMTP_HOST', 'localhost:1025')
     from ministack.services.ses import _send_templated_email, _templates
     _templates['MyTemplate'] = {
@@ -793,6 +803,7 @@ def test_ses_resources_and_send_statistics_are_region_scoped():
     east_before = east.get_send_quota()["SentLast24Hours"]
     west_before = west.get_send_quota()["SentLast24Hours"]
     for client, label in ((east, "east"), (west, "west")):
+        client.verify_email_identity(EmailAddress=f"{label}-{identity}")
         client.send_email(
             Source=f"{label}-{identity}",
             Destination={"ToAddresses": ["recipient@example.com"]},
@@ -965,3 +976,94 @@ def test_ses_v2_restore_legacy_state_maps_unregionalized_values_to_boot_region()
             assert store.get_scoped(account_id, foreign_region, resource_key) is None
     finally:
         service.reset()
+
+
+def _ses_clients(region):
+    import boto3
+    from botocore.config import Config
+
+    kw = dict(endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+              aws_access_key_id="test", aws_secret_access_key="test", region_name=region,
+              config=Config(retries={"mode": "standard"}))
+    return boto3.client("ses", **kw), boto3.client("sesv2", **kw)
+
+
+def test_ses_sandbox_account_only_sends_to_verified_or_simulator_recipients():
+    # Account state is per region; a region of its own keeps other tests in production.
+    v1, v2 = _ses_clients("ap-southeast-4")
+    s = _uuid_mod.uuid4().hex[:8]
+    sender, verified = f"sender-{s}.example.com", f"ok-{s}@example.com"
+    v2.create_email_identity(EmailIdentity=sender)
+    v2.create_email_identity(EmailIdentity=verified)
+    assert v2.get_account()["ProductionAccessEnabled"] is True
+    content = {"Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}}}
+    try:
+        v2.put_account_details(MailType="TRANSACTIONAL", WebsiteURL="https://example.com",
+                               ProductionAccessEnabled=False)
+        account = v2.get_account()
+        assert account["ProductionAccessEnabled"] is False
+        assert account["Details"]["MailType"] == "TRANSACTIONAL"
+
+        def v2_send(to):
+            return v2.send_email(FromEmailAddress=f"app@{sender}",
+                                 Destination={"ToAddresses": [to]}, Content=content)
+
+        v2_send(verified)
+        v2_send("success@simulator.amazonses.com")
+        unverified = f"nobody-{s}@unverified.example.invalid"
+        message = ("Email address is not verified. The following identities failed the check "
+                   f"in region AP-SOUTHEAST-4: {unverified}")
+        with pytest.raises(ClientError) as exc:
+            v2_send(unverified)
+        assert exc.value.response["Error"]["Code"] == "MessageRejected"
+        assert exc.value.response["Error"]["Message"] == message
+        with pytest.raises(ClientError) as exc:
+            v1.send_email(Source=f"app@{sender}", Destination={"ToAddresses": [unverified]},
+                          Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+        assert exc.value.response["Error"]["Code"] == "MessageRejected"
+
+        tpl = f"tpl-{s}"
+        v2.create_email_template(TemplateName=tpl, TemplateContent={"Subject": "s", "Text": "b"})
+        results = v2.send_bulk_email(
+            FromEmailAddress=f"app@{sender}",
+            DefaultContent={"Template": {"TemplateName": tpl, "TemplateData": "{}"}},
+            BulkEmailEntries=[{"Destination": {"ToAddresses": [verified]}},
+                              {"Destination": {"ToAddresses": [unverified]}}])["BulkEmailEntryResults"]
+        assert [r["Status"] for r in results] == ["SUCCESS", "MESSAGE_REJECTED"]
+        assert results[1]["Error"] == message
+
+        v2.put_account_details(MailType="TRANSACTIONAL", WebsiteURL="https://example.com",
+                               ProductionAccessEnabled=True)
+        v2_send(unverified)
+    finally:
+        v2.put_account_details(MailType="TRANSACTIONAL", WebsiteURL="https://example.com",
+                               ProductionAccessEnabled=True)
+
+
+def test_ses_send_from_an_unverified_sender_is_rejected():
+    v1, v2 = _ses_clients("ap-southeast-5")
+    s = _uuid_mod.uuid4().hex[:8]
+    domain, address = f"verified-{s}.example.com", f"Person-{s}@other.example.org"
+    v2.create_email_identity(EmailIdentity=domain)
+    v1.verify_email_identity(EmailAddress=address)
+    content = {"Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}}}
+
+    def send(sender):
+        return v2.send_email(FromEmailAddress=sender, Destination={"ToAddresses": ["to@example.com"]},
+                             Content=content)
+
+    send(f"app@{domain}")
+    send(f"app@mail.{domain}")  # a verified domain covers its subdomains
+    send(address)
+    unverified = f"person-{s}@other.example.org"  # address identities are case-sensitive
+    for sender in (unverified, f"app@unverified-{s}.example.invalid"):
+        with pytest.raises(ClientError) as exc:
+            send(sender)
+        assert exc.value.response["Error"]["Code"] == "MessageRejected"
+        assert exc.value.response["Error"]["Message"] == (
+            "Email address is not verified. The following identities failed the check "
+            f"in region AP-SOUTHEAST-5: {sender}")
+    with pytest.raises(ClientError) as exc:
+        v1.send_email(Source=unverified, Destination={"ToAddresses": ["to@example.com"]},
+                      Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+    assert exc.value.response["Error"]["Code"] == "MessageRejected"
