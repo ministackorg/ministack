@@ -13,6 +13,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`.
 
+### Fixed
+
+- **CloudFormation — `Ref` to a list parameter** — a `Ref` to a `CommaDelimitedList` or `List<...>` parameter gave the value as one string, such as `"attr_a, attr_b"`, not a list. A list property got this string, and each character became one member: `NonKeyAttributes: !Ref Projected` gave a GSI with the attributes `a`, `t`, `t`, `r`, and so on. `!Join` also joined each character. `Ref` now gives a list, such as `["attr_a", "attr_b"]`, with the spaces after the commas removed. A list in the `Parameters` of an `AWS::CloudFormation::Stack` now fails that resource, as on AWS. To pass a list to a nested stack, use `!Join [",", !Ref Names]`. Contributed by @mishukdutta-cz.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

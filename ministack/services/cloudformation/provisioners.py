@@ -3921,6 +3921,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
+        if any(isinstance(v, list) for v in raw_param_props.values()):
+            # AWS fails a list here, for example a Ref to a CommaDelimitedList
+            raise ValueError("Value of property Parameters must be an object with String (or simple type) properties")
         provided_params = [
             {"Key": k, "Value": "" if v is None else str(v)}
             for k, v in raw_param_props.items()
