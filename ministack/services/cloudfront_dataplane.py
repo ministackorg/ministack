@@ -1,53 +1,9 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""CloudFront data plane — actually serves a distribution's traffic.
+"""CloudFront data plane: serves viewer requests to ``<label>.cloudfront.net`` / ``<label>.cloudfront.<MINISTACK_HOST>``.
 
-``ministack/services/cloudfront.py`` is the CloudFront control plane: it
-persists distributions, functions, and policies and answers the CloudFront
-REST/XML API. It never serves a byte of viewer traffic — MiniStack's
-CloudFront is otherwise control-plane only. This module is the data plane:
-routed in by ``app.py`` whenever a viewer request's Host is
-``<label>.cloudfront.net`` or ``<label>.cloudfront.<MINISTACK_HOST>`` and
-``<label>`` matches a stored distribution's DomainName.
-
-Modelled, at AWS parity for the pieces real deployments use:
-  * a custom origin (``CustomOriginConfig``) or an S3 origin
-    (``S3OriginConfig``), selected per matched cache behavior —
-    ``DefaultCacheBehavior`` plus ordered ``CacheBehaviors``, first
-    ``PathPattern`` match wins, CloudFront glob semantics (``*`` any chars
-    incl. ``/``, ``?`` one char, case-sensitive);
-  * what reaches the origin: the union of a cache policy's
-    ParametersInCacheKeyAndForwardedToOrigin and an attached origin request
-    policy (CloudFront Developer Guide, "Understand how origin request
-    policies and cache policies work together"), or a legacy
-    ``ForwardedValues`` block when the behavior has no cache policy at all;
-  * ``ViewerProtocolPolicy``, ``AllowedMethods``, ``DefaultRootObject``,
-    and a custom origin's ``OriginPath``/``CustomHeaders``;
-  * ``viewer-request``/``viewer-response`` CloudFront Functions
-    (``cloudfront-js-1.0``/``-2.0``), executed via ``core.cloudfront_js``;
-  * a response-headers policy's custom headers, security headers, and
-    removed headers;
-  * the response headers CloudFront itself adds (``Via``, ``X-Cache``,
-    ``X-Amz-Cf-Pop``, ``X-Amz-Cf-Id``);
-  * a stacked distribution (an origin that is itself a CloudFront
-    distribution) answers 403 instead of recursing.
-
-Not modelled: caching itself (every request reaches the origin —
-``CachingDisabled`` is the simplest fit and nothing here varies by TTL), WAF,
-logging, geo/IP restrictions, custom error pages, signed URLs/cookies,
-Lambda@Edge, CORS preflight responses (CloudFront's response-headers-policy
-CORS docs describe header values added to whatever response already exists;
-nothing documents CloudFront itself answering an OPTIONS preflight instead of
-forwarding it), the two "all viewer headers plus synthetic
-``CloudFront-*``" origin request policies' extra geo/device headers (the
-viewer headers themselves still forward; the ~20 synthesized
-``CloudFront-Viewer-*``/``CloudFront-Is-*-Viewer`` headers do not, since
-nothing here needs them), and origins addressed by an AWS hostname (ALB,
-Function URL, execute-api, S3 website endpoints) — refused with CloudFront's
-502 before a socket opens, since this emulator never dials a real AWS host.
-A custom origin is otherwise dialed at its own DomainName/HTTPPort or
-HTTPSPort exactly as configured; an explicit ``:port`` in its DomainName,
-which MiniStack's own endpoints carry, overrides those.
+Not modelled: caching, WAF, logging, geo restrictions, custom error pages, signed URLs and cookies,
+Lambda@Edge, CORS preflight, synthetic ``CloudFront-Viewer-*`` headers, origins at AWS hostnames (502).
 """
 
 import base64
@@ -70,17 +26,10 @@ from ministack.services import cloudfront, s3
 logger = logging.getLogger("cloudfront_dataplane")
 
 _HOP_BY_HOP_REQUEST_HEADERS = {"host", "cookie", "content-length", "connection", "transfer-encoding"}
-# A narrower set used only at the actual socket boundary (_forward_to_origin):
-# by that point Host and Cookie have already been deliberately recomputed by
-# the caller (per the forwarding policy and the Host-forwarding rule) and
-# must survive, unlike the other hop-by-hop headers HTTP itself manages.
+# Hop-by-hop headers dropped at the socket boundary (_forward_to_origin).
 _CONNECTION_MANAGEMENT_HEADERS = {"content-length", "connection", "transfer-encoding"}
 
-# Forwarded regardless of any cache-policy/origin-request-policy header
-# configuration (CloudFront Developer Guide, "HTTP request headers and
-# CloudFront behavior (custom and Amazon S3 origins)": Range and the
-# conditional-GET headers are listed as always forwarded, not gated on
-# whether you've configured CloudFront to forward them).
+# Always forwarded, whatever the policies say (Developer Guide, request headers table).
 _ALWAYS_FORWARD_REQUEST_HEADERS = {
     "range", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
 }
@@ -101,10 +50,7 @@ class CloudFrontFunctionError(Exception):
 
 
 def _title_case_header_name(name: str) -> str:
-    """"example-header-name" -> "Example-Header-Name" — the conversion
-    CloudFront Functions applies to every header name when it converts the
-    event object back into an HTTP request or response. ASCII letters only;
-    left untouched otherwise, matching the documented behavior."""
+    """"example-header-name" -> "Example-Header-Name", as CloudFront Functions title-case header names."""
     return "-".join(part[:1].upper() + part[1:] if part[:1].isascii() else part for part in name.split("-"))
 
 
@@ -131,10 +77,7 @@ def _event_cookies_from_header(cookie_header: str) -> dict:
 
 
 def _event_cookies_from_set_cookie(set_cookie) -> dict:
-    """The response.cookies event object built from one or more raw
-    Set-Cookie header values, grouped by cookie name with a ``multiValue``
-    array for repeats and an ``attributes`` string carrying everything after
-    the first ``;`` (functions-event-structure.html, "Cookie attributes")."""
+    """The response.cookies event object built from raw Set-Cookie header values."""
     values = set_cookie if isinstance(set_cookie, list) else ([set_cookie] if set_cookie else [])
     cookies = {}
     for raw in values:
@@ -174,12 +117,7 @@ def _event_querystring(query_params: dict) -> dict:
 
 
 def _merge_function_headers(original_headers_obj: dict, returned_headers_obj: dict) -> dict:
-    """A name(lowercase)->value dict built from a function's returned headers
-    object. functions-event-structure.html: a header whose ``multiValue``
-    field is unchanged from what the event carried is read only for its
-    primary ``value`` (the function is assumed to have edited just that),
-    and the rest of that header's original values carry through unedited; a
-    header whose ``multiValue`` did change is read in full instead."""
+    """A name(lowercase)->value dict built from a function's returned headers object."""
     original = original_headers_obj or {}
     out = {}
     for name, field in (returned_headers_obj or {}).items():
@@ -249,9 +187,7 @@ async def _run_function(function_arn: str, event: dict) -> dict:
     if code is None:
         raise CloudFrontFunctionError(f"{function_arn} has no published (LIVE) code")
     try:
-        # A function cannot call back into MiniStack (no network access in
-        # its sandbox — see core.cloudfront_js), so this is run_offloop work,
-        # same as the S3 origin fetch (core.concurrency).
+        # A function cannot call back into MiniStack, so this is run_offloop work.
         return await run_offloop(cloudfront_js.evaluate, code, event)
     except cloudfront_js.CloudFrontFunctionError as exc:
         raise CloudFrontFunctionError(str(exc)) from exc
@@ -263,11 +199,7 @@ async def _run_function(function_arn: str, event: dict) -> dict:
 
 
 def _glob_to_regex(pattern: str):
-    # "You can optionally include a slash (/) at the beginning of the path
-    # pattern... If you don't specify the / at the beginning of the path,
-    # this character is automatically implied; CloudFront treats the path
-    # the same with or without the leading /" (CloudFront Developer Guide,
-    # "Path pattern").
+    # A leading / in a path pattern is optional (Developer Guide, "Path pattern").
     if not pattern.startswith("/"):
         pattern = "/" + pattern
     out = [".*" if ch == "*" else "." if ch == "?" else _re_escape(ch) for ch in pattern]
@@ -282,22 +214,12 @@ def _match_behavior(parsed: dict, path: str):
 
 
 # ---------------------------------------------------------------------------
-# Origin-request forwarding — CloudFront Developer Guide, "Understand how
-# origin request policies and cache policies work together" (the table of
-# None/All/Allow-list/Block-list combinations this reproduces) plus legacy
-# ``ForwardedValues`` ("Control origin requests with a policy": "With legacy
-# cache settings, CloudFront forwards the headers to your origin by
-# default").
+# Origin-request forwarding: the cache policy / origin request policy combination table (Developer Guide).
 # ---------------------------------------------------------------------------
 
 
 def _behavior_kind(behavior: str, names, lowercase: bool = False):
-    """A cache-policy or origin-request-policy behavior value, reduced to a
-    (kind, set) pair the combinator below understands. ``allViewer`` and
-    ``allViewerAndWhitelistCloudFront`` (origin-request-policy-only header
-    behaviors) both forward every viewer header, so both map to "all" —
-    this module doesn't synthesize the ~20 CloudFront-added geo/device
-    headers the second one also adds (see module docstring)."""
+    """A cache or origin request policy behavior value as a (kind, set) pair."""
     names = [n.lower() for n in (names or [])] if lowercase else list(names or [])
     if behavior in ("all", "allViewer", "allViewerAndWhitelistCloudFront"):
         return ("all", None)
@@ -309,10 +231,7 @@ def _behavior_kind(behavior: str, names, lowercase: bool = False):
 
 
 def _combine_forward(cache_kind_set, orp_kind_set, name: str) -> bool:
-    """Whether ``name`` reaches the origin, per the cache-policy /
-    origin-request-policy combination table. ``orp_kind_set`` is None when
-    the behavior has no origin request policy at all (same result as an
-    origin request policy whose behavior is "none" for every category)."""
+    """Whether ``name`` reaches the origin, per the cache-policy / origin-request-policy combination table."""
     cache_kind, cache_set = cache_kind_set
     if cache_kind == "all":
         return True  # a cache policy's "all" always wins, even over an ORP block list
@@ -343,10 +262,7 @@ def _combine_forward(cache_kind_set, orp_kind_set, name: str) -> bool:
 
 
 def _legacy_predicates(fv: dict):
-    """Forwarding predicates for a behavior that has no CachePolicyId — a
-    legacy ``ForwardedValues`` block instead (AWS requires a cache policy
-    before an origin request policy can be attached, so legacy behaviors
-    never carry one)."""
+    """Forwarding predicates for a legacy ``ForwardedValues`` behavior (no CachePolicyId)."""
     header_names = {n.lower() for n in (fv.get("headers") or [])}
     forward_all_headers = "*" in (fv.get("headers") or [])
     cookies_forward = fv.get("cookies_forward", "none")
@@ -415,22 +331,12 @@ def _forwarding_predicates(behavior: dict):
 
 
 def _cors_origin_allowed(allow_origins: list, viewer_origin: str) -> bool:
-    """AccessControlAllowOrigins entries: "*" or an origin value matched the
-    way the response-headers-policy CORS doc's wildcard examples show
-    (``*`` only ever a glob over the whole value here, not AWS's narrower
-    leftmost-subdomain validation rule — that rule constrains what a policy
-    may be *created* with, not what this module needs to match against)."""
+    """Whether ``viewer_origin`` matches an AccessControlAllowOrigins entry ("*" or a glob)."""
     return any(p == "*" or fnmatch.fnmatchcase(viewer_origin, p) for p in allow_origins or [])
 
 
 def _apply_cors_headers(headers: dict, cors_cfg: dict, viewer_origin: str, method: str) -> dict:
-    """Response-headers-policy CORS config (CloudFront Developer Guide,
-    "Understand response headers policies" > "CORS headers"): these are
-    headers added to a response to a CORS request, so nothing here applies
-    unless the viewer request carried an Origin header. Access-Control-
-    Allow-Headers/-Methods/-Max-Age are documented as values for
-    *preflight* responses specifically; Allow-Origin/-Credentials/-Expose-
-    Headers apply to any CORS response."""
+    """Apply a response headers policy's CORS headers (Developer Guide, "CORS headers")."""
     if not cors_cfg or not viewer_origin or not _cors_origin_allowed(cors_cfg.get("AllowOrigins"), viewer_origin):
         return headers
     result = dict(headers)
@@ -468,9 +374,7 @@ def _apply_response_headers_policy(headers: dict, policy_cfg: dict, viewer_origi
             return
         result[key] = value
 
-    # CustomHeaders/RemoveHeaders are None (not []) when the create request
-    # never supplied that block at all, distinct from supplying an empty one
-    # — `or []` covers both "absent" and "empty".
+    # CustomHeaders/RemoveHeaders are None when the policy never supplied that block.
     for item in policy_cfg.get("CustomHeaders") or []:
         _set(item["Header"], item["Value"], item["Override"])
 
@@ -535,12 +439,7 @@ def _render_headers(headers: dict, title_case: bool) -> dict:
     return {_title_case_header_name(name): value for name, value in headers.items()}
 
 
-# Mirrors the fixed body CloudFront's own synthesized error pages use — a
-# "The request could not be satisfied" title/heading across status codes,
-# with only the numeric status and explanation paragraph varying — observed
-# from live responses rather than published in the CloudFront Developer
-# Guide, so the per-status explanation text below is inference, not an
-# AWS-confirmed value.
+# The fixed body of CloudFront's own error pages ("The request could not be satisfied").
 _CF_ERROR_TEMPLATE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
 <HTML><HEAD><META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
 <TITLE>ERROR: The request could not be satisfied</TITLE>
@@ -566,12 +465,7 @@ def _cf_error_response(status: int, explanation: str, x_cache: str) -> tuple:
     return status, _render_headers(headers, title_case=True), body
 
 
-# CloudFront Developer Guide, http-502-bad-gateway.html: "the SSL/TLS
-# handshake fails, and CloudFront returns an HTTP status code 502 (Bad
-# Gateway) and sets the X-Cache header to Error from cloudfront" — the only
-# documented X-Cache value for a CloudFront-synthesized error; applied here
-# to every such response (unreachable origin, blocked method, protocol
-# policy, function failure), not only the SSL case the doc names.
+# A failed origin TLS handshake is a 502 (Developer Guide, http-502-bad-gateway).
 _ERROR_X_CACHE = "Error from cloudfront"
 
 
@@ -588,12 +482,7 @@ class OriginTimeout(Exception):
     """The origin didn't respond within OriginReadTimeout."""
 
 
-# A custom origin's DomainName can be AWS-owned-shaped — an execute-api/ALB/
-# Lambda-URL/S3 host Terraform computed from a MiniStack-run resource, using
-# AWS's own naming template. It is never dialed: refused with a 502 before a
-# socket opens (module docstring's Not-modelled list). Every other origin,
-# including a plain MiniStack-local host, is dialed at its own DomainName and
-# port exactly as configured (sns.py's HTTP delivery precedent).
+# An origin addressed by an AWS-owned hostname is refused with 502, so no traffic reaches real AWS.
 _AWS_OWNED_HOST_SUFFIXES = (".amazonaws.com", ".amazonaws.com.cn", ".on.aws", ".api.aws", ".cloudfront.net")
 
 
@@ -611,12 +500,6 @@ def _origin_connect_target(origin: dict, viewer_is_https: bool) -> tuple:
     DomainName and HTTPPort/HTTPSPort, dialed exactly as configured."""
     policy = origin["protocol_policy"]
     use_https = policy == "https-only" or (policy == "match-viewer" and viewer_is_https)
-    # MiniStack's own endpoints carry the gateway port (an HTTP API's apiEndpoint
-    # is `https://<id>.execute-api.<host>:4566`), so an origin built from one
-    # names it; AWS itself takes ports only from HTTPPort/HTTPSPort.
-    host, sep, port = origin["domain_name"].rpartition(":")
-    if sep and port.isdigit():
-        return host, int(port), use_https
     port = origin["https_port"] if use_https else origin["http_port"]
     return origin["domain_name"], port, use_https
 
@@ -635,10 +518,7 @@ def _origin_ssl_context() -> ssl.SSLContext:
 
 
 def _set_header_ci(headers: dict, name: str, value) -> None:
-    """Set ``name: value``, dropping any existing key that matches
-    case-insensitively first — otherwise a lowercase viewer-forwarded key and
-    a freshly Title-Cased one (e.g. a forwarded "host" plus this module's own
-    "Host") both survive as distinct dict keys and become two header lines."""
+    """Set ``name: value``, replacing any case-insensitive match."""
     for existing in [k for k in headers if k.lower() == name.lower()]:
         del headers[existing]
     headers[name] = value
@@ -664,15 +544,11 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
     fwd_headers = {k: v for k, v in headers.items() if k not in _CONNECTION_MANAGEMENT_HEADERS}
     for name, value in origin.get("custom_headers") or []:
         _set_header_ci(fwd_headers, name, value)
-    # Host defaults to the origin's own configured DomainName — CloudFront's
-    # own default Host selection — unless the forwarding policy carries the
-    # viewer's.
+    # Host is the origin's DomainName unless the policies forward the viewer's Host.
     _set_header_ci(fwd_headers, "Host", headers.get("host", origin["domain_name"]))
     _set_header_ci(fwd_headers, "Via", f"1.1 {_cf_via_hash()}.cloudfront.net (CloudFront)")
     _set_header_ci(fwd_headers, "X-Amz-Cf-Id", _cf_request_id())
-    # Always appended regardless of the forwarding policy (CloudFront
-    # Developer Guide, "Client IP addresses"), from the viewer's own XFF, not
-    # whatever the policy let through into `headers`.
+    # Always appended (Developer Guide, "Client IP addresses").
     _set_header_ci(fwd_headers, "X-Forwarded-For",
                     _origin_x_forwarded_for(viewer_x_forwarded_for, client_ip))
     # RFC 9110 §5.3: a repeated field value is one comma-joined line.
@@ -695,9 +571,7 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
     except TimeoutError as e:
         raise OriginTimeout(str(e)) from e
     except Exception as e:
-        # Covers an unreachable origin and a custom origin's untrusted/
-        # self-signed certificate failing verification (see
-        # http-502-bad-gateway.html's self-signed/expired/invalid-chain case).
+        # An unreachable origin, or an untrusted or self-signed origin certificate.
         raise OriginUnreachable(str(e)) from e
     finally:
         conn.close()
@@ -709,19 +583,15 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
 
 
 def _s3_object_key(origin: dict, uri: str) -> str:
-    """CloudFront concatenates OriginPath directly in front of the request
-    URI to build what reaches the origin. S3 keys are stored decoded, so the
-    percent-encoding forwarded verbatim to a custom origin is decoded here
-    instead, and the leading slash dropped."""
+    """OriginPath prefixed to the request URI, as CloudFront builds the origin path."""
     return unquote((origin.get("origin_path") or "") + uri).lstrip("/")
 
 
-def _serve_s3_origin(origin: dict, method: str, uri: str, headers: dict) -> tuple:
-    """Blocking: run under core.concurrency.run_offloop (an in-process store
-    read, never re-entrant). Mirrors _forward_to_origin's calling convention
-    (status, headers, body — no reason phrase; the caller derives one from
-    the status)."""
-    return s3.serve_cloudfront_origin_fetch(origin["s3_bucket"], _s3_object_key(origin, uri), method, headers)
+def _serve_s3_origin(origin: dict, method: str, uri: str, headers: dict, dist_arn: str = "") -> tuple:
+    """Fetch from an S3 origin in-process (blocking; run off the event loop)."""
+    return s3.serve_cloudfront_origin_fetch(
+        origin["s3_bucket"], _s3_object_key(origin, uri), method, headers,
+        source_arn=dist_arn if origin.get("oac_id") else "", oai_id=origin.get("oai_id", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -758,14 +628,7 @@ def _strip_hop_by_hop_response_headers(headers: dict) -> dict:
 
 def _check_viewer_protocol_policy(behavior: dict, method: str, viewer_is_https: bool, request_uri: str,
                                    query_string: str, headers: dict):
-    """A redirect/forbid response, or None to continue. CloudFront Developer
-    Guide, "Require HTTPS for communication between viewers and CloudFront" >
-    "Require HTTPS for viewers": redirect-to-https sends 301 (GET/HEAD) or
-    307 (other methods, HTTP/1.1+ — "This guarantees that the request is
-    sent again to the new location using the same method and body payload")
-    with the HTTPS URL; https-only answers plain HTTP with 403. (The same
-    page also documents a 403 for a non-idempotent method on pre-HTTP/1.1 —
-    out of scope here: this module has no HTTP-version signal.)"""
+    """A redirect/forbid response, or None to continue."""
     policy = behavior.get("viewer_protocol_policy", "allow-all")
     if viewer_is_https or policy == "allow-all":
         return None
@@ -805,11 +668,7 @@ def _apply_default_root_object(default_root_object: str, request_uri: str) -> st
 
 
 def _check_stacked_distribution(headers: dict):
-    """CloudFront Developer Guide, http-403-permission-denied.html, "Stacked
-    distributions cause a 403 error": a request that already carries this
-    hop's own Via marker (`_forward_to_origin` always stamps one) is refused
-    rather than forwarded again, so a distribution fronting itself fails
-    fast instead of recursing forever."""
+    """403 for a request that already passed through this hop (Developer Guide, stacked distributions)."""
     if "(cloudfront)" in headers.get("via", "").lower():
         return _cf_error_response(
             403, "This distribution is configured to serve another CloudFront distribution as its origin.",
@@ -825,17 +684,7 @@ def _check_stacked_distribution(headers: dict):
 
 async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
                           headers: dict, body: bytes, query_params: dict, client_ip: str = "127.0.0.1") -> tuple:
-    """Serve one viewer request against ``dist`` (a cloudfront.py distribution
-    record). Returns an (status, headers, body) tuple in the shape the ASGI
-    gateway sends directly to the client.
-
-    ``path`` is the ASGI-decoded path (used only for cache-behavior
-    path-pattern matching); ``raw_uri`` and ``raw_query_string`` are the
-    request target exactly as the viewer sent it, percent-encoding intact,
-    for forwarding byte-exact when nothing rewrites them (CloudFront
-    Developer Guide, "Restrictions on all edge functions" > "URI, query
-    string, and headers encoding"). ``client_ip`` is the TCP peer's address.
-    """
+    """Serve one viewer request against ``dist`` (a cloudfront.py distribution record)."""
     stacked_response = _check_stacked_distribution(headers)
     if stacked_response is not None:
         return stacked_response
@@ -878,10 +727,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
             return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)
 
         if isinstance(result, dict) and "statusCode" in result:
-            # Function-generated response: CloudFront returns it to the
-            # viewer WITHOUT forwarding to the origin, running the
-            # viewer-response function, or applying the response-headers
-            # policy (functions-event-structure.html).
+            # A function-generated response goes straight to the viewer, skipping the origin.
             resp_headers = _merge_function_headers(None, result.get("headers"))
             resp_headers = _add_cloudfront_headers(resp_headers, "FunctionGeneratedResponse from cloudfront")
             set_cookie_values = _set_cookie_values_from_event(result.get("cookies"))
@@ -889,15 +735,11 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
                 resp_headers["set-cookie"] = (
                     set_cookie_values if len(set_cookie_values) > 1 else set_cookie_values[0]
                 )
-            # statusDescription has no outlet: ASGI's http.response.start
-            # carries only a numeric status, no reason-phrase field, so
-            # there is nowhere to forward it to the viewer wire response.
+            # statusDescription is dropped: ASGI carries no reason phrase.
             resp_body = _body_from_response_event(result, b"")
             return result["statusCode"], _render_headers(resp_headers, title_case=True), resp_body
 
-        # Request-side headers stay lowercase-keyed internally; every
-        # viewer-facing response is Title-Cased once, at its single return
-        # point, rather than a decision repeated per header.
+        # Request headers stay lowercase internally; responses are Title-Cased once, on return.
         req = result if isinstance(result, dict) else event["request"]
         request_uri = req.get("uri", request_uri)
         request_headers = _merge_function_headers(event["request"]["headers"], req.get("headers"))
@@ -907,11 +749,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
             request_headers["cookie"] = "; ".join(cookie_pairs)
         qs_field = req.get("querystring")
         if isinstance(qs_field, str):
-            # A function rearranged the querystring into a literal string
-            # (functions-event-structure.html, "Query strings values or
-            # query string objects"). It can no longer be decomposed by
-            # parameter name for cache/origin-request-policy filtering, so
-            # it is forwarded to the origin exactly as returned.
+            # A function rewrote the querystring as a literal string (functions-event-structure).
             literal_query_string = qs_field
             request_query = {}
         elif qs_field is not None:
@@ -940,11 +778,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
     if header_allowed("user-agent") and "user-agent" in request_headers:
         fwd_headers["user-agent"] = request_headers["user-agent"]
     else:
-        # CloudFront Developer Guide, "User-Agent header": "CloudFront adds
-        # this header regardless of whether the request from the viewer
-        # includes a User-Agent header. If the request from the viewer
-        # includes a User-Agent header, CloudFront removes it" — unless the
-        # policy forwards it (handled above), replace it unconditionally.
+        # User-Agent is "Amazon CloudFront" unless forwarded (Developer Guide, "User-Agent header").
         fwd_headers["user-agent"] = "Amazon CloudFront"
     if forward_host:
         fwd_headers["host"] = request_headers.get("host", "")
@@ -965,7 +799,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
 
     if origin.get("s3_bucket"):
         status, origin_headers_list, origin_body = await run_offloop(
-            _serve_s3_origin, origin, method, request_uri, fwd_headers,
+            _serve_s3_origin, origin, method, request_uri, fwd_headers, dist.get("ARN", ""),
         )
         reason = http.client.responses.get(status, "")
         origin_headers = _multidict_from_pairs(origin_headers_list.items() if isinstance(origin_headers_list, dict)
@@ -973,9 +807,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
     else:
         full_uri = (origin.get("origin_path") or "") + request_uri
         try:
-            # The origin may be MiniStack's own gateway (e.g. a distribution
-            # deliberately fronting another MiniStack-hosted service) — a
-            # bounded pool here could deadlock against itself.
+            # The origin may be MiniStack's own gateway, so the call must be reentrant.
             status, reason, origin_headers_list, origin_body = await run_reentrant(
                 _forward_to_origin, origin, method, full_uri, forward_qs, fwd_headers, body, viewer_is_https,
                 client_ip, request_headers.get("x-forwarded-for", ""),
@@ -996,10 +828,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
     response_body = origin_body
 
     response_function_arn = behavior["functions"].get("viewer-response")
-    # CloudFront does not invoke a viewer-response function when the origin
-    # answers 400 or above (functions-event-structure.html, "Status code and
-    # body" note); the response-headers policy above still applies to that
-    # response, only the function is skipped.
+    # No viewer-response function runs when the origin answers 400 or above.
     if response_function_arn and status < 400:
         event = _build_function_event(
             "viewer-response", dist_id, dist_domain, request_id,
@@ -1013,9 +842,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
             return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)
         response = result if isinstance(result, dict) else event["response"]
         status = response.get("statusCode", status)
-        # Replace, not merge: the returned headers object is the complete
-        # set the function wants sent, so a header it deleted must stay gone
-        # rather than survive from the pre-function response.
+        # Replace, not merge: a header the function deleted stays gone.
         response_headers = _merge_function_headers(event["response"]["headers"], response.get("headers"))
         set_cookie_values = _set_cookie_values_from_event(response.get("cookies"))
         if set_cookie_values:
