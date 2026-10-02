@@ -1440,9 +1440,23 @@ def _sqs_queue_fields(props, is_fifo):
     return fields
 
 
+def _sqs_queue_name(props, stack_name, logical_id):
+    """The queue name, which ends in .fifo exactly when FifoQueue is true."""
+    is_fifo = _cfn_bool(props.get("FifoQueue"))
+    name = props.get("QueueName")
+    if not name:
+        name = _physical_name(stack_name, logical_id, max_len=75 if is_fifo else 80)
+        name += ".fifo" if is_fifo else ""
+    elif name.endswith(".fifo") != is_fifo:
+        raise _sqs._Err("InvalidParameterValue", (
+            "The name of a FIFO queue can only include alphanumeric characters, hyphens, or "
+            "underscores, must end with .fifo suffix and be 1 to 80 in length." if is_fifo else
+            "Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length"))
+    return name, is_fifo
+
+
 def _sqs_create(logical_id, props, stack_name):
-    name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
-    is_fifo = name.endswith(".fifo")
+    name, is_fifo = _sqs_queue_name(props, stack_name, logical_id)
     attributes = _sqs_queue_fields(props, is_fifo)
     url = _sqs._queue_url_for_account(get_account_id(), name)
     arn = f"arn:aws:sqs:{get_region()}:{get_account_id()}:{name}"
@@ -1469,14 +1483,12 @@ def _sqs_create(logical_id, props, stack_name):
 def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a queue's attributes in place, keeping its messages.
 
-    QueueName (and the .fifo suffix it implies) is create-only on AWS: a
-    change is a replacement, so the new queue is created and the old one
-    removed. Everything else maps onto SetQueueAttributes semantics — the
+    QueueName and FifoQueue are create-only on AWS: a change is a
+    replacement, so the new queue is created and the old one removed.
+    Everything else maps onto SetQueueAttributes semantics — the
     queue record (URL, messages, dedup state) survives.
     """
-    name = new_props.get("QueueName") or _physical_name(
-        stack_name, logical_id or physical_id, max_len=80
-    )
+    name, _ = _sqs_queue_name(new_props, stack_name, logical_id or physical_id)
     queue = _sqs._queues.get(physical_id)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
@@ -10382,6 +10394,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_policies(physical_id)
 
 
 def _asg_lc_create(logical_id, props, stack_name, replacing=""):
@@ -10410,7 +10423,10 @@ def _asg_policy_create(logical_id, props, stack_name):
     policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
-    _asg._policies[key] = _asg._policy_record(asg_name, policy_name, arn, props)
+    record = _asg._policy_record(asg_name, policy_name, arn, props)
+    _asg._delete_policy_alarms(_asg._policies.get(key))
+    _asg._put_tracking_alarms(record)
+    _asg._policies[key] = record
     return arn, {"Arn": arn, "PolicyName": policy_name}
 
 
@@ -10427,6 +10443,8 @@ def _asg_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     if replaced is not None:
         return replaced
     record = _asg._policy_record(asg_name, current["PolicyName"], physical_id, new_props)
+    _asg._delete_policy_alarms(current)
+    _asg._put_tracking_alarms(record)
     current.clear()
     current.update(record)
     return physical_id, {"Arn": physical_id, "PolicyName": current["PolicyName"]}
@@ -10436,7 +10454,7 @@ def _asg_policy_delete(physical_id, props):
     # physical_id is the ARN, find matching key
     for k, v in list(_asg._policies.items()):
         if v.get("PolicyARN") == physical_id:
-            _asg._policies.pop(k, None)
+            _asg._delete_policy_alarms(_asg._policies.pop(k, None))
             break
 
 
