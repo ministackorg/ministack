@@ -780,6 +780,18 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "UserId",
         "requires_replacement": lambda old, new: old.get("UserName") != new.get("UserName"),
     },
+    # The schemas' createOnlyProperties, plus Engine: only conditionally
+    # create-only there, yet a change of engine replaces the resource.
+    "AWS::RDS::DBCluster": {
+        "name": "DBClusterIdentifier",
+        "requires_replacement": lambda old, new: any(
+            old.get(p) != new.get(p) for p in _RDS_DB_CLUSTER_CREATE_ONLY + ("Engine",)),
+    },
+    "AWS::RDS::DBInstance": {
+        "name": "DBInstanceIdentifier",
+        "requires_replacement": lambda old, new: any(
+            old.get(p) != new.get(p) for p in _RDS_DB_INSTANCE_CREATE_ONLY + ("Engine",)),
+    },
     # Type and WorkflowName are "Update requires: Replacement" in the
     # aws-resource-glue-trigger reference.
     "AWS::Glue::Trigger": {
@@ -878,14 +890,13 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with five exceptions. Four have a
-    deterministic generated name (the DynamoDB table, the Location tracker,
-    the IoT thing type and the Glue trigger): the replacement takes the name
-    back, so there is nothing left to retain. The fifth is the Lambda
-    permission's degenerate ``Id`` branch,
-    which removes and re-puts one statement under a Sid that cannot change:
-    the physical id is kept, nothing is replaced, and the policy does not
-    apply.
+    cannot be forgotten at one site, with these exceptions. The DynamoDB
+    table, the Location tracker, the IoT thing type, the Glue trigger and the
+    RDS DB cluster and instance have a deterministic generated name: the
+    replacement takes the name back, so there is nothing left to retain. The
+    other is the Lambda permission's degenerate ``Id`` branch, which removes
+    and re-puts one statement under a Sid that cannot change: the physical id
+    is kept, nothing is replaced, and the policy does not apply.
     """
     if _RETAIN_REPLACED.get():
         return
@@ -4052,20 +4063,22 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
     using-cfn-nested-stacks), so the set the parent stored covers the child
     and, through the child's own record, every level below it. Like the
-    parent's check this runs under AUTH=true only, and it reads the IAM
-    rule alone: whether a child template's own Transform needs
-    CAPABILITY_AUTO_EXPAND on the parent is not modelled here.
+    parent's check it runs under AUTH=true or CFN_ENFORCE_CAPABILITIES=1. A
+    child template with a macro needs CAPABILITY_AUTO_EXPAND on the parent.
     """
-    from ministack.app import AUTH
-    if not AUTH:
-        return
     from ministack.services.cloudformation.handlers import (
+        _capabilities_enforced,
         _insufficient_capabilities_message,
         _missing_capabilities,
         _required_iam_capabilities,
+        _uses_macro,
     )
-    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)),
-                                    _required_iam_capabilities(template))
+    if not _capabilities_enforced():
+        return
+    required = _required_iam_capabilities(template)
+    if _uses_macro(template):
+        required.append("CAPABILITY_AUTO_EXPAND")
+    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)), required)
     if missing:
         raise ValueError(_insufficient_capabilities_message(missing))
 
@@ -4077,13 +4090,13 @@ def _parent_capabilities(parent_stack_name):
 
 
 def _inherited_capabilities(parent_stack_name):
-    """What a child stack's record carries, which is the parent's set under
-    AUTH=true and nothing without it. The set exists to be read by the check
-    on the level below, so recording it where no check runs would only change
-    what DescribeStacks reports on a child.
+    """What a child stack's record carries, which is the parent's set where
+    the check runs and nothing elsewhere. The set exists to be read by the
+    check on the level below, so recording it where no check runs would only
+    change what DescribeStacks reports on a child.
     """
-    from ministack.app import AUTH
-    return _parent_capabilities(parent_stack_name) if AUTH else []
+    from ministack.services.cloudformation.handlers import _capabilities_enforced
+    return _parent_capabilities(parent_stack_name) if _capabilities_enforced() else []
 
 
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
@@ -4188,7 +4201,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         "ParentId": _cr_stack_id(parent_stack_name),
         # The parent's acknowledgement covers every level of nesting, so a
         # child of this child reads the same set. Only the check needs it, so
-        # it is recorded only where the check runs: without AUTH a child's
+        # it is recorded only where the check runs: elsewhere a child's
         # DescribeStacks reports what it reported before, nothing.
         "Capabilities": _inherited_capabilities(parent_stack_name),
     }
@@ -10304,45 +10317,112 @@ def _cf_kvs_delete(physical_id, props):
 # RDS DBCluster
 # ---------------------------------------------------------------------------
 
+# The type schema's createOnlyProperties and conditionalCreateOnlyProperties.
+_RDS_DB_CLUSTER_CREATE_ONLY = (
+    "ClusterScalabilityType", "DBClusterIdentifier", "DBSubnetGroupName", "DBSystemId",
+    "DatabaseName", "EngineMode", "KmsKeyId", "PubliclyAccessible", "RestoreToTime",
+    "RestoreType", "SnapshotIdentifier", "SourceDBClusterIdentifier",
+    "SourceDbClusterResourceId", "SourceRegion", "StorageEncrypted", "UseLatestRestorableTime",
+)
+_RDS_DB_CLUSTER_CONDITIONAL = ("AvailabilityZones", "Engine", "GlobalClusterIdentifier",
+                               "MasterUsername")
+
+
+def _rds_db_cluster_fields(props):
+    """The DBCluster record fields that a stack update changes in place."""
+    engine = props.get("Engine", "aurora-postgresql")
+    return {
+        "Engine": engine,
+        "EngineVersion": props.get("EngineVersion") or _rds._default_engine_version(engine),
+        "Port": int(props.get("Port") or _rds._default_port(engine)),
+        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
+        "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
+        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00"),
+        "ServerlessV2ScalingConfiguration": props.get("ServerlessV2ScalingConfiguration"),
+        "VpcSecurityGroups": [{"VpcSecurityGroupId": sg, "Status": "active"}
+                              for sg in props.get("VpcSecurityGroupIds") or []],
+        "DeletionProtection": _cfn_bool(props.get("DeletionProtection", False)),
+        "CopyTagsToSnapshot": _cfn_bool(props.get("CopyTagsToSnapshot", False)),
+        "IAMDatabaseAuthenticationEnabled": _cfn_bool(props.get("EnableIAMDatabaseAuthentication", False)),
+        "HttpEndpointEnabled": _cfn_bool(props.get("EnableHttpEndpoint", False)),
+        "_MasterUserPassword": props.get("MasterUserPassword", "password"),
+    }
+
+
+def _rds_apply_changed(record, old_fields, new_fields):
+    """Write the fields whose template value changed; values set through the RDS API stay."""
+    record.update({k: v for k, v in new_fields.items() if old_fields.get(k) != v})
+
+
+def _rds_cluster_resource_id():
+    """A new DbClusterResourceId in the shape RDS reports it."""
+    return f"cluster-{new_uuid().replace('-', '')[:20].upper()}"
+
+
+def _rds_db_cluster_attrs(cluster):
+    """The Fn::GetAtt attributes of a DB cluster record."""
+    return {
+        "Arn": cluster["DBClusterArn"],
+        "DBClusterArn": cluster["DBClusterArn"],
+        "DBClusterResourceId": cluster["DbClusterResourceId"],
+        "Endpoint.Address": cluster["Endpoint"],
+        "Endpoint.Port": str(cluster["Port"]),
+        "ReadEndpoint.Address": cluster["ReaderEndpoint"],
+    }
+
+
 def _rds_db_cluster_create(logical_id, props, stack_name):
     cluster_id = props.get("DBClusterIdentifier") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
-    engine = props.get("Engine", "aurora-postgresql")
-    engine_version = props.get("EngineVersion") or _rds._default_engine_version(engine)
-    master_user = props.get("MasterUsername", "admin")
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]
+    created = now_iso()
 
-    _rds._clusters[cluster_id] = {
+    cluster = _rds._clusters[cluster_id] = {
         "DBClusterIdentifier": cluster_id,
         "DBClusterArn": arn,
-        "Engine": engine,
-        "EngineVersion": engine_version,
+        "DbClusterResourceId": _rds_cluster_resource_id(),
         "EngineMode": props.get("EngineMode", "provisioned"),
         "Status": "available",
-        "MasterUsername": master_user,
+        "MasterUsername": props.get("MasterUsername", "admin"),
         "DatabaseName": props.get("DatabaseName", ""),
         "Endpoint": f"{cluster_id}.cluster-{suffix}.{get_region()}.rds.amazonaws.com",
         "ReaderEndpoint": f"{cluster_id}.cluster-ro-{suffix}.{get_region()}.rds.amazonaws.com",
-        "Port": int(props.get("Port", 5432)),
         "MultiAZ": props.get("MultiAZ", False),
         "AvailabilityZones": [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"],
         "DBClusterMembers": [],
-        "VpcSecurityGroups": [],
         "DBSubnetGroup": props.get("DBSubnetGroupName", "default"),
         "StorageEncrypted": props.get("StorageEncrypted", False),
-        "DeletionProtection": props.get("DeletionProtection", False),
-        "CopyTagsToSnapshot": props.get("CopyTagsToSnapshot", False),
         "AllocatedStorage": 1,
-        "ClusterCreateTime": now_iso(),
-        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
+        "ClusterCreateTime": created,
+        "EarliestRestorableTime": created,
+        "LatestRestorableTime": created,
+        **_rds_db_cluster_fields(props),
     }
-    return cluster_id, {
-        "Arn": arn,
-        "ClusterResourceId": f"cluster-{new_uuid()[:20]}",
-        "Endpoint.Address": f"{cluster_id}.cluster-{suffix}.{get_region()}.rds.amazonaws.com",
-        "Endpoint.Port": str(int(props.get("Port", 5432))),
-        "ReadEndpoint.Address": f"{cluster_id}.cluster-ro-{suffix}.{get_region()}.rds.amazonaws.com",
-    }
+    return cluster_id, _rds_db_cluster_attrs(cluster)
+
+
+def _rds_db_cluster_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a DB cluster in place; a create-only property replaces it."""
+    cluster = _rds._clusters.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("DBClusterIdentifier") or _physical_name(
+            stack_name, logical_id or physical_id, lowercase=True, max_len=63),
+        physical_id if cluster is not None else None,
+        _rds_db_cluster_create, _rds_db_cluster_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::RDS::DBCluster", old_props, new_props):
+        # The generated name is deterministic, so the replacement takes it back.
+        _rds_db_cluster_delete(physical_id, old_props)
+        return _rds_db_cluster_create(logical_id or physical_id, new_props, stack_name)
+    # A record saved before the create stored these fields gets them first, so the update cannot fail half-way.
+    cluster.setdefault("DbClusterResourceId", _rds_cluster_resource_id())
+    for key in ("EarliestRestorableTime", "LatestRestorableTime"):
+        cluster.setdefault(key, cluster["ClusterCreateTime"])
+    _rds_apply_changed(cluster, _rds_db_cluster_fields(old_props), _rds_db_cluster_fields(new_props))
+    return physical_id, _rds_db_cluster_attrs(cluster)
 
 
 def _rds_db_cluster_delete(physical_id, props):
@@ -10359,6 +10439,75 @@ def _rds_db_cluster_snapshot(physical_id, props):
 # RDS DBInstance
 # ---------------------------------------------------------------------------
 
+_RDS_DB_INSTANCE_CREATE_ONLY = (
+    "BackupTarget", "CharacterSetName", "CustomIAMInstanceProfile", "DBClusterIdentifier",
+    "DBInstanceIdentifier", "DBName", "DBSubnetGroupName", "DBSystemId", "KmsKeyId",
+    "MasterUsername", "NcharCharacterSetName", "SourceRegion", "StorageEncrypted", "Timezone",
+)
+_RDS_DB_INSTANCE_CONDITIONAL = (
+    "AutoMinorVersionUpgrade", "AvailabilityZone", "BackupRetentionPeriod",
+    "DBClusterSnapshotIdentifier", "DBParameterGroupName", "DBSnapshotIdentifier", "Engine",
+    "MultiAZ", "PerformanceInsightsKMSKeyId", "PreferredMaintenanceWindow", "RestoreTime",
+    "SourceDBClusterIdentifier", "SourceDBInstanceAutomatedBackupsArn",
+    "SourceDBInstanceIdentifier", "SourceDbiResourceId", "UseLatestRestorableTime",
+)
+
+
+def _rds_db_instance_port(props):
+    return int(props.get("Port") or _rds._default_port(props.get("Engine", "postgres")))
+
+
+def _rds_db_instance_fields(props):
+    """The DBInstance record fields that a stack update changes in place."""
+    engine = props.get("Engine", "postgres")
+    engine_version = props.get("EngineVersion") or _rds._default_engine_version(engine)
+    vpc_sgs = props.get("VPCSecurityGroups") or props.get("VpcSecurityGroupIds") or []
+    if isinstance(vpc_sgs, str):
+        vpc_sgs = [vpc_sgs]
+    return {
+        "Engine": engine,
+        "LicenseModel": _rds._license_model(engine),
+        "OptionGroupMemberships": [{
+            "OptionGroupName": f"default:{engine}-{engine_version.split('.')[0]}",
+            "Status": "in-sync",
+        }],
+        "DBInstanceClass": props.get("DBInstanceClass", "db.t3.micro"),
+        "EngineVersion": engine_version,
+        "AllocatedStorage": int(props.get("AllocatedStorage") or 20),
+        "StorageType": props.get("StorageType", "gp2"),
+        "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
+        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
+        "VpcSecurityGroups": [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs],
+        "DBParameterGroups": [{
+            "DBParameterGroupName": props.get("DBParameterGroupName")
+            or f"default.{engine}{engine_version.split('.')[0]}",
+            "ParameterApplyStatus": "in-sync",
+        }],
+        "AvailabilityZone": props.get("AvailabilityZone", f"{get_region()}a"),
+        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00"),
+        "MultiAZ": _cfn_bool(props.get("MultiAZ", False)),
+        "AutoMinorVersionUpgrade": _cfn_bool(props.get("AutoMinorVersionUpgrade", True)),
+        "PubliclyAccessible": _cfn_bool(props.get("PubliclyAccessible", False)),
+        "CopyTagsToSnapshot": _cfn_bool(props.get("CopyTagsToSnapshot", False)),
+        "MonitoringInterval": int(props.get("MonitoringInterval", 0)),
+        "MonitoringRoleArn": props.get("MonitoringRoleArn", ""),
+        "PromotionTier": int(props.get("PromotionTier", 1)),
+        "IAMDatabaseAuthenticationEnabled": _cfn_bool(props.get("EnableIAMDatabaseAuthentication", False)),
+        "DeletionProtection": _cfn_bool(props.get("DeletionProtection", False)),
+        "PerformanceInsightsEnabled": _cfn_bool(props.get("EnablePerformanceInsights", False)),
+    }
+
+
+def _rds_db_instance_attrs(instance):
+    """The Fn::GetAtt attributes of a DB instance record."""
+    return {
+        "Endpoint.Address": instance["Endpoint"]["Address"],
+        "Endpoint.Port": str(instance["Endpoint"]["Port"]),
+        "DbiResourceId": instance["DbiResourceId"],
+        "DBInstanceArn": instance["DBInstanceArn"],
+    }
+
+
 def _rds_db_instance_create(logical_id, props, stack_name):
     """Provision an AWS::RDS::DBInstance.
 
@@ -10370,9 +10519,6 @@ def _rds_db_instance_create(logical_id, props, stack_name):
     db_id = props.get("DBInstanceIdentifier") or _physical_name(
         stack_name, logical_id, lowercase=True, max_len=63
     )
-    engine = props.get("Engine", "postgres")
-    engine_version = props.get("EngineVersion") or _rds._default_engine_version(engine)
-    db_class = props.get("DBInstanceClass", "db.t3.micro")
     master_user = props.get("MasterUsername", "admin")
     master_pass = props.get("MasterUserPassword", "password")
     db_name = props.get("DBName", "")
@@ -10386,21 +10532,9 @@ def _rds_db_instance_create(logical_id, props, stack_name):
         if not db_name:
             db_name = parent.get("DatabaseName", "")
 
-    port = int(props.get("Port") or _rds._default_port(engine))
-    allocated_storage = int(props.get("AllocatedStorage") or 20)
-    storage_type = props.get("StorageType", "gp2")
     subnet_group_name = props.get("DBSubnetGroupName", "default")
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
-    dbi_resource_id = f"db-{new_uuid().replace('-', '')[:20].upper()}"
-    param_group_name = (
-        props.get("DBParameterGroupName")
-        or f"default.{engine}{engine_version.split('.')[0]}"
-    )
-
-    vpc_sgs = props.get("VPCSecurityGroups") or props.get("VpcSecurityGroupIds") or []
-    if isinstance(vpc_sgs, str):
-        vpc_sgs = [vpc_sgs]
-    vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs]
+    fields = _rds_db_instance_fields(props)
 
     subnet_group = _rds._subnet_groups.get(subnet_group_name, {
         "DBSubnetGroupName": subnet_group_name,
@@ -10413,60 +10547,31 @@ def _rds_db_instance_create(logical_id, props, stack_name):
 
     instance = {
         "DBInstanceIdentifier": db_id,
-        "DBInstanceClass": db_class,
-        "Engine": engine,
-        "EngineVersion": engine_version,
         "DBInstanceStatus": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
         "DBName": db_name or "mydb",
         "Endpoint": {
             "Address": f"{db_id}.{new_uuid()[:8]}.{get_region()}.rds.amazonaws.com",
-            "Port": port,
+            "Port": _rds_db_instance_port(props),
             "HostedZoneId": "Z2R2ITUGPM61AM",
         },
-        "AllocatedStorage": allocated_storage,
         "InstanceCreateTime": _rds._format_time(time.time()),
-        "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
-        "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
         "DBSecurityGroups": [],
-        "VpcSecurityGroups": vpc_sg_list,
-        "DBParameterGroups": [{
-            "DBParameterGroupName": param_group_name,
-            "ParameterApplyStatus": "in-sync",
-        }],
-        "AvailabilityZone": props.get("AvailabilityZone", f"{get_region()}a"),
         "DBSubnetGroup": subnet_group,
-        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00"),
         "PendingModifiedValues": {},
-        "MultiAZ": bool(props.get("MultiAZ", False)),
-        "AutoMinorVersionUpgrade": bool(props.get("AutoMinorVersionUpgrade", True)),
         "ReadReplicaDBInstanceIdentifiers": [],
         "ReadReplicaSourceDBInstanceIdentifier": "",
-        "LicenseModel": _rds._license_model(engine),
-        "OptionGroupMemberships": [{
-            "OptionGroupName": f"default:{engine}-{engine_version.split('.')[0]}",
-            "Status": "in-sync",
-        }],
-        "PubliclyAccessible": bool(props.get("PubliclyAccessible", False)),
-        "StorageType": storage_type,
-        "StorageEncrypted": bool(props.get("StorageEncrypted", False)),
+        "StorageEncrypted": _cfn_bool(props.get("StorageEncrypted", False)),
         "KmsKeyId": props.get("KmsKeyId", ""),
-        "DbiResourceId": dbi_resource_id,
+        "DbiResourceId": f"db-{new_uuid().replace('-', '')[:20].upper()}",
         "CACertificateIdentifier": "rds-ca-rsa2048-g1",
-        "CopyTagsToSnapshot": bool(props.get("CopyTagsToSnapshot", False)),
-        "MonitoringInterval": int(props.get("MonitoringInterval", 0)),
-        "MonitoringRoleArn": props.get("MonitoringRoleArn", ""),
-        "PromotionTier": int(props.get("PromotionTier", 1)),
         "DBInstanceArn": arn,
         "DBClusterIdentifier": cluster_id,
-        "IAMDatabaseAuthenticationEnabled": bool(props.get("EnableIAMDatabaseAuthentication", False)),
-        "DeletionProtection": bool(props.get("DeletionProtection", False)),
-        "PerformanceInsightsEnabled": bool(props.get("EnablePerformanceInsights", False)),
         "TagList": props.get("Tags", []),
+        "LatestRestorableTime": _rds._format_time(time.time()),
+        **fields,
     }
-    import time as _time
-    instance["LatestRestorableTime"] = _rds._format_time(_time.time())
 
     _rds._instances[db_id] = instance
     if cluster_id and cluster_id in _rds._clusters:
@@ -10476,15 +10581,39 @@ def _rds_db_instance_create(logical_id, props, stack_name):
                 "DBInstanceIdentifier": db_id,
                 "IsClusterWriter": True,
                 "DBClusterParameterGroupStatus": "in-sync",
-                "PromotionTier": int(props.get("PromotionTier", 1)),
+                "PromotionTier": fields["PromotionTier"],
             })
 
-    return db_id, {
-        "Endpoint.Address": instance["Endpoint"]["Address"],
-        "Endpoint.Port": str(port),
-        "DbiResourceId": dbi_resource_id,
-        "DBInstanceArn": arn,
-    }
+    return db_id, _rds_db_instance_attrs(instance)
+
+
+def _rds_db_instance_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a DB instance in place; a create-only property replaces it."""
+    instance = _rds._instances.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("DBInstanceIdentifier") or _physical_name(
+            stack_name, logical_id or physical_id, lowercase=True, max_len=63),
+        physical_id if instance is not None else None,
+        _rds_db_instance_create, _rds_db_instance_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if _requires_replacement("AWS::RDS::DBInstance", old_props, new_props):
+        # The generated name is deterministic, so the replacement takes it back.
+        _rds_db_instance_delete(physical_id, old_props)
+        return _rds_db_instance_create(logical_id or physical_id, new_props, stack_name)
+    _rds_apply_changed(instance, _rds_db_instance_fields(old_props), _rds_db_instance_fields(new_props))
+    if _rds_db_instance_port(old_props) != _rds_db_instance_port(new_props):
+        instance["Endpoint"]["Port"] = _rds_db_instance_port(new_props)
+    if new_props.get("MasterUserPassword") not in (None, old_props.get("MasterUserPassword")):
+        instance["_MasterUserPassword"] = new_props["MasterUserPassword"]
+    _reconcile_tag_list(instance.setdefault("TagList", []), old_props, new_props)
+    cluster = _rds._clusters.get(instance.get("DBClusterIdentifier") or "")
+    for member in (cluster or {}).get("DBClusterMembers", []):
+        if member.get("DBInstanceIdentifier") == physical_id:
+            member["PromotionTier"] = instance["PromotionTier"]
+    return physical_id, _rds_db_instance_attrs(instance)
 
 
 def _rds_db_instance_snapshot(physical_id, props):
@@ -12711,6 +12840,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::User": ("UserId", "UserName"),
     "AWS::ElastiCache::UserGroup": ("UserGroupId",),
+    "AWS::RDS::DBCluster": _RDS_DB_CLUSTER_CREATE_ONLY,
+    "AWS::RDS::DBInstance": _RDS_DB_INSTANCE_CREATE_ONLY,
     # Table, Partition and Connection replace on nested members
     # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
     "AWS::Glue::Database": ("DatabaseName",),
@@ -12723,6 +12854,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
 _CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("KeySchema",),
     "AWS::Lambda::Function": ("DurableConfig",),
+    "AWS::RDS::DBCluster": _RDS_DB_CLUSTER_CONDITIONAL,
+    "AWS::RDS::DBInstance": _RDS_DB_INSTANCE_CONDITIONAL,
     "AWS::ElastiCache::CacheCluster": ("NumCacheNodes",),
     "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration", "NumNodeGroups"),
 }
@@ -13419,9 +13552,11 @@ _RESOURCE_HANDLERS = {
         "update": _cw_dashboard_update,
         "delete": _cw_dashboard_delete,
     },
-    "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete,
+    "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "update": _rds_db_cluster_update,
+                            "update_with_logical_id": True, "delete": _rds_db_cluster_delete,
                             "snapshot": _rds_db_cluster_snapshot},
-    "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete,
+    "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "update": _rds_db_instance_update,
+                             "update_with_logical_id": True, "delete": _rds_db_instance_delete,
                              "snapshot": _rds_db_instance_snapshot},
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,

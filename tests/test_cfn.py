@@ -3178,6 +3178,60 @@ def test_cfn_nested_stack_capabilities_are_rechecked_on_an_update(monkeypatch):
         _forget_nested_test_stacks(parent)
 
 
+@pytest.mark.parametrize("auth,setting", [(False, "1"), (True, "0"), (True, "typo")])
+def test_cfn_capabilities_setting_turns_the_check_on(monkeypatch, auth, setting):
+    """CFN_ENFORCE_CAPABILITIES turns the check on without AUTH, and no value
+    of it turns the check off under AUTH, for CreateStack and nested stacks."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import _create_stack
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    monkeypatch.setenv("CFN_ENFORCE_CAPABILITIES", setting)
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-caps-setting-{uid}"
+    url = "http://localhost:4566/tpl/child.json"
+    try:
+        status, code, message = _caps_error(
+            _create_stack(_caps_params(_CAPS_ROLE_TEMPLATE, StackName=stack_name)))
+        assert (status, code, message) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert stack_name not in _stacks
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_IAM\]"):
+            _deploy_nested_child(monkeypatch, f"{stack_name}-p", [],
+                                 {url: _CAPS_ROLE_TEMPLATE}, url)
+        child = _deploy_nested_child(monkeypatch, f"{stack_name}-p2", ["CAPABILITY_IAM"],
+                                     {url: _CAPS_ROLE_TEMPLATE}, url)
+        assert _stacks[child]["Capabilities"] == ["CAPABILITY_IAM"]
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+        _forget_nested_test_stacks(f"{stack_name}-p")
+
+
+def test_cfn_nested_stack_macro_needs_auto_expand_on_the_parent(monkeypatch):
+    """A child template with a Transform fails the nested stack unless the
+    parent acknowledged CAPABILITY_AUTO_EXPAND."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    uid = _uuid_mod.uuid4().hex[:8]
+    parent = f"cfn-nested-macro-{uid}"
+    url = "http://localhost:4566/tpl/macro.json"
+    templates = {url: {"Transform": "AWS::LanguageExtensions",
+                       "Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}}
+    try:
+        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_AUTO_EXPAND\]"):
+            _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_IAM"], templates, url)
+        child = _deploy_nested_child(monkeypatch, parent, ["CAPABILITY_AUTO_EXPAND"], templates, url)
+        assert _stacks[child]["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _forget_nested_test_stacks(parent)
+
+
 def test_cfn_create_stack_refuses_missing_capabilities_under_auth(monkeypatch):
     import ministack.app as app_mod
     from ministack.services.cloudformation import _stack_events, _stacks
@@ -26316,6 +26370,265 @@ def test_cfn_rds_instance_in_a_cluster_defaults_to_delete(cfn, rds):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _rds_cluster_stack(retention=1, tier=1, **cluster_props):
+    """An Aurora cluster with one member, exporting the cluster's GetAtt identity."""
+    return {"Resources": {
+        "Cluster": {"Type": "AWS::RDS::DBCluster", "DeletionPolicy": "Delete", "Properties": {
+            "Engine": "aurora-postgresql", "MasterUsername": "admin",
+            "MasterUserPassword": "password123", "BackupRetentionPeriod": retention,
+            **cluster_props}},
+        "Member": {"Type": "AWS::RDS::DBInstance", "Properties": {
+            "DBClusterIdentifier": {"Ref": "Cluster"}, "Engine": "aurora-postgresql",
+            "DBInstanceClass": "db.serverless", "PromotionTier": tier}},
+    }, "Outputs": {
+        "ResourceId": {"Value": {"Fn::GetAtt": ["Cluster", "DBClusterResourceId"]}},
+        "Endpoint": {"Value": {"Fn::GetAtt": ["Cluster", "Endpoint.Address"]}},
+    }}
+
+
+_RDS_CLUSTER_IDENTITY = ("DBClusterArn", "DbClusterResourceId", "Endpoint", "ClusterCreateTime")
+_RDS_INSTANCE_IDENTITY = ("DBInstanceArn", "DbiResourceId", "Endpoint", "InstanceCreateTime")
+
+
+def _rds_ids(stack, rds):
+    """The cluster and member records of a _rds_cluster_stack."""
+    cluster = rds.describe_db_clusters(DBClusterIdentifier=stack["Cluster"])["DBClusters"][0]
+    member = rds.describe_db_instances(DBInstanceIdentifier=stack["Member"])["DBInstances"][0]
+    return cluster, member
+
+
+def _rds_physical_ids(cfn, stack_name):
+    return {r["LogicalResourceId"]: r["PhysicalResourceId"]
+            for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+
+
+def test_cfn_update_rds_cluster_and_member_in_place(cfn, rds):
+    """A cluster property change and a member property change are applied
+    to the existing records: identifiers, endpoints, resource ids, create
+    times and the cluster's member list stay."""
+    stack_name = f"cfn-rds-upd-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack()))
+    try:
+        created = _wait_stack(cfn, stack_name)
+        assert created["StackStatus"] == "CREATE_COMPLETE", created.get("StackStatusReason")
+        ids = _rds_physical_ids(cfn, stack_name)
+        cluster, member = _rds_ids(ids, rds)
+        assert _output(created, "ResourceId") == cluster["DbClusterResourceId"]
+        assert _output(created, "Endpoint") == cluster["Endpoint"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack(retention=2)))
+        updated = _wait_stack(cfn, stack_name)
+        assert updated["StackStatus"] == "UPDATE_COMPLETE", updated.get("StackStatusReason")
+        assert _rds_physical_ids(cfn, stack_name) == ids
+        after, _ = _rds_ids(ids, rds)
+        assert after["BackupRetentionPeriod"] == 2
+        assert {k: after[k] for k in _RDS_CLUSTER_IDENTITY} == {k: cluster[k] for k in _RDS_CLUSTER_IDENTITY}
+        assert [m["DBInstanceIdentifier"] for m in after["DBClusterMembers"]] == [ids["Member"]]
+        assert updated["Outputs"] == created["Outputs"]
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_rds_cluster_stack(retention=2, tier=2)))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _rds_physical_ids(cfn, stack_name) == ids
+        after, member_after = _rds_ids(ids, rds)
+        assert member_after["PromotionTier"] == 2
+        assert ({k: member_after[k] for k in _RDS_INSTANCE_IDENTITY}
+                == {k: member[k] for k in _RDS_INSTANCE_IDENTITY})
+        assert [m["PromotionTier"] for m in after["DBClusterMembers"]] == [2]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_rds_cluster_rolls_back_in_place(cfn, rds):
+    """A cluster change followed by a failing resource is sent back to the
+    previous value on the same cluster, with its member still listed."""
+    stack_name = f"cfn-rds-rb-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack()))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        ids = _rds_physical_ids(cfn, stack_name)
+        cluster, _ = _rds_ids(ids, rds)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_with_failing_resource(
+            json.dumps(_rds_cluster_stack(retention=2)), "Cluster"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        after, _ = _rds_ids(ids, rds)
+        assert after["BackupRetentionPeriod"] == 1
+        assert {k: after[k] for k in _RDS_CLUSTER_IDENTITY} == {k: cluster[k] for k in _RDS_CLUSTER_IDENTITY}
+        assert [m["DBInstanceIdentifier"] for m in after["DBClusterMembers"]] == [ids["Member"]]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_rds_instance_in_place(cfn, rds):
+    """A standalone instance keeps its identity over a BackupRetentionPeriod change; a "false" string reads false."""
+    stack_name = f"cfn-rds-inst-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(retention):
+        return json.dumps({"Resources": {"Db": {
+            "Type": "AWS::RDS::DBInstance", "DeletionPolicy": "Delete", "Properties": {
+                "Engine": "postgres", "DBInstanceClass": "db.t4g.micro", "AllocatedStorage": "20",
+                "MasterUsername": "admin", "MasterUserPassword": "password123",
+                "StorageEncrypted": "false", "BackupRetentionPeriod": retention}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(1))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        db_id = _rds_physical_ids(cfn, stack_name)["Db"]
+        before = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert before["StorageEncrypted"] is False
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(2))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _rds_physical_ids(cfn, stack_name)["Db"] == db_id
+        after = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert after["BackupRetentionPeriod"] == 2
+        assert {k: after[k] for k in _RDS_INSTANCE_IDENTITY} == {k: before[k] for k in _RDS_INSTANCE_IDENTITY}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_rds_cluster_master_username_change_is_not_applied(cfn, rds):
+    """A cluster MasterUsername change completes without touching the cluster."""
+    stack_name = f"cfn-rds-user-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack()))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        ids = _rds_physical_ids(cfn, stack_name)
+        cluster, _ = _rds_ids(ids, rds)
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack(MasterUsername="owner")))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _rds_physical_ids(cfn, stack_name) == ids
+        after, _ = _rds_ids(ids, rds)
+        assert after["MasterUsername"] == "admin"
+        assert {k: after[k] for k in _RDS_CLUSTER_IDENTITY} == {k: cluster[k] for k in _RDS_CLUSTER_IDENTITY}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("rtype,props,before,after", [
+    ("AWS::RDS::DBCluster", {}, "aurora-postgresql", "aurora-mysql"),
+    ("AWS::RDS::DBInstance", {"DBInstanceClass": "db.t4g.micro", "AllocatedStorage": "20"}, "postgres", "mysql"),
+])
+def test_cfn_update_rds_engine_change_replaces(cfn, rds, rtype, props, before, after):
+    """Engine is only conditionally create-only, yet under a generated
+    identifier an Engine change replaces the resource."""
+    stack_name = f"cfn-rds-eng-{_uuid_mod.uuid4().hex[:8]}"
+    cluster = rtype == "AWS::RDS::DBCluster"
+
+    def template(engine):
+        return json.dumps({"Resources": {"R": {"Type": rtype, "DeletionPolicy": "Delete", "Properties": {
+            "Engine": engine, "MasterUsername": "admin", "MasterUserPassword": "password123", **props}}}})
+
+    def describe():
+        physical_id = _rds_physical_ids(cfn, stack_name)["R"]
+        if cluster:
+            return rds.describe_db_clusters(DBClusterIdentifier=physical_id)["DBClusters"][0]
+        return rds.describe_db_instances(DBInstanceIdentifier=physical_id)["DBInstances"][0]
+
+    resource_id = "DbClusterResourceId" if cluster else "DbiResourceId"
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(before))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        old = describe()
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(after))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        new = describe()
+        assert new["Engine"] == after
+        assert new[resource_id] != old[resource_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_rds_cluster_keeps_values_the_template_did_not_change(cfn, rds):
+    """A stack update writes only the properties it changes, so a value set
+    through ModifyDBCluster stays."""
+    stack_name = f"cfn-rds-oob-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_rds_cluster_stack()))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        ids = _rds_physical_ids(cfn, stack_name)
+        rds.modify_db_cluster(DBClusterIdentifier=ids["Cluster"], BackupRetentionPeriod=7, ApplyImmediately=True)
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_rds_cluster_stack(CopyTagsToSnapshot=True)))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        after, _ = _rds_ids(ids, rds)
+        assert (after["CopyTagsToSnapshot"], after["BackupRetentionPeriod"]) == (True, 7)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("rtype,name_prop,props,prop,values", [
+    ("AWS::RDS::DBCluster", "DBClusterIdentifier", {"Engine": "aurora-postgresql"}, "DatabaseName", ("one", "two")),
+    ("AWS::RDS::DBCluster", "DBClusterIdentifier", {}, "Engine", ("aurora-postgresql", "aurora-mysql")),
+    ("AWS::RDS::DBInstance", "DBInstanceIdentifier",
+     {"Engine": "postgres", "DBInstanceClass": "db.t4g.micro", "AllocatedStorage": "20"}, "DBName", ("one", "two")),
+])
+def test_cfn_update_rds_custom_named_create_only_change_is_refused(cfn, rtype, name_prop, props, prop, values):
+    """A create-only change under an explicit, unchanged identifier would
+    replace the resource, which CloudFormation refuses."""
+    name = f"cfn-rds-named-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(value):
+        return json.dumps({"Resources": {"R": {"Type": rtype, "DeletionPolicy": "Delete", "Properties": {
+            name_prop: name, "MasterUsername": "admin", "MasterUserPassword": "password123",
+            **props, prop: value}}}})
+
+    cfn.create_stack(StackName=name, TemplateBody=template(values[0]))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=template(values[1]))
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert (f"CloudFormation cannot update a stack when a custom-named resource requires "
+                f"replacing. Rename {name} and update the stack again.") in _stack_event_reasons(cfn, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_update_rds_cluster_create_only_change_replaces(cfn, rds):
+    """Under a generated identifier a DatabaseName change replaces the cluster."""
+    stack_name = f"cfn-rds-repl-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(db_name):
+        return json.dumps({"Resources": {"Cluster": {
+            "Type": "AWS::RDS::DBCluster", "DeletionPolicy": "Delete", "Properties": {
+                "Engine": "aurora-postgresql", "DatabaseName": db_name}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("one"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cluster_id = _rds_physical_ids(cfn, stack_name)["Cluster"]
+        before = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("two"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        after = rds.describe_db_clusters(
+            DBClusterIdentifier=_rds_physical_ids(cfn, stack_name)["Cluster"])["DBClusters"][0]
+        assert after["DatabaseName"] == "two"
+        assert after["DbClusterResourceId"] != before["DbClusterResourceId"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_update_rds_cluster_saved_without_its_resource_id():
+    """A cluster record saved before the create stored DbClusterResourceId updates in place and gets one."""
+    from ministack.services import rds as _rds_store
+    handler = _RESOURCE_HANDLERS["AWS::RDS::DBCluster"]
+    stack_name = f"cfn-rds-saved-{_uuid_mod.uuid4().hex[:8]}"
+    old = {"Engine": "aurora-postgresql", "MasterUsername": "admin", "BackupRetentionPeriod": 1}
+    new = dict(old, BackupRetentionPeriod=2)
+    cluster_id, _ = handler["create"]("Cluster", old, stack_name)
+    try:
+        record = _rds_store._clusters[cluster_id]
+        for key in ("DbClusterResourceId", "EarliestRestorableTime", "LatestRestorableTime"):
+            record.pop(key)
+        physical_id, attrs = handler["update"](cluster_id, old, new, stack_name, "Cluster")
+        assert physical_id == cluster_id
+        assert record["BackupRetentionPeriod"] == 2
+        assert attrs["DBClusterResourceId"] == record["DbClusterResourceId"]
+        assert record["DbClusterResourceId"].startswith("cluster-")
+        assert record["LatestRestorableTime"] == record["ClusterCreateTime"]
+    finally:
+        handler["delete"](cluster_id, new)
+
 def _template(resource_type, properties):
     return {"Resources": {"R": {"Type": resource_type, "Properties": properties}}}
 
@@ -26367,6 +26680,13 @@ def _requirements(change):
     ("AWS::DynamoDB::Table", {"KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]},
      {"KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}]},
      "Conditionally"),
+    ("AWS::RDS::DBCluster", {}, {"DatabaseName": "two"}, "Always"),
+    ("AWS::RDS::DBCluster", {"BackupRetentionPeriod": 1}, {"BackupRetentionPeriod": 2}, "Never"),
+    ("AWS::RDS::DBCluster", {"Engine": "aurora-postgresql"}, {"Engine": "aurora-mysql"}, "Conditionally"),
+    ("AWS::RDS::DBCluster", {}, {"Port": 5433}, "Never"),
+    ("AWS::RDS::DBInstance", {}, {"DBName": "two"}, "Always"),
+    ("AWS::RDS::DBInstance", {"BackupRetentionPeriod": 1}, {"BackupRetentionPeriod": 2}, "Conditionally"),
+    ("AWS::RDS::DBInstance", {"AllocatedStorage": "20"}, {"AllocatedStorage": "30"}, "Never"),
     ("AWS::Lambda::Function", {"DurableConfig": {"ExecutionTimeout": 60}},
      {"DurableConfig": {"ExecutionTimeout": 120}}, "Conditionally"),
     ("AWS::Lambda::Function", {"DurableConfig": {"ExecutionTimeout": 60}}, {}, "Conditionally"),
