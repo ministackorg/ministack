@@ -849,6 +849,8 @@ def _start_query_execution(data):
     ).get("OutputLocation", "s3://athena-results/")
     db = data.get("QueryExecutionContext", {}).get("Database", "default")
     catalog = data.get("QueryExecutionContext", {}).get("Catalog", "AwsDataCatalog")
+    # Athena rejects any malformed statement here; with no Trino parser, only this DDL rule is
+    # checked at submission and other errors fail the execution instead.
     ddl = _parse_ddl(query)
     if isinstance(ddl, CreateTable) and not ddl.external and not ddl.iceberg:
         return error_response_json(
