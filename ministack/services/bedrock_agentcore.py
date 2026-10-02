@@ -59,6 +59,7 @@ logger = logging.getLogger("bedrock_agentcore")
 _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
 _resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
+_memories = AccountRegionScopedDict()    # memoryId -> memory record
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
 
@@ -72,6 +73,7 @@ def get_state():
         "runtimes": _runtimes,
         "endpoints": _endpoints,
         "resourcePolicies": _resource_policies,
+        "memories": _memories,
     })
 
 
@@ -85,9 +87,11 @@ def _restore_state(data):
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
+    _memories.update(data.get("memories", {}))
     _migrate_legacy_arns()
     # Backfill one snapshot for state written before version history existed.
     for runtime in _runtimes._data.values():
@@ -127,6 +131,7 @@ def reset():
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +345,133 @@ def _paginate_agentcore_results(items, query_params):
             str(offset + limit).encode()
         ).decode().rstrip("=")
     return page, None
+
+
+def _memory_id(identifier):
+    """Accept the memory ID or its ARN, as the AgentCore data plane does."""
+    if isinstance(identifier, str) and ":memory/" in identifier:
+        return identifier.rsplit(":memory/", 1)[1]
+    return identifier
+
+
+def _memory_arn(memory_id):
+    return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
+            f"memory/{memory_id}")
+
+
+def _memory_public_record(record):
+    return {key: copy.deepcopy(value) for key, value in record.items()
+            if not key.startswith("_")}
+
+
+def _memory_page(items, data, default=20):
+    query = {"maxResults": data.get("maxResults", default)}
+    if "nextToken" in data:
+        query["nextToken"] = data["nextToken"]
+    return _paginate_agentcore_results(items, query)
+
+
+def _create_memory(body):
+    data = _parse_body(body)
+    name = data.get("name")
+    duration = data.get("eventExpiryDuration")
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        return _validation("name must start with a letter and contain only letters, digits, and underscores")
+    if any(memory.get("name") == name for memory in _memories.values()):
+        return _conflict(f"A memory with name '{name}' already exists")
+    if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+        return _validation("eventExpiryDuration must be an integer from 3 to 365")
+    if data.get("tags"):
+        return _validation("Tagging is not supported by MiniStack AgentCore Memory yet")
+    # MiniStack implements explicit record storage/retrieval. Built-in
+    # extraction strategies invoke managed model pipelines and are not emulated.
+    if data.get("memoryStrategies"):
+        return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+
+    memory_id = _resource_id(name)
+    now = time.time()
+    record = {
+        "id": memory_id,
+        "arn": _memory_arn(memory_id),
+        "name": name,
+        "description": data.get("description", ""),
+        "eventExpiryDuration": duration,
+        "status": "ACTIVE",
+        "createdAt": now,
+        "updatedAt": now,
+        "indexedKeys": copy.deepcopy(data.get("indexedKeys", [])),
+        "namespaceKeys": copy.deepcopy(data.get("namespaceKeys", [])),
+        "strategies": [],
+    }
+    for field in ("encryptionKeyArn", "memoryExecutionRoleArn", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    _memories[memory_id] = record
+
+    response = _memory_public_record(record)
+    response["status"] = "CREATING"
+    return json_response({"memory": response}, 202)
+
+
+def _get_memory(memory_id, query_params):
+    record = _memories.get(_memory_id(memory_id))
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    view = _agentcore_query_value(query_params, "view", "full")
+    if view not in ("full", "without_decryption"):
+        return _validation("view must be 'full' or 'without_decryption'")
+    return json_response({"memory": _memory_public_record(record)})
+
+
+def _list_memories(body):
+    data = _parse_body(body)
+    items = [{key: record[key] for key in (
+        "arn", "createdAt", "id", "status", "updatedAt"
+    ) if key in record} for record in _memories.values()]
+    page, error = _memory_page(items, data, default=10)
+    if error:
+        return error
+    return json_response({
+        "memories": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _update_memory(memory_id, body):
+    record = _memories.get(_memory_id(memory_id))
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    data = _parse_body(body)
+    if "memoryStrategies" in data and data["memoryStrategies"]:
+        return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+    if "eventExpiryDuration" in data:
+        duration = data["eventExpiryDuration"]
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+            return _validation("eventExpiryDuration must be an integer from 3 to 365")
+        record["eventExpiryDuration"] = duration
+    if "description" in data:
+        record["description"] = data["description"]
+    for field in ("memoryExecutionRoleArn", "namespaceKeys", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    if data.get("addIndexedKeys"):
+        existing = {item.get("key") for item in record.get("indexedKeys", [])}
+        record.setdefault("indexedKeys", []).extend(
+            copy.deepcopy(item) for item in data["addIndexedKeys"]
+            if item.get("key") not in existing
+        )
+    record["updatedAt"] = time.time()
+    response = _memory_public_record(record)
+    response["status"] = "UPDATING"
+    return json_response({"memory": response}, 202)
+
+
+def _delete_memory(memory_id):
+    memory_id = _memory_id(memory_id)
+    record = _memories.pop(memory_id, None)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    return json_response({"memoryId": memory_id, "status": "DELETING"}, 202)
 
 
 def _version_snapshot(runtime):
@@ -1067,6 +1199,18 @@ def _invoke_container(url, body, headers, content_type, session_id):
 
 async def handle_request(method, path, headers, body, query_params):
     inner = path.strip("/")
+    if inner == "memories" and method == "POST":
+        return _list_memories(body)
+    if inner == "memories/create" and method == "POST":
+        return _create_memory(body)
+    if inner.startswith("memories/"):
+        parts = [unquote(part) for part in inner.split("/") if part]
+        if len(parts) == 3 and parts[2] == "details" and method == "GET":
+            return _get_memory(parts[1], query_params)
+        if len(parts) == 3 and parts[2] == "update" and method == "PUT":
+            return _update_memory(parts[1], body)
+        if len(parts) == 3 and parts[2] == "delete" and method == "DELETE":
+            return _delete_memory(parts[1])
     if inner.startswith("resourcepolicy/"):
         resource_arn = unquote(inner[len("resourcepolicy/"):])
         if method == "PUT":
