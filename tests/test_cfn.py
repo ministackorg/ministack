@@ -9843,6 +9843,153 @@ def test_cfn_stack_tags_map_valued_tags_and_eks_nodegroup(cfn, sqs, eks):
         _delete_cfn_test_stack(cfn, name)
 
 
+def _cfn_eks_template(name, cluster=None, nodes=None):
+    """A cluster and a node group, with property overrides for each."""
+    return json.dumps({"Resources": {
+        "Cluster": {"Type": "AWS::EKS::Cluster", "Properties": {
+            "Name": name, "RoleArn": "arn:aws:iam::000000000000:role/eks-role",
+            "ResourcesVpcConfig": {"SubnetIds": ["subnet-1", "subnet-2"]},
+            "Tags": [{"Key": "team", "Value": "a"}], **(cluster or {})}},
+        "Nodes": {"Type": "AWS::EKS::Nodegroup", "Properties": {
+            "ClusterName": {"Ref": "Cluster"}, "NodegroupName": f"{name}-ng",
+            "NodeRole": "arn:aws:iam::000000000000:role/eks-node-role",
+            "Subnets": ["subnet-1"], "InstanceTypes": ["t3.small"],
+            "ScalingConfig": {"MinSize": 0, "DesiredSize": 0, "MaxSize": 1},
+            "Labels": {"tier": "a"}, **(nodes or {})}},
+    }})
+
+
+def test_cfn_update_eks_cluster_in_place(cfn, eks):
+    """Logging, Version, endpoint access and Tags change on the same cluster; dropped SecurityGroupIds go."""
+    name = f"cfn-eks-upd-{_uuid_mod.uuid4().hex[:8]}"
+    api = {"Logging": {"ClusterLogging": {"EnabledTypes": [{"Type": "api"}]}}}
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=_cfn_eks_template(name))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = eks.describe_cluster(name=name)["cluster"]
+        assert before["logging"]["clusterLogging"] == [{"types": [
+            "api", "audit", "authenticator", "controllerManager", "scheduler"], "enabled": False}]
+        eks.tag_resource(resourceArn=before["arn"], tags={"outside": "api"})
+
+        steps = [
+            (api, lambda c: c["logging"]["clusterLogging"] == [
+                {"types": ["api"], "enabled": True},
+                {"types": ["audit", "authenticator", "controllerManager", "scheduler"],
+                 "enabled": False}]),
+            ({**api, "Version": "1.31"}, lambda c: c["version"] == "1.31"),
+            ({**api, "Version": "1.31", "ResourcesVpcConfig": {
+                "SubnetIds": ["subnet-1", "subnet-2"], "EndpointPrivateAccess": True,
+                "PublicAccessCidrs": ["203.0.113.0/24"], "SecurityGroupIds": ["sg-1"]}},
+             lambda c: c["resourcesVpcConfig"]["endpointPrivateAccess"] is True
+             and c["resourcesVpcConfig"]["publicAccessCidrs"] == ["203.0.113.0/24"]
+             and c["resourcesVpcConfig"]["securityGroupIds"] == ["sg-1"]),
+            ({**api, "Version": "1.31", "ResourcesVpcConfig": {
+                "SubnetIds": ["subnet-1", "subnet-2"], "EndpointPrivateAccess": True,
+                "PublicAccessCidrs": ["203.0.113.0/24"]}, "Tags": [{"Key": "team", "Value": "b"}]},
+             lambda c: _template_tags(c["tags"]) == {"team": "b"}
+             and c["resourcesVpcConfig"]["securityGroupIds"] == []),
+        ]
+        for props, check in steps:
+            cfn.update_stack(StackName=name, TemplateBody=_cfn_eks_template(name, props))
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            cluster = eks.describe_cluster(name=name)["cluster"]
+            assert check(cluster), cluster
+            assert (cluster["arn"], cluster["createdAt"]) == (before["arn"], before["createdAt"])
+        tags = eks.list_tags_for_resource(resourceArn=before["arn"])["tags"]
+        assert _template_tags(tags) == {"team": "b", "outside": "api"}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_update_eks_nodegroup_in_place(cfn, eks):
+    """ScalingConfig, Labels, Taints, Tags, LaunchTemplate and UpdateConfig change on the same node group."""
+    name = f"cfn-eks-ng-{_uuid_mod.uuid4().hex[:8]}"
+    taint = {"Key": "dedicated", "Value": "batch", "Effect": "NO_SCHEDULE"}
+    lt = {"LaunchTemplate": {"Id": "lt-1", "Version": "1"}, "UpdateConfig": {"MaxUnavailable": 2}}
+    steps = [
+        ({**lt, "ScalingConfig": {"MinSize": 0, "DesiredSize": 0, "MaxSize": 2}},
+         lambda n: n["scalingConfig"] == {"minSize": 0, "desiredSize": 0, "maxSize": 2}),
+        ({**lt, "Labels": {"tier": "b"}}, lambda n: n["labels"] == {"tier": "b"}),
+        ({**lt, "Taints": [taint]},
+         lambda n: n["taints"] == [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}]),
+        ({"LaunchTemplate": {"Id": "lt-1", "Version": "2"}, "UpdateConfig": {"MaxUnavailable": 1}},
+         lambda n: (n["launchTemplate"], n["updateConfig"]) == ({"id": "lt-1", "version": "2"}, {"maxUnavailable": 1})),
+        ({"Tags": {"team": "b"}},
+         lambda n: _template_tags(n["tags"]) == {"team": "b"} and not {"launchTemplate", "updateConfig"} & n.keys()),
+    ]
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=_cfn_eks_template(name, nodes=lt))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = eks.describe_nodegroup(clusterName=name, nodegroupName=f"{name}-ng")["nodegroup"]
+        assert (before["launchTemplate"], before["updateConfig"]) == (
+            {"id": "lt-1", "version": "1"}, {"maxUnavailable": 2})
+        for props, check in steps:
+            cfn.update_stack(StackName=name, TemplateBody=_cfn_eks_template(name, nodes=props))
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            ng = eks.describe_nodegroup(clusterName=name, nodegroupName=f"{name}-ng")["nodegroup"]
+            assert check(ng), ng
+            assert (ng["nodegroupArn"], ng["createdAt"]) == (before["nodegroupArn"], before["createdAt"])
+        tags = eks.list_tags_for_resource(resourceArn=before["nodegroupArn"])["tags"]
+        assert _template_tags(tags) == {"team": "b"}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("created,enabled", [
+    ({"Logging": {"ClusterLogging": {"EnabledTypes": [{"Type": "api"}]}}}, [["api"]]),
+    (None, [["api", "audit"]]),
+], ids=["logging-changed", "logging-added"])
+def test_cfn_update_eks_change_is_rolled_back(cfn, eks, created, enabled):
+    """The rollback sends Logging and ScalingConfig back; a template without Logging keeps it."""
+    name = f"cfn-eks-rb-{_uuid_mod.uuid4().hex[:8]}"
+    api = {"Type": "api"}
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=_cfn_eks_template(name, created))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        changed = _cfn_eks_template(
+            name, {"Logging": {"ClusterLogging": {"EnabledTypes": [api, {"Type": "audit"}]}}},
+            {"ScalingConfig": {"MinSize": 0, "DesiredSize": 0, "MaxSize": 3}})
+        cfn.update_stack(StackName=name,
+                         TemplateBody=_cfn_with_failing_resource(changed, ["Cluster", "Nodes"]))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        cluster = eks.describe_cluster(name=name)["cluster"]
+        assert [g["types"] for g in cluster["logging"]["clusterLogging"] if g["enabled"]] == enabled
+        ng = eks.describe_nodegroup(clusterName=name, nodegroupName=f"{name}-ng")["nodegroup"]
+        assert ng["scalingConfig"]["maxSize"] == 1
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("cluster,nodes,reason", [
+    ({"RoleArn": "arn:aws:iam::000000000000:role/eks-role-2"}, None,
+     "CloudFormation cannot update a stack when a custom-named resource requires "
+     "replacing. Rename {name} and update the stack again."),
+    (None, {"InstanceTypes": ["t3.medium"]},
+     "NodeGroup already exists with name {name}-ng and cluster name {name}"),
+], ids=["cluster-role", "nodegroup-instance-types"])
+def test_cfn_update_eks_create_only_change_fails_under_a_custom_name(
+        cfn, eks, cluster, nodes, reason):
+    """A createOnly change under an explicit name fails the update, as on AWS."""
+    name = f"cfn-eks-co-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=_cfn_eks_template(name))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=_cfn_eks_template(name, cluster, nodes))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert any(reason.format(name=name) in r for r in reasons), reasons
+        ng = eks.describe_nodegroup(clusterName=name, nodegroupName=f"{name}-ng")["nodegroup"]
+        assert ng["instanceTypes"] == ["t3.small"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_change_set_tags_replace_the_previous_stack_tags(cfn, sqs):
     """An UPDATE change set that carries new stack tags: after execute the
     queue carries the new tag and no longer the old one. The execution

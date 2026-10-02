@@ -26,6 +26,12 @@ def _reset(service):
     service._sent_emails_list().clear()
 
 
+def _verify(service, identity="example.com"):
+    """Senders must be verified identities, as on AWS."""
+    status, _ = _call(service, "POST", "/v2/email/identities", body={"EmailIdentity": identity})
+    assert status == 200
+
+
 def _arn(kind, name, *, partition="aws", service="ses", region=REGION, account=ACCOUNT_ID):
     return f"arn:{partition}:{service}:{region}:{account}:{kind}/{name}"
 
@@ -75,6 +81,7 @@ def test_ses_v2_target_delegates_to_ses_v2_handler(monkeypatch):
 @pytest.mark.parametrize("suffix", ["", "/"])
 @pytest.mark.parametrize("bulk", [False, True])
 def test_ses_target_send_uses_real_v2_handler(ses_v2, prefix, suffix, bulk):
+    _verify(ses_v2)
     from ministack.services import ses
 
     template = {"TemplateContent": {"Subject": "Hello {{name}}", "Text": "Welcome"},
@@ -479,6 +486,7 @@ def test_ses_v2_email_template_apis_reject_missing_templates(ses_v2, method, bod
 
 
 def test_ses_v2_send_email_renders_stored_templates(ses_v2):
+    _verify(ses_v2)
     _call(
         ses_v2,
         "POST",
@@ -513,6 +521,7 @@ def test_ses_v2_send_email_renders_stored_templates(ses_v2):
 
 
 def test_ses_v2_send_email_resolves_template_arns(ses_v2):
+    _verify(ses_v2)
     _call(
         ses_v2,
         "POST",
@@ -531,6 +540,7 @@ def test_ses_v2_send_email_resolves_template_arns(ses_v2):
 
 
 def test_ses_v2_send_email_renders_inline_template_content_without_storing_it(ses_v2):
+    _verify(ses_v2)
     status, _body = _send_template(
         ses_v2,
         {"TemplateContent": {"Subject": "Inline {{v}}", "Text": "Body {{v}}"}},
@@ -626,6 +636,7 @@ def _bulk_entry(to, **replacement):
 
 
 def test_ses_v2_send_bulk_email_via_app_router_with_inline_template(ses_v2):
+    _verify(ses_v2)
     status, body = asyncio.run(
         _post_via_app(
             "/v2/email/outbound-bulk-emails",
@@ -654,6 +665,7 @@ def test_ses_v2_send_bulk_email_via_app_router_with_inline_template(ses_v2):
 
 
 def test_ses_v2_send_bulk_email_via_app_router_with_stored_template(ses_v2):
+    _verify(ses_v2)
     _call(
         ses_v2,
         "POST",

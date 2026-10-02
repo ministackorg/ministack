@@ -76,3 +76,8 @@ def execute_api_arn(region: str, account_id: str, api_id: str,
         f"arn:aws:execute-api:{region}:{account_id}:"
         f"{api_id}/{stage}/{method}/{path.lstrip('/')}"
     )
+
+
+def execute_api_route_arn(region: str, account_id: str, api_id: str, stage: str, route_key: str) -> str:
+    """Build the ``execute-api`` ARN of a WebSocket route: ``...:<api-id>/<stage>/<route-key>``."""
+    return f"arn:aws:execute-api:{region}:{account_id}:{api_id}/{stage}/{route_key}"

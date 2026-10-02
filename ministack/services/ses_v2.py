@@ -32,8 +32,10 @@ from ministack.core.responses import (
     now_iso,
 )
 from ministack.services.ses import (
+    _account_details,
     _build_mime_message,
     _dkim_tokens,
+    _message_rejection,
     _parse_raw_mime,
     _render_template,
     _restore_regional_store,
@@ -313,14 +315,33 @@ async def handle_request(method, path, headers, body, query_params):
         cutoff = time.time() - 86400
         sent_list = _sent_emails_list()
         sent_24h = sum(1 for e in sent_list if e["Timestamp"] >= cutoff)
-        return json_response({
+        account = _account_details.get("account") or {}
+        out = {
             "DedicatedIpAutoWarmupEnabled": False,
             "EnforcementStatus": "HEALTHY",
-            "ProductionAccessEnabled": True,
+            "ProductionAccessEnabled": account.get("ProductionAccessEnabled", True),
             "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": float(sent_24h)},
             "SendingEnabled": True,
             "SuppressionAttributes": {"SuppressedReasons": []},
-        })
+        }
+        if account.get("Details"):
+            out["Details"] = account["Details"]
+        return json_response(out)
+
+    # POST /v2/email/account/details  (PutAccountDetails)
+    if sub == "/account/details" and method == "POST":
+        if data.get("MailType") not in ("MARKETING", "TRANSACTIONAL"):
+            return _json_err("BadRequestException", "MailType must be MARKETING or TRANSACTIONAL")
+        if not data.get("WebsiteURL"):
+            return _json_err("BadRequestException", "WebsiteURL is required")
+        account = dict(_account_details.get("account") or {})
+        account["Details"] = {k: data[k] for k in (
+            "MailType", "WebsiteURL", "ContactLanguage", "UseCaseDescription",
+            "AdditionalContactEmailAddresses") if k in data}
+        if "ProductionAccessEnabled" in data:
+            account["ProductionAccessEnabled"] = bool(data["ProductionAccessEnabled"])
+        _account_details["account"] = account
+        return json_response({})
 
     # PUT /v2/email/account/suppression
     if sub == "/account/suppression" and method == "PUT":
@@ -377,6 +398,9 @@ async def handle_request(method, path, headers, body, query_params):
             body_html = rendered.get("Html", "")
 
         all_addrs = to_addrs + cc_addrs + bcc_addrs
+        rejected = _message_rejection(source or (parsed.get("From", "") if raw else ""), all_addrs)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         if source and all_addrs:
             mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                            subj, body_text, body_html, msg_id)
@@ -420,6 +444,9 @@ async def handle_request(method, path, headers, body, query_params):
         if not entries:
             return _json_err("BadRequestException", "BulkEmailEntries is required")
 
+        rejected = _message_rejection(source)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         results = []
         for entry in entries:
             dest = entry.get("Destination", {})
@@ -431,6 +458,10 @@ async def handle_request(method, path, headers, body, query_params):
                      .get("ReplacementTemplate", {})
                      .get("ReplacementTemplateData", default_data)
             )
+            rejected = _message_rejection(None, to_addrs + cc_addrs + bcc_addrs)
+            if rejected:
+                results.append({"Status": "MESSAGE_REJECTED", "Error": rejected})
+                continue
             rendered = _render_template(stored, template_data)
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
