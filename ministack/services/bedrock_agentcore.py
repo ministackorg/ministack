@@ -281,6 +281,10 @@ def _validation(message: str):
     return error_response_json("ValidationException", message, 400)
 
 
+def _runtime_not_found(runtime_id):
+    return _not_found(f"Agent '{runtime_id}' was not found. Please check the agent ID and try again.")
+
+
 def _not_found(message: str):
     return error_response_json("ResourceNotFoundException", message, 404)
 
@@ -336,6 +340,32 @@ def _paginate_agentcore_results(items, query_params):
             str(offset + limit).encode()
         ).decode().rstrip("=")
     return page, None
+
+
+def _version_snapshot(runtime):
+    return {key: copy.deepcopy(value) for key, value in runtime.items()
+            if not key.startswith("_")}
+
+
+def _runtime_versions(runtime):
+    versions = runtime.get("_versions")
+    if versions:
+        return versions
+    current = runtime.get("agentRuntimeVersion", "1")
+    return {current: _version_snapshot(runtime)}
+
+
+def _version_summary(runtime, version):
+    snapshot = _runtime_versions(runtime)[version]
+    return {
+        "agentRuntimeArn": runtime["agentRuntimeArn"],
+        "agentRuntimeId": runtime["agentRuntimeId"],
+        "agentRuntimeVersion": version,
+        "agentRuntimeName": snapshot["agentRuntimeName"],
+        "description": snapshot.get("description", ""),
+        "lastUpdatedAt": _iso(snapshot["lastUpdatedAt"]),
+        "status": snapshot["status"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +426,8 @@ def _create_agent_runtime(body):
 def _get_agent_runtime(runtime_id, query_params=None):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
-    version = _query_value(query_params, "version")
+        return _runtime_not_found(runtime_id)
+    version = _agentcore_query_value(query_params, "version")
     if version is None:
         selected = record
     else:
@@ -435,12 +465,12 @@ def _list_agent_runtimes(query_params):
 def _list_agent_runtime_versions(runtime_id, query_params):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     items = [
         _version_summary(record, version)
         for version in sorted(_runtime_versions(record), key=int, reverse=True)
     ]
-    page, error = _paginate(items, query_params)
+    page, error = _paginate_agentcore_results(items, query_params)
     if error:
         return error
     return json_response({
@@ -452,7 +482,7 @@ def _list_agent_runtime_versions(runtime_id, query_params):
 def _update_agent_runtime(runtime_id, body):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     data = _parse_body(body)
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
         if not data.get(field):
@@ -498,7 +528,7 @@ def _update_agent_runtime(runtime_id, body):
 def _delete_agent_runtime(runtime_id):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     _stop_container(runtime_id)
     _resource_policies.pop(record["agentRuntimeArn"], None)
     for endpoint in (_endpoints.get(runtime_id) or {}).values():
@@ -515,7 +545,7 @@ def _delete_agent_runtime(runtime_id):
 def _create_agent_runtime_endpoint(runtime_id, body):
     runtime = _runtimes.get(runtime_id)
     if runtime is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     data = _parse_body(body)
     name = data.get("name")
     if not name or not _NAME_RE.match(name):
@@ -561,7 +591,7 @@ def _get_agent_runtime_endpoint(runtime_id, endpoint_name):
 
 def _list_agent_runtime_endpoints(runtime_id, query_params):
     if _runtimes.get(runtime_id) is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     endpoints = _endpoints.get(runtime_id) or {}
     items = []
     for record in endpoints.values():
@@ -589,7 +619,7 @@ def _list_agent_runtime_endpoints(runtime_id, query_params):
 def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
     runtime = _runtimes.get(runtime_id)
     if runtime is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     record = (_endpoints.get(runtime_id) or {}).get(endpoint_name)
     if record is None:
         return _not_found(f"Endpoint {endpoint_name} not found")
@@ -780,7 +810,7 @@ def _invoke_agent_runtime(runtime_arn, headers, body, query_params=None):
     if runtime is None:
         return _not_found(f"Agent runtime {runtime_arn} not found")
 
-    qualifier = _query_value(query_params, "qualifier")
+    qualifier = _agentcore_query_value(query_params, "qualifier")
     endpoint = _endpoint_for_qualifier(runtime, owner_account, owner_region, qualifier)
     if qualifier and endpoint is None:
         return _not_found(f"Agent runtime endpoint {qualifier} not found")
