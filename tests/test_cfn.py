@@ -30001,6 +30001,343 @@ def test_cfn_update_rollback_does_not_resend_a_refused_resource_update(cfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+# --- resource import (ChangeSetType=IMPORT) ---
+
+_IMPORT_REVIEW = ("Verify that resources and their properties defined in the template match "
+                  "the intended configuration of the resource import to avoid unexpected changes.")
+_TAG_PHASE = "Apply stack-level tags to imported resource if applicable."
+
+
+def _cfn_import(cfn, stack, resources, to_import, template=None, **extra):
+    """Create an IMPORT change set and return its description."""
+    cs_id = cfn.create_change_set(
+        StackName=stack, ChangeSetName="imp", ChangeSetType="IMPORT",
+        TemplateBody=json.dumps({**(template or {}), "Resources": resources}), ResourcesToImport=to_import,
+        Capabilities=["CAPABILITY_NAMED_IAM"], **extra)["Id"]
+    return cfn.describe_change_set(ChangeSetName=cs_id)
+
+
+def _cfn_execute_import(cfn, stack):
+    """Execute the IMPORT change set; return the final stack and the events it added."""
+    before = len(cfn.describe_stack_events(StackName=stack)["StackEvents"])
+    cfn.execute_change_set(StackName=stack, ChangeSetName="imp")
+    final = _wait_stack(cfn, stack)
+    events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+    return final, [(e["LogicalResourceId"], e["ResourceStatus"], e.get("ResourceStatusReason", ""))
+                   for e in reversed(events[:len(events) - before])]
+
+
+def _cfn_queue_import(qname, url):
+    return ({"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain", "Properties": {"QueueName": qname}},
+            [{"ResourceType": "AWS::SQS::Queue", "LogicalResourceId": "Q",
+              "ResourceIdentifier": {"QueueUrl": url}}])
+
+
+def test_cfn_import_adopts_a_queue_into_a_new_stack(cfn, sqs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, qname = f"cfn-imp-new-{uid}", f"cfn-imp-new-{uid}"
+    url = sqs.create_queue(QueueName=qname, Attributes={"VisibilityTimeout": "17"})["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="kept")
+    declared, to_import = _cfn_queue_import(qname, url)
+    try:
+        cs = _cfn_import(cfn, stack, {"Q": declared}, to_import)
+        assert (cs["Status"], cs["ExecutionStatus"], cs["StatusReason"]) == (
+            "CREATE_COMPLETE", "AVAILABLE", _IMPORT_REVIEW)
+        final, events = _cfn_execute_import(cfn, stack)
+        assert final["StackStatus"] == "IMPORT_COMPLETE"
+        assert events == [
+            (stack, "IMPORT_IN_PROGRESS", "User Initiated"),
+            ("Q", "IMPORT_IN_PROGRESS", "Resource import started."),
+            ("Q", "IMPORT_IN_PROGRESS", ""),
+            ("Q", "IMPORT_COMPLETE", "Resource import completed."),
+            ("Q", "UPDATE_IN_PROGRESS", _TAG_PHASE),
+            ("Q", "UPDATE_COMPLETE", ""),
+            (stack, "IMPORT_COMPLETE", ""),
+        ]
+        resource = cfn.describe_stack_resource(StackName=stack, LogicalResourceId="Q")
+        assert resource["StackResourceDetail"]["ResourceStatus"] == "UPDATE_COMPLETE"
+        assert resource["StackResourceDetail"]["PhysicalResourceId"] == url
+        assert list(cfn.get_template(StackName=stack)["TemplateBody"]["Resources"]) == ["Q"]
+        attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["VisibilityTimeout"])["Attributes"]
+        assert attrs["VisibilityTimeout"] == "17"
+        # Outputs cannot come with the import; a later update reads them off the live queue.
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps({
+            "Resources": {"Q": declared},
+            "Outputs": {"Ref": {"Value": {"Ref": "Q"}},
+                        "Arn": {"Value": {"Fn::GetAtt": ["Q", "Arn"]}}}}))
+        final = _wait_stack(cfn, stack)
+        assert final["StackStatus"] == "UPDATE_COMPLETE", final.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in final["Outputs"]}
+        arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        assert outputs == {"Ref": url, "Arn": arn}
+        _delete_cfn_test_stack(cfn, stack)
+        assert sqs.receive_message(QueueUrl=url)["Messages"][0]["Body"] == "kept"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_cfn_import_into_an_existing_stack_leaves_its_resources_alone(cfn, sqs, ssm):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, qname, pname = f"cfn-imp-old-{uid}", f"cfn-imp-old-{uid}", f"/cfn-imp-old/{uid}"
+    url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    x = {"Type": "AWS::SSM::Parameter", "Properties": {"Name": pname, "Type": "String", "Value": "v"}}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"X": x}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        declared, to_import = _cfn_queue_import(qname, url)
+        _cfn_import(cfn, stack, {"X": x, "Q": declared}, to_import)
+        assert cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"] == "CREATE_COMPLETE"
+        final, events = _cfn_execute_import(cfn, stack)
+        assert final["StackStatus"] == "IMPORT_COMPLETE"
+        assert [e for e in events if e[0] == "X"] == []
+        assert ssm.get_parameter(Name=pname)["Parameter"]["Version"] == 1
+        statuses = {r["LogicalResourceId"]: r["ResourceStatus"]
+                    for r in cfn.describe_stack_resources(StackName=stack)["StackResources"]}
+        assert statuses == {"X": "CREATE_COMPLETE", "Q": "UPDATE_COMPLETE"}
+        # The imported queue is an ordinary stack resource from here on.
+        declared["Properties"]["VisibilityTimeout"] = 45
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"X": x, "Q": declared}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["VisibilityTimeout"])["Attributes"]
+        assert attrs["VisibilityTimeout"] == "45"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.parametrize("new_stack", [False, True])
+def test_cfn_import_rolls_back_when_the_resource_is_gone(cfn, sqs, new_stack):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, qname = f"cfn-imp-gone-{uid}", f"cfn-imp-gone-{uid}"
+    url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    x = {"Type": "AWS::SQS::Queue"}
+    params = {"Parameters": {"V": {"Type": "String", "Default": "a"}}}
+    try:
+        resources, extra = {}, {}
+        if not new_stack:
+            cfn.create_stack(StackName=stack, TemplateBody=json.dumps({**params, "Resources": {"X": x}}))
+            assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+            resources["X"] = x
+            extra = {"template": params, "Parameters": [{"ParameterKey": "V", "ParameterValue": "b"}]}
+        declared, to_import = _cfn_queue_import(qname, url)
+        _cfn_import(cfn, stack, {**resources, "Q": declared}, to_import, **extra)
+        sqs.delete_queue(QueueUrl=url)
+        final, events = _cfn_execute_import(cfn, stack)
+        reason = f"Resource of type 'AWS::SQS::Queue' with identifier '{url}' was not found."
+        status = "ROLLBACK_COMPLETE" if new_stack else "IMPORT_ROLLBACK_COMPLETE"
+        assert final["StackStatus"] == status
+        assert events == [
+            (stack, "IMPORT_IN_PROGRESS", "User Initiated"),
+            ("Q", "IMPORT_IN_PROGRESS", "Resource import started."),
+            ("Q", "IMPORT_FAILED", reason),
+            (stack, "IMPORT_ROLLBACK_IN_PROGRESS", reason),
+            ("Q", "IMPORT_ROLLBACK_IN_PROGRESS", ""),
+            ("Q", "IMPORT_ROLLBACK_COMPLETE", ""),
+            (stack, status, ""),
+        ]
+        assert [r["LogicalResourceId"] for r in cfn.describe_stack_resources(
+            StackName=stack)["StackResources"]] == list(resources)
+        if not new_stack:
+            assert final["Parameters"] == [{"ParameterKey": "V", "ParameterValue": "a"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+@pytest.mark.parametrize("change", ["new-outputs", "new-tags", "dropped-output", "changed-tags"])
+def test_cfn_import_refuses_outputs_and_tags_changes(cfn, sqs, change):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, qname = f"cfn-imp-frozen-{uid}", f"cfn-imp-frozen-{uid}"
+    url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    declared, to_import = _cfn_queue_import(qname, url)
+    output = {"O": {"Value": "x"}}
+    tags = [{"Key": "team", "Value": "a"}]
+    try:
+        if change.startswith("new"):
+            body = {"Resources": {"Q": declared}}
+        else:
+            base = {"Resources": {"X": {"Type": "AWS::SQS::Queue"}}, "Outputs": output}
+            cfn.create_stack(StackName=stack, TemplateBody=json.dumps(base), Tags=tags)
+            assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+            body = {**base, "Resources": {**base["Resources"], "Q": declared}}
+        extra = {}
+        if change == "new-outputs":
+            body["Outputs"] = output
+        elif change == "new-tags":
+            extra["Tags"] = tags
+        elif change == "dropped-output":
+            del body["Outputs"]
+        else:
+            # The stack's own tags are accepted again, a different set is not.
+            cfn.create_change_set(
+                StackName=stack, ChangeSetName="same", ChangeSetType="IMPORT", Tags=tags,
+                TemplateBody=json.dumps(body), ResourcesToImport=to_import)
+            extra["Tags"] = [{"Key": "team", "Value": "b"}]
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack, ChangeSetName="imp", ChangeSetType="IMPORT",
+                                  TemplateBody=json.dumps(body), ResourcesToImport=to_import, **extra)
+        section = "Tags" if change.endswith("tags") else "Outputs"
+        assert exc.value.response["Error"]["Message"] == (
+            f"As part of the import operation, you cannot modify or add [{section}]")
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_cfn_import_adopts_each_supported_type(cfn, sqs, ssm, s3, ddb, iam, logs, lam, iot_client,
+                                               cognito_idp):
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    name, stack = f"cfn-imp-all-{uid}", f"cfn-imp-all-{uid}"
+    trust = {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    document = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Connect",
+                                                         "Resource": "*"}]}
+    ca_pem, _key = generate_ca(common_name=name)
+    url = sqs.create_queue(QueueName=name)["QueueUrl"]
+    ssm.put_parameter(Name=name, Value="v1", Type="String")
+    s3.create_bucket(Bucket=name)
+    ddb.create_table(TableName=name, BillingMode="PAY_PER_REQUEST",
+                     KeySchema=[{"AttributeName": "k", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "k", "AttributeType": "S"}])
+    role = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust))["Role"]
+    logs.create_log_group(logGroupName=name)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e, c):\n    return e\n")
+    fn_arn = lam.create_function(FunctionName=name, Runtime="python3.12", Role=role["Arn"],
+                                 Handler="index.handler", Code={"ZipFile": buf.getvalue()})["FunctionArn"]
+    policy_arn = iot_client.create_policy(policyName=name, policyDocument=json.dumps(document))["policyArn"]
+    ca = iot_client.register_ca_certificate(caCertificate=ca_pem, certificateMode="SNI_ONLY",
+                                            setAsActive=True)
+    pool = cognito_idp.create_user_pool(PoolName=name)["UserPool"]
+    table_arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+    queue_arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    log_arn = logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"][0]["arn"]
+    # (type, identifier, properties, {attribute: live value}); Ref is the identifier.
+    cases = {
+        "Q": ("AWS::SQS::Queue", {"QueueUrl": url}, {"QueueName": name}, {"Arn": queue_arn, "QueueName": name}),
+        "P": ("AWS::SSM::Parameter", {"Name": name}, {"Name": name, "Type": "String", "Value": "v1"},
+              {"Type": "String", "Value": "v1"}),
+        "B": ("AWS::S3::Bucket", {"BucketName": name}, {"BucketName": name}, {"Arn": f"arn:aws:s3:::{name}"}),
+        "T": ("AWS::DynamoDB::Table", {"TableName": name}, {
+            "TableName": name, "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}]}, {"Arn": table_arn}),
+        "R": ("AWS::IAM::Role", {"RoleName": name}, {"RoleName": name, "AssumeRolePolicyDocument": trust},
+              {"Arn": role["Arn"], "RoleId": role["RoleId"]}),
+        "L": ("AWS::Logs::LogGroup", {"LogGroupName": name}, {"LogGroupName": name}, {"Arn": log_arn}),
+        "F": ("AWS::Lambda::Function", {"FunctionName": name}, {
+            "FunctionName": name, "Runtime": "python3.12", "Handler": "index.handler", "Role": role["Arn"],
+            "Code": {"ZipFile": "def handler(e, c):\n    return e\n"}}, {"Arn": fn_arn}),
+        "IP": ("AWS::IoT::Policy", {"Id": name}, {"PolicyName": name, "PolicyDocument": document},
+               {"Arn": policy_arn, "Id": name}),
+        "CA": ("AWS::IoT::CACertificate", {"Id": ca["certificateId"]}, {
+            "CACertificatePem": ca_pem, "Status": "ACTIVE", "CertificateMode": "SNI_ONLY"},
+            {"Arn": ca["certificateArn"], "Id": ca["certificateId"]}),
+        "UP": ("AWS::Cognito::UserPool", {"UserPoolId": pool["Id"]}, {"UserPoolName": name},
+               {"Arn": pool["Arn"], "UserPoolId": pool["Id"]}),
+    }
+    resources = {lid: {"Type": t, "DeletionPolicy": "Retain", "Properties": props}
+                 for lid, (t, _ident, props, _attrs) in cases.items()}
+    to_import = [{"ResourceType": t, "LogicalResourceId": lid, "ResourceIdentifier": ident}
+                 for lid, (t, ident, _props, _attrs) in cases.items()]
+    try:
+        cs = _cfn_import(cfn, stack, resources, to_import)
+        assert cs["ExecutionStatus"] == "AVAILABLE", cs["StatusReason"]
+        assert [c["ResourceChange"]["Action"] for c in cs["Changes"]] == ["Import"] * len(cases)
+        final, _events = _cfn_execute_import(cfn, stack)
+        assert final["StackStatus"] == "IMPORT_COMPLETE", final.get("StackStatusReason")
+        physical = {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                    for r in cfn.describe_stack_resources(StackName=stack)["StackResources"]}
+        assert physical == {lid: next(iter(ident.values())) for lid, (_t, ident, _p, _a) in cases.items()}
+        outputs = {f"{lid}Ref": {"Value": {"Ref": lid}} for lid in cases}
+        outputs.update({f"{lid}{attr}": {"Value": {"Fn::GetAtt": [lid, attr]}}
+                        for lid, (_t, _i, _p, attrs) in cases.items() for attr in attrs})
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps({"Resources": resources, "Outputs": outputs}),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        final = _wait_stack(cfn, stack)
+        assert final["StackStatus"] == "UPDATE_COMPLETE", final.get("StackStatusReason")
+        expected = {f"{lid}Ref": v for lid, v in physical.items()}
+        expected.update({f"{lid}{attr}": value
+                         for lid, (_t, _i, _p, attrs) in cases.items() for attr, value in attrs.items()})
+        assert {o["OutputKey"]: o["OutputValue"] for o in final["Outputs"]} == expected
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        sqs.delete_queue(QueueUrl=url)
+        ssm.delete_parameter(Name=name)
+        s3.delete_bucket(Bucket=name)
+        ddb.delete_table(TableName=name)
+        lam.delete_function(FunctionName=name)
+        iam.delete_role(RoleName=name)
+        logs.delete_log_group(logGroupName=name)
+        iot_client.delete_policy(policyName=name)
+        iot_client.update_ca_certificate(certificateId=ca["certificateId"], newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca["certificateId"])
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
+# AWS's StatusReason for an identifier that names nothing, per type.
+_CFN_IMPORT_MISSING = {
+    "AWS::IAM::Role": (
+        "RoleName",
+        r"The role with name {v} cannot be found\. \(Service: Iam, Status Code: 404, "
+        r"Request ID: [0-9a-f-]+\) \(SDK Attempt Count: 1\)"),
+    "AWS::Logs::LogGroup": (
+        "LogGroupName",
+        r"Resource of type 'AWS::Logs::LogGroup' with identifier "
+        r"'\{{\"/properties/LogGroupName\":\"{v}\"\}}' was not found\."),
+    "AWS::Lambda::Function": (
+        "FunctionName",
+        r"Function not found: arn:aws:lambda:[a-z0-9-]+:\d{{12}}:function:{v} \(Service: Lambda, "
+        r"Status Code: 404, Request ID: [0-9a-f-]+\) \(SDK Attempt Count: 1\)"),
+    "AWS::IoT::Policy": (
+        "Id", r"Resource of type 'AWS::IoT::Policy' with identifier '{v}' was not found\."),
+    "AWS::IoT::CACertificate": (
+        "Id", r"Resource of type 'AWS::IoT::CACertificate' with identifier '{v}' was not found\."),
+    "AWS::Cognito::UserPool": (
+        "UserPoolId",
+        r"User pool {v} does not exist\. \(Service: CognitoIdentityProvider, Status Code: 400, "
+        r"Request ID: [0-9a-f-]+\) \(SDK Attempt Count: 1\)"),
+}
+
+
+@pytest.mark.parametrize("rtype", list(_CFN_IMPORT_MISSING))
+def test_cfn_import_of_a_missing_resource_fails_the_change_set(cfn, rtype):
+    key, missing = _CFN_IMPORT_MISSING[rtype]
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, value = f"cfn-imp-missing-{uid}", f"cfn-imp-missing-{uid}"
+    try:
+        cs = _cfn_import(cfn, stack, {"R": {"Type": rtype, "DeletionPolicy": "Retain"}},
+                         [{"ResourceType": rtype, "LogicalResourceId": "R", "ResourceIdentifier": {key: value}}])
+        assert (cs["Status"], cs["ExecutionStatus"], cs["Changes"]) == ("FAILED", "UNAVAILABLE", [])
+        assert re.fullmatch(missing.format(v=re.escape(value)), cs["StatusReason"]), cs["StatusReason"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_import_of_a_type_without_an_adopter_is_not_executable(cfn, eb):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, bus = f"cfn-imp-bus-{uid}", f"cfn-imp-bus-{uid}"
+    eb.create_event_bus(Name=bus)
+    try:
+        cs = _cfn_import(cfn, stack, {"B": {"Type": "AWS::Events::EventBus", "DeletionPolicy": "Retain",
+                                            "Properties": {"Name": bus}}},
+                         [{"ResourceType": "AWS::Events::EventBus", "LogicalResourceId": "B",
+                           "ResourceIdentifier": {"Name": bus}}])
+        assert (cs["Status"], cs["ExecutionStatus"], cs["StatusReason"]) == (
+            "CREATE_COMPLETE", "UNAVAILABLE",
+            "Resource import is not supported by this emulator for AWS::Events::EventBus")
+        with pytest.raises(ClientError) as exc:
+            cfn.execute_change_set(StackName=stack, ChangeSetName="imp")
+        assert exc.value.response["Error"]["Code"] == "InvalidChangeSetStatus"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        eb.delete_event_bus(Name=bus)
+
+
 # ---------------------------------------------------------------------------
 # OnFailure, OnStackFailure, DeletionMode, TemplateStage, ClientRequestToken
 # ---------------------------------------------------------------------------
