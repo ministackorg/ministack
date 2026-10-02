@@ -33,6 +33,7 @@ import os
 import secrets
 import threading
 import time
+from collections import Counter
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
@@ -569,7 +570,7 @@ def _cluster_view(cluster, include):
     c = {k: v for k, v in cluster.items()
          if k not in ("attachments", "attachmentsStatus", "configuration")}
     c["settings"] = cluster["settings"] if "SETTINGS" in include else []
-    c["statistics"] = []
+    c["statistics"] = _cluster_statistics(cluster) if "STATISTICS" in include else []
     c["tags"] = _tags.get(cluster["clusterArn"], []) if "TAGS" in include else []
     if "ATTACHMENTS" in include:
         c["attachments"] = cluster.get("attachments", [])
@@ -578,6 +579,30 @@ def _cluster_view(cluster, include):
     if "CONFIGURATIONS" in include and "configuration" in cluster:
         c["configuration"] = cluster["configuration"]
     return c
+
+
+_STATISTICS_LAUNCH_TYPES = (("EC2", "FARGATE"), ("EXTERNAL",), ("MANAGED_INSTANCES",))
+_STATISTICS_LABELS = {"EC2": "EC2", "FARGATE": "Fargate", "EXTERNAL": "External",
+                      "MANAGED_INSTANCES": "ManagedInstances"}
+
+
+def _cluster_statistics(cluster):
+    """Task and service counters by launch type, in the order AWS lists them."""
+    name = cluster["clusterName"]
+    counts = Counter((t["lastStatus"], t.get("launchType")) for t in _tasks.values()
+                     if t.get("clusterArn") == cluster["clusterArn"])
+    counts.update((s["status"], s.get("launchType")) for k, s in _services.items()
+                  if k.startswith(f"{name}/"))
+    stats = []
+    for kind, states in (("Tasks", ("RUNNING", "PENDING")), ("Service", ("ACTIVE", "DRAINING"))):
+        for group in _STATISTICS_LAUNCH_TYPES:
+            for state in states:
+                for launch_type in group:
+                    stats.append({
+                        "name": f"{state.lower()}{_STATISTICS_LABELS[launch_type]}{kind}Count",
+                        "value": str(counts[(state, launch_type)]),
+                    })
+    return stats
 
 
 def _list_clusters(data):
