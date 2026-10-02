@@ -10368,6 +10368,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_policies(physical_id)
 
 
 def _asg_lc_create(logical_id, props, stack_name):
@@ -10395,7 +10396,10 @@ def _asg_policy_create(logical_id, props, stack_name):
     policy_name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:scalingPolicy:{new_uuid()}:autoScalingGroupName/{asg_name}:policyName/{policy_name}"
     key = f"{asg_name}/{policy_name}"
-    _asg._policies[key] = _asg._policy_record(asg_name, policy_name, arn, props)
+    record = _asg._policy_record(asg_name, policy_name, arn, props)
+    _asg._delete_policy_alarms(_asg._policies.get(key))
+    _asg._put_tracking_alarms(record)
+    _asg._policies[key] = record
     return arn, {"Arn": arn, "PolicyName": policy_name}
 
 
@@ -10412,6 +10416,8 @@ def _asg_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     if replaced is not None:
         return replaced
     record = _asg._policy_record(asg_name, current["PolicyName"], physical_id, new_props)
+    _asg._delete_policy_alarms(current)
+    _asg._put_tracking_alarms(record)
     current.clear()
     current.update(record)
     return physical_id, {"Arn": physical_id, "PolicyName": current["PolicyName"]}
@@ -10421,7 +10427,7 @@ def _asg_policy_delete(physical_id, props):
     # physical_id is the ARN, find matching key
     for k, v in list(_asg._policies.items()):
         if v.get("PolicyARN") == physical_id:
-            _asg._policies.pop(k, None)
+            _asg._delete_policy_alarms(_asg._policies.pop(k, None))
             break
 
 

@@ -10,6 +10,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **CloudFormation — `AWS::SQS::Queue` with `FifoQueue` gets a generated `.fifo` name** — `FifoQueue: true` without a `QueueName` creates a FIFO queue with a generated `.fifo` name instead of a standard queue, and a `QueueName` whose `.fifo` suffix disagrees with `FifoQueue` fails the resource. Contributed by @iot-rocket.
+- **RDS — `DescribeDBClusterSnapshotAttributes`** — was unimplemented (`InvalidAction: Unknown RDS action`), so Terraform's `aws_db_cluster_snapshot` resource failed on read (`reading RDS DB Cluster Snapshot … attribute`) after creating the snapshot. Returns the `restore` attribute with no shared accounts (the manual-snapshot default); `ModifyDBClusterSnapshotAttribute` is not implemented. Unknown snapshot ids answer `DBClusterSnapshotNotFoundFault`.
+- **Lambda — Docker executor under `USE_SSL=1` when MiniStack runs in a container** — the gateway certificate, CA bundle and Java truststore were bind-mounted into every Lambda container from MiniStack's own filesystem (`MINISTACK_SSL_CERT`, or the generated `ministack-tls/server.crt` under the temp directory), paths the host Docker daemon cannot see, so every invocation failed with `bind source path does not exist`. In a container they are now copied into the Lambda container, as function code already is.
+- **ECS — forced rolling deployments replace tasks and refresh images** — `UpdateService(forceNewDeployment=True)` replaces tasks even when the task definition is unchanged or omitted. Rolling deployments preserve scheduling limits, wait for replacement tasks to stabilize, and retain circuit-breaker rollback; zero-sized deployments drain old tasks and complete. Docker-backed services pin image digests per deployment, honor `versionConsistency: disabled`, and use Secrets Manager credentials for private registries. Tasks report resolved image digests and Fargate platform fields. Cached images remain usable on both launch types, including MiniStack ECR images, preserving MiniStack’s intentional offline fallback.
+- **IoT — mTLS trusts every registered device certificate** — the listener no longer fails the TLS handshake for an ACTIVE certificate whose CA was deactivated or deleted before its first connect, or that was registered without a CA; as on AWS, only the certificate's own status refuses it.
+### Added
+
+- **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`.
 
 ## [1.5.20] — 2026-10-01
 
@@ -31,6 +38,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **botocore 1.43.106** — the service models MiniStack reads move from 1.43.63 to 1.43.106; the images keep `awscli` 1.45.63, installed on the same botocore instead of its pinned one.
 
 ### Fixed
+
 
 - **SES v2 — `ListEmailIdentities` and `ListConfigurationSets` answer the routes newer SDKs use** — botocore 1.43.106 sends them as `POST /v2/email/list-identities` and `POST /v2/email/list-configuration-sets` with `NextToken`, `PageSize` and `Filter` in the body; those paths answered `NotFoundException`. Both forms page, and the `Filter` keys are applied.
 - **Kinesis — `ApproximateArrivalTimestamp` keeps milliseconds** — it was truncated to whole seconds, so an `AT_TIMESTAMP` iterator from an SDK that sends fractional seconds skipped records written earlier in the same second.
