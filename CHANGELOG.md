@@ -15,7 +15,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **CloudFormation — `Ref` to a list parameter** — a `Ref` to a `CommaDelimitedList` or `List<...>` parameter gave the value as one string, such as `"attr_a, attr_b"`, not a list. A list property got this string, and each character became one member: `NonKeyAttributes: !Ref Projected` gave a GSI with the attributes `a`, `t`, `t`, `r`, and so on. `!Join` also joined each character. `Ref` now gives a list, such as `["attr_a", "attr_b"]`, with the spaces after the commas removed. A list in the `Parameters` of an `AWS::CloudFormation::Stack` now fails that resource, as on AWS. To pass a list to a nested stack, use `!Join [",", !Ref Names]`. Contributed by @mishukdutta-cz.
+- **CloudFormation — `Ref` to a list parameter** — a `Ref` to a `CommaDelimitedList` or `List<...>` parameter gave one string, such as `"attr_a, attr_b"`, not a list. Resource code that loops over a list property used each character as one item: `NonKeyAttributes: !Ref Projected` gave a GSI with the attributes `a`, `t`, `t`, `r`, and so on, and `!Join ["|", !Ref Projected]` gave `a|t|t|r|...`. `Ref` now gives a list, such as `["attr_a", "attr_b"]`. A template that uses this `Ref` as a string can now fail, as on AWS: an output `Value: !Ref Names` or a nested-stack parameter `Names: !Ref Names` rolls back the stack. A string property, such as the `Value` of an `AWS::SSM::Parameter`, now gets the list, not `a,b`. To use the list as one string, use `!Join [",", !Ref Names]`. Contributed by @mishukdutta-cz.
 
 ## [1.5.20] — 2026-10-01
 
