@@ -21,6 +21,8 @@ Supports:
 import copy
 import logging
 import os
+import time
+from decimal import Decimal
 from xml.sax.saxutils import escape
 
 from ministack.core.responses import (
@@ -365,6 +367,7 @@ def _delete_asg(p):
     keys_to_del = [k for k in _hooks if k.startswith(f"{name}/")]
     for k in keys_to_del:
         del _hooks[k]
+    _delete_group_policies(name)
     return _xml(200, "DeleteAutoScalingGroupResponse", "<DeleteAutoScalingGroupResult/>")
 
 
@@ -619,9 +622,85 @@ def _put_scaling_policy(p):
         record = _policy_record(asg_name, policy_name, arn, fields)
     except ValueError as exc:
         return _error("ValidationError", f"Invalid numeric value in the scaling policy: {escape(str(exc))}")
+    _delete_policy_alarms(_policies.get(key))
+    _put_tracking_alarms(record)
     _policies[key] = record
     return _xml(200, "PutScalingPolicyResponse",
-                f"<PutScalingPolicyResult><PolicyARN>{arn}</PolicyARN></PutScalingPolicyResult>")
+                f"<PutScalingPolicyResult><PolicyARN>{arn}</PolicyARN>"
+                f"<Alarms>{_member_xml(record.get('Alarms', []))}</Alarms></PutScalingPolicyResult>")
+
+
+_TRACKING_METRICS = {
+    "ASGAverageCPUUtilization": ("CPUUtilization", None),
+    "ASGAverageNetworkIn": ("NetworkIn", "Bytes"),
+    "ASGAverageNetworkOut": ("NetworkOut", "Bytes"),
+}
+
+
+def _tracking_metric(tracking, asg_name):
+    """The alarm metric of a target tracking configuration, or None for types without modelled alarms."""
+    predefined = tracking.get("PredefinedMetricSpecification") or {}
+    if predefined.get("PredefinedMetricType") in _TRACKING_METRICS:
+        name, unit = _TRACKING_METRICS[predefined["PredefinedMetricType"]]
+        return {"Namespace": "AWS/EC2", "MetricName": name, "Statistic": "Average", "Unit": unit,
+                "Dimensions": [{"Name": "AutoScalingGroupName", "Value": asg_name}]}
+    custom = tracking.get("CustomizedMetricSpecification") or {}
+    if custom.get("MetricName"):
+        return {"Namespace": custom.get("Namespace"), "MetricName": custom["MetricName"],
+                "Statistic": custom.get("Statistic"), "Unit": custom.get("Unit"),
+                "Dimensions": custom.get("Dimensions", [])}
+    return None
+
+
+def _put_tracking_alarms(record):
+    """Create the AlarmHigh and, unless scale-in is disabled, AlarmLow alarms of a target tracking policy."""
+    tracking = record.get("TargetTrackingConfiguration")
+    metric = tracking and _tracking_metric(tracking, record["AutoScalingGroupName"])
+    if not metric:
+        return
+    from ministack.services import cloudwatch as _cw
+    target = Decimal(str(tracking.get("TargetValue", 0)))
+    levels = [("High", 3, target, "GreaterThanThreshold")]
+    if not tracking.get("DisableScaleIn"):
+        levels.append(("Low", 15, target * Decimal("0.9"), "LessThanThreshold"))
+    record["Alarms"] = []
+    for level, periods, threshold, operator in levels:
+        name = f"TargetTracking-{record['AutoScalingGroupName']}-Alarm{level}-{new_uuid()}"
+        now = int(time.time())
+        alarm = {k: v for k, v in {
+            "AlarmName": name,
+            "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
+            "AlarmDescription": f"DO NOT EDIT OR DELETE. For TargetTrackingScaling policy {record['PolicyARN']}.",
+            "ActionsEnabled": True,
+            "OKActions": [],
+            "AlarmActions": [record["PolicyARN"]],
+            "InsufficientDataActions": [],
+            "StateValue": "INSUFFICIENT_DATA",
+            "StateReason": "Unchecked: Initial alarm creation",
+            "StateUpdatedTimestamp": now,
+            "AlarmConfigurationUpdatedTimestamp": now,
+            **metric,
+            "Period": 60,
+            "EvaluationPeriods": periods,
+            "Threshold": float(threshold),
+            "ComparisonOperator": operator,
+        }.items() if v is not None}
+        _cw.cloudformation_put_metric_alarm(alarm)
+        record["Alarms"].append({"AlarmName": name, "AlarmARN": alarm["AlarmArn"]})
+
+
+def _delete_policy_alarms(record):
+    """Delete the alarms a policy created."""
+    from ministack.services import cloudwatch as _cw
+    for alarm in (record or {}).get("Alarms", []):
+        _cw.cloudformation_delete_metric_alarm(alarm["AlarmName"])
+
+
+def _delete_group_policies(asg_name):
+    """Delete the policies of a group and their alarms."""
+    for k, policy in list(_policies.items()):
+        if policy.get("AutoScalingGroupName") == asg_name:
+            _delete_policy_alarms(_policies.pop(k, None))
 
 
 def _member_xml(value):
@@ -656,7 +735,7 @@ def _delete_policy(p):
     policy_name = _p(p, "PolicyName")
     asg_name = _p(p, "AutoScalingGroupName")
     key = f"{asg_name}/{policy_name}"
-    _policies.pop(key, None)
+    _delete_policy_alarms(_policies.pop(key, None))
     return _xml(200, "DeletePolicyResponse", "<DeletePolicyResult/>")
 
 

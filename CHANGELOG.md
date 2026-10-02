@@ -14,6 +14,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **SES — a send from an unverified sender is rejected** — v1 `SendEmail`, `SendRawEmail`, `SendTemplatedEmail` and `SendBulkTemplatedEmail` and v2 `SendEmail` and `SendBulkEmail` accepted any `Source` / `FromEmailAddress`. AWS requires the sender to be a verified identity in the account and region, in production as well as the sandbox, and now so does MiniStack: the send fails with `MessageRejected` "Email address is not verified. The following identities failed the check in region …". A verified domain covers its addresses and subdomains, domain names compare case-insensitively and email addresses case-sensitively, as AWS documents. Tests that send from an address they never created as an identity need a `VerifyEmailIdentity` / `CreateEmailIdentity` first. Reported by @skialpine.
+- **ECS — forced rolling deployments replace tasks and refresh images** — `UpdateService(forceNewDeployment=True)` replaces tasks even when the task definition is unchanged or omitted. Rolling deployments preserve scheduling limits, wait for replacement tasks to stabilize, and retain circuit-breaker rollback; zero-sized deployments drain old tasks and complete. Docker-backed services pin image digests per deployment, honor `versionConsistency: disabled`, and use Secrets Manager credentials for private registries. Tasks report resolved image digests and Fargate platform fields. Cached images remain usable on both launch types, including MiniStack ECR images, preserving MiniStack’s intentional offline fallback.
+- **IoT — mTLS trusts every registered device certificate** — the listener no longer fails the TLS handshake for an ACTIVE certificate whose CA was deactivated or deleted before its first connect, or that was registered without a CA; as on AWS, only the certificate's own status refuses it.
+### Added
+
+- **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`.
 
 ## [1.5.20] — 2026-10-01
 
@@ -35,6 +40,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **botocore 1.43.106** — the service models MiniStack reads move from 1.43.63 to 1.43.106; the images keep `awscli` 1.45.63, installed on the same botocore instead of its pinned one.
 
 ### Fixed
+
 
 - **SES v2 — `ListEmailIdentities` and `ListConfigurationSets` answer the routes newer SDKs use** — botocore 1.43.106 sends them as `POST /v2/email/list-identities` and `POST /v2/email/list-configuration-sets` with `NextToken`, `PageSize` and `Filter` in the body; those paths answered `NotFoundException`. Both forms page, and the `Filter` keys are applied.
 - **Kinesis — `ApproximateArrivalTimestamp` keeps milliseconds** — it was truncated to whole seconds, so an `AT_TIMESTAMP` iterator from an SDK that sends fractional seconds skipped records written earlier in the same second.
