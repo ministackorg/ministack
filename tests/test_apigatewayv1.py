@@ -4951,7 +4951,7 @@ def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
 
 
 def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
-    """A 0/0 limit refuses everything; a real limit does not."""
+    """A 0/0 limit refuses everything with TooManyRequestsException; a real limit does not."""
     api_id, root = _gw_api(apigw_v1, f"gwthr-{_uuid_mod.uuid4().hex[:8]}")
     try:
         resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
@@ -4970,6 +4970,8 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
 
         throttle("/~1thr/GET", 0, 0)
         assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+        assert _gwresp_call(api_id, "thr", stage="p")[1].get(
+            "x-amzn-errortype") == "TooManyRequestsException"
         throttle("/~1thr/GET", 100, 50)
         assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
         apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
@@ -4978,6 +4980,97 @@ def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
         assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _plan_key(apigw_v1, api_id, **plan_kwargs):
+    """The value of a new key in a new usage plan on stage p."""
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+    stage = {"apiId": api_id, "stage": "p"}
+    if "method_throttle" in plan_kwargs:
+        stage["throttle"] = plan_kwargs.pop("method_throttle")
+    plan = apigw_v1.create_usage_plan(name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+                                      apiStages=[stage], **plan_kwargs)["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+    return [("x-api-key", key["value"])]
+
+
+def test_apigwv1_usage_plan_throttle_answers_429(apigw_v1):
+    """The plan limit applies to every method the key calls, stage limits too."""
+    api_id, root = _gw_api(apigw_v1, f"gwplthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part, required in (("a", True), ("open", False)):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=required)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+            {"op": "replace", "path": "/*/*/throttling/rateLimit", "value": "1000"},
+            {"op": "replace", "path": "/*/*/throttling/burstLimit", "value": "500"},
+        ])
+        closed = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0, "burstLimit": 0})
+        tiny = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0.01, "burstLimit": 1})
+        free = _plan_key(apigw_v1, api_id)
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed) == throttled
+        assert _stage_call(api_id, "/open", headers=closed) == throttled
+        assert _stage_call(api_id, "/open") == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=free) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=tiny) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/open", headers=tiny) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_adds_to_the_plan_limit(apigw_v1):
+    """A per-method plan limit throttles that method and never lifts the plan limit."""
+    api_id, root = _gw_api(apigw_v1, f"gwplmthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part in ("a", "b"):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        closed_a = _plan_key(apigw_v1, api_id,
+                             throttle={"rateLimit": 1000, "burstLimit": 500},
+                             method_throttle={"/a/GET": {"rateLimit": 0, "burstLimit": 0}})
+        open_a = _plan_key(apigw_v1, api_id,
+                           throttle={"rateLimit": 0, "burstLimit": 0},
+                           method_throttle={"/a/GET": {"rateLimit": 1000, "burstLimit": 500}})
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed_a) == throttled
+        assert _stage_call(api_id, "/b", headers=closed_a) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=open_a) == throttled
+        assert _stage_call(api_id, "/b", headers=open_a) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_is_per_api_stage(apigw_v1):
+    """The same method on two API stages of one plan has two buckets."""
+    apis = [_gw_api(apigw_v1, f"gwplstg-{_uuid_mod.uuid4().hex[:8]}") for _ in range(2)]
+    try:
+        for api_id, root in apis:
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart="a")["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+            apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+        limits = {"/a/GET": {"rateLimit": 0.01, "burstLimit": 1}}
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p", "throttle": limits} for api_id, _ in apis])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+        headers = [("x-api-key", key["value"])]
+        first, second = (api_id for api_id, _ in apis)
+
+        assert _stage_call(first, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(second, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(first, "/a", headers=headers) == (429, '{"message":"Too Many Requests"}')
+    finally:
+        for api_id, _ in apis:
+            apigw_v1.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
@@ -5001,15 +5094,181 @@ def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
         json_header = [("Content-Type", "application/json")]
 
         assert _stage_call(api_id, "/val", "POST", '{"name":"x"}', json_header) == (
-            400, '{"message":"Missing required request parameters: [q]"}')
+            400, '{"message": "Missing required request parameters: [q]"}')
         assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", "not json", json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", '{"name":123}', json_header) == (
-            400, '{"message":"Invalid request body"}')
+            400, '{"message": "Invalid request body"}')
         assert _stage_call(api_id, "/val?q=1", "POST", '{"name":"x"}',
                            json_header) == (200, '{"ok":true}')
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        for path in ("/val", "/val?q=1"):
+            with pytest.raises(_urlerr.HTTPError) as exc:
+                _urlreq.urlopen(_urlreq.Request(
+                    f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p{path}",
+                    method="POST", data=b"{}", headers=dict(json_header)))
+            assert exc.value.headers["x-amzn-ErrorType"] == "BadRequestException"
+        apigw_v1.put_gateway_response(
+            restApiId=api_id, responseType="BAD_REQUEST_BODY", responseTemplates={
+                "application/json":
+                    '{"m":$context.error.messageString,"e":"$context.error.message"}'})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
+            400, '{"m": "Invalid request body","e":"Invalid request body"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_applies_json_schema_draft4(apigw_v1):
+    """The body is checked against the draft 4 keywords of the model."""
+    api_id, root = _gw_api(apigw_v1, f"gwjs-{_uuid_mod.uuid4().hex[:8]}")
+
+    def prop(schema, ok, bad):
+        return ({"type": "object", "properties": {"v": schema}},
+                [f'{{"v":{b}}}' for b in ok], [f'{{"v":{b}}}' for b in bad])
+
+    cases = {
+        "Enum": prop({"enum": ["red", "blue"]}, ['"red"'], ['"green"']),
+        "Pattern": prop({"type": "string", "pattern": "[0-9]"}, ['"a1b"'], ['"abc"']),
+        "Length": prop({"type": "string", "minLength": 2, "maxLength": 2},
+                       ['"ab"', '"\U0001F600\U0001F600"'], ['"a"', '"abc"']),
+        "Range": prop({"minimum": 1, "maximum": 10, "exclusiveMaximum": True},
+                      ["1", "9.5", '"x"'], ["0", "10"]),
+        "Multiple": prop({"multipleOf": 0.5}, ["1.5"], ["1.2"]),
+        "Int": prop({"type": "integer"}, ["3", "-0"], ["3.0", "3.5", "1e2", "true", '"3"']),
+        "Num": prop({"type": "number"}, ["1e2"], ["true", '"1"']),
+        "Bool": prop({"type": "boolean"}, ["false"], ['"true"', "0"]),
+        "Nullable": prop({"type": ["string", "null"]}, ["null", '"x"'], ["1"]),
+        "List": prop({"type": "array", "items": {"type": "string"}, "minItems": 1,
+                      "maxItems": 2, "uniqueItems": True},
+                     ['["a"]'], ["[]", '["a","b","c"]', "[1]", '["a","a"]']),
+        "Tuple": prop({"type": "array", "items": [{"type": "string"}, {"type": "integer"}],
+                       "additionalItems": False}, ['["a",1]', '["a"]'], ["[1,1]", '["a",1,2]']),
+        "Combined": prop({"anyOf": [{"type": "string"}, {"allOf": [{"minimum": 1}, {"maximum": 2}]}],
+                          "not": {"enum": ["no"]}}, ['"x"', "1.5"], ["3", '"no"']),
+        "OneOf": prop({"oneOf": [{"type": "integer"}, {"minimum": 2}]}, ["1"], ["3", "1.5"]),
+        "Formats": ({"type": "object", "properties": {
+            "email": {"format": "email"}, "time": {"format": "date-time"},
+            "ip": {"format": "ipv4"}, "ip6": {"format": "ipv6"},
+            "host": {"format": "hostname"}, "uri": {"format": "uri"}}},
+            ['{"email":"a@b.io","time":"2026-09-30T12:00:00Z","ip":"10.0.0.1","ip6":"::1",'
+             '"host":"a_b.example","uri":"rel/path"}'],
+            ['{"email":"nope"}', '{"time":"2026-09-30"}', '{"ip":"999.0.0.1"}',
+             '{"ip6":"zz::"}', '{"host":"-bad-"}', '{"uri":"not a uri"}']),
+        "Closed": ({"type": "object", "properties": {"a": {}}, "additionalProperties": False},
+                   ['{"a":1}'], ['{"a":1,"b":2}']),
+        "Extra": ({"type": "object", "patternProperties": {"^n_": {"type": "number"}},
+                   "additionalProperties": {"type": "string"}},
+                  ['{"n_a":1,"b":"x"}'], ['{"n_a":"x"}', '{"b":1}']),
+        "Count": ({"type": "object", "minProperties": 1, "maxProperties": 2,
+                   "dependencies": {"a": ["b"]}},
+                  ['{"a":1,"b":1}', '{"b":1}'], ["{}", '{"a":1}', '{"a":1,"b":2,"c":3}']),
+        "Local": ({"definitions": {"s": {"type": "string"}}, "type": "object",
+                   "properties": {"v": {"$ref": "#/definitions/s"}}}, ['{"v":"x"}'], ['{"v":1}']),
+        "Ref": prop({"$ref": f"https://apigateway.amazonaws.com/restapis/{api_id}/models/Other"},
+                    ['{"id":"x"}'], ["{}", '{"id":1}']),
+        "Any": ({}, ["1", '"x"', "[" * 1000 + "]" * 1000],
+                ["", "not json", "[" * 1001 + "]" * 1001, "[" * 100000 + "]" * 100000]),
+        "Deep": ({"definitions": {"a": {"type": "array", "items": {"$ref": "#/definitions/a"}}},
+                  "$ref": "#/definitions/a"}, ["[[]]", "[" * 1000 + "]" * 1000], ["[1]", "[" * 1001 + "]" * 1001]),
+    }
+    try:
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True)["id"]
+        apigw_v1.create_model(
+            restApiId=api_id, name="Other", contentType="application/json",
+            schema=json.dumps({"type": "object", "required": ["id"],
+                               "properties": {"id": {"type": "string"}}}))
+        for name, (schema, _ok, _bad) in cases.items():
+            apigw_v1.create_model(restApiId=api_id, name=name,
+                                  contentType="application/json", schema=json.dumps(schema))
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=name)["id"]
+            _mock_method(apigw_v1, api_id, resource, "POST", requestValidatorId=validator,
+                         requestModels={"application/json": name})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+        for name, (_schema, ok, bad) in cases.items():
+            for body in ok:
+                assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == (
+                    200, '{"ok":true}'), (name, body)
+            for body in bad:
+                assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == (
+                    400, '{"message": "Invalid request body"}'), (name, body)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_schema_loop_answers_500(apigw_v1):
+    """A schema that applies itself to the same value answers 500; a pure $ref cycle passes."""
+    api_id, root = _gw_api(apigw_v1, f"gwloop-{_uuid_mod.uuid4().hex[:8]}")
+    models = f"https://apigateway.amazonaws.com/restapis/{api_id}/models"
+
+    def defs(a, b=None):
+        return {"definitions": {"a": a, "b": b or {}}, "$ref": "#/definitions/a"}
+
+    loop = {"allOf": [{"$ref": "#/definitions/a"}]}
+    cases = {
+        "PureRef": (defs({"$ref": "#/definitions/b"}, {"$ref": "#/definitions/a"}), ["{}"], [], []),
+        "AllOf": (defs(loop), [], [], ["{}", "1"]),
+        "AnyOf": (defs({"anyOf": [{"type": "object"}, {"$ref": "#/definitions/a"}]}), [], [], ["{}"]),
+        "Not": (defs({"not": {"$ref": "#/definitions/a"}}), [], [], ["{}"]),
+        "TypeFirst": (defs({"type": "string", "allOf": [{"$ref": "#/definitions/a"}]}), [], [], ["{}"]),
+        "Depends": (defs({"dependencies": {"x": {"$ref": "#/definitions/a"}}}), ["{}"], [], ['{"x":1}']),
+        "Nested": ({"definitions": {"a": loop}, "type": "object", "required": ["n"],
+                    "properties": {"c": {"$ref": "#/definitions/a"}}}, ['{"n":1}'], ['{"c":1}'],
+                   ['{"n":1,"c":1}']),
+        "Twice": (defs({"allOf": [{"$ref": "#/definitions/b"}] * 2}, {"type": "object"}),
+                  ["{}"], ["1"], []),
+        "Siblings": ({"definitions": {"a": loop}, "properties": {
+            "a": {"type": "string"}, "c": {"$ref": "#/definitions/a"}}},
+            ['{"a":"x"}'], ['{"a":1}'], ['{"a":1,"c":1}', '{"c":1,"a":1}']),
+        "Closed": ({"definitions": {"a": loop}, "properties": {"c": {"$ref": "#/definitions/a"}},
+                    "additionalProperties": False}, [], ['{"c":1,"z":1}', '{"z":1,"c":1}'], ['{"c":1}']),
+        "Items": ({"definitions": {"a": loop}, "items": [{"type": "string"}, {"$ref": "#/definitions/a"}]},
+                  [], ["[1]"], ["[1,1]"]),
+        "Yy": ({"type": "object"}, [], [], ["{}"]),
+        "Xx": ({"allOf": [{"$ref": f"{models}/Yy"}]}, [], [], ["{}"]),
+        "Py": ({"type": "object"}, ["{}"], [], []),
+        "Px": ({"$ref": f"{models}/Py"}, ["{}", "1"], [], []),
+        "Self": ({"type": "object"}, ["{}"], [], []),
+    }
+    updates = {"Yy": {"allOf": [{"$ref": f"{models}/Xx"}]}, "Py": {"$ref": f"{models}/Px"},
+               "Self": defs({"$ref": f"{models}/Self"})}
+    try:
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True)["id"]
+        for name, (schema, *_bodies) in cases.items():
+            apigw_v1.create_model(restApiId=api_id, name=name,
+                                  contentType="application/json", schema=json.dumps(schema))
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=name)["id"]
+            _mock_method(apigw_v1, api_id, resource, "POST", requestValidatorId=validator,
+                         requestModels={"application/json": name})
+        for name, schema in updates.items():
+            apigw_v1.update_model(restApiId=api_id, modelName=name, patchOperations=[{
+                "op": "replace", "path": "/schema", "value": json.dumps(schema)}])
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+        expected = ((200, '{"ok":true}'), (400, '{"message": "Invalid request body"}'),
+                    (500, '{"message": "Internal server error"}'))
+        for name, (_schema, *bodies) in cases.items():
+            for answer, sent in zip(expected, bodies):
+                for body in sent:
+                    assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == answer, (
+                        name, body)
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        with pytest.raises(_urlerr.HTTPError) as exc:
+            _urlreq.urlopen(_urlreq.Request(
+                f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p/AllOf",
+                method="POST", data=b"{}", headers=dict(json_header)))
+        assert exc.value.headers["x-amzn-ErrorType"] == "InternalServerErrorException"
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
 
