@@ -891,8 +891,7 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
     cannot be forgotten at one site, with these exceptions. The DynamoDB
-    table, the Location tracker, the IoT thing type, the Glue trigger and the
-    RDS DB cluster and instance have a deterministic generated name: the
+    table, the Location tracker, the IoT thing type and the Glue trigger have a deterministic generated name: the
     replacement takes the name back, so there is nothing left to retain. The
     other is the Lambda permission's degenerate ``Id`` branch, which removes
     and re-puts one statement under a Sid that cannot change: the physical id
@@ -4063,7 +4062,7 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
     using-cfn-nested-stacks), so the set the parent stored covers the child
     and, through the child's own record, every level below it. Like the
-    parent's check it runs under AUTH=true or CFN_ENFORCE_CAPABILITIES=1. A
+    parent's check it runs under AUTH=true only. A
     child template with a macro needs CAPABILITY_AUTO_EXPAND on the parent.
     """
     from ministack.services.cloudformation.handlers import (
@@ -10371,8 +10370,9 @@ def _rds_db_cluster_attrs(cluster):
     }
 
 
-def _rds_db_cluster_create(logical_id, props, stack_name):
-    cluster_id = props.get("DBClusterIdentifier") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+def _rds_db_cluster_create(logical_id, props, stack_name, replacing=""):
+    cluster_id = props.get("DBClusterIdentifier") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=63, replacing=replacing)
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]
     created = now_iso()
@@ -10414,9 +10414,9 @@ def _rds_db_cluster_update(physical_id, old_props, new_props, stack_name, logica
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBCluster", old_props, new_props):
-        # The generated name is deterministic, so the replacement takes it back.
-        _rds_db_cluster_delete(physical_id, old_props)
-        return _rds_db_cluster_create(logical_id or physical_id, new_props, stack_name)
+        created = _rds_db_cluster_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        _delete_predecessor(_rds_db_cluster_delete, physical_id, old_props)
+        return created
     # A record saved before the create stored these fields gets them first, so the update cannot fail half-way.
     cluster.setdefault("DbClusterResourceId", _rds_cluster_resource_id())
     for key in ("EarliestRestorableTime", "LatestRestorableTime"):
@@ -10508,7 +10508,7 @@ def _rds_db_instance_attrs(instance):
     }
 
 
-def _rds_db_instance_create(logical_id, props, stack_name):
+def _rds_db_instance_create(logical_id, props, stack_name, replacing=""):
     """Provision an AWS::RDS::DBInstance.
 
     Writes the instance record directly into rds._instances with the same
@@ -10517,7 +10517,7 @@ def _rds_db_instance_create(logical_id, props, stack_name):
     happens via the CLI / SDK path which already handles container spawn).
     """
     db_id = props.get("DBInstanceIdentifier") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=63
+        stack_name, logical_id, lowercase=True, max_len=63, replacing=replacing
     )
     master_user = props.get("MasterUsername", "admin")
     master_pass = props.get("MasterUserPassword", "password")
@@ -10600,9 +10600,9 @@ def _rds_db_instance_update(physical_id, old_props, new_props, stack_name, logic
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBInstance", old_props, new_props):
-        # The generated name is deterministic, so the replacement takes it back.
-        _rds_db_instance_delete(physical_id, old_props)
-        return _rds_db_instance_create(logical_id or physical_id, new_props, stack_name)
+        created = _rds_db_instance_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        _delete_predecessor(_rds_db_instance_delete, physical_id, old_props)
+        return created
     _rds_apply_changed(instance, _rds_db_instance_fields(old_props), _rds_db_instance_fields(new_props))
     if _rds_db_instance_port(old_props) != _rds_db_instance_port(new_props):
         instance["Endpoint"]["Port"] = _rds_db_instance_port(new_props)

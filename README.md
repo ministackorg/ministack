@@ -897,7 +897,6 @@ come from `repositoryCredentials.credentialsParameter` (a Secrets Manager secret
 | `LAMBDA_WARM_TTL_SECONDS` | `300` | How long an idle warm Lambda container stays in the pool before the reaper evicts it |
 | `LAMBDA_ACCOUNT_CONCURRENCY` | `0` | Account-level concurrent-invocation cap (0 = unbounded). Match real AWS by setting to `1000`. Used to simulate `ConcurrentInvocationLimitExceeded` throttles |
 | `SFN_MOCK_CONFIG` | _(unset)_ | Path to JSON file for Step Functions mock testing; compatible with AWS SFN Local format. Also accepts `LOCALSTACK_SFN_MOCK_CONFIG` |
-| `CFN_ENFORCE_CAPABILITIES` | _(unset)_ | Set `1` to have CloudFormation refuse a template whose IAM resources or macros the request's `Capabilities` do not acknowledge (`InsufficientCapabilitiesException`, and on a nested stack a failed resource), as AWS always does, also without `AUTH=true`. Under `AUTH=true` the check always runs |
 | `ATHENA_ENGINE` | `auto` | SQL engine for Athena: `auto`, `duckdb`, `mock` |
 | `SMTP_HOST` | _(unset)_ | SMTP server for SES email relay (e.g. `mailhog:1025`). When set, SES SendEmail/SendRawEmail actually deliver mail. When unset, emails are stored in-memory only |
 | `MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS` | `30` | API Gateway v1/v2 HTTP `HTTP_PROXY` / `HTTP` integration: upstream request timeout (seconds) |

@@ -3178,39 +3178,6 @@ def test_cfn_nested_stack_capabilities_are_rechecked_on_an_update(monkeypatch):
         _forget_nested_test_stacks(parent)
 
 
-@pytest.mark.parametrize("auth,setting", [(False, "1"), (True, "0"), (True, "typo")])
-def test_cfn_capabilities_setting_turns_the_check_on(monkeypatch, auth, setting):
-    """CFN_ENFORCE_CAPABILITIES turns the check on without AUTH, and no value
-    of it turns the check off under AUTH, for CreateStack and nested stacks."""
-    import ministack.app as app_mod
-    from ministack.services.cloudformation import _stack_events, _stacks
-    from ministack.services.cloudformation.handlers import _create_stack
-
-    monkeypatch.setattr(app_mod, "AUTH", auth)
-    monkeypatch.setenv("CFN_ENFORCE_CAPABILITIES", setting)
-    uid = _uuid_mod.uuid4().hex[:8]
-    stack_name = f"cfn-caps-setting-{uid}"
-    url = "http://localhost:4566/tpl/child.json"
-    try:
-        status, code, message = _caps_error(
-            _create_stack(_caps_params(_CAPS_ROLE_TEMPLATE, StackName=stack_name)))
-        assert (status, code, message) == (
-            400, "InsufficientCapabilitiesException",
-            "Requires capabilities : [CAPABILITY_IAM]")
-        assert stack_name not in _stacks
-        with pytest.raises(ValueError, match=r"Requires capabilities : \[CAPABILITY_IAM\]"):
-            _deploy_nested_child(monkeypatch, f"{stack_name}-p", [],
-                                 {url: _CAPS_ROLE_TEMPLATE}, url)
-        child = _deploy_nested_child(monkeypatch, f"{stack_name}-p2", ["CAPABILITY_IAM"],
-                                     {url: _CAPS_ROLE_TEMPLATE}, url)
-        assert _stacks[child]["Capabilities"] == ["CAPABILITY_IAM"]
-    finally:
-        stack = _stacks.pop(stack_name, None)
-        if stack:
-            _stack_events.pop(stack["StackId"], None)
-        _forget_nested_test_stacks(f"{stack_name}-p")
-
-
 def test_cfn_nested_stack_macro_needs_auto_expand_on_the_parent(monkeypatch):
     """A child template with a Transform fails the nested stack unless the
     parent acknowledged CAPABILITY_AUTO_EXPAND."""
