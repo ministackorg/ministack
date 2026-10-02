@@ -24,6 +24,7 @@ from .engine import (
 )
 from .provisioners import (
     _DEFERRED_PREDECESSOR_DELETES,
+    _NAME_SEED,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
     _custom_named_replacement_error,
@@ -31,6 +32,7 @@ from .provisioners import (
     _import_resource,
     _property_recreation,
     _provision_resource,
+    _replacing_change,
     _snapshot_resource,
     _tag_map,
     _update_resource,
@@ -84,6 +86,11 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
                                  "AWS::CloudFormation::Stack",
                                  "AWS::ElastiCache::CacheCluster",
                                  "AWS::ElastiCache::ReplicationGroup"))
+
+
+def _update_keeping_seed(*args):
+    """Return _update_resource's result and the name seed it left, which a worker thread would lose."""
+    return _update_resource(*args), _NAME_SEED.get()
 
 
 # ===========================================================================
@@ -263,6 +270,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
     type's update handler; ``record`` takes the attributes it answers."""
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
                physical_id=physical_id)
+    seed_token = _NAME_SEED.set((record or {}).get("_name_seed", ""))
     try:
         if _runs_on_worker_thread(rtype):
             new_pid, new_attrs = await run_reentrant(
@@ -277,6 +285,8 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
         _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_FAILED",
                    str(exc), physical_id)
         raise
+    finally:
+        _NAME_SEED.reset(seed_token)
     if record is not None:
         if new_pid != physical_id:
             logger.warning("Rollback update of %s moved it from %s to %s",
@@ -655,6 +665,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
         raw_props = res_def.get("Properties", {})
         update_attempt = None
+        name_seed = ""
 
         try:
             # Resolve properties
@@ -723,22 +734,29 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     stack_name, stack_id, logical_id)
                 pending_deletes = []
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
-                # A custom-named refusal never reaches the handler: nothing to send back.
-                if not _custom_named_replacement_error(
-                        resource_type, old_tagged, new_tagged):
+                seed_token = _NAME_SEED.set(prev_resource.get("_name_seed", ""))
+                # A refusal or a replacement leaves the resource as it was: nothing to send back.
+                refused = _custom_named_replacement_error(resource_type, old_tagged, new_tagged)
+                if not refused and _replacing_change(resource_type, old_tagged, new_tagged):
+                    _add_event(stack_id, stack_name, logical_id, resource_type,
+                               "UPDATE_IN_PROGRESS",
+                               "Requested update requires the creation of a new "
+                               "physical resource; hence creating one.", old_pid)
+                elif not refused:
                     update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
                     if _runs_on_worker_thread(resource_type):
-                        physical_id, attrs = await run_reentrant(
-                            _update_resource, resource_type, old_pid, old_tagged,
+                        (physical_id, attrs), name_seed = await run_reentrant(
+                            _update_keeping_seed, resource_type, old_pid, old_tagged,
                             new_tagged, stack_name, logical_id, old_attrs
                         )
                     else:
-                        physical_id, attrs = _update_resource(
+                        (physical_id, attrs), name_seed = _update_keeping_seed(
                             resource_type, old_pid, old_tagged, new_tagged,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
+                    _NAME_SEED.reset(seed_token)
                     _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
                 if physical_id != old_pid or pending_deletes:
@@ -796,6 +814,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         }
         if dynamic_values:
             provisioned_resources[logical_id]["_dynamic"] = dynamic_values
+        if name_seed:
+            provisioned_resources[logical_id]["_name_seed"] = name_seed
         created_in_this_run.append(logical_id)
 
         if logical_id not in imports:
