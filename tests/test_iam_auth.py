@@ -2265,6 +2265,12 @@ class TestActionExtraction:
         assert extract_iam_action("dynamodb", "POST", "/", {"x-amz-target": "DynamoDB_20120810.PutItem"}, b"", {}) == "dynamodb:PutItem"
         assert extract_iam_action("kms", "POST", "/", {"x-amz-target": "TrentService.Encrypt"}, b"", {}) == "kms:Encrypt"
 
+    def test_opensearchserverless_target_protocol(self):
+        from ministack.core.iam_actions import extract_iam_action
+        assert extract_iam_action(
+            "opensearchserverless", "POST", "/", {"x-amz-target": "OpenSearchServerless.CreateCollection"}, b"", {}
+        ) == "aoss:CreateCollection"
+
     def test_s3_rest(self):
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("s3", "GET", "/", {}, b"", {}) == "s3:ListAllMyBuckets"
