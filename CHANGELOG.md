@@ -13,6 +13,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`.
 
+### Fixed
+
+- **CloudFormation — `Fn::Select` in a condition** — a condition that checks one member of a `CommaDelimitedList`, such as `!Not [!Equals [!Select [2, !Ref KeySpec], ""]]`, was always true, whatever the parameter value. Templates use this check for an optional member: `"id,S,,"` gives `["id", "S", "", ""]`, and an empty member means "no value". Conditions did not resolve `Fn::Select`, so `Fn::Equals` compared the unresolved function with `""`. Thus the stack made resources whose condition is false, and `Fn::If` took the wrong branch. Conditions now resolve `Fn::Select`, with the same comma split as resource properties. Contributed by @mishukdutta-cz.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

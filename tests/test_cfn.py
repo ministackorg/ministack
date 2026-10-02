@@ -2160,6 +2160,33 @@ def test_cfn_conditions(cfn, s3):
     with pytest.raises(ClientError):
         s3.head_bucket(Bucket="cfn-t04-cond")
 
+
+def test_cfn_condition_selects_from_comma_delimited_list(cfn):
+    """Fn::Select in a condition gives one member of a CommaDelimitedList. An empty member makes the condition false,
+    so the stack does not make the resource."""
+    name = f"cfn-cond-select-{_uuid_mod.uuid4().hex[:8]}"
+
+    def parameter(condition):
+        return {"Type": "AWS::SSM::Parameter", "Condition": condition,
+                "Properties": {"Name": f"/{name}/{condition}", "Type": "String", "Value": "x"}}
+
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "gsi,,S"}},
+        "Conditions": {
+            "FirstSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [0, {"Ref": "Spec"}]}, ""]}]},
+            "SecondSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [1, {"Ref": "Spec"}]}, ""]}]},
+        },
+        "Resources": {"First": parameter("FirstSet"), "Second": parameter("SecondSet")},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        resources = cfn.describe_stack_resources(StackName=name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in resources] == ["First"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_outputs_exports(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",

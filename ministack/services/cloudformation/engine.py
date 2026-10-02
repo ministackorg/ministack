@@ -633,6 +633,16 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
                 return _eval(val)
             if "Condition" in val:
                 return _eval(val)
+            if "Fn::Select" in val:
+                index, items = val["Fn::Select"]
+                index = int(_resolve_cond_value(index))
+                items = _resolve_cond_value(items)
+                if isinstance(items, str):
+                    # A CommaDelimitedList parameter is one string here: "id,S,," becomes ["id", "S", "", ""]
+                    items = [s.strip() for s in items.split(",")]
+                if 0 <= index < len(items):
+                    return items[index]
+                return ""
         return val
 
     for name, defn in cond_defs.items():
