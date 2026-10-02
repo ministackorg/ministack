@@ -68,9 +68,7 @@ logger = logging.getLogger("cloudformation")
 # so AWS::Region / ARNs reflect the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
-# Mixed into the suffix of a generated name. A replacement draws a new one so
-# the new resource does not take its predecessor's name; the engine keeps it
-# on the resource record and sets it again for every later update.
+# Mixed into generated names; a replacement draws a new one, kept on the resource record.
 _NAME_SEED = contextvars.ContextVar("cfn_name_seed", default="")
 
 
@@ -665,10 +663,7 @@ def _requires_replacement_pipes(old_props, new_props):
 # custom-named resource (you must rename it first), so MiniStack must fail the
 # update instead of silently executing the replacement and destroying data
 # (issue #1433).
-# A replacement is a change to a property of the type's _REPLACING_PROPERTIES
-# row, or one ``requires_replacement`` adds. A type with an ``exists`` message
-# is not refused up front: AWS runs the create, which fails with that message
-# because the predecessor still holds the name.
+# An ``exists`` entry is not refused up front: the replacement's create fails on the name.
 _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
         "name": "TableName",
@@ -921,14 +916,7 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with five exceptions. Four have a
-    deterministic generated name (the DynamoDB table, the IoT thing type and
-    the ElastiCache cache cluster and replication group): the replacement
-    takes the name back, so there is nothing left to retain. The fifth is the
-    Lambda permission's degenerate ``Id`` branch,
-    which removes and re-puts one statement under a Sid that cannot change:
-    the physical id is kept, nothing is replaced, and the policy does not
-    apply.
+    cannot be forgotten at one site.
     """
     if _RETAIN_REPLACED.get():
         return
@@ -939,15 +927,12 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     delete_fn(*args, **kwargs)
 
 
-def _replacing_update(create_fn, delete_fn):
-    """An update handler for a type whose every property is create-only."""
-    def update(physical_id, old_props, new_props, stack_name, logical_id=None):
-        # A custom name was refused above; a generated one gets a new name.
-        created = create_fn(logical_id or physical_id, new_props, stack_name,
-                            replacing=physical_id)
-        _delete_predecessor(delete_fn, physical_id, old_props)
-        return created
-    return update
+def _seeded_create(create_fn, logical_id, props, stack_name):
+    """Create a handler's replacement under a new generated name."""
+    _NAME_SEED.set(new_uuid()[:8])
+    return create_fn(logical_id, props, stack_name)
+
+
 def _replace_resource(resource_type, physical_id, old_props, new_props,
                       stack_name, logical_id):
     """Create the resource anew under a new generated name."""
@@ -1367,7 +1352,7 @@ def _s3_apply_notification(name, notif):
 # S3 Multi-Region Access Point
 # ---------------------------------------------------------------------------
 
-def _s3_mrap_create(logical_id, props, stack_name, replacing=""):
+def _s3_mrap_create(logical_id, props, stack_name):
     """Provision an AWS::S3::MultiRegionAccessPoint.
 
     On AWS this is asynchronous — `CreateMultiRegionAccessPoint` returns a
@@ -1379,7 +1364,7 @@ def _s3_mrap_create(logical_id, props, stack_name, replacing=""):
     plane can resolve the alias to one of them.
     """
     name = props.get("Name") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=50, replacing=replacing)
+        stack_name, logical_id, lowercase=True, max_len=50)
     buckets = [
         r.get("Bucket") for r in (props.get("Regions") or [])
         if isinstance(r, dict) and r.get("Bucket")
@@ -2211,10 +2196,8 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     published versions, aliases, the resource policy, tags, event invoke
     configs. Going through the Lambda module's own update paths keeps them.
 
-    FunctionName, PackageType and TenancyConfig changes are replaced in
-    ``_update_resource`` before this runs. A DurableConfig change may require
-    replacement on AWS; under the same physical name the closest local
-    equivalent is the full re-provision the create fallback always did.
+    FunctionName, PackageType and TenancyConfig are replaced in ``_update_resource``;
+    a DurableConfig change re-provisions under the same name.
     """
     name = new_props.get("FunctionName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
@@ -2421,11 +2404,8 @@ def _iam_role_create(logical_id, props, stack_name):
 def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a role in place, keeping its ARN and RoleId.
 
-    RoleName and Path are create-only: ``_update_resource`` replaces the
-    role before this runs. Everything else — assume-role document, inline
-    Policies, ManagedPolicyArns, Description, MaxSessionDuration, Tags —
-    updates in place, so policies attached from outside the template survive
-    (the create fallback used to rebuild the record and drop them).
+    RoleName and Path are replaced in ``_update_resource``; the rest updates
+    in place, so policies attached from outside the template survive.
     """
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
@@ -2717,10 +2697,7 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    # A generated name belongs to this stack resource, so a profile left under
-    # it is taken over; a custom name goes through CreateInstanceProfile as it
-    # is, and its EntityAlreadyExists keeps one stack from writing over a
-    # profile another stack or the API owns.
+    # A generated name is this stack's to take over; a custom one meets EntityAlreadyExists.
     if not props.get("InstanceProfileName"):
         _iam._instance_profiles.pop(name, None)
     resp = _iam._create_instance_profile({"InstanceProfileName": [name], "Path": [path]})
@@ -3654,9 +3631,9 @@ def _eks_cluster_fields(props):
     return fields
 
 
-def _eks_cluster_create(logical_id, props, stack_name, replacing=""):
+def _eks_cluster_create(logical_id, props, stack_name):
     import ministack.services.eks as _eks
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100, replacing=replacing)
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100)
     body = {
         "name": name,
         "roleArn": props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/eks-role"),
@@ -3693,7 +3670,7 @@ def _eks_cluster_update(physical_id, old_props, new_props, stack_name, logical_i
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::EKS::Cluster", old_props, new_props):
-        created = _eks_cluster_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        created = _seeded_create(_eks_cluster_create, logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_eks_cluster_delete, physical_id, old_props)
         return created
     fields = _eks_cluster_fields(new_props)
@@ -3734,11 +3711,11 @@ def _eks_nodegroup_attrs(ng):
             "Arn": ng["nodegroupArn"]}
 
 
-def _eks_nodegroup_create(logical_id, props, stack_name, replacing=""):
+def _eks_nodegroup_create(logical_id, props, stack_name):
     import ministack.services.eks as _eks
     cluster_name = props.get("ClusterName", "")
     ng_name = props.get("NodegroupName") or _physical_name(
-        stack_name, logical_id, max_len=63, replacing=replacing)
+        stack_name, logical_id, max_len=63)
     body = {
         "nodegroupName": ng_name,
         "instanceTypes": props.get("InstanceTypes", ["t3.medium"]),
@@ -3775,8 +3752,8 @@ def _eks_nodegroup_update(physical_id, old_props, new_props, stack_name, logical
             "NodeRole", "Subnets", "InstanceTypes", "AmiType", "CapacityType", "DiskSize",
             "RemoteAccess")):
         if not new_props.get("NodegroupName"):
-            created = _eks_nodegroup_create(
-                logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+            created = _seeded_create(
+                _eks_nodegroup_create, logical_id or physical_id, new_props, stack_name)
             _delete_predecessor(_eks_nodegroup_delete, physical_id, old_props)
             return created
         # The replacement's create meets the name still in use and fails, as on AWS.
@@ -5763,8 +5740,8 @@ def _pipes_pipe_fields(props):
     }
 
 
-def _pipes_pipe_create(logical_id, props, stack_name, replacing=""):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64, replacing=replacing)
+def _pipes_pipe_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     fields = _pipes_pipe_fields(props)
     source_params = props.get("SourceParameters", {})
     ddb_params = source_params.get("DynamoDBStreamParameters", {}) if isinstance(source_params, dict) else {}
@@ -5795,7 +5772,7 @@ def _pipes_pipe_update(physical_id, old_props, new_props, stack_name, logical_id
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::Pipes::Pipe", old_props, new_props):
-        created = _pipes_pipe_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        created = _seeded_create(_pipes_pipe_create, logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_pipes_pipe_delete, physical_id, old_props)
         return created
     fields = _pipes_pipe_fields(new_props)
@@ -10441,9 +10418,9 @@ def _rds_db_cluster_attrs(cluster):
     }
 
 
-def _rds_db_cluster_create(logical_id, props, stack_name, replacing=""):
+def _rds_db_cluster_create(logical_id, props, stack_name):
     cluster_id = props.get("DBClusterIdentifier") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=63, replacing=replacing)
+        stack_name, logical_id, lowercase=True, max_len=63)
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]
     created = now_iso()
@@ -10485,7 +10462,7 @@ def _rds_db_cluster_update(physical_id, old_props, new_props, stack_name, logica
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBCluster", old_props, new_props):
-        created = _rds_db_cluster_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        created = _seeded_create(_rds_db_cluster_create, logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_rds_db_cluster_delete, physical_id, old_props)
         return created
     # A record saved before the create stored these fields gets them first, so the update cannot fail half-way.
@@ -10579,7 +10556,7 @@ def _rds_db_instance_attrs(instance):
     }
 
 
-def _rds_db_instance_create(logical_id, props, stack_name, replacing=""):
+def _rds_db_instance_create(logical_id, props, stack_name):
     """Provision an AWS::RDS::DBInstance.
 
     Writes the instance record directly into rds._instances with the same
@@ -10588,7 +10565,7 @@ def _rds_db_instance_create(logical_id, props, stack_name, replacing=""):
     happens via the CLI / SDK path which already handles container spawn).
     """
     db_id = props.get("DBInstanceIdentifier") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=63, replacing=replacing
+        stack_name, logical_id, lowercase=True, max_len=63
     )
     master_user = props.get("MasterUsername", "admin")
     master_pass = props.get("MasterUserPassword", "password")
@@ -10671,7 +10648,7 @@ def _rds_db_instance_update(physical_id, old_props, new_props, stack_name, logic
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBInstance", old_props, new_props):
-        created = _rds_db_instance_create(logical_id or physical_id, new_props, stack_name, replacing=physical_id)
+        created = _seeded_create(_rds_db_instance_create, logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_rds_db_instance_delete, physical_id, old_props)
         return created
     _rds_apply_changed(instance, _rds_db_instance_fields(old_props), _rds_db_instance_fields(new_props))
@@ -10813,9 +10790,9 @@ def _asg_delete(physical_id, props):
     _asg._delete_group_policies(physical_id)
 
 
-def _asg_lc_create(logical_id, props, stack_name, replacing=""):
+def _asg_lc_create(logical_id, props, stack_name):
     name = props.get("LaunchConfigurationName") or _physical_name(
-        stack_name, logical_id, max_len=255, replacing=replacing)
+        stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _asg._launch_configs[name] = {
         "LaunchConfigurationName": name,
@@ -12633,9 +12610,7 @@ def _ecr_repo_update(physical_id, old_props, new_props, stack_name, logical_id=N
     repo = _ecr._repositories.get(physical_id)
     if repo is None:
         return _ecr_repo_create(logical_id or physical_id, new_props, stack_name)
-    # ImageTagMutability, ImageScanningConfiguration, LifecyclePolicy,
-    # RepositoryPolicyText and Tags update in place; RepositoryName and
-    # EncryptionConfiguration are replaced in _update_resource.
+    # RepositoryName and EncryptionConfiguration are replaced in _update_resource.
     api = _ecr_cfn_to_api(new_props)
     repo["imageTagMutability"] = api["imageTagMutability"]
     repo["imageScanningConfiguration"] = api["imageScanningConfiguration"]
@@ -12818,14 +12793,7 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
-# CloudFormation replacement rules, checked against DescribeType and change
-# sets. A row lists the schema's createOnlyProperties (Always); the conditional
-# table below lists its conditionalCreateOnlyProperties (Conditionally). Any
-# other property of a listed type is in place (Never), as AWS reports it. A
-# stack update replaces the resource when an Always property changes. Service
-# API immutability is different: an update may fail without being reported as
-# a replacement (for example Cognito sign-in attributes). Types without a row
-# keep the conservative Conditionally answer and their handler's behavior.
+# Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
@@ -12933,8 +12901,6 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::S3::MultiRegionAccessPoint": {
         "create": _s3_mrap_create,
-        "update": _replacing_update(_s3_mrap_create, _s3_mrap_delete),
-        "update_with_logical_id": True,
         "delete": _s3_mrap_delete,
     },
     "AWS::S3::BucketPolicy": {
@@ -13740,8 +13706,6 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AutoScaling::LaunchConfiguration": {
         "create": _asg_lc_create,
-        "update": _replacing_update(_asg_lc_create, _asg_lc_delete),
-        "update_with_logical_id": True,
         "delete": _asg_lc_delete,
     },
     "AWS::AutoScaling::ScalingPolicy": {
