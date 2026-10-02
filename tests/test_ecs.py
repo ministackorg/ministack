@@ -1107,6 +1107,58 @@ def test_ecs_update_cluster(ecs):
     )
     assert resp["cluster"]["clusterName"] == "upd-cl"
 
+
+@pytest.mark.parametrize("include", [
+    [], ["ATTACHMENTS"], ["CONFIGURATIONS"], ["SETTINGS"], ["STATISTICS"], ["TAGS"],
+])
+def test_ecs_describe_clusters_include_gates_fields(ecs, include):
+    """Each include value returns only its own field; the others stay empty or absent."""
+    name = f"incl-{_uuid_mod.uuid4().hex[:8]}"
+    settings = [{"name": "containerInsights", "value": "enabled"}]
+    tags = [{"key": "k", "value": "v"}]
+    configuration = {"executeCommandConfiguration": {"logging": "DEFAULT"}}
+    ecs.create_cluster(clusterName=name, tags=tags, settings=settings, configuration=configuration)
+    try:
+        c = ecs.describe_clusters(clusters=[name], include=include)["clusters"][0]
+        assert c["settings"] == (settings if "SETTINGS" in include else [])
+        assert c["tags"] == (tags if "TAGS" in include else [])
+        assert c.get("configuration") == (configuration if "CONFIGURATIONS" in include else None)
+        assert ("attachments" in c) == ("ATTACHMENTS" in include)
+        assert "attachmentsStatus" not in c
+        if "STATISTICS" not in include:
+            assert c["statistics"] == []
+    finally:
+        ecs.delete_cluster(cluster=name)
+
+
+def test_ecs_describe_clusters_statistics_count_services_by_launch_type(ecs):
+    """STATISTICS lists the sixteen task and service counters in the AWS order."""
+    name = f"stats-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=name)
+    td = ecs.register_task_definition(
+        family=name, containerDefinitions=[{"name": "app", "image": "alpine", "memory": 128}],
+    )["taskDefinition"]["taskDefinitionArn"]
+    ecs.create_service(cluster=name, serviceName="svc", taskDefinition=td,
+                       desiredCount=0, launchType="EC2")
+    try:
+        stats = ecs.describe_clusters(clusters=[name], include=["STATISTICS"])["clusters"][0]["statistics"]
+        assert [s["name"] for s in stats] == [
+            "runningEC2TasksCount", "runningFargateTasksCount",
+            "pendingEC2TasksCount", "pendingFargateTasksCount",
+            "runningExternalTasksCount", "pendingExternalTasksCount",
+            "runningManagedInstancesTasksCount", "pendingManagedInstancesTasksCount",
+            "activeEC2ServiceCount", "activeFargateServiceCount",
+            "drainingEC2ServiceCount", "drainingFargateServiceCount",
+            "activeExternalServiceCount", "drainingExternalServiceCount",
+            "activeManagedInstancesServiceCount", "drainingManagedInstancesServiceCount",
+        ]
+        assert {s["name"]: s["value"] for s in stats if s["value"] != "0"} == {"activeEC2ServiceCount": "1"}
+    finally:
+        ecs.delete_service(cluster=name, service="svc")
+        ecs.delete_cluster(cluster=name)
+        ecs.deregister_task_definition(taskDefinition=td)
+
+
 def test_ecs_timestamps_are_epoch(ecs):
     """ECS timestamps should be epoch numbers, not ISO strings."""
     ecs.create_cluster(clusterName="ts-test-v44")

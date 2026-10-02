@@ -1322,58 +1322,42 @@ def _resolve_refs(value, resources, params, conditions, mappings,
 # Dependency Extractor + Topological Sort
 # ===========================================================================
 
+def _intrinsic_references(value):
+    """Yield (name, attribute or None) for each Ref, Fn::GetAtt and Fn::Sub variable."""
+    if isinstance(value, list):
+        for item in value:
+            yield from _intrinsic_references(item)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, arg in value.items():
+        if key == "Ref" and isinstance(arg, str):
+            yield arg, None
+        elif key == "Fn::GetAtt":
+            parts = arg.split(".", 1) if isinstance(arg, str) else arg
+            if isinstance(parts, list) and parts and isinstance(parts[0], str):
+                attr = parts[1] if len(parts) > 1 and isinstance(parts[1], str) else None
+                yield parts[0], attr
+        elif key == "Fn::Sub":
+            text, bindings = (list(arg) + [{}])[:2] if isinstance(arg, list) else (arg, {})
+            bindings = bindings if isinstance(bindings, dict) else {}
+            for var in re.findall(r"\$\{([^}]+)\}", str(text)):
+                if not var.startswith("!") and var not in bindings:
+                    name, _, attr = var.partition(".")
+                    yield name, attr or None
+            yield from _intrinsic_references(list(bindings.values()))
+        else:
+            yield from _intrinsic_references(arg)
+
+
 def _extract_deps(resource_def: dict, all_resource_names: set) -> set:
     """Walk a resource definition and extract dependency logical IDs."""
-    deps = set()
-
-    def _walk(obj):
-        if isinstance(obj, dict):
-            if "Ref" in obj:
-                ref = obj["Ref"]
-                if ref in all_resource_names:
-                    deps.add(ref)
-            if "Fn::GetAtt" in obj:
-                args = obj["Fn::GetAtt"]
-                if isinstance(args, list) and args:
-                    if args[0] in all_resource_names:
-                        deps.add(args[0])
-                elif isinstance(args, str):
-                    logical = args.split(".")[0]
-                    if logical in all_resource_names:
-                        deps.add(logical)
-            if "Fn::Sub" in obj:
-                sub_val = obj["Fn::Sub"]
-                template_str = sub_val[0] if isinstance(sub_val, list) else sub_val
-                for match in re.finditer(r"\$\{([^}]+)\}", str(template_str)):
-                    var = match.group(1)
-                    if var.startswith("!"):
-                        continue
-                    base = var.split(".")[0]
-                    if base in all_resource_names:
-                        deps.add(base)
-            # Walk ALL branches of Fn::If
-            if "Fn::If" in obj:
-                args = obj["Fn::If"]
-                for branch in args[1:]:
-                    _walk(branch)
-            for k, v in obj.items():
-                if k not in ("Ref", "Fn::GetAtt", "Fn::Sub", "Fn::If"):
-                    _walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _walk(item)
-
-    # DependsOn
+    deps = {name for name, _ in _intrinsic_references(resource_def.get("Properties", {}))
+            if name in all_resource_names}
     depends_on = resource_def.get("DependsOn", [])
     if isinstance(depends_on, str):
         depends_on = [depends_on]
-    for d in depends_on:
-        if d in all_resource_names:
-            deps.add(d)
-
-    # Walk Properties
-    _walk(resource_def.get("Properties", {}))
-
+    deps.update(d for d in depends_on if d in all_resource_names)
     return deps
 
 
