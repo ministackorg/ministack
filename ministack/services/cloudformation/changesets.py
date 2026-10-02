@@ -4,10 +4,17 @@
 CloudFormation change set handlers — Create, Describe, Execute, Delete, List change sets.
 """
 
+import asyncio
 import copy
+import json
 import logging
 
+import ministack.services.cloudwatch_logs as _cw_logs
+import ministack.services.cognito as _cognito
 import ministack.services.dynamodb as _dynamodb
+import ministack.services.iam as _iam
+import ministack.services.iot as _iot
+import ministack.services.lambda_svc as _lambda_svc
 import ministack.services.s3 as _s3
 import ministack.services.sns as _sns
 import ministack.services.sqs as _sqs
@@ -15,11 +22,13 @@ import ministack.services.ssm as _ssm
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
+    _NO_VALUE,
     _apply_transforms,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    _topological_sort,
     validate_template_support,
 )
 from .helpers import (
@@ -37,6 +46,7 @@ from .helpers import (
     stack_name_problems,
     validation_error_message,
 )
+from .provisioners import _RESOURCE_HANDLERS, _import_resource
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -45,6 +55,7 @@ from .stacks import (
     _diff_resources,
     _stack_region,
     _stack_region_context,
+    _stack_tags_changed,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -143,23 +154,76 @@ def _parameter_import_problem(name):
     return None
 
 
+def _role_import_problem(name):
+    if name not in _iam._roles:
+        return _sdk_error(f"The role with name {name} cannot be found.", "Iam", 404)
+    return None
+
+
+def _log_group_import_problem(name):
+    if name not in _cw_logs._log_groups:
+        key = json.dumps({"/properties/LogGroupName": name}, separators=(",", ":"))
+        return _IMPORT_NOT_FOUND.format(type="AWS::Logs::LogGroup", value=key)
+    return None
+
+
+def _function_import_problem(name):
+    if name not in _lambda_svc._functions:
+        arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{name}"
+        return _sdk_error(f"Function not found: {arn}", "Lambda", 404)
+    return None
+
+
+def _iot_policy_import_problem(name):
+    if name not in _iot._policies:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::Policy", value=name)
+    return None
+
+
+def _ca_certificate_import_problem(ca_id):
+    if ca_id not in _iot._ca_certificates:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::CACertificate", value=ca_id)
+    return None
+
+
+def _user_pool_import_problem(pool_id):
+    if pool_id not in _cognito._user_pools:
+        return _sdk_error(f"User pool {pool_id} does not exist.", "CognitoIdentityProvider", 400)
+    return None
+
+
 # The resource types an IMPORT change set looks up before it describes the
 # import: the one ResourceIdentifier key AWS expects, and a lookup in this
 # emulator's own store that returns the StatusReason of the FAILED change set
-# AWS leaves behind when the identifier is invalid or names nothing (each
-# measured for an existing, a missing, a blank and an empty value). Types not
-# listed are accepted without a lookup.
+# AWS leaves behind when the identifier is invalid or names nothing (measured
+# for a missing value, and for the first five also a blank and an empty one).
+# Types not listed are accepted without a lookup.
 _IMPORT_LOOKUPS = {
     "AWS::SQS::Queue": ("QueueUrl", _queue_import_problem),
     "AWS::SNS::Topic": ("TopicArn", _topic_import_problem),
     "AWS::S3::Bucket": ("BucketName", _bucket_import_problem),
     "AWS::DynamoDB::Table": ("TableName", _table_import_problem),
     "AWS::SSM::Parameter": ("Name", _parameter_import_problem),
+    "AWS::IAM::Role": ("RoleName", _role_import_problem),
+    "AWS::Logs::LogGroup": ("LogGroupName", _log_group_import_problem),
+    "AWS::Lambda::Function": ("FunctionName", _function_import_problem),
+    "AWS::IoT::Policy": ("Id", _iot_policy_import_problem),
+    "AWS::IoT::CACertificate": ("Id", _ca_certificate_import_problem),
+    "AWS::Cognito::UserPool": ("UserPoolId", _user_pool_import_problem),
 }
 
 
 def _listed(ids):
     return "[" + ", ".join(ids) + "]"
+
+
+def _tag_dict(tags):
+    return {t.get("Key"): t.get("Value") for t in tags or []}
+
+
+# The StatusReason AWS gives an executable IMPORT change set.
+_IMPORT_REVIEW = ("Verify that resources and their properties defined in the template match "
+                  "the intended configuration of the resource import to avoid unexpected changes.")
 
 
 def _import_changes(resources_to_import, template, diff):
@@ -509,9 +573,21 @@ def _create_change_set(params):
     with _stack_region_context(stack, stack_id):
         old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
         new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
-    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"))
+    changed_params = {k for k, v in param_values.items()
+                      if old_params.get(k, {}).get("Value") != v.get("Value")}
+    retag = (stack.get("_resources", {}) if cs_type == "UPDATE"
+             and _stack_tags_changed(stack, tags, tags_given) else ())
+    changes = _diff_resources(old_resolved, new_resolved, stack.get("_resources"),
+                              template, changed_params, retag)
     import_failure = None
     if cs_type == "IMPORT":
+        previous_tags = {} if new_stack_import else _tag_dict(stack.get("Tags"))
+        frozen = next((name for name, changed in (
+            ("Outputs", template.get("Outputs", {}) != old_template.get("Outputs", {})),
+            ("Tags", tags_given and _tag_dict(tags) != previous_tags),
+        ) if changed), None)
+        if frozen:
+            return _rejected(f"As part of the import operation, you cannot modify or add [{frozen}]")
         # An import describes the resources being adopted, not the template
         # diff, which would call each of them `Add`; the diff only decides
         # what else the template may not do during an import.
@@ -537,8 +613,14 @@ def _create_change_set(params):
         # the change set, with no changes, once it looks the resource up.
         _cs_status, _cs_exec, _cs_reason = "FAILED", "UNAVAILABLE", import_failure
     elif cs_type == "IMPORT":
-        _cs_status, _cs_exec = "CREATE_COMPLETE", "UNAVAILABLE"
-        _cs_reason = "Resource import is not supported by this emulator"
+        unsupported = sorted({e["ResourceType"] for e in resources_to_import
+                              if "import" not in _RESOURCE_HANDLERS.get(e["ResourceType"], {})})
+        if unsupported:
+            _cs_status, _cs_exec = "CREATE_COMPLETE", "UNAVAILABLE"
+            _cs_reason = ("Resource import is not supported by this emulator for "
+                          + ", ".join(unsupported))
+        else:
+            _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", _IMPORT_REVIEW
     elif changes:
         _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
     else:
@@ -572,6 +654,7 @@ def _create_change_set(params):
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
+        "_resources_to_import": resources_to_import,
     }
     _change_sets[cs_id] = change_set
 
@@ -616,11 +699,20 @@ def _describe_change_set(params):
                     f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
                     "</RequiresRecreation>"
                 )
+            causing_xml = (
+                f"<CausingEntity>{_esc(d['CausingEntity'])}</CausingEntity>"
+                if d.get("CausingEntity") else ""
+            )
+            source_xml = (
+                f"<ChangeSource>{_esc(d['ChangeSource'])}</ChangeSource>"
+                if d.get("ChangeSource") else ""
+            )
             details_xml += (
                 "<member>"
                 f"<Target>{target_xml}</Target>"
                 f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
-                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                f"{source_xml}"
+                f"{causing_xml}"
                 "</member>"
             )
         # botocore reads an empty element as "", so a member the change does
@@ -715,15 +807,6 @@ def _execute_change_set(params):
         return _error("ChangeSetNotFound",
                       f"ChangeSet [{cs_name}] does not exist", 404)
 
-    if cs.get("ChangeSetType") == "IMPORT":
-        # The ordinary create path would recreate the imported resource and
-        # could delete the stack's existing resources when that create fails.
-        return _error(
-            "InvalidChangeSetStatus",
-            f"ChangeSet [{cs_name}] cannot be executed: resource import is not "
-            "supported by this emulator.",
-        )
-
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
@@ -757,6 +840,11 @@ def _execute_change_set(params):
     tags = cs.get("Tags", [])
     cs_type = cs.get("ChangeSetType", "UPDATE")
     is_update = cs_type == "UPDATE"
+    if cs_type == "IMPORT":
+        _start_import(cs, stack)
+        _drop_other_change_sets(stack_id, _executed_cs_id)
+        return _xml(200, "ExecuteChangeSetResponse",
+                    "<ExecuteChangeSetResult></ExecuteChangeSetResult>")
 
     if is_update:
         previous_stack = {
@@ -808,12 +896,7 @@ def _execute_change_set(params):
             stack_id,
         )
 
-    # Real AWS deletes the stack's other change sets on execute — they are no
-    # longer valid for the updated stack. #1418
-    from ministack.services.cloudformation import _change_sets as _cs_store
-    for _cid in [c for c, v in _cs_store.items()
-                 if v.get("StackId") == stack_id and c != _executed_cs_id]:
-        _cs_store.pop(_cid, None)
+    _drop_other_change_sets(stack_id, _executed_cs_id)
 
     # ExecutionStatus stays EXECUTE_IN_PROGRESS until the deploy finishes, when
     # _track_change_set_execution sets EXECUTE_COMPLETE or EXECUTE_FAILED. Status
@@ -822,6 +905,114 @@ def _execute_change_set(params):
     # set as "not ready" (it gates on Status == CREATE_COMPLETE). #1418
     return _xml(200, "ExecuteChangeSetResponse",
                 "<ExecuteChangeSetResult></ExecuteChangeSetResult>")
+
+
+def _drop_other_change_sets(stack_id, executed_cs_id):
+    """Delete the stack's other change sets, as AWS does on execute."""
+    from ministack.services.cloudformation import _change_sets
+    for cid in [c for c, v in _change_sets.items()
+                if v.get("StackId") == stack_id and c != executed_cs_id]:
+        _change_sets.pop(cid, None)
+
+
+def _start_import(cs, stack):
+    """Put the stack into IMPORT_IN_PROGRESS and adopt the change set's resources."""
+    stack_id, stack_name = stack["StackId"], stack["StackName"]
+    new_stack = stack["StackStatus"] == "REVIEW_IN_PROGRESS"
+    stack["StackStatus"] = "IMPORT_IN_PROGRESS"
+    stack["StackStatusReason"] = "User Initiated"
+    stack["LastUpdatedTime"] = now_iso()
+    with _stack_region_context(stack, stack_id):
+        _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+                   "IMPORT_IN_PROGRESS", "User Initiated", stack_id)
+        _create_stack_task_in_region(
+            _track_change_set_execution(cs, stack, _import_resources_async(cs, stack, new_stack)),
+            stack, stack_id)
+
+
+async def _import_resources_async(cs, stack, new_stack):
+    """Adopt an IMPORT change set's resources unchanged; one that cannot be read rolls it back."""
+    stack_id, stack_name = stack["StackId"], stack["StackName"]
+    template, param_values = cs["_template"], cs["_resolved_params"]
+    conditions = _evaluate_conditions(template, param_values)
+    definitions = template.get("Resources", {})
+    entries = {e["LogicalResourceId"]: e for e in cs["_resources_to_import"]}
+    order = [lid for lid in _topological_sort(definitions, conditions) if lid in entries]
+    resources = stack.setdefault("_resources", {})
+
+    def event(logical_id, status, reason="", physical_id=""):
+        _add_event(stack_id, stack_name, logical_id, entries[logical_id]["ResourceType"],
+                   status, reason, physical_id)
+
+    started, failure = [], None
+    for logical_id in order:
+        entry = entries[logical_id]
+        rtype = entry["ResourceType"]
+        started.append(logical_id)
+        event(logical_id, "IMPORT_IN_PROGRESS", "Resource import started.")
+        failure = _import_not_found([entry])
+        if failure is None:
+            try:
+                physical_id, attrs = _import_resource(rtype, entry["ResourceIdentifier"])
+                props = _resolve_refs(
+                    copy.deepcopy(definitions[logical_id].get("Properties", {})), resources,
+                    param_values, conditions, template.get("Mappings", {}), stack_name, stack_id)
+            except Exception as exc:
+                logger.error("Failed to import %s (%s): %s", logical_id, rtype, exc)
+                failure = str(exc)
+        if failure is not None:
+            event(logical_id, "IMPORT_FAILED", failure)
+            break
+        event(logical_id, "IMPORT_IN_PROGRESS", physical_id=physical_id)
+        event(logical_id, "IMPORT_COMPLETE", "Resource import completed.", physical_id)
+        resources[logical_id] = {
+            "PhysicalResourceId": physical_id,
+            "ResourceType": rtype,
+            "ResourceStatus": "IMPORT_COMPLETE",
+            "LogicalResourceId": logical_id,
+            "Properties": {k: v for k, v in props.items() if v is not _NO_VALUE},
+            "Attributes": attrs,
+            "Timestamp": now_iso(),
+        }
+    await asyncio.sleep(0)
+
+    if failure is not None:
+        stack["StackStatus"] = "IMPORT_ROLLBACK_IN_PROGRESS"
+        stack["StackStatusReason"] = failure
+        _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+                   "IMPORT_ROLLBACK_IN_PROGRESS", failure, stack_id)
+        for logical_id in reversed(started):
+            record = resources.pop(logical_id, None) or {}
+            event(logical_id, "IMPORT_ROLLBACK_IN_PROGRESS",
+                  physical_id=record.get("PhysicalResourceId", ""))
+            event(logical_id, "IMPORT_ROLLBACK_COMPLETE",
+                  physical_id=record.get("PhysicalResourceId", ""))
+        stack["StackStatus"] = "ROLLBACK_COMPLETE" if new_stack else "IMPORT_ROLLBACK_COMPLETE"
+        stack["StackStatusReason"] = ""
+        _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+                   stack["StackStatus"], physical_id=stack_id)
+        return
+
+    for logical_id in order:
+        record = resources[logical_id]
+        event(logical_id, "UPDATE_IN_PROGRESS",
+              "Apply stack-level tags to imported resource if applicable.",
+              record["PhysicalResourceId"])
+        record["ResourceStatus"] = "UPDATE_COMPLETE"
+        event(logical_id, "UPDATE_COMPLETE", physical_id=record["PhysicalResourceId"])
+    stack["_template"] = template
+    stack["_template_body"] = cs["_template_body"]
+    stack["_resolved_params"] = param_values
+    stack["_conditions"] = conditions
+    stack["Capabilities"] = list(cs.get("Capabilities", []))
+    stack["Parameters"] = [
+        {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
+        for k, v in param_values.items()
+    ]
+    stack["StackStatus"] = "IMPORT_COMPLETE"
+    stack["StackStatusReason"] = ""
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "IMPORT_COMPLETE", physical_id=stack_id)
 
 
 # --- DeleteChangeSet ---
