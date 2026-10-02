@@ -1107,6 +1107,30 @@ def test_ecs_update_cluster(ecs):
     )
     assert resp["cluster"]["clusterName"] == "upd-cl"
 
+
+@pytest.mark.parametrize("include", [
+    [], ["ATTACHMENTS"], ["CONFIGURATIONS"], ["SETTINGS"], ["STATISTICS"], ["TAGS"],
+])
+def test_ecs_describe_clusters_include_gates_fields(ecs, include):
+    """Each include value returns only its own field; the others stay empty or absent."""
+    name = f"incl-{_uuid_mod.uuid4().hex[:8]}"
+    settings = [{"name": "containerInsights", "value": "enabled"}]
+    tags = [{"key": "k", "value": "v"}]
+    configuration = {"executeCommandConfiguration": {"logging": "DEFAULT"}}
+    ecs.create_cluster(clusterName=name, tags=tags, settings=settings, configuration=configuration)
+    try:
+        c = ecs.describe_clusters(clusters=[name], include=include)["clusters"][0]
+        assert c["settings"] == (settings if "SETTINGS" in include else [])
+        assert c["tags"] == (tags if "TAGS" in include else [])
+        assert c.get("configuration") == (configuration if "CONFIGURATIONS" in include else None)
+        assert ("attachments" in c) == ("ATTACHMENTS" in include)
+        assert "attachmentsStatus" not in c
+        if "STATISTICS" not in include:
+            assert c["statistics"] == []
+    finally:
+        ecs.delete_cluster(cluster=name)
+
+
 def test_ecs_timestamps_are_epoch(ecs):
     """ECS timestamps should be epoch numbers, not ISO strings."""
     ecs.create_cluster(clusterName="ts-test-v44")

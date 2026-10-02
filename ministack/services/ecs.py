@@ -505,7 +505,12 @@ def _create_cluster(data):
     name = data.get("clusterName", "default")
     if name in _clusters and _clusters[name]["status"] == "ACTIVE":
         return json_response({"cluster": _clusters[name]})
+    return json_response({"cluster": _put_cluster(data)})
 
+
+def _put_cluster(data):
+    """Store a cluster built from CreateCluster fields, replacing one of the same name."""
+    name = data.get("clusterName", "default")
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
     cluster = {
         "clusterArn": arn,
@@ -516,19 +521,21 @@ def _create_cluster(data):
         "pendingTasksCount": 0,
         "activeServicesCount": 0,
         "tags": data.get("tags", []),
-        "settings": data.get("settings", [
+        "settings": data.get("settings") or [
             {"name": "containerInsights", "value": "disabled"},
-        ]),
+        ],
         "capacityProviders": data.get("capacityProviders", []),
         "defaultCapacityProviderStrategy": data.get("defaultCapacityProviderStrategy", []),
         "statistics": [],
         "attachments": [],
         "attachmentsStatus": "",
     }
+    if data.get("configuration"):
+        cluster["configuration"] = data["configuration"]
     _clusters[name] = cluster
     if cluster["tags"]:
         _tags[arn] = list(cluster["tags"])
-    return json_response({"cluster": cluster})
+    return cluster
 
 
 def _delete_cluster(data):
@@ -549,20 +556,26 @@ def _describe_clusters(data):
     for ref in names:
         n = _resolve_cluster_name(ref)
         if n in _clusters:
-            c = dict(_clusters[n])
-            if "TAGS" in include:
-                c["tags"] = _tags.get(c["clusterArn"], [])
             _recount_cluster(n)
-            c.update({
-                "runningTasksCount": _clusters[n]["runningTasksCount"],
-                "pendingTasksCount": _clusters[n]["pendingTasksCount"],
-                "activeServicesCount": _clusters[n]["activeServicesCount"],
-            })
-            result.append(c)
+            result.append(_cluster_view(_clusters[n], include))
         else:
             arn = ref if ref.startswith("arn:") else f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{ref}"
             failures.append({"arn": arn, "reason": "MISSING"})
     return json_response({"clusters": result, "failures": failures})
+
+
+def _cluster_view(cluster, include):
+    """Cluster as DescribeClusters returns it for the given include values."""
+    c = {k: v for k, v in cluster.items()
+         if k not in ("attachments", "attachmentsStatus", "configuration")}
+    c["settings"] = cluster["settings"] if "SETTINGS" in include else []
+    c["statistics"] = []
+    c["tags"] = _tags.get(cluster["clusterArn"], []) if "TAGS" in include else []
+    if "ATTACHMENTS" in include:
+        c["attachments"] = cluster.get("attachments", [])
+    if "CONFIGURATIONS" in include and "configuration" in cluster:
+        c["configuration"] = cluster["configuration"]
+    return c
 
 
 def _list_clusters(data):
