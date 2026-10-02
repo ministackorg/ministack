@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -11,6 +12,11 @@ import pytest
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+# AWS's CloudFront edge domain shape: 'd' + 13 lowercase alphanumerics +
+# '.cloudfront.net' (e.g. d111111abcdef8.cloudfront.net), unrelated to the
+# distribution's own Id.
+_CF_DOMAIN_RE = re.compile(r"^d[a-z0-9]{13}\.cloudfront\.net$")
 
 _CF_DIST_CONFIG = {
     "CallerReference": "cf-test-ref-1",
@@ -87,7 +93,7 @@ def test_cloudfront_create_distribution(cloudfront):
     resp = cloudfront.create_distribution(DistributionConfig=_CF_DIST_CONFIG)
     dist = resp["Distribution"]
     assert dist["Id"]
-    assert dist["DomainName"].endswith(".cloudfront.net")
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
     assert dist["Status"] == "Deployed"
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
 
@@ -107,7 +113,7 @@ def test_cloudfront_create_distribution_with_tags(cloudfront):
     dist = resp["Distribution"]
     dist_id = dist["Id"]
     dist_arn = dist["ARN"]
-    assert dist["DomainName"].endswith(".cloudfront.net")
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
     tags = cloudfront.list_tags_for_resource(Resource=dist_arn)["Tags"]["Items"]
     assert any(t["Key"] == "env" and t["Value"] == "test" for t in tags)
     etag = resp["ETag"]
@@ -135,10 +141,34 @@ def test_cloudfront_get_distribution(cloudfront):
     resp = cloudfront.get_distribution(Id=dist_id)
     dist = resp["Distribution"]
     assert dist["Id"] == dist_id
-    assert dist["DomainName"] == f"{dist_id}.cloudfront.net"
+    assert _CF_DOMAIN_RE.match(dist["DomainName"])
+    assert dist_id not in dist["DomainName"]
     assert dist["Status"] == "Deployed"
     # terraform-provider-aws v6+ dereferences OriginGroups without a nil check
     assert dist["DistributionConfig"]["OriginGroups"]["Quantity"] == 0
+
+
+def test_cloudfront_distribution_domain_name_like_aws(cloudfront):
+    """DomainName is 'd' + 13 lowercase alphanumerics, like real AWS, and is
+    stable across Get/Update/List — not derived from the distribution's Id."""
+    cfg = {**_CF_DIST_CONFIG, "CallerReference": f"cf-domain-{_uuid_mod.uuid4().hex[:12]}"}
+    create_resp = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create_resp["Distribution"]["Id"]
+    domain = create_resp["Distribution"]["DomainName"]
+    assert _CF_DOMAIN_RE.match(domain)
+    assert dist_id not in domain
+
+    get_domain = cloudfront.get_distribution(Id=dist_id)["Distribution"]["DomainName"]
+    assert get_domain == domain
+
+    disabled_cfg = {**cfg, "Enabled": False}
+    upd = cloudfront.update_distribution(
+        DistributionConfig=disabled_cfg, Id=dist_id, IfMatch=create_resp["ETag"]
+    )
+    assert upd["Distribution"]["DomainName"] == domain
+
+    listed = {d["Id"]: d["DomainName"] for d in cloudfront.list_distributions()["DistributionList"]["Items"]}
+    assert listed[dist_id] == domain
 
 
 def test_cloudfront_get_distribution_config(cloudfront):
@@ -1617,6 +1647,218 @@ def test_cloudfront_response_headers_policy_duplicate_and_list(cloudfront):
 
 
 # ---------------------------------------------------------------------------
+# AWS-managed cache / origin-request / response-headers policies.
+#
+# Names, ids and configs verified against the CloudFront Developer Guide's
+# "Use managed cache policies", "Use managed origin request policies", and
+# "Use managed response headers policies" pages. Real ids used below are the
+# ones ops-v2's modules/branding-assets and modules/cloudfront-api already
+# reference by literal id/name.
+# ---------------------------------------------------------------------------
+
+_MANAGED_CACHING_DISABLED_ID = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+_MANAGED_CACHING_OPTIMIZED_ID = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+_MANAGED_ALL_VIEWER_ID = "216adef6-5c7f-47e4-b989-5492eafa07d3"
+_MANAGED_ALL_VIEWER_EXCEPT_HOST_ID = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+_MANAGED_SECURITY_HEADERS_ID = "67f7725c-6f97-4210-82d7-5512b31e9d03"
+
+
+def test_cloudfront_list_cache_policies_includes_aws_managed(cloudfront):
+    resp = cloudfront.list_cache_policies()["CachePolicyList"]
+    by_id = {i["CachePolicy"]["Id"]: i for i in resp["Items"]}
+    assert _MANAGED_CACHING_DISABLED_ID in by_id
+    assert _MANAGED_CACHING_OPTIMIZED_ID in by_id
+    assert by_id[_MANAGED_CACHING_DISABLED_ID]["Type"] == "managed"
+    assert by_id[_MANAGED_CACHING_DISABLED_ID]["CachePolicy"]["CachePolicyConfig"]["Name"] == "Managed-CachingDisabled"
+
+    managed_only = cloudfront.list_cache_policies(Type="managed")["CachePolicyList"]
+    assert all(i["Type"] == "managed" for i in managed_only["Items"])
+    assert _MANAGED_CACHING_DISABLED_ID in {i["CachePolicy"]["Id"] for i in managed_only["Items"]}
+
+    custom_only = cloudfront.list_cache_policies(Type="custom")["CachePolicyList"]
+    assert _MANAGED_CACHING_DISABLED_ID not in {i["CachePolicy"]["Id"] for i in custom_only.get("Items", [])}
+
+
+def test_cloudfront_get_managed_cache_policy_by_id(cloudfront):
+    got = cloudfront.get_cache_policy(Id=_MANAGED_CACHING_DISABLED_ID)
+    cfg = got["CachePolicy"]["CachePolicyConfig"]
+    assert cfg["Name"] == "Managed-CachingDisabled"
+    assert cfg["MinTTL"] == 0 and cfg["MaxTTL"] == 0 and cfg["DefaultTTL"] == 0
+    params = cfg["ParametersInCacheKeyAndForwardedToOrigin"]
+    assert params["EnableAcceptEncodingGzip"] is False
+    assert params["HeadersConfig"]["HeaderBehavior"] == "none"
+
+    # Stable ETag across repeated reads (no mutation is possible).
+    assert cloudfront.get_cache_policy(Id=_MANAGED_CACHING_DISABLED_ID)["ETag"] == got["ETag"]
+
+    cfg_resp = cloudfront.get_cache_policy_config(Id=_MANAGED_CACHING_OPTIMIZED_ID)
+    optimized = cfg_resp["CachePolicyConfig"]
+    assert optimized["Name"] == "Managed-CachingOptimized"
+    assert optimized["MinTTL"] == 1 and optimized["DefaultTTL"] == 86400 and optimized["MaxTTL"] == 31536000
+    opt_params = optimized["ParametersInCacheKeyAndForwardedToOrigin"]
+    assert opt_params["EnableAcceptEncodingGzip"] is True
+    assert opt_params["EnableAcceptEncodingBrotli"] is True
+
+
+def test_cloudfront_managed_cache_policy_is_immutable(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_cache_policy(
+            Id=_MANAGED_CACHING_DISABLED_ID,
+            IfMatch=cloudfront.get_cache_policy(Id=_MANAGED_CACHING_DISABLED_ID)["ETag"],
+            CachePolicyConfig=_cache_policy_config("attempted-rename"),
+        )
+    assert exc.value.response["Error"]["Code"] == "IllegalUpdate"
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_cache_policy(
+            Id=_MANAGED_CACHING_DISABLED_ID,
+            IfMatch=cloudfront.get_cache_policy(Id=_MANAGED_CACHING_DISABLED_ID)["ETag"],
+        )
+    assert exc.value.response["Error"]["Code"] == "IllegalDelete"
+
+    # Still there afterwards.
+    assert cloudfront.get_cache_policy(Id=_MANAGED_CACHING_DISABLED_ID)
+
+
+def test_cloudfront_custom_cache_policy_cannot_reuse_managed_name(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config("Managed-CachingDisabled"))
+    assert exc.value.response["Error"]["Code"] == "CachePolicyAlreadyExists"
+
+
+def test_cloudfront_list_origin_request_policies_includes_aws_managed(cloudfront):
+    resp = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]
+    by_id = {i["OriginRequestPolicy"]["Id"]: i for i in resp["Items"]}
+    assert _MANAGED_ALL_VIEWER_ID in by_id
+    assert _MANAGED_ALL_VIEWER_EXCEPT_HOST_ID in by_id
+    assert by_id[_MANAGED_ALL_VIEWER_ID]["Type"] == "managed"
+    all_viewer_cfg = by_id[_MANAGED_ALL_VIEWER_ID]["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+    assert all_viewer_cfg["Name"] == "Managed-AllViewer"
+    assert all_viewer_cfg["HeadersConfig"]["HeaderBehavior"] == "allViewer"
+
+    except_host_cfg = cloudfront.get_origin_request_policy_config(
+        Id=_MANAGED_ALL_VIEWER_EXCEPT_HOST_ID
+    )["OriginRequestPolicyConfig"]
+    assert except_host_cfg["Name"] == "Managed-AllViewerExceptHostHeader"
+    assert except_host_cfg["HeadersConfig"]["HeaderBehavior"] == "allExcept"
+    assert except_host_cfg["HeadersConfig"]["Headers"]["Items"] == ["Host"]
+    assert except_host_cfg["CookiesConfig"]["CookieBehavior"] == "all"
+
+
+def test_cloudfront_managed_origin_request_policy_is_immutable(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_origin_request_policy(
+            Id=_MANAGED_ALL_VIEWER_ID,
+            IfMatch=cloudfront.get_origin_request_policy(Id=_MANAGED_ALL_VIEWER_ID)["ETag"],
+        )
+    assert exc.value.response["Error"]["Code"] == "IllegalDelete"
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_origin_request_policy(
+            Id=_MANAGED_ALL_VIEWER_ID,
+            IfMatch=cloudfront.get_origin_request_policy(Id=_MANAGED_ALL_VIEWER_ID)["ETag"],
+            OriginRequestPolicyConfig=_orp_config("attempted-rename"),
+        )
+    assert exc.value.response["Error"]["Code"] == "IllegalUpdate"
+
+
+def test_cloudfront_list_response_headers_policies_includes_aws_managed(cloudfront):
+    resp = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]
+    by_id = {i["ResponseHeadersPolicy"]["Id"]: i for i in resp["Items"]}
+    assert _MANAGED_SECURITY_HEADERS_ID in by_id
+    assert by_id[_MANAGED_SECURITY_HEADERS_ID]["Type"] == "managed"
+
+    cfg = cloudfront.get_response_headers_policy_config(Id=_MANAGED_SECURITY_HEADERS_ID)["ResponseHeadersPolicyConfig"]
+    assert cfg["Name"] == "Managed-SecurityHeadersPolicy"
+    assert "CorsConfig" not in cfg
+    sec = cfg["SecurityHeadersConfig"]
+    assert sec["FrameOptions"]["FrameOption"] == "SAMEORIGIN"
+    assert sec["ReferrerPolicy"]["ReferrerPolicy"] == "strict-origin-when-cross-origin"
+    assert sec["ContentTypeOptions"]["Override"] is True
+    assert sec["StrictTransportSecurity"]["AccessControlMaxAgeSec"] == 31536000
+
+
+def test_cloudfront_managed_response_headers_policy_is_immutable(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_response_headers_policy(
+            Id=_MANAGED_SECURITY_HEADERS_ID,
+            IfMatch=cloudfront.get_response_headers_policy(Id=_MANAGED_SECURITY_HEADERS_ID)["ETag"],
+        )
+    assert exc.value.response["Error"]["Code"] == "IllegalDelete"
+
+
+# ---------------------------------------------------------------------------
+# Monitoring subscriptions (aws_cloudfront_monitoring_subscription).
+# Wire shapes verified against botocore cloudfront service-2.json (2020-05-31)
+# and the CreateMonitoringSubscription API reference (POST, 200 response;
+# DeleteMonitoringSubscription: DELETE, 200 with an empty body).
+# ---------------------------------------------------------------------------
+
+
+def test_cloudfront_monitoring_subscription_lifecycle(cloudfront):
+    dist_id = cloudfront.create_distribution(
+        DistributionConfig=_custom_origin_distribution_config(f"mon-{_uuid_mod.uuid4().hex[:8]}")
+    )["Distribution"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMonitoringSubscription"
+
+    created = cloudfront.create_monitoring_subscription(
+        DistributionId=dist_id,
+        MonitoringSubscription={
+            "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Enabled"}
+        },
+    )
+    assert (
+        created["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Enabled"
+    )
+
+    got = cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert (
+        got["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Enabled"
+    )
+
+    # A second Create overwrites rather than erroring: terraform-provider-aws's
+    # aws_cloudfront_monitoring_subscription resource calls this same
+    # operation for both Create and Update.
+    cloudfront.create_monitoring_subscription(
+        DistributionId=dist_id,
+        MonitoringSubscription={
+            "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Disabled"}
+        },
+    )
+    got = cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert (
+        got["MonitoringSubscription"]["RealtimeMetricsSubscriptionConfig"]["RealtimeMetricsSubscriptionStatus"]
+        == "Disabled"
+    )
+
+    cloudfront.delete_monitoring_subscription(DistributionId=dist_id)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMonitoringSubscription"
+
+
+def test_cloudfront_monitoring_subscription_missing_distribution(cloudfront):
+    for call in (
+        lambda: cloudfront.get_monitoring_subscription(DistributionId="ENOSUCHDIST0000000"),
+        lambda: cloudfront.delete_monitoring_subscription(DistributionId="ENOSUCHDIST0000000"),
+        lambda: cloudfront.create_monitoring_subscription(
+            DistributionId="ENOSUCHDIST0000000",
+            MonitoringSubscription={
+                "RealtimeMetricsSubscriptionConfig": {"RealtimeMetricsSubscriptionStatus": "Enabled"}
+            },
+        ),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
+
+
+# ---------------------------------------------------------------------------
 # Read-only list surface — ops previously falling through the path dispatch.
 # Shapes verified against botocore cloudfront service-2.json (2020-05-31).
 # ---------------------------------------------------------------------------
@@ -1717,8 +1959,11 @@ def test_cloudfront_list_cache_policies_round_trip(cloudfront):
     assert listed["Quantity"] == baseline + 1
     names = [s["CachePolicy"]["CachePolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
-    types = {s["Type"] for s in listed["Items"]}
-    assert types == {"custom"}
+    by_id = {s["CachePolicy"]["Id"]: s for s in listed["Items"]}
+    assert by_id[pid]["Type"] == "custom"
+    # ListCachePolicies with no Type filter also returns the AWS-managed
+    # catalog (Type=managed) alongside custom policies.
+    assert "managed" in {s["Type"] for s in listed["Items"]}
 
     cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
 
@@ -1734,7 +1979,11 @@ def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
     assert listed["Quantity"] == baseline + 1
     names = [s["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
-    assert {s["Type"] for s in listed["Items"]} == {"custom"}
+    by_id = {s["OriginRequestPolicy"]["Id"]: s for s in listed["Items"]}
+    assert by_id[pid]["Type"] == "custom"
+    # ListOriginRequestPolicies with no Type filter also returns the
+    # AWS-managed catalog (Type=managed) alongside custom policies.
+    assert "managed" in {s["Type"] for s in listed["Items"]}
 
     cloudfront.delete_origin_request_policy(Id=pid, IfMatch=create["ETag"])
 
@@ -1750,7 +1999,11 @@ def test_cloudfront_list_response_headers_policies_round_trip(cloudfront):
     assert listed["Quantity"] == baseline + 1
     names = [s["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
-    assert {s["Type"] for s in listed["Items"]} == {"custom"}
+    by_id = {s["ResponseHeadersPolicy"]["Id"]: s for s in listed["Items"]}
+    assert by_id[pid]["Type"] == "custom"
+    # ListResponseHeadersPolicies with no Type filter also returns the
+    # AWS-managed catalog (Type=managed) alongside custom policies.
+    assert "managed" in {s["Type"] for s in listed["Items"]}
 
     cloudfront.delete_response_headers_policy(Id=pid, IfMatch=create["ETag"])
 

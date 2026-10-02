@@ -58,6 +58,7 @@ from .stacks import (
     _deploy_stack_async,
     _roll_back_operation,
     _stack_region_context,
+    _stack_tags_changed,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -934,9 +935,9 @@ def _stack_has_no_updates(stack, template, param_values, tags,
                           use_previous_template=False, tags_given=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
-    request either carries no tags or the tags the stack already has. Real
-    CloudFormation refuses such a request with ``No updates are to be
-    performed.`` instead of running an empty update. A template body that
+    request either carries no tags or the tags the stack already has, in any
+    order. Real CloudFormation refuses such a request with ``No updates are to
+    be performed.`` instead of running an empty update. A template body that
     carries a dynamic reference is the exception: the update is accepted
     (with ``UsePreviousTemplate`` it is still refused) — measured on AWS."""
     if template != stack.get("_template", {}):
@@ -946,9 +947,7 @@ def _stack_has_no_updates(stack, template, param_values, tags,
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
         return False
-    if (tags or tags_given) and tags != stack.get("Tags", []):
-        return False
-    return True
+    return not _stack_tags_changed(stack, tags, tags_given)
 
 
 def _update_stack(params):

@@ -889,7 +889,8 @@ def _create_nodegroup(cluster_name, body):
 
     key = f"{cluster_name}/{ng_name}"
     if key in _nodegroups:
-        return _error(409, "ResourceInUseException", f"Nodegroup already exists with name: {ng_name}")
+        return _error(409, "ResourceInUseException",
+                      f"NodeGroup already exists with name {ng_name} and cluster name {cluster_name}")
 
     arn = _nodegroup_arn(cluster_name, ng_name)
     now = _now()
