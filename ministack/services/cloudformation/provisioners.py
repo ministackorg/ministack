@@ -740,6 +740,7 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "ManagedPolicyName",
         "exists": "A policy called {name} already exists. Duplicate names are not allowed.",
     },
+    "AWS::ECR::Repository": {"name": "RepositoryName"},
     "AWS::IoT::ProvisioningTemplate": {
         "name": "TemplateName",
         "requires_replacement": lambda old, new: (
@@ -6989,7 +6990,8 @@ def _ecr_repo_apply_policies(name, props):
 
 
 def _ecr_repo_create(logical_id, props, stack_name):
-    name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
+    name = props.get("RepositoryName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=256)
     api = _ecr_cfn_to_api(props)
     if name in _ecr._repositories:
         # The create has always overwritten an existing record; refusing the
@@ -12627,19 +12629,13 @@ def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
     return physical_id, {"Arn": stream["StreamARN"]}
 
 
-def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
+def _ecr_repo_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     repo = _ecr._repositories.get(physical_id)
-    new_name = new_props.get("RepositoryName")
-    if repo is None or (new_name and new_name != physical_id):
-        # A new name is a replacement: create the new repository, then delete
-        # the old one through DeleteRepository, unless the template retains it.
-        result = _ecr_repo_create(physical_id, new_props, stack_name)
-        if repo is not None:
-            _delete_predecessor(_ecr_repo_delete, physical_id, old_props)
-        return result
+    if repo is None:
+        return _ecr_repo_create(logical_id or physical_id, new_props, stack_name)
     # ImageTagMutability, ImageScanningConfiguration, LifecyclePolicy,
-    # RepositoryPolicyText and Tags update in place; EncryptionConfiguration
-    # requires replacement and stays as it is.
+    # RepositoryPolicyText and Tags update in place; RepositoryName and
+    # EncryptionConfiguration are replaced in _update_resource.
     api = _ecr_cfn_to_api(new_props)
     repo["imageTagMutability"] = api["imageTagMutability"]
     repo["imageScanningConfiguration"] = api["imageScanningConfiguration"]
@@ -12851,6 +12847,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
+    "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (
@@ -13370,7 +13367,12 @@ _RESOURCE_HANDLERS = {
         "import": _cognito_identity_pool_import,
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
-    "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
+    "AWS::ECR::Repository": {
+        "create": _ecr_repo_create,
+        "update": _ecr_repo_update,
+        "update_with_logical_id": True,
+        "delete": _ecr_repo_delete,
+    },
     "AWS::CertificateManager::Certificate": {
         "create": _acm_certificate_create,
         "update": _acm_certificate_update,
