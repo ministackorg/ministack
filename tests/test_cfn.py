@@ -33332,3 +33332,56 @@ def test_cfn_elasticache_lambda_reaches_replication_group(cfn, lam):
         assert result.get("reply") == "+PONG", result
     finally:
         _delete_cfn_test_stack(cfn, stack)
+
+
+def _cfn_apigwv2_domain_template(domain, key):
+    return json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"Name": "dom-api", "ProtocolType": "HTTP"}},
+            "Stage": {"Type": "AWS::ApiGatewayV2::Stage",
+                      "Properties": {"ApiId": {"Ref": "Api"}, "StageName": "prod"}},
+            "Domain": {"Type": "AWS::ApiGatewayV2::DomainName", "Properties": {
+                "DomainName": domain, "Tags": {"team": "a"},
+                "DomainNameConfigurations": [{"EndpointType": "REGIONAL", "CertificateArn":
+                    "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"}]}},
+            "Mapping": {"Type": "AWS::ApiGatewayV2::ApiMapping", "DependsOn": ["Stage"], "Properties": {
+                "DomainName": {"Ref": "Domain"}, "ApiId": {"Ref": "Api"}, "Stage": "prod", "ApiMappingKey": key}},
+        },
+        "Outputs": {
+            "Domain": {"Value": {"Ref": "Domain"}},
+            "Regional": {"Value": {"Fn::GetAtt": ["Domain", "RegionalDomainName"]}},
+            "Arn": {"Value": {"Fn::GetAtt": ["Domain", "DomainNameArn"]}},
+            "Mapping": {"Value": {"Ref": "Mapping"}},
+            "MappingId": {"Value": {"Fn::GetAtt": ["Mapping", "ApiMappingId"]}},
+        },
+    })
+
+
+def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
+    stack_name = f"cfn-apigw-dom-{_uuid_mod.uuid4().hex[:8]}"
+    domain = f"{stack_name}.example.com"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Domain") == domain
+        assert _output(stack, "Arn") == f"arn:aws:apigateway:us-east-1::/domainnames/{domain}"
+        got = apigw.get_domain_name(DomainName=domain)
+        assert _output(stack, "Regional") == got["DomainNameConfigurations"][0]["ApiGatewayDomainName"]
+        assert got["Tags"]["team"] == "a"
+        assert got["Tags"]["aws:cloudformation:logical-id"] == "Domain"
+        mapping_id = _output(stack, "Mapping")
+        assert _output(stack, "MappingId") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v1"
+
+        # ApiMappingKey updates in place.
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Mapping") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        apigw.get_domain_name(DomainName=domain)
+

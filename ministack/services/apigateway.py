@@ -394,6 +394,35 @@ async def handle_request(method, path, headers, body, query_params):
                 tag_keys = [tag_keys]
             return _untag_resource(resource_arn, tag_keys)
 
+    if resource == "domainnames":
+        name = urllib.parse.unquote(parts[2]) if len(parts) > 2 else None
+        mapping_id = parts[4] if len(parts) > 4 else None
+        if not name:
+            if method == "POST":
+                return _create_domain_name(data)
+            if method == "GET":
+                return _get_domain_names(query_params)
+        elif len(parts) > 3 and parts[3] == "apimappings":
+            if not mapping_id:
+                if method == "POST":
+                    return _create_api_mapping(name, data)
+                if method == "GET":
+                    return _get_api_mappings(name, query_params)
+            else:
+                if method == "GET":
+                    return _get_api_mapping(name, mapping_id)
+                if method == "PATCH":
+                    return _update_api_mapping(name, mapping_id, data)
+                if method == "DELETE":
+                    return _delete_api_mapping(name, mapping_id)
+        elif len(parts) == 3:
+            if method == "GET":
+                return _get_domain_name(name)
+            if method == "PATCH":
+                return _update_domain_name(name, data)
+            if method == "DELETE":
+                return _delete_domain_name(name)
+
     if resource == "apis":
         api_id = parts[2] if len(parts) > 2 else None
         sub = parts[3] if len(parts) > 3 else None
@@ -2252,6 +2281,11 @@ def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | N
     segments = spec.resource[1:].split("/")
     if not segments or any(segment == "" for segment in segments):
         return None, _invalid_tag_resource_arn(resource_arn)
+    if len(segments) == 2 and segments[0] == "domainnames":
+        from ministack.services import apigateway_v1 as v1
+        if segments[1] not in v1._domain_names:
+            return None, _tag_resource_not_found(resource_arn)
+        return _domain_arn(segments[1]), None
     if len(segments) not in (2, 4) or segments[0] != "apis":
         return None, _invalid_tag_resource_arn(resource_arn)
 
@@ -2277,11 +2311,19 @@ def _delete_api_tag_resources(api_id: str):
             _api_tags.pop(resource_arn, None)
 
 
+def _tag_store(canonical_arn: str):
+    """Domain name tags are shared with API Gateway v1."""
+    if "::/domainnames/" in canonical_arn:
+        from ministack.services import apigateway_v1 as v1
+        return v1._v1_tags
+    return _api_tags
+
+
 def _get_tags(resource_arn: str):
     canonical_arn, err = _validate_tag_resource_arn(resource_arn)
     if err:
         return err
-    tags = _api_tags.get(canonical_arn, {})
+    tags = _tag_store(canonical_arn).get(canonical_arn, {})
     return _apigw_response({"tags": tags})
 
 
@@ -2290,7 +2332,7 @@ def _tag_resource(resource_arn: str, data: dict):
     if err:
         return err
     tags = data.get("tags", {})
-    _api_tags.setdefault(canonical_arn, {}).update(tags)
+    _tag_store(canonical_arn).setdefault(canonical_arn, {}).update(tags)
     return 201, {}, b""
 
 
@@ -2298,9 +2340,257 @@ def _untag_resource(resource_arn: str, tag_keys: list):
     canonical_arn, err = _validate_tag_resource_arn(resource_arn)
     if err:
         return err
-    existing = _api_tags.get(canonical_arn, {})
+    existing = _tag_store(canonical_arn).get(canonical_arn, {})
     for key in tag_keys:
         existing.pop(key, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Domain names and API mappings ----
+# One resource with v1 custom domains: records, base path mappings and tags live in apigateway_v1.
+
+_ROUTING_V2_TO_V1 = {
+    "API_MAPPING_ONLY": "BASE_PATH_MAPPING_ONLY",
+    "ROUTING_RULE_ONLY": "ROUTING_RULE_ONLY",
+    "ROUTING_RULE_THEN_API_MAPPING": "ROUTING_RULE_THEN_BASE_PATH_MAPPING",
+}
+_ROUTING_V1_TO_V2 = {v1: v2 for v2, v1 in _ROUTING_V2_TO_V1.items()}
+
+
+def _domain_arn(domain_name):
+    return f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}"
+
+
+def _domain_not_found():
+    return _apigw_error("NotFoundException", "Invalid domain name identifier specified", 404)
+
+
+def _domain_view(record):
+    from ministack.services import apigateway_v1 as v1
+    endpoint = record.get("endpointConfiguration") or {}
+    endpoint_type = (endpoint.get("types") or ["REGIONAL"])[0]
+    regional = endpoint_type == "REGIONAL"
+    config = {
+        "apiGatewayDomainName": record["regionalDomainName" if regional else "distributionDomainName"],
+        "certificateArn": record.get("regionalCertificateArn" if regional else "certificateArn") or None,
+        "certificateName": record.get("regionalCertificateName" if regional else "certificateName") or None,
+        "domainNameStatus": "AVAILABLE",
+        "endpointType": endpoint_type,
+        "hostedZoneId": record["regionalHostedZoneId" if regional else "distributionHostedZoneId"],
+        "ipAddressType": endpoint.get("ipAddressType", "ipv4"),
+        "securityPolicy": record.get("securityPolicy", "TLS_1_2"),
+        "ownershipVerificationCertificateArn": record.get("ownershipVerificationCertificateArn") or None,
+    }
+    arn = _domain_arn(record["domainName"])
+    return {
+        "apiMappingSelectionExpression": "$request.basepath",
+        "domainName": record["domainName"],
+        "domainNameArn": arn,
+        "domainNameConfigurations": [config],
+        "mutualTlsAuthentication": record.get("mutualTlsAuthentication") or None,
+        "routingMode": _ROUTING_V1_TO_V2.get(record.get("routingMode"), "API_MAPPING_ONLY"),
+        "tags": dict(v1._v1_tags.get(arn) or record.get("tags") or {}),
+    }
+
+
+def _apply_domain_configuration(record, configs):
+    config = (configs or [{}])[0]
+    endpoint_type = config.get("endpointType", "REGIONAL")
+    record["endpointConfiguration"] = {"types": [endpoint_type],
+                                       "ipAddressType": config.get("ipAddressType", "ipv4")}
+    arn_key, name_key = (("regionalCertificateArn", "regionalCertificateName")
+                         if endpoint_type == "REGIONAL" else ("certificateArn", "certificateName"))
+    record[arn_key] = config.get("certificateArn", "")
+    record[name_key] = config.get("certificateName", "")
+    record["securityPolicy"] = config.get("securityPolicy", "TLS_1_2")
+    record["ownershipVerificationCertificateArn"] = config.get("ownershipVerificationCertificateArn", "")
+
+
+def _create_domain_name(data):
+    from ministack.services import apigateway_v1 as v1
+    name = data.get("domainName")
+    if not name:
+        return _apigw_error("BadRequestException", "Domain name is required", 400)
+    if name in v1._domain_names:
+        return _apigw_error("ConflictException", "The domain name you provided already exists.", 409)
+    if data.get("routingMode", "API_MAPPING_ONLY") not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    record = {
+        "domainName": name,
+        "certificateName": "",
+        "certificateArn": "",
+        "regionalCertificateName": "",
+        "regionalCertificateArn": "",
+        "distributionDomainName": f"d{new_uuid().replace('-', '')[:13]}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
+        "regionalDomainName": f"d-{new_uuid().replace('-', '')[:10]}.execute-api.{get_region()}.amazonaws.com",
+        "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication") or {},
+        "routingMode": _ROUTING_V2_TO_V1[data.get("routingMode", "API_MAPPING_ONLY")],
+        "tags": {},
+    }
+    _apply_domain_configuration(record, data.get("domainNameConfigurations"))
+    v1._domain_names[name] = record
+    v1._base_path_mappings[name] = {}
+    if data.get("tags"):
+        v1._v1_tags[_domain_arn(name)] = dict(data["tags"])
+    return _apigw_response(_domain_view(record), 201)
+
+
+def _get_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    return _apigw_response(_domain_view(record)) if record else _domain_not_found()
+
+
+def _page(items, query_params):
+    """One page of items for maxResults/nextToken, or a BadRequestException response."""
+    def value(key):
+        v = (query_params or {}).get(key)
+        return v[0] if isinstance(v, list) else v
+    try:
+        start = int(value("nextToken") or 0)
+        limit = int(value("maxResults") or len(items) or 1)
+    except ValueError:
+        return _apigw_error("BadRequestException", "Invalid nextToken or maxResults", 400)
+    page = {"items": items[start:start + limit]}
+    if start + limit < len(items):
+        page["nextToken"] = str(start + limit)
+    return _apigw_response(page)
+
+
+def _get_domain_names(query_params):
+    from ministack.services import apigateway_v1 as v1
+    return _page([_domain_view(r) for r in v1._domain_names.values()], query_params)
+
+
+def _update_domain_name(name, data):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    if not record:
+        return _domain_not_found()
+    if "routingMode" in data and data["routingMode"] not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    if "domainNameConfigurations" in data:
+        _apply_domain_configuration(record, data["domainNameConfigurations"])
+    if "mutualTlsAuthentication" in data:
+        record["mutualTlsAuthentication"] = data["mutualTlsAuthentication"] or {}
+    if "routingMode" in data:
+        record["routingMode"] = _ROUTING_V2_TO_V1[data["routingMode"]]
+    return _apigw_response(_domain_view(record))
+
+
+def _delete_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return _domain_not_found()
+    v1._domain_names.pop(name, None)
+    v1._base_path_mappings.pop(name, None)
+    v1._v1_tags.pop(_domain_arn(name), None)
+    return 204, {}, b""
+
+
+def _mapping_view(base_path, mapping):
+    return {
+        "apiId": mapping["restApiId"],
+        "apiMappingId": mapping.setdefault("_apiMappingId", new_uuid().replace("-", "")[:6]),
+        "apiMappingKey": "" if base_path == "(none)" else base_path,
+        "stage": mapping["stage"],
+    }
+
+
+def _domain_mappings(name):
+    """The domain's base path mappings, or a NotFoundException response."""
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return None, _domain_not_found()
+    return v1._base_path_mappings.setdefault(name, {}), None
+
+
+def _find_mapping(mappings, mapping_id):
+    for base_path, mapping in mappings.items():
+        if _mapping_view(base_path, mapping)["apiMappingId"] == mapping_id:
+            return base_path, mapping
+    return None, None
+
+
+def _api_mapping_not_found():
+    return _apigw_error("NotFoundException", "Invalid API mapping identifier specified", 404)
+
+
+def _check_mapping_target(api_id, stage):
+    from ministack.services import apigateway_v1 as v1
+    if api_id in _apis:
+        stages = _stages.get(api_id, {})
+    elif api_id in v1._rest_apis:
+        stages = v1._stages_v1.get(api_id, {})
+    else:
+        return _apigw_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage not in stages:
+        return _apigw_error("BadRequestException", "Invalid stage identifier specified", 400)
+    return None
+
+
+def _create_api_mapping(name, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    api_id, stage = data.get("apiId"), data.get("stage")
+    if not api_id or not stage:
+        return _apigw_error("BadRequestException", "ApiId and Stage are required", 400)
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    base_path = data.get("apiMappingKey") or "(none)"
+    if base_path in mappings:
+        return _apigw_error("ConflictException", "The API mapping key you provided already exists.", 409)
+    mappings[base_path] = {"basePath": base_path, "restApiId": api_id, "stage": stage}
+    return _apigw_response(_mapping_view(base_path, mappings[base_path]), 201)
+
+
+def _get_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    return _apigw_response(_mapping_view(base_path, mapping)) if mapping else _api_mapping_not_found()
+
+
+def _get_api_mappings(name, query_params):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    return _page([_mapping_view(k, m) for k, m in mappings.items()], query_params)
+
+
+def _update_api_mapping(name, mapping_id, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    api_id = data.get("apiId") or mapping["restApiId"]
+    stage = data.get("stage") or mapping["stage"]
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    new_path = (data["apiMappingKey"] or "(none)") if "apiMappingKey" in data else base_path
+    if new_path != base_path and new_path in mappings:
+        return _apigw_error("ConflictException", "The API mapping key you provided already exists.", 409)
+    mapping["restApiId"], mapping["stage"] = api_id, stage
+    if new_path != base_path:
+        mapping["basePath"] = new_path
+        mappings[new_path] = mappings.pop(base_path)
+    return _apigw_response(_mapping_view(new_path, mapping))
+
+
+def _delete_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    mappings.pop(base_path)
     return 204, {}, b""
 
 

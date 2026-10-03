@@ -1081,6 +1081,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
     "AWS::ApiGatewayV2::Api": ("Tags", "map"),
     "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::ApiGatewayV2::DomainName": ("Tags", "map"),
     "AWS::AppConfig::Application": ("Tags", "list"),
     "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
     "AWS::AppConfig::Deployment": ("Tags", "list"),
@@ -10041,6 +10042,84 @@ def _apigw_v2_stage_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# ApiGatewayV2 DomainName and ApiMapping
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_result(resp, what, missing_ok=False):
+    if resp[0] == 404 and missing_ok:
+        return None
+    if resp[0] >= 400:
+        raise ValueError(f"{what} failed: {resp[2]!r}")
+    return json.loads(resp[2]) if resp[2] else {}
+
+
+def _apigw_v2_domain_body(props):
+    return {
+        "domainNameConfigurations": _pascal_to_camel(props.get("DomainNameConfigurations") or []),
+        "mutualTlsAuthentication": _pascal_to_camel(props.get("MutualTlsAuthentication") or {}),
+        "routingMode": props.get("RoutingMode", "API_MAPPING_ONLY"),
+    }
+
+
+def _apigw_v2_domain_attrs(view):
+    config = view["domainNameConfigurations"][0]
+    return {"DomainNameArn": view["domainNameArn"],
+            "RegionalDomainName": config["apiGatewayDomainName"],
+            "RegionalHostedZoneId": config["hostedZoneId"]}
+
+
+def _apigw_v2_domain_create(logical_id, props, stack_name):
+    body = {"domainName": props.get("DomainName", ""), "tags": dict(props.get("Tags") or {}),
+            **_apigw_v2_domain_body(props)}
+    view = _apigw_v2_result(_apigw_v2._create_domain_name(body), "AWS::ApiGatewayV2::DomainName create")
+    return view["domainName"], _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; the rest updates in place."""
+    import ministack.services.apigateway_v1 as _apigw_v1
+    view = _apigw_v2_result(_apigw_v2._update_domain_name(physical_id, _apigw_v2_domain_body(new_props)),
+                            "AWS::ApiGatewayV2::DomainName update", missing_ok=True)
+    if view is None:
+        return _apigw_v2_domain_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_map(_apigw_v1._v1_tags.setdefault(view["domainNameArn"], {}), old_props, new_props)
+    return physical_id, _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_domain_name(physical_id),
+                     "AWS::ApiGatewayV2::DomainName delete", missing_ok=True)
+
+
+def _apigw_v2_mapping_body(props):
+    return {"apiId": props.get("ApiId", ""), "stage": props.get("Stage", ""),
+            "apiMappingKey": props.get("ApiMappingKey", "")}
+
+
+def _apigw_v2_mapping_create(logical_id, props, stack_name):
+    mapping = _apigw_v2_result(
+        _apigw_v2._create_api_mapping(props.get("DomainName", ""), _apigw_v2_mapping_body(props)),
+        "AWS::ApiGatewayV2::ApiMapping create")
+    return mapping["apiMappingId"], {"ApiMappingId": mapping["apiMappingId"]}
+
+
+def _apigw_v2_mapping_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; ApiId, ApiMappingKey and Stage update in place."""
+    mapping = _apigw_v2_result(
+        _apigw_v2._update_api_mapping(new_props.get("DomainName", ""), physical_id,
+                                      _apigw_v2_mapping_body(new_props)),
+        "AWS::ApiGatewayV2::ApiMapping update", missing_ok=True)
+    if mapping is None:
+        return _apigw_v2_mapping_create(logical_id or physical_id, new_props, stack_name)
+    return physical_id, {"ApiMappingId": physical_id}
+
+
+def _apigw_v2_mapping_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_api_mapping(props.get("DomainName", ""), physical_id),
+                     "AWS::ApiGatewayV2::ApiMapping delete", missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration
 # ---------------------------------------------------------------------------
 
@@ -13102,6 +13181,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
     "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
+    "AWS::ApiGatewayV2::DomainName": ("DomainName",),
+    "AWS::ApiGatewayV2::ApiMapping": ("DomainName",),
     "AWS::EFS::FileSystem": ("AvailabilityZoneName", "Encrypted", "KmsKeyId", "PerformanceMode"),
     "AWS::EFS::MountTarget": (
         "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
@@ -13802,6 +13883,18 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_v2_route_delete,
     },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::DomainName": {
+        "create": _apigw_v2_domain_create,
+        "update": _apigw_v2_domain_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_domain_delete,
+    },
+    "AWS::ApiGatewayV2::ApiMapping": {
+        "create": _apigw_v2_mapping_create,
+        "update": _apigw_v2_mapping_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_mapping_delete,
+    },
     "AWS::SES::EmailIdentity": {
         "create": _ses_email_identity_create,
         "update": _ses_email_identity_update,

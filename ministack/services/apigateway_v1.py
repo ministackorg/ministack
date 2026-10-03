@@ -4558,17 +4558,23 @@ def _create_base_path_mapping(domain_name, data):
     return _v1_response(mapping, 201)
 
 
+def _public_mapping(mapping):
+    """A base path mapping without the API Gateway v2 mapping id."""
+    return {k: v for k, v in mapping.items() if not k.startswith("_")}
+
+
 def _get_base_path_mappings(domain_name, query_params):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_paginated_response(list(_base_path_mappings.get(domain_name, {}).values()), query_params)
+    return _v1_paginated_response(
+        [_public_mapping(m) for m in _base_path_mappings.get(domain_name, {}).values()], query_params)
 
 
 def _get_base_path_mapping(domain_name, base_path):
     mapping = _base_path_mappings.get(domain_name, {}).get(base_path)
     if not mapping:
         return _v1_error("NotFoundException", "Invalid base path mapping identifier specified", 404)
-    return _v1_response(mapping)
+    return _v1_response(_public_mapping(mapping))
 
 
 def _delete_base_path_mapping(domain_name, base_path):
