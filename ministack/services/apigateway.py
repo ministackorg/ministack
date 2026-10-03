@@ -2542,7 +2542,7 @@ def _create_api_mapping(name, data):
         return err
     base_path = data.get("apiMappingKey") or "(none)"
     if base_path in mappings:
-        return _apigw_error("ConflictException", "The API mapping key you provided already exists.", 409)
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
     mappings[base_path] = {"basePath": base_path, "restApiId": api_id, "stage": stage}
     return _apigw_response(_mapping_view(base_path, mappings[base_path]), 201)
 
@@ -2575,7 +2575,7 @@ def _update_api_mapping(name, mapping_id, data):
         return err
     new_path = (data["apiMappingKey"] or "(none)") if "apiMappingKey" in data else base_path
     if new_path != base_path and new_path in mappings:
-        return _apigw_error("ConflictException", "The API mapping key you provided already exists.", 409)
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
     mapping["restApiId"], mapping["stage"] = api_id, stage
     if new_path != base_path:
         mapping["basePath"] = new_path

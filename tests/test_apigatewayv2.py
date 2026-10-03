@@ -4884,6 +4884,7 @@ def test_apigwv2_api_mapping_crud(apigw, apigw_v1):
         with pytest.raises(ClientError) as exc:
             apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
         assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == "ApiMapping key already exists for this domain name"
         with pytest.raises(ClientError) as exc:
             apigw.create_api_mapping(DomainName=name, ApiId="nope123", Stage="prod")
         assert exc.value.response["Error"]["Code"] == "NotFoundException"
