@@ -42,6 +42,10 @@ _trails = AccountRegionScopedDict()           # trail_name -> trail_record, scop
 _event_selectors = AccountRegionScopedDict()  # trail_name -> list[EventSelector], scoped to HomeRegion
 _trail_tags = AccountScopedDict()             # trail_arn -> {tag_key: tag_value}
 
+_DEFAULT_EVENT_SELECTORS = [
+    {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
+]
+
 _SCRUB_KEYS = frozenset(
     {
         "secretaccesskey",
@@ -680,7 +684,7 @@ def _get_event_selectors(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
-    selectors = _event_selectors.get_scoped(get_account_id(), home_region, name) or []
+    selectors = _event_selectors.get_scoped(get_account_id(), home_region, name, _DEFAULT_EVENT_SELECTORS)
     return _ok(
         {
             "TrailARN": trail.get("TrailARN", _trail_arn(name)),

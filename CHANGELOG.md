@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudTrail — `GetEventSelectors` returns the default selector of a new trail** — a trail that never had `PutEventSelectors` answered an empty `EventSelectors` list instead of the default selector that logs all read and write management events. Contributed by @iot-rocket.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added

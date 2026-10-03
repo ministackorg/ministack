@@ -23,6 +23,9 @@ from botocore.exceptions import ClientError
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 WEST_REGION = "us-west-2"
+DEFAULT_EVENT_SELECTORS = [
+    {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
+]
 
 
 def _client(service, region=REGION):
@@ -503,7 +506,7 @@ def test_put_event_selectors_rejects_foreign_region_trail_arn(ct):
         ct.put_event_selectors(TrailName=foreign_arn, EventSelectors=selectors)
     assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
 
-    assert ct.get_event_selectors(TrailName=name)["EventSelectors"] == []
+    assert ct.get_event_selectors(TrailName=name)["EventSelectors"] == DEFAULT_EVENT_SELECTORS
 
 
 def test_get_event_selectors_by_arn_from_different_request_region(ct):
@@ -518,11 +521,13 @@ def test_get_event_selectors_by_arn_from_different_request_region(ct):
     assert resp["EventSelectors"] == selectors
 
 
-def test_get_event_selectors_empty(ct):
+@pytest.mark.parametrize("region", [REGION, WEST_REGION])
+def test_get_event_selectors_defaults_to_all_management_events(ct, region):
+    """A trail without PutEventSelectors reports the default selector, also from a peer region."""
     name = f"trail-nosel-{_uid()}"
-    ct.create_trail(Name=name, S3BucketName="bucket")
-    resp = ct.get_event_selectors(TrailName=name)
-    assert resp["EventSelectors"] == []
+    ct.create_trail(Name=name, S3BucketName="bucket", IsMultiRegionTrail=True)
+    resp = _client("cloudtrail", region=region).get_event_selectors(TrailName=name)
+    assert resp["EventSelectors"] == DEFAULT_EVENT_SELECTORS
 
 
 def test_add_list_remove_tags(ct):
