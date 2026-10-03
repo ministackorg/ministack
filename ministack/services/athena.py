@@ -17,6 +17,7 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
 import asyncio
 import copy
 import csv
+import glob
 import io
 import json
 import logging
@@ -24,6 +25,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -73,7 +75,13 @@ def _ensure_default_workgroup():
             "Description": "Primary workgroup",
             "CreationTime": int(time.time()),
             "Configuration": {
-                "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
+                "ResultConfiguration": {"OutputLocation": "s3://athena-results/"},
+                # AUTO is the default selection; the effective version is what Athena resolved it to.
+                # https://docs.aws.amazon.com/athena/latest/APIReference/API_EngineVersion.html
+                "EngineVersion": {
+                    "SelectedEngineVersion": "AUTO",
+                    "EffectiveEngineVersion": "Athena engine version 3",
+                },
             },
         }
 
@@ -313,7 +321,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPreparedStatement": _get_prepared_statement,
         "DeletePreparedStatement": _delete_prepared_statement,
         "ListPreparedStatements": _list_prepared_statements,
-        # Table Metadata
+        # Databases and Table Metadata (Glue Data Catalog)
+        "GetDatabase": _get_database,
+        "ListDatabases": _list_databases,
         "GetTableMetadata": _get_table_metadata,
         "ListTableMetadata": _list_table_metadata,
         # Tags
@@ -330,6 +340,477 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+# ---- SQL scanning ----
+
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_NUMBER_RE = re.compile(r"[0-9]+")
+
+
+def _sql_tokens(sql):
+    """``(kind, text, start, end)`` per token: ``name`` (lower-cased), ``qname``, ``str``, ``number``, ``punct``."""
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        elif ch in "'\"`":
+            j = i + 1
+            while j < n and not (sql[j] == ch and sql[j + 1:j + 2] != ch):
+                j += 2 if sql[j] == ch else 1
+            end = min(j + 1, n)
+            if ch == "'":
+                yield "str", sql[i:end], i, end
+            else:
+                yield "qname", sql[i + 1:j].replace(ch * 2, ch), i, end
+            i = end
+        elif m := _NAME_RE.match(sql, i):
+            yield "name", m.group(0).lower(), i, m.end()
+            i = m.end()
+        elif m := _NUMBER_RE.match(sql, i):
+            yield "number", m.group(0), i, m.end()
+            i = m.end()
+        else:
+            yield "punct", ch, i, i + 1
+            i += 1
+
+
+class _Cursor:
+    def __init__(self, text):
+        self.text = text
+        self.tokens = list(_sql_tokens(text))
+        self.i = 0
+
+    def reset(self):
+        self.i = 0
+
+    def at_end(self):
+        return self.i >= len(self.tokens)
+
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else (None, None, None, None)
+
+    def advance(self):
+        self.i += 1
+
+    def keywords(self, *words):
+        """Consume the bare-name keyword run ``words`` if it is next; else leave the cursor."""
+        for offset, word in enumerate(words):
+            if self.i + offset >= len(self.tokens) or self.tokens[self.i + offset][:2] != ("name", word):
+                return False
+        self.i += len(words)
+        return True
+
+    def punct(self, char):
+        if self.peek()[:2] == ("punct", char):
+            self.advance()
+            return True
+        return False
+
+    def skip_group(self):
+        """After ``punct("(")``: consume through the matching ``)``."""
+        depth = 1
+        while not self.at_end() and depth > 0:
+            if self.punct("("):
+                depth += 1
+            elif self.punct(")"):
+                depth -= 1
+            else:
+                self.advance()
+
+    def name(self):
+        kind, text = self.peek()[:2]
+        if kind == "name":
+            self.advance()
+            return text
+        return None
+
+    def identifier(self):
+        """A bare (lower-cased) or quoted (verbatim) identifier."""
+        kind, text = self.peek()[:2]
+        if kind in ("name", "qname"):
+            self.advance()
+            return text
+        return None
+
+    def number(self):
+        kind, text = self.peek()[:2]
+        if kind == "number":
+            self.advance()
+            return int(text)
+        return None
+
+    def string(self):
+        """A ``'...'`` literal's value: ``''`` is a quote, and Hive's ``\\t``, ``\\n`` and ``\\\\`` are unescaped."""
+        kind, text = self.peek()[:2]
+        if kind != "str" or len(text) < 2 or not text.endswith("'"):
+            return None
+        self.advance()
+        value = text[1:-1].replace("''", "'")
+        return re.sub(r"\\(.)", lambda m: {"t": "\t", "n": "\n"}.get(m.group(1), m.group(1)), value)
+
+    def dotted_name(self, max_parts):
+        """The next dotted name, right-aligned in a ``max_parts`` tuple (``t`` → ``(None, None, "t")``)."""
+        parts = []
+        while True:
+            part = self.identifier()
+            if part is None:
+                return None
+            parts.append(part)
+            if not self.punct("."):
+                break
+        if len(parts) > max_parts:
+            return None
+        return (None,) * (max_parts - len(parts)) + tuple(parts)
+
+
+@dataclass(frozen=True)
+class _TableReference:
+    """One ``FROM``/``JOIN`` target and where its text sits in the query."""
+
+    database: str | None  # None when the reference names only the table
+    table: str
+    start: int
+    end: int
+    aliased: bool
+
+
+# After a table reference, these keywords start the next clause; anything else is an alias.
+_CLAUSE_KEYWORDS = frozenset(
+    "where on join inner left right full cross natural using group order limit offset having "
+    "union except intersect window qualify fetch with".split()
+)
+
+
+def _table_references(query):
+    """The ``FROM``/``JOIN`` targets of ``query``, in order; CTE names shadow tables."""
+    cursor = _Cursor(query)
+    ctes = _cte_names(cursor)
+    cursor.reset()
+    references = []
+    while not cursor.at_end():
+        if not (cursor.keywords("from") or cursor.keywords("join")):
+            cursor.advance()
+            continue
+        start = cursor.peek()[2]
+        name = cursor.dotted_name(3)
+        if name is None:
+            continue
+        _, database, table = name  # the catalog qualifier is dropped: Glue is the only catalog here
+        if database is None and table in ctes:
+            continue
+        end = cursor.tokens[cursor.i - 1][3]
+        next_kind, next_text = cursor.peek()[:2]
+        aliased = next_kind == "qname" or (next_kind == "name" and next_text not in _CLAUSE_KEYWORDS)
+        references.append(_TableReference(database, table, start, end, aliased))
+    return references
+
+
+def _cte_names(cursor):
+    """Names bound by a top-level ``WITH name AS (...)``."""
+    names = set()
+    if not cursor.keywords("with"):
+        return names
+    while True:
+        name = cursor.identifier()
+        if name is None or not cursor.keywords("as") or not cursor.punct("("):
+            return names
+        names.add(name)
+        cursor.skip_group()
+        if not cursor.punct(","):
+            return names
+
+
+# ---- Table DDL ----
+
+_TEXT_INPUT_FORMAT = "org.apache.hadoop.mapred.TextInputFormat"
+_LAZY_SIMPLE_SERDE = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+# STORED AS <format> → (InputFormat, OutputFormat, SerDe), as Athena writes them to Glue.
+_STORED_AS = {
+    "textfile": (_TEXT_INPUT_FORMAT, "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat", _LAZY_SIMPLE_SERDE),
+    "parquet": (
+        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+        "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+    ),
+    "orc": (
+        "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
+        "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat",
+        "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
+    ),
+    "avro": (
+        "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat",
+        "org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat",
+        "org.apache.hadoop.hive.serde2.avro.AvroSerDe",
+    ),
+}
+# A ROW FORMAT SERDE table with no STORED AS is text written through IgnoreKeyTextOutputFormat.
+_SERDE_TEXT_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat"
+# ROW FORMAT DELIMITED <clause> TERMINATED BY / DEFINED AS 'c' → SerDe parameter.
+_DELIMITED = {
+    ("fields", "terminated", "by"): "field.delim",
+    ("escaped", "by"): "escape.delim",
+    ("collection", "items", "terminated", "by"): "collection.delim",
+    ("map", "keys", "terminated", "by"): "mapkey.delim",
+    ("lines", "terminated", "by"): "line.delim",
+    ("null", "defined", "as"): "serialization.null.format",
+}
+
+
+@dataclass(frozen=True)
+class _CreateTable:
+    database: str | None  # None when the statement names only the table
+    table: str
+    external: bool
+    columns: list = field(default_factory=list)  # Glue column dicts: Name, Type, optional Comment
+    partition_keys: list = field(default_factory=list)
+    comment: str | None = None
+    location: str | None = None
+    input_format: str = _TEXT_INPUT_FORMAT
+    output_format: str = _STORED_AS["textfile"][1]
+    serde: str = _LAZY_SIMPLE_SERDE
+    serde_parameters: dict = field(default_factory=lambda: {"serialization.format": "1"})
+    table_properties: dict = field(default_factory=dict)
+    bucket_columns: list = field(default_factory=list)
+    number_of_buckets: int = -1
+    if_not_exists: bool = False
+
+    @property
+    def iceberg(self):
+        return self.table_properties.get("table_type", "").lower() == "iceberg"
+
+
+@dataclass(frozen=True)
+class _DropTable:
+    database: str | None
+    table: str
+    if_exists: bool = False
+
+
+def _parse_ddl(query):
+    """The ``_CreateTable`` or ``_DropTable`` a statement is; None sends it to the query engine."""
+    cursor = _Cursor(query)
+    if cursor.tokens and cursor.tokens[-1][:2] == ("punct", ";"):
+        cursor.tokens.pop()
+    if any(token[:2] == ("punct", ";") for token in cursor.tokens):
+        return None
+    if cursor.keywords("drop", "table"):
+        if_exists = cursor.keywords("if", "exists")
+        name = cursor.dotted_name(2)
+        if name is None or not cursor.at_end():
+            return None
+        return _DropTable(*name, if_exists=if_exists)
+    if not cursor.keywords("create"):
+        return None
+    external = cursor.keywords("external")
+    if not cursor.keywords("table"):
+        return None
+    if_not_exists = cursor.keywords("if", "not", "exists")
+    name = cursor.dotted_name(2)
+    columns = _column_list(cursor) if name else []
+    if not columns:
+        return None
+    clauses = {}
+    stored_as = row_format_serde = None
+    serde_parameters = {"serialization.format": "1"}
+    while not cursor.at_end():
+        if cursor.keywords("comment"):
+            clauses["comment"] = cursor.string()
+        elif cursor.keywords("partitioned", "by"):
+            clauses["partition_keys"] = _column_list(cursor) or None
+        elif cursor.keywords("clustered", "by"):
+            bucket_columns = _name_list(cursor)
+            buckets = cursor.number() if bucket_columns and cursor.keywords("into") else None
+            if buckets is None or not cursor.keywords("buckets"):
+                return None
+            clauses["bucket_columns"], clauses["number_of_buckets"] = bucket_columns, buckets
+        elif cursor.keywords("row", "format", "delimited"):
+            delimited = _delimited(cursor)
+            if delimited is None:
+                return None
+            serde_parameters.update(delimited)
+        elif cursor.keywords("row", "format", "serde"):
+            row_format_serde = cursor.string()
+            if row_format_serde is None:
+                return None
+            if cursor.keywords("with", "serdeproperties"):
+                properties = _property_list(cursor)
+                if properties is None:
+                    return None
+                serde_parameters.update(properties)
+        elif cursor.keywords("with", "serdeproperties"):
+            properties = _property_list(cursor)
+            if properties is None:
+                return None
+            serde_parameters.update(properties)
+        elif cursor.keywords("stored", "as", "inputformat"):
+            input_format = cursor.string()
+            output_format = cursor.string() if cursor.keywords("outputformat") else None
+            if input_format is None or output_format is None:
+                return None
+            stored_as = (input_format, output_format, None)
+        elif cursor.keywords("stored", "as"):
+            stored_as = _STORED_AS.get(cursor.name() or "")
+            if stored_as is None:
+                return None
+        elif cursor.keywords("location"):
+            clauses["location"] = cursor.string()
+        elif cursor.keywords("tblproperties"):
+            clauses["table_properties"] = _property_list(cursor)
+        else:
+            return None
+        if any(value is None for value in clauses.values()):
+            return None
+    if stored_as is None:
+        input_format, output_format, serde = _STORED_AS["textfile"]
+        if row_format_serde:
+            output_format = _SERDE_TEXT_OUTPUT_FORMAT
+    else:
+        input_format, output_format, serde = stored_as
+    return _CreateTable(
+        *name, external=external, columns=columns, input_format=input_format, output_format=output_format,
+        serde=row_format_serde or serde or _LAZY_SIMPLE_SERDE, serde_parameters=serde_parameters,
+        if_not_exists=if_not_exists, **clauses,
+    )
+
+
+def _column_list(cursor):
+    """``( name type [COMMENT 'text'] , … )`` → Glue column dicts; [] when malformed."""
+    if not cursor.punct("("):
+        return []
+    columns = []
+    while True:
+        name = cursor.identifier()
+        if name is None:
+            return []
+        type_start = type_end = None
+        comment = None
+        depth = 0
+        while not cursor.at_end():
+            kind, text, start, end = cursor.peek()
+            if depth == 0 and kind == "punct" and text in ",)":
+                break
+            if depth == 0 and kind == "name" and text == "comment":
+                cursor.advance()
+                comment = cursor.string()
+                if comment is None:
+                    return []
+                continue
+            if kind == "punct" and text in "(<":
+                depth += 1
+            elif kind == "punct" and text in ")>":
+                depth -= 1
+            if type_start is None:
+                type_start = start
+            type_end = end
+            cursor.advance()
+        if type_start is None:
+            return []
+        column = {"Name": name, "Type": cursor.text[type_start:type_end].lower()}
+        if comment is not None:
+            column["Comment"] = comment
+        columns.append(column)
+        if cursor.punct(","):
+            continue
+        if cursor.punct(")"):
+            return columns
+        return []
+
+
+def _name_list(cursor):
+    """``( a , b )`` → ``["a", "b"]``; [] when malformed."""
+    if not cursor.punct("("):
+        return []
+    names = []
+    while (name := cursor.identifier()) is not None:
+        names.append(name)
+        if cursor.punct(")"):
+            return names
+        if not cursor.punct(","):
+            return []
+    return []
+
+
+def _property_list(cursor):
+    """``( 'k' = 'v' , … )`` → dict; None when malformed."""
+    if not cursor.punct("("):
+        return None
+    properties = {}
+    while True:
+        key = cursor.string()
+        value = cursor.string() if key is not None and cursor.punct("=") else None
+        if value is None:
+            return None
+        properties[key] = value
+        if cursor.punct(")"):
+            return properties
+        if not cursor.punct(","):
+            return None
+
+
+def _delimited(cursor):
+    """The SerDe parameters a ``ROW FORMAT DELIMITED`` clause sets; None when malformed."""
+    parameters = {}
+    while True:
+        for words, parameter in _DELIMITED.items():
+            if cursor.keywords(*words):
+                value = cursor.string()
+                if value is None:
+                    return None
+                parameters[parameter] = value
+                break
+        else:
+            break
+    if "field.delim" in parameters:
+        parameters["serialization.format"] = parameters["field.delim"]
+    return parameters
+
+
+def _create_table_input(ddl):
+    """The Glue ``TableInput`` Athena writes for ``ddl``."""
+    parameters = {"EXTERNAL": "TRUE", "transient_lastDdlTime": str(int(time.time())), **ddl.table_properties}
+    if ddl.comment is not None:
+        parameters["comment"] = ddl.comment
+    storage = {
+        "Columns": ddl.columns,
+        "InputFormat": ddl.input_format,
+        "OutputFormat": ddl.output_format,
+        "Compressed": False,
+        "NumberOfBuckets": ddl.number_of_buckets,
+        "SerdeInfo": {"SerializationLibrary": ddl.serde, "Parameters": ddl.serde_parameters},
+        "BucketColumns": ddl.bucket_columns,
+        "SortColumns": [],
+        "Parameters": {},
+        "SkewedInfo": {"SkewedColumnNames": [], "SkewedColumnValues": [], "SkewedColumnValueLocationMaps": {}},
+        "StoredAsSubDirectories": False,
+    }
+    if ddl.location:
+        storage["Location"] = ddl.location.rstrip("/")
+    return {
+        "Name": ddl.table,
+        "Owner": "hadoop",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": parameters,
+        "StorageDescriptor": storage,
+        "PartitionKeys": ddl.partition_keys,
+    }
+
+
+def _data_format(table_data):
+    """``classification`` when set, else the format its InputFormat or SerDe names, else ``csv``."""
+    classification = (table_data.get("Parameters") or {}).get("classification")
+    if classification:
+        return classification
+    storage = table_data.get("StorageDescriptor") or {}
+    classes = f"{storage.get('InputFormat', '')} {(storage.get('SerdeInfo') or {}).get('SerializationLibrary', '')}".lower()
+    return next((fmt for fmt in ("parquet", "orc", "avro", "json") if fmt in classes), "csv")
+
+
 # ---- Query Execution ----
 
 
@@ -344,6 +825,14 @@ def _start_query_execution(data):
     ).get("OutputLocation", "s3://athena-results/")
     db = data.get("QueryExecutionContext", {}).get("Database", "default")
     catalog = data.get("QueryExecutionContext", {}).get("Catalog", "AwsDataCatalog")
+    # Athena rejects any malformed statement here; with no Trino parser, only this DDL rule is
+    # checked at submission and other errors fail the execution instead.
+    ddl = _parse_ddl(query)
+    if isinstance(ddl, _CreateTable) and not ddl.external and not ddl.iceberg:
+        return error_response_json(
+            "InvalidRequestException", "External keyword required for table type HIVE", 400,
+            extra={"AthenaErrorCode": "MALFORMED_QUERY"},
+        )
 
     execution = {
         "QueryExecutionId": query_id,
@@ -377,12 +866,12 @@ def _start_query_execution(data):
     }
     _executions[query_id] = execution
 
-    asyncio.create_task(_execute_query(query_id, query, db))
+    asyncio.create_task(_execute_query(query_id, query, db, ddl))
 
     return json_response({"QueryExecutionId": query_id})
 
 
-async def _execute_query(query_id, query, database):
+async def _execute_query(query_id, query, database, ddl):
     execution = _executions.get(query_id)
     if not execution:
         return
@@ -393,7 +882,9 @@ async def _execute_query(query_id, query, database):
     try:
         engine = get_athena_engine()
 
-        if engine == "duckdb":
+        if ddl is not None:
+            results = _run_ddl(ddl, database)
+        elif engine == "duckdb":
             results = await _run_duckdb(query, database)
         else:
             results = _mock_query_results(query)
@@ -464,45 +955,84 @@ async def _run_duckdb(query, database):
 
 
 async def _rewrite_data_paths(query, database):
+    """Replace each Glue table reference with a DuckDB relation over its local S3 data."""
     from ministack.services import glue as glue_svc
 
-    # Skip identifiers that look like function calls (read_csv('s3://...'))
-    # or already contain a path separator. Restrict to bare table references
-    # — optional database qualifier, then table name — letters/digits/dots/
-    # underscores/hyphens. Quoted identifiers (e.g. "my-db"."my-table") are
-    # left to a future pass.
-    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b'
-    tables_to_resolve = re.findall(pattern, query, re.IGNORECASE)
-
-    for full_name in tables_to_resolve:
-        parts = full_name.split(".")
-        db_name, table_name = (parts[0], parts[1]) if len(parts) > 1 else (database or "default", parts[0])
+    account_id = get_account_id()
+    edits = []
+    for ref in _table_references(query):
+        db_name = ref.database or database or "default"
 
         # Read directly from glue's internal store rather than going through
         # the HTTP handler. The store is account-scoped via AccountScopedDict
         # and reads the current request's contextvar, so multi-tenancy is
         # preserved without crafting synthetic Authorization headers.
-        table_data = glue_svc._tables.get(f"{db_name}/{table_name}")
+        table_data = glue_svc._tables.get(f"{db_name}/{ref.table}")
         if not table_data:
             continue
-
-        sd = table_data.get("StorageDescriptor", {})
-        s3_location = sd.get("Location")
+        s3_location = (table_data.get("StorageDescriptor") or {}).get("Location")
         if not s3_location:
             continue
 
-        account_id = get_account_id()
         p = urlparse(s3_location)
         stripped = f"{p.netloc}{p.path}".rstrip("/")
-        classification = table_data.get("Parameters", {}).get("classification", "csv")
+        local_dir = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
+        if next(glob.iglob(f"{local_dir}/**/*", recursive=True), None):
+            relation = f"'{local_dir}/**/*.{_data_format(table_data)}'"  # DuckDB reads the files, or reports why not
+        else:
+            relation = _empty_relation(table_data)
+        alias = "" if ref.aliased else f' AS "{ref.table}"'
+        edits.append((ref.start, ref.end, relation + alias))
 
-        local_path = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-        duck_path = f"{local_path}/**/*.{classification}"
+    for span_start, span_end, replacement in reversed(edits):
+        query = query[:span_start] + replacement + query[span_end:]
+    return _rewrite_s3_paths(query)
 
-        query = re.sub(rf"\b{re.escape(full_name)}\b", f"'{duck_path}'", query)
 
-    query = _rewrite_s3_paths(query)
-    return query
+_DUCKDB_TYPE_BY_ATHENA = {
+    "boolean": "BOOLEAN", "tinyint": "TINYINT", "smallint": "SMALLINT", "int": "INTEGER", "integer": "INTEGER",
+    "bigint": "BIGINT", "float": "FLOAT", "real": "FLOAT", "double": "DOUBLE", "date": "DATE",
+    "timestamp": "TIMESTAMP", "binary": "BLOB", "varbinary": "BLOB",
+}
+
+
+def _empty_relation(table_data):
+    """Zero rows with the table's Glue columns and partition keys; complex types read as VARCHAR."""
+    columns = ((table_data.get("StorageDescriptor") or {}).get("Columns") or []) + (table_data.get("PartitionKeys") or [])
+    if not columns:
+        return "(SELECT 1 WHERE FALSE)"
+    projected = []
+    for column in columns:
+        base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+        duck_type = "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+        name = str(column.get("Name", "")).replace('"', '""')
+        projected.append(f'CAST(NULL AS {duck_type}) AS "{name}"')
+    return f"(SELECT {', '.join(projected)} WHERE FALSE)"
+
+
+def _run_ddl(ddl, database):
+    from ministack.services import glue as glue_svc
+
+    db_name = ddl.database or database or "default"
+    if isinstance(ddl, _DropTable):
+        if f"{db_name}/{ddl.table}" not in glue_svc._tables:
+            if ddl.if_exists:
+                return {"columns": [], "rows": [], "column_types": []}
+            raise ValueError(f"Table '{db_name}.{ddl.table}' does not exist")
+        glue_svc._delete_table({"DatabaseName": db_name, "Name": ddl.table})
+        return {"columns": [], "rows": [], "column_types": []}
+    if ddl.iceberg:
+        raise ValueError("NOT_SUPPORTED: Iceberg tables are not supported")
+    if db_name not in glue_svc._databases:
+        raise ValueError(f"Schema '{db_name}' does not exist")
+    if f"{db_name}/{ddl.table}" in glue_svc._tables:
+        if ddl.if_not_exists:
+            return {"columns": [], "rows": [], "column_types": []}
+        raise ValueError(f"Table '{db_name}.{ddl.table}' already exists")
+    status, _, body = glue_svc._create_table({"DatabaseName": db_name, "TableInput": _create_table_input(ddl)})
+    if status >= 300:
+        raise ValueError(json.loads(body).get("message", "Glue CreateTable failed"))
+    return {"columns": [], "rows": [], "column_types": []}
 
 
 def _rewrite_s3_paths(query):
@@ -627,13 +1157,11 @@ def _mock_query_results(query):
 
 
 def _detect_statement_type(query):
-    q = query.strip().upper()
-    if q.startswith("SELECT") or q.startswith("WITH"):
+    first = next((text for kind, text, _, _ in _sql_tokens(query) if kind != "punct" or text != "("), "")
+    if first in ("select", "with", "insert", "delete", "update", "merge"):
         return "DML"
-    if q.startswith(("CREATE", "DROP", "ALTER")):
+    if first in ("create", "drop", "alter"):
         return "DDL"
-    if q.startswith(("INSERT", "DELETE", "UPDATE", "MERGE")):
-        return "DML"
     return "UTILITY"
 
 
@@ -684,7 +1212,9 @@ def _get_query_results(data):
     page_rows = rows[start_idx : start_idx + max_results]
 
     result_rows = []
-    result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
+    # Only a DML result's first page carries Athena's header row of column names.
+    if execution.get("StatementType") == "DML" and start_idx == 0:
+        result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
         result_rows.append(
             {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
@@ -1074,7 +1604,40 @@ def _list_prepared_statements(data):
     return json_response({"PreparedStatements": stmts})
 
 
-# ---- Table Metadata (stubs) ----
+# ---- Databases and Table Metadata (Glue Data Catalog) ----
+
+
+def _athena_database(db):
+    database = {"Name": db["Name"], "Parameters": db.get("Parameters") or {}}
+    if db.get("Description"):
+        database["Description"] = db["Description"]
+    return database
+
+
+def _get_database(data):
+    from ministack.services import glue as glue_svc
+    if data.get("CatalogName", "AwsDataCatalog") not in _data_catalogs:
+        return error_response_json("MetadataException", f"Catalog {data.get('CatalogName')} not found", 400)
+    db = glue_svc._databases.get(data.get("DatabaseName", ""))
+    if not db:
+        return error_response_json("MetadataException", f"Database {data.get('DatabaseName')} not found", 400)
+    return json_response({"Database": _athena_database(db)})
+
+
+def _list_databases(data):
+    from ministack.services import glue as glue_svc
+    if data.get("CatalogName", "AwsDataCatalog") not in _data_catalogs:
+        return error_response_json("MetadataException", f"Catalog {data.get('CatalogName')} not found", 400)
+    databases = [_athena_database(db) for db in glue_svc._databases.values()]
+    token = data.get("NextToken") or "0"
+    if not token.isdigit():
+        return error_response_json("InvalidRequestException", "Invalid NextToken", 400)
+    start = int(token)
+    end = start + int(data.get("MaxResults") or 50)
+    response = {"DatabaseList": databases[start:end]}
+    if end < len(databases):
+        response["NextToken"] = str(end)
+    return json_response(response)
 
 
 def _glue_col(c):

@@ -58,6 +58,7 @@ from .stacks import (
     _deploy_stack_async,
     _roll_back_operation,
     _stack_region_context,
+    _stack_tags_changed,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -205,14 +206,12 @@ def _check_capabilities(sent, template, params, macros=True):
     ``template``, because a macro may add IAM resources and AWS asks for those
     to be acknowledged as well (template-macros-overview.html).
 
-    Capabilities are IAM scope, so the check only runs under ``AUTH=true``;
-    without it every template is accepted as before. ``CAPABILITY_IAM`` is
+    The check runs under ``AUTH=true`` only. ``CAPABILITY_IAM`` is
     satisfied by either IAM capability, ``CAPABILITY_NAMED_IAM`` only by
     itself. Pass ``macros=False`` for ``CreateChangeSet``: the API reference
     says ``CAPABILITY_AUTO_EXPAND`` "doesn't apply to creating change sets".
     Returns an error response or ``None``."""
-    from ministack.app import AUTH
-    if not AUTH:
+    if not _capabilities_enforced():
         return None
     given = set(_extract_string_members(params, "Capabilities"))
     required = _required_iam_capabilities(template)
@@ -222,6 +221,12 @@ def _check_capabilities(sent, template, params, macros=True):
     if not missing:
         return None
     return _error("InsufficientCapabilitiesException", _insufficient_capabilities_message(missing))
+
+
+def _capabilities_enforced():
+    """Capabilities are IAM scope, so they are checked under ``AUTH=true`` only."""
+    from ministack.app import AUTH
+    return AUTH
 
 
 def _required_iam_capabilities(template):
@@ -934,9 +939,9 @@ def _stack_has_no_updates(stack, template, param_values, tags,
                           use_previous_template=False, tags_given=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
-    request either carries no tags or the tags the stack already has. Real
-    CloudFormation refuses such a request with ``No updates are to be
-    performed.`` instead of running an empty update. A template body that
+    request either carries no tags or the tags the stack already has, in any
+    order. Real CloudFormation refuses such a request with ``No updates are to
+    be performed.`` instead of running an empty update. A template body that
     carries a dynamic reference is the exception: the update is accepted
     (with ``UsePreviousTemplate`` it is still refused) — measured on AWS."""
     if template != stack.get("_template", {}):
@@ -946,9 +951,7 @@ def _stack_has_no_updates(stack, template, param_values, tags,
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
         return False
-    if (tags or tags_given) and tags != stack.get("Tags", []):
-        return False
-    return True
+    return not _stack_tags_changed(stack, tags, tags_given)
 
 
 def _update_stack(params):
@@ -973,7 +976,8 @@ def _update_stack(params):
 
     current_status = stack.get("StackStatus", "")
     if current_status not in ("CREATE_COMPLETE", "UPDATE_COMPLETE",
-                               "UPDATE_ROLLBACK_COMPLETE"):
+                               "UPDATE_ROLLBACK_COMPLETE", "IMPORT_COMPLETE",
+                               "IMPORT_ROLLBACK_COMPLETE"):
         return _error("ValidationError",
                       f"Stack [{stack_name}] is in {current_status} state "
                       f"and cannot be updated")

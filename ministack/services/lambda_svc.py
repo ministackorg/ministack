@@ -3845,6 +3845,16 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+def _docker_cp_file(container, src_path: str, dest_path: str):
+    """Copy one local file (symlinks followed) into a container at ``dest_path``."""
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
+        tar.add(src_path, arcname=dest_path.lstrip("/"))
+    buf.seek(0)
+    container.put_archive("/", buf)
+
+
 # Bare-text body the RIE answers with (HTTP 200) when a run hits the function
 # timeout (#1845); it is not a JSON error payload.
 _RIE_TIMEOUT_TEXT_RE = re.compile(r"Task timed out after \d+\.\d\d seconds")
@@ -4119,8 +4129,11 @@ _CONTAINER_BUNDLE_PATH = "/var/ministack/ca-bundle.pem"
 _CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
 
 
-def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
-    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert."""
+def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", copies=None):
+    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert.
+
+    With ``copies`` (MiniStack in a container) the trust files are listed for docker cp, not bind-mounted.
+    """
     from ministack.core import tls as _tls
 
     if not _tls.use_ssl_enabled():
@@ -4136,20 +4149,24 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
         return
     # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
     bundle = _tls.ca_bundle_path(cert_path)
-    mounts.append(docker_lib.types.Mount(
-        _CONTAINER_CA_PATH, cert_path, type="bind", read_only=True))
+
+    def trust(target, source):
+        if copies is not None:
+            copies.append((target, source))
+        else:
+            mounts.append(docker_lib.types.Mount(target, source, type="bind", read_only=True))
+
+    trust(_CONTAINER_CA_PATH, cert_path)
     container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
     if bundle:
-        mounts.append(docker_lib.types.Mount(
-            _CONTAINER_BUNDLE_PATH, bundle, type="bind", read_only=True))
+        trust(_CONTAINER_BUNDLE_PATH, bundle)
         for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
             container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
     # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
     if runtime.startswith("java"):
         store = _tls.java_truststore_path(cert_path)
         if store:
-            mounts.append(docker_lib.types.Mount(
-                _CONTAINER_TRUSTSTORE_PATH, store, type="bind", read_only=True))
+            trust(_CONTAINER_TRUSTSTORE_PATH, store)
             container_env.setdefault("JAVA_TOOL_OPTIONS", " ".join((
                 f"-Djavax.net.ssl.trustStore={_CONTAINER_TRUSTSTORE_PATH}",
                 "-Djavax.net.ssl.trustStoreType=pkcs12",
@@ -4540,7 +4557,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
 
-    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime)
+    trust_copies = [] if _running_in_container() else None
+    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime, trust_copies)
 
     if mounts:
         run_kwargs["mounts"] = mounts
@@ -4615,7 +4633,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
-        if _use_docker_cp or _cp_layers:
+        if _use_docker_cp or _cp_layers or trust_copies:
             create_kwargs = {k: v for k, v in run_kwargs.items()
                              if k not in ("detach", "stdin_open")}
             container = client.containers.create(**create_kwargs)
@@ -4632,6 +4650,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             # layer ordering. Fixes issue #888.
             for ld in layers_dirs:
                 _docker_cp_dir(container, ld, "/opt", arcname=".")
+            for target, source in trust_copies or ():
+                _docker_cp_file(container, source, target)
             container.start()
         else:
             container = client.containers.run(**run_kwargs)

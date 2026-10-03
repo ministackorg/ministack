@@ -136,6 +136,17 @@ def reset():
     _positions.clear()
 
 
+def check_same_region(*arns):
+    """Raise ValueError when an ARN names a region other than the pipe's."""
+    for component_arn in arns:
+        try:
+            component_region = parse_arn(component_arn).region
+        except ArnParseError:
+            continue
+        if component_region and component_region != get_region():
+            raise ValueError(CROSS_REGION_PIPE_ERROR)
+
+
 def register_pipe(
     *,
     name: str,
@@ -149,13 +160,7 @@ def register_pipe(
 ):
     pipe_region = get_region()
     # AWS rejects cross-region source/target ARNs before role validation.
-    for component_arn in (source, target):
-        try:
-            component_region = parse_arn(component_arn).region
-        except ArnParseError:
-            continue
-        if component_region and component_region != pipe_region:
-            raise ValueError(CROSS_REGION_PIPE_ERROR)
+    check_same_region(source, target)
 
     arn = f"arn:aws:pipes:{pipe_region}:{get_account_id()}:pipe/{name}"
     state = "STOPPED" if str(desired_state).upper() == "STOPPED" else "RUNNING"

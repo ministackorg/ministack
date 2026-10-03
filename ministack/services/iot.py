@@ -7823,9 +7823,8 @@ async def handle_websocket(
 #   a handshake that sends no CONNECT registers nothing.
 #
 # The TLS layer adds one constraint of its own: a presented chain is verified,
-# so a certificate from a CA the listener does not trust fails the handshake
-# before any of the above. The trusted set is the Local CA plus every ACTIVE
-# CA in the registry.
+# so an untrusted certificate fails the handshake first. Trusted: the Local CA and every
+# registered CA and device certificate, whatever its status.
 
 _MTLS_DEFAULT_PORT = 8883
 _MTLS_READ_CHUNK = 65536
@@ -7969,31 +7968,16 @@ def _mtls_ensure_server_cert() -> tuple[str, str]:
     return cert_pem, key_pem
 
 
-def _mtls_registered_ca_pems() -> list[str]:
-    """ACTIVE CA certificates from the CA registry, across every scope.
-
-    The store is scoped by account and region; a single listener serves every
-    tenant, so it is read across all scopes. Only ACTIVE CAs qualify:
-    registering a CA without activating it is how AWS says "not yet", and
-    honouring that keeps ``UpdateCACertificate`` meaningful for connections
-    opened after it.
-    """
-    pems = []
-    for record in list(_ca_certificates._data.values()):
-        if not isinstance(record, dict) or record.get("status") != "ACTIVE":
-            continue
-        pem = record.get("certificatePem")
-        if isinstance(pem, str) and pem.strip():
-            pems.append(pem)
-    return pems
-
-
-def _mtls_trust_anchors() -> list[str]:
-    """CAs whose client certificates verify at the TLS layer: the Local CA plus
-    every ACTIVE registered CA. Presenting a certificate is optional, so this
-    set only decides which presented chains survive the handshake; who a
-    session belongs to is decided afterwards, in ``_mtls_serve_conn``."""
-    return [get_ca_cert_pem(), *_mtls_registered_ca_pems()]
+def _mtls_trust_anchors() -> list[tuple[str, str]]:
+    """(id, PEM) of the Local CA and every registered CA and device certificate, across every scope and status."""
+    local = get_ca_cert_pem()
+    anchors = [(hashlib.sha256(local.encode("utf-8")).hexdigest(), local)]
+    for store in (_ca_certificates, _certificates):
+        for record in list(store._data.values()):
+            pem = record.get("certificatePem") if isinstance(record, dict) else None
+            if isinstance(pem, str) and pem.strip():
+                anchors.append((record.get("certificateId") or hashlib.sha256(pem.encode("utf-8")).hexdigest(), pem))
+    return anchors
 
 
 def _mtls_refresh_trust_anchors(ctx: ssl.SSLContext) -> None:
@@ -8001,17 +7985,15 @@ def _mtls_refresh_trust_anchors(ctx: ssl.SSLContext) -> None:
 
     Anchors are loaded one PEM at a time so that a single unparseable
     registered certificate costs only itself, and each is remembered — by
-    digest, including the ones that failed — so a handshake never repeats the
-    work or the warning. ``load_verify_locations`` is additive and a live
-    context cannot forget an anchor, so a CA deactivated after loading stays
-    trusted at the TLS layer until ``reset()`` rebinds; the session-attribution
-    lookup still runs per connection.
+    certificate id, including the ones that failed — so a handshake never
+    repeats the work or the warning. ``load_verify_locations`` is additive, so an anchor
+    stays loaded after its record is gone; whether a presented certificate is
+    served is decided per connection by the registry lookup.
     """
-    for pem in _mtls_trust_anchors():
-        digest = hashlib.sha256(pem.encode("utf-8")).hexdigest()
-        if digest in _mtls_loaded_anchors:
+    for anchor_id, pem in _mtls_trust_anchors():
+        if anchor_id in _mtls_loaded_anchors:
             continue
-        _mtls_loaded_anchors.add(digest)
+        _mtls_loaded_anchors.add(anchor_id)
         try:
             ctx.load_verify_locations(cadata=pem)
         except Exception as e:
@@ -8021,9 +8003,9 @@ def _mtls_refresh_trust_anchors(ctx: ssl.SSLContext) -> None:
 def _mtls_on_client_hello(
     ssl_object: ssl.SSLObject, server_name: str | None, ctx: ssl.SSLContext
 ) -> None:
-    """Pull newly registered CAs in mid-handshake, before the peer is verified.
+    """Pull newly registered certificates in mid-handshake, before the peer is verified.
 
-    A CA registered while the listener is bound has to be trusted without a
+    A certificate registered while the listener is bound has to be trusted without a
     restart, and ``sni_callback`` is the only hook that runs late enough to see
     the current registry yet early enough to matter. It runs on every
     handshake, including those carrying no server name — which is what a
@@ -8047,6 +8029,8 @@ def _mtls_build_ssl_context() -> ssl.SSLContext:
     # signal; absence of one falls back the same way an unsigned WS upgrade
     # does.
     ctx.verify_mode = ssl.CERT_OPTIONAL
+    # A registered device certificate is an anchor of its own, whatever signed it.
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
     cert_pem, key_pem = _mtls_ensure_server_cert()
     # load_cert_chain only takes paths; a combined cert+key file is the least
     # material to leave on disk, and it is unlinked before the handshake.
