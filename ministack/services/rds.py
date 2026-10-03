@@ -2457,6 +2457,10 @@ def _start_rds_container_for_instance(db_id, instance):
         container_kwargs["tmpfs"] = {
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
+    if _is_mysql_engine(engine) and (
+        options := _mysql_server_options(instance.get("BackupRetentionPeriod", 1))
+    ):
+        container_kwargs["command"] = options
 
     try:
         container = _run_rds_container(
@@ -2613,6 +2617,12 @@ def _wait_for_port(host, port, timeout=60):
 
 def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
+
+
+def _mysql_server_options(backup_retention_period):
+    """Server options for a standalone MySQL/MariaDB instance. As on RDS, a
+    backup retention period of 0 turns binary logging off."""
+    return [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
 
 
 def _is_postgres_engine(engine):
@@ -4771,6 +4781,10 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
+                if _is_mysql_engine(engine) and (
+                    options := _mysql_server_options(_p(p, "BackupRetentionPeriod") or "1")
+                ):
+                    container_kwargs["command"] = options
                 container = _run_rds_container(
                     docker_client, engine, container_kwargs,
                     tls_names=[endpoint_host or "",

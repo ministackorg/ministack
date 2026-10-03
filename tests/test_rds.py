@@ -8144,6 +8144,30 @@ def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE
     )
 
 
+@pytest.mark.data_plane
+def test_rds_mysql_binary_logging_follows_backup_retention(rds):
+    """On RDS a backup retention period of 0 turns binary logging off."""
+    suffix = uuid.uuid4().hex[:8]
+    expected = {f"binlog-off-{suffix}": 0, f"binlog-on-{suffix}": 1}
+    try:
+        for db_id, retention in zip(expected, (0, 1)):
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, Engine="mysql", EngineVersion="8.0",
+                DBInstanceClass="db.t3.micro", AllocatedStorage=20, DBName=DATABASE,
+                MasterUsername="admin", MasterUserPassword=PASSWORD,
+                BackupRetentionPeriod=retention,
+            )
+        for db_id, log_bin in expected.items():
+            conn = _aurora_connect(_wait_for_instance(rds, db_id)["Endpoint"])
+            with conn.cursor() as cur:
+                cur.execute("SELECT @@log_bin")
+                assert cur.fetchone()[0] == log_bin
+            conn.close()
+    finally:
+        for db_id in expected:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
 @contextlib.contextmanager
 def _live_cluster(rds, engine_version=None):
     suffix = uuid.uuid4().hex[:10]

@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **RDS — a backup retention period of 0 turns binary logging off** — on RDS for MySQL, `BackupRetentionPeriod=0` turns binary logging off; MiniStack's MySQL 8.0/8.4 instances kept the image default, binary logging on. Such an instance now starts with binary logging off. Contributed by @skialpine.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 
