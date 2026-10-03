@@ -1,4 +1,5 @@
-"""CloudFormation + CDK support for AWS::DocDB::* resources.
+"""
+CloudFormation + CDK support for AWS::DocDB::* resources.
 
 Covers the two layers CDK deployments exercise:
 - ``engine._resolve_dynamic_reference(s)`` — CDK L2 assembles
@@ -20,10 +21,17 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from ministack.services import secretsmanager as sm
+from ministack.services import ssm as ssm_svc
 from ministack.services.cloudformation.engine import (
     _resolve_dynamic_reference,
     _resolve_dynamic_references,
 )
+
+# White-box tests assert on service internals by design.
+# pylint: disable=protected-access
+# pytest fixture injection requires these names.
+# pylint: disable=redefined-outer-name
 
 
 def _endpoint():
@@ -43,6 +51,7 @@ def _client(service):
 
 @pytest.fixture(scope="module")
 def cfn():
+    """A CloudFormation client pointed at the MiniStack endpoint."""
     return _client("cloudformation")
 
 
@@ -77,22 +86,22 @@ def docdb():
         socket.getaddrinfo = real_getaddrinfo
 
 
-def _delete_stack_if_exists(cfn, name, timeout=60):
+def _delete_stack_if_exists(client, name, timeout=60):
     try:
-        cfn.describe_stacks(StackName=name)
+        client.describe_stacks(StackName=name)
     except ClientError as exc:
         if "does not exist" not in str(exc):
             raise
         return
-    cfn.delete_stack(StackName=name)
-    _wait_stack(cfn, name, timeout=timeout)
+    client.delete_stack(StackName=name)
+    _wait_stack(client, name, timeout=timeout)
 
 # ---------------------------------------------------------------------------
 # Pure-function tests for the secretsmanager dynamic-reference pass
 # ---------------------------------------------------------------------------
 
 def test_dynref_bare_form_returns_whole_secret():
-    from ministack.services import secretsmanager as sm
+    """A bare secretsmanager reference resolves to the whole secret string."""
     sm._secrets["plain-secret"] = {
         "ARN": "arn:aws:secretsmanager:us-east-1:000000000000:secret:plain-secret",
         "Name": "plain-secret", "DeletedDate": None,
@@ -108,7 +117,6 @@ def test_dynref_bare_form_returns_whole_secret():
 
 def test_dynref_secretstring_key_with_arn():
     """CDK emits ARN-based refs whose colons must not break parsing."""
-    from ministack.services import secretsmanager as sm
     arn = ("arn:aws:secretsmanager:us-east-1:000000000000:"
            "secret:docdb-master-AbCdEf")
     sm._secrets["docdb-master-AbCdEf"] = {
@@ -130,7 +138,6 @@ def test_dynref_secretstring_key_with_arn():
 
 def test_dynref_inside_structure_and_caching():
     """Refs resolve inside nested structures and one literal is read once."""
-    from ministack.services import secretsmanager as sm
     sm._secrets["struct-secret"] = {
         "ARN": "arn:test", "Name": "struct-secret", "DeletedDate": None,
         "Versions": {"v1": {"SecretString": json.dumps({"user": "admin", "pw": "x"}),
@@ -165,7 +172,7 @@ def test_dynref_inside_structure_and_caching():
 
 
 def test_dynref_missing_key_raises():
-    from ministack.services import secretsmanager as sm
+    """A missing SecretString key raises ValueError."""
     sm._secrets["tiny-secret"] = {
         "ARN": "arn:test", "Name": "tiny-secret", "DeletedDate": None,
         "Versions": {"v1": {"SecretString": "{}", "Stages": ["AWSCURRENT"]}},
@@ -179,6 +186,7 @@ def test_dynref_missing_key_raises():
 
 
 def test_dynref_missing_secret_raises():
+    """An unknown secret name raises ValueError."""
     with pytest.raises(ValueError, match="could not be resolved: secret"):
         _resolve_dynamic_reference("{{resolve:secretsmanager:no-such-secret-xyz}}")
 
@@ -186,7 +194,6 @@ def test_dynref_missing_secret_raises():
 def test_dynref_ssm_service_resolves_too():
     """The same pass resolves ssm references; unsupported services are
     refused at CreateStack time by the template pre-flight."""
-    from ministack.services import ssm as ssm_svc
     record = {
         "Name": "/docdb/dynref", "Value": "param-value",
         "OriginalValue": "param-value", "Type": "String", "KeyId": "",
@@ -208,11 +215,11 @@ def test_dynref_ssm_service_resolves_too():
 # End-to-end deploy of a CDK-shaped DocumentDB stack
 # ---------------------------------------------------------------------------
 
-def _wait_stack(cfn, name, timeout=60):
+def _wait_stack(client, name, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+            stacks = client.describe_stacks(StackName=name)["Stacks"]
         except ClientError as exc:
             if "does not exist" in str(exc):
                 return {"StackStatus": "DELETE_COMPLETE", "StackName": name}
@@ -295,7 +302,12 @@ CDK_SHAPE_TEMPLATE = {
 }
 
 
+# pytest fixture injection requires these names.
+# pylint: disable=redefined-outer-name
+
+
 def test_cfn_docdb_cdk_shape_stack_lifecycle(cfn, docdb):
+    """A CDK-shaped stack deploys end to end and deletes cleanly."""
     stack_name = "cfn-docdb-cdk-shape"
     _delete_stack_if_exists(cfn, stack_name)
     cfn.create_stack(StackName=stack_name,
@@ -304,7 +316,9 @@ def test_cfn_docdb_cdk_shape_stack_lifecycle(cfn, docdb):
     assert result["StackStatus"] == "CREATE_COMPLETE", result.get("StackStatusReason")
 
     outputs = {o["OutputKey"]: o["OutputValue"] for o in result.get("Outputs", [])}
-    assert outputs["ClusterEndpointPort"] in ("27017",) or int(outputs["ClusterEndpointPort"]) >= 27117
+    cluster_port = outputs["ClusterEndpointPort"]
+    port_ok = cluster_port in ("27017",) or int(cluster_port) >= 27117
+    assert port_ok
     assert outputs["InstanceEndpointAddress"]
 
     mine = [c for c in docdb.describe_db_clusters()["DBClusters"]
@@ -319,7 +333,7 @@ def test_cfn_docdb_cdk_shape_stack_lifecycle(cfn, docdb):
     port = members[0]["Endpoint"]["Port"]
     assert port == 27017 or port >= 27117
 
-    # Stack delete removes instance -> cluster -> containers.
+    # Stack delete removes instance -> cluster -> DocumentDB containers.
     cfn.delete_stack(StackName=stack_name)
     done = _wait_stack(cfn, stack_name)
     assert done["StackStatus"] == "DELETE_COMPLETE"
@@ -359,6 +373,7 @@ def test_cfn_docdb_cluster_master_user_secret_passthrough(cfn, docdb):
 
 
 def test_cfn_docdb_bad_engine_version_fails_readably(cfn):
+    """An unsupported EngineVersion rolls the stack back with a clear reason."""
     template = {
         "Resources": {
             "Cluster": {

@@ -327,6 +327,11 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_listener_survives_reset",
     "tests/test_iot_data.py::test_mtls_reset_rebinds_with_a_device_connected",
     "tests/test_iot_data.py::test_mtls_shutdown_completes_with_a_device_connected",
+    # DocDB pymongo tests start real DocumentDB containers and poll wall-clock
+    # readiness; xdist load makes the timing unreliable.
+    "tests/test_docdb.py::test_docdb_pymongo_shared_endpoint",
+    "tests/test_docdb.py::test_docdb_pymongo_v8_connects",
+    "tests/test_docdb.py::test_docdb_pymongo_tls_connects",
 }
 
 

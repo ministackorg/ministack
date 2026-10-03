@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **DocumentDB — data plane runs the real DocumentDB container** — cluster and standalone-instance compute now uses the official `documentdb-local` image (`ghcr.io/documentdb/documentdb/documentdb-local:latest`, MIT licensed, replacing the MongoDB images) for both engine versions 5.0.0 and 8.0.0; credentials move to the container's `USERNAME`/`PASSWORD` env, the wire port stays 27017 (via `DOCUMENTDB_PORT`) and storage moves to `/data`. The gateway serves TLS with a self-signed certificate (`tls=true&tlsAllowInvalidCertificates=true`) while its `allowTLS` default also accepts plaintext, so existing pymongo clients keep working. Readiness waits after container start extend from 60 s to 300 s because first boot initializes a PostgreSQL data directory. Tags actions (`AddTagsToResource`, `ListTagsForResource`, `RemoveTagsFromResource`) now resolve `ResourceName` against live records and return the documented 404 faults (`DBClusterNotFoundFault`, `DBInstanceNotFound`, `DBSnapshotNotFound`) for unknown ARNs; a missing `ResourceName` returns `MissingParameter` for all three. DocumentDB state restores only through the registry's `load_persisted_state` contract, matching every other service.
+
 ### Fixed
 
 - **STS — role trust denies and conditions are enforced** — with `AUTH=true`, `AssumeRole` now rejects matching explicit denies, including `NotAction` exclusions, and evaluates `sts:ExternalId` and `sts:RoleSessionName` conditions before issuing credentials. A denied call registers no session. Local JSON requests use the supplied role ARN for authorization and receive JSON trust-denial errors; Query requests retain XML responses. With `AUTH=false`, trust denies and conditions remain permissive.

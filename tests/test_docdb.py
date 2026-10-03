@@ -1,7 +1,18 @@
+"""
+DocumentDB service integration tests.
+
+Covers the control plane (instances, clusters, snapshots, parameter groups,
+tags, engine catalog) through the boto3 ``docdb`` client. Docker- and pymongo-
+gated smoke tests at the bottom connect to the real ``documentdb-local``
+container; they skip when either optional dependency is missing.
+"""
+import importlib.util
 import time
 
 import pytest
 from botocore.exceptions import ClientError
+
+from ministack.services.documentdb import _docker_image_for_docdb
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -9,8 +20,8 @@ def _docdb_teardown_after_module(docdb):
     """Tear down every DocumentDB resource after this module's tests.
 
     Many control-plane tests create clusters whose first member starts a real
-    mongo container; without this teardown those containers keep running after
-    the session (the server deliberately leaves containers alive across
+    DocumentDB container; without this teardown those containers keep running
+    after the session (the server deliberately leaves containers alive across
     restarts for warm-boot reattachment, so it will not reap them on its own).
     Scoped to the DocumentDB API on purpose — a full ``/_ministack/reset``
     would wipe other services' state mid-session under xdist.
@@ -33,7 +44,7 @@ def _docdb_teardown_after_module(docdb):
                     DBClusterSnapshotIdentifier=snap["DBClusterSnapshotIdentifier"])
             except ClientError:
                 pass
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         pass
 
 
@@ -42,17 +53,19 @@ def _docdb_teardown_after_module(docdb):
 # ---------------------------------------------------------------------------
 
 def _make_cluster(docdb, cluster_id, **kwargs):
-    params = dict(
-        DBClusterIdentifier=cluster_id,
-        Engine="docdb",
-        MasterUsername="root",
-        MasterUserPassword="password123",
-    )
+    """Create a minimal cluster with the given identifier and overrides."""
+    params = {
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "docdb",
+        "MasterUsername": "root",
+        "MasterUserPassword": "password123",
+    }
     params.update(kwargs)
     return docdb.create_db_cluster(**params)["DBCluster"]
 
 
 def test_docdb_create_instance(docdb):
+    """A cluster member instance reports its parent cluster and endpoint."""
     _make_cluster(docdb, "test-docdb-cluster-a")
     docdb.create_db_instance(
         DBInstanceIdentifier="test-docdb",
@@ -70,6 +83,7 @@ def test_docdb_create_instance(docdb):
 
 
 def test_docdb_cluster_member_shares_endpoint(docdb):
+    """Two members alias one endpoint; exactly one member is the writer."""
     _make_cluster(docdb, "member-endpoint-cluster")
     a = docdb.create_db_instance(
         DBInstanceIdentifier="member-a",
@@ -85,7 +99,8 @@ def test_docdb_cluster_member_shares_endpoint(docdb):
     )["DBInstance"]
     assert a["Endpoint"] == b["Endpoint"]
 
-    cluster = docdb.describe_db_clusters(DBClusterIdentifier="member-endpoint-cluster")["DBClusters"][0]
+    cluster = docdb.describe_db_clusters(
+        DBClusterIdentifier="member-endpoint-cluster")["DBClusters"][0]
     members = sorted(m["DBInstanceIdentifier"] for m in cluster["DBClusterMembers"])
     assert members == ["member-a", "member-b"]
     writers = [m for m in cluster["DBClusterMembers"] if m["IsClusterWriter"]]
@@ -94,6 +109,7 @@ def test_docdb_cluster_member_shares_endpoint(docdb):
 
 
 def test_docdb_engines(docdb):
+    """The catalog lists every supported version with its parameter family."""
     resp = docdb.describe_db_engine_versions(Engine="docdb")
     versions = {v["EngineVersion"]: v for v in resp["DBEngineVersions"]}
     assert set(versions) >= {"5.0.0", "8.0.0"}
@@ -103,6 +119,7 @@ def test_docdb_engines(docdb):
 
 
 def test_docdb_unsupported_engine_version_rejected(docdb):
+    """An engine version outside the catalog raises InvalidParameterCombination."""
     with pytest.raises(ClientError) as exc:
         docdb.create_db_cluster(
             DBClusterIdentifier="bad-version-cluster",
@@ -115,6 +132,7 @@ def test_docdb_unsupported_engine_version_rejected(docdb):
 
 
 def test_docdb_delete_instance(docdb):
+    """A deleted instance disappears from DescribeDBInstances."""
     _make_cluster(docdb, "delete-instance-cluster")
     docdb.create_db_instance(
         DBInstanceIdentifier="docdb-del-v2",
@@ -131,6 +149,7 @@ def test_docdb_delete_instance(docdb):
 
 
 def test_docdb_modify_instance(docdb):
+    """ModifyDBInstance applies the new class to the stored record."""
     _make_cluster(docdb, "modify-instance-cluster")
     docdb.create_db_instance(
         DBInstanceIdentifier="docdb-mod-v2",
@@ -148,8 +167,8 @@ def test_docdb_modify_instance(docdb):
 
 
 def test_docdb_deletion_protection(docdb):
-    # Deletion protection is cluster-level on real DocumentDB; instances
-    # inherit it and DeleteDBInstance is refused while it is on.
+    """Deletion protection is cluster-level; DeleteDBInstance is refused."""
+    # See note [1] in the docstring: members inherit the cluster's live flag.
     _make_cluster(docdb, "protected-cluster", DeletionProtection=True)
     docdb.create_db_instance(
         DBInstanceIdentifier="docdb-protected",
@@ -171,6 +190,7 @@ def test_docdb_deletion_protection(docdb):
 
 
 def test_docdb_tags(docdb):
+    """Create-time tags round-trip through add/list/remove tag actions."""
     _make_cluster(docdb, "tag-cluster", Tags=[{"Key": "env", "Value": "dev"}])
     docdb.create_db_instance(
         DBInstanceIdentifier="docdb-tag-v2",
@@ -178,7 +198,8 @@ def test_docdb_tags(docdb):
         Engine="docdb",
         DBClusterIdentifier="tag-cluster",
     )
-    arn = docdb.describe_db_clusters(DBClusterIdentifier="tag-cluster")["DBClusters"][0]["DBClusterArn"]
+    arn = docdb.describe_db_clusters(
+        DBClusterIdentifier="tag-cluster")["DBClusters"][0]["DBClusterArn"]
 
     tags = docdb.list_tags_for_resource(ResourceName=arn)["TagList"]
     assert any(t["Key"] == "env" and t["Value"] == "dev" for t in tags)
@@ -193,7 +214,86 @@ def test_docdb_tags(docdb):
     assert any(t["Key"] == "team" for t in tags3)
 
 
+def test_docdb_tags_unknown_resource_404(docdb):
+    """Unknown ResourceName raises the matching documented fault (404).
+
+    Error codes are per the botocore docdb model: the shape names end in
+    Fault but DBClusterNotFoundFault keeps its name, while the instance and
+    snapshot faults serialize as DBInstanceNotFound / DBSnapshotNotFound.
+    """
+    bad_arn = "arn:aws:rds:us-east-1:000000000000:cluster:no-such-cluster"
+    with pytest.raises(ClientError) as exc:
+        docdb.list_tags_for_resource(ResourceName=bad_arn)
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    with pytest.raises(ClientError) as exc:
+        docdb.add_tags_to_resource(
+            ResourceName=bad_arn, Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+    with pytest.raises(ClientError) as exc:
+        docdb.remove_tags_from_resource(ResourceName=bad_arn, TagKeys=["k"])
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+    bad_db_arn = "arn:aws:rds:us-east-1:000000000000:db:no-such-instance"
+    with pytest.raises(ClientError) as exc:
+        docdb.list_tags_for_resource(ResourceName=bad_db_arn)
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+    bad_snap_arn = "arn:aws:rds:us-east-1:000000000000:cluster-snapshot:no-such-snap"
+    with pytest.raises(ClientError) as exc:
+        docdb.list_tags_for_resource(ResourceName=bad_snap_arn)
+    assert exc.value.response["Error"]["Code"] == "DBSnapshotNotFound"
+
+
+def test_docdb_tags_missing_resource_name(docdb):
+    """Missing ResourceName raises MissingParameter for all three actions."""
+    with pytest.raises(ClientError) as exc:
+        docdb.list_tags_for_resource(ResourceName="")
+    assert exc.value.response["Error"]["Code"] == "MissingParameter"
+
+    with pytest.raises(ClientError) as exc:
+        docdb.add_tags_to_resource(ResourceName="", Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "MissingParameter"
+
+    with pytest.raises(ClientError) as exc:
+        docdb.remove_tags_from_resource(ResourceName="", TagKeys=["k"])
+    assert exc.value.response["Error"]["Code"] == "MissingParameter"
+
+
+def test_docdb_tags_on_subnet_group_and_param_group(docdb):
+    """Group-ARN resolution tags subnet/parameter groups like live resources."""
+    docdb.create_db_subnet_group(
+        DBSubnetGroupName="tag-subnets",
+        DBSubnetGroupDescription="tags test",
+        SubnetIds=["subnet-aaaa", "subnet-bbbb"],
+    )
+    sg_arn = docdb.describe_db_subnet_groups(
+        DBSubnetGroupName="tag-subnets")["DBSubnetGroups"][0]["DBSubnetGroupArn"]
+    docdb.add_tags_to_resource(
+        ResourceName=sg_arn, Tags=[{"Key": "net", "Value": "yes"}])
+    assert docdb.list_tags_for_resource(ResourceName=sg_arn)["TagList"] == [
+        {"Key": "net", "Value": "yes"}]
+    docdb.delete_db_subnet_group(DBSubnetGroupName="tag-subnets")
+
+    docdb.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="tag-pg",
+        DBParameterGroupFamily="docdb5.0",
+        Description="tags test",
+    )
+    pg_arn = docdb.describe_db_cluster_parameter_groups(
+        DBClusterParameterGroupName="tag-pg")["DBClusterParameterGroups"][0][
+        "DBClusterParameterGroupArn"]
+    docdb.add_tags_to_resource(
+        ResourceName=pg_arn, Tags=[{"Key": "cfg", "Value": "yes"}])
+    assert docdb.list_tags_for_resource(ResourceName=pg_arn)["TagList"] == [
+        {"Key": "cfg", "Value": "yes"}]
+    docdb.delete_db_cluster_parameter_group(DBClusterParameterGroupName="tag-pg")
+
+
 def test_docdb_orderable_options(docdb):
+    """Orderable options exist for the requested engine version only."""
     resp = docdb.describe_orderable_db_instance_options(Engine="docdb", EngineVersion="8.0.0")
     options = resp["OrderableDBInstanceOptions"]
     assert options
@@ -205,6 +305,7 @@ def test_docdb_orderable_options(docdb):
 # ---------------------------------------------------------------------------
 
 def test_docdb_cluster_snapshot_crud(docdb):
+    """Cluster snapshots create, list, and delete; duplicates are refused."""
     _make_cluster(docdb, "snapshot-cluster")
 
     snap = docdb.create_db_cluster_snapshot(
@@ -226,7 +327,8 @@ def test_docdb_cluster_snapshot_crud(docdb):
     assert len(desc["DBClusterSnapshots"]) == 1
 
     by_cluster = docdb.describe_db_cluster_snapshots(DBClusterIdentifier="snapshot-cluster")
-    assert any(s["DBClusterSnapshotIdentifier"] == "snap-1" for s in by_cluster["DBClusterSnapshots"])
+    assert any(
+        s["DBClusterSnapshotIdentifier"] == "snap-1" for s in by_cluster["DBClusterSnapshots"])
 
     docdb.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier="snap-1")
     with pytest.raises(ClientError) as exc:
@@ -235,6 +337,7 @@ def test_docdb_cluster_snapshot_crud(docdb):
 
 
 def test_docdb_cluster_snapshot_attributes(docdb):
+    """Snapshot restore attributes add and remove account IDs."""
     _make_cluster(docdb, "attribute-cluster")
     docdb.create_db_cluster_snapshot(
         DBClusterSnapshotIdentifier="snap-attrs",
@@ -243,7 +346,8 @@ def test_docdb_cluster_snapshot_attributes(docdb):
 
     attrs = docdb.describe_db_cluster_snapshot_attributes(DBClusterSnapshotIdentifier="snap-attrs")
     result = attrs["DBClusterSnapshotAttributesResult"]
-    restore = next(a for a in result["DBClusterSnapshotAttributes"] if a["AttributeName"] == "restore")
+    restore = next(
+        a for a in result["DBClusterSnapshotAttributes"] if a["AttributeName"] == "restore")
     assert "000000000000" in restore["AttributeValues"]
 
     mod = docdb.modify_db_cluster_snapshot_attribute(
@@ -278,6 +382,7 @@ def test_docdb_cluster_snapshot_attributes(docdb):
 # ---------------------------------------------------------------------------
 
 def test_docdb_cluster_parameter_group_crud(docdb):
+    """A parameter group creates, describes, and deletes cleanly."""
     docdb.create_db_cluster_parameter_group(
         DBClusterParameterGroupName="pg-crud",
         DBParameterGroupFamily="docdb5.0",
@@ -295,6 +400,7 @@ def test_docdb_cluster_parameter_group_crud(docdb):
 
 
 def test_docdb_cluster_parameters_modify_reset(docdb):
+    """Modified parameters persist; a full reset restores engine defaults."""
     docdb.create_db_cluster_parameter_group(
         DBClusterParameterGroupName="pg-mod",
         DBParameterGroupFamily="docdb8.0",
@@ -330,6 +436,7 @@ def test_docdb_cluster_parameters_modify_reset(docdb):
 # ---------------------------------------------------------------------------
 
 def test_docdb_delete_cluster_refused_while_members_exist(docdb):
+    """DeleteDBCluster is refused until every member is deleted first."""
     _make_cluster(docdb, "occupied-cluster")
     docdb.create_db_instance(
         DBInstanceIdentifier="occupied-member",
@@ -350,6 +457,7 @@ def test_docdb_delete_cluster_refused_while_members_exist(docdb):
 
 
 def test_docdb_failover_rotates_writer(docdb):
+    """Failover promotes the top-tier member; an explicit target wins."""
     _make_cluster(docdb, "failover-cluster")
     docdb.create_db_instance(
         DBInstanceIdentifier="fo-writer",
@@ -394,6 +502,7 @@ def test_docdb_failover_rotates_writer(docdb):
 
 
 def test_docdb_restore_cluster_from_snapshot(docdb):
+    """A restore keeps version, user, and identifiers from the snapshot."""
     src = _make_cluster(
         docdb, "restore-source",
         EngineVersion="8.0.0",
@@ -418,7 +527,9 @@ def test_docdb_restore_cluster_from_snapshot(docdb):
 
 
 def test_docdb_pending_maintenance_actions(docdb):
-    arn = docdb.describe_db_clusters(DBClusterIdentifier="failover-cluster")["DBClusters"][0]["DBClusterArn"]
+    """Applied maintenance actions are listable for the same resource."""
+    arn = docdb.describe_db_clusters(
+        DBClusterIdentifier="failover-cluster")["DBClusters"][0]["DBClusterArn"]
     applied = docdb.apply_pending_maintenance_action(
         ResourceIdentifier=arn,
         ApplyAction="system-update",
@@ -437,6 +548,7 @@ def test_docdb_pending_maintenance_actions(docdb):
 
 
 def test_docdb_describe_certificates_and_events(docdb):
+    """One CA certificate is cataloged; no events are recorded."""
     certs = docdb.describe_certificates()["Certificates"]
     assert len(certs) == 1
     assert certs[0]["CertificateIdentifier"] == "rds-ca-rsa2048-g1"
@@ -450,32 +562,38 @@ def test_docdb_describe_certificates_and_events(docdb):
 # ---------------------------------------------------------------------------
 
 def test_docker_image_for_docdb_versions():
-    from ministack.services.documentdb import _docker_image_for_docdb
-
+    """The image helper returns the documentdb-local config per version."""
     image, env, port, data_path = _docker_image_for_docdb("5.0.0", "root", "secret", "admin")
-    assert image.endswith("mongo:5.0.33")
-    assert env["MONGO_INITDB_ROOT_USERNAME"] == "root"
-    assert env["MONGO_INITDB_ROOT_PASSWORD"] == "secret"
+    assert image.endswith("ghcr.io/documentdb/documentdb/documentdb-local:latest") \
+        or image.endswith("documentdb-local:latest")
+    assert env["USERNAME"] == "root"
+    assert env["PASSWORD"] == "secret"
+    assert env["DOCUMENTDB_PORT"] == "27017"
     assert port == 27017
-    assert data_path == "/data/db"
+    assert data_path == "/data"
 
-    image8, _, _, _ = _docker_image_for_docdb("8.0.0", "root", "secret", "admin")
-    assert image8.endswith("mongo:8.0.29")
+    image8, _, port8, data_path8 = _docker_image_for_docdb("8.0.0", "root", "secret", "admin")
+    assert image8 == image
+    assert port8 == 27017
+    assert data_path8 == "/data"
 
 
-def test_docker_image_for_docdb_unknown_version_falls_back():
-    from ministack.services.documentdb import _docker_image_for_docdb
-
+def test_docker_image_for_docdb_unknown_version_same_image():
+    """An unknown version maps to the one image that backs the catalog."""
+    # See note [1] in the docstring of _docker_image_for_docdb.
     image, _, _, _ = _docker_image_for_docdb("9.9.9", "root", "secret")
-    assert image.endswith("mongo:5.0.33")
+    known, _, _, _ = _docker_image_for_docdb("5.0.0", "root", "secret")
+    assert image == known
 
 
 def test_docker_image_prefix_honored(monkeypatch):
+    """MINISTACK_IMAGE_PREFIX is applied to the image reference."""
     monkeypatch.setenv("MINISTACK_IMAGE_PREFIX", "mirror.example.com/")
-    from ministack.services.documentdb import _docker_image_for_docdb
 
     image, _, _, _ = _docker_image_for_docdb("8.0.0", "root", "secret")
-    assert image == "mirror.example.com/mongo:8.0.29"
+    assert image == (
+        "mirror.example.com/ghcr.io/documentdb/documentdb/documentdb-local:latest"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,19 +602,15 @@ def test_docker_image_prefix_honored(monkeypatch):
 
 def _docker_available():
     try:
-        import docker
+        import docker  # pylint: disable=import-outside-toplevel  # optional-dep probe
         docker.from_env().ping()
         return True
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         return False
 
 
 def _pymongo_available():
-    try:
-        import pymongo
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("pymongo") is not None
 
 
 def test_docdb_pymongo_shared_endpoint(docdb):
@@ -506,7 +620,7 @@ def test_docdb_pymongo_shared_endpoint(docdb):
     if not _docker_available():
         pytest.skip("Docker not available for DocDB container launch")
 
-    import pymongo
+    import pymongo  # pylint: disable=import-outside-toplevel  # imported after skip guards
 
     _make_cluster(docdb, "smoke-cluster")
     for member_id in ("smoke-a", "smoke-b"):
@@ -517,7 +631,7 @@ def test_docdb_pymongo_shared_endpoint(docdb):
             DBClusterIdentifier="smoke-cluster",
         )
 
-    deadline = time.time() + 120
+    deadline = time.time() + 300
     while time.time() < deadline:
         instances = docdb.describe_db_instances(
             Filters=[{"Name": "db-cluster-id", "Values": ["smoke-cluster"]}])["DBInstances"]
@@ -528,7 +642,7 @@ def test_docdb_pymongo_shared_endpoint(docdb):
             break
         time.sleep(2)
     else:
-        raise TimeoutError("DocDB members not available after 120s")
+        raise TimeoutError("DocDB members not available after 300s")
 
     ep_a = next(i["Endpoint"] for i in instances if i["DBInstanceIdentifier"] == "smoke-a")
     ep_b = next(i["Endpoint"] for i in instances if i["DBInstanceIdentifier"] == "smoke-b")
@@ -537,12 +651,12 @@ def test_docdb_pymongo_shared_endpoint(docdb):
     client_a = pymongo.MongoClient(
         ep_a["Address"], int(ep_a["Port"]),
         username="root", password="password123",
-        serverSelectionTimeoutMS=60000, directConnection=True,
+        serverSelectionTimeoutMS=120000, directConnection=True,
     )
     client_b = pymongo.MongoClient(
         ep_b["Address"], int(ep_b["Port"]),
         username="root", password="password123",
-        serverSelectionTimeoutMS=60000, directConnection=True,
+        serverSelectionTimeoutMS=120000, directConnection=True,
     )
     try:
         client_a.smoketest.items.insert_one({"k": 1, "msg": "visible through member B"})
@@ -559,13 +673,15 @@ def test_docdb_pymongo_shared_endpoint(docdb):
 
 
 def test_docdb_pymongo_v8_connects(docdb):
-    """A DocDB 8.0.0 cluster member accepts wire connections (mongo:8.0.29)."""
+    """
+    A DocDB 8.0.0 cluster member accepts wire connections (documentdb-local).
+    """
     if not _pymongo_available():
         pytest.skip("pymongo not installed")
     if not _docker_available():
         pytest.skip("Docker not available for DocDB container launch")
 
-    import pymongo
+    import pymongo  # pylint: disable=import-outside-toplevel  # imported after skip guards
 
     _make_cluster(docdb, "v8-cluster", EngineVersion="8.0.0")
     docdb.create_db_instance(
@@ -593,3 +709,56 @@ def test_docdb_pymongo_v8_connects(docdb):
         client.close()
         docdb.delete_db_instance(DBInstanceIdentifier="v8-member")
         docdb.delete_db_cluster(DBClusterIdentifier="v8-cluster")
+
+
+def test_docdb_pymongo_tls_connects(docdb):
+    """
+    The same endpoint accepts TLS with the container's self-signed cert.
+
+    The documentdb-local gateway always serves TLS; its tlsMode default
+    (allowTLS) accepts plaintext, and clients can also connect explicitly
+    with tls=true. The self-signed certificate requires
+    tlsAllowInvalidCertificates=true.
+    """
+    if not _pymongo_available():
+        pytest.skip("pymongo not installed")
+    if not _docker_available():
+        pytest.skip("Docker not available for DocDB container launch")
+
+    import pymongo  # pylint: disable=import-outside-toplevel  # imported after skip guards
+
+    _make_cluster(docdb, "tls-cluster")
+    docdb.create_db_instance(
+        DBInstanceIdentifier="tls-member",
+        DBInstanceClass="db.t3.medium",
+        Engine="docdb",
+        DBClusterIdentifier="tls-cluster",
+    )
+
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        instances = docdb.describe_db_instances(
+            DBInstanceIdentifier="tls-member")["DBInstances"]
+        if instances and instances[0]["DBInstanceStatus"] == "available":
+            break
+        time.sleep(2)
+    else:
+        raise TimeoutError("DocDB member not available after 300s")
+
+    ep = instances[0]["Endpoint"]
+    client = pymongo.MongoClient(
+        ep["Address"], int(ep["Port"]),
+        username="root", password="password123",
+        serverSelectionTimeoutMS=120000, directConnection=True,
+        tls=True, tlsAllowInvalidCertificates=True,
+    )
+    try:
+        db = client["tlscheck"]
+        coll = db["items"]
+        coll.insert_one({"k": "tls"})
+        found = coll.find_one({"k": "tls"})
+        assert found is not None
+    finally:
+        client.close()
+        docdb.delete_db_instance(DBInstanceIdentifier="tls-member")
+        docdb.delete_db_cluster(DBClusterIdentifier="tls-cluster")

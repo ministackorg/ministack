@@ -1,25 +1,45 @@
+# One file per CONTRIBUTING.md, so pylint's file-shape limits and the
+# defensive Docker-boundary catches are suppressed here only.
+# pylint: disable=too-many-lines,broad-exception-caught,too-many-locals
+# pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 """Amazon DocumentDB (DocDB) service emulator.
 
 Control plane emulated in-process (Query API ``Action=`` form bodies plus
 ``application/x-amz-json-1.*`` JSON bodies for the same actions); data plane is
-real MongoDB — when Docker is available, cluster compute runs in a real
-``mongo`` container and every response endpoint is wire-connectable with
-pymongo or any MongoDB driver. There is no in-process emulation of Mongo
-commands.
+a real DocumentDB engine — when Docker is available, cluster compute runs in
+the official ``documentdb-local`` container (``ghcr.io/documentdb/
+documentdb/documentdb-local:latest``, MIT licensed) and every response
+endpoint is wire-connectable with pymongo or any MongoDB driver. There is no
+in-process emulation of Mongo commands.
+
+The container's gateway always serves TLS (self-signed certificate; connect
+with ``tls=true&tlsAllowInvalidCertificates=true``) but the default
+``tlsMode`` is ``allowTLS``, so plaintext connections are accepted too. The
+gateway additionally accepts plaintext in ``disabled`` mode.
 
 Engine versions (single source of truth: ``DOCDB_ENGINE_VERSIONS``):
-  - 5.0.0 → family ``docdb5.0``, backed by ``mongo:5.0.33``
-  - 8.0.0 → family ``docdb8.0``, backed by ``mongo:8.0.29``
-5.0.0 is the default, matching the AWS SDK default. Images honor
-``MINISTACK_IMAGE_PREFIX``.
+  - 5.0.0 → family ``docdb5.0``
+  - 8.0.0 → family ``docdb8.0``
+Both map to the same backing image — the image tracks DocumentDB releases and
+speaks MongoDB 3.6-8.0 API. 5.0.0 is the default, matching the AWS SDK
+default. Images honor ``MINISTACK_IMAGE_PREFIX``.
 
-Cluster model mirrors RDS/Aurora: one shared mongo container per DB cluster.
-The first member created on a cluster starts it; later members are control-
-plane records aliasing the same endpoint, so data written through one member
-is visible through all members and through both cluster endpoints. Deleting
-the last member removes its container but keeps the named volume (under
-``DOCDB_PERSIST=1``), so a later member restarts onto preserved data; only
-``DeleteDBCluster`` removes container and storage. Standalone instances
+Cold start is slower than mongod: first boot initializes a PostgreSQL data
+directory and the entrypoint can wait up to 600 s, so readiness waits run up
+to 300 s.
+
+Container usernames must not start (case-insensitive) with ``documentdb``,
+``citus``, ``pg`` or ``internal_role`` — the container refuses to come up
+otherwise and the instance ends ``failed``.
+
+Cluster model mirrors RDS/Aurora: one shared DocumentDB container per DB
+cluster. The first member created on a cluster starts it; later members are
+control-plane records aliasing the same endpoint, so data written through one
+member is visible through all members and through both cluster endpoints.
+Deleting the last member removes its container but keeps the named volume
+(under ``DOCDB_PERSIST=1``), so a later member restarts onto preserved data;
+only ``DeleteDBCluster`` removes container and storage. Standalone instances
 (created without ``DBClusterIdentifier`` over raw HTTP) keep their own
 per-instance container.
 
@@ -52,7 +72,7 @@ Env vars: DOCDB_BASE_PORT (default 27117), DOCDB_PERSIST, DOCDB_TMPFS_SIZE,
 DOCKER_NETWORK.
 
 References:
-- AWS DocDB API: https://docs.aws.amazon.com/documentdb/latest/APIReference/API_Operations_Amazon_DocumentDB_with_MongoDB_compatibility.html
+- AWS DocDB API: https://docs.aws.amazon.com/documentdb/latest/APIReference/
 """
 
 import copy
@@ -60,6 +80,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -68,10 +89,11 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
 from ministack.core.concurrency import run_offloop
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _request_account_id,
+    _request_region,
     apply_image_prefix,
     get_account_id,
     get_region,
@@ -106,8 +128,8 @@ _port_counter = [BASE_PORT]
 # DescribePendingMaintenanceActions. In-memory only (not persisted).
 _pending_maintenance_actions: list = []
 
-_docker = None
-_ministack_network = None
+_docker = None  # pylint: disable=invalid-name  # module-level cache placeholder
+_ministack_network = None  # pylint: disable=invalid-name  # module-level cache placeholder
 
 _shared_container_lock = threading.RLock()
 _port_lock = threading.Lock()
@@ -118,7 +140,11 @@ _port_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def get_state():
-    """Return a persistable snapshot of all DocumentDB state.
+    """
+    Return a persistable snapshot of all DocumentDB state.
+
+    [1] Reaches into the scoped-dict ``_data`` maps on purpose: non-restorable
+        Docker container ids must be stripped from the copies.
 
     Returns:
         dict: Store name → record mapping, plus the port counter. Non-
@@ -127,6 +153,7 @@ def get_state():
             to surviving containers and volumes.
     """
     with _shared_container_lock:
+        # See note [1] in the docstring: the strip below is deliberate.
         instances = copy.deepcopy(_instances)
         clusters = copy.deepcopy(_clusters)
         state = {
@@ -139,24 +166,28 @@ def get_state():
             "tags": copy.deepcopy(_tags),
             "port_counter": _port_counter[0],
         }
-    for key in list(instances._data):
-        instances._data[key].pop("_docker_container_id", None)
-    for key in list(clusters._data):
-        clusters._data[key].pop("_shared_container_id", None)
+    for key in list(instances._data):  # pylint: disable=protected-access  # see note [1]
+        instances._data[key].pop("_docker_container_id", None)  # pylint: disable=protected-access  # see note [1]
+    for key in list(clusters._data):  # pylint: disable=protected-access  # see note [1]
+        clusters._data[key].pop("_shared_container_id", None)  # pylint: disable=protected-access  # see note [1]
     return state
 
 
-def restore_state(data):
-    """Load persisted state and respawn backing containers.
+def load_persisted_state(data):
+    """
+    Load persisted state and respawn backing containers.
 
     Instances and clusters come back marked ``creating`` while daemon threads
-    restart their mongo containers (reusing persisted host ports when still
-    free), then flip to ``available`` once TCP-ready. Stopped resources stay
-    stopped. Accepts the current ``(account, region, key)``-keyed layout plus
-    older account-scoped and plain-dict layouts defensively.
+    restart their DocumentDB containers (reusing persisted host ports when
+    still free), then flip to ``available`` once TCP-ready. Stopped resources
+    stay stopped. Accepts the current ``(account, region, key)``-keyed layout
+    plus older account-scoped and plain-dict layouts defensively.
 
-    Args:
-        data: Persisted payload produced by :func:`get_state`; may be empty.
+    [1] Reaches into the scoped-dict ``_data`` map on purpose: the three
+        persisted layouts are keyed differently and need record rewrites in
+        place.
+
+    :param data: Persisted payload produced by :func:`get_state`; may be empty.
     """
     if not data:
         return
@@ -169,7 +200,7 @@ def restore_state(data):
         cluster["_shared_container_ready"] = False
         if DOCDB_PERSIST:
             cluster.setdefault("_shared_volume_name", _cluster_volume_name(cluster_id))
-        _clusters._data[key] = cluster
+        _clusters._data[key] = cluster  # pylint: disable=protected-access  # see note [1]
 
     _subnet_groups.update(data.get("subnet_groups", {}))
     _snapshots.update(data.get("snapshots", {}))
@@ -189,23 +220,21 @@ def restore_state(data):
             inst["DBInstanceStatus"] = "creating"
             if DOCDB_PERSIST:
                 inst.setdefault("_docker_volume_name", _instance_volume_name(db_id))
-            _instances._data[(account_id, region, db_id)] = inst
+            _instances._data[(account_id, region, db_id)] = inst  # pylint: disable=protected-access  # see note [1]
             to_respawn.append((account_id, region, db_id, inst))
     elif hasattr(instances_data, "_data"):
         # Legacy account-scoped layout: (account_id, instance_id) keys.
-        for key, inst in instances_data._data.items():
+        for key, inst in instances_data._data.items():  # pylint: disable=protected-access  # see note [1]
             account_id, db_id = key
             region = _record_region(inst)
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
-            _instances._data[(account_id, region, db_id)] = inst
+            _instances._data[(account_id, region, db_id)] = inst  # pylint: disable=protected-access  # see note [1]
             to_respawn.append((account_id, region, db_id, inst))
     else:
         # Legacy plain-dict layout: name → record.
-        from ministack.core.responses import get_account_id as _acct
-
         for name, inst in instances_data.items():
-            account_id = (_record_account(inst) or _acct())
+            account_id = (_record_account(inst) or get_account_id())
             region = _record_region(inst)
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
@@ -242,7 +271,9 @@ def restore_state(data):
 
 
 def _record_region(record):
-    """Best-effort region from an ``arn:aws:rds:<region>:...`` record field."""
+    """
+    Store region from an ``arn:aws:rds:<region>:...`` record field.
+    """
     for field in ("DBInstanceArn", "DBClusterArn"):
         parts = (record.get(field) or "").split(":")
         if len(parts) > 3 and parts[3]:
@@ -251,7 +282,9 @@ def _record_region(record):
 
 
 def _record_account(record):
-    """Best-effort account id from an ARN-shaped record field."""
+    """
+    Store account id from an ARN-shaped record field.
+    """
     for field in ("DBInstanceArn", "DBClusterArn"):
         parts = (record.get(field) or "").split(":")
         if len(parts) > 4 and parts[4]:
@@ -260,13 +293,12 @@ def _record_account(record):
 
 
 def _respawn_cluster_members(account_id, region, cluster_id, members):
-    """Restart one cluster's shared container after a warm boot.
+    """
+    Restart one cluster's shared container after a warm boot.
 
     Reuses the persisted host port when it is free, waits for TCP readiness on
     the chosen address, then publishes every member ``available``.
     """
-    from ministack.core.responses import _request_account_id, _request_region
-
     if account_id:
         _request_account_id.set(account_id)
     if region:
@@ -287,7 +319,8 @@ def _respawn_cluster_members(account_id, region, cluster_id, members):
     result = {"started": False, "failed": False}
     with _shared_container_lock:
         current = _clusters.get_scoped(account_id, region, cluster_id)
-        if current is not cluster or int(cluster.get("_shared_container_epoch", 0)) != restore_epoch:
+        epoch_now = int(cluster.get("_shared_container_epoch", 0))
+        if current is not cluster or epoch_now != restore_epoch:
             return
         if docker_client:
             if cluster.get("_shared_container_id"):
@@ -323,9 +356,9 @@ def _respawn_cluster_members(account_id, region, cluster_id, members):
 
 
 def _respawn_standalone_instance(account_id, region, db_id, instance):
-    """Restart one standalone instance's own container after a warm boot."""
-    from ministack.core.responses import _request_account_id, _request_region
-
+    """
+    Restart one standalone instance's own container after a warm boot.
+    """
     if account_id:
         _request_account_id.set(account_id)
     if region:
@@ -346,7 +379,7 @@ def _respawn_standalone_instance(account_id, region, db_id, instance):
     if not _is_host_port_free(host_port):
         host_port = _next_port()
     volume_name = instance.get("_docker_volume_name") if DOCDB_PERSIST else None
-    started = _launch_mongo_container(
+    started = _launch_documentdb_container(
         f"ministack-docdb-{db_id}",
         image, env, host_port, container_port, data_path,
         labels={
@@ -373,7 +406,9 @@ def _respawn_standalone_instance(account_id, region, db_id, instance):
 
 
 def _readiness_target(cluster, start_result):
-    """Pick the host:port to probe for a freshly (re)started shared container."""
+    """
+    Pick the host:port to probe for a freshly (re)started shared container.
+    """
     if start_result.get("readiness_port"):
         return start_result.get("readiness_host"), start_result.get("readiness_port")
     endpoint = cluster.get("_shared_endpoint") or {}
@@ -387,11 +422,13 @@ def _readiness_target(cluster, start_result):
 # ---------------------------------------------------------------------------
 
 def _get_docker():
-    """Return a cached Docker client, or None when Docker is unavailable."""
-    global _docker
+    """
+    Return a cached Docker client, or None when Docker is unavailable.
+    """
+    global _docker  # pylint: disable=global-statement  # module-level client cache
     if _docker is None:
         try:
-            import docker
+            import docker  # pylint: disable=import-outside-toplevel  # optional [full] dep
             _docker = docker.from_env()
         except Exception:
             pass
@@ -399,8 +436,10 @@ def _get_docker():
 
 
 def _get_ministack_network(docker_client):
-    """Detect the Docker network MiniStack itself runs on (if containerised)."""
-    global _ministack_network
+    """
+    Detect the Docker network MiniStack itself runs on (if containerized).
+    """
+    global _ministack_network  # pylint: disable=global-statement  # module-level network cache
     if _ministack_network is not None:
         return _ministack_network or None
     if DOCKER_NETWORK:
@@ -420,8 +459,15 @@ def _get_ministack_network(docker_client):
     return None
 
 
-def _wait_for_port(host, port, timeout=60):
-    """Block until a TCP connection to host:port succeeds."""
+def _wait_for_port(host, port, timeout=300):
+    """
+    Block until a TCP connection to host:port succeeds.
+
+    Defaults to 300 s: the DocumentDB container initializes a PostgreSQL data
+    directory on a cold volume and its entrypoint can wait minutes for the
+    database, so mongod-style 60 s timeouts stop short. The gateway's listener
+    accepts TCP in every ``tlsMode``, so TCP probing stays valid.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -433,7 +479,9 @@ def _wait_for_port(host, port, timeout=60):
 
 
 def _is_host_port_free(port):
-    """True when no listener currently holds the given localhost port."""
+    """
+    True when no listener currently holds the given localhost port.
+    """
     try:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
             return False
@@ -442,7 +490,9 @@ def _is_host_port_free(port):
 
 
 def _next_port():
-    """Allocate the next host port for published containers."""
+    """
+    Allocate the next host port for published containers.
+    """
     with _port_lock:
         port = _port_counter[0]
         _port_counter[0] += 1
@@ -450,23 +500,38 @@ def _next_port():
 
 
 def _cluster_docker_name(cluster_id):
-    """Stable Docker container name for a cluster's shared mongo container."""
+    """
+    Get
+    s the Docker container name for a cluster's shared DocumentDB contain
+    er.
+    """
     return f"ministack-docdb-cluster-{cluster_id}"
 
 
 def _cluster_volume_name(cluster_id):
-    """Stable Docker volume name for a cluster's persistent storage."""
+    """
+    Gets the Docker volume name for a cluster's persistent storage.
+    """
     return f"ministack-docdb-cluster-{cluster_id}-data"
 
 
 def _instance_volume_name(db_id):
-    """Stable Docker volume name for a standalone instance's storage."""
+    """
+    Gets the Docker volume name for a standalone instance's storage.
+    """
     return f"ministack-docdb-{db_id}-data"
 
 
-def _launch_mongo_container(name, image, env, host_port, container_port, data_path,
-                            labels, volume_name=None):
-    """Run one mongo container and derive its endpoint addresses.
+def _launch_documentdb_container(name,
+                                 image,
+                                 env,
+                                 host_port,
+                                 container_port,
+                                 data_path,
+                                 labels,
+                                 volume_name=None):
+    """
+    Run one DocumentDB container and derive its endpoint addresses.
 
     Returns:
         tuple: ``(container_id, internal_address, internal_port,
@@ -478,14 +543,14 @@ def _launch_mongo_container(name, image, env, host_port, container_port, data_pa
     if not docker_client:
         return None
     ms_network = _get_ministack_network(docker_client)
-    kwargs = dict(
-        image=image,
-        detach=True,
-        environment=env,
-        ports={f"{container_port}/tcp": host_port},
-        name=name,
-        labels=labels,
-    )
+    kwargs = {
+        "image": image,
+        "detach": True,
+        "environment": env,
+        "ports": {f"{container_port}/tcp": host_port},
+        "name": name,
+        "labels": labels,
+    }
     if ms_network:
         kwargs["network"] = ms_network
     if volume_name:
@@ -513,7 +578,9 @@ def _launch_mongo_container(name, image, env, host_port, container_port, data_pa
 
 
 def _remove_stale_owned_container(docker_client, name):
-    """Remove a leftover same-name container only when our labels prove ownership."""
+    """
+    Remove a leftover same-name container only when our labels prove ownership.
+    """
     try:
         stale = docker_client.containers.get(name)
     except Exception:
@@ -531,15 +598,15 @@ def _remove_stale_owned_container(docker_client, name):
 # ---------------------------------------------------------------------------
 
 def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
-    """Start (or recreate) the single mongo container owned by a DocDB cluster.
+    """
+    Start (or recreate) the single DocumentDB container owned by a DocDB cluster.
 
     Cluster members are control-plane records that all point at this
     container's endpoint. Shared by first-member creation and warm boot.
 
-    Args:
-        cluster_id: Cluster identifier; also names the container and volume.
-        cluster: Cluster record; updated in place with ``_shared_*`` fields.
-        remove_stale: Remove an existing same-name container first.
+    :param cluster_id: Cluster identifier; also names the container and volume.
+    :param cluster: Cluster record; updated in place with ``_shared_*`` fields.
+    :param remove_stale: Remove an existing same-name container first.
 
     Returns:
         dict: ``started`` / ``failed`` flags plus readiness host/port.
@@ -550,6 +617,9 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     db_name = cluster.get("DatabaseName") or "admin"
 
     def _fallback_endpoint():
+        """
+        Returns default endpoint if needed.
+        """
         return {
             "Address": "localhost",
             "Port": int(cluster.get("Port") or 27017),
@@ -578,7 +648,8 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     host_port = cluster.get("_shared_host_port") or _next_port()
     if not _is_host_port_free(host_port):
         logger.info(
-            "docdb: persisted shared host port %d for cluster %s is in use; allocating a fresh port",
+            "docdb: persisted shared host port %d for cluster %s is in use; "
+            "allocating a fresh port",
             host_port, cluster_id,
         )
         host_port = _next_port()
@@ -589,7 +660,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         cluster["_shared_volume_name"] = volume_name
         cluster["_shared_storage_initialized"] = True
 
-    started = _launch_mongo_container(
+    started = _launch_documentdb_container(
         container_name,
         image, env, host_port, container_port, data_path,
         labels={
@@ -632,7 +703,9 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
 
 
 def _restart_cluster_shared_container(cluster_id, cluster):
-    """Start a preserved (stopped) shared container without recreating it."""
+    """
+    Start a preserved (stopped) shared container without recreating it.
+    """
     docker_client = _get_docker()
     container_id = cluster.get("_shared_container_id")
     if not docker_client or not container_id:
@@ -643,7 +716,8 @@ def _restart_cluster_shared_container(cluster_id, cluster):
         container.reload()
     except Exception as e:
         cluster["_shared_container_ready"] = False
-        logger.warning("docdb: failed to restart shared container for cluster %s: %s", cluster_id, e)
+        logger.warning(
+            "docdb: failed to restart shared container for cluster %s: %s", cluster_id, e)
         return {"started": False, "failed": True, "readiness_host": None, "readiness_port": None}
 
     ms_network = _get_ministack_network(docker_client)
@@ -684,7 +758,9 @@ def _restart_cluster_shared_container(cluster_id, cluster):
 
 
 def _stop_cluster_shared_container(cluster_id, cluster):
-    """Stop a cluster's shared mongo container, preserving it and its volume."""
+    """
+    Stop a cluster's shared DocumentDB container, preserving it and its volume.
+    """
     docker_client = _get_docker()
     container_id = cluster.get("_shared_container_id")
     if not docker_client or not container_id:
@@ -702,7 +778,8 @@ def _stop_cluster_shared_container(cluster_id, cluster):
 
 
 def _remove_cluster_shared_resources(cluster_id, cluster, timeout=5):
-    """Stop and remove a cluster's shared container and its named volume.
+    """
+    Stop and remove a cluster's shared container and its named volume.
 
     Called by ``DeleteDBCluster`` and ``reset``; the last place cluster-owned
     storage can be reclaimed.
@@ -729,7 +806,9 @@ def _remove_cluster_shared_resources(cluster_id, cluster, timeout=5):
 
 
 def _attach_instance_to_shared_cluster(instance, cluster):
-    """Point a member instance's endpoint at the cluster's shared container."""
+    """
+    Point a member instance's endpoint at the cluster's shared container.
+    """
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
         return
@@ -738,14 +817,17 @@ def _attach_instance_to_shared_cluster(instance, cluster):
     instance["_internal_address"] = cluster.get("_shared_internal_address")
     instance["_internal_port"] = cluster.get("_shared_internal_port")
     instance["_shared_cluster_id"] = cluster["DBClusterIdentifier"]
-    instance["MasterUsername"] = cluster.get("MasterUsername", instance.get("MasterUsername", "root"))
+    instance["MasterUsername"] = cluster.get(
+        "MasterUsername", instance.get("MasterUsername", "root"))
     instance["_MasterUserPassword"] = cluster.get(
         "_MasterUserPassword", instance.get("_MasterUserPassword", "password"),
     )
 
 
 def _sync_cluster_endpoints(cluster):
-    """Publish the shared container's endpoint as the cluster Endpoint/Port."""
+    """
+    Publish the shared container's endpoint as the cluster Endpoint/Port.
+    """
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
         return
@@ -754,7 +836,8 @@ def _sync_cluster_endpoints(cluster):
 
 
 def _register_instance_in_cluster(instance):
-    """Append the instance to its parent cluster's ``DBClusterMembers``.
+    """
+    Append the instance to its parent cluster's ``DBClusterMembers``.
 
     The first member becomes the writer; subsequent members register as
     readers with their ``PromotionTier``.
@@ -777,7 +860,9 @@ def _register_instance_in_cluster(instance):
 
 
 def _unregister_instance_from_clusters(db_id):
-    """Remove an instance from any cluster member list it belongs to."""
+    """
+    Remove an instance from any cluster member list it belongs to.
+    """
     for cluster in _clusters.values():
         mem = cluster.get("DBClusterMembers") or []
         remaining = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
@@ -800,7 +885,9 @@ def _unregister_instance_from_clusters(db_id):
 
 
 def _teardown_cluster_compute(cluster):
-    """Clear a cluster's live-compute fields after its container went away."""
+    """
+    Clear a cluster's live-compute fields after its container went away.
+    """
     cluster["_shared_container_id"] = None
     cluster["_shared_container_ready"] = True
     cluster["_shared_endpoint"] = None
@@ -812,13 +899,16 @@ def _teardown_cluster_compute(cluster):
 # Engine versions & Docker images
 # ---------------------------------------------------------------------------
 
-def _default_engine_version(engine):
-    """Return the default DocumentDB engine version (5.0.0, per AWS SDK)."""
+def _default_engine_version(engine):  # pylint: disable=unused-argument  # RDS parity
+    """
+    Return the default DocumentDB engine version (5.0.0, per AWS SDK).
+    """
     return DEFAULT_ENGINE_VERSION
 
 
 def _engine_version_error(engine_version):
-    """Build an InvalidParameterCombination error for unsupported versions.
+    """
+    Build an InvalidParameterCombination error for unsupported versions.
 
     Returns:
         tuple | None: Error response, or None when the version is cataloged.
@@ -834,36 +924,40 @@ def _engine_version_error(engine_version):
     )
 
 
-def _docker_image_for_docdb(engine_version, user, password, db_name=""):
-    """Map a DocumentDB engine version to its wire-compatible mongo image.
+def _docker_image_for_docdb(engine_version, user, password, db_name=""):  # pylint: disable=unused-argument  # tuple contract kept
+    """
+    Return the DocumentDB container configuration for any engine version.
 
-    DocDB 5.0 ↔ mongo:5.0.33 and DocDB 8.0 ↔ mongo:8.0.29 are wire-compatible with
-    their Mongo majors; unknown majors fall back to mongo:5.0.33 with a warning.
-    Honors MINISTACK_IMAGE_PREFIX via :func:`apply_image_prefix`.
+    Every cataloged version runs the official ``documentdb-local`` image (MIT;
+    it tracks DocumentDB releases and speaks MongoDB 3.6 - 8.0 API), so one image
+    backs engine versions 5.0.0 and 8.0.0. Engine-version validation is the
+    control plane's job (:func:`_engine_version_error`), so unknown versions
+    return the same image without a warning. Honors ``MINISTACK_IMAGE_PREFIX``
+    via :func:`apply_image_prefix`.
 
-    Args:
-        engine_version: Requested DocumentDB engine version string.
-        user: Root username injected via MONGO_INITDB_ROOT_USERNAME.
-        password: Root password injected via MONGO_INITDB_ROOT_PASSWORD.
-        db_name: Ignored; clients ``use <db>`` after connecting.
+    :param engine_version: Requested DocDB engine version (not for image selection).
+    :param user: Master username injected via the container's ``USERNAME`` env
+            (the container refuses names starting with ``documentdb``,
+            ``citus``, ``pg`` or ``internal_role``).
+    :param password: Master password injected via the container's ``PASSWORD`` env.
+    :param db_name: Ignored; clients ``use <db>`` after connecting.
 
     Returns:
-        tuple: ``(image, env_dict, container_port, data_path)``.
+        tuple: ``(image, env_dict, container_port, data_path)``. The container
+        serves the MongoDB wire protocol on port 27017 (``DOCUMENTDB_PORT``);
+        data lives under ``/data`` (``DATA_PATH``).
     """
-    major = str(engine_version or "").split(".")[0]
-    images = {"5": "mongo:5.0.33", "8": "mongo:8.0.29"}
-    image = images.get(major)
-    if image is None:
-        logger.warning(
-            "docdb: unsupported engine version %s; falling back to mongo:5.0.33",
-            engine_version,
-        )
-        image = "mongo:5.0.33"
     env = {
-        "MONGO_INITDB_ROOT_USERNAME": user,
-        "MONGO_INITDB_ROOT_PASSWORD": password,
+        "USERNAME": user,
+        "PASSWORD": password,
+        "DOCUMENTDB_PORT": "27017",
     }
-    return apply_image_prefix(image), env, 27017, "/data/db"
+    return (
+        apply_image_prefix("ghcr.io/documentdb/documentdb/documentdb-local:latest"),
+        env,
+        27017,
+        "/data",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +965,9 @@ def _docker_image_for_docdb(engine_version, user, password, db_name=""):
 # ---------------------------------------------------------------------------
 
 def _json_key_to_query_param_name(key):
-    """Map JSON / Smithy body keys to Query-API parameter names."""
+    """
+    Map JSON / Smithy body keys to Query-API parameter names.
+    """
     lk = key.lower()
     if lk == "dbinstanceidentifier":
         return "DBInstanceIdentifier"
@@ -883,7 +979,9 @@ def _json_key_to_query_param_name(key):
 
 
 def _flatten_json_request_params(params, data):
-    """Merge SigV4 JSON (``application/x-amz-json-1.*``) bodies into query-style params."""
+    """
+    Merge SigV4 JSON (``application/x-amz-json-1.*``) bodies into query-style params.
+    """
     if not isinstance(data, dict):
         return
     for key, val in data.items():
@@ -910,7 +1008,9 @@ def _flatten_json_request_params(params, data):
 
 
 def _parse_request_params(body, headers, query_params):
-    """Merge query-string, form-encoded, and JSON-body parameters into one map."""
+    """
+    Merge query-string, form-encoded, and JSON-body parameters into one map.
+    """
     params = dict(query_params)
     if not body:
         return params
@@ -932,20 +1032,20 @@ def _parse_request_params(body, headers, query_params):
     return params
 
 
-async def handle_request(method, path, headers, body, query_params):
-    """Dispatch a DocumentDB request off the event loop.
+async def handle_request(method, path, headers, body, query_params):  # pylint: disable=unused-argument  # fixed service contract
+    """
+    Dispatch a DocumentDB request off the event loop.
 
     Handler paths reach the Docker daemon (container create/start/stop), which
     blocks for as long as the daemon takes; like rds.py this must not hold the
     event loop. The containers started here never call back into MiniStack, so
     the shared non-reentrant pool is safe.
 
-    Args:
-        method: HTTP method.
-        path: Request path (ignored; Query API lives on POST /).
-        headers: Lower-cased request headers.
-        body: Raw request body bytes.
-        query_params: Parsed query string ({name: [values]}).
+    :param method: HTTP method.
+    :param path: Request path (ignored; Query API lives on POST /).
+    :param headers: Lower-cased request headers.
+    :param body: Raw request body bytes.
+    :param query_params: Parsed query string ({name: [values]}).
 
     Returns:
         tuple: ``(status, headers, body)`` XML response.
@@ -955,7 +1055,9 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def _handle_request_sync(headers, params):
-    """Resolve the requested action and invoke its handler synchronously."""
+    """
+    Resolve the requested action and invoke its handler synchronously.
+    """
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
@@ -972,15 +1074,15 @@ def _handle_request_sync(headers, params):
 # ---------------------------------------------------------------------------
 
 def _create_db_instance(params):
-    """Create a DB instance, optionally as a member of a DB cluster.
+    """
+    Create a DB instance, optionally as a member of a DB cluster.
 
-    Members alias the parent cluster's shared mongo container; the first
+    Members alias the parent cluster's shared DocumentDB container; the first
     member starts it. Instances created without ``DBClusterIdentifier`` (raw
     HTTP callers only — the boto3 client requires a cluster) run their own
     per-instance container.
 
-    Args:
-        params: Merged query/form/JSON request parameters.
+    :param params: Merged query/form/JSON request parameters.
 
     Returns:
         tuple: XML CreateDBInstanceResponse with the instance record.
@@ -1008,7 +1110,8 @@ def _create_db_instance(params):
             "EngineVersion"
         ) or _default_engine_version(engine)
     else:
-        engine_version = _evaluate_params(params, "EngineVersion") or _default_engine_version(engine)
+        engine_version = _evaluate_params(params, "EngineVersion") \
+            or _default_engine_version(engine)
     version_error = _engine_version_error(engine_version)
     if version_error:
         return version_error
@@ -1060,7 +1163,7 @@ def _create_db_instance(params):
             for sg in _parse_member_list(params, "VpcSecurityGroupIds")
         ],
         "DBParameterGroups": [{
-            "DBParameterGroupName": f"default.docdb{str(engine_version).split('.')[0]}",
+            "DBParameterGroupName": f"default.docdb{str(engine_version).split('.', maxsplit=1)[0]}",
             "ParameterApplyStatus": "in-sync",
         }],
         "AvailabilityZone": _evaluate_params(params, "AvailabilityZone") or f"{get_region()}a",
@@ -1070,9 +1173,12 @@ def _create_db_instance(params):
             "SubnetGroupStatus": "Complete",
             "Subnets": [],
             "VpcId": "vpc-00000000",
-            "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{subnet_group_name}",
+            "DBSubnetGroupArn": (
+            f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{subnet_group_name}"),
         }),
-        "PreferredMaintenanceWindow": _evaluate_params(params, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "PreferredMaintenanceWindow": (
+            _evaluate_params(params, "PreferredMaintenanceWindow")
+            or "sun:05:00-sun:06:00"),
         "PendingModifiedValues": {},
         "LatestRestorableTime": _format_time(now_ts),
         "MultiAZ": _evaluate_params(params, "MultiAZ") == "true",
@@ -1082,7 +1188,9 @@ def _create_db_instance(params):
         "ReadReplicaDBClusterIdentifiers": [],
         "ReplicaMode": "",
         "LicenseModel": "docdb",
-        "Iops": int(_evaluate_params(params, "Iops") or "0") if _evaluate_params(params, "Iops") else None,
+        "Iops": (
+            int(_evaluate_params(params, "Iops") or "0")
+            if _evaluate_params(params, "Iops") else None),
         "OptionGroupMemberships": [],
         "CharacterSetName": "",
         "NcharCharacterSetName": "",
@@ -1105,7 +1213,8 @@ def _create_db_instance(params):
         "PromotionTier": int(_evaluate_params(params, "PromotionTier") or "1"),
         "DBInstanceArn": arn,
         "Timezone": "",
-        "IAMDatabaseAuthenticationEnabled": _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true",
+        "IAMDatabaseAuthenticationEnabled": (
+            _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true"),
         "PerformanceInsightsEnabled": False,
         "PerformanceInsightsKMSKeyId": "",
         "PerformanceInsightsRetentionPeriod": 7,
@@ -1113,7 +1222,8 @@ def _create_db_instance(params):
         "ProcessorFeatures": [],
         "DeletionProtection": deletion_protection,
         "AssociatedRoles": [],
-        "MaxAllocatedStorage": int(_evaluate_params(params, "MaxAllocatedStorage") or str(allocated_storage)),
+        "MaxAllocatedStorage": int(
+            _evaluate_params(params, "MaxAllocatedStorage") or str(allocated_storage)),
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
@@ -1155,7 +1265,8 @@ def _create_db_instance(params):
 
 
 def _ensure_cluster_compute(cluster):
-    """Guarantee a running shared container behind a cluster before use.
+    """
+    Guarantee a running shared container behind a cluster before use.
 
     Restarts the preserved container when present, otherwise starts a fresh
     one (removing any stale same-name leftover we own).
@@ -1171,7 +1282,8 @@ def _ensure_cluster_compute(cluster):
 
 
 def _start_instance_container(db_id, instance):
-    """Start the per-instance mongo container backing a standalone instance.
+    """
+    Start the per-instance DocumentDB container backing a standalone instance.
 
     No-op without Docker: the record keeps its placeholder localhost endpoint.
     """
@@ -1186,7 +1298,7 @@ def _start_instance_container(db_id, instance):
     )
     host_port = _next_port()
     volume_name = _instance_volume_name(db_id) if DOCDB_PERSIST else None
-    started = _launch_mongo_container(
+    started = _launch_documentdb_container(
         f"ministack-docdb-{db_id}",
         image, env, host_port, container_port, data_path,
         labels={
@@ -1208,31 +1320,36 @@ def _start_instance_container(db_id, instance):
         "_host_port": host_port,
         "Endpoint": {"Address": ep_addr, "Port": ep_port, "HostedZoneId": "Z2R2ITUGPM61AM"},
     })
-    _log_readiness_async(internal_addr or "127.0.0.1", internal_port or host_port, f"instance {db_id}")
+    _log_readiness_async(
+        internal_addr or "127.0.0.1", internal_port or host_port, f"instance {db_id}")
 
 
 def _log_readiness_async(host, port, label):
-    """Spawn a daemon thread that waits for the port and logs readiness."""
+    """
+    Spawn a daemon thread that waits for the port and logs readiness.
+    """
     def _bg_wait(h=host, p=int(port or 0), lbl=label):
         if not p:
             return
         if _wait_for_port(h, p):
-            logger.info("docdb: mongo container for %s ready at %s:%s", lbl, h, p)
+            logger.info("docdb: DocumentDB container for %s ready at %s:%s", lbl, h, p)
         else:
-            logger.warning("docdb: mongo container for %s at %s:%s not ready after timeout", lbl, h, p)
+            logger.warning(
+                "docdb: DocumentDB container for %s at %s:%s not ready after timeout",
+                lbl, h, p)
 
     threading.Thread(target=_bg_wait, daemon=True).start()
 
 
 def _delete_db_instance(params):
-    """Delete a DB instance and release its backing compute.
+    """
+    elete a DB instance and release its backing compute.
 
     Member deletion unregisters the instance from its cluster; removing the
     final member stops the shared container but keeps its volume. Deletion
     protection is honored before any state changes.
 
-    Args:
-        params: Request parameters (DBInstanceIdentifier required).
+    :param params: Request parameters (DBInstanceIdentifier required).
 
     Returns:
         tuple: XML DeleteDBInstanceResponse with the deleted instance record.
@@ -1283,7 +1400,9 @@ def _delete_db_instance(params):
 
 
 def _will_be_last_member(cluster_id, db_id):
-    """True when deleting db_id would leave its parent cluster with no members."""
+    """
+    True when deleting db_id would leave its parent cluster with no members.
+    """
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return False
@@ -1293,7 +1412,9 @@ def _will_be_last_member(cluster_id, db_id):
 
 
 def _remove_instance_container(db_id, instance):
-    """Stop and remove the container owned by a standalone instance."""
+    """
+    Stop and remove the container owned by a standalone instance.
+    """
     container_id = instance.get("_docker_container_id")
     if not container_id:
         return
@@ -1310,7 +1431,9 @@ def _remove_instance_container(db_id, instance):
 
 
 def _log_readiness_teardown(cluster_id):
-    """Log that the last member of a cluster went away (compute taken down)."""
+    """
+    Log that the last member of a cluster went away (compute taken down).
+    """
     logger.info(
         "docdb: last member of cluster %s deleted; shared container stopped "
         "(volume retained until DeleteDBCluster)", cluster_id,
@@ -1318,7 +1441,9 @@ def _log_readiness_teardown(cluster_id):
 
 
 def _describe_db_instances(params):
-    """Describe DB instances, optionally filtered by identifier or Filters."""
+    """
+    Describe DB instances, optionally filtered by identifier or Filters.
+    """
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     if db_id:
         instance = _resolve_instance(db_id)
@@ -1333,19 +1458,20 @@ def _describe_db_instances(params):
 
     members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances)
     return _xml(200, "DescribeDBInstancesResponse",
-                f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
+                f"<DescribeDBInstancesResult><DBInstances>{members}"
+                f"</DBInstances></DescribeDBInstancesResult>")
 
 
 def _modify_db_instance(params):
-    """Apply modifyable fields to a DB instance directly (no pending staging).
+    """
+    Apply modifyable fields to a DB instance directly (no pending staging).
 
     Accepted: DBInstanceClass, AllocatedStorage, EngineVersion, MasterUserPassword,
     DeletionProtection, BackupRetentionPeriod, PreferredMaintenanceWindow,
     MultiAZ, AutoMinorVersionUpgrade, CopyTagsToSnapshot. ApplyImmediately is
     accepted for SDK compatibility; changes always apply immediately.
 
-    Args:
-        params: Request parameters (DBInstanceIdentifier required).
+    :param params: Request parameters (DBInstanceIdentifier required).
 
     Returns:
         tuple: XML ModifyDBInstanceResponse with the updated record.
@@ -1366,7 +1492,7 @@ def _modify_db_instance(params):
             return version_error
         instance["EngineVersion"] = new_version
         instance["DBParameterGroups"] = [{
-            "DBParameterGroupName": f"default.docdb{str(new_version).split('.')[0]}",
+            "DBParameterGroupName": f"default.docdb{str(new_version).split('.', maxsplit=1)[0]}",
             "ParameterApplyStatus": "in-sync",
         }]
     simple_fields = (
@@ -1386,8 +1512,10 @@ def _modify_db_instance(params):
     return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
 
 
-def _coerce_scalar(field, value, current):
-    """Cast a request string to the stored field's existing type when known."""
+def _coerce_scalar(field, value, current):  # pylint: disable=unused-argument  # field kept for call-site readability
+    """
+    Cast a request string to the stored field's existing type when known.
+    """
     if isinstance(current, bool):
         return str(value).lower() == "true"
     if isinstance(current, int) and not isinstance(current, bool):
@@ -1399,7 +1527,9 @@ def _coerce_scalar(field, value, current):
 
 
 def _start_db_instance(params):
-    """Mark a DB instance available (metadata-only; compute is always up)."""
+    """
+    Mark a DB instance available (metadata-only; compute is always up).
+    """
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
@@ -1409,7 +1539,9 @@ def _start_db_instance(params):
 
 
 def _stop_db_instance(params):
-    """Mark a DB instance stopped (control-plane status only)."""
+    """
+    Mark a DB instance stopped (control-plane status only).
+    """
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
@@ -1419,7 +1551,9 @@ def _stop_db_instance(params):
 
 
 def _reboot_db_instance(params):
-    """Reboot a DB instance (status returns to available immediately)."""
+    """
+    Reboot a DB instance (status returns to available immediately).
+    """
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
@@ -1433,10 +1567,10 @@ def _reboot_db_instance(params):
 # ---------------------------------------------------------------------------
 
 def _create_db_cluster(params):
-    """Create a DB cluster record; compute starts with its first member.
+    """
+    Create a DB cluster record; compute starts with its first member.
 
-    Args:
-        params: Request parameters (DBClusterIdentifier required).
+    :param params: Request parameters (DBClusterIdentifier required).
 
     Returns:
         tuple: XML CreateDBClusterResponse with the cluster record.
@@ -1449,10 +1583,12 @@ def _create_db_cluster(params):
     if not cluster_id:
         return _error("MissingParameter", "DBClusterIdentifier is required", 400)
     if cluster_id in _clusters:
-        return _error("DBClusterAlreadyExistsFault", f"DB cluster {cluster_id} already exists.", 400)
+        return _error(
+            "DBClusterAlreadyExistsFault", f"DB cluster {cluster_id} already exists.", 400)
 
     engine = "docdb"
-    engine_version = _evaluate_params(params, "EngineVersion") or _default_engine_version(engine)
+    engine_version = _evaluate_params(params, "EngineVersion") \
+        or _default_engine_version(engine)
     version_error = _engine_version_error(engine_version)
     if version_error:
         return version_error
@@ -1479,9 +1615,13 @@ def _create_db_cluster(params):
         "_MasterUserPassword": master_pass,
         "DatabaseName": _evaluate_params(params, "DatabaseName") or None,
         "NetworkType": _evaluate_params(params, "NetworkType") or "IPV4",
-        "EngineLifecycleSupport": _evaluate_params(params, "EngineLifecycleSupport") or "open-source-rds-extended-support",
-        "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
-        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
+        "EngineLifecycleSupport": (
+            _evaluate_params(params, "EngineLifecycleSupport")
+            or "open-source-rds-extended-support"),
+        "Endpoint": (
+            f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com"),
+        "ReaderEndpoint": (
+            f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com"),
         "Port": port,
         "MultiAZ": _evaluate_params(params, "MultiAZ") == "true",
         "AvailabilityZones": az_list,
@@ -1491,17 +1631,21 @@ def _create_db_cluster(params):
             for sg in _parse_member_list(params, "VpcSecurityGroupIds")
         ],
         "DBSubnetGroup": _evaluate_params(params, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _evaluate_params(params, "DBClusterParameterGroupName") or "default.docdb",
+        "DBClusterParameterGroup": (
+            _evaluate_params(params, "DBClusterParameterGroupName") or "default.docdb"),
         "BackupRetentionPeriod": int(_evaluate_params(params, "BackupRetentionPeriod") or "1"),
         "PreferredBackupWindow": _evaluate_params(params, "PreferredBackupWindow") or "03:00-04:00",
-        "PreferredMaintenanceWindow": _evaluate_params(params, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "PreferredMaintenanceWindow": (
+            _evaluate_params(params, "PreferredMaintenanceWindow")
+            or "sun:05:00-sun:06:00"),
         "ClusterCreateTime": _format_time(now_ts),
         "EarliestRestorableTime": _format_time(now_ts),
         "LatestRestorableTime": _format_time(now_ts),
         "StorageEncrypted": _evaluate_params(params, "StorageEncrypted") == "true",
         "KmsKeyId": _evaluate_params(params, "KmsKeyId") or "",
         "DeletionProtection": _evaluate_params(params, "DeletionProtection") == "true",
-        "IAMDatabaseAuthenticationEnabled": _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true",
+        "IAMDatabaseAuthenticationEnabled": (
+            _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true"),
         "EnabledCloudwatchLogsExports": [],
         "HttpEndpointEnabled": _evaluate_params(params, "EnableHttpEndpoint") == "true",
         "CopyTagsToSnapshot": _evaluate_params(params, "CopyTagsToSnapshot") == "true",
@@ -1529,18 +1673,19 @@ def _create_db_cluster(params):
         cluster["TagList"] = req_tags
 
     return _xml(200, "CreateDBClusterResponse",
-                f"<CreateDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></CreateDBClusterResult>")
+                f"<CreateDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></CreateDBClusterResult>")
 
 
 def _delete_db_cluster(params):
-    """Delete a DB cluster along with its shared container and volume.
+    """
+    Delete a DB cluster along with its shared container and volume.
 
     Refuses while instances remain attached, mirroring AWS ordering (delete
     the members first); an empty cluster's compute and storage are always
     removed.
 
-    Args:
-        params: Request parameters (DBClusterIdentifier required).
+    :param params: Request parameters (DBClusterIdentifier required).
 
     Returns:
         tuple: XML DeleteDBClusterResponse with the deleted cluster record.
@@ -1574,11 +1719,14 @@ def _delete_db_cluster(params):
     _tags.pop(cluster["DBClusterArn"], None)
     del _clusters[cluster_id]
     return _xml(200, "DeleteDBClusterResponse",
-                f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
+                f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></DeleteDBClusterResult>")
 
 
 def _describe_db_clusters(params):
-    """Describe DB clusters, optionally filtered by identifier or Filters."""
+    """
+    Describe DB clusters, optionally filtered by identifier or Filters.
+    """
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     if cluster_id:
         cluster = _clusters.get(cluster_id)
@@ -1593,11 +1741,14 @@ def _describe_db_clusters(params):
 
     members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
     return _xml(200, "DescribeDBClustersResponse",
-                f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+                f"<DescribeDBClustersResult><DBClusters>{members}"
+                f"</DBClusters></DescribeDBClustersResult>")
 
 
 def _modify_db_cluster(params):
-    """Modify cluster settings; MasterUserPassword also rotates container creds."""
+    """
+    Modify cluster settings; MasterUserPassword also rotates container creds.
+    """
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
@@ -1614,11 +1765,13 @@ def _modify_db_cluster(params):
     if _evaluate_params(params, "PreferredBackupWindow"):
         cluster["PreferredBackupWindow"] = _evaluate_params(params, "PreferredBackupWindow")
     if _evaluate_params(params, "PreferredMaintenanceWindow"):
-        cluster["PreferredMaintenanceWindow"] = _evaluate_params(params, "PreferredMaintenanceWindow")
+        cluster["PreferredMaintenanceWindow"] = _evaluate_params(
+            params, "PreferredMaintenanceWindow")
     if _evaluate_params(params, "DeletionProtection"):
         cluster["DeletionProtection"] = _evaluate_params(params, "DeletionProtection") == "true"
     if _evaluate_params(params, "EnableIAMDatabaseAuthentication"):
-        cluster["IAMDatabaseAuthenticationEnabled"] = _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true"
+        cluster["IAMDatabaseAuthenticationEnabled"] = (
+            _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true")
     if _evaluate_params(params, "EnableHttpEndpoint"):
         cluster["HttpEndpointEnabled"] = _evaluate_params(params, "EnableHttpEndpoint") == "true"
     if _evaluate_params(params, "CopyTagsToSnapshot"):
@@ -1631,11 +1784,14 @@ def _modify_db_cluster(params):
         ]
 
     return _xml(200, "ModifyDBClusterResponse",
-                f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
+                f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></ModifyDBClusterResult>")
 
 
 def _start_db_cluster(params):
-    """Start a stopped cluster's compute (restart/recreate the container)."""
+    """
+    Start a stopped cluster's compute (restart/recreate the container).
+    """
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
@@ -1643,13 +1799,15 @@ def _start_db_cluster(params):
     if cluster.get("Status") != "stopped":
         return _error(
             "InvalidDBClusterStateFault",
-            f"DbCluster {cluster_id} is in {cluster.get('Status')} state but expected it to be one of stopped.",
+            f"DbCluster {cluster_id} is in {cluster.get('Status')} state but "
+            "expected it to be one of stopped.",
             400,
         )
 
     members = _cluster_member_instances(cluster)
     had_compute = bool(cluster.get("_shared_container_id"))
-    has_storage = bool(cluster.get("_shared_storage_initialized") or cluster.get("_shared_volume_name"))
+    has_storage = bool(
+        cluster.get("_shared_storage_initialized") or cluster.get("_shared_volume_name"))
     docker_client = _get_docker()
 
     if not docker_client or not (had_compute or has_storage):
@@ -1659,7 +1817,8 @@ def _start_db_cluster(params):
         for member in members:
             member["DBInstanceStatus"] = "available"
         return _xml(200, "StartDBClusterResponse",
-                    f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
+                    f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                    f"</DBCluster></StartDBClusterResult>")
 
     if had_compute:
         result = _restart_cluster_shared_container(cluster_id, cluster)
@@ -1670,7 +1829,8 @@ def _start_db_cluster(params):
 
     if not result.get("started") and result.get("failed"):
         # Compute did not come back; keep everything stopped so Start can retry.
-        return _error("InternalFailure", f"Failed to start compute for DB cluster {cluster_id}.", 500)
+        return _error(
+            "InternalFailure", f"Failed to start compute for DB cluster {cluster_id}.", 500)
 
     if result.get("started"):
         readiness_host = result.get("readiness_host") or "127.0.0.1"
@@ -1684,11 +1844,14 @@ def _start_db_cluster(params):
     for member in members:
         member["DBInstanceStatus"] = status
     return _xml(200, "StartDBClusterResponse",
-                f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
+                f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></StartDBClusterResult>")
 
 
 def _stop_db_cluster(params):
-    """Stop a cluster's shared mongo container, preserving it and its volume."""
+    """
+    Stop a cluster's shared DocumentDB container, preserving it and its volume.
+    """
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:
@@ -1696,7 +1859,8 @@ def _stop_db_cluster(params):
     if cluster.get("Status") != "available":
         return _error(
             "InvalidDBClusterStateFault",
-            f"DbCluster {cluster_id} is in {cluster.get('Status')} state but expected it to be one of available.",
+            f"DbCluster {cluster_id} is in {cluster.get('Status')} state but "
+            "expected it to be one of available.",
             400,
         )
     _stop_cluster_shared_container(cluster_id, cluster)
@@ -1705,17 +1869,18 @@ def _stop_db_cluster(params):
     for member in _cluster_member_instances(cluster):
         member["DBInstanceStatus"] = "stopped"
     return _xml(200, "StopDBClusterResponse",
-                f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
+                f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></StopDBClusterResult>")
 
 
 def _failover_db_cluster(params):
-    """Rotate IsClusterWriter to the next member (lowest PromotionTier).
+    """
+    Rotate IsClusterWriter to the next member (lowest PromotionTier).
 
     Endpoints stay unchanged, matching real DocDB where cluster endpoints are
     stable across failover. Zero-member clusters succeed as a no-op.
 
-    Args:
-        params: Request parameters; TargetDBInstanceIdentifier optional.
+    :param params: Request parameters; TargetDBInstanceIdentifier optional.
 
     Returns:
         tuple: XML FailoverDBClusterResponse reporting transitional status
@@ -1756,7 +1921,8 @@ def _failover_db_cluster(params):
     response_cluster = copy.deepcopy(cluster)
     response_cluster["Status"] = "failing-over"
     return _xml(200, "FailoverDBClusterResponse",
-                f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}</DBCluster></FailoverDBClusterResult>")
+                f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}"
+                f"</DBCluster></FailoverDBClusterResult>")
 
 
 def _restore_db_cluster_from_snapshot(params):
@@ -1764,9 +1930,7 @@ def _restore_db_cluster_from_snapshot(params):
 
     Snapshots are metadata-only (configuration + tags, no data dump), so the
     restored cluster comes up empty against fresh storage.
-
-    Args:
-        params: Request parameters (DBClusterIdentifier, Engine,
+    :param params: Request parameters (DBClusterIdentifier, Engine,
             SnapshotIdentifier required).
 
     Returns:
@@ -1781,14 +1945,16 @@ def _restore_db_cluster_from_snapshot(params):
     if not cluster_id:
         return _error("MissingParameter", "DBClusterIdentifier is required", 400)
     if cluster_id in _clusters:
-        return _error("DBClusterAlreadyExistsFault", f"DB cluster {cluster_id} already exists.", 400)
+        return _error(
+            "DBClusterAlreadyExistsFault", f"DB cluster {cluster_id} already exists.", 400)
 
     snap_id = _evaluate_params(params, "SnapshotIdentifier")
     snapshot = _db_cluster_snapshots.get(snap_id) if snap_id else None
     if not snapshot:
         return _error(
             "DBClusterSnapshotNotFoundFault",
-            f"DBClusterSnapshot {snap_id} not found." if snap_id else "SnapshotIdentifier is required",
+            f"DBClusterSnapshot {snap_id} not found."
+            if snap_id else "SnapshotIdentifier is required",
             404 if snap_id else 400,
         )
 
@@ -1818,18 +1984,23 @@ def _restore_db_cluster_from_snapshot(params):
         "DatabaseName": None,
         "NetworkType": _evaluate_params(params, "NetworkType") or "IPV4",
         "EngineLifecycleSupport": "open-source-rds-extended-support",
-        "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
-        "ReaderEndpoint": f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com",
+        "Endpoint": (
+            f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.docdb.amazonaws.com"),
+        "ReaderEndpoint": (
+            f"{cluster_id}.cluster-ro-{unique_suffix}.{get_region()}.docdb.amazonaws.com"),
         "Port": int(_evaluate_params(params, "Port") or snapshot.get("Port") or "27017"),
         "MultiAZ": False,
-        "AvailabilityZones": _parse_member_list(params, "AvailabilityZones") or snapshot.get("AvailabilityZones", []),
+        "AvailabilityZones": (
+            _parse_member_list(params, "AvailabilityZones")
+            or snapshot.get("AvailabilityZones", [])),
         "DBClusterMembers": [],
         "VpcSecurityGroups": [
             {"VpcSecurityGroupId": sg, "Status": "active"}
             for sg in _parse_member_list(params, "VpcSecurityGroupIds")
         ],
         "DBSubnetGroup": _evaluate_params(params, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _evaluate_params(params, "DBClusterParameterGroupName") or "default.docdb",
+        "DBClusterParameterGroup": (
+            _evaluate_params(params, "DBClusterParameterGroupName") or "default.docdb"),
         "BackupRetentionPeriod": 1,
         "PreferredBackupWindow": "03:00-04:00",
         "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
@@ -1867,7 +2038,8 @@ def _restore_db_cluster_from_snapshot(params):
         cluster["TagList"] = req_tags
 
     return _xml(200, "RestoreDBClusterFromSnapshotResponse",
-                f"<RestoreDBClusterFromSnapshotResult><DBCluster>{_cluster_xml(cluster)}</DBCluster>"
+                f"<RestoreDBClusterFromSnapshotResult>"
+                f"<DBCluster>{_cluster_xml(cluster)}</DBCluster>"
                 f"</RestoreDBClusterFromSnapshotResult>")
 
 
@@ -1876,7 +2048,9 @@ def _restore_db_cluster_from_snapshot(params):
 # ---------------------------------------------------------------------------
 
 def _create_snapshot_internal(snap_id, instance):
-    """Record an instance snapshot copying the instance's configuration."""
+    """
+    Record an instance snapshot copying the instance's configuration.
+    """
     if snap_id in _snapshots:
         return None
     now_ts = time.time()
@@ -1902,7 +2076,8 @@ def _create_snapshot_internal(snap_id, instance):
         "StorageEncrypted": instance.get("StorageEncrypted", False),
         "KmsKeyId": instance.get("KmsKeyId", ""),
         "Encrypted": instance.get("StorageEncrypted", False),
-        "IAMDatabaseAuthenticationEnabled": instance.get("IAMDatabaseAuthenticationEnabled", False),
+        "IAMDatabaseAuthenticationEnabled": instance.get(
+            "IAMDatabaseAuthenticationEnabled", False),
         "PercentProgress": 100,
         "DbiResourceId": instance.get("DbiResourceId", ""),
         "TagList": list(instance.get("TagList", [])) if instance.get("CopyTagsToSnapshot") else [],
@@ -1914,10 +2089,10 @@ def _create_snapshot_internal(snap_id, instance):
 
 
 def _create_db_snapshot(params):
-    """Create a manual snapshot of a DB instance (metadata-only).
+    """
+    Create a manual snapshot of a DB instance (metadata-only).
 
-    Args:
-        params: Request parameters (DBSnapshotIdentifier, DBInstanceIdentifier).
+    :param params: Request parameters (DBSnapshotIdentifier, DBInstanceIdentifier).
 
     Returns:
         tuple: XML CreateDBSnapshotResponse with the snapshot record.
@@ -1947,11 +2122,14 @@ def _create_db_snapshot(params):
         _tags[arn] = req_tags
         snap["TagList"] = req_tags
     return _xml(200, "CreateDBSnapshotResponse",
-                f"<CreateDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></CreateDBSnapshotResult>")
+                f"<CreateDBSnapshotResult>"
+                f"<DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></CreateDBSnapshotResult>")
 
 
 def _describe_db_snapshots(params):
-    """Describe instance snapshots, optionally filtered or listed by source."""
+    """
+    Describe instance snapshots, optionally filtered or listed by source.
+    """
     snap_id = _evaluate_params(params, "DBSnapshotIdentifier")
     if snap_id:
         snap = _snapshots.get(snap_id)
@@ -1966,11 +2144,13 @@ def _describe_db_snapshots(params):
 
     members = "".join(f"<DBSnapshot>{_snapshot_xml(s)}</DBSnapshot>" for s in snaps)
     return _xml(200, "DescribeDBSnapshotsResponse",
-                f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots></DescribeDBSnapshotsResult>")
+                f"<DescribeDBSnapshotsResult><DBSnapshots>{members}"
+                f"</DBSnapshots></DescribeDBSnapshotsResult>")
 
 
 def _delete_db_snapshot(params):
-    """Delete an instance snapshot and its tags.
+    """
+    Delete an instance snapshot and its tags.
 
     Raises:
         DBSnapshotNotFound: Unknown snapshot identifier (404).
@@ -1982,7 +2162,8 @@ def _delete_db_snapshot(params):
     _tags.pop(snap.get("DBSnapshotArn", ""), None)
     snap["Status"] = "deleted"
     return _xml(200, "DeleteDBSnapshotResponse",
-                f"<DeleteDBSnapshotResult><DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></DeleteDBSnapshotResult>")
+                f"<DeleteDBSnapshotResult>"
+                f"<DBSnapshot>{_snapshot_xml(snap)}</DBSnapshot></DeleteDBSnapshotResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -1990,13 +2171,13 @@ def _delete_db_snapshot(params):
 # ---------------------------------------------------------------------------
 
 def _create_db_cluster_snapshot(params):
-    """Create a manual snapshot of a DB cluster (metadata-only).
+    """
+    Create a manual snapshot of a DB cluster (metadata-only).
 
     Records the cluster configuration, tags (honoring CopyTagsToSnapshot),
     and the restore attribute defaults; contains no database dump.
 
-    Args:
-        params: Request parameters (DBClusterSnapshotIdentifier,
+    :param params: Request parameters (DBClusterSnapshotIdentifier,
             DBClusterIdentifier required).
 
     Returns:
@@ -2060,11 +2241,14 @@ def _create_db_cluster_snapshot(params):
 
     return _xml(200, "CreateDBClusterSnapshotResponse",
                 "<CreateDBClusterSnapshotResult><DBClusterSnapshot>"
-                f"{_cluster_snapshot_xml(snap)}</DBClusterSnapshot></CreateDBClusterSnapshotResult>")
+                f"{_cluster_snapshot_xml(snap)}"
+                "</DBClusterSnapshot></CreateDBClusterSnapshotResult>")
 
 
 def _describe_db_cluster_snapshots(params):
-    """Describe cluster snapshots, optionally filtered by snapshot or cluster."""
+    """
+    Describe cluster snapshots, optionally filtered by snapshot or cluster.
+    """
     snap_id = _evaluate_params(params, "DBClusterSnapshotIdentifier")
     if snap_id:
         snap = _db_cluster_snapshots.get(snap_id)
@@ -2084,14 +2268,16 @@ def _describe_db_cluster_snapshots(params):
         if snap_type:
             snaps = [s for s in snaps if s.get("SnapshotType") == snap_type]
 
-    members = "".join(f"<DBClusterSnapshot>{_cluster_snapshot_xml(s)}</DBClusterSnapshot>" for s in snaps)
+    members = "".join(
+        f"<DBClusterSnapshot>{_cluster_snapshot_xml(s)}</DBClusterSnapshot>" for s in snaps)
     return _xml(200, "DescribeDBClusterSnapshotsResponse",
                 "<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>"
                 f"{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
 
 
 def _delete_db_cluster_snapshot(params):
-    """Delete a cluster snapshot and its tags.
+    """
+    Delete a cluster snapshot and its tags.
 
     Raises:
         DBClusterSnapshotNotFoundFault: Unknown snapshot identifier (404).
@@ -2108,11 +2294,14 @@ def _delete_db_cluster_snapshot(params):
     snap["Status"] = "deleted"
     return _xml(200, "DeleteDBClusterSnapshotResponse",
                 "<DeleteDBClusterSnapshotResult><DBClusterSnapshot>"
-                f"{_cluster_snapshot_xml(snap)}</DBClusterSnapshot></DeleteDBClusterSnapshotResult>")
+                f"{_cluster_snapshot_xml(snap)}"
+                "</DBClusterSnapshot></DeleteDBClusterSnapshotResult>")
 
 
 def _describe_db_cluster_snapshot_attributes(params):
-    """Return a cluster snapshot's share/restore attribute values."""
+    """
+    Return a cluster snapshot's share/restore attribute values.
+    """
     snap = _resolve_cluster_snapshot(params)
     if isinstance(snap, tuple):
         return snap
@@ -2123,10 +2312,10 @@ def _describe_db_cluster_snapshot_attributes(params):
 
 
 def _modify_db_cluster_snapshot_attribute(params):
-    """Add or remove values for a cluster snapshot attribute (share/restore).
+    """
+    Add or remove values for a cluster snapshot attribute (share/restore).
 
-    Args:
-        params: Request parameters; AttributeName (default ``restore``),
+    :param params: Request parameters; AttributeName (default ``restore``),
             ValuesToAdd / ValuesToRemove lists of account ids.
 
     Returns:
@@ -2154,7 +2343,9 @@ def _modify_db_cluster_snapshot_attribute(params):
 
 
 def _resolve_cluster_snapshot(params):
-    """Fetch the snapshot named by DBClusterSnapshotIdentifier or an error tuple."""
+    """
+    Fetch the snapshot named by DBClusterSnapshotIdentifier or an error tuple.
+    """
     snap_id = _evaluate_params(params, "DBClusterSnapshotIdentifier")
     snap = _db_cluster_snapshots.get(snap_id)
     if not snap:
@@ -2167,7 +2358,8 @@ def _resolve_cluster_snapshot(params):
 
 
 def _snapshot_attributes_response(root_tag, result_tag, snap):
-    """Render a snapshot-attribute response document.
+    """
+    Render a snapshot-attribute response document.
 
     The service model nests a ``DBClusterSnapshotAttributesResult`` element
     inside the action's ``*Result`` wrapper.
@@ -2183,7 +2375,8 @@ def _snapshot_attributes_response(root_tag, result_tag, snap):
                 f"<{result_tag}><DBClusterSnapshotAttributesResult>"
                 f"<DBClusterSnapshotIdentifier>{snap['DBClusterSnapshotIdentifier']}"
                 f"</DBClusterSnapshotIdentifier><DBClusterSnapshotAttributes>{attrs_xml}"
-                f"</DBClusterSnapshotAttributes></DBClusterSnapshotAttributesResult></{result_tag}>")
+                f"</DBClusterSnapshotAttributes></DBClusterSnapshotAttributesResult>"
+                f"</{result_tag}>")
 
 
 # ---------------------------------------------------------------------------
@@ -2193,7 +2386,8 @@ def _snapshot_attributes_response(root_tag, result_tag, snap):
 # Minimal plausible DocumentDB cluster-parameter catalog, applied to every
 # family (docdb5.0 / docdb8.0): (name, default, description, type, apply type).
 _CLUSTER_PARAMETER_DEFAULTS = [
-    ("audit_logs", "disabled", "Which audit logs to export to CloudWatch Logs.", "string", "dynamic"),
+    ("audit_logs", "disabled", "Which audit logs to export to CloudWatch Logs.",
+     "string", "dynamic"),
     ("change_stream_log_retention_duration", "10800",
      "How long change stream events are retained, in seconds.", "string", "dynamic"),
     ("profiler", "disabled", "Database profiler mode (off, slow_ops, all).", "string", "dynamic"),
@@ -2202,12 +2396,15 @@ _CLUSTER_PARAMETER_DEFAULTS = [
     ("profiler_sampling_rate", "500",
      "Fraction of slow operations sampled, in milliseconds.", "integer", "dynamic"),
     ("tls", "enabled", "Whether TLS is required for connections.", "string", "static"),
-    ("ttl_monitor_enabled", "true", "Whether the TTL monitor deletes expired documents.", "boolean", "dynamic"),
+    ("ttl_monitor_enabled", "true",
+     "Whether the TTL monitor deletes expired documents.", "boolean", "dynamic"),
 ]
 
 
-def _default_parameters_for_family(family):
-    """Build default parameter records for a docdb parameter-group family."""
+def _default_parameters_for_family(family):  # pylint: disable=unused-argument  # catalog may grow per family
+    """
+    Build default parameter records for a docdb parameter-group family.
+    """
     return [
         {
             "name": name,
@@ -2221,7 +2418,8 @@ def _default_parameters_for_family(family):
 
 
 def _create_db_cluster_parameter_group(params):
-    """Create an empty DB cluster parameter group for a given family.
+    """
+    Create an empty DB cluster parameter group for a given family.
 
     Raises:
         DBParameterGroupAlreadyExistsFault: Same-name group exists (400).
@@ -2261,7 +2459,9 @@ def _create_db_cluster_parameter_group(params):
 
 
 def _describe_db_cluster_parameter_groups(params):
-    """Describe cluster parameter groups, optionally filtered by name."""
+    """
+    Describe cluster parameter groups, optionally filtered by name.
+    """
     name = _evaluate_params(params, "DBClusterParameterGroupName")
     if name:
         pg = _db_cluster_param_groups.get(name)
@@ -2272,19 +2472,29 @@ def _describe_db_cluster_parameter_groups(params):
     else:
         groups = list(_db_cluster_param_groups.values())
 
-    members = "".join(f"""<DBClusterParameterGroup>
-        <DBClusterParameterGroupName>{g['DBClusterParameterGroupName']}</DBClusterParameterGroupName>
-        <DBParameterGroupFamily>{g['DBParameterGroupFamily']}</DBParameterGroupFamily>
-        <Description>{_esc(g['Description'])}</Description>
-        <DBClusterParameterGroupArn>{g.get('DBClusterParameterGroupArn', '')}</DBClusterParameterGroupArn>
-    </DBClusterParameterGroup>""" for g in groups)
+    members = "".join(_cluster_parameter_group_xml(g) for g in groups)
     return _xml(200, "DescribeDBClusterParameterGroupsResponse",
                 "<DescribeDBClusterParameterGroupsResult><DBClusterParameterGroups>"
                 f"{members}</DBClusterParameterGroups></DescribeDBClusterParameterGroupsResult>")
 
 
+def _cluster_parameter_group_xml(g):
+    """
+    Render one cluster parameter group dict to XML fields.
+    """
+    name = g["DBClusterParameterGroupName"]
+    arn = g.get("DBClusterParameterGroupArn", "")
+    return f"""<DBClusterParameterGroup>
+        <DBClusterParameterGroupName>{name}</DBClusterParameterGroupName>
+        <DBParameterGroupFamily>{g['DBParameterGroupFamily']}</DBParameterGroupFamily>
+        <Description>{_esc(g['Description'])}</Description>
+        <DBClusterParameterGroupArn>{arn}</DBClusterParameterGroupArn>
+    </DBClusterParameterGroup>"""
+
+
 def _delete_db_cluster_parameter_group(params):
-    """Delete a cluster parameter group and its tags.
+    """
+    Delete a cluster parameter group and its tags.
 
     Raises:
         DBParameterGroupNotFound: Unknown group name (404).
@@ -2299,7 +2509,9 @@ def _delete_db_cluster_parameter_group(params):
 
 
 def _modify_db_cluster_parameter_group(params):
-    """Store submitted parameters on a group; status reports ``in-sync``."""
+    """
+    Store submitted parameters on a group; status reports ``in-sync``.
+    """
     pg = _resolve_cluster_param_group(params)
     if isinstance(pg, tuple):
         return pg
@@ -2320,7 +2532,9 @@ def _modify_db_cluster_parameter_group(params):
 
 
 def _reset_db_cluster_parameter_group(params):
-    """Reset some or all parameters of a group back to engine defaults."""
+    """
+    Reset some or all parameters of a group back to engine defaults.
+    """
     pg = _resolve_cluster_param_group(params)
     if isinstance(pg, tuple):
         return pg
@@ -2350,7 +2564,8 @@ def _reset_db_cluster_parameter_group(params):
 
 
 def _describe_db_cluster_parameters(params):
-    """Describe a group's parameters: engine defaults overlaid with overrides.
+    """
+    Describe a group's parameters: engine defaults overlaid with overrides.
 
     Supports the Source filter (``engine-default`` / ``user``).
 
@@ -2368,7 +2583,9 @@ def _describe_db_cluster_parameters(params):
 
 
 def _resolve_cluster_param_group(params):
-    """Fetch the parameter group named in the request, or an error tuple."""
+    """
+    Fetch the parameter group named in the request, or an error tuple.
+    """
     name = _evaluate_params(params, "DBClusterParameterGroupName")
     pg = _db_cluster_param_groups.get(name)
     if not pg:
@@ -2378,7 +2595,9 @@ def _resolve_cluster_param_group(params):
 
 
 def _parameter_member_prefix(params, prefix="Parameters"):
-    """Handle both Query API and botocore/SFN parameter-list serialization."""
+    """
+    Handle both Query API and botocore/SFN parameter-list serialization.
+    """
     query_prefix = f"{prefix}.member"
     if _evaluate_params(params, f"{query_prefix}.1.ParameterName"):
         return query_prefix
@@ -2386,7 +2605,9 @@ def _parameter_member_prefix(params, prefix="Parameters"):
 
 
 def _cluster_parameters_xml(pg, source_filter):
-    """Render a group's parameter records (defaults merged with overrides)."""
+    """
+    Render a group's parameter records (defaults merged with overrides).
+    """
     defaults = _default_parameters_for_family(pg.get("DBParameterGroupFamily", ""))
     custom = pg.get("Parameters", {})
     default_names = {p["name"] for p in defaults}
@@ -2420,7 +2641,9 @@ def _cluster_parameters_xml(pg, source_filter):
 
 
 def _cluster_parameter_xml(name, value, source, apply_method, spec):
-    """Render one Parameter record; ``spec`` carries default metadata or None."""
+    """
+    Render one Parameter record; ``spec`` carries default metadata or None.
+    """
     description = spec["description"] if spec else ""
     data_type = spec["data_type"] if spec else "string"
     apply_type = spec["apply_type"] if spec else "dynamic"
@@ -2441,7 +2664,9 @@ def _cluster_parameter_xml(name, value, source, apply_method, spec):
 # ---------------------------------------------------------------------------
 
 def _create_subnet_group(params):
-    """Create a DB subnet group listing VPC subnets for cluster placement."""
+    """
+    Create a DB subnet group listing VPC subnets for cluster placement.
+    """
     name = _evaluate_params(params, "DBSubnetGroupName")
     if not name:
         return _error("MissingParameter", "DBSubnetGroupName is required", 400)
@@ -2473,7 +2698,8 @@ def _create_subnet_group(params):
 
 
 def _delete_subnet_group(params):
-    """Delete a DB subnet group and its tags.
+    """
+    Delete a DB subnet group and its tags.
 
     Raises:
         DBSubnetGroupNotFoundFault: Unknown group name (404).
@@ -2487,7 +2713,9 @@ def _delete_subnet_group(params):
 
 
 def _describe_subnet_groups(params):
-    """Describe DB subnet groups, optionally filtered by name."""
+    """
+    Describe DB subnet groups, optionally filtered by name.
+    """
     name = _evaluate_params(params, "DBSubnetGroupName")
     if name:
         sg = _subnet_groups.get(name)
@@ -2507,13 +2735,71 @@ def _describe_subnet_groups(params):
 # Tags
 # ---------------------------------------------------------------------------
 
+def _tags_resource_not_found(arn):
+    """
+    Build the documented not-found fault for an unknown tags target ARN.
+
+    Resolves ``ResourceName`` against live records: cluster ARN, instance ARN,
+    cluster-snapshot ARN, legacy snapshot ARN, subnet-group ARN and cluster
+    parameter-group ARN. Returns the matching fault per the API Reference —
+    ``DBClusterNotFoundFault``, ``DBInstanceNotFound`` and
+    ``DBSnapshotNotFound`` are documented for the tags actions;
+    ``DBSubnetGroupNotFoundFault`` and ``DBParameterGroupNotFound`` reuse each
+    group handler's existing fault code (inference: the model does not list
+    them for the tags actions).
+    """
+    for cl in _clusters.values():
+        if cl.get("DBClusterArn") == arn:
+            return None
+    for inst in _instances.values():
+        if inst.get("DBInstanceArn") == arn:
+            return None
+    for snap in _snapshots.values():
+        if snap.get("DBSnapshotArn") == arn:
+            return None
+    for csnap in _db_cluster_snapshots.values():
+        if csnap.get("DBClusterSnapshotArn") == arn:
+            return None
+    for sg in _subnet_groups.values():
+        if sg.get("DBSubnetGroupArn") == arn:
+            return None
+    for pg in _db_cluster_param_groups.values():
+        if pg.get("DBClusterParameterGroupArn") == arn:
+            return None
+    parts = arn.split(":")
+    kind = parts[5] if len(parts) >= 7 and parts[0] == "arn" else ""
+    if kind == "db":
+        return _error("DBInstanceNotFound", f"DBInstance {arn} not found.", 404)
+    if kind in ("snapshot", "cluster-snapshot"):
+        return _error("DBSnapshotNotFound", f"DBSnapshot {arn} not found.", 404)
+    if kind == "subgrp":
+        return _error(
+            "DBSubnetGroupNotFoundFault", f"Subnet group {arn} not found.", 404)
+    if kind in ("cluster-pg", "pg"):
+        return _error(
+            "DBParameterGroupNotFound",
+            f"DB cluster parameter group {arn} not found.",
+            404,
+        )
+    return _error("DBClusterNotFoundFault", f"DBCluster {arn} not found.", 404)
+
+
 def _add_tags(params):
-    """Add or overwrite tags on a resource identified by ARN."""
+    """
+    Add or overwrite tags on a resource identified by ARN.
+
+    Raises:
+        DBClusterNotFoundFault | DBInstanceNotFound | DBSnapshotNotFound:
+            Unknown ResourceName (404).
+    """
     arn = _evaluate_params(params, "ResourceName")
-    new_tags = _parse_tags(params)
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    not_found = _tags_resource_not_found(arn)
+    if not_found:
+        return not_found
 
+    new_tags = _parse_tags(params)
     existing = _tags.get(arn, [])
     existing_keys = {t["Key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:
@@ -2530,12 +2816,21 @@ def _add_tags(params):
 
 
 def _remove_tags(params):
-    """Remove tag keys from a resource identified by ARN."""
+    """
+    Remove tag keys from a resource identified by ARN.
+
+    Raises:
+        DBClusterNotFoundFault | DBInstanceNotFound | DBSnapshotNotFound:
+            Unknown ResourceName (404).
+    """
     arn = _evaluate_params(params, "ResourceName")
-    keys_to_remove = set(_parse_member_list(params, "TagKeys"))
     if not arn:
         return _error("MissingParameter", "ResourceName is required", 400)
+    not_found = _tags_resource_not_found(arn)
+    if not_found:
+        return not_found
 
+    keys_to_remove = set(_parse_member_list(params, "TagKeys"))
     existing = _tags.get(arn, [])
     _tags[arn] = [t for t in existing if t["Key"] not in keys_to_remove]
 
@@ -2544,20 +2839,33 @@ def _remove_tags(params):
 
 
 def _list_tags(params):
-    """List tags on a resource identified by ARN."""
+    """
+    List tags on a resource identified by ARN.
+
+    Raises:
+        DBClusterNotFoundFault | DBInstanceNotFound | DBSnapshotNotFound:
+            Unknown ResourceName (404).
+    """
     arn = _evaluate_params(params, "ResourceName")
     if not arn:
-        return _xml(200, "ListTagsForResourceResponse",
-                    "<ListTagsForResourceResult><TagList/></ListTagsForResourceResult>")
+        return _error("MissingParameter", "ResourceName is required", 400)
+    not_found = _tags_resource_not_found(arn)
+    if not_found:
+        return not_found
 
     tag_list = _tags.get(arn, [])
-    members = "".join(f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>" for t in tag_list)
+    members = "".join(
+        f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+        for t in tag_list)
     return _xml(200, "ListTagsForResourceResponse",
-                f"<ListTagsForResourceResult><TagList>{members}</TagList></ListTagsForResourceResult>")
+                f"<ListTagsForResourceResult><TagList>{members}"
+                f"</TagList></ListTagsForResourceResult>")
 
 
 def _sync_tag_list_to_resource(arn):
-    """Keep embedded TagList copies in sync with the canonical _tags store."""
+    """
+    Keep embedded TagList copies in sync with the canonical _tags store.
+    """
     tag_list = _tags.get(arn, [])
     for inst in _instances.values():
         if inst.get("DBInstanceArn") == arn:
@@ -2582,7 +2890,9 @@ def _sync_tag_list_to_resource(arn):
 # ---------------------------------------------------------------------------
 
 def _describe_db_engine_versions(params):
-    """Emit the cataloged docdb engine versions with their families."""
+    """
+    Emit the cataloged docdb engine versions with their families.
+    """
     version_filter = _evaluate_params(params, "EngineVersion")
     members = ""
     for ver, family in DOCDB_ENGINE_VERSIONS:
@@ -2590,7 +2900,7 @@ def _describe_db_engine_versions(params):
             continue
         upgrade_targets = ""
         seen_higher = False
-        for higher_ver, higher_family in DOCDB_ENGINE_VERSIONS:
+        for higher_ver, _ in DOCDB_ENGINE_VERSIONS:
             if seen_higher:
                 upgrade_targets += f"""<ValidUpgradeTarget>
                         <Engine>docdb</Engine>
@@ -2633,7 +2943,9 @@ def _describe_db_engine_versions(params):
 
 
 def _describe_orderable_options(params):
-    """List orderable instance classes for a cataloged engine version."""
+    """
+    List orderable instance classes for a cataloged engine version.
+    """
     engine_version = _evaluate_params(params, "EngineVersion") or DEFAULT_ENGINE_VERSION
     if engine_version not in _DOCDB_ENGINE_VERSION_SET:
         engine_version = DEFAULT_ENGINE_VERSION
@@ -2677,8 +2989,10 @@ def _describe_orderable_options(params):
             <SupportedActivityStreamModes/>
         </OrderableDBInstanceOption>"""
     return _xml(200, "DescribeOrderableDBInstanceOptionsResponse",
-                "<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>"
-                f"{members}</OrderableDBInstanceOptions></DescribeOrderableDBInstanceOptionsResult>")
+                "<DescribeOrderableDBInstanceOptionsResult>"
+                "<OrderableDBInstanceOptions>"
+                f"{members}</OrderableDBInstanceOptions>"
+                "</DescribeOrderableDBInstanceOptionsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -2695,9 +3009,12 @@ _STATIC_CERTIFICATE = {
 
 
 def _describe_certificates(params):
-    """Return the static CA certificate matching CACertificateIdentifier."""
+    """
+    Return the static CA certificate matching CACertificateIdentifier.
+    """
     ident = _evaluate_params(params, "CertificateIdentifier")
-    cert_arn = f"arn:aws:rds:{get_region()}::cert:{_STATIC_CERTIFICATE['CertificateIdentifier']}"
+    cert_arn = (
+        f"arn:aws:rds:{get_region()}::cert:{_STATIC_CERTIFICATE['CertificateIdentifier']}")
     cert = dict(_STATIC_CERTIFICATE, CertificateArn=cert_arn)
     certs = [cert] if not ident or ident == cert["CertificateIdentifier"] else []
     members = "".join(f"""<Certificate>
@@ -2709,20 +3026,23 @@ def _describe_certificates(params):
         <ValidTill>{c['ValidTill']}</ValidTill>
     </Certificate>""" for c in certs)
     return _xml(200, "DescribeCertificatesResponse",
-                f"<DescribeCertificatesResult><Certificates>{members}</Certificates></DescribeCertificatesResult>")
+                f"<DescribeCertificatesResult><Certificates>{members}"
+                f"</Certificates></DescribeCertificatesResult>")
 
 
-def _describe_events(params):
-    """Return recorded events; none are recorded today, so an empty list."""
+def _describe_events(params):  # pylint: disable=unused-argument  # action handlers take params
+    """
+    Return recorded events; none are recorded today, so an empty list.
+    """
     return _xml(200, "DescribeEventsResponse",
                 "<DescribeEventsResult><Events/></DescribeEventsResult>")
 
 
 def _apply_pending_maintenance_action(params):
-    """Record an opt-in for a pending maintenance action on a resource.
+    """
+    Record an opt-in for a pending maintenance action on a resource.
 
-    Args:
-        params: Request parameters (ResourceIdentifier, ApplyAction,
+    :param params: Request parameters (ResourceIdentifier, ApplyAction,
             OptInType required).
 
     Returns:
@@ -2764,7 +3084,9 @@ def _apply_pending_maintenance_action(params):
 
 
 def _describe_pending_maintenance_actions(params):
-    """Return recorded pending maintenance actions, optionally per resource."""
+    """
+    Return recorded pending maintenance actions, optionally per resource.
+    """
     resource_identifier = _evaluate_params(params, "ResourceIdentifier")
     entries = [
         e for e in _pending_maintenance_actions
@@ -2794,7 +3116,8 @@ def _describe_pending_maintenance_actions(params):
 # ---------------------------------------------------------------------------
 
 def _xml(status, root_tag, inner):
-    """Wrap rendered inner fields in a Query-API response document.
+    """
+    Wrap rendered inner fields in a Query-API response document.
 
     Returns:
         tuple: ``(status, headers, body)`` with the RDS-style XML namespace
@@ -2809,7 +3132,8 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
-    """Build an RDS-style XML error response.
+    """
+    Build an RDS-style XML error response.
 
     Args:
         code: AWS wire error code (e.g. ``DBClusterNotFoundFault``).
@@ -2826,13 +3150,27 @@ def _error(code, message, status):
 
 
 def _single_instance_response(root_tag, result_tag, instance):
-    """Wrap one instance record in a create/delete/modify/start/stop envelope."""
+    """
+    Wrap one instance record in a create/delete/modify/start/stop envelope.
+    """
     return _xml(200, root_tag,
                 f"<{result_tag}><DBInstance>{_instance_xml(instance)}</DBInstance></{result_tag}>")
 
 
+def _subnet_az_name(subnet_entry):
+    """
+    AZ name for a subnet record, defaulting to the region.
+    """
+    zone = subnet_entry.get("SubnetAvailabilityZone")
+    if isinstance(zone, dict) and zone.get("Name"):
+        return zone["Name"]
+    return f"{get_region()}a"
+
+
 def _instance_xml(i):
-    """Render an instance dict to XML fields — no wrapping element."""
+    """
+    Render an instance dict to XML fields — no wrapping element.
+    """
     ep = i.get("Endpoint", {})
     subnet = i.get("DBSubnetGroup", {})
     if isinstance(subnet, str):
@@ -2845,12 +3183,10 @@ def _instance_xml(i):
             <Status>{sg.get('Status', 'active')}</Status>
         </VpcSecurityGroupMembership>"""
 
-    db_sg_xml = ""
-    for sg in i.get("DBSecurityGroups", []):
-        db_sg_xml += f"""<DBSecurityGroup>
+    db_sg_xml = "".join(f"""<DBSecurityGroup>
             <DBSecurityGroupName>{sg}</DBSecurityGroupName>
             <Status>active</Status>
-        </DBSecurityGroup>"""
+        </DBSecurityGroup>""" for sg in i.get("DBSecurityGroups", []))
 
     param_xml = ""
     for pg in i.get("DBParameterGroups", []):
@@ -2870,13 +3206,13 @@ def _instance_xml(i):
     for t in i.get("TagList", []):
         tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
 
-    read_replica_xml = ""
-    for rr in i.get("ReadReplicaDBInstanceIdentifiers", []):
-        read_replica_xml += f"<ReadReplicaDBInstanceIdentifier>{rr}</ReadReplicaDBInstanceIdentifier>"
+    read_replica_xml = "".join(
+        f"<ReadReplicaDBInstanceIdentifier>{rr}</ReadReplicaDBInstanceIdentifier>"
+        for rr in i.get("ReadReplicaDBInstanceIdentifiers", []))
 
     subnet_xml = ""
     for s in subnet.get("Subnets", []):
-        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
+        az = _subnet_az_name(s)
         subnet_xml += f"""<Subnet>
             <SubnetIdentifier>{s.get('SubnetIdentifier', '')}</SubnetIdentifier>
             <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
@@ -2900,6 +3236,13 @@ def _instance_xml(i):
             <ValidTill>{cert.get('ValidTill', '')}</ValidTill>
         </CertificateDetails>"""
 
+    backup_window = i.get("PreferredBackupWindow", "03:00-04:00")
+    maintenance_window = i.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00")
+    latest_restore = i.get("LatestRestorableTime") or _format_time(time.time())
+    read_replica_source = i.get("ReadReplicaSourceDBInstanceIdentifier", "")
+    ca_certificate = i.get("CACertificateIdentifier", "rds-ca-rsa2048-g1")
+    iam_auth = str(i.get("IAMDatabaseAuthenticationEnabled", False)).lower()
+
     return f"""<DBInstanceIdentifier>{i['DBInstanceIdentifier']}</DBInstanceIdentifier>
         <DBInstanceClass>{i['DBInstanceClass']}</DBInstanceClass>
         <Engine>{i['Engine']}</Engine>
@@ -2914,7 +3257,7 @@ def _instance_xml(i):
         </Endpoint>
         <AllocatedStorage>{i['AllocatedStorage']}</AllocatedStorage>
         <InstanceCreateTime>{i.get('InstanceCreateTime', '')}</InstanceCreateTime>
-        <PreferredBackupWindow>{i.get('PreferredBackupWindow', '03:00-04:00')}</PreferredBackupWindow>
+        <PreferredBackupWindow>{backup_window}</PreferredBackupWindow>
         <BackupRetentionPeriod>{i.get('BackupRetentionPeriod', 1)}</BackupRetentionPeriod>
         <DBSecurityGroups>{db_sg_xml}</DBSecurityGroups>
         <VpcSecurityGroups>{vpc_sg_xml}</VpcSecurityGroups>
@@ -2922,19 +3265,23 @@ def _instance_xml(i):
         <AvailabilityZone>{i.get('AvailabilityZone', f'{get_region()}a')}</AvailabilityZone>
         <DBSubnetGroup>
             <DBSubnetGroupName>{subnet.get('DBSubnetGroupName', 'default')}</DBSubnetGroupName>
-            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription', '')}</DBSubnetGroupDescription>
+            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription', '')}
+            </DBSubnetGroupDescription>
             <VpcId>{subnet.get('VpcId', 'vpc-00000000')}</VpcId>
             <SubnetGroupStatus>{subnet.get('SubnetGroupStatus', 'Complete')}</SubnetGroupStatus>
             <Subnets>{subnet_xml}</Subnets>
             <DBSubnetGroupArn>{subnet.get('DBSubnetGroupArn', '')}</DBSubnetGroupArn>
         </DBSubnetGroup>
-        <PreferredMaintenanceWindow>{i.get('PreferredMaintenanceWindow', 'sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
+        <PreferredMaintenanceWindow>{maintenance_window}</PreferredMaintenanceWindow>
         <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
-        <LatestRestorableTime>{i.get('LatestRestorableTime') or _format_time(time.time())}</LatestRestorableTime>
+        <LatestRestorableTime>{latest_restore}</LatestRestorableTime>
         <MultiAZ>{str(i.get('MultiAZ', False)).lower()}</MultiAZ>
-        <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade', True)).lower()}</AutoMinorVersionUpgrade>
+        <AutoMinorVersionUpgrade>
+            {str(i.get('AutoMinorVersionUpgrade', True)).lower()}
+        </AutoMinorVersionUpgrade>
         <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>
-        <ReadReplicaSourceDBInstanceIdentifier>{i.get('ReadReplicaSourceDBInstanceIdentifier', '')}</ReadReplicaSourceDBInstanceIdentifier>
+        <ReadReplicaSourceDBInstanceIdentifier>{read_replica_source}
+        </ReadReplicaSourceDBInstanceIdentifier>
         <ReadReplicaDBClusterIdentifiers/>
         <ReplicaMode>{i.get('ReplicaMode', '')}</ReplicaMode>
         <LicenseModel>{i.get('LicenseModel', 'general-public-license')}</LicenseModel>
@@ -2948,32 +3295,45 @@ def _instance_xml(i):
         <StorageEncrypted>{str(i.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <KmsKeyId>{i.get('KmsKeyId', '')}</KmsKeyId>
         <DbiResourceId>{i.get('DbiResourceId', '')}</DbiResourceId>
-        <CACertificateIdentifier>{i.get('CACertificateIdentifier', 'rds-ca-rsa2048-g1')}</CACertificateIdentifier>
+        <CACertificateIdentifier>{ca_certificate}</CACertificateIdentifier>
         <DomainMemberships/>
         <CopyTagsToSnapshot>{str(i.get('CopyTagsToSnapshot', False)).lower()}</CopyTagsToSnapshot>
         <MonitoringInterval>{i.get('MonitoringInterval', 0)}</MonitoringInterval>
-        <EnhancedMonitoringResourceArn>{i.get('EnhancedMonitoringResourceArn', '')}</EnhancedMonitoringResourceArn>
+        <EnhancedMonitoringResourceArn>
+            {i.get('EnhancedMonitoringResourceArn', '')}
+        </EnhancedMonitoringResourceArn>
         <MonitoringRoleArn>{i.get('MonitoringRoleArn', '')}</MonitoringRoleArn>
         <PromotionTier>{i.get('PromotionTier', 1)}</PromotionTier>
         <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
-        <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled', False)).lower()}</IAMDatabaseAuthenticationEnabled>
-        <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled', False)).lower()}</PerformanceInsightsEnabled>
+        <IAMDatabaseAuthenticationEnabled>{iam_auth}
+        </IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>
+            {str(i.get('PerformanceInsightsEnabled', False)).lower()}
+        </PerformanceInsightsEnabled>
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection', False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
-        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage', i.get('AllocatedStorage', 20))}</MaxAllocatedStorage>
+        <MaxAllocatedStorage>
+            {i.get('MaxAllocatedStorage', i.get('AllocatedStorage', 20))}
+        </MaxAllocatedStorage>
         <TagList>{tag_xml}</TagList>
         {cert_xml}
-        <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled', False)).lower()}</CustomerOwnedIpEnabled>
+        <CustomerOwnedIpEnabled>
+            {str(i.get('CustomerOwnedIpEnabled', False)).lower()}
+        </CustomerOwnedIpEnabled>
         <BackupTarget>{i.get('BackupTarget', 'region')}</BackupTarget>
         <NetworkType>{i.get('NetworkType', 'IPV4')}</NetworkType>
         <StorageThroughput>{i.get('StorageThroughput', 0)}</StorageThroughput>
-        <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable', False)).lower()}</IsStorageConfigUpgradeAvailable>"""
+        <IsStorageConfigUpgradeAvailable>
+            {str(i.get('IsStorageConfigUpgradeAvailable', False)).lower()}
+        </IsStorageConfigUpgradeAvailable>"""
 
 
 def _cluster_xml(c):
-    """Render a cluster dict to XML fields — no wrapping element."""
+    """
+    Render a cluster dict to XML fields — no wrapping element.
+    """
     vpc_sg_xml = ""
     for sg in c.get("VpcSecurityGroups", []):
         vpc_sg_xml += f"""<VpcSecurityGroupMembership>
@@ -2990,9 +3350,8 @@ def _cluster_xml(c):
             <PromotionTier>{m.get('PromotionTier', 1)}</PromotionTier>
         </DBClusterMember>"""
 
-    az_xml = ""
-    for az in c.get("AvailabilityZones", []):
-        az_xml += f"<AvailabilityZone>{az}</AvailabilityZone>"
+    az_xml = "".join(f"<AvailabilityZone>{az}</AvailabilityZone>"
+                     for az in c.get("AvailabilityZones", []))
 
     tag_xml = ""
     for t in c.get("TagList", []):
@@ -3013,6 +3372,11 @@ def _cluster_xml(c):
             "</MasterUserSecret>"
         )
 
+    backup_window = c.get("PreferredBackupWindow", "03:00-04:00")
+    maintenance_window = c.get("PreferredMaintenanceWindow", "sun:05:00-sun:06:00")
+    iam_auth = str(c.get("IAMDatabaseAuthenticationEnabled", False)).lower()
+    lifecycle = c.get("EngineLifecycleSupport", "open-source-rds-extended-support")
+
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
         <Engine>{c['Engine']}</Engine>
@@ -3032,16 +3396,19 @@ def _cluster_xml(c):
         <DBSubnetGroup>{c.get('DBSubnetGroup', 'default')}</DBSubnetGroup>
         <DBClusterParameterGroup>{c.get('DBClusterParameterGroup', '')}</DBClusterParameterGroup>
         <BackupRetentionPeriod>{c.get('BackupRetentionPeriod', 1)}</BackupRetentionPeriod>
-        <PreferredBackupWindow>{c.get('PreferredBackupWindow', '03:00-04:00')}</PreferredBackupWindow>
-        <PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow', 'sun:05:00-sun:06:00')}</PreferredMaintenanceWindow>
+        <PreferredBackupWindow>{backup_window}</PreferredBackupWindow>
+        <PreferredMaintenanceWindow>{maintenance_window}</PreferredMaintenanceWindow>
         <ClusterCreateTime>{c.get('ClusterCreateTime', '')}</ClusterCreateTime>
         <EarliestRestorableTime>{c.get('EarliestRestorableTime', '')}</EarliestRestorableTime>
         <LatestRestorableTime>{c.get('LatestRestorableTime', '')}</LatestRestorableTime>
         <StorageEncrypted>{str(c.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <KmsKeyId>{c.get('KmsKeyId', '')}</KmsKeyId>
         <DeletionProtection>{str(c.get('DeletionProtection', False)).lower()}</DeletionProtection>
-        <IAMDatabaseAuthenticationEnabled>{str(c.get('IAMDatabaseAuthenticationEnabled', False)).lower()}</IAMDatabaseAuthenticationEnabled>
-        <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled', False)).lower()}</HttpEndpointEnabled>
+        <IAMDatabaseAuthenticationEnabled>{iam_auth}
+        </IAMDatabaseAuthenticationEnabled>
+        <HttpEndpointEnabled>
+            {str(c.get('HttpEndpointEnabled', False)).lower()}
+        </HttpEndpointEnabled>
         <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot', False)).lower()}</CopyTagsToSnapshot>
         <CrossAccountClone>{str(c.get('CrossAccountClone', False)).lower()}</CrossAccountClone>
         <DbClusterResourceId>{c.get('DbClusterResourceId', '')}</DbClusterResourceId>
@@ -3051,11 +3418,13 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage', 1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus', 'stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType', 'IPV4')}</NetworkType>
-        <EngineLifecycleSupport>{c.get('EngineLifecycleSupport', 'open-source-rds-extended-support')}</EngineLifecycleSupport>"""
+        <EngineLifecycleSupport>{lifecycle}</EngineLifecycleSupport>"""
 
 
 def _snapshot_xml(s):
-    """Render an (legacy) instance-snapshot dict to XML fields."""
+    """
+    Render an (legacy) instance-snapshot dict to XML fields.
+    """
     tag_xml = ""
     for t in s.get("TagList", []):
         tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
@@ -3080,24 +3449,31 @@ def _snapshot_xml(s):
         <StorageEncrypted>{str(s.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <KmsKeyId>{s.get('KmsKeyId', '')}</KmsKeyId>
         <Encrypted>{str(s.get('Encrypted', False)).lower()}</Encrypted>
-        <IAMDatabaseAuthenticationEnabled>{str(s.get('IAMDatabaseAuthenticationEnabled', False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <IAMDatabaseAuthenticationEnabled>
+            {str(s.get('IAMDatabaseAuthenticationEnabled', False)).lower()}
+        </IAMDatabaseAuthenticationEnabled>
         <PercentProgress>{s.get('PercentProgress', 100)}</PercentProgress>
         <DbiResourceId>{s.get('DbiResourceId', '')}</DbiResourceId>
         <TagList>{tag_xml}</TagList>
-        <OriginalSnapshotCreateTime>{s.get('OriginalSnapshotCreateTime', '')}</OriginalSnapshotCreateTime>
+        <OriginalSnapshotCreateTime>
+            {s.get('OriginalSnapshotCreateTime', '')}
+        </OriginalSnapshotCreateTime>
         <SnapshotDatabaseTime>{s.get('SnapshotDatabaseTime', '')}</SnapshotDatabaseTime>
         <SnapshotTarget>{s.get('SnapshotTarget', 'region')}</SnapshotTarget>"""
 
 
 def _cluster_snapshot_xml(s):
-    """Render a cluster snapshot dict to XML fields — no wrapping element."""
+    """
+    Render a cluster snapshot dict to XML fields — no wrapping element.
+    """
     tag_xml = ""
     for t in s.get("TagList", []):
         tag_xml += f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
-    az_xml = ""
-    for az in s.get("AvailabilityZones", []):
-        az_xml += f"<AvailabilityZone>{az}</AvailabilityZone>"
-    return f"""<DBClusterSnapshotIdentifier>{s['DBClusterSnapshotIdentifier']}</DBClusterSnapshotIdentifier>
+    az_xml = "".join(f"<AvailabilityZone>{az}</AvailabilityZone>"
+                     for az in s.get("AvailabilityZones", []))
+    snap_identifier = s['DBClusterSnapshotIdentifier']
+    open_id = f"<DBClusterSnapshotIdentifier>{snap_identifier}"
+    return f"""{open_id}</DBClusterSnapshotIdentifier>
         <DBClusterIdentifier>{s['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterSnapshotArn>{s.get('DBClusterSnapshotArn', '')}</DBClusterSnapshotArn>
         <Engine>{s['Engine']}</Engine>
@@ -3116,25 +3492,33 @@ def _cluster_snapshot_xml(s):
         <LicenseModel>{s.get('LicenseModel', 'docdb')}</LicenseModel>
         <StorageType>{s.get('StorageType', 'gp2')}</StorageType>
         <DbClusterResourceId>{s.get('DbClusterResourceId', '')}</DbClusterResourceId>
-        <SourceDBClusterSnapshotArn>{s.get('SourceDBClusterSnapshotArn', '')}</SourceDBClusterSnapshotArn>
-        <IAMDatabaseAuthenticationEnabled>{str(s.get('IAMDatabaseAuthenticationEnabled', False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <SourceDBClusterSnapshotArn>
+            {s.get('SourceDBClusterSnapshotArn', '')}
+        </SourceDBClusterSnapshotArn>
+        <IAMDatabaseAuthenticationEnabled>
+            {str(s.get('IAMDatabaseAuthenticationEnabled', False)).lower()}
+        </IAMDatabaseAuthenticationEnabled>
         <AllocatedStorage>{s.get('AllocatedStorage', 1)}</AllocatedStorage>
         <TagList>{tag_xml}</TagList>"""
 
 
 def _subnet_group_xml(sg):
-    """Render a subnet-group dict to XML fields — no wrapping element."""
+    """
+    Render a subnet-group dict to XML fields — no wrapping element.
+    """
     subnets_xml = ""
     for s in sg.get("Subnets", []):
-        az = s.get("SubnetAvailabilityZone", {}).get("Name", f"{get_region()}a") if isinstance(s.get("SubnetAvailabilityZone"), dict) else f"{get_region()}a"
+        az = _subnet_az_name(s)
         subnets_xml += f"""<Subnet>
             <SubnetIdentifier>{s.get('SubnetIdentifier', '')}</SubnetIdentifier>
             <SubnetAvailabilityZone><Name>{az}</Name></SubnetAvailabilityZone>
             <SubnetOutpost/>
             <SubnetStatus>Active</SubnetStatus>
         </Subnet>"""
-    return f"""<DBSubnetGroupName>{sg['DBSubnetGroupName']}</DBSubnetGroupName>
-        <DBSubnetGroupDescription>{sg.get('DBSubnetGroupDescription', '')}</DBSubnetGroupDescription>
+    group_name = sg["DBSubnetGroupName"]
+    return f"""<DBSubnetGroupName>{group_name}</DBSubnetGroupName>
+        <DBSubnetGroupDescription>{sg.get('DBSubnetGroupDescription', '')}
+        </DBSubnetGroupDescription>
         <VpcId>{sg.get('VpcId', 'vpc-00000000')}</VpcId>
         <SubnetGroupStatus>{sg.get('SubnetGroupStatus', 'Complete')}</SubnetGroupStatus>
         <Subnets>{subnets_xml}</Subnets>
@@ -3147,13 +3531,17 @@ def _subnet_group_xml(sg):
 # ---------------------------------------------------------------------------
 
 def _format_time(ts):
-    """Format a unix timestamp as DocDB-style UTC with millisecond precision."""
+    """
+    Format a unix timestamp as DocDB-style UTC with millisecond precision.
+    """
     dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _evaluate_params(params, key, default=""):
-    """Read the first value for a request parameter, or the default."""
+    """
+    Read the first value for a request parameter, or the default.
+    """
     val = params.get(key, [default])
     if isinstance(val, list):
         return val[0] if val else default
@@ -3161,7 +3549,9 @@ def _evaluate_params(params, key, default=""):
 
 
 def _parse_tags(params):
-    """Parse Tags.member.N.Key/Value or Tags.Tag.N.Key/Value into records."""
+    """
+    Parse Tags.member.N.Key/Value or Tags.Tag.N.Key/Value into records.
+    """
     tags = []
     prefix = "Tags.member"
     if not _evaluate_params(params, "Tags.member.1.Key"):
@@ -3178,7 +3568,8 @@ def _parse_tags(params):
 
 
 def _parse_member_list(params, prefix):
-    """Parse list params in either Prefix.member.N or Prefix.<MemberName>.N form.
+    """
+    Parse list params in either Prefix.member.N or Prefix.<MemberName>.N form.
 
     The member.N format is used by direct AWS CLI/SDK calls. The
     <MemberName>.N format is produced by botocore's serializer when dispatched
@@ -3194,7 +3585,6 @@ def _parse_member_list(params, prefix):
         i += 1
     if items:
         return items
-    import re
     pattern = re.compile(rf"^{re.escape(prefix)}\.([^.]+)\.(\d+)$")
     numbered = {}
     for key in params:
@@ -3206,7 +3596,8 @@ def _parse_member_list(params, prefix):
 
 
 def _parse_filters(params):
-    """Parse request filters in either ``Filters.Filter.N`` or
+    """
+    Parse request filters in either ``Filters.Filter.N`` or
     ``Filters.member.N`` wire form (botocore emits one or the other
     depending on the model's locationName)."""
     filters = {}
@@ -3237,7 +3628,8 @@ def _parse_filters(params):
 # ---------------------------------------------------------------------------
 
 def _resolve_instance(db_id):
-    """Look up an instance by DBInstanceIdentifier or DbiResourceId.
+    """
+    Look up an instance by DBInstanceIdentifier or DbiResourceId.
 
     AWS accepts either value for the DBInstanceIdentifier parameter in
     DescribeDBInstances and related APIs.
@@ -3253,7 +3645,9 @@ def _resolve_instance(db_id):
 
 
 def _cluster_member_instances(cluster):
-    """Resolve a cluster's member records to their live instance dicts."""
+    """
+    Resolve a cluster's member records to their live instance dicts.
+    """
     return [
         inst
         for inst in (
@@ -3265,7 +3659,9 @@ def _cluster_member_instances(cluster):
 
 
 def _apply_instance_filters(instances, filters):
-    """Filter instance records by db-instance-id, engine, or db-cluster-id."""
+    """
+    Filter instance records by db-instance-id, engine, or db-cluster-id.
+    """
     result = []
     for inst in instances:
         match = True
@@ -3285,7 +3681,9 @@ def _apply_instance_filters(instances, filters):
 
 
 def _apply_cluster_filters(clusters, filters):
-    """Filter cluster records by db-cluster-id or engine."""
+    """
+    Filter cluster records by db-cluster-id or engine.
+    """
     result = []
     for cl in clusters:
         match = True
@@ -3306,7 +3704,8 @@ def _apply_cluster_filters(clusters, filters):
 # ---------------------------------------------------------------------------
 
 def reset():
-    """Stop/remove every docdb container (cluster-owned and standalone), then
+    """
+    Stop/remove every docdb container (cluster-owned and standalone), then
     clear all state.
 
     Cluster-owned containers are reaped once from the cluster records before
@@ -3332,7 +3731,8 @@ def reset():
                         c.stop(timeout=2)
                         c.remove(v=True)
                     except Exception as e:
-                        logger.warning("reset: failed to stop/remove docdb container %s: %s", cid, e)
+                        logger.warning(
+                            "reset: failed to stop/remove docdb container %s: %s", cid, e)
         _instances.clear()
         _clusters.clear()
         _subnet_groups.clear()
@@ -3401,23 +3801,9 @@ _ACTION_MAP = {
 }
 
 
-# Load persisted state at module import. Must run AFTER every helper this code
-# path may touch is defined — restore_state spawns daemon threads that race
-# against the rest of module parsing, and a thread reaching an undefined name
-# raises NameError mid-restore (mirrors rds.py issue #692).
-try:
-    _restored = load_state("documentdb")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
-
-
 def _live_container_ids():
-    """Container ids still owned by a live instance or cluster.
+    """
+    Container ids still owned by a live instance or cluster.
 
     A stopped cluster still owns its (exited) container — StartDBCluster must
     be able to restart it — so it is reported here and never reaped.
