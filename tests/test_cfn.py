@@ -6797,8 +6797,7 @@ def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
 
 
 # ---------------------------------------------------------------------------
-# AWS::EFS::* (#1873). Ref, Fn::GetAtt and replacement properties follow the
-# CloudFormation Template Reference pages for the three types.
+# AWS::EFS::*
 # ---------------------------------------------------------------------------
 
 _efs_physical_ids = _sd_physical_ids
@@ -7003,8 +7002,7 @@ def test_cfn_efs_update_replacement(cfn, efs):
     assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
     after = _efs_physical_ids(cfn, stack_name)
 
-    # PerformanceMode replaces the file system; the mount targets and the access
-    # point follow because their FileSystemId changed.
+    # The mount targets and access point follow the replaced file system.
     for logical_id in ("Fs", "Mt1", "Mt2", "Ap"):
         assert after[logical_id] != before[logical_id]
     assert efs.describe_file_systems(FileSystemId=after["Fs"])["FileSystems"][0]["PerformanceMode"] == "maxIO"

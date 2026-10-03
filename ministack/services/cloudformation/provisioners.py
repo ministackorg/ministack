@@ -664,10 +664,6 @@ def _requires_replacement_pipes(old_props, new_props):
 # custom-named resource (you must rename it first), so MiniStack must fail the
 # update instead of silently executing the replacement and destroying data
 # (issue #1433).
-# A replacement is a change to a property of the type's _REPLACING_PROPERTIES
-# row, or one ``requires_replacement`` adds. A type with an ``exists`` message
-# is not refused up front: AWS runs the create, which fails with that message
-# because the predecessor still holds the name.
 # An ``exists`` entry is not refused up front: the replacement's create fails on the name.
 _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
@@ -921,14 +917,6 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with five exceptions. Four have a
-    deterministic generated name (the DynamoDB table, the IoT thing type and
-    the ElastiCache cache cluster and replication group): the replacement
-    takes the name back, so there is nothing left to retain. The fifth is the
-    Lambda permission's degenerate ``Id`` branch,
-    which removes and re-puts one statement under a Sid that cannot change:
-    the physical id is kept, nothing is replaced, and the policy does not
-    apply.
     cannot be forgotten at one site.
     """
     if _RETAIN_REPLACED.get():
@@ -2213,10 +2201,6 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     published versions, aliases, the resource policy, tags, event invoke
     configs. Going through the Lambda module's own update paths keeps them.
 
-    FunctionName, PackageType and TenancyConfig changes are replaced in
-    ``_update_resource`` before this runs. A DurableConfig change may require
-    replacement on AWS; under the same physical name the closest local
-    equivalent is the full re-provision the create fallback always did.
     FunctionName, PackageType and TenancyConfig are replaced in ``_update_resource``;
     a DurableConfig change re-provisions under the same name.
     """
@@ -2718,10 +2702,6 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    # A generated name belongs to this stack resource, so a profile left under
-    # it is taken over; a custom name goes through CreateInstanceProfile as it
-    # is, and its EntityAlreadyExists keeps one stack from writing over a
-    # profile another stack or the API owns.
     # A generated name is this stack's to take over; a custom one meets EntityAlreadyExists.
     if not props.get("InstanceProfileName"):
         _iam._instance_profiles.pop(name, None)
@@ -9319,30 +9299,17 @@ def _sd_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
-# EFS (AWS::EFS::*)
-#
-# Every handler goes through efs.py's own functions, so a stack-created file
-# system, mount target or access point is the record the EFS API writes. Ref,
-# Fn::GetAtt and the replacement properties follow the CloudFormation Template
-# Reference pages for the three types. A replacement property is listed in
-# _REPLACING_PROPERTIES and replaced by the engine before these update handlers
-# run, so the handlers only change what updates in place.
+# EFS (AWS::EFS::*) — through efs.py; create-only properties are replaced by the engine.
 # ---------------------------------------------------------------------------
 
 def _efs_result(response, what, missing_ok=False):
-    """The parsed body of an efs call, or ValueError naming ``what``. With
-    ``missing_ok`` a 404 (resource already gone) returns None."""
+    """The parsed body of an efs call; a 404 returns None when ``missing_ok``."""
     status, _, body = response
     if status == 404 and missing_ok:
         return None
     if status >= 400:
         raise ValueError(f"{what} failed: {body!r}")
     return json.loads(body) if body else {}
-
-
-def _efs_file_system_id(value):
-    """A file system id from an id or a ``...:file-system/fs-...`` ARN."""
-    return str(value or "").rsplit("/", 1)[-1]
 
 
 def _efs_policy_json(policy):
@@ -9382,8 +9349,7 @@ def _efs_put_protection(fs_id, protection):
 
 
 def _efs_replication_destinations(configuration):
-    """The Destinations a ReplicationConfiguration property sends to the API:
-    Status and StatusMessage describe the destination, they do not configure it."""
+    """The API Destinations, without the read-only Status and StatusMessage."""
     return [
         {k: v for k, v in destination.items() if k not in ("Status", "StatusMessage")}
         for destination in (configuration or {}).get("Destinations") or []
@@ -9403,8 +9369,7 @@ def _efs_delete_replication(fs_id):
 
 
 def _efs_file_system_create(logical_id, props, stack_name):
-    # No CreationToken: efs.py returns the existing file system for a repeated
-    # token, which would turn a replacement into a no-op.
+    # No CreationToken: a repeated one would return the predecessor on a replacement.
     body = {
         key: props[key]
         for key in ("PerformanceMode", "ThroughputMode", "KmsKeyId",
@@ -9431,8 +9396,7 @@ def _efs_file_system_create(logical_id, props, stack_name):
 
 
 def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """AvailabilityZoneName, Encrypted, KmsKeyId and PerformanceMode replace
-    the file system in the engine. Everything else changes in place."""
+    """The in-place properties; the create-only ones are replaced by the engine."""
     fs = _efs._file_systems.get(physical_id)
     if fs is None:
         return _efs_file_system_create(logical_id or physical_id, new_props, stack_name)
@@ -9469,16 +9433,14 @@ def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logic
 
 
 def _efs_file_system_delete(physical_id, props):
-    # A file system in a replication configuration cannot be deleted; the
-    # destination it created stays, as on AWS.
+    # A replicating file system cannot be deleted; the destination stays, as on AWS.
     _efs_delete_replication(physical_id)
     _efs_result(_efs._delete_file_system(physical_id),
                 "AWS::EFS::FileSystem delete", missing_ok=True)
 
 
 def _efs_mount_target_attrs(mount_target):
-    # Id is the file system id, as the CloudFormation reference documents.
-    # An IPV6_ONLY mount target has no IPv4 address.
+    # Id is the file system id (template reference); IPV6_ONLY has no IpAddress.
     attrs = {"Id": mount_target["FileSystemId"]}
     if "IpAddress" in mount_target:
         attrs["IpAddress"] = mount_target["IpAddress"]
@@ -9487,7 +9449,7 @@ def _efs_mount_target_attrs(mount_target):
 
 def _efs_mount_target_create(logical_id, props, stack_name):
     body = {
-        "FileSystemId": _efs_file_system_id(props.get("FileSystemId")),
+        "FileSystemId": _efs._fs_id_from(props.get("FileSystemId")),
         "SubnetId": props.get("SubnetId", ""),
         "SecurityGroups": list(props.get("SecurityGroups") or []),
     }
@@ -9499,8 +9461,7 @@ def _efs_mount_target_create(logical_id, props, stack_name):
 
 
 def _efs_mount_target_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """FileSystemId, SubnetId, IpAddress, IpAddressType and Ipv6Address replace
-    the mount target in the engine; SecurityGroups change in place."""
+    """SecurityGroups change in place; the rest is replaced by the engine."""
     mount_target = _efs._mount_targets.get(physical_id)
     if mount_target is None:
         return _efs_mount_target_create(logical_id or physical_id, new_props, stack_name)
@@ -9542,7 +9503,7 @@ def _efs_access_point_attrs(access_point):
 
 
 def _efs_access_point_create(logical_id, props, stack_name):
-    body = {"FileSystemId": _efs_file_system_id(props.get("FileSystemId"))}
+    body = {"FileSystemId": _efs._fs_id_from(props.get("FileSystemId"))}
     if props.get("PosixUser"):
         body["PosixUser"] = _efs_posix_user(props["PosixUser"])
     if props.get("RootDirectory"):
@@ -9556,8 +9517,7 @@ def _efs_access_point_create(logical_id, props, stack_name):
 
 
 def _efs_access_point_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """FileSystemId, ClientToken, PosixUser and RootDirectory replace the access
-    point in the engine; AccessPointTags change in place."""
+    """AccessPointTags change in place; the rest is replaced by the engine."""
     access_point = _efs._access_points.get(physical_id)
     if access_point is None:
         return _efs_access_point_create(logical_id or physical_id, new_props, stack_name)
@@ -13078,14 +13038,6 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
-# CloudFormation replacement rules, checked against DescribeType and change
-# sets. A row lists the schema's createOnlyProperties (Always); the conditional
-# table below lists its conditionalCreateOnlyProperties (Conditionally). Any
-# other property of a listed type is in place (Never), as AWS reports it. A
-# stack update replaces the resource when an Always property changes. Service
-# API immutability is different: an update may fail without being reported as
-# a replacement (for example Cognito sign-in attributes). Types without a row
-# keep the conservative Conditionally answer and their handler's behavior.
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),

@@ -89,7 +89,6 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
 
 
 def _update_keeping_seed(*args):
-    """Return _update_resource's result and the name seed it left, which a worker thread would lose."""
     """_update_resource's result and the name seed it left."""
     return _update_resource(*args), _NAME_SEED.get()
 

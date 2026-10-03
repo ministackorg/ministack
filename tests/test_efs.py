@@ -353,8 +353,7 @@ def test_efs_file_system_policy(efs):
 
     put = efs.put_file_system_policy(FileSystemId=fs_id, Policy=policy)
     assert put["FileSystemId"] == fs_id
-    # The documented example responses fill in an Id, a Sid per statement and
-    # the file system ARN as Resource.
+    # Id, Sid and Resource are filled in as the API reference examples show.
     stored = json.loads(put["Policy"])
     arn = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]["FileSystemArn"]
     assert stored["Id"] == "1"
@@ -500,9 +499,7 @@ def test_efs_put_account_preferences(efs):
 
 
 # ---------------------------------------------------------------------------
-# File system policy validation, protection, replication and mount target
-# validation. Behavior follows the EFS API reference pages (documentation, not a
-# run against an AWS account).
+# File system policy, protection, replication and mount target validation
 # ---------------------------------------------------------------------------
 
 _LOCKOUT_POLICY = json.dumps({

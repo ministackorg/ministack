@@ -153,8 +153,7 @@ def _delete_file_system(fs_id):
         return _error(409, "FileSystemInUse",
                       f"File system '{fs_id}' has mount targets and cannot be deleted.")
     if _replication_of(fs_id):
-        # "You cannot delete a file system that is part of an EFS replication
-        # configuration." The documentation names no error code for it.
+        # Documented without an error code.
         return _error(409, "FileSystemInUse",
                       f"File system '{fs_id}' is part of a replication configuration; "
                       "delete the replication configuration first.")
@@ -197,8 +196,7 @@ def _update_file_system_protection(fs_id, body):
     if _replication_of(fs_id):
         return _error(409, "ReplicationAlreadyExists",
                       f"File system '{fs_id}' is already included in a replication configuration.")
-    # REPLICATING marks a destination and is set by replication only; the
-    # documentation does not say what a caller setting it gets back.
+    # REPLICATING is set by replication only.
     if value not in ("ENABLED", "DISABLED"):
         return _error(400, "BadRequest",
                       "ReplicationOverwriteProtection must be ENABLED or DISABLED.")
@@ -211,8 +209,7 @@ def _update_file_system_protection(fs_id, body):
 # ---------------------------------------------------------------------------
 
 def _replication_of(fs_id):
-    """The replication configuration that has the file system as its source or
-    destination, from any region of the account, else None."""
+    """The account's replication configuration involving the file system, in any region."""
     account = get_account_id()
     for (acct, _region, _source), config in _replication_configs.all_items():
         if acct != account:
@@ -231,8 +228,7 @@ def _create_replication_configuration(source_id, body):
     destinations = body.get("Destinations")
     if not isinstance(destinations, list) or len(destinations) != 1:
         return _error(400, "BadRequest", "Exactly one destination is supported.")
-    # "This file system cannot already be a source or destination file system in
-    # another replication configuration." The documentation names no error code.
+    # Documented without an error code.
     if _replication_of(source_id):
         return _error(400, "BadRequest",
                       f"File system '{source_id}' is already part of a replication configuration.")
@@ -342,8 +338,7 @@ def _delete_replication_configuration(source_id, query):
             d["Region"] == get_region() for d in config["Destinations"]):
         return _error(400, "BadRequest",
                       "LOCAL_CONFIGURATION_ONLY is not valid for same-account, same-region replication.")
-    # "After a replication configuration is deleted, the destination file system
-    # becomes writeable and its replication overwrite protection is re-enabled."
+    # The destination's overwrite protection is re-enabled.
     for destination in config["Destinations"]:
         with request_scope(get_account_id(), destination["Region"]):
             target = _file_systems.get(destination["FileSystemId"])
@@ -358,9 +353,7 @@ def _delete_replication_configuration(source_id, query):
 # ---------------------------------------------------------------------------
 
 def _pick_address(cidr, used, requested, kind):
-    """The address a mount target takes in the subnet range: the requested one
-    when it lies in the range and is free, else the first free host after the
-    four addresses a subnet reserves at its start. Returns (address, error)."""
+    """The requested free address, else the first free host past the 4 reserved; (address, error)."""
     network = ipaddress.ip_network(cidr, strict=False)
     if requested:
         try:
@@ -382,8 +375,7 @@ def _pick_address(cidr, used, requested, kind):
 
 
 def _security_groups_in_vpc(security_groups, vpc_id):
-    """The security groups for a mount target: the ones given, which must exist
-    in the subnet's VPC, else the VPC's default group. Returns (ids, error)."""
+    """The given groups, which must be in the VPC, else its default group; (ids, error)."""
     from ministack.services import ec2
 
     if not security_groups:
@@ -791,11 +783,7 @@ def _describe_backup_policy(fs_id):
 
 
 def _policy_locks_out_caller(statements):
-    """Whether a statement denies PutFileSystemPolicy to every principal with no
-    condition: the lockout the safety check refuses. Allow statements never
-    lock out a same-account caller, and a conditional Deny cannot be evaluated
-    here, so only the unconditional Deny counts (inference: the documentation
-    describes the check by its purpose, not its rules)."""
+    """Whether an unconditional Deny of PutFileSystemPolicy covers every principal."""
     for statement in statements:
         if statement.get("Effect") != "Deny" or statement.get("Condition"):
             continue
@@ -836,8 +824,7 @@ def _put_file_system_policy(fs_id, body):
         return _error(400, "InvalidPolicyException",
                       "The policy would lock out the caller from PutFileSystemPolicy; "
                       "set BypassPolicyLockoutSafetyCheck to override.")
-    # The documentation's example responses carry an Id, a Sid per statement and
-    # the file system ARN as Resource where the request left them out.
+    # Id, Sid and Resource are filled in as the API reference examples show.
     policy["Statement"] = statements
     policy.setdefault("Id", "1")
     for statement in statements:
