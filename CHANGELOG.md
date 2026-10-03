@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenSearch — data-plane containers are named per account** — a domain's container was named `ministack-opensearch-<region>-<domain>`, so a second account creating a domain of the same name (including an account on another MiniStack sharing the Docker daemon) failed with a Docker name conflict, and the failed create's cleanup removed containers by that name. The names now carry an account and region hash, as RDS's do. Contributed by @skialpine.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
