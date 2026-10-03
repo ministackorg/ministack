@@ -6438,6 +6438,8 @@ def _create_param_group(p):
     name = _p(p, "DBParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBParameterGroupName is required", 400)
+    if name in _param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "postgres15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:pg:{name}"
@@ -6566,6 +6568,8 @@ def _create_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBClusterParameterGroupName is required", 400)
+    if name in _db_cluster_param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "aurora-postgresql15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}"

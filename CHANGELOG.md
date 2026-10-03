@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **RDS — creating an existing parameter group is refused** — `CreateDBParameterGroup` and `CreateDBClusterParameterGroup` with a name already in use replaced the group with an empty one, dropping its parameters; they now return `DBParameterGroupAlreadyExists`, as AWS does. Contributed by @skialpine.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 

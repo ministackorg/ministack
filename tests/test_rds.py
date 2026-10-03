@@ -501,6 +501,30 @@ def test_rds_cluster_parameter_group(rds):
     assert groups[0]["DBClusterParameterGroupName"] == "test-cpg"
     rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="test-cpg")
 
+def test_rds_create_parameter_group_refuses_an_existing_name(rds):
+    """AWS refuses a second create of a parameter group; it must not replace the group with an empty one."""
+    name = f"pg-dup-{_uuid_mod.uuid4().hex[:8]}"
+    rds.create_db_parameter_group(DBParameterGroupName=name, DBParameterGroupFamily="mysql8.0", Description="d")
+    rds.create_db_cluster_parameter_group(DBClusterParameterGroupName=name,
+                                          DBParameterGroupFamily="aurora-mysql8.0", Description="d")
+    rds.modify_db_parameter_group(DBParameterGroupName=name, Parameters=[
+        {"ParameterName": "max_connections", "ParameterValue": "100", "ApplyMethod": "immediate"}])
+    try:
+        for create in (
+            lambda: rds.create_db_parameter_group(DBParameterGroupName=name,
+                                                  DBParameterGroupFamily="mysql8.0", Description="d"),
+            lambda: rds.create_db_cluster_parameter_group(DBClusterParameterGroupName=name,
+                                                          DBParameterGroupFamily="aurora-mysql8.0", Description="d"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                create()
+            assert exc.value.response["Error"]["Code"] == "DBParameterGroupAlreadyExists"
+        params = rds.describe_db_parameters(DBParameterGroupName=name, Source="user")["Parameters"]
+        assert [(p["ParameterName"], p["ParameterValue"]) for p in params] == [("max_connections", "100")]
+    finally:
+        rds.delete_db_parameter_group(DBParameterGroupName=name)
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName=name)
+
 def test_rds_modify_db_parameter_group(rds):
     rds.create_db_parameter_group(
         DBParameterGroupName="test-mpg",
