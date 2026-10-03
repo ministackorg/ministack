@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudTrail — `PutEventSelectors` stores `AdvancedEventSelectors` and sets `HasCustomEventSelectors`** — advanced selectors are now stored and returned in place of `EventSelectors` instead of being dropped, a request with both kinds, neither, or an empty or oversized list fails with `InvalidEventSelectorsException`, basic selectors read back with their omitted members filled in, and `GetTrail` and `DescribeTrails` report `HasCustomEventSelectors: true` while a trail has selectors other than the default one. Contributed by @iot-rocket.
+- **CloudTrail — `GetEventSelectors` returns the default selector of a new trail** — a trail that never had `PutEventSelectors` answered an empty `EventSelectors` list instead of the default selector that logs all read and write management events. Contributed by @iot-rocket.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
