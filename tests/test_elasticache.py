@@ -1632,6 +1632,24 @@ def test_serverless_cache_serves_tls_only(ec, tmp_path):
 
 
 @pytest.mark.data_plane
+def test_serverless_cache_is_one_cluster_mode_shard(ec, tmp_path):
+    """AWS serves a serverless cache in cluster mode: keys in different slots
+    fail together with CROSSSLOT, and CLUSTER SLOTS names the cache endpoint."""
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-slots-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        endpoint = _wait_serverless(ec, name)["Endpoint"]
+        assert _tls_command(endpoint, ca_file, "MGET {a}x {b}y").startswith(b"-CROSSSLOT")
+        assert _tls_command(endpoint, ca_file, "MGET {a}x {a}y") == b"*2\r\n$-1\r\n$-1\r\n"
+        address = endpoint["Address"]
+        assert _tls_command(endpoint, ca_file, "CLUSTER SLOTS").startswith(
+            f"*1\r\n*3\r\n:0\r\n:16383\r\n*4\r\n${len(address)}\r\n{address}\r\n:{endpoint['Port']}\r\n".encode())
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+@pytest.mark.data_plane
 def test_serverless_cache_engine_change_replaces_container_on_same_endpoint(ec, tmp_path):
     ca_file = _serverless_ca_file(tmp_path)
     name = f"sls-eng-{_uid()}"
@@ -2132,6 +2150,13 @@ def test_elasticache_cluster_create_time_present_and_parsed(ec):
 # ---------------------------------------------------------------------------
 # Serverless caches — provisioning state, not liveness
 # ---------------------------------------------------------------------------
+
+def test_serverless_announce_flags_skip_a_hostname_redis_refuses():
+    assert elasticache._serverless_announce_flags("localhost", 26500) == (
+        "--cluster-announce-tls-port 26500 --cluster-announce-hostname localhost "
+        "--cluster-preferred-endpoint-type hostname")
+    assert elasticache._serverless_announce_flags("ministack_app_1", 26500) == "--cluster-announce-tls-port 26500"
+
 
 def _serverless_create_params(name, engine="valkey"):
     return {"ServerlessCacheName": [name], "Engine": [engine]}

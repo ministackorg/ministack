@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ElastiCache — serverless caches run in cluster mode** — AWS serves a serverless cache as a cluster-mode cache, so a multi-key command whose keys hash to different slots fails with `CROSSSLOT`; MiniStack's container ran without cluster mode and accepted it, so such code passed locally and failed on AWS. The container now runs as one cluster-mode shard holding every slot, and `CLUSTER SLOTS` reports the cache's endpoint, as AWS's single virtual shard does. Contributed by @skialpine.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
