@@ -17,7 +17,7 @@ from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
-from ministack.core.responses import get_account_id, json_response, new_uuid
+from ministack.core.responses import error_response_json, get_account_id, get_region, json_response, new_uuid
 from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
@@ -186,7 +186,7 @@ async def handle_request(method, path, headers, body, query_params):
         # When AUTH=true, validate role exists and trust policy permits the caller
         from ministack.app import AUTH
         if AUTH:
-            from ministack.core.iam_evaluator import evaluate_trust_policy
+            from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
             from ministack.services import iam as iam_svc
             # Extract role name from ARN
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
@@ -216,10 +216,22 @@ async def handle_request(method, path, headers, body, query_params):
             # Evaluate trust policy
             trust_doc = role.get("AssumeRolePolicyDocument", "{}")
             caller_arn = caller["userArn"]
-            if not evaluate_trust_policy(trust_doc, caller_arn):
-                return _error(403, "AccessDenied",
-                              f"User: {caller_arn} is not authorized to perform: "
-                              f"sts:AssumeRole on resource: {role_arn}", ns="sts")
+            trust_context = EvalContext(
+                principal_arn=caller_arn,
+                principal_type=caller["principalType"],
+                principal_account=caller["accountId"],
+                action="sts:AssumeRole", resource_arn=role_arn, region=get_region(),
+                service_context={
+                    "sts:externalid": _p(params, "ExternalId", None),
+                    "sts:rolesessionname": _p(params, "RoleSessionName", None),
+                },
+            )
+            if not evaluate_trust_policy(trust_doc, caller_arn, trust_context):
+                message = (f"User: {caller_arn} is not authorized to perform: "
+                           f"sts:AssumeRole on resource: {role_arn}")
+                if use_json:
+                    return error_response_json("AccessDenied", message, 403)
+                return _error(403, "AccessDenied", message, ns="sts")
 
         duration = int(_p(params, "DurationSeconds") or 3600)
         expiration = _future(duration)
