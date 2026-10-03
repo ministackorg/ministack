@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **STS — role trust denies and conditions are enforced** — with `AUTH=true`, `AssumeRole` now rejects matching explicit denies, including `NotAction` exclusions, and evaluates `sts:ExternalId` and `sts:RoleSessionName` conditions before issuing credentials. A denied call registers no session. Local JSON requests use the supplied role ARN for authorization and receive JSON trust-denial errors; Query requests retain XML responses. With `AUTH=false`, trust denies and conditions remain permissive.
 ### Added
 
 - **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`. Contributed by @sjincho.
