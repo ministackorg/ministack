@@ -36,6 +36,7 @@ import ministack.services.dynamodb as _dynamodb
 import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
+import ministack.services.efs as _efs
 import ministack.services.elasticache as _ec
 import ministack.services.eventbridge as _eb
 import ministack.services.firehose as _firehose
@@ -663,6 +664,10 @@ def _requires_replacement_pipes(old_props, new_props):
 # custom-named resource (you must rename it first), so MiniStack must fail the
 # update instead of silently executing the replacement and destroying data
 # (issue #1433).
+# A replacement is a change to a property of the type's _REPLACING_PROPERTIES
+# row, or one ``requires_replacement`` adds. A type with an ``exists`` message
+# is not refused up front: AWS runs the create, which fails with that message
+# because the predecessor still holds the name.
 # An ``exists`` entry is not refused up front: the replacement's create fails on the name.
 _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
@@ -916,6 +921,14 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
+    cannot be forgotten at one site, with five exceptions. Four have a
+    deterministic generated name (the DynamoDB table, the IoT thing type and
+    the ElastiCache cache cluster and replication group): the replacement
+    takes the name back, so there is nothing left to retain. The fifth is the
+    Lambda permission's degenerate ``Id`` branch,
+    which removes and re-puts one statement under a Sid that cannot change:
+    the physical id is kept, nothing is replaced, and the policy does not
+    apply.
     cannot be forgotten at one site.
     """
     if _RETAIN_REPLACED.get():
@@ -1052,12 +1065,14 @@ def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict,
 
 
 def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
-                        key: str = "Key", value: str = "Value") -> None:
+                        key: str = "Key", value: str = "Value",
+                        prop: str = "Tags") -> None:
     """The list-store twin of ``_reconcile_tag_map``: entries the template
     dropped are removed, the new ones set, entries from elsewhere kept. The
-    list is changed in place; ``key``/``value`` name the entry fields."""
-    old_tags = _tag_map(old_props.get("Tags"))
-    new_tags = _tag_map(new_props.get("Tags"))
+    list is changed in place; ``key``/``value`` name the entry fields and
+    ``prop`` the template property that carries the tags."""
+    old_tags = _tag_map(old_props.get(prop))
+    new_tags = _tag_map(new_props.get(prop))
     if old_tags == new_tags:
         return
     store[:] = [
@@ -1104,6 +1119,8 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ECR::Repository": ("Tags", "list"),
     "AWS::ECS::Cluster": ("Tags", "list"),
     "AWS::ECS::Service": ("Tags", "list"),
+    "AWS::EFS::AccessPoint": ("AccessPointTags", "list"),
+    "AWS::EFS::FileSystem": ("FileSystemTags", "list"),
     "AWS::EKS::Cluster": ("Tags", "list"),
     "AWS::EKS::Nodegroup": ("Tags", "map"),
     "AWS::ElasticLoadBalancingV2::Listener": ("Tags", "list"),
@@ -2196,6 +2213,10 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     published versions, aliases, the resource policy, tags, event invoke
     configs. Going through the Lambda module's own update paths keeps them.
 
+    FunctionName, PackageType and TenancyConfig changes are replaced in
+    ``_update_resource`` before this runs. A DurableConfig change may require
+    replacement on AWS; under the same physical name the closest local
+    equivalent is the full re-provision the create fallback always did.
     FunctionName, PackageType and TenancyConfig are replaced in ``_update_resource``;
     a DurableConfig change re-provisions under the same name.
     """
@@ -2697,6 +2718,10 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
+    # A generated name belongs to this stack resource, so a profile left under
+    # it is taken over; a custom name goes through CreateInstanceProfile as it
+    # is, and its EntityAlreadyExists keeps one stack from writing over a
+    # profile another stack or the API owns.
     # A generated name is this stack's to take over; a custom one meets EntityAlreadyExists.
     if not props.get("InstanceProfileName"):
         _iam._instance_profiles.pop(name, None)
@@ -9294,6 +9319,260 @@ def _sd_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# EFS (AWS::EFS::*)
+#
+# Every handler goes through efs.py's own functions, so a stack-created file
+# system, mount target or access point is the record the EFS API writes. Ref,
+# Fn::GetAtt and the replacement properties follow the CloudFormation Template
+# Reference pages for the three types. A replacement property is listed in
+# _REPLACING_PROPERTIES and replaced by the engine before these update handlers
+# run, so the handlers only change what updates in place.
+# ---------------------------------------------------------------------------
+
+def _efs_result(response, what, missing_ok=False):
+    """The parsed body of an efs call, or ValueError naming ``what``. With
+    ``missing_ok`` a 404 (resource already gone) returns None."""
+    status, _, body = response
+    if status == 404 and missing_ok:
+        return None
+    if status >= 400:
+        raise ValueError(f"{what} failed: {body!r}")
+    return json.loads(body) if body else {}
+
+
+def _efs_file_system_id(value):
+    """A file system id from an id or a ``...:file-system/fs-...`` ARN."""
+    return str(value or "").rsplit("/", 1)[-1]
+
+
+def _efs_policy_json(policy):
+    return policy if isinstance(policy, str) else json.dumps(policy)
+
+
+def _efs_refresh_name(record):
+    """``Name`` follows the ``Name`` tag, as at create."""
+    record["Name"] = next(
+        (t["Value"] for t in record.get("Tags", []) if t.get("Key") == "Name"), "")
+
+
+def _efs_file_system_attrs(fs):
+    return {"Arn": fs["FileSystemArn"], "FileSystemId": fs["FileSystemId"]}
+
+
+def _efs_put_backup_policy(fs_id, policy):
+    _efs_result(_efs._put_backup_policy(fs_id, {"BackupPolicy": policy}),
+                "AWS::EFS::FileSystem BackupPolicy")
+
+
+def _efs_put_lifecycle_policies(fs_id, policies):
+    _efs_result(_efs._put_lifecycle_configuration(fs_id, {"LifecyclePolicies": policies}),
+                "AWS::EFS::FileSystem LifecyclePolicies")
+
+
+def _efs_put_file_system_policy(fs_id, props):
+    body = {"Policy": _efs_policy_json(props["FileSystemPolicy"])}
+    if "BypassPolicyLockoutSafetyCheck" in props:
+        body["BypassPolicyLockoutSafetyCheck"] = _cfn_bool(props["BypassPolicyLockoutSafetyCheck"])
+    _efs_result(_efs._put_file_system_policy(fs_id, body), "AWS::EFS::FileSystem FileSystemPolicy")
+
+
+def _efs_put_protection(fs_id, protection):
+    _efs_result(_efs._update_file_system_protection(fs_id, dict(protection or {})),
+                "AWS::EFS::FileSystem FileSystemProtection")
+
+
+def _efs_replication_destinations(configuration):
+    """The Destinations a ReplicationConfiguration property sends to the API:
+    Status and StatusMessage describe the destination, they do not configure it."""
+    return [
+        {k: v for k, v in destination.items() if k not in ("Status", "StatusMessage")}
+        for destination in (configuration or {}).get("Destinations") or []
+    ]
+
+
+def _efs_create_replication(fs_id, configuration):
+    _efs_result(
+        _efs._create_replication_configuration(
+            fs_id, {"Destinations": _efs_replication_destinations(configuration)}),
+        "AWS::EFS::FileSystem ReplicationConfiguration")
+
+
+def _efs_delete_replication(fs_id):
+    _efs_result(_efs._delete_replication_configuration(fs_id, {}),
+                "AWS::EFS::FileSystem ReplicationConfiguration delete", missing_ok=True)
+
+
+def _efs_file_system_create(logical_id, props, stack_name):
+    # No CreationToken: efs.py returns the existing file system for a repeated
+    # token, which would turn a replacement into a no-op.
+    body = {
+        key: props[key]
+        for key in ("PerformanceMode", "ThroughputMode", "KmsKeyId",
+                    "ProvisionedThroughputInMibps", "AvailabilityZoneName")
+        if key in props
+    }
+    if "Encrypted" in props:
+        body["Encrypted"] = _cfn_bool(props["Encrypted"])
+    if "FileSystemTags" in props:
+        body["Tags"] = props["FileSystemTags"]
+    fs = _efs_result(_efs._create_file_system(body), "AWS::EFS::FileSystem create")
+    fs_id = fs["FileSystemId"]
+    if props.get("LifecyclePolicies"):
+        _efs_put_lifecycle_policies(fs_id, props["LifecyclePolicies"])
+    if props.get("BackupPolicy"):
+        _efs_put_backup_policy(fs_id, props["BackupPolicy"])
+    if props.get("FileSystemPolicy"):
+        _efs_put_file_system_policy(fs_id, props)
+    if props.get("FileSystemProtection"):
+        _efs_put_protection(fs_id, props["FileSystemProtection"])
+    if props.get("ReplicationConfiguration"):
+        _efs_create_replication(fs_id, props["ReplicationConfiguration"])
+    return fs_id, _efs_file_system_attrs(fs)
+
+
+def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """AvailabilityZoneName, Encrypted, KmsKeyId and PerformanceMode replace
+    the file system in the engine. Everything else changes in place."""
+    fs = _efs._file_systems.get(physical_id)
+    if fs is None:
+        return _efs_file_system_create(logical_id or physical_id, new_props, stack_name)
+    throughput = {}
+    for key, default in (("ThroughputMode", "bursting"), ("ProvisionedThroughputInMibps", None)):
+        if new_props.get(key) != old_props.get(key):
+            if key in new_props:
+                throughput[key] = new_props[key]
+            elif default is not None:
+                throughput[key] = default
+    if throughput:
+        _efs_result(_efs._update_file_system(physical_id, throughput),
+                    "AWS::EFS::FileSystem update")
+    if new_props.get("LifecyclePolicies") != old_props.get("LifecyclePolicies"):
+        _efs_put_lifecycle_policies(physical_id, new_props.get("LifecyclePolicies") or [])
+    if new_props.get("BackupPolicy") != old_props.get("BackupPolicy"):
+        _efs_put_backup_policy(physical_id, new_props.get("BackupPolicy") or {"Status": "DISABLED"})
+    if new_props.get("FileSystemPolicy") != old_props.get("FileSystemPolicy"):
+        if new_props.get("FileSystemPolicy"):
+            _efs_put_file_system_policy(physical_id, new_props)
+        else:
+            _efs_result(_efs._delete_file_system_policy(physical_id),
+                        "AWS::EFS::FileSystem FileSystemPolicy")
+    if new_props.get("FileSystemProtection") != old_props.get("FileSystemProtection"):
+        _efs_put_protection(physical_id, new_props.get("FileSystemProtection")
+                            or {"ReplicationOverwriteProtection": "ENABLED"})
+    if new_props.get("ReplicationConfiguration") != old_props.get("ReplicationConfiguration"):
+        _efs_delete_replication(physical_id)
+        if new_props.get("ReplicationConfiguration"):
+            _efs_create_replication(physical_id, new_props["ReplicationConfiguration"])
+    _reconcile_tag_list(fs.setdefault("Tags", []), old_props, new_props, prop="FileSystemTags")
+    _efs_refresh_name(fs)
+    return physical_id, _efs_file_system_attrs(fs)
+
+
+def _efs_file_system_delete(physical_id, props):
+    # A file system in a replication configuration cannot be deleted; the
+    # destination it created stays, as on AWS.
+    _efs_delete_replication(physical_id)
+    _efs_result(_efs._delete_file_system(physical_id),
+                "AWS::EFS::FileSystem delete", missing_ok=True)
+
+
+def _efs_mount_target_attrs(mount_target):
+    # Id is the file system id, as the CloudFormation reference documents.
+    # An IPV6_ONLY mount target has no IPv4 address.
+    attrs = {"Id": mount_target["FileSystemId"]}
+    if "IpAddress" in mount_target:
+        attrs["IpAddress"] = mount_target["IpAddress"]
+    return attrs
+
+
+def _efs_mount_target_create(logical_id, props, stack_name):
+    body = {
+        "FileSystemId": _efs_file_system_id(props.get("FileSystemId")),
+        "SubnetId": props.get("SubnetId", ""),
+        "SecurityGroups": list(props.get("SecurityGroups") or []),
+    }
+    for key in ("IpAddress", "Ipv6Address", "IpAddressType"):
+        if props.get(key):
+            body[key] = props[key]
+    mount_target = _efs_result(_efs._create_mount_target(body), "AWS::EFS::MountTarget create")
+    return mount_target["MountTargetId"], _efs_mount_target_attrs(mount_target)
+
+
+def _efs_mount_target_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """FileSystemId, SubnetId, IpAddress, IpAddressType and Ipv6Address replace
+    the mount target in the engine; SecurityGroups change in place."""
+    mount_target = _efs._mount_targets.get(physical_id)
+    if mount_target is None:
+        return _efs_mount_target_create(logical_id or physical_id, new_props, stack_name)
+    if new_props.get("SecurityGroups") != old_props.get("SecurityGroups"):
+        _efs_result(_efs._modify_mount_target_security_groups(
+            physical_id, {"SecurityGroups": list(new_props.get("SecurityGroups") or [])}),
+            "AWS::EFS::MountTarget SecurityGroups")
+    return physical_id, _efs_mount_target_attrs(mount_target)
+
+
+def _efs_mount_target_delete(physical_id, props):
+    _efs_result(_efs._delete_mount_target(physical_id),
+                "AWS::EFS::MountTarget delete", missing_ok=True)
+
+
+def _efs_posix_user(user):
+    """The API types Uid, Gid and SecondaryGids as numbers; templates write strings."""
+    user = copy.deepcopy(user)
+    for key in ("Uid", "Gid"):
+        if key in user:
+            user[key] = int(user[key])
+    if "SecondaryGids" in user:
+        user["SecondaryGids"] = [int(gid) for gid in user["SecondaryGids"]]
+    return user
+
+
+def _efs_root_directory(root):
+    root = copy.deepcopy(root)
+    info = root.get("CreationInfo")
+    if info:
+        for key in ("OwnerUid", "OwnerGid"):
+            if key in info:
+                info[key] = int(info[key])
+    return root
+
+
+def _efs_access_point_attrs(access_point):
+    return {"AccessPointId": access_point["AccessPointId"], "Arn": access_point["AccessPointArn"]}
+
+
+def _efs_access_point_create(logical_id, props, stack_name):
+    body = {"FileSystemId": _efs_file_system_id(props.get("FileSystemId"))}
+    if props.get("PosixUser"):
+        body["PosixUser"] = _efs_posix_user(props["PosixUser"])
+    if props.get("RootDirectory"):
+        body["RootDirectory"] = _efs_root_directory(props["RootDirectory"])
+    if props.get("ClientToken"):
+        body["ClientToken"] = props["ClientToken"]
+    if "AccessPointTags" in props:
+        body["Tags"] = props["AccessPointTags"]
+    access_point = _efs_result(_efs._create_access_point(body), "AWS::EFS::AccessPoint create")
+    return access_point["AccessPointId"], _efs_access_point_attrs(access_point)
+
+
+def _efs_access_point_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """FileSystemId, ClientToken, PosixUser and RootDirectory replace the access
+    point in the engine; AccessPointTags change in place."""
+    access_point = _efs._access_points.get(physical_id)
+    if access_point is None:
+        return _efs_access_point_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_list(access_point.setdefault("Tags", []), old_props, new_props,
+                        prop="AccessPointTags")
+    _efs_refresh_name(access_point)
+    return physical_id, _efs_access_point_attrs(access_point)
+
+
+def _efs_access_point_delete(physical_id, props):
+    _efs_result(_efs._delete_access_point(physical_id),
+                "AWS::EFS::AccessPoint delete", missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Route53 HostedZone
 # ---------------------------------------------------------------------------
 
@@ -12799,6 +13078,14 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
+# CloudFormation replacement rules, checked against DescribeType and change
+# sets. A row lists the schema's createOnlyProperties (Always); the conditional
+# table below lists its conditionalCreateOnlyProperties (Conditionally). Any
+# other property of a listed type is in place (Never), as AWS reports it. A
+# stack update replaces the resource when an Always property changes. Service
+# API immutability is different: an update may fail without being reported as
+# a replacement (for example Cognito sign-in attributes). Types without a row
+# keep the conservative Conditionally answer and their handler's behavior.
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
@@ -12863,6 +13150,11 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
     "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
+    "AWS::EFS::FileSystem": ("AvailabilityZoneName", "Encrypted", "KmsKeyId", "PerformanceMode"),
+    "AWS::EFS::MountTarget": (
+        "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
+    ),
+    "AWS::EFS::AccessPoint": ("ClientToken", "FileSystemId", "PosixUser", "RootDirectory"),
 }
 
 
@@ -13448,6 +13740,24 @@ _RESOURCE_HANDLERS = {
         "create": _ecs_service_create,
         "update": _ecs_service_update,
         "delete": _ecs_service_delete,
+    },
+    "AWS::EFS::FileSystem": {
+        "create": _efs_file_system_create,
+        "update": _efs_file_system_update,
+        "update_with_logical_id": True,
+        "delete": _efs_file_system_delete,
+    },
+    "AWS::EFS::MountTarget": {
+        "create": _efs_mount_target_create,
+        "update": _efs_mount_target_update,
+        "update_with_logical_id": True,
+        "delete": _efs_mount_target_delete,
+    },
+    "AWS::EFS::AccessPoint": {
+        "create": _efs_access_point_create,
+        "update": _efs_access_point_update,
+        "update_with_logical_id": True,
+        "delete": _efs_access_point_delete,
     },
     "AWS::EC2::LaunchTemplate": {
         "create": _ec2_launch_template_create,

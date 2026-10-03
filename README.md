@@ -557,6 +557,9 @@ subnet = ec2.create_subnet(
 | `AWS::ECS::Cluster` | Cluster name | Arn, ClusterName |
 | `AWS::ECS::TaskDefinition` | Task def ARN | TaskDefinitionArn |
 | `AWS::ECS::Service` | Service ARN | ServiceArn, Name |
+| `AWS::EFS::FileSystem` | File system ID | Arn, FileSystemId |
+| `AWS::EFS::MountTarget` | Mount target ID | IpAddress, Id |
+| `AWS::EFS::AccessPoint` | Access point ID | AccessPointId, Arn |
 | `AWS::ElasticLoadBalancingV2::LoadBalancer` | LB ARN | Arn, DNSName, LoadBalancerFullName, CanonicalHostedZoneID, SecurityGroups |
 | `AWS::ElasticLoadBalancingV2::Listener` | Listener ARN | ListenerArn, Arn |
 | `AWS::Lambda::LayerVersion` | Layer version ARN | LayerVersionArn, Arn |

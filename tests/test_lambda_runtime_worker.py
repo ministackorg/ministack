@@ -438,3 +438,4 @@ def test_python_worker_cwd_is_code_dir():
 
     assert result["status"] == "ok", result
     assert os.path.realpath(result["result"]["cwd"]) == os.path.realpath(result["result"]["root"])
+    assert result["result"]["cwd"] == result["result"]["root"]
