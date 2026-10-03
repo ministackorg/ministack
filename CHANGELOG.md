@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **RDS — standalone deletion protection and snapshot-tag settings apply immediately** — `ModifyDBInstance` now applies `DeletionProtection` and `CopyTagsToSnapshot` regardless of `ApplyImmediately`, returning the active values without adding these fields to `PendingModifiedValues`. Omitted settings keep their existing values.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
