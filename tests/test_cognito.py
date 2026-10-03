@@ -8923,3 +8923,264 @@ def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():
     keys.add_header("Host", aws_host)
     with urllib.request.urlopen(keys) as r:
         assert "keys" in _json.loads(r.read())
+
+
+def _federation_id_claims(cid, redirect_location):
+    code = _parse_qs(urlparse(redirect_location).query)["code"][0]
+    token_data = (
+        f"grant_type=authorization_code&code={code}"
+        f"&client_id={cid}&redirect_uri=http://localhost:3000/callback"
+    ).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token", data=token_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        id_token = json.loads(resp.read())["id_token"]
+    payload = id_token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+
+@pytest.mark.parametrize("nonce", ["n-0S6_WzA2Mj", ""])
+def test_cognito_saml_federation_id_token_nonce(cognito_idp, nonce):
+    """The authorize nonce reaches the ID token of a SAML federation sign-in; no nonce, no claim."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    nonce_qs = f"&nonce={nonce}" if nonce else ""
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=s&scope=openid{nonce_qs}"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["RelayState"][0]
+
+    saml_resp = _build_mock_saml_response(
+        name_id="nonce@example.com",
+        attributes={"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress": "nonce@example.com"},
+    )
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=_urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        callback_location = e.headers.get("Location", "")
+
+    claims = _federation_id_claims(cid, callback_location)
+    assert claims.get("nonce") == (nonce or None)
+
+
+@pytest.mark.parametrize("nonce", ["n-0S6_WzA2Mj", ""])
+def test_cognito_oidc_federation_id_token_nonce(cognito_idp, nonce):
+    """The authorize nonce reaches the ID token of an OIDC federation sign-in; no nonce, no claim."""
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "user-nonce", "email": "nonce@example.com", "name": "Nonce"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+        nonce_qs = f"&nonce={nonce}" if nonce else ""
+        authorize_url = (
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=s&scope=openid{nonce_qs}"
+        )
+        try:
+            _no_redirect_opener.open(authorize_url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+
+        try:
+            _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            callback_location = e.headers.get("Location", "")
+
+        claims = _federation_id_claims(cid, callback_location)
+        assert claims.get("nonce") == (nonce or None)
+    finally:
+        stop()
+
+
+_LINKING_PRESIGNUP_HANDLER = (
+    "import json, os, urllib.request\n"
+    "def handler(event, ctx):\n"
+    "    req = urllib.request.Request(\n"
+    "        os.environ['AWS_ENDPOINT_URL'],\n"
+    "        data=json.dumps({\n"
+    "            'UserPoolId': event['userPoolId'],\n"
+    "            'DestinationUser': {'ProviderName': 'Cognito',\n"
+    "                                'ProviderAttributeValue': 'native-user'},\n"
+    "            'SourceUser': {'ProviderName': '%(provider)s',\n"
+    "                           'ProviderAttributeName': 'Cognito_Subject',\n"
+    "                           'ProviderAttributeValue': '%(subject)s'},\n"
+    "        }).encode(),\n"
+    "        headers={\n"
+    "            'Content-Type': 'application/x-amz-json-1.1',\n"
+    "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.AdminLinkProviderForUser',\n"
+    "        },\n"
+    "        method='POST',\n"
+    "    )\n"
+    "    urllib.request.urlopen(req, timeout=6).read()\n"
+    "    return event\n"
+)
+
+
+def _create_presignup_linking_lambda(lam, fn_name, provider, subject):
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(
+            _LINKING_PRESIGNUP_HANDLER % {"provider": provider, "subject": subject})},
+        Timeout=8,
+    )
+    return lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+
+def _linktest_token_response(cid, redirect_location):
+    code = _parse_qs(urlparse(redirect_location).query)["code"][0]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token",
+        data=(f"grant_type=authorization_code&code={code}&client_id={cid}"
+              f"&redirect_uri=http://localhost:3000/callback").encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _saml_first_sign_in_location(cid, name_id):
+    try:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestSAML&state=s&scope=openid")
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["RelayState"][0]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=_urlencode({"SAMLResponse": _build_mock_saml_response(name_id=name_id),
+                         "RelayState": relay_state}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        return e.headers.get("Location", "")
+
+
+def _linktest_native_sub(cognito_idp, pid, username):
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username=username)
+    return {a["Name"]: a["Value"] for a in user["UserAttributes"]}["sub"]
+
+
+def test_cognito_saml_presignup_link_resolves_first_sign_in_to_linked_user(cognito_idp, lam):
+    """AdminLinkProviderForUser called inside PreSignUp_ExternalProvider applies to the same sign-in."""
+    fn_arn = _create_presignup_linking_lambda(
+        lam, "ministack-presignup-saml-link", "TestSAML", "linked-saml@example.com")
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="native-user", MessageAction="SUPPRESS")
+    native_sub = _linktest_native_sub(cognito_idp, pid, "native-user")
+
+    location = _saml_first_sign_in_location(cid, "linked-saml@example.com")
+
+    tokens = _linktest_token_response(cid, location)
+    assert _decode_jwt_claims(tokens["id_token"])["cognito:username"] == "native-user"
+    assert _decode_jwt_claims(tokens["id_token"])["sub"] == native_sub
+    assert _decode_jwt_claims(tokens["access_token"])["sub"] == native_sub
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_linked-saml@example.com")
+
+
+def test_cognito_saml_presignup_without_link_still_creates_federated_user(cognito_idp, lam):
+    """A PreSignUp trigger that links a different identity leaves this sign-in a new user."""
+    fn_arn = _create_presignup_linking_lambda(
+        lam, "ministack-presignup-saml-other-link", "TestSAML", "someone-else@example.com")
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="native-user", MessageAction="SUPPRESS")
+
+    _saml_first_sign_in_location(cid, "unlinked@example.com")
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_unlinked@example.com")
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+
+
+def test_cognito_oidc_presignup_link_resolves_first_sign_in_to_linked_user(cognito_idp, lam):
+    """The OIDC callback also applies a link made inside PreSignUp_ExternalProvider."""
+    fn_arn = _create_presignup_linking_lambda(
+        lam, "ministack-presignup-oidc-link", "TestOIDC", "user-linked")
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "user-linked", "email": "linked-oidc@example.com"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"PreSignUp": fn_arn})
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="native-user", MessageAction="SUPPRESS")
+        native_sub = _linktest_native_sub(cognito_idp, pid, "native-user")
+
+        try:
+            _no_redirect_opener.open(
+                f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+                f"&redirect_uri=http://localhost:3000/callback"
+                f"&identity_provider=TestOIDC&state=s&scope=openid")
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+        try:
+            _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            location = e.headers.get("Location", "")
+
+        tokens = _linktest_token_response(cid, location)
+        claims = _decode_jwt_claims(tokens["id_token"])
+        assert claims["cognito:username"] == "native-user"
+        assert claims["sub"] == native_sub
+        with pytest.raises(ClientError):
+            cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_user-linked")
+    finally:
+        stop()
+
+
+def test_cognito_federation_access_token_pretoken_event_has_user_attributes(cognito_idp, lam):
+    """The access-token PreTokenGeneration event of a federation /oauth2/token carries userAttributes and groups."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    attrs = event['request'].get('userAttributes') or {}\n"
+        "    groups = event['request'].get('groupConfiguration', {}).get('groupsToOverride') or []\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "        'accessTokenGeneration': {'claimsToAddOrOverride': {\n"
+        "            'seen_sub': attrs.get('sub', 'MISSING'),\n"
+        "            'seen_groups': ','.join(groups),\n"
+        "        }},\n"
+        "    }\n"
+        "    return event\n"
+    )
+    lam.create_function(
+        FunctionName="ministack-pretoken-federation-access", Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(
+        FunctionName="ministack-pretoken-federation-access")["Configuration"]["FunctionArn"]
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={
+        "PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": "V2_0"}})
+    cognito_idp.create_group(UserPoolId=pid, GroupName="admins")
+
+    location = _saml_first_sign_in_location(cid, "pretoken@example.com")
+    # Join the group after provisioning but before the code is redeemed.
+    cognito_idp.admin_add_user_to_group(
+        UserPoolId=pid, Username="TestSAML_pretoken@example.com", GroupName="admins")
+    tokens = _linktest_token_response(cid, location)
+
+    access = _decode_jwt_claims(tokens["access_token"])
+    assert access["seen_sub"] == access["sub"]
+    assert access["seen_groups"] == "admins"

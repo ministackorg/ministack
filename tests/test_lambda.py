@@ -13957,6 +13957,50 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
         (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
 
 
+def test_lambda_trust_files_are_copied_not_mounted_when_ministack_runs_in_docker(monkeypatch, tmp_path):
+    """In a container the trust files are docker cp'd, not bind-mounted; a symlink is followed."""
+    import tarfile
+
+    real = tmp_path / "real.crt"
+    real.write_text("-----BEGIN CERTIFICATE-----\n")
+    (tmp_path / "server.crt").symlink_to(real)
+    (tmp_path / "server.key").write_text("key")
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setenv("MINISTACK_SSL_CERT", str(tmp_path / "server.crt"))
+    monkeypatch.setenv("MINISTACK_SSL_KEY", str(tmp_path / "server.key"))
+    monkeypatch.setattr(lsvc, "_is_in_container", True)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "")
+
+    captured, archived = {}, {}
+    container = _mk_container()
+    container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _put_archive(path, data):
+        with tarfile.open(fileobj=data) as tar:
+            archived.update({(path, m.name): m.isfile() for m in tar.getmembers()})
+
+    container.put_archive.side_effect = _put_archive
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return container
+
+    client = MagicMock()
+    client.containers.run = _capture
+    client.containers.create = _capture
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "trust-fn", "PackageType": "Image", "ImageUri": "my-repo/my-image:latest",
+         "Timeout": 3, "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:trust-fn"},
+        None,
+    )
+    assert [m["Target"] for m in captured.get("mounts", []) if m["Target"].startswith("/var/ministack/")] == []
+    assert archived[("/", "var/ministack/ministack-ca.pem")] is True
+
+
 def test_cognito_issuer_wiring_never_overrides_the_caller(monkeypatch, tmp_path):
     """LAMBDA_DOCKER_FLAGS --add-host and a function's own env come first."""
     from ministack.services import lambda_svc as lsvc

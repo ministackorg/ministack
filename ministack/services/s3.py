@@ -4476,6 +4476,45 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None, query_
     return 200, resp_headers, b""
 
 
+def _cloudfront_origin_allows(owner: str, bucket_name: str, key: str, source_arn: str, oai_id: str) -> bool:
+    """Whether S3 lets CloudFront read the object: OAC as cloudfront.amazonaws.com, OAI as its user, else anonymous."""
+    if _foreign_bucket_allows(owner, bucket_name, key, "GET", {}, ""):
+        return True
+    policy = _bucket_policies.get_scoped(owner, None, bucket_name)
+    if not policy or not (source_arn or oai_id):
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    ctx = EvalContext(
+        principal_arn=(f"arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity {oai_id}"
+                       if oai_id else "*"),
+        principal_type="User" if oai_id else "Service",
+        principal_account="",
+        action="s3:GetObject",
+        resource_arn=f"arn:aws:s3:::{bucket_name}/{key}",
+        region=get_region(),
+        service_context={"aws:sourcearn": source_arn} if source_arn else {},
+    )
+    service = None if oai_id else "cloudfront.amazonaws.com"
+    return evaluate_resource_policy(policy, ctx, service=service).decision == "Allow"
+
+
+def serve_cloudfront_origin_fetch(bucket_name: str, key: str, method: str, headers: dict,
+                                  source_arn: str = "", oai_id: str = "") -> tuple:
+    """A CloudFront origin fetch from an S3 bucket, served in-process."""
+    headers = dict(headers or {})
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    owner = _bucket_owner_account(bucket_name) or get_account_id()
+    if not _cloudfront_origin_allows(owner, bucket_name, key, source_arn, oai_id) or key not in bucket["objects"]:
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket_name}/{key}")
+    if method == "HEAD":
+        status, resp_headers, _ = _head_object(bucket_name, key, headers, {})
+        return status, resp_headers, b""
+    return _get_object(bucket_name, key, headers, {})
+
+
 def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     """Remove the current object plus its key-level metadata and on-disk copy."""
     bucket["objects"].pop(key, None)

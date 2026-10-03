@@ -1505,9 +1505,7 @@ def _gateway_error_response(error, request):
         # AWS renders the messageString of these types with a leading space (measured).
         message_string = " " + message_string
     if response_type == "AUTHORIZER_CONFIGURATION_ERROR":
-        # $context.error.responseType renders as API_CONFIGURATION_ERROR, while the
-        # response entry, its status and x-amzn-ErrorType stay those of
-        # AUTHORIZER_CONFIGURATION_ERROR (measured).
+        # Rendered as API_CONFIGURATION_ERROR; entry, status and error type stay AUTHORIZER_* (measured).
         rendered_type = "API_CONFIGURATION_ERROR"
     variables = {
         "context.error.message": "" if message is None else message,

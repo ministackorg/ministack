@@ -14,7 +14,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DeleteDBClusterParameterGroup, DescribeDBClusterParameters,
           ModifyDBClusterParameterGroup, ResetDBClusterParameterGroup,
           CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
-          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DeleteDBClusterSnapshot,
+          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DescribeDBClusterSnapshotAttributes,
+          DeleteDBClusterSnapshot,
           CreateOptionGroup, DeleteOptionGroup, DescribeOptionGroups, DescribeOptionGroupOptions,
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
@@ -6783,6 +6784,24 @@ def _describe_db_cluster_snapshots(p):
         f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
 
 
+def _describe_db_cluster_snapshot_attributes(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    if not snap_id or snap_id not in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotNotFoundFault",
+            f"DB cluster snapshot {snap_id} not found.", 404)
+    # Never shared: ModifyDBClusterSnapshotAttribute is not implemented.
+    result = (
+        f"<DBClusterSnapshotAttributesResult>"
+        f"<DBClusterSnapshotIdentifier>{_esc(snap_id)}</DBClusterSnapshotIdentifier>"
+        f"<DBClusterSnapshotAttributes>"
+        f"<DBClusterSnapshotAttribute><AttributeName>restore</AttributeName><AttributeValues></AttributeValues></DBClusterSnapshotAttribute>"
+        f"</DBClusterSnapshotAttributes>"
+        f"</DBClusterSnapshotAttributesResult>"
+    )
+    return _xml(200, "DescribeDBClusterSnapshotAttributesResponse",
+        f"<DescribeDBClusterSnapshotAttributesResult>{result}</DescribeDBClusterSnapshotAttributesResult>")
+
+
 def _delete_db_cluster_snapshot(p):
     snap_id = _p(p, "DBClusterSnapshotIdentifier")
     snap = _db_cluster_snapshots.pop(snap_id, None)
@@ -11101,6 +11120,7 @@ _ACTION_MAP = {
     "DescribeDBSnapshots": _describe_db_snapshots,
     "CreateDBClusterSnapshot": _create_db_cluster_snapshot,
     "DescribeDBClusterSnapshots": _describe_db_cluster_snapshots,
+    "DescribeDBClusterSnapshotAttributes": _describe_db_cluster_snapshot_attributes,
     "DeleteDBClusterSnapshot": _delete_db_cluster_snapshot,
     "CreateDBSubnetGroup": _create_subnet_group,
     "DeleteDBSubnetGroup": _delete_subnet_group,

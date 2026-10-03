@@ -1027,3 +1027,61 @@ def test_agentcore_state_with_legacy_arns_moves_to_aws_arns():
         assert eps["DEFAULT"]["liveVersion"] == "3"
     finally:
         svc.load_persisted_state(saved)
+
+
+def test_agentcore_memory_lifecycle_and_pagination():
+    control = _client("bedrock-agentcore-control")
+    name = f"memory_{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        control.create_memory(
+            name=f"memory_{_uuid_mod.uuid4().hex[:8]}",
+            eventExpiryDuration=30,
+            tags={"purpose": "unsupported"},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    created = control.create_memory(name=name, eventExpiryDuration=30)
+    memory_id = created["memory"]["id"]
+    second_memory_id = None
+
+    try:
+        memory = control.get_memory(memoryId=memory_id)["memory"]
+        assert memory["name"] == name
+        assert memory["eventExpiryDuration"] == 30
+
+        second = control.create_memory(
+            name=f"memory_{_uuid_mod.uuid4().hex[:8]}", eventExpiryDuration=14
+        )
+        second_memory_id = second["memory"]["id"]
+        assert control.list_memories(maxResults=1)["nextToken"]
+
+        updated = control.update_memory(
+            memoryId=memory_id,
+            description="Explicit long-term records",
+            eventExpiryDuration=60,
+            addIndexedKeys=[{"key": "source", "type": "STRING"}],
+            namespaceKeys=[{"key": "tenant"}],
+        )["memory"]
+        assert updated["status"] == "UPDATING"
+        memory = control.get_memory(memoryId=memory_id)["memory"]
+        assert memory["description"] == "Explicit long-term records"
+        assert memory["eventExpiryDuration"] == 60
+        assert memory["indexedKeys"] == [{"key": "source", "type": "STRING"}]
+        assert memory["namespaceKeys"] == [{"key": "tenant"}]
+
+        with pytest.raises(ClientError) as exc:
+            control.update_memory(
+                memoryId=memory_id,
+                eventExpiryDuration=90,
+                memoryStrategies={
+                    "deleteMemoryStrategies": [{"memoryStrategyId": "unsupported"}]
+                },
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert control.get_memory(memoryId=memory_id)["memory"][
+            "eventExpiryDuration"
+        ] == 60
+    finally:
+        control.delete_memory(memoryId=memory_id)
+        if second_memory_id:
+            control.delete_memory(memoryId=second_memory_id)
