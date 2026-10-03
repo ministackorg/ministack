@@ -2245,6 +2245,36 @@ def test_cfn_condition_selects_from_comma_delimited_list(cfn):
         _delete_cfn_test_stack(cfn, name)
 
 
+def test_cfn_condition_select_out_of_range_is_a_template_error(cfn):
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Conditions": {"C": {"Fn::Equals": [{"Fn::Select": [5, {"Ref": "Spec"}]}, ""]}},
+        "Resources": {"T": {"Type": "AWS::SNS::Topic", "Condition": "C"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=f"cfn-sel-oob-{_uuid_mod.uuid4().hex[:8]}",
+                         TemplateBody=json.dumps(template))
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert exc.value.response["Error"]["Message"] == (
+        "Template error: Fn::Select cannot select nonexistent value at index 5")
+
+
+def test_cfn_ssm_parameter_rejects_a_list_value(cfn):
+    name = f"cfn-ssm-list-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter",
+                            "Properties": {"Type": "String", "Value": {"Ref": "Names"}}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert ("Properties validation failed for resource P with message: "
+                "[#/Value: expected type: String, found: JSONArray]") in _stack_event_reasons(cfn, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_outputs_exports(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",

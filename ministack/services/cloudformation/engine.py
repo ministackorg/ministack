@@ -637,9 +637,7 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
                 if isinstance(items, str):
                     # A CommaDelimitedList parameter is one string here: "id,S,," becomes ["id", "S", "", ""]
                     items = [s.strip() for s in items.split(",")]
-                if 0 <= index < len(items):
-                    return items[index]
-                return ""
+                return _select(index, items)
         return val
 
     for name, defn in cond_defs.items():
@@ -771,6 +769,13 @@ def _check_rules_section(template: dict) -> None:
         _check_rule_expression(rule.get("RuleCondition"), name)
         for assertion in rule["Assertions"]:
             _check_rule_expression(assertion["Assert"], name)
+
+
+def _select(index: int, items: list):
+    """Fn::Select; an index outside the list fails the template, as on AWS."""
+    if not 0 <= index < len(items):
+        raise ValueError(f"Template error: Fn::Select cannot select nonexistent value at index {index}")
+    return items[index]
 
 
 def _rule_inner_type(ptype: str) -> tuple[str, bool]:
@@ -1181,9 +1186,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                               mappings, stack_name, stack_id)
         if isinstance(items, str):
             items = [s.strip() for s in items.split(",")]
-        if 0 <= index < len(items):
-            return items[index]
-        return ""
+        return _select(index, items)
 
     # --- Fn::Split ---
     if "Fn::Split" in value:

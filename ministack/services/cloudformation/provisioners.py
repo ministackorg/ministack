@@ -2750,7 +2750,10 @@ def _iam_ip_delete(physical_id, props):
 _SSM_CFN_PARAMETER_TYPES = ("String", "StringList")
 
 
-def _ssm_check_type(props):
+def _ssm_check_type(props, logical_id):
+    if isinstance(props.get("Value"), list):
+        raise ValueError(f"Properties validation failed for resource {logical_id} with message: "
+                         "[#/Value: expected type: String, found: JSONArray]")
     ptype = props.get("Type", "String")
     if ptype not in _SSM_CFN_PARAMETER_TYPES:
         raise ValueError(
@@ -2790,7 +2793,7 @@ def _ssm_create(logical_id, props, stack_name):
     # two doors into the same store behave alike: a create over an existing
     # parameter fails as real CloudFormation does (`ParameterAlreadyExists`), and
     # Version/history stay consistent with the API path.
-    _ssm_check_type(props)
+    _ssm_check_type(props, logical_id)
     name = props.get("Name") or f"/{stack_name}/{logical_id}"
     data = _ssm_put_data(name, props)
     status, _headers, body = _ssm._put_parameter(data)
@@ -2799,8 +2802,8 @@ def _ssm_create(logical_id, props, stack_name):
     return name, _ssm_attrs(name, data)
 
 
-def _ssm_update(physical_id, old_props, new_props, stack_name):
-    _ssm_check_type(new_props)
+def _ssm_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _ssm_check_type(new_props, logical_id or physical_id)
     new_name = new_props.get("Name")
     if new_name and new_name != physical_id:
         # Name is Update requires: Replacement — create the new parameter and
@@ -13066,7 +13069,8 @@ _RESOURCE_HANDLERS = {
         "delete": _iam_ip_delete,
     },
     "AWS::SSM::Parameter": {
-        "create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete, "import": _ssm_import,
+        "create": _ssm_create, "update": _ssm_update, "update_with_logical_id": True,
+        "delete": _ssm_delete, "import": _ssm_import,
     },
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,

@@ -319,8 +319,8 @@ def _create_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
-    conditions = _evaluate_conditions(template, param_values)
     try:
+        conditions = _evaluate_conditions(template, param_values)
         validate_template_support(template, conditions, params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
