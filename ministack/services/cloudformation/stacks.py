@@ -17,19 +17,24 @@ from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
     _extract_deps,
+    _intrinsic_references,
     _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
 )
 from .provisioners import (
     _DEFERRED_PREDECESSOR_DELETES,
+    _NAME_SEED,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
     _custom_named_replacement_error,
     _delete_resource,
+    _import_resource,
     _property_recreation,
     _provision_resource,
+    _replacing_change,
     _snapshot_resource,
+    _tag_map,
     _update_resource,
     _with_stack_tags,
 )
@@ -81,6 +86,11 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
                                  "AWS::CloudFormation::Stack",
                                  "AWS::ElastiCache::CacheCluster",
                                  "AWS::ElastiCache::ReplicationGroup"))
+
+
+def _update_keeping_seed(*args):
+    """_update_resource's result and the name seed it left."""
+    return _update_resource(*args), _NAME_SEED.get()
 
 
 # ===========================================================================
@@ -156,6 +166,28 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
+
+
+# The reasons AWS gives the events of an imported resource.
+_IMPORT_STARTED = "Resource import started."
+_IMPORT_COMPLETED = "Resource import completed."
+_IMPORT_TAGS = "Apply stack-level tags to imported resource if applicable."
+_IMPORT_UNTAG = "Remove stack-level tags from imported resource if applicable."
+
+
+def _adopt_resource(stack_id, stack_name, logical_id, resource_type, identifier):
+    """Import an existing resource during a create or update, with AWS's events."""
+    from .changesets import _import_not_found
+    _add_event(stack_id, stack_name, logical_id, resource_type, "IMPORT_IN_PROGRESS",
+               _IMPORT_STARTED)
+    missing = _import_not_found([{"ResourceType": resource_type, "ResourceIdentifier": identifier}])
+    if missing is not None:
+        raise ValueError(missing)
+    physical_id, attrs = _import_resource(resource_type, identifier)
+    for status, reason in (("IMPORT_IN_PROGRESS", ""), ("IMPORT_COMPLETE", _IMPORT_COMPLETED),
+                           ("UPDATE_IN_PROGRESS", _IMPORT_TAGS), ("UPDATE_COMPLETE", "")):
+        _add_event(stack_id, stack_name, logical_id, resource_type, status, reason, physical_id)
+    return physical_id, attrs
 
 
 # ===========================================================================
@@ -238,6 +270,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
     type's update handler; ``record`` takes the attributes it answers."""
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
                physical_id=physical_id)
+    seed_token = _NAME_SEED.set((record or {}).get("_name_seed", ""))
     try:
         if _runs_on_worker_thread(rtype):
             new_pid, new_attrs = await run_reentrant(
@@ -252,6 +285,8 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
         _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_FAILED",
                    str(exc), physical_id)
         raise
+    finally:
+        _NAME_SEED.reset(seed_token)
     if record is not None:
         if new_pid != physical_id:
             logger.warning("Rollback update of %s moved it from %s to %s",
@@ -326,7 +361,7 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
 def _failed_operation(is_update, previous_stack, created, failed_update,
                       failed_logical_id, replaced_ids, cancelled, template,
                       param_values, retain_except_on_create, stack_tags,
-                      previous_tags) -> dict:
+                      previous_tags, imports=None) -> dict:
     """What the rollback of a failed operation needs, kept on the stack record
     of a ``*_FAILED`` stack (``DisableRollback``) until ``RollbackStack`` runs
     it. Lists only, so the record survives the JSON persistence round trip."""
@@ -343,6 +378,7 @@ def _failed_operation(is_update, previous_stack, created, failed_update,
         "retain_except_on_create": bool(retain_except_on_create),
         "stack_tags": list(stack_tags or []),
         "previous_tags": list(previous_tags or []),
+        "imports": dict(imports or {}),
     }
 
 
@@ -365,6 +401,7 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
     retain_except_on_create = operation.get("retain_except_on_create", False)
     stack_tags = operation.get("stack_tags") or []
     previous_tags = operation.get("previous_tags") or []
+    imports = operation.get("imports") or {}
     mappings = template.get("Mappings", {})
     conditions = _evaluate_conditions(template, param_values)
     resources_defs = template.get("Resources", {})
@@ -439,12 +476,30 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
     # resources" (view-stack-events): a cleanup delete failure does not fail it.
     cleanup_phase = bool(is_update and previous_stack
                          and not rollback_failed_records)
+
+    def release():
+        # An imported resource leaves the stack as it came; one that failed never got tags.
+        if failed_logical_id in imports:
+            for status in ("IMPORT_ROLLBACK_IN_PROGRESS", "IMPORT_ROLLBACK_COMPLETE"):
+                _add_event(stack_id, stack_name, failed_logical_id,
+                           resources_defs[failed_logical_id].get("Type", ""), status)
+        for logical_id in reversed([lid for lid in to_delete if lid in imports]):
+            res = provisioned_resources.pop(logical_id, {})
+            for status, reason in (("UPDATE_IN_PROGRESS", _IMPORT_UNTAG), ("UPDATE_COMPLETE", ""),
+                                   ("IMPORT_ROLLBACK_IN_PROGRESS", ""),
+                                   ("IMPORT_ROLLBACK_COMPLETE", "")):
+                _add_event(stack_id, stack_name, logical_id, res.get("ResourceType", ""),
+                           status, reason, res.get("PhysicalResourceId", ""))
+
+    # An update releases them before its cleanup, a create after its deletes.
+    if is_update and previous_stack:
+        release()
     if cleanup_phase:
         stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS"
         _add_event(stack_id, stack_name, stack_name,
                    "AWS::CloudFormation::Stack", stack["StackStatus"],
                    physical_id=stack_id)
-    for logical_id in reversed(to_delete):
+    for logical_id in reversed([lid for lid in to_delete if lid not in imports]):
         res = provisioned_resources.get(logical_id, {})
         rtype = res.get("ResourceType", "")
         pid = res.get("PhysicalResourceId", "")
@@ -486,6 +541,8 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
                 "Properties": res_props,
             }
         provisioned_resources.pop(logical_id, None)
+    if not (is_update and previous_stack):
+        release()
 
     if is_update and previous_stack:
         # Restore previous resources
@@ -531,12 +588,15 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
                               previous_stack: dict | None = None,
-                              retain_except_on_create: bool = False):
+                              retain_except_on_create: bool = False,
+                              imports: dict | None = None):
     """Background task: provision resources and set final stack status.
 
     ``retain_except_on_create`` is the API parameter of the same name: a
     rollback of this operation then deletes what the operation created even
     when the template says ``DeletionPolicy: Retain``."""
+    # The identifiers of the resources ImportExistingResources adopts, by logical id.
+    imports = imports or {}
     from ministack.services.cloudformation import _exports, _stacks
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
@@ -605,6 +665,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
         raw_props = res_def.get("Properties", {})
         update_attempt = None
+        name_seed = ""
 
         try:
             # Resolve properties
@@ -642,8 +703,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 reuse_secrets=resource_unchanged,
             )
 
-            _add_event(stack_id, stack_name, logical_id, resource_type,
-                       f"{status_prefix}_IN_PROGRESS")
+            if logical_id not in imports:
+                _add_event(stack_id, stack_name, logical_id, resource_type,
+                           f"{status_prefix}_IN_PROGRESS")
 
             # On stack update, route previously-provisioned resources through
             # the type's update handler when one exists; otherwise fall back
@@ -672,22 +734,29 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     stack_name, stack_id, logical_id)
                 pending_deletes = []
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
-                # A custom-named refusal never reaches the handler: nothing to send back.
-                if not _custom_named_replacement_error(
-                        resource_type, old_tagged, new_tagged):
+                seed_token = _NAME_SEED.set(prev_resource.get("_name_seed", ""))
+                # A refusal or a replacement leaves the resource as it was: nothing to send back.
+                refused = _custom_named_replacement_error(resource_type, old_tagged, new_tagged)
+                if not refused and _replacing_change(resource_type, old_tagged, new_tagged):
+                    _add_event(stack_id, stack_name, logical_id, resource_type,
+                               "UPDATE_IN_PROGRESS",
+                               "Requested update requires the creation of a new "
+                               "physical resource; hence creating one.", old_pid)
+                elif not refused:
                     update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
                     if _runs_on_worker_thread(resource_type):
-                        physical_id, attrs = await run_reentrant(
-                            _update_resource, resource_type, old_pid, old_tagged,
+                        (physical_id, attrs), name_seed = await run_reentrant(
+                            _update_keeping_seed, resource_type, old_pid, old_tagged,
                             new_tagged, stack_name, logical_id, old_attrs
                         )
                     else:
-                        physical_id, attrs = _update_resource(
+                        (physical_id, attrs), name_seed = _update_keeping_seed(
                             resource_type, old_pid, old_tagged, new_tagged,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
+                    _NAME_SEED.reset(seed_token)
                     _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
                 if physical_id != old_pid or pending_deletes:
@@ -702,7 +771,10 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
                     stack_name, stack_id, logical_id)
-                if _runs_on_worker_thread(resource_type):
+                if logical_id in imports:
+                    physical_id, attrs = _adopt_resource(
+                        stack_id, stack_name, logical_id, resource_type, imports[logical_id])
+                elif _runs_on_worker_thread(resource_type):
                     physical_id, attrs = await run_reentrant(
                         _provision_resource, resource_type, logical_id, new_tagged, stack_name
                     )
@@ -714,7 +786,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             logger.error("Failed to provision %s (%s): %s",
                          logical_id, resource_type, exc)
             _add_event(stack_id, stack_name, logical_id, resource_type,
-                       f"{status_prefix}_FAILED", str(exc))
+                       "IMPORT_FAILED" if logical_id in imports else f"{status_prefix}_FAILED",
+                       str(exc))
             failed = True
             fail_reason = f"Resource {logical_id} failed: {exc}"
             failed_logical_id = logical_id
@@ -732,7 +805,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         provisioned_resources[logical_id] = {
             "PhysicalResourceId": physical_id,
             "ResourceType": resource_type,
-            "ResourceStatus": f"{status_prefix}_COMPLETE",
+            "ResourceStatus": ("UPDATE_COMPLETE" if logical_id in imports
+                               else f"{status_prefix}_COMPLETE"),
             "LogicalResourceId": logical_id,
             "Properties": resolved_props,
             "Attributes": attrs,
@@ -740,10 +814,13 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         }
         if dynamic_values:
             provisioned_resources[logical_id]["_dynamic"] = dynamic_values
+        if name_seed:
+            provisioned_resources[logical_id]["_name_seed"] = name_seed
         created_in_this_run.append(logical_id)
 
-        _add_event(stack_id, stack_name, logical_id, resource_type,
-                   f"{status_prefix}_COMPLETE", physical_id=physical_id)
+        if logical_id not in imports:
+            _add_event(stack_id, stack_name, logical_id, resource_type,
+                       f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
     resolved_outputs: list = []
     new_exports: dict = {}
@@ -868,7 +945,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             is_update, previous_stack, created_in_this_run, failed_update,
             failed_logical_id, [entry[0] for entry in replaced_resources],
             cancelled, template, param_values, retain_except_on_create,
-            stack_tags, previous_tags)
+            stack_tags, previous_tags, imports)
         if disable_rollback:
             stack["StackStatus"] = f"{status_prefix}_FAILED"
             stack["StackStatusReason"] = fail_reason
@@ -1078,6 +1155,18 @@ _DIFFED_ATTRIBUTES = (
     "UpdateReplacePolicy",
 )
 
+# Types a stack-tag change leaves out of a change set (measured).
+_UNTAGGED_TYPES = (
+    "AWS::CloudFormation::CustomResource",
+    "AWS::CloudFormation::WaitCondition",
+    "AWS::CloudFormation::WaitConditionHandle",
+)
+
+
+def _stack_tags_changed(stack: dict, tags: list, tags_given: bool) -> bool:
+    """True when a request's stack tags differ from the stack's, order aside."""
+    return bool(tags or tags_given) and _tag_map(tags) != _tag_map(stack.get("Tags"))
+
 
 _POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
                    "Snapshot": "Snapshot"}
@@ -1090,22 +1179,103 @@ def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
     return {"PolicyAction": prefix + action} if action else {}
 
 
-def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None) -> list:
+def _replacement(details: list, type_changed: bool) -> str:
+    """The Replacement of a Modify that carries these details."""
+    recreation = {(d["Target"]["RequiresRecreation"], d["Evaluation"]) for d in details}
+    if type_changed or ("Always", "Static") in recreation:
+        return "True"
+    if any(r != "Never" for r, _ in recreation):
+        return "Conditional"
+    return "False"
+
+
+def _reference_details(res_def: dict, replacements: dict, changed_params) -> dict:
+    """Details per property for its references to changed parameters and resources."""
+    rtype = res_def.get("Type", "")
+    found: dict = {}
+    for name, value in (res_def.get("Properties") or {}).items():
+        for ref, attr in _intrinsic_references(value):
+            if ref in changed_params and attr is None:
+                source, entity, evaluation = "ParameterReference", ref, "Static"
+            elif ref in replacements and (attr or replacements[ref] != "False"):
+                source = "ResourceAttribute" if attr else "ResourceReference"
+                entity = f"{ref}.{attr}" if attr else ref
+                evaluation = "Static" if replacements[ref] == "True" else "Dynamic"
+            else:
+                continue
+            detail = {
+                "Target": {"Attribute": "Properties", "Name": name,
+                           "RequiresRecreation": _property_recreation(rtype, name)},
+                "Evaluation": evaluation,
+                "ChangeSource": source,
+                "CausingEntity": entity,
+            }
+            if detail not in found.setdefault(name, []):
+                found[name].append(detail)
+    return found
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None,
+                    template: dict | None = None, changed_params=(), retag=()) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    References in ``template`` (unresolved) to changed parameters or resources add their own details.
     ``resources`` are the stack's provisioned resources, whose physical ids a
     ``Remove`` or ``Modify`` reports.
+    Each resource in ``retag`` (the stack's resources when its tags change)
+    outside ``_UNTAGGED_TYPES`` also gets a ``Tags`` entry.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
+    raw_res = (template or new_template).get("Resources", {})
     changes = []
 
-    all_keys = old_res.keys() | new_res.keys()
-    for key in sorted(all_keys):
+    common = old_res.keys() & new_res.keys()
+    changed_props, attr_details, type_changed = {}, {}, {}
+    for key in common:
+        old_props = old_res[key].get("Properties", {}) or {}
+        new_props = new_res[key].get("Properties", {}) or {}
+        changed_props[key] = {name for name in set(old_props) | set(new_props)
+                              if old_props.get(name) != new_props.get(name)}
+        attr_details[key] = [
+            {"Target": {"Attribute": attr, "RequiresRecreation": "Never"},
+             "Evaluation": "Static", "ChangeSource": "DirectModification"}
+            for attr in _DIFFED_ATTRIBUTES
+            if old_res[key].get(attr) != new_res[key].get(attr)
+        ]
+        type_changed[key] = old_res[key].get("Type") != new_res[key].get("Type")
+
+    def _modify_details(key, refs):
+        details = []
+        rtype = new_res[key].get("Type", "")
+        for name in sorted(changed_props[key] | set(refs)):
+            if name in changed_props[key]:
+                details.append({
+                    "Target": {"Attribute": "Properties", "Name": name,
+                               "RequiresRecreation": _property_recreation(rtype, name)},
+                    "Evaluation": "Dynamic" if refs.get(name) else "Static",
+                    "ChangeSource": "DirectModification",
+                })
+            details.extend(refs.get(name, []))
+        return details + attr_details[key]
+
+    # Repeat until no reference adds a detail: a change can cascade to its referrers.
+    refs: dict = {}
+    while True:
+        details = {key: _modify_details(key, refs.get(key, {})) for key in common}
+        replacements = {key: _replacement(d, type_changed[key])
+                        for key, d in details.items() if d or type_changed[key]}
+        found = {key: _reference_details(raw_res.get(key, {}), replacements, changed_params)
+                 for key in common}
+        if found == refs:
+            break
+        refs = found
+
+    for key in sorted(old_res.keys() | new_res.keys()):
         pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
         physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
@@ -1127,41 +1297,23 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                 }
             })
         else:
-            details = []
-            old_props = old_res[key].get("Properties", {}) or {}
-            new_props = new_res[key].get("Properties", {}) or {}
             rtype = new_res[key].get("Type", "")
-            if old_props != new_props:
-                for name in sorted(set(old_props) | set(new_props)):
-                    if old_props.get(name) != new_props.get(name):
-                        details.append({
-                            "Target": {"Attribute": "Properties", "Name": name,
-                                       "RequiresRecreation":
-                                           _property_recreation(rtype, name)},
-                            "Evaluation": "Static",
-                            "ChangeSource": "DirectModification",
-                        })
-            for attr in _DIFFED_ATTRIBUTES:
-                if old_res[key].get(attr) != new_res[key].get(attr):
-                    details.append({
-                        "Target": {"Attribute": attr, "RequiresRecreation": "Never"},
-                        "Evaluation": "Static",
-                        "ChangeSource": "DirectModification",
-                    })
-            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
-            if not details and not type_changed:
+            retagged = key in retag and not (
+                rtype.startswith("Custom::") or rtype in _UNTAGGED_TYPES)
+            if key not in replacements and not retagged:
                 continue
             scope = []
-            for d in details:
+            for d in details[key]:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            recreation = {d["Target"].get("RequiresRecreation") for d in details}
-            if type_changed or "Always" in recreation:
-                replacement = "True"
-            elif "Conditionally" in recreation:
-                replacement = "Conditional"
-            else:
-                replacement = "False"
+            replacement = replacements.get(key, "False")
+            if retagged:
+                # First in Details, last in Scope, no ChangeSource (measured).
+                details[key].insert(0, {
+                    "Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
+                    "Evaluation": "Static",
+                })
+                scope.append("Tags")
             changes.append({
                 "ResourceChange": {
                     "Action": "Modify",
@@ -1172,7 +1324,7 @@ def _diff_resources(old_template: dict, new_template: dict, resources: dict | No
                     **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
                        if replacement == "True" else {}),
                     "Scope": scope,
-                    "Details": details,
+                    "Details": details[key],
                 }
             })
     return changes

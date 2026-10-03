@@ -1228,8 +1228,11 @@ def validate_role_arn(role_arn: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def evaluate_trust_policy(trust_doc: str | dict,
-                          caller_arn: str) -> bool:
+                          caller_arn: str, ctx: EvalContext | None = None) -> bool:
     """Check if a role's trust policy allows the given caller to assume it.
+
+    Matching denies override allows, regardless of statement order. Conditions
+    use the shared evaluator; omitted request context leaves STS keys absent.
 
     Supports Principal forms:
       - ``"*"`` — anyone
@@ -1251,23 +1254,40 @@ def evaluate_trust_policy(trust_doc: str | dict,
     if isinstance(statements, dict):
         statements = [statements]
 
+    if ctx is None:
+        ctx = EvalContext(
+            principal_arn=caller_arn,
+            principal_type=("User" if ":user/" in caller_arn else
+                            "AssumedRole" if ":assumed-role/" in caller_arn else "Root"),
+            principal_account=_account_from_arn(caller_arn) or "",
+            action="sts:AssumeRole", resource_arn="*", region="",
+        )
+    allowed = False
     for stmt in statements:
         if not isinstance(stmt, dict):
             continue
-        if stmt.get("Effect") != "Allow":
+        if stmt.get("Effect") not in ("Allow", "Deny"):
             continue
-        # Check Action includes sts:AssumeRole (or *)
+        # Match the requested action, including exclusions in NotAction.
         actions = stmt.get("Action", [])
+        not_actions = stmt.get("NotAction", [])
         if isinstance(actions, str):
             actions = [actions]
-        if not any(fnmatch_iam("sts:AssumeRole", a) for a in actions):
+        if isinstance(not_actions, str):
+            not_actions = [not_actions]
+        if not (actions or not_actions) or not _action_matches("sts:AssumeRole", actions, not_actions):
             continue
         # Check Principal
         principal = stmt.get("Principal", {})
-        if _principal_matches(principal, caller_arn):
-            return True
+        if not _principal_matches(principal, caller_arn):
+            continue
+        if not _conditions_met(stmt.get("Condition", {}), ctx):
+            continue
+        if stmt["Effect"] == "Deny":
+            return False
+        allowed = True
 
-    return False
+    return allowed
 
 
 def _principal_matches(principal: Any, caller_arn: str) -> bool:

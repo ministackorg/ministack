@@ -33,6 +33,7 @@ import os
 import secrets
 import threading
 import time
+from collections import Counter
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
@@ -505,7 +506,12 @@ def _create_cluster(data):
     name = data.get("clusterName", "default")
     if name in _clusters and _clusters[name]["status"] == "ACTIVE":
         return json_response({"cluster": _clusters[name]})
+    return json_response({"cluster": _put_cluster(data)})
 
+
+def _put_cluster(data):
+    """Store a cluster built from CreateCluster fields, replacing one of the same name."""
+    name = data.get("clusterName", "default")
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{name}"
     cluster = {
         "clusterArn": arn,
@@ -516,19 +522,21 @@ def _create_cluster(data):
         "pendingTasksCount": 0,
         "activeServicesCount": 0,
         "tags": data.get("tags", []),
-        "settings": data.get("settings", [
+        "settings": data.get("settings") or [
             {"name": "containerInsights", "value": "disabled"},
-        ]),
+        ],
         "capacityProviders": data.get("capacityProviders", []),
         "defaultCapacityProviderStrategy": data.get("defaultCapacityProviderStrategy", []),
         "statistics": [],
         "attachments": [],
         "attachmentsStatus": "",
     }
+    if data.get("configuration"):
+        cluster["configuration"] = data["configuration"]
     _clusters[name] = cluster
     if cluster["tags"]:
         _tags[arn] = list(cluster["tags"])
-    return json_response({"cluster": cluster})
+    return cluster
 
 
 def _delete_cluster(data):
@@ -549,20 +557,52 @@ def _describe_clusters(data):
     for ref in names:
         n = _resolve_cluster_name(ref)
         if n in _clusters:
-            c = dict(_clusters[n])
-            if "TAGS" in include:
-                c["tags"] = _tags.get(c["clusterArn"], [])
             _recount_cluster(n)
-            c.update({
-                "runningTasksCount": _clusters[n]["runningTasksCount"],
-                "pendingTasksCount": _clusters[n]["pendingTasksCount"],
-                "activeServicesCount": _clusters[n]["activeServicesCount"],
-            })
-            result.append(c)
+            result.append(_cluster_view(_clusters[n], include))
         else:
             arn = ref if ref.startswith("arn:") else f"arn:aws:ecs:{get_region()}:{get_account_id()}:cluster/{ref}"
             failures.append({"arn": arn, "reason": "MISSING"})
     return json_response({"clusters": result, "failures": failures})
+
+
+def _cluster_view(cluster, include):
+    """Cluster as DescribeClusters returns it for the given include values."""
+    c = {k: v for k, v in cluster.items()
+         if k not in ("attachments", "attachmentsStatus", "configuration")}
+    c["settings"] = cluster["settings"] if "SETTINGS" in include else []
+    c["statistics"] = _cluster_statistics(cluster) if "STATISTICS" in include else []
+    c["tags"] = _tags.get(cluster["clusterArn"], []) if "TAGS" in include else []
+    if "ATTACHMENTS" in include:
+        c["attachments"] = cluster.get("attachments", [])
+        if cluster.get("attachmentsStatus"):
+            c["attachmentsStatus"] = cluster["attachmentsStatus"]
+    if "CONFIGURATIONS" in include and "configuration" in cluster:
+        c["configuration"] = cluster["configuration"]
+    return c
+
+
+_STATISTICS_LAUNCH_TYPES = (("EC2", "FARGATE"), ("EXTERNAL",), ("MANAGED_INSTANCES",))
+_STATISTICS_LABELS = {"EC2": "EC2", "FARGATE": "Fargate", "EXTERNAL": "External",
+                      "MANAGED_INSTANCES": "ManagedInstances"}
+
+
+def _cluster_statistics(cluster):
+    """Task and service counters by launch type, in the order AWS lists them."""
+    name = cluster["clusterName"]
+    counts = Counter((t["lastStatus"], t.get("launchType")) for t in _tasks.values()
+                     if t.get("clusterArn") == cluster["clusterArn"])
+    counts.update((s["status"], s.get("launchType")) for k, s in _services.items()
+                  if k.startswith(f"{name}/"))
+    stats = []
+    for kind, states in (("Tasks", ("RUNNING", "PENDING")), ("Service", ("ACTIVE", "DRAINING"))):
+        for group in _STATISTICS_LAUNCH_TYPES:
+            for state in states:
+                for launch_type in group:
+                    stats.append({
+                        "name": f"{state.lower()}{_STATISTICS_LABELS[launch_type]}{kind}Count",
+                        "value": str(counts[(state, launch_type)]),
+                    })
+    return stats
 
 
 def _list_clusters(data):
@@ -617,8 +657,7 @@ def _register_task_definition(data):
         cdef.setdefault("cpu", 0)
         cdef.setdefault("essential", True)
 
-    rev = _task_def_latest.get(family, 0) + 1
-    _task_def_latest[family] = rev
+    rev = _next_task_def_revision(family)
     td_key = f"{family}:{rev}"
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
 
@@ -662,6 +701,13 @@ def _register_task_definition(data):
     if req_tags:
         _tags[arn] = list(req_tags)
     return json_response({"taskDefinition": td, "tags": req_tags})
+
+
+def _next_task_def_revision(family):
+    """Reserve the family's next revision number; numbers are never reused."""
+    rev = _task_def_latest.get(family, 0) + 1
+    _task_def_latest[family] = rev
+    return rev
 
 
 def _deregister_task_definition(data):
@@ -985,8 +1031,7 @@ def _complete_service_deployment(cluster_name, svc_key, expected_deployment_id=N
                     and primary.get("id") != expected_deployment_id)
                 or primary.get("runningCount", 0) < svc.get("desiredCount", 0)):
             return
-        # A callback can start more tasks during reconciliation. Its own
-        # startup window cannot certify those newly RUNNING replacements.
+        # Tasks started during reconciliation are not yet past their startup window.
         stable_count = sum(
             1 for task in _tasks.values()
             if task.get("group") == f"service:{svc_name}"
@@ -1076,13 +1121,9 @@ def _schedule_service_deployment_completion(
                 if (healthy_task and healthy_task.get("lastStatus") == "RUNNING"):
                     _record_service_task_healthy(svc_key, healthy_task)
                 _refresh_service_state(cluster_name, group)
-                # The first task establishes image digests before the other
-                # tasks are started. Also progress capacity-limited rollouts
-                # now that this task has survived the startup window.
+                # The first task's digests unblock the remaining tasks and capacity-limited rollouts.
                 _reconcile_service_tasks(cluster_name, svc_key)
-                # A predecessor's startup callback may run after an update,
-                # while a crashing replacement is briefly RUNNING. Its grace
-                # window cannot establish the replacement's stability.
+                # A predecessor's callback cannot certify a replacement deployment.
                 _complete_service_deployment(
                     cluster_name, svc_key, expected_deployment_id=deployment_id)
 
@@ -1104,8 +1145,7 @@ def _record_service_task_failure(task, digest_resolution_failed=False):
     schedule_completion = False
 
     with resource_lock("ecs-service", svc_key):
-        # A registry lookup can outlive StopTask/reset. Only digest resolution
-        # requires a still-active worker; ordinary task failures arrive stopped.
+        # A registry lookup can outlive StopTask/reset.
         if digest_resolution_failed and not _task_is_active(task.get("taskArn"), task):
             return
         svc = _services.get(svc_key)
@@ -1203,8 +1243,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     network_cfg = svc.get("networkConfiguration", {})
 
     if desired == 0:
-        # No replacement worker will schedule completion for an empty rollout.
-        # Stop every deployment's tasks, including predecessors of a force.
+        # Empty rollout: no worker will complete it, so stop every deployment's tasks here.
         for task_arn, task in list(_tasks.items()):
             if (task.get("group") == f"service:{svc_name}"
                     and task.get("clusterArn") == cluster_arn
@@ -1223,10 +1262,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
 
     primary = _primary_deployment(svc)
     is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
-    # Partition tasks by deployment as well as definition: a forced rollout
-    # uses the same definition but must replace its predecessor's tasks. A PENDING
-    # task already counts toward desired capacity, so reconciliation does not
-    # launch duplicates while its worker is pulling the image.
+    # Partition by deployment too (a force reuses the definition); PENDING counts as capacity.
     current_tasks = []
     stale_tasks = []
     for arn, t in _tasks.items():
@@ -1283,8 +1319,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
         if to_spawn > 0:
             if (is_rolling and primary and _get_docker()
                     and _deployment_needs_first_task(primary, td, svc)):
-                # Only the first task resolves tags. Its worker releases the
-                # remaining capacity after publishing the deployment's digests.
+                # Only the first task resolves tags; its worker releases the rest of the capacity.
                 to_spawn = 0 if current_tasks else min(to_spawn, 1)
         if to_spawn > 0:
             _run_task({
@@ -1507,8 +1542,7 @@ def _update_service(data):
     is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
     if (td_arn != svc["taskDefinition"]
             or (is_rolling and data.get("forceNewDeployment", False))):
-        # Bind legacy persisted tasks before inserting another deployment of
-        # the same definition; afterwards its ARN alone is ambiguous.
+        # Bind legacy tasks to their deployment before a same-definition one is added.
         for task in _tasks.values():
             if (task.get("group") == f"service:{svc_name}"
                     and task.get("clusterArn") == svc.get("clusterArn")):
@@ -2241,9 +2275,7 @@ def _prepare_service_images(task, td, docker_client):
             task.setdefault("_image_resolution_containers", []).append(name)
         else:
             unresolved = True
-            # MiniStack supports offline images for both launch types. A
-            # missing registry manifest is not a deployment failure when
-            # Docker can still run the requested image from its local cache.
+            # A missing manifest is not a failure while the image is cached locally (offline).
             try:
                 docker_client.images.get(image)
             except Exception:
@@ -2256,8 +2288,7 @@ def _prepare_service_images(task, td, docker_client):
             return None
         deployment["_image_digests"] = digests
         if unresolved:
-            # Stop resolving after three failed attempts. The circuit breaker
-            # still applies to images that cannot execute from local cache.
+            # Stop resolving after three failures; the breaker still covers uncached images.
             deployment["_image_resolution_disabled"] = True
     if unresolved and not unresolved_images_cached and (svc.get("deploymentConfiguration") or {}).get(
             "deploymentCircuitBreaker", {}).get("enable", False):
@@ -2284,16 +2315,14 @@ def _run_docker_container(
                     repository = _image_repository(cache_image)
                     tail = cache_image.rsplit("/", 1)[-1]
                     tag = tail.rsplit(":", 1)[1] if ":" in tail else "latest"
-                    # The agent tags a successful first-task canonical pull
-                    # back to its requested URI, preserving the default cache.
+                    # Tag the first-task canonical pull back to its requested URI.
                     if not pulled.tag(repository, tag=tag):
                         raise RuntimeError("unable to tag the pulled container image")
             except Exception as exc:
                 if not allow_cached:
                     raise _ImagePullError(str(exc)) from exc
                 logger.warning("ECS: image pull failed for %s; trying the local cache", cdef["image"])
-                # Preserve the resolver's tag fallback. Later tasks prefer the
-                # pinned cache entry, then try the original tag offline.
+                # Pull failed: try the pinned cache entry, then the original tag.
                 from docker.errors import ImageNotFound
                 for candidate in dict.fromkeys((cache_image or cdef["image"], fallback_image)):
                     if not candidate:
@@ -2419,9 +2448,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             digest = cdef["image"].split("@", 1)[1]
         if digest:
             effective_cdef["image"] = f"{_image_repository(cdef['image'])}@{digest}"
-            # ECS reports the resolved manifest digest. Under EC2's default
-            # policy it remains that digest even if a pull falls back to the
-            # original tag's cache, as in the agent's state-change payload.
+            # Report the resolved digest even when the pull fell back to the cached tag.
             with resource_lock("ecs-task", task_arn):
                 if _task_is_active(task_arn, task):
                     task["containers"][i]["imageDigest"] = digest

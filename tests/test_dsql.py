@@ -4,6 +4,7 @@ validator unit tests and live data-plane (wire proxy) tests.
 """
 
 import asyncio
+import logging
 import os
 import re
 import socket
@@ -1648,14 +1649,128 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _prepare_postgres_image(client, image):
+    """Keep registry acquisition out of the backend lifecycle being tested."""
+    from docker.errors import APIError, ImageNotFound
+
+    try:
+        client.images.get(image)
+        return
+    except ImageNotFound:
+        pass
+
+    # The daemon wraps registry token connection resets in an Engine API 500.
+    # Retry that observed transport failure, not permission/image/runtime errors.
+    for attempt in range(1, 4):
+        try:
+            client.images.pull(image)
+            return
+        except APIError as exc:
+            if exc.status_code != 500 or "connection reset by peer" not in str(exc).lower():
+                raise
+            logging.getLogger(__name__).warning(
+                "DSQL test image %s pull failed (attempt %d/3): %s", image, attempt, exc
+            )
+            if attempt == 3:
+                raise RuntimeError(f"Could not prepare DSQL test image {image} after 3 pull attempts") from exc
+            time.sleep(attempt)
+
+
+class TestPostgresImageSetup:
+    """Image preparation recovers from transient errors and preserves failures."""
+
+    @pytest.fixture
+    def image_client(self):
+        from unittest.mock import Mock
+
+        docker = pytest.importorskip("docker")
+        client = Mock()
+        client.images.get.side_effect = docker.errors.ImageNotFound("No such image")
+        return client
+
+    @staticmethod
+    def _pull_error(message, status=500):
+        import docker
+        from requests import Response
+
+        response = Response()
+        response.status_code = status
+        response.url = "http+docker://localhost/v1.48/images/create"
+        return docker.errors.APIError("Image pull failed", response=response, explanation=message)
+
+    def test_cached_image_does_not_contact_registry(self, image_client):
+        image_client.images.get.side_effect = None
+        _prepare_postgres_image(image_client, "postgres:16-alpine")
+        image_client.images.get.assert_called_once_with("postgres:16-alpine")
+        image_client.images.pull.assert_not_called()
+
+    def test_connection_reset_recovers(self, image_client, monkeypatch, caplog):
+        from unittest.mock import Mock, call
+
+        sleep = Mock()
+        monkeypatch.setattr(time, "sleep", sleep)
+        error = self._pull_error('Get "https://auth.docker.io/token": read: connection reset by peer')
+        image_client.images.pull.side_effect = [error, error, None]
+        _prepare_postgres_image(image_client, "postgres:16-alpine")
+        assert image_client.images.pull.call_args_list == [call("postgres:16-alpine")] * 3
+        assert sleep.call_count == 2
+        assert all(args[0] > 0 for args, _ in sleep.call_args_list)
+        assert str(error) in caplog.text
+
+    def test_persistent_reset_is_setup_failure_with_original_errors(self, image_client, monkeypatch, caplog):
+        from unittest.mock import Mock
+
+        sleep = Mock()
+        monkeypatch.setattr(time, "sleep", sleep)
+        errors = [self._pull_error(f"connection reset by peer (failure {n})") for n in range(3)]
+        image_client.images.pull.side_effect = errors
+        with pytest.raises(RuntimeError, match="after 3 pull attempts") as caught:
+            _prepare_postgres_image(image_client, "postgres:16-alpine")
+        assert caught.value.__cause__ is errors[-1]
+        assert image_client.images.pull.call_count == 3
+        assert sleep.call_count == 2
+        for error in errors:
+            assert str(error) in caplog.text
+
+    @pytest.mark.parametrize(
+        ("status", "message"),
+        [(401, "unauthorized"), (500, "daemon failure")],
+    )
+    def test_other_pull_errors_are_not_retried(self, image_client, monkeypatch, status, message):
+        from unittest.mock import Mock
+
+        sleep = Mock()
+        monkeypatch.setattr(time, "sleep", sleep)
+        error = self._pull_error(message, status)
+        image_client.images.pull.side_effect = error
+        with pytest.raises(type(error)) as caught:
+            _prepare_postgres_image(image_client, "postgres:16-alpine")
+        assert caught.value is error
+        image_client.images.pull.assert_called_once_with("postgres:16-alpine")
+        sleep.assert_not_called()
+
+
 @pytest.fixture(scope="module")
-def pg_backend():
+def pg_image():
+    docker = pytest.importorskip("docker")
+    from ministack.services import dsql as dsql_mod
+
+    client = docker.from_env()
+    try:
+        _prepare_postgres_image(client, dsql_mod.PG_IMAGE)
+    finally:
+        client.close()
+    return dsql_mod.PG_IMAGE
+
+
+@pytest.fixture(scope="module")
+def pg_backend(pg_image):
     """Run a trust-auth postgres container on an ephemeral published port."""
     docker = pytest.importorskip("docker")
     psycopg2 = pytest.importorskip("psycopg2")
     client = docker.from_env()
     container = client.containers.run(
-        image="postgres:16-alpine",
+        image=pg_image,
         detach=True,
         environment={
             "POSTGRES_USER": "postgres",
@@ -1729,7 +1844,7 @@ class TestContainersE2E:
     Postgres container behind the wire proxy, reachable over SQL. Runs
     in-process (flag monkeypatched on) wherever a Docker daemon exists."""
 
-    def test_env_flag_spins_up_real_backend(self, monkeypatch):
+    def test_env_flag_spins_up_real_backend(self, monkeypatch, pg_image, caplog):
         import json
 
         psycopg2 = pytest.importorskip("psycopg2")
@@ -1755,7 +1870,7 @@ class TestContainersE2E:
                 while dsql_mod._clusters[identifier]["status"] != "ACTIVE":
                     assert time.time() < deadline, "backend did not start in time"
                     await asyncio.sleep(0.5)
-                assert dsql_mod._clusters[identifier]["_has_backend"] is True
+                assert dsql_mod._clusters[identifier]["_has_backend"] is True, caplog.text
 
                 def _select_one():
                     conn = psycopg2.connect(
@@ -2739,7 +2854,7 @@ class TestLiveProxy:
     os.environ.get("DSQL_STRICT", "0").lower() not in ("1", "true", "yes"),
     reason="the server needs DSQL_STRICT=1 to spawn the backend behind the endpoint",
 )
-def test_cluster_data_plane_end_to_end(dsql):
+def test_cluster_data_plane_end_to_end(dsql, pg_image):
     """CreateCluster -> poll ACTIVE -> psycopg2 through the endpoint."""
     psycopg2 = pytest.importorskip("psycopg2")
     resp = dsql.create_cluster()

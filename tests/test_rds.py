@@ -536,6 +536,31 @@ def test_rds_cluster_snapshot(rds):
     assert snaps[0]["DBClusterSnapshotIdentifier"] == "snap-cl-snap"
     rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier="snap-cl-snap")
 
+def test_rds_describe_db_cluster_snapshot_attributes(rds):
+    rds.create_db_cluster(
+        DBClusterIdentifier="snap-attr-cl",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    rds.create_db_cluster_snapshot(
+        DBClusterSnapshotIdentifier="snap-attr-snap",
+        DBClusterIdentifier="snap-attr-cl",
+    )
+    resp = rds.describe_db_cluster_snapshot_attributes(DBClusterSnapshotIdentifier="snap-attr-snap")
+    result = resp["DBClusterSnapshotAttributesResult"]
+    assert result["DBClusterSnapshotIdentifier"] == "snap-attr-snap"
+    attrs = result["DBClusterSnapshotAttributes"]
+    assert len(attrs) >= 1
+    restore = next(a for a in attrs if a["AttributeName"] == "restore")
+    assert restore["AttributeValues"] == []
+    rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier="snap-attr-snap")
+
+def test_rds_describe_db_cluster_snapshot_attributes_unknown_id(rds):
+    with pytest.raises(ClientError) as exc_info:
+        rds.describe_db_cluster_snapshot_attributes(DBClusterSnapshotIdentifier="no-such-snap-attr")
+    assert exc_info.value.response["Error"]["Code"] == "DBClusterSnapshotNotFoundFault"
+
 def test_rds_option_group(rds):
     rds.create_option_group(
         OptionGroupName="test-og",

@@ -47,6 +47,10 @@ def _version() -> str:
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
+# A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
+_CLOUDFRONT_HOST_RE = re.compile(
+    r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
+)
 # Lambda Function URL: {urlId}.lambda-url.{region}.<anything>[:port]. The stored
 # FunctionUrl carries AWS's own `.on.aws` suffix, so we match any suffix rather
 # than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
@@ -154,7 +158,7 @@ def _extract_s3_vhost_bucket(host: str):
 
 
 _S3_VHOST_EXCLUDE_RE = re.compile(
-    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\."
+    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot|cloudfront)\."
 )
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
@@ -1180,6 +1184,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         _parse_execute_api_url(host, path) is not None
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
+        or _parse_cloudfront_dataplane_host(host) is not None
     )
     for response in (
         None if owns_cors else _handle_options_request(method, request_id),
@@ -1732,6 +1737,32 @@ def _resolve_custom_domain_request(host: str, path: str):
     return apigw_v1.resolve_base_path_mapping(hostname, path)
 
 
+def _parse_cloudfront_dataplane_host(host: str) -> str | None:
+    """The distribution label addressed by ``host``, or None."""
+    m = _CLOUDFRONT_HOST_RE.match(host.split(":")[0].lower())
+    return m.group(1) if m else None
+
+
+async def _handle_cloudfront_dataplane_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a CloudFront distribution's viewer traffic, matched by Host."""
+    label = _parse_cloudfront_dataplane_host(host)
+    if label is None:
+        return None
+    dist = _get_module("cloudfront").find_distribution_for_label(label)
+    if dist is None:
+        return None
+    try:
+        return await _get_module("cloudfront_dataplane").handle_request(
+            dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
+        )
+    except Exception as e:
+        logger.exception("Error in CloudFront data-plane dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
     raw_path: str | None = None,
@@ -2122,6 +2153,8 @@ async def _handle_special_data_plane_request(
     query_params: dict,
     request_id: str,
     raw_path: str | None = None,
+    raw_query_string: str = "",
+    client_ip: str = "127.0.0.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
     # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
@@ -2156,6 +2189,11 @@ async def _handle_special_data_plane_request(
         return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
+    if response := await _handle_cloudfront_dataplane_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip,
+    ):
+        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_execute_api_request(
         host, path, method, headers, body, query_params, raw_path=raw_path
     ):
@@ -2609,13 +2647,13 @@ async def app(scope, receive, send):
             return
         try:
             if parsed:
-                ws_api_id, _stage, _execute_path = parsed
+                ws_api_id, ws_stage, ws_execute_path = parsed
                 await _get_module("apigateway").handle_websocket(
                     scope,
                     receive,
                     send,
                     ws_api_id,
-                    path_override=_execute_path,
+                    path_override=f"/{ws_stage}{ws_execute_path}",
                 )
             elif appsync_rt_m:
                 await _get_module("appsync_events").handle_websocket(scope, receive, send, appsync_rt_m.group(1))
@@ -2727,6 +2765,8 @@ async def app(scope, receive, send):
         await _handle_special_data_plane_request(
             method, path, headers, body, query_params, request_id,
             raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+            raw_query_string=query_string,
+            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
         ),
         receive,
     ):

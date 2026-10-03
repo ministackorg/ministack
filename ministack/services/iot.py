@@ -7823,10 +7823,8 @@ async def handle_websocket(
 #   a handshake that sends no CONNECT registers nothing.
 #
 # The TLS layer adds one constraint of its own: a presented chain is verified,
-# so a certificate the listener does not trust fails the handshake before any
-# of the above. The trusted set is the Local CA plus every registered CA and
-# device certificate, whatever its status: as on AWS, a registered device
-# certificate keeps connecting after its CA is deactivated or deleted.
+# so an untrusted certificate fails the handshake first. Trusted: the Local CA and every
+# registered CA and device certificate, whatever its status.
 
 _MTLS_DEFAULT_PORT = 8883
 _MTLS_READ_CHUNK = 65536
