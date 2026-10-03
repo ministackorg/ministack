@@ -15,6 +15,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EFS — file system policy, protection and replication** — `PutFileSystemPolicy`, `DescribeFileSystemPolicy`, `DeleteFileSystemPolicy`, `UpdateFileSystemProtection` and `Create`/`Describe`/`DeleteReplicationConfiguration`; `CreateMountTarget` checks the subnet, security groups, zone and address (`SubnetNotFound`, `SecurityGroupNotFound`, `MountTargetConflict`, `AvailabilityZonesMismatch`, `IpAddressInUse`), and `DeleteFileSystem` with mount targets answers 409. Contributed by @fabio-andre-rodrigues.
 ### Fixed
 
+- **Docker — the image healthcheck probes `GATEWAY_PORT`** — it always requested `localhost:4566`, so a container started on another port reported `unhealthy` while serving; it now resolves the port as the server does (`GATEWAY_PORT`, then `EDGE_PORT`, then `4566`). Contributed by @skialpine.
 - **STS — role trust denies and conditions are enforced** — with `AUTH=true`, `AssumeRole` now rejects matching explicit denies, including `NotAction` exclusions, and evaluates `sts:ExternalId` and `sts:RoleSessionName` conditions before issuing credentials. A denied call registers no session. Local JSON requests use the supplied role ARN for authorization and receive JSON trust-denial errors; Query requests retain XML responses. With `AUTH=false`, trust denies and conditions remain permissive.
 ### Added
 

@@ -12,7 +12,7 @@
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/pulls/ministackorg/ministack" alt="Docker Pulls"></a>
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/image-size/ministackorg/ministack/latest" alt="Docker Image Size"></a>
   <a href="https://github.com/ministackorg/ministack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ministackorg/ministack" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python">
+  <img src="https://img.shields.io/badge/python-3.10%20to%203.13-blue" alt="Python">
 </p>
 
 <p align="center">
