@@ -7,9 +7,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **STS — role trust denies and conditions are enforced** — with `AUTH=true`, `AssumeRole` now rejects matching explicit denies, including `NotAction` exclusions, and evaluates `sts:ExternalId` and `sts:RoleSessionName` conditions before issuing credentials. A denied call registers no session. Local JSON requests use the supplied role ARN for authorization and receive JSON trust-denial errors; Query requests retain XML responses. With `AUTH=false`, trust denies and conditions remain permissive.
 ### Added
 
 - **Athena — databases, DDL, and Trino-style table references** — `ListDatabases` and `GetDatabase` read the Glue Data Catalog; `CREATE EXTERNAL TABLE` and `DROP TABLE` apply to it, creating the Glue table Athena would (formats, SerDe, TBLPROPERTIES); `CREATE TABLE` without `EXTERNAL` is rejected as Athena rejects it, and Iceberg tables are not supported; a query may name a table as `"awsdatacatalog"."db"."t"` or `db.t`. Contributed by @sjincho.
@@ -31,9 +28,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `AWS::ECS::Cluster` and `AWS::ECS::TaskDefinition` update in place** — a cluster change keeps the cluster (settings or configuration dropped from the template stay), and a task definition change registers the next revision of the family and deregisters the old one instead of overwriting revision 1. Contributed by @iot-rocket.
 - **CloudFormation — more `IMPORT` types** — SNS topics, KMS keys and aliases, IoT thing types, Cognito user pool clients, groups, resource servers and identity pools, and API Gateway REST APIs and stages can be imported, including two-key identifiers, and `Fn::GetAtt` on an identity pool's `Id` resolves. Contributed by @iot-rocket.
 - **CloudFormation — `ImportExistingResources`** — a `CREATE` or `UPDATE` change set imports an added resource whose static custom name already exists (it needs `DeletionPolicy` `Retain` or `RetainExceptOnCreate`), and a rollback releases imported resources instead of deleting them. Contributed by @iot-rocket.
-
-### Fixed
-
 - **ECS — `UpdateService` with `forceNewDeployment` replaces the tasks** — it was ignored when the task definition did not change. Rolling deployments now pin image digests from the first task, honor `versionConsistency` `disabled`, use `repositoryCredentials` for private registries, and report `imageDigest` and the Fargate platform version; a task falls back to the local image when the pull fails. Contributed by @AdrianAcala.
 - **AutoScaling — target tracking alarms** — `PutScalingPolicy` with `TargetTrackingScaling` creates the `TargetTracking-<group>-AlarmHigh-<uuid>` alarm and, unless `DisableScaleIn` is set, the `AlarmLow` one on the tracked metric, lists them in `Alarms` of `PutScalingPolicy` and `DescribePolicies`, replaces them when the policy is updated and deletes them with the policy or its group. An `AWS::AutoScaling::ScalingPolicy` in a template does the same. Contributed by @iot-rocket.
 - **IoT — mTLS trusts every registered device certificate** — the listener no longer fails the TLS handshake for an ACTIVE certificate whose CA was deactivated or deleted before its first connect, or that was registered without a CA; as on AWS, only the certificate's own status refuses it. Contributed by @iot-rocket.
