@@ -46,6 +46,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `AWS::SQS::Queue` with `FifoQueue` gets a generated `.fifo` name** — `FifoQueue: true` without a `QueueName` creates a FIFO queue with a generated `.fifo` name instead of a standard queue, and a `QueueName` whose `.fifo` suffix disagrees with `FifoQueue` fails the resource. Contributed by @iot-rocket.
 - **CloudFormation — nested stack with a `Transform`** — under `AUTH=true`, a nested stack whose template declares a `Transform` or calls `Fn::Transform` fails with `Requires capabilities : [CAPABILITY_AUTO_EXPAND]` unless the parent acknowledged `CAPABILITY_AUTO_EXPAND`, as on AWS. Contributed by @iot-rocket.
 
+### Fixed
+
+- **CloudFormation — `Fn::Select` in a condition** — a condition that checks one member of a `CommaDelimitedList`, such as `!Not [!Equals [!Select [2, !Ref KeySpec], ""]]`, was always true, whatever the parameter value. Templates use this check for an optional member: `"id,S,,"` gives `["id", "S", "", ""]`, and an empty member means "no value". Conditions did not resolve `Fn::Select`, so `Fn::Equals` compared the unresolved function with `""`. Thus the stack made resources whose condition is false, and `Fn::If` took the wrong branch. Conditions now resolve `Fn::Select`, with the same comma split as resource properties. Contributed by @mishukdutta-cz.
+
+### Fixed
+
+- **CloudFormation — `Ref` to a list parameter** — a `Ref` to a `CommaDelimitedList` or `List<...>` parameter gave one string, such as `"attr_a, attr_b"`, not a list. Resource code that loops over a list property used each character as one item: `NonKeyAttributes: !Ref Projected` gave a GSI with the attributes `a`, `t`, `t`, `r`, and so on, and `!Join ["|", !Ref Projected]` gave `a|t|t|r|...`. `Ref` now gives a list, such as `["attr_a", "attr_b"]`. A template that uses this `Ref` as a string can now fail, as on AWS: an output `Value: !Ref Names` or a nested-stack parameter `Names: !Ref Names` rolls back the stack. A string property, such as the `Value` of an `AWS::SSM::Parameter`, now gets the list, not `a,b`. To use the list as one string, use `!Join [",", !Ref Names]`. Contributed by @mishukdutta-cz.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added

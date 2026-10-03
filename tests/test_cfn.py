@@ -576,6 +576,64 @@ def test_cfn_nested_stack_stays_in_parent_region():
             pass
 
 
+def test_cfn_ref_to_list_parameter_gives_a_list(cfn, ddb):
+    """A Ref to a CommaDelimitedList gives a list of its members, without the spaces after the commas."""
+    name = f"cfn-list-ref-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Parameters": {"Projected": {"Type": "CommaDelimitedList", "Default": "attr_a, attr_b"}},
+        "Resources": {"Table": {"Type": "AWS::DynamoDB::Table", "Properties": {
+            "TableName": name,
+            "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                     {"AttributeName": "gpk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": {"Ref": "Projected"}},
+            }],
+        }}},
+        "Outputs": {"Joined": {"Value": {"Fn::Join": ["|", {"Ref": "Projected"}]}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert _output(stack, "Joined") == "attr_a|attr_b"
+        projection = ddb.describe_table(TableName=name)["Table"]["GlobalSecondaryIndexes"][0]["Projection"]
+        # AWS does not keep the order of NonKeyAttributes
+        assert sorted(projection["NonKeyAttributes"]) == ["attr_a", "attr_b"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_nested_stack_fails_a_list_parameter(cfn, s3):
+    """A list in nested-stack Parameters fails the stack resource. A template must pass a string, for example with
+    Fn::Join."""
+    name = f"cfn-nested-list-{_uuid_mod.uuid4().hex[:8]}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    child = {"Parameters": {"Names": {"Type": "String"}}, "Resources": {}}
+    parent = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Resources": {"Child": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+            "TemplateURL": f"{endpoint}/{name}/child.json",
+            "Parameters": {"Names": {"Ref": "Names"}},
+        }}},
+    }
+    s3.create_bucket(Bucket=name)
+    s3.put_object(Bucket=name, Key="child.json", Body=json.dumps(child))
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(parent))
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        failed = [e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Child" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed == ["Value of property Parameters must be an object with String (or simple type) properties"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        s3.delete_object(Bucket=name, Key="child.json")
+        s3.delete_bucket(Bucket=name)
+
+
 _E2E_STACK = "e2e-test"
 
 _E2E_TEMPLATE = """
@@ -2159,6 +2217,33 @@ def test_cfn_conditions(cfn, s3):
 
     with pytest.raises(ClientError):
         s3.head_bucket(Bucket="cfn-t04-cond")
+
+
+def test_cfn_condition_selects_from_comma_delimited_list(cfn):
+    """Fn::Select in a condition gives one member of a CommaDelimitedList. An empty member makes the condition false,
+    so the stack does not make the resource."""
+    name = f"cfn-cond-select-{_uuid_mod.uuid4().hex[:8]}"
+
+    def parameter(condition):
+        return {"Type": "AWS::SSM::Parameter", "Condition": condition,
+                "Properties": {"Name": f"/{name}/{condition}", "Type": "String", "Value": "x"}}
+
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "gsi,,S"}},
+        "Conditions": {
+            "FirstSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [0, {"Ref": "Spec"}]}, ""]}]},
+            "SecondSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [1, {"Ref": "Spec"}]}, ""]}]},
+        },
+        "Resources": {"First": parameter("FirstSet"), "Second": parameter("SecondSet")},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        resources = cfn.describe_stack_resources(StackName=name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in resources] == ["First"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
 
 def test_cfn_outputs_exports(cfn):
     template = {
