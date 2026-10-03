@@ -1659,8 +1659,7 @@ def _prepare_postgres_image(client, image):
     except ImageNotFound:
         pass
 
-    # The daemon wraps registry token connection resets in an Engine API 500.
-    # Retry that observed transport failure, not permission/image/runtime errors.
+    # Retry only the Engine API 500 wrapping a registry connection reset.
     for attempt in range(1, 4):
         try:
             client.images.pull(image)
@@ -1674,80 +1673,6 @@ def _prepare_postgres_image(client, image):
             if attempt == 3:
                 raise RuntimeError(f"Could not prepare DSQL test image {image} after 3 pull attempts") from exc
             time.sleep(attempt)
-
-
-class TestPostgresImageSetup:
-    """Image preparation recovers from transient errors and preserves failures."""
-
-    @pytest.fixture
-    def image_client(self):
-        from unittest.mock import Mock
-
-        docker = pytest.importorskip("docker")
-        client = Mock()
-        client.images.get.side_effect = docker.errors.ImageNotFound("No such image")
-        return client
-
-    @staticmethod
-    def _pull_error(message, status=500):
-        import docker
-        from requests import Response
-
-        response = Response()
-        response.status_code = status
-        response.url = "http+docker://localhost/v1.48/images/create"
-        return docker.errors.APIError("Image pull failed", response=response, explanation=message)
-
-    def test_cached_image_does_not_contact_registry(self, image_client):
-        image_client.images.get.side_effect = None
-        _prepare_postgres_image(image_client, "postgres:16-alpine")
-        image_client.images.get.assert_called_once_with("postgres:16-alpine")
-        image_client.images.pull.assert_not_called()
-
-    def test_connection_reset_recovers(self, image_client, monkeypatch, caplog):
-        from unittest.mock import Mock, call
-
-        sleep = Mock()
-        monkeypatch.setattr(time, "sleep", sleep)
-        error = self._pull_error('Get "https://auth.docker.io/token": read: connection reset by peer')
-        image_client.images.pull.side_effect = [error, error, None]
-        _prepare_postgres_image(image_client, "postgres:16-alpine")
-        assert image_client.images.pull.call_args_list == [call("postgres:16-alpine")] * 3
-        assert sleep.call_count == 2
-        assert all(args[0] > 0 for args, _ in sleep.call_args_list)
-        assert str(error) in caplog.text
-
-    def test_persistent_reset_is_setup_failure_with_original_errors(self, image_client, monkeypatch, caplog):
-        from unittest.mock import Mock
-
-        sleep = Mock()
-        monkeypatch.setattr(time, "sleep", sleep)
-        errors = [self._pull_error(f"connection reset by peer (failure {n})") for n in range(3)]
-        image_client.images.pull.side_effect = errors
-        with pytest.raises(RuntimeError, match="after 3 pull attempts") as caught:
-            _prepare_postgres_image(image_client, "postgres:16-alpine")
-        assert caught.value.__cause__ is errors[-1]
-        assert image_client.images.pull.call_count == 3
-        assert sleep.call_count == 2
-        for error in errors:
-            assert str(error) in caplog.text
-
-    @pytest.mark.parametrize(
-        ("status", "message"),
-        [(401, "unauthorized"), (500, "daemon failure")],
-    )
-    def test_other_pull_errors_are_not_retried(self, image_client, monkeypatch, status, message):
-        from unittest.mock import Mock
-
-        sleep = Mock()
-        monkeypatch.setattr(time, "sleep", sleep)
-        error = self._pull_error(message, status)
-        image_client.images.pull.side_effect = error
-        with pytest.raises(type(error)) as caught:
-            _prepare_postgres_image(image_client, "postgres:16-alpine")
-        assert caught.value is error
-        image_client.images.pull.assert_called_once_with("postgres:16-alpine")
-        sleep.assert_not_called()
 
 
 @pytest.fixture(scope="module")

@@ -347,13 +347,6 @@ def _paginate_agentcore_results(items, query_params):
     return page, None
 
 
-def _memory_id(identifier):
-    """Accept the memory ID or its ARN, as the AgentCore data plane does."""
-    if isinstance(identifier, str) and ":memory/" in identifier:
-        return identifier.rsplit(":memory/", 1)[1]
-    return identifier
-
-
 def _memory_arn(memory_id):
     return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
             f"memory/{memory_id}")
@@ -362,6 +355,73 @@ def _memory_arn(memory_id):
 def _memory_public_record(record):
     return {key: copy.deepcopy(value) for key, value in record.items()
             if not key.startswith("_")}
+
+
+_MEMORY_ID_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}")
+
+# MemoryStrategyInput union member -> MemoryStrategyType.
+_MEMORY_STRATEGY_TYPES = {
+    "semanticMemoryStrategy": "SEMANTIC",
+    "summaryMemoryStrategy": "SUMMARIZATION",
+    "userPreferenceMemoryStrategy": "USER_PREFERENCE",
+    "customMemoryStrategy": "CUSTOM",
+    "episodicMemoryStrategy": "EPISODIC",
+}
+
+
+def _memory_strategies(inputs, now):
+    """MemoryStrategy records for a MemoryStrategyInputList, or an error response."""
+    if not isinstance(inputs, list):
+        return None, _validation("memoryStrategies must be a list")
+    strategies = []
+    for item in inputs:
+        members = [key for key in item if key in _MEMORY_STRATEGY_TYPES] if isinstance(item, dict) else []
+        if len(members) != 1 or len(item) != 1:
+            return None, _validation("Each memory strategy must set exactly one strategy type")
+        spec = item[members[0]]
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+            return None, _validation("Memory strategy name is invalid")
+        strategy = {
+            "strategyId": _resource_id(name),
+            "name": name,
+            "type": _MEMORY_STRATEGY_TYPES[members[0]],
+            "namespaces": copy.deepcopy(spec.get("namespaces", [])),
+            "namespaceTemplates": copy.deepcopy(spec.get("namespaceTemplates", [])),
+            "status": "ACTIVE",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        for field in ("description", "memoryRecordSchema"):
+            if field in spec:
+                strategy[field] = copy.deepcopy(spec[field])
+        strategies.append(strategy)
+    return strategies, None
+
+
+def _modify_memory_strategies(record, changes, now):
+    """Apply ModifyMemoryStrategies to a copy of the record's strategies."""
+    if not isinstance(changes, dict):
+        return None, _validation("memoryStrategies must be an object")
+    strategies = copy.deepcopy(record.get("strategies", []))
+    by_id = {strategy["strategyId"]: strategy for strategy in strategies}
+    for item in changes.get("deleteMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        strategies.remove(by_id.pop(strategy_id))
+    for item in changes.get("modifyMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        for field in ("description", "namespaces", "namespaceTemplates", "memoryRecordSchema"):
+            if field in item:
+                by_id[strategy_id][field] = copy.deepcopy(item[field])
+        by_id[strategy_id]["updatedAt"] = now
+    added, error = _memory_strategies(changes.get("addMemoryStrategies") or [], now)
+    if error:
+        return None, error
+    return strategies + added, None
 
 
 def _memory_page(items, data, default=20):
@@ -381,29 +441,29 @@ def _create_memory(body):
         return _conflict(f"A memory with name '{name}' already exists")
     if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
         return _validation("eventExpiryDuration must be an integer from 3 to 365")
-    if data.get("tags"):
-        return _validation("Tagging is not supported by MiniStack AgentCore Memory yet")
-    # MiniStack implements explicit record storage/retrieval. Built-in
-    # extraction strategies invoke managed model pipelines and are not emulated.
-    if data.get("memoryStrategies"):
-        return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+    tags = data.get("tags") or {}
+    if not isinstance(tags, dict) or len(tags) > 50:
+        return _validation("tags must be a map of at most 50 entries")
+    now = int(time.time())
+    # Strategies are recorded; no extraction runs behind them.
+    strategies, error = _memory_strategies(data.get("memoryStrategies") or [], now)
+    if error:
+        return error
 
     memory_id = _resource_id(name)
-    now = time.time()
     record = {
         "id": memory_id,
         "arn": _memory_arn(memory_id),
         "name": name,
-        "description": data.get("description", ""),
         "eventExpiryDuration": duration,
         "status": "ACTIVE",
         "createdAt": now,
         "updatedAt": now,
-        "indexedKeys": copy.deepcopy(data.get("indexedKeys", [])),
-        "namespaceKeys": copy.deepcopy(data.get("namespaceKeys", [])),
-        "strategies": [],
+        "strategies": strategies,
+        "_tags": copy.deepcopy(tags),
     }
-    for field in ("encryptionKeyArn", "memoryExecutionRoleArn", "streamDeliveryResources"):
+    for field in ("description", "encryptionKeyArn", "memoryExecutionRoleArn",
+                  "indexedKeys", "namespaceKeys", "streamDeliveryResources"):
         if field in data:
             record[field] = copy.deepcopy(data[field])
     _memories[memory_id] = record
@@ -414,7 +474,7 @@ def _create_memory(body):
 
 
 def _get_memory(memory_id, query_params):
-    record = _memories.get(_memory_id(memory_id))
+    record = _memories.get(memory_id)
     if record is None:
         return _not_found(f"Memory '{memory_id}' not found")
     view = _agentcore_query_value(query_params, "view", "full")
@@ -438,17 +498,22 @@ def _list_memories(body):
 
 
 def _update_memory(memory_id, body):
-    record = _memories.get(_memory_id(memory_id))
+    record = _memories.get(memory_id)
     if record is None:
         return _not_found(f"Memory '{memory_id}' not found")
     data = _parse_body(body)
-    if "memoryStrategies" in data and data["memoryStrategies"]:
-        return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+    now = int(time.time())
     if "eventExpiryDuration" in data:
         duration = data["eventExpiryDuration"]
         if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
             return _validation("eventExpiryDuration must be an integer from 3 to 365")
-        record["eventExpiryDuration"] = duration
+    if "memoryStrategies" in data:
+        strategies, error = _modify_memory_strategies(record, data["memoryStrategies"], now)
+        if error:
+            return error
+        record["strategies"] = strategies
+    if "eventExpiryDuration" in data:
+        record["eventExpiryDuration"] = data["eventExpiryDuration"]
     if "description" in data:
         record["description"] = data["description"]
     for field in ("memoryExecutionRoleArn", "namespaceKeys", "streamDeliveryResources"):
@@ -460,14 +525,13 @@ def _update_memory(memory_id, body):
             copy.deepcopy(item) for item in data["addIndexedKeys"]
             if item.get("key") not in existing
         )
-    record["updatedAt"] = time.time()
+    record["updatedAt"] = now
     response = _memory_public_record(record)
     response["status"] = "UPDATING"
     return json_response({"memory": response}, 202)
 
 
 def _delete_memory(memory_id):
-    memory_id = _memory_id(memory_id)
     record = _memories.pop(memory_id, None)
     if record is None:
         return _not_found(f"Memory '{memory_id}' not found")
@@ -1204,13 +1268,17 @@ async def handle_request(method, path, headers, body, query_params):
     if inner == "memories/create" and method == "POST":
         return _create_memory(body)
     if inner.startswith("memories/"):
-        parts = [unquote(part) for part in inner.split("/") if part]
-        if len(parts) == 3 and parts[2] == "details" and method == "GET":
-            return _get_memory(parts[1], query_params)
-        if len(parts) == 3 and parts[2] == "update" and method == "PUT":
-            return _update_memory(parts[1], body)
-        if len(parts) == 3 and parts[2] == "delete" and method == "DELETE":
-            return _delete_memory(parts[1])
+        memory_id, _, op = unquote(inner[len("memories/"):]).rpartition("/")
+        handler = {("GET", "details"): lambda: _get_memory(memory_id, query_params),
+                   ("PUT", "update"): lambda: _update_memory(memory_id, body),
+                   ("DELETE", "delete"): lambda: _delete_memory(memory_id)}.get((method, op))
+        if handler:
+            if not _MEMORY_ID_RE.fullmatch(memory_id):
+                return _validation(
+                    f"1 validation error detected: Value '{memory_id}' at 'memoryId' failed to "
+                    f"satisfy constraint: Member must satisfy regular expression pattern: "
+                    f"{_MEMORY_ID_RE.pattern}")
+            return handler()
     if inner.startswith("resourcepolicy/"):
         resource_arn = unquote(inner[len("resourcepolicy/"):])
         if method == "PUT":

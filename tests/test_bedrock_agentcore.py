@@ -4,8 +4,10 @@ Covers the v1 surface: agent-runtime CRUD, runtime-endpoint CRUD,
 InvokeAgentRuntime (deterministic echo), region isolation, and validation.
 """
 import asyncio
+import datetime
 import json
 import os
+import re
 import sys
 import threading
 import types
@@ -1032,16 +1034,10 @@ def test_agentcore_state_with_legacy_arns_moves_to_aws_arns():
 def test_agentcore_memory_lifecycle_and_pagination():
     control = _client("bedrock-agentcore-control")
     name = f"memory_{_uuid_mod.uuid4().hex[:8]}"
-    with pytest.raises(ClientError) as exc:
-        control.create_memory(
-            name=f"memory_{_uuid_mod.uuid4().hex[:8]}",
-            eventExpiryDuration=30,
-            tags={"purpose": "unsupported"},
-        )
-    assert exc.value.response["Error"]["Code"] == "ValidationException"
-
-    created = control.create_memory(name=name, eventExpiryDuration=30)
+    created = control.create_memory(name=name, eventExpiryDuration=30, tags={"team": "a"})
     memory_id = created["memory"]["id"]
+    assert created["memory"]["status"] == "CREATING"
+    assert isinstance(created["memory"]["createdAt"], datetime.datetime)
     second_memory_id = None
 
     try:
@@ -1074,14 +1070,52 @@ def test_agentcore_memory_lifecycle_and_pagination():
                 memoryId=memory_id,
                 eventExpiryDuration=90,
                 memoryStrategies={
-                    "deleteMemoryStrategies": [{"memoryStrategyId": "unsupported"}]
+                    "deleteMemoryStrategies": [{"memoryStrategyId": "missing_strategy-abcdefghij"}]
                 },
             )
-        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
         assert control.get_memory(memoryId=memory_id)["memory"][
             "eventExpiryDuration"
         ] == 60
+        with pytest.raises(ClientError) as exc:
+            control.get_memory(memoryId=created["memory"]["arn"])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
     finally:
         control.delete_memory(memoryId=memory_id)
         if second_memory_id:
             control.delete_memory(memoryId=second_memory_id)
+
+
+def test_agentcore_memory_strategies_are_recorded():
+    control = _client("bedrock-agentcore-control")
+    memory = control.create_memory(
+        name=f"memory_{_uuid_mod.uuid4().hex[:8]}",
+        eventExpiryDuration=7,
+        memoryStrategies=[{"semanticMemoryStrategy": {
+            "name": "facts", "namespaces": ["/facts/{actorId}"],
+        }}],
+    )["memory"]
+    try:
+        [strategy] = memory["strategies"]
+        assert strategy["type"] == "SEMANTIC"
+        assert strategy["name"] == "facts"
+        assert strategy["namespaces"] == ["/facts/{actorId}"]
+        assert strategy["status"] == "ACTIVE"
+        assert re.fullmatch(r"facts-[a-zA-Z0-9]{10}", strategy["strategyId"])
+
+        updated = control.update_memory(memoryId=memory["id"], memoryStrategies={
+            "modifyMemoryStrategies": [{
+                "memoryStrategyId": strategy["strategyId"], "description": "changed",
+            }],
+            "addMemoryStrategies": [{"summaryMemoryStrategy": {"name": "summary"}}],
+        })["memory"]
+        assert [(s["type"], s.get("description")) for s in updated["strategies"]] == [
+            ("SEMANTIC", "changed"), ("SUMMARIZATION", None)]
+
+        control.update_memory(memoryId=memory["id"], memoryStrategies={
+            "deleteMemoryStrategies": [{"memoryStrategyId": strategy["strategyId"]}],
+        })
+        remaining = control.get_memory(memoryId=memory["id"])["memory"]["strategies"]
+        assert [s["type"] for s in remaining] == ["SUMMARIZATION"]
+    finally:
+        control.delete_memory(memoryId=memory["id"])
