@@ -341,20 +341,13 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 # ---- SQL scanning ----
-#
-# Statements are read token by token, so a literal, a comment or a quoted name
-# is never structure: the "," in 'a, b' or the ")" in -- note) ends nothing.
 
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"[0-9]+")
 
 
 def _sql_tokens(sql):
-    """``(kind, text, start, end)`` per token, skipping whitespace and comments.
-
-    Kinds: ``name`` (bare, lower-cased), ``qname`` (``"x"`` or Hive's ``\\`x\\```, unquoted),
-    ``str`` (``'x'`` as written), ``number``, ``punct`` (one character).
-    """
+    """``(kind, text, start, end)`` per token: ``name`` (lower-cased), ``qname``, ``str``, ``number``, ``punct``."""
     i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
@@ -462,9 +455,7 @@ class _Cursor:
         return re.sub(r"\\(.)", lambda m: {"t": "\t", "n": "\n"}.get(m.group(1), m.group(1)), value)
 
     def dotted_name(self, max_parts):
-        """The dotted name that is next, right-aligned in a ``max_parts`` tuple: with 3,
-        ``t`` → ``(None, None, "t")`` and ``a.b.c`` → ``("a", "b", "c")``. None when no name is
-        next, a ``.`` has nothing after it, or the name has more than ``max_parts`` parts."""
+        """The next dotted name, right-aligned in a ``max_parts`` tuple (``t`` → ``(None, None, "t")``)."""
         parts = []
         while True:
             part = self.identifier()
@@ -479,7 +470,7 @@ class _Cursor:
 
 
 @dataclass(frozen=True)
-class TableReference:
+class _TableReference:
     """One ``FROM``/``JOIN`` target and where its text sits in the query."""
 
     database: str | None  # None when the reference names only the table
@@ -497,13 +488,7 @@ _CLAUSE_KEYWORDS = frozenset(
 
 
 def _table_references(query):
-    """The ``FROM``/``JOIN`` targets of ``query``, in order, with CTE names left out.
-
-    ``SELECT u.id FROM "awsdatacatalog"."acme"."users" u JOIN orders ON ...`` yields
-    ``TableReference("acme", "users", 17, 48, aliased=True)`` and
-    ``TableReference(None, "orders", 56, 62, aliased=False)``: a catalog qualifier is dropped,
-    since Glue is the only catalog here, and a ``WITH users AS (...)`` name shadows a table.
-    """
+    """The ``FROM``/``JOIN`` targets of ``query``, in order; CTE names shadow tables."""
     cursor = _Cursor(query)
     ctes = _cte_names(cursor)
     cursor.reset()
@@ -522,7 +507,7 @@ def _table_references(query):
         end = cursor.tokens[cursor.i - 1][3]
         next_kind, next_text = cursor.peek()[:2]
         aliased = next_kind == "qname" or (next_kind == "name" and next_text not in _CLAUSE_KEYWORDS)
-        references.append(TableReference(database, table, start, end, aliased))
+        references.append(_TableReference(database, table, start, end, aliased))
     return references
 
 
@@ -578,7 +563,7 @@ _DELIMITED = {
 
 
 @dataclass(frozen=True)
-class CreateTable:
+class _CreateTable:
     database: str | None  # None when the statement names only the table
     table: str
     external: bool
@@ -601,18 +586,14 @@ class CreateTable:
 
 
 @dataclass(frozen=True)
-class DropTable:
+class _DropTable:
     database: str | None
     table: str
     if_exists: bool = False
 
 
 def _parse_ddl(query):
-    """The ``CreateTable`` or ``DropTable`` a statement is, or None.
-
-    None also covers a CREATE this does not model (CTAS, ``SORTED BY``, an unknown ``STORED AS``)
-    and anything followed by a second statement, so those reach the query engine as written.
-    """
+    """The ``_CreateTable`` or ``_DropTable`` a statement is; None sends it to the query engine."""
     cursor = _Cursor(query)
     if cursor.tokens and cursor.tokens[-1][:2] == ("punct", ";"):
         cursor.tokens.pop()
@@ -623,7 +604,7 @@ def _parse_ddl(query):
         name = cursor.dotted_name(2)
         if name is None or not cursor.at_end():
             return None
-        return DropTable(*name, if_exists=if_exists)
+        return _DropTable(*name, if_exists=if_exists)
     if not cursor.keywords("create"):
         return None
     external = cursor.keywords("external")
@@ -691,7 +672,7 @@ def _parse_ddl(query):
             output_format = _SERDE_TEXT_OUTPUT_FORMAT
     else:
         input_format, output_format, serde = stored_as
-    return CreateTable(
+    return _CreateTable(
         *name, external=external, columns=columns, input_format=input_format, output_format=output_format,
         serde=row_format_serde or serde or _LAZY_SIMPLE_SERDE, serde_parameters=serde_parameters,
         if_not_exists=if_not_exists, **clauses,
@@ -773,10 +754,7 @@ def _property_list(cursor):
 
 
 def _delimited(cursor):
-    """The SerDe parameters a ``ROW FORMAT DELIMITED`` clause sets; None when malformed.
-
-    ``FIELDS TERMINATED BY ','`` → ``{"field.delim": ",", "serialization.format": ","}``.
-    """
+    """The SerDe parameters a ``ROW FORMAT DELIMITED`` clause sets; None when malformed."""
     parameters = {}
     while True:
         for words, parameter in _DELIMITED.items():
@@ -794,8 +772,7 @@ def _delimited(cursor):
 
 
 def _create_table_input(ddl):
-    """The Glue ``TableInput`` Athena writes for ``ddl``: TBLPROPERTIES and the table COMMENT
-    become Parameters, STORED AS / ROW FORMAT become the formats and SerDe."""
+    """The Glue ``TableInput`` Athena writes for ``ddl``."""
     parameters = {"EXTERNAL": "TRUE", "transient_lastDdlTime": str(int(time.time())), **ddl.table_properties}
     if ddl.comment is not None:
         parameters["comment"] = ddl.comment
@@ -825,8 +802,7 @@ def _create_table_input(ddl):
 
 
 def _data_format(table_data):
-    """The file format DuckDB reads a table as: its ``classification`` property when set, else the
-    one its InputFormat or SerDe names (``MapredParquetInputFormat`` → ``parquet``), else ``csv``."""
+    """``classification`` when set, else the format its InputFormat or SerDe names, else ``csv``."""
     classification = (table_data.get("Parameters") or {}).get("classification")
     if classification:
         return classification
@@ -852,7 +828,7 @@ def _start_query_execution(data):
     # Athena rejects any malformed statement here; with no Trino parser, only this DDL rule is
     # checked at submission and other errors fail the execution instead.
     ddl = _parse_ddl(query)
-    if isinstance(ddl, CreateTable) and not ddl.external and not ddl.iceberg:
+    if isinstance(ddl, _CreateTable) and not ddl.external and not ddl.iceberg:
         return error_response_json(
             "InvalidRequestException", "External keyword required for table type HIVE", 400,
             extra={"AthenaErrorCode": "MALFORMED_QUERY"},
@@ -979,21 +955,7 @@ async def _run_duckdb(query, database):
 
 
 async def _rewrite_data_paths(query, database):
-    """Replace each Glue table reference with the DuckDB relation that reads its local S3 data.
-
-    With Glue table ``acme.users`` at ``s3://acme-data/users/`` holding CSV::
-
-        SELECT u.id FROM "awsdatacatalog"."acme"."users" u WHERE u.id > 1
-        SELECT users.id FROM users WHERE users.id > 1
-
-    become::
-
-        SELECT u.id FROM '<data dir>/<account>/acme-data/users/**/*.csv' u WHERE u.id > 1
-        SELECT users.id FROM '<data dir>/<account>/acme-data/users/**/*.csv' AS "users" WHERE users.id > 1
-
-    The second gains an alias so ``users.id`` still resolves once the name is a path. A table
-    not in Glue is left as written for DuckDB to reject.
-    """
+    """Replace each Glue table reference with a DuckDB relation over its local S3 data."""
     from ministack.services import glue as glue_svc
 
     account_id = get_account_id()
@@ -1015,7 +977,7 @@ async def _rewrite_data_paths(query, database):
         p = urlparse(s3_location)
         stripped = f"{p.netloc}{p.path}".rstrip("/")
         local_dir = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-        if glob.glob(f"{local_dir}/**/*", recursive=True):
+        if next(glob.iglob(f"{local_dir}/**/*", recursive=True), None):
             relation = f"'{local_dir}/**/*.{_data_format(table_data)}'"  # DuckDB reads the files, or reports why not
         else:
             relation = _empty_relation(table_data)
@@ -1052,7 +1014,7 @@ def _run_ddl(ddl, database):
     from ministack.services import glue as glue_svc
 
     db_name = ddl.database or database or "default"
-    if isinstance(ddl, DropTable):
+    if isinstance(ddl, _DropTable):
         if f"{db_name}/{ddl.table}" not in glue_svc._tables:
             if ddl.if_exists:
                 return {"columns": [], "rows": [], "column_types": []}
@@ -1646,7 +1608,10 @@ def _list_prepared_statements(data):
 
 
 def _athena_database(db):
-    return {"Name": db["Name"], "Description": db.get("Description", ""), "Parameters": db.get("Parameters") or {}}
+    database = {"Name": db["Name"], "Parameters": db.get("Parameters") or {}}
+    if db.get("Description"):
+        database["Description"] = db["Description"]
+    return database
 
 
 def _get_database(data):
@@ -1664,7 +1629,10 @@ def _list_databases(data):
     if data.get("CatalogName", "AwsDataCatalog") not in _data_catalogs:
         return error_response_json("MetadataException", f"Catalog {data.get('CatalogName')} not found", 400)
     databases = [_athena_database(db) for db in glue_svc._databases.values()]
-    start = int(data.get("NextToken") or 0)
+    token = data.get("NextToken") or "0"
+    if not token.isdigit():
+        return error_response_json("InvalidRequestException", "Invalid NextToken", 400)
+    start = int(token)
     end = start + int(data.get("MaxResults") or 50)
     response = {"DatabaseList": databases[start:end]}
     if end < len(databases):

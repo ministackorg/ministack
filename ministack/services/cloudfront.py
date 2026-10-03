@@ -1097,23 +1097,6 @@ def _build_cache_policy_xml(parent, policy):
 
 # ---------------------------------------------------------------------------
 # AWS-managed policies (cache / origin request / response headers).
-#
-# Real CloudFront ships a fixed catalog of these under every account; Terraform
-# modules reference them by name (e.g. "Managed-CachingDisabled") via the
-# aws_cloudfront_cache_policy/aws_cloudfront_origin_request_policy/
-# aws_cloudfront_response_headers_policy data sources, and ListCachePolicies
-# et al. must report them with Type=managed. They are immutable (Update/Delete
-# error) and identical for every account, so they are seeded once as module
-# constants rather than per-account state — nothing resets or persists them
-# because nothing ever mutates them.
-#
-# Evidence: AWS docs — "Use managed cache policies", "Use managed origin
-# request policies", "Use managed response headers policies" (CloudFront
-# Developer Guide) for names/ids/configs. The literal "Managed-" Name prefix
-# (docs show only the short console name) is confirmed by ops-v2's
-# modules/cloudfront-api, which already looks policies up by e.g.
-# "Managed-CachingDisabled". LastModifiedTime below is a stable placeholder,
-# not an AWS-observed value.
 # ---------------------------------------------------------------------------
 
 _MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:29:32.290Z"
@@ -1581,9 +1564,7 @@ def _orp_cfg(name, header_behavior, headers=(), cookie_behavior="none", qs_behav
     }
 
 
-# Evidence: AWS docs "Use managed origin request policies" (CloudFront
-# Developer Guide) for names/ids/behaviors; see the catalog note above
-# _MANAGED_CACHE_POLICIES for the "Managed-" Name-prefix evidence.
+# Managed origin request policies (Developer Guide, "Use managed origin request policies").
 _MANAGED_ORIGIN_REQUEST_POLICIES = {
     pid: _managed_policy(pid, cfg)
     for pid, cfg in {
@@ -1860,9 +1841,7 @@ def _rhp_cfg(name, cors=None, security=None):
     }
 
 
-# Evidence: AWS docs "Use managed response headers policies" (CloudFront
-# Developer Guide) for names/ids/CORS+security settings; see the catalog note
-# above _MANAGED_CACHE_POLICIES for the "Managed-" Name-prefix evidence.
+# Managed response headers policies (Developer Guide, "Use managed response headers policies").
 _MANAGED_RESPONSE_HEADERS_POLICIES = {
     pid: _managed_policy(pid, cfg)
     for pid, cfg in {
@@ -2270,11 +2249,7 @@ def _list_anycast_ip_lists(query_params):
 
 
 def _list_cache_policies(query_params):
-    """CachePolicyList: managed policies plus stored custom ones.
-
-    ``Type`` optionally filters to ``managed`` or ``custom``; omitted, AWS
-    returns both (ListCachePolicies API reference).
-    """
+    """CachePolicyList: managed policies plus stored custom ones."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
     type_filter = _qval(query_params, "Type", "")
     entries = []
@@ -2298,12 +2273,7 @@ def _list_cache_policies(query_params):
 
 
 def _list_policies(store, spec, query_params):
-    """Generic ``*PolicyList``: managed policies plus stored custom ones.
-
-    Shared by origin request policies and response headers policies; the
-    summary member and resource tag come from ``spec``. ``Type`` optionally
-    filters to ``managed`` or ``custom``; omitted, AWS returns both.
-    """
+    """Generic ``*PolicyList``: managed policies plus stored custom ones."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
     type_filter = _qval(query_params, "Type", "")
     entries = []
@@ -2335,12 +2305,7 @@ _MONITORING_SUB_STATUSES = {"Enabled", "Disabled"}
 
 
 def _create_monitoring_subscription(dist_id, body):
-    """CreateMonitoringSubscription (POST, 200): NoSuchDistribution when the
-    distribution is unknown. terraform-provider-aws's
-    aws_cloudfront_monitoring_subscription resource wires its Update to this
-    same Create operation (UpdateWithoutTimeout: resourceMonitoringSubscriptionCreate)
-    with no AlreadyExists handling, so Create on a distribution that already
-    has a subscription must overwrite its status rather than error."""
+    """CreateMonitoringSubscription (POST, 200): NoSuchDistribution when the distribution is unknown."""
     dist = _distributions.get(dist_id)
     if not dist:
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
@@ -4565,14 +4530,7 @@ def _list_distributions_by_connection_mode(mode):
 
 
 def find_distribution_for_label(label: str):
-    """The distribution whose DomainName is ``<label>.cloudfront.net``.
-
-    A viewer request carries no credentials, so this scans the ambient
-    account's distributions the same way ``alb.find_lb_for_host`` scans
-    ``_lbs.values()`` for ALB's own host-routed data plane — not a
-    cross-account search, just the same ambient-scoped lookup every other
-    host-routed service uses here.
-    """
+    """The distribution whose DomainName is ``<label>.cloudfront.net``."""
     domain = f"{label}.cloudfront.net"
     for dist in _distributions.values():
         if dist.get("DomainName", "").lower() == domain:
@@ -4580,11 +4538,7 @@ def find_distribution_for_label(label: str):
     return None
 
 
-# The regional/legacy REST-endpoint domain shapes an Origin's DomainName
-# takes when the origin is an S3 bucket (CloudFront Developer Guide, "Amazon
-# S3 origin"). A website-endpoint domain (s3-website-*) isn't matched here:
-# AWS itself requires that shape to be configured as a CustomOriginConfig,
-# never S3OriginConfig, so it is correctly left to the custom-origin path.
+# S3 REST-endpoint domain shapes of an origin's DomainName (Developer Guide, "Amazon S3 origin").
 _S3_ORIGIN_DOMAIN_RE = re.compile(
     r"^(?P<bucket>[a-z0-9][a-z0-9.-]*[a-z0-9])\.s3(?:\.[a-z0-9-]+|-[a-z0-9-]+)?\.amazonaws\.com$"
 )
@@ -4596,10 +4550,7 @@ def _s3_origin_bucket(domain_name: str):
 
 
 def _dataplane_custom_headers(origin_el):
-    """Origin.CustomHeaders — wire name "CustomHeaders" (CloudFormation's
-    OriginCustomHeaders is a JSON-only rename, see _CFN_DISTRIBUTION_CONFIG_RENAMES
-    above); Items/OriginCustomHeader/{HeaderName,HeaderValue} per the botocore
-    cloudfront service-2.json (2020-05-31) shape."""
+    """Origin.CustomHeaders as a list of (HeaderName, HeaderValue)."""
     headers = []
     ch_el = _find(origin_el, "CustomHeaders")
     items_el = _find(ch_el, "Items") if ch_el is not None else None
@@ -4621,10 +4572,10 @@ def _dataplane_origin(origin_el):
         "domain_name": domain_name,
         "origin_path": _opt_text(origin_el, "OriginPath") or "",
         "custom_headers": _dataplane_custom_headers(origin_el),
-        # Origin carries exactly one of S3OriginConfig or CustomOriginConfig
-        # (AWS's schema is mutually exclusive); the bucket name itself is
-        # only ever recoverable from DomainName, never a separate field.
+        # An S3 origin's bucket comes only from its DomainName.
         "s3_bucket": _s3_origin_bucket(domain_name) if s3cfg is not None else None,
+        "oac_id": _opt_text(origin_el, "OriginAccessControlId") or "",
+        "oai_id": ((_text(s3cfg, "OriginAccessIdentity") or "").rsplit("/", 1)[-1] if s3cfg is not None else ""),
         "http_port": int(_text(custom, "HTTPPort") or "80") if custom is not None else 80,
         "https_port": int(_text(custom, "HTTPSPort") or "443") if custom is not None else 443,
         "protocol_policy": _text(custom, "OriginProtocolPolicy") if custom is not None else "match-viewer",
@@ -4691,10 +4642,7 @@ def _dataplane_behavior(behavior_el, path_pattern=None):
 
 
 def parse_distribution_dataplane_config(dist: dict) -> dict:
-    """A distribution's stored config XML, reduced to what the data plane
-    dispatches against: the default root object, origins by id, the default
-    behavior, and ordered behaviors in declaration order (first
-    ``path_pattern`` match wins)."""
+    """A distribution's config reduced to what the data plane dispatches on."""
     config_el = _dist_config_el(dist)
 
     origins = {}

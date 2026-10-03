@@ -990,7 +990,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "sts":
-        role_arn = _query_param(query_params, "RoleArn")
+        role_arn = _query_param(query_params, "RoleArn") or _safe_json_field(body, "RoleArn")
         if role_arn:
             return role_arn
         return "*"

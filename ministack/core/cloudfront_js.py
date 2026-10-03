@@ -1,28 +1,8 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""CloudFront Functions evaluation.
+"""CloudFront Functions on the shared Node worker pool (``core.node_pool``).
 
-A CloudFront Function is a top-level ``function handler(event) {...}``
-(runtime `cloudfront-js-1.0`) or an ES-module-style function that may use
-`import`/`async` (`cloudfront-js-2.0`; CloudFront Developer Guide, "Writing
-function code for CloudFront Functions"). Evaluation runs on the shared
-`core.node_pool` worker pool (see that module for the process management,
-JSON-line protocol, leasing, recycling, and timeout mechanics); each worker
-caches compiled functions by the hash of their source, the same pattern
-`core/appsync_js.py` uses for resolvers.
-
-Fidelity note: Node is more permissive than the real CloudFront Functions
-runtime, which is a restricted ECMAScript subset (CloudFront Developer
-Guide, "Writing function code for CloudFront Functions" > "Restrictions and
-limitations", and "JavaScript runtime 2.0 features for CloudFront
-Functions"). Function code that runs here can still be refused by real
-CloudFront at publish/associate time. This module reproduces one documented
-restriction that is cheap to enforce and otherwise easy to get wrong: the
-`require()`/`import` surface is limited to `crypto`, `querystring`, and the
-`Buffer` module, not Node's full module graph. Runtime 2.0 also documents a
-fourth module, `cloudfront` (the KeyValueStore, `import cf from
-'cloudfront'`), which is not modelled here — importing it fails the same way
-an unrecognized Node module would.
+Node is more permissive than the CloudFront runtime; only ``crypto``, ``querystring`` and ``buffer`` can be required.
 """
 
 from __future__ import annotations
@@ -33,11 +13,7 @@ from ministack.core import node_pool
 
 logger = logging.getLogger("cloudfront_functions")
 
-# Real CloudFront Functions quota execution at ~1ms (CloudFront Developer
-# Guide, "Quotas on functions"), too tight for a subprocess-per-call Node
-# evaluation. This instead guards only against a runaway (infinite-loop)
-# function, borrowing Lambda@Edge's 5s viewer-request/response timeout as
-# the closest documented CloudFront figure.
+# CloudFront Functions run in ~1ms; this timeout only stops a runaway function.
 _EVAL_TIMEOUT = 5.0
 _MAX_OLD_SPACE_MB = 256
 _RECYCLE_AFTER = 1000
@@ -142,10 +118,7 @@ rl.on("line", async (line) => {
 
 
 class CloudFrontFunctionError(Exception):
-    """A function threw, failed to evaluate, or the worker could not run it
-    at all — CloudFront answers every one of these with a 503 (CloudFront
-    Developer Guide, "HTTP 503 status code" > "Lambda@Edge or CloudFront
-    Function execution error")."""
+    """A function threw or could not run; CloudFront answers 503."""
 
 
 _pool = node_pool.NodeWorkerPool(

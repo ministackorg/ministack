@@ -3846,9 +3846,7 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
 
 
 def _docker_cp_file(container, src_path: str, dest_path: str):
-    """Copy one local file into a Docker container at ``dest_path``, creating
-    its parent directories (``put_archive`` needs an existing destination).
-    A symlinked source is followed, as a bind mount would."""
+    """Copy one local file (symlinks followed) into a container at ``dest_path``."""
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
@@ -4134,9 +4132,7 @@ _CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
 def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", copies=None):
     """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert.
 
-    With ``copies`` (DinD: the host daemon cannot see this container's files) the
-    trust files are listed there as ``(container_path, local_path)`` for docker cp
-    instead of being bind-mounted.
+    With ``copies`` (MiniStack in a container) the trust files are listed for docker cp, not bind-mounted.
     """
     from ministack.core import tls as _tls
 

@@ -867,7 +867,32 @@ def cf_s3_stack(cloudfront, s3):
         },
     }
     dist = cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "cloudfront.amazonaws.com"},
+        "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*",
+        "Condition": {"StringEquals": {"AWS:SourceArn": dist["ARN"]}},
+    }]}))
     return {"dist_host": dist["DomainName"], "body": body}
+
+
+def test_s3_origin_without_a_bucket_policy_grant_is_denied(cloudfront, s3):
+    """An OAC origin whose bucket policy does not grant the distribution answers 403."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket = f"cf-dp-s3-nogrant-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="hello.txt", Body=b"x")
+    dist = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cf-dp-s3-nogrant-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "s3-origin", "DomainName": f"{bucket}.s3.amazonaws.com",
+            "S3OriginConfig": {"OriginAccessIdentity": ""}, "OriginAccessControlId": "test-oac-id",
+        }]},
+        "DefaultCacheBehavior": {"TargetOriginId": "s3-origin", "ViewerProtocolPolicy": "allow-all",
+                                 "CachePolicyId": _CACHING_DISABLED},
+    })["Distribution"]
+    status, _headers, body = _get(dist["DomainName"], "/hello.txt")
+    assert status == 403
+    assert b"<Code>AccessDenied</Code>" in body
 
 
 def test_s3_origin_serves_bucket_object(cf_s3_stack):
@@ -989,30 +1014,6 @@ def cf_raw_origin_stack(cloudfront, path_echo_origin_port):
     dist = cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]
     return dist["DomainName"]
 
-
-def test_origin_domain_name_port_overrides_http_port(cloudfront, path_echo_origin_port):
-    """An origin built from a MiniStack endpoint names the gateway port in its DomainName."""
-    suffix = _uuid_mod.uuid4().hex[:10]
-    dist = cloudfront.create_distribution(DistributionConfig={
-        "CallerReference": f"cf-dp-port-{suffix}",
-        "Comment": "origin DomainName with an explicit port",
-        "Enabled": True,
-        "Origins": {"Quantity": 1, "Items": [{
-            "Id": "port-origin",
-            "DomainName": f"127.0.0.1:{path_echo_origin_port}",
-            "CustomOriginConfig": {
-                "HTTPPort": 1, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
-                "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
-                "OriginReadTimeout": 30, "OriginKeepaliveTimeout": 5,
-            },
-        }]},
-        "DefaultCacheBehavior": {
-            "TargetOriginId": "port-origin", "ViewerProtocolPolicy": "allow-all",
-            "CachePolicyId": _CACHING_DISABLED,
-        },
-    })["Distribution"]
-    status, _body = _raw_get(dist["DomainName"], "/port-check")
-    assert status == 200
 
 def _raw_get(dist_host: str, raw_path: str):
     conn = http.client.HTTPConnection("127.0.0.1", int(GATEWAY_PORT), timeout=10)

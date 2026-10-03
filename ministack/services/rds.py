@@ -6789,8 +6789,7 @@ def _describe_db_cluster_snapshot_attributes(p):
     if not snap_id or snap_id not in _db_cluster_snapshots:
         return _error("DBClusterSnapshotNotFoundFault",
             f"DB cluster snapshot {snap_id} not found.", 404)
-    # Manual snapshots default to no shared accounts (empty "restore" values);
-    # ModifyDBClusterSnapshotAttribute is not implemented, so this is always empty.
+    # Never shared: ModifyDBClusterSnapshotAttribute is not implemented.
     result = (
         f"<DBClusterSnapshotAttributesResult>"
         f"<DBClusterSnapshotIdentifier>{_esc(snap_id)}</DBClusterSnapshotIdentifier>"

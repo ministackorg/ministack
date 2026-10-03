@@ -7,7 +7,6 @@ CloudFormation handlers — API action handlers for all supported CloudFormation
 import copy
 import json
 import logging
-import os
 
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 from ministack.services.cloudformation import drift as _drift
@@ -207,8 +206,7 @@ def _check_capabilities(sent, template, params, macros=True):
     ``template``, because a macro may add IAM resources and AWS asks for those
     to be acknowledged as well (template-macros-overview.html).
 
-    The check runs under ``AUTH=true``, and without it when
-    ``CFN_ENFORCE_CAPABILITIES=1``. ``CAPABILITY_IAM`` is
+    The check runs under ``AUTH=true`` only. ``CAPABILITY_IAM`` is
     satisfied by either IAM capability, ``CAPABILITY_NAMED_IAM`` only by
     itself. Pass ``macros=False`` for ``CreateChangeSet``: the API reference
     says ``CAPABILITY_AUTO_EXPAND`` "doesn't apply to creating change sets".
@@ -226,9 +224,9 @@ def _check_capabilities(sent, template, params, macros=True):
 
 
 def _capabilities_enforced():
-    """Whether Capabilities are checked: under ``AUTH``, or with ``CFN_ENFORCE_CAPABILITIES`` on."""
+    """Capabilities are IAM scope, so they are checked under ``AUTH=true`` only."""
     from ministack.app import AUTH
-    return AUTH or os.environ.get("CFN_ENFORCE_CAPABILITIES", "").strip().lower() in ("1", "true", "yes", "on")
+    return AUTH
 
 
 def _required_iam_capabilities(template):

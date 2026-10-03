@@ -13958,9 +13958,7 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
 
 
 def test_lambda_trust_files_are_copied_not_mounted_when_ministack_runs_in_docker(monkeypatch, tmp_path):
-    """In a container, a bind source resolves on the host daemon, where
-    MiniStack's certificate does not exist: the trust files are docker cp'd
-    instead, for a container-image function too, and a symlink is followed."""
+    """In a container the trust files are docker cp'd, not bind-mounted; a symlink is followed."""
     import tarfile
 
     real = tmp_path / "real.crt"

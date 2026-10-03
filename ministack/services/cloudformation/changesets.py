@@ -9,11 +9,13 @@ import copy
 import json
 import logging
 
+import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.cloudwatch_logs as _cw_logs
 import ministack.services.cognito as _cognito
 import ministack.services.dynamodb as _dynamodb
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
+import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
 import ministack.services.s3 as _s3
 import ministack.services.sns as _sns
@@ -48,6 +50,9 @@ from .helpers import (
 )
 from .provisioners import _RESOURCE_HANDLERS, _import_resource
 from .stacks import (
+    _IMPORT_COMPLETED,
+    _IMPORT_STARTED,
+    _IMPORT_TAGS,
     _add_event,
     _create_stack_task_in_region,
     _create_then_delete_on_failure,
@@ -192,24 +197,97 @@ def _user_pool_import_problem(pool_id):
     return None
 
 
-# The resource types an IMPORT change set looks up before it describes the
-# import: the one ResourceIdentifier key AWS expects, and a lookup in this
-# emulator's own store that returns the StatusReason of the FAILED change set
-# AWS leaves behind when the identifier is invalid or names nothing (measured
-# for a missing value, and for the first five also a blank and an empty one).
-# Types not listed are accepted without a lookup.
+def _kms_key_import_problem(key_id):
+    if key_id not in _kms._keys:
+        arn = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
+        return _sdk_error(f"Key '{arn}' does not exist", "Kms", 400)
+    return None
+
+
+def _kms_alias_import_problem(name):
+    # AWS fails the change set without a StatusReason.
+    return None if _kms._alias_arn(name) in _kms._aliases else ""
+
+
+def _thing_type_import_problem(name):
+    if name not in _iot._thing_types:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::ThingType", value=name)
+    return None
+
+
+def _cognito_error(message):
+    return _sdk_error(message, "CognitoIdentityProvider", 400)
+
+
+def _user_pool_client_import_problem(pool_id, client_id):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if client_id not in _cognito._user_pools[pool_id]["_clients"]:
+        return _cognito_error("User pool client does not exist.")
+    return None
+
+
+def _user_pool_group_import_problem(pool_id, group_name):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if group_name not in _cognito._user_pools[pool_id]["_groups"]:
+        return _cognito_error("Group not found.")
+    return None
+
+
+def _resource_server_import_problem(pool_id, identifier):
+    if pool_id not in _cognito._user_pools:
+        return _user_pool_import_problem(pool_id)
+    if identifier not in _cognito._pool_resource_servers(_cognito._user_pools[pool_id]):
+        return _cognito_error(f"{identifier} does not exist in user pool {pool_id}.")
+    return None
+
+
+def _identity_pool_import_problem(pool_id):
+    if pool_id not in _cognito._identity_pools:
+        return _sdk_error(f"IdentityPool '{pool_id}' not found.", "CognitoIdentity", 400)
+    return None
+
+
+def _rest_api_import_problem(api_id):
+    if api_id not in _apigw_v1._rest_apis:
+        return _sdk_error(f"Invalid API identifier specified {get_account_id()}:{api_id}",
+                          "ApiGateway", 404)
+    return None
+
+
+def _stage_import_problem(api_id, stage_name):
+    if api_id not in _apigw_v1._rest_apis:
+        return _rest_api_import_problem(api_id)
+    if stage_name not in _apigw_v1._stages_v1.get(api_id, {}):
+        return _sdk_error("Invalid stage identifier specified", "ApiGateway", 404)
+    return None
+
+
+# Per type: the ResourceIdentifier keys (schema primaryIdentifier), the last one being the change's
+# physical id, and the FAILED StatusReason lookup (measured).
 _IMPORT_LOOKUPS = {
-    "AWS::SQS::Queue": ("QueueUrl", _queue_import_problem),
-    "AWS::SNS::Topic": ("TopicArn", _topic_import_problem),
-    "AWS::S3::Bucket": ("BucketName", _bucket_import_problem),
-    "AWS::DynamoDB::Table": ("TableName", _table_import_problem),
-    "AWS::SSM::Parameter": ("Name", _parameter_import_problem),
-    "AWS::IAM::Role": ("RoleName", _role_import_problem),
-    "AWS::Logs::LogGroup": ("LogGroupName", _log_group_import_problem),
-    "AWS::Lambda::Function": ("FunctionName", _function_import_problem),
-    "AWS::IoT::Policy": ("Id", _iot_policy_import_problem),
-    "AWS::IoT::CACertificate": ("Id", _ca_certificate_import_problem),
-    "AWS::Cognito::UserPool": ("UserPoolId", _user_pool_import_problem),
+    "AWS::SQS::Queue": (("QueueUrl",), _queue_import_problem),
+    "AWS::SNS::Topic": (("TopicArn",), _topic_import_problem),
+    "AWS::S3::Bucket": (("BucketName",), _bucket_import_problem),
+    "AWS::DynamoDB::Table": (("TableName",), _table_import_problem),
+    "AWS::SSM::Parameter": (("Name",), _parameter_import_problem),
+    "AWS::IAM::Role": (("RoleName",), _role_import_problem),
+    "AWS::Logs::LogGroup": (("LogGroupName",), _log_group_import_problem),
+    "AWS::Lambda::Function": (("FunctionName",), _function_import_problem),
+    "AWS::IoT::Policy": (("Id",), _iot_policy_import_problem),
+    "AWS::IoT::CACertificate": (("Id",), _ca_certificate_import_problem),
+    "AWS::Cognito::UserPool": (("UserPoolId",), _user_pool_import_problem),
+    "AWS::KMS::Key": (("KeyId",), _kms_key_import_problem),
+    "AWS::KMS::Alias": (("AliasName",), _kms_alias_import_problem),
+    "AWS::IoT::ThingType": (("ThingTypeName",), _thing_type_import_problem),
+    "AWS::Cognito::UserPoolClient": (("UserPoolId", "ClientId"), _user_pool_client_import_problem),
+    "AWS::Cognito::UserPoolGroup": (("UserPoolId", "GroupName"), _user_pool_group_import_problem),
+    "AWS::Cognito::UserPoolResourceServer": (
+        ("UserPoolId", "Identifier"), _resource_server_import_problem),
+    "AWS::Cognito::IdentityPool": (("Id",), _identity_pool_import_problem),
+    "AWS::ApiGateway::RestApi": (("RestApiId",), _rest_api_import_problem),
+    "AWS::ApiGateway::Stage": (("RestApiId", "StageName"), _stage_import_problem),
 }
 
 
@@ -245,9 +323,10 @@ def _import_changes(resources_to_import, template, diff):
     for entry in resources_to_import:
         logical, rtype = entry["LogicalResourceId"], entry.get("ResourceType")
         identifier = entry.get("ResourceIdentifier") or {}
-        if rtype in _IMPORT_LOOKUPS and list(identifier) != [_IMPORT_LOOKUPS[rtype][0]]:
+        keys = _IMPORT_LOOKUPS[rtype][0] if rtype in _IMPORT_LOOKUPS else None
+        if keys and sorted(identifier) != sorted(keys):
             raise ValueError(f"Invalid resource identifier for resource type {rtype}. "
-                             f"Expected [{_IMPORT_LOOKUPS[rtype][0]}]")
+                             f"Expected [{', '.join(keys)}]")
         if rtype != declared[logical].get("Type"):
             raise ValueError(
                 f"Resource type of [{logical}] passed in ResourceToImport does not match with "
@@ -278,23 +357,62 @@ def _import_changes(resources_to_import, template, diff):
         raise ValueError(f"The following resources to import {_listed(no_policy)} must have "
                          "DeletionPolicy attribute specified in the template.")
 
-    changes = []
-    for entry in resources_to_import:
-        change = {
-            "Action": "Import",
-            "LogicalResourceId": entry["LogicalResourceId"],
-            "ResourceType": entry["ResourceType"],
-            "Scope": [],
-            "Details": [],
-        }
-        # AWS reports the identifier value as the physical id (measured for the
-        # five types in _IMPORT_LOOKUPS). How it joins a multi-key identifier
-        # (AWS::IAM::RolePolicy's PolicyName + RoleName, say) is unmeasured, so
-        # none is invented for one.
-        if len(entry["ResourceIdentifier"]) == 1:
-            change["PhysicalResourceId"] = next(iter(entry["ResourceIdentifier"].values()))
-        changes.append({"ResourceChange": change})
-    return changes
+    return [_import_change(entry) for entry in resources_to_import]
+
+
+def _import_change(entry):
+    """The Import change of one resource to import."""
+    change = {
+        "Action": "Import",
+        "LogicalResourceId": entry["LogicalResourceId"],
+        "ResourceType": entry["ResourceType"],
+        "Scope": [],
+        "Details": [],
+    }
+    # Key joining for unlisted multi-key types is unmeasured, so none is invented.
+    identifier = entry["ResourceIdentifier"]
+    if entry["ResourceType"] in _IMPORT_LOOKUPS:
+        change["PhysicalResourceId"] = identifier[_IMPORT_LOOKUPS[entry["ResourceType"]][0][-1]]
+    elif len(identifier) == 1:
+        change["PhysicalResourceId"] = next(iter(identifier.values()))
+    return {"ResourceChange": change}
+
+
+def _existing_resources(changes, template):
+    """The added resources ImportExistingResources finds, in the stack's region."""
+    found = []
+    for change in changes:
+        rc = change["ResourceChange"]
+        rtype, logical_id = rc["ResourceType"], rc["LogicalResourceId"]
+        if (rc["Action"] != "Add" or rtype not in _IMPORT_LOOKUPS
+                or "import" not in _RESOURCE_HANDLERS.get(rtype, {})):
+            continue
+        # Only a name written as a literal counts; one from a Ref or Fn::Sub is created.
+        props = template["Resources"][logical_id].get("Properties") or {}
+        keys = _IMPORT_LOOKUPS[rtype][0]
+        if not all(isinstance(props.get(key), str) and props[key] for key in keys):
+            continue
+        entry = {"ResourceType": rtype, "LogicalResourceId": logical_id,
+                 "ResourceIdentifier": {key: props[key] for key in keys}}
+        if _import_not_found([entry]) is None:
+            found.append(entry)
+    return found
+
+
+def _unretained_import_reason(entries, template):
+    """AWS's StatusReason when an existing resource to import is not retained, or None."""
+    declared = template.get("Resources", {})
+    unretained = [
+        f"{e['LogicalResourceId']} ({{{', '.join(f'{k}={v}' for k, v in e['ResourceIdentifier'].items())}}})"
+        for e in sorted(entries, key=lambda e: list(declared).index(e["LogicalResourceId"]))
+        if declared[e["LogicalResourceId"]].get("DeletionPolicy") not in ("Retain", "RetainExceptOnCreate")
+    ]
+    if not unretained:
+        return None
+    return ("CloudFormation is attempting to import some resources because they already exist in "
+            "your account. The resources must have the DeletionPolicy attribute set to 'Retain' or "
+            "'RetainExceptOnCreate' in the template for successful import. The affected resources "
+            f"are {', '.join(unretained)}")
 
 
 def _import_ref(rtype, value):
@@ -313,16 +431,23 @@ def _import_owner(resources_to_import):
     from ministack.services.cloudformation import _stacks
     for entry in resources_to_import:
         rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
-        if len(identifier) != 1:
+        if rtype in _IMPORT_LOOKUPS:
+            keys = _IMPORT_LOOKUPS[rtype][0]
+        elif len(identifier) == 1:
+            keys = tuple(identifier)
+        else:
             continue
-        value = next(iter(identifier.values()))
-        ref = _import_ref(rtype, value)
+        # The last key is the physical id; the others are the resource's properties.
+        *parents, last = keys
+        ref = _import_ref(rtype, identifier[last])
         for stack in _stacks.values():
             if stack.get("StackStatus") == "DELETE_COMPLETE":
                 continue
             for res in stack.get("_resources", {}).values():
-                pid = res.get("PhysicalResourceId")
-                if res.get("ResourceType") == rtype and pid and _import_ref(rtype, pid) == ref:
+                pid, props = res.get("PhysicalResourceId"), res.get("Properties") or {}
+                if (res.get("ResourceType") == rtype and pid and _import_ref(rtype, pid) == ref
+                        and all(props.get(key) == identifier[key] for key in parents)):
+                    value = "|".join(identifier[key] for key in keys)
                     return f"{value} already exists in stack {stack['StackId']}"
     return None
 
@@ -337,9 +462,9 @@ def _import_not_found(resources_to_import):
     for entry in resources_to_import:
         rtype, identifier = entry["ResourceType"], entry["ResourceIdentifier"]
         if rtype in _IMPORT_LOOKUPS:
-            key, problem = _IMPORT_LOOKUPS[rtype]
-            reason = problem(identifier[key])
-            if reason:
+            keys, problem = _IMPORT_LOOKUPS[rtype]
+            reason = problem(*(identifier[key] for key in keys))
+            if reason is not None:
                 return reason
             continue
         # A blank name can name nothing, whatever the type.
@@ -403,6 +528,8 @@ def _create_change_set(params):
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
+    import_existing = (cs_type in ("CREATE", "UPDATE")
+                       and _p(params, "ImportExistingResources", "false").lower() == "true")
 
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -598,17 +725,27 @@ def _create_change_set(params):
         with _stack_region_context(stack, stack_id):
             # AWS looks the resource up before it asks whether a stack holds
             # it: a stack's queue deleted behind its back is "not found".
-            import_failure = (_import_not_found(resources_to_import)
-                              or _import_owner(resources_to_import))
-        if import_failure:
+            import_failure = _import_not_found(resources_to_import)
+            if import_failure is None:
+                import_failure = _import_owner(resources_to_import)
+        if import_failure is not None:
             changes = []
+    existing = []
+    if import_existing:
+        with _stack_region_context(stack, stack_id):
+            existing = _existing_resources(changes, template)
+            import_failure = _unretained_import_reason(existing, template) or _import_owner(existing)
+        if import_failure is not None:
+            changes = []
+        adopted = {e["LogicalResourceId"]: _import_change(e) for e in existing}
+        changes = [adopted.get(c["ResourceChange"]["LogicalResourceId"], c) for c in changes]
 
     cs_id = (
         f"arn:aws:cloudformation:{_stack_region(stack, stack_id)}:{get_account_id()}:"
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
-    if import_failure:
+    if import_failure is not None:
         # AWS accepts an import of a resource that does not exist and fails
         # the change set, with no changes, once it looks the resource up.
         _cs_status, _cs_exec, _cs_reason = "FAILED", "UNAVAILABLE", import_failure
@@ -655,6 +792,8 @@ def _create_change_set(params):
         "_template_body": template_body,
         "_resolved_params": param_values,
         "_resources_to_import": resources_to_import,
+        "_import_existing": {e["LogicalResourceId"]: e["ResourceIdentifier"] for e in existing},
+        "ImportExistingResources": import_existing,
     }
     _change_sets[cs_id] = change_set
 
@@ -751,6 +890,10 @@ def _describe_change_set(params):
             "</member>"
         )
 
+    import_existing_xml = (
+        "<ImportExistingResources>true</ImportExistingResources>"
+        if cs.get("ImportExistingResources") else ""
+    )
     inner = (
         f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
         f"<ChangeSetName>{_esc(cs['ChangeSetName'])}</ChangeSetName>"
@@ -762,6 +905,7 @@ def _describe_change_set(params):
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
         f"<ChangeSetType>{cs.get('ChangeSetType', '')}</ChangeSetType>"
+        f"{import_existing_xml}"
         "<Capabilities>"
         + "".join(f"<member>{_esc(c)}</member>" for c in cs.get("Capabilities", []))
         + "</Capabilities>"
@@ -887,7 +1031,8 @@ def _execute_change_set(params):
                                      param_values, disable_rollback, tags,
                                      is_update=is_update,
                                      previous_stack=previous_stack,
-                                     retain_except_on_create=retain_except_on_create)
+                                     retain_except_on_create=retain_except_on_create,
+                                     imports=cs.get("_import_existing"))
         if on_stack_failure == "DELETE" and not is_update:
             deploy = _create_then_delete_on_failure(real_stack_name, stack_id, deploy)
         _create_stack_task_in_region(
@@ -949,7 +1094,7 @@ async def _import_resources_async(cs, stack, new_stack):
         entry = entries[logical_id]
         rtype = entry["ResourceType"]
         started.append(logical_id)
-        event(logical_id, "IMPORT_IN_PROGRESS", "Resource import started.")
+        event(logical_id, "IMPORT_IN_PROGRESS", _IMPORT_STARTED)
         failure = _import_not_found([entry])
         if failure is None:
             try:
@@ -964,7 +1109,7 @@ async def _import_resources_async(cs, stack, new_stack):
             event(logical_id, "IMPORT_FAILED", failure)
             break
         event(logical_id, "IMPORT_IN_PROGRESS", physical_id=physical_id)
-        event(logical_id, "IMPORT_COMPLETE", "Resource import completed.", physical_id)
+        event(logical_id, "IMPORT_COMPLETE", _IMPORT_COMPLETED, physical_id)
         resources[logical_id] = {
             "PhysicalResourceId": physical_id,
             "ResourceType": rtype,
@@ -995,9 +1140,7 @@ async def _import_resources_async(cs, stack, new_stack):
 
     for logical_id in order:
         record = resources[logical_id]
-        event(logical_id, "UPDATE_IN_PROGRESS",
-              "Apply stack-level tags to imported resource if applicable.",
-              record["PhysicalResourceId"])
+        event(logical_id, "UPDATE_IN_PROGRESS", _IMPORT_TAGS, record["PhysicalResourceId"])
         record["ResourceStatus"] = "UPDATE_COMPLETE"
         event(logical_id, "UPDATE_COMPLETE", physical_id=record["PhysicalResourceId"])
     stack["_template"] = template

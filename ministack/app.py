@@ -47,10 +47,7 @@ def _version() -> str:
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
-# A CloudFront distribution's DomainName is always AWS-shaped
-# ("<label>.cloudfront.net"); matched the same way ALB's own
-# ".elb.amazonaws.com" / ".alb.localhost" pair is — the real AWS host
-# unconditionally, plus the resolvable local form built on MINISTACK_HOST.
+# A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
 _CLOUDFRONT_HOST_RE = re.compile(
     r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
 )
@@ -1741,12 +1738,7 @@ def _resolve_custom_domain_request(host: str, path: str):
 
 
 def _parse_cloudfront_dataplane_host(host: str) -> str | None:
-    """The distribution label addressed by ``host``, or None.
-
-    Host-based only, like ALB's own ``.elb.amazonaws.com`` / ``.alb.localhost``
-    pair and the S3-vhost check: a request whose first label doesn't match
-    this shape isn't a CloudFront distribution request at all, so nothing
-    existing changes."""
+    """The distribution label addressed by ``host``, or None."""
     m = _CLOUDFRONT_HOST_RE.match(host.split(":")[0].lower())
     return m.group(1) if m else None
 
@@ -1755,13 +1747,7 @@ async def _handle_cloudfront_dataplane_request(
     host: str, path: str, raw_path: str, raw_query_string: str, method: str,
     headers: dict, body: bytes, query_params: dict, client_ip: str,
 ):
-    """Serve a CloudFront distribution's viewer traffic (Host-based:
-    ``<label>.cloudfront.net`` or ``<label>.cloudfront.<MINISTACK_HOST>``).
-    Checked before execute-api/lambda-url/S3-vhost/ALB host routing so a
-    distribution's own viewer-request function — not the origin it fronts —
-    sees the request first, exactly as a real CloudFront edge would. See
-    ``cloudfront_dataplane.handle_request`` for what ``raw_path``/
-    ``raw_query_string`` carry and why."""
+    """Serve a CloudFront distribution's viewer traffic, matched by Host."""
     label = _parse_cloudfront_dataplane_host(host)
     if label is None:
         return None

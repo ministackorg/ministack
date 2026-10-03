@@ -875,6 +875,12 @@ def test_athena_list_and_get_databases_from_glue(athena, glue):
         athena.list_databases(CatalogName="no_such_catalog")
     page = athena.list_databases(CatalogName="AwsDataCatalog", MaxResults=1)
     assert len(page["DatabaseList"]) == 1 and "NextToken" in page
+    glue.create_database(DatabaseInput={"Name": "ath_db_nodesc"})
+    got = athena.get_database(CatalogName="AwsDataCatalog", DatabaseName="ath_db_nodesc")["Database"]
+    assert "Description" not in got
+    with pytest.raises(ClientError) as err:
+        athena.list_databases(CatalogName="AwsDataCatalog", NextToken="not-a-token")
+    assert err.value.response["Error"]["Code"] == "InvalidRequestException"
 
 
 def test_athena_workgroup_reports_engine_version(athena):
@@ -1080,13 +1086,13 @@ def test_athena_reads_a_parquet_table_created_without_classification(
 
 
 def test_parse_create_external_table_with_location_and_comment():
-    from ministack.services.athena import CreateTable, _parse_ddl
+    from ministack.services.athena import _CreateTable, _parse_ddl
 
     ddl = _parse_ddl(
         "CREATE EXTERNAL TABLE events (id INT, note STRING COMMENT 'free text') "
         "LOCATION 's3://bucket/db/events/'"
     )
-    assert ddl == CreateTable(
+    assert ddl == _CreateTable(
         None, "events", external=True,
         columns=[{"Name": "id", "Type": "int"}, {"Name": "note", "Type": "string", "Comment": "free text"}],
         location="s3://bucket/db/events/",
@@ -1191,20 +1197,20 @@ def test_parse_literals_and_comments_are_not_structure():
 
 
 def test_parse_drop_table():
-    from ministack.services.athena import DropTable, _parse_ddl
+    from ministack.services.athena import _DropTable, _parse_ddl
 
-    assert _parse_ddl("DROP TABLE events") == DropTable(None, "events")
-    assert _parse_ddl("drop table if exists db.events;") == DropTable("db", "events", if_exists=True)
+    assert _parse_ddl("DROP TABLE events") == _DropTable(None, "events")
+    assert _parse_ddl("drop table if exists db.events;") == _DropTable("db", "events", if_exists=True)
 
 
 def test_table_references_qualified_quoted_and_aliased():
-    from ministack.services.athena import TableReference, _table_references
+    from ministack.services.athena import _table_references, _TableReference
 
     query = 'SELECT u.id FROM "awsdatacatalog"."acme"."users" u JOIN orders ON u.id = orders.uid'
     refs = _table_references(query)
     assert refs == [
-        TableReference("acme", "users", query.index('"awsdatacatalog"'), query.index(" u JOIN"), aliased=True),
-        TableReference(None, "orders", query.index("orders ON"), query.index(" ON u.id"), aliased=False),
+        _TableReference("acme", "users", query.index('"awsdatacatalog"'), query.index(" u JOIN"), aliased=True),
+        _TableReference(None, "orders", query.index("orders ON"), query.index(" ON u.id"), aliased=False),
     ]
 
 

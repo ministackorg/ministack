@@ -5003,6 +5003,16 @@ def _admin_disable_provider_for_user(data):
     return json_response({})
 
 
+def _merge_federated_attrs(user: dict, user_attrs: dict, now) -> str:
+    """Apply a federated sign-in's mapped attributes to an existing profile; return its sub."""
+    merged = _attr_list_to_dict(user.get("Attributes", []))
+    # `sub` is Cognito's own immutable identifier; a mapped IdP `sub` claim must not replace it.
+    merged.update({k: v for k, v in user_attrs.items() if k != "sub"})
+    user["Attributes"] = _dict_to_attr_list(merged)
+    user["UserLastModifiedDate"] = now
+    return merged.get("sub", new_uuid())
+
+
 def _linked_username_for_federation(pool, provider_name, name_id, user_attrs):
     """Resolve a federated sign-in to a linked local profile, if one exists.
 
@@ -5475,6 +5485,7 @@ def _oauth2_authorize_federation(query_params):
     identity_provider = _qp(query_params, "identity_provider")
     state = _qp(query_params, "state")
     scope = _qp(query_params, "scope", "openid")
+    nonce = _qp(query_params, "nonce")
 
     if not client_id:
         return error_response_json("InvalidParameterException", "client_id is required.", 400)
@@ -5507,6 +5518,9 @@ def _oauth2_authorize_federation(query_params):
         "redirect_uri": redirect_uri,
         "state": state,
         "scope": scope,
+        # The app's nonce belongs in the ID token MiniStack issues to the app;
+        # it is not forwarded to the external IdP.
+        "nonce": nonce,
         "provider_name": identity_provider,
         "created_at": time.time(),
     }
@@ -5680,12 +5694,7 @@ def _saml2_idp_response(body: bytes, query_params):
     now = _now_epoch()
 
     if existing_user:
-        # Update attributes
-        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
-        existing_dict.update(user_attrs)
-        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
-        existing_user["UserLastModifiedDate"] = now
-        sub = existing_dict.get("sub", new_uuid())
+        sub = _merge_federated_attrs(existing_user, user_attrs, now)
     else:
         sub = new_uuid()
         if "email" not in user_attrs:
@@ -5696,25 +5705,35 @@ def _saml2_idp_response(body: bytes, query_params):
             logger.info("Cognito: PreSignUp Lambda rejected SAML federation sign-up for %s: %s",
                         username, e)
             return error_response_json("UserLambdaValidationException", str(e), 400)
-        if presignup["autoVerifyEmail"] and "email" in user_attrs:
-            user_attrs["email_verified"] = "true"
-        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
-            user_attrs["phone_number_verified"] = "true"
-        user_attrs["sub"] = sub
-        user = {
-            "Username": username,
-            "Attributes": _dict_to_attr_list(user_attrs),
-            "UserCreateDate": now,
-            "UserLastModifiedDate": now,
-            "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
-            "MFAOptions": [],
-            "_password": "",
-            "_groups": [],
-            "_tokens": [],
-        }
-        pool["_users"][username] = user
-        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+        # The trigger may have linked this identity (AdminLinkProviderForUser);
+        # AWS completes the same sign-in as the linked profile.
+        linked_username = _linked_username_for_federation(
+            pool, provider_name, name_id, user_attrs)
+        if linked_username:
+            username = linked_username
+            if not user_attrs.get("email"):
+                user_attrs.pop("email", None)  # placeholder must not blank the profile's email
+            sub = _merge_federated_attrs(pool["_users"][username], user_attrs, now)
+        else:
+            if presignup["autoVerifyEmail"] and "email" in user_attrs:
+                user_attrs["email_verified"] = "true"
+            if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+                user_attrs["phone_number_verified"] = "true"
+            user_attrs["sub"] = sub
+            user = {
+                "Username": username,
+                "Attributes": _dict_to_attr_list(user_attrs),
+                "UserCreateDate": now,
+                "UserLastModifiedDate": now,
+                "Enabled": True,
+                "UserStatus": "EXTERNAL_PROVIDER",
+                "MFAOptions": [],
+                "_password": "",
+                "_groups": [],
+                "_tokens": [],
+            }
+            pool["_users"][username] = user
+            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
     # Generate authorization code
     _cleanup_expired_relay_codes()
@@ -5727,6 +5746,7 @@ def _saml2_idp_response(body: bytes, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
     }
 
@@ -5911,11 +5931,7 @@ def _oauth2_idp_response(method, body, query_params):
     now = _now_epoch()
 
     if existing_user:
-        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
-        existing_dict.update(user_attrs)
-        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
-        existing_user["UserLastModifiedDate"] = now
-        sub = existing_dict.get("sub", new_uuid())
+        sub = _merge_federated_attrs(existing_user, user_attrs, now)
     else:
         sub = new_uuid()
         if "email" not in user_attrs and "@" in name_id:
@@ -5926,25 +5942,33 @@ def _oauth2_idp_response(method, body, query_params):
             logger.info("Cognito: PreSignUp Lambda rejected OIDC federation sign-up for %s: %s",
                         username, e)
             return error_response_json("UserLambdaValidationException", str(e), 400)
-        if presignup["autoVerifyEmail"] and "email" in user_attrs:
-            user_attrs["email_verified"] = "true"
-        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
-            user_attrs["phone_number_verified"] = "true"
-        user_attrs["sub"] = sub
-        user = {
-            "Username": username,
-            "Attributes": _dict_to_attr_list(user_attrs),
-            "UserCreateDate": now,
-            "UserLastModifiedDate": now,
-            "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
-            "MFAOptions": [],
-            "_password": "",
-            "_groups": [],
-            "_tokens": [],
-        }
-        pool["_users"][username] = user
-        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+        # The trigger may have linked this identity (AdminLinkProviderForUser);
+        # AWS completes the same sign-in as the linked profile.
+        linked_username = _linked_username_for_federation(
+            pool, provider_name, name_id, user_attrs)
+        if linked_username:
+            username = linked_username
+            sub = _merge_federated_attrs(pool["_users"][username], user_attrs, now)
+        else:
+            if presignup["autoVerifyEmail"] and "email" in user_attrs:
+                user_attrs["email_verified"] = "true"
+            if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+                user_attrs["phone_number_verified"] = "true"
+            user_attrs["sub"] = sub
+            user = {
+                "Username": username,
+                "Attributes": _dict_to_attr_list(user_attrs),
+                "UserCreateDate": now,
+                "UserLastModifiedDate": now,
+                "Enabled": True,
+                "UserStatus": "EXTERNAL_PROVIDER",
+                "MFAOptions": [],
+                "_password": "",
+                "_groups": [],
+                "_tokens": [],
+            }
+            pool["_users"][username] = user
+            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
     # Issue MiniStack auth code so the app's /oauth2/token call works.
     _cleanup_expired_relay_codes()
@@ -5957,6 +5981,7 @@ def _oauth2_idp_response(method, body, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
         "_oidc_access_token": access_token,  # kept for /oauth2/userInfo passthrough
     }
@@ -6397,16 +6422,20 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             effective_client_id = code_data["client_id"]
 
             user_attrs = {}
+            groups = []
             pool = _get_pool_unscoped(pool_id)
             if pool:
                 user = pool["_users"].get(username)
                 if user:
                     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+                    groups = user.get("_groups", [])
 
             access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
+                                        user_attrs=user_attrs, groups=groups,
                                         trigger_source="TokenGeneration_HostedAuth")
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
-                                    trigger_source="TokenGeneration_HostedAuth")
+                                    groups=groups, trigger_source="TokenGeneration_HostedAuth",
+                                    nonce=code_data.get("nonce", ""))
             refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh")
 
             return json_response({
