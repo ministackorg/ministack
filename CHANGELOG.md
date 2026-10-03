@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **AWS Budgets** — `CreateBudget` (inline `NotificationsWithSubscribers` and `ResourceTags`), `DescribeBudget`, `DescribeBudgets`, `UpdateBudget`, `DeleteBudget`, `CreateNotification`, `UpdateNotification`, `DeleteNotification`, `DescribeNotificationsForBudget`, `CreateSubscriber`, `UpdateSubscriber`, `DeleteSubscriber`, `DescribeSubscribersForNotification`, `TagResource`, `UntagResource`, `ListTagsForResource`. Global (account-scoped, no region) JSON 1.1 service; a new or updated budget reports zero `CalculatedSpend.ActualSpend` and no `ForecastedSpend` rather than an invented number; an omitted `TimePeriod.Start` defaults to the start of the budget's `TimeUnit` period and an omitted `End` to `06/15/87 00:00 UTC`, and an omitted notification `ThresholdType` defaults to `PERCENTAGE`, as AWS does; the 10-notification/budget and 11-subscriber/notification quotas are enforced (`CreationLimitExceededException`); deleting a notification's last subscriber deletes the notification, matching AWS. Budget Actions (RI/Savings Plans auto-remediation) and `DescribeBudgetPerformanceHistory` are out of scope.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added

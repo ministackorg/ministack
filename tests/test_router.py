@@ -190,6 +190,7 @@ _TOKEN_ROUTES = {
     "appsync-api": "appsync-events", "appsync-realtime-api": "appsync-events",
     "athena": "athena", "autoscaling": "autoscaling", "backup": "backup",
     "batch": "batch", "bedrock": "bedrock", "bedrock-runtime": "bedrock-runtime",
+    "budgets": "budgets",
     "cloudcontrolapi": "cloudcontrol", "cloudformation": "cloudformation",
     "cloudfront": "cloudfront", "cloudfront-kvs": "cloudfront-keyvaluestore",
     "cloudtrail": "cloudtrail", "codebuild": "codebuild",
