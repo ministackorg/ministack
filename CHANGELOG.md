@@ -21,6 +21,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — Node.js and Python functions start in the code directory** — `process.cwd()` and `os.getcwd()` were MiniStack's own directory, so libraries that read files relative to it (such as `node-config`) missed the function's files; the working directory is now the code root (`LAMBDA_TASK_ROOT`), as on AWS. Contributed by @drakeo338. Reported by @shane-patzlsberger.
 - **STS — `AssumeRole` honors trust-policy denies and conditions** — with `AUTH=true`, a matching `Deny` (including `NotAction`) overrides an `Allow`, and `sts:ExternalId` and `sts:RoleSessionName` conditions are evaluated; a denied call returns `AccessDenied` and creates no session. Contributed by @AdrianAcala.
 - **Cognito — federated sign-in tokens** — the ID token carries the `nonce` from `/oauth2/authorize`, both tokens carry `cognito:groups`, and a user linked by a PreSignUp trigger signs in as the linked profile instead of a new one. Contributed by @kjdev.
 - **CloudFormation — nested stack with a `Transform`** — where `Capabilities` are checked, a nested stack whose template declares a `Transform` or calls `Fn::Transform` fails with `Requires capabilities : [CAPABILITY_AUTO_EXPAND]` unless the parent acknowledged `CAPABILITY_AUTO_EXPAND`, as on AWS.

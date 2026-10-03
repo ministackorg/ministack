@@ -5686,6 +5686,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 text=True,
                 timeout=timeout,
                 env=env,
+                cwd=code_dir,
             )
 
             log_tail = proc.stderr.strip()

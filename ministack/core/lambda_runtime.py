@@ -1225,6 +1225,7 @@ class Worker:
 
         self._proc = subprocess.Popen(
             [binary, worker_path],
+            cwd=code_dir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
