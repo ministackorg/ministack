@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **SNS — `CreateTopic` keeps its tags** — the handler read `Tag.member.N` where the API sends `Tags.member.N`, so tags given at creation were dropped. Contributed by @iot-rocket.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
