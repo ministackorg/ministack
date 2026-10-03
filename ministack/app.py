@@ -47,6 +47,10 @@ def _version() -> str:
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
 _EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
+# A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
+_CLOUDFRONT_HOST_RE = re.compile(
+    r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
+)
 # Lambda Function URL: {urlId}.lambda-url.{region}.<anything>[:port]. The stored
 # FunctionUrl carries AWS's own `.on.aws` suffix, so we match any suffix rather
 # than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
@@ -154,7 +158,7 @@ def _extract_s3_vhost_bucket(host: str):
 
 
 _S3_VHOST_EXCLUDE_RE = re.compile(
-    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\."
+    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot|cloudfront)\."
     r"|^(docdb|documentdb)\."
 )
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
@@ -1184,6 +1188,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         _parse_execute_api_url(host, path) is not None
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
+        or _parse_cloudfront_dataplane_host(host) is not None
     )
     for response in (
         None if owns_cors else _handle_options_request(method, request_id),
@@ -1227,7 +1232,29 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_elasticache_ca_request(method, path)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_elasticache_ca_request(method: str, path: str):
+    """`GET /_ministack/elasticache/ca.pem` returns the CA that signs serverless
+    cache certificates; a client trusts it to connect with TLS."""
+    if path != "/_ministack/elasticache/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import elasticache
+
+        cert_pem = elasticache.serverless_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, cert_pem.encode())
 
 
 def _handle_rds_ca_request(method: str, path: str):
@@ -1714,8 +1741,35 @@ def _resolve_custom_domain_request(host: str, path: str):
     return apigw_v1.resolve_base_path_mapping(hostname, path)
 
 
+def _parse_cloudfront_dataplane_host(host: str) -> str | None:
+    """The distribution label addressed by ``host``, or None."""
+    m = _CLOUDFRONT_HOST_RE.match(host.split(":")[0].lower())
+    return m.group(1) if m else None
+
+
+async def _handle_cloudfront_dataplane_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a CloudFront distribution's viewer traffic, matched by Host."""
+    label = _parse_cloudfront_dataplane_host(host)
+    if label is None:
+        return None
+    dist = _get_module("cloudfront").find_distribution_for_label(label)
+    if dist is None:
+        return None
+    try:
+        return await _get_module("cloudfront_dataplane").handle_request(
+            dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
+        )
+    except Exception as e:
+        logger.exception("Error in CloudFront data-plane dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
 async def _handle_execute_api_request(
-    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
+    raw_path: str | None = None,
 ):
     """Handle API Gateway execute-api data plane requests (Host-based,
     path-based, and registered custom domains)."""
@@ -1778,6 +1832,13 @@ async def _handle_execute_api_request(
         apigw_v2 = _get_module("apigateway")
         if apigw_v2.find_api_scope(api_id) is None:
             return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        if raw_path is not None and path.endswith(execute_path):
+            # `path` is the server's full decode, which also turns %25 into "%";
+            # an HTTP API keeps that one escape in rawPath.
+            prefix = path[: len(path) - len(execute_path)]
+            http_api_path = apigw_v2.decode_http_api_path(raw_path)
+            if http_api_path.startswith(prefix):
+                execute_path = http_api_path[len(prefix):]
         return await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
@@ -2095,6 +2156,9 @@ async def _handle_special_data_plane_request(
     body: bytes,
     query_params: dict,
     request_id: str,
+    raw_path: str | None = None,
+    raw_query_string: str = "",
+    client_ip: str = "127.0.0.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
     # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
@@ -2129,7 +2193,14 @@ async def _handle_special_data_plane_request(
         return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
-    if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
+    if response := await _handle_cloudfront_dataplane_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip,
+    ):
+        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+    if response := await _handle_execute_api_request(
+        host, path, method, headers, body, query_params, raw_path=raw_path
+    ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
@@ -2410,15 +2481,17 @@ async def _dispatch_service_request(
     if AUTH:
         from ministack.core.iam_actions import (
             access_denied_response,
+            agentcore_endpoint_arn,
             dynamodb_resource_arns,
             dynamodb_service_context,
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
         )
-        from ministack.core.iam_evaluator import AuthError, enforce
+        from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
 
+        pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
@@ -2457,6 +2530,10 @@ async def _dispatch_service_request(
                         break
             # PutEvents carries one entry per event, and entries may name
             # different buses: AWS authorizes each against its own bus.
+            if service == "bedrock-agentcore" and method == "POST" and not denied:
+                endpoint_arn = agentcore_endpoint_arn(path, routing_params)
+                if endpoint_arn:
+                    denied = enforce(access_key, iam_action, service, region, resource_arn=endpoint_arn)
             if service == "events" and not denied:
                 for extra_arn in eventbridge_resource_arns(
                         body, region, get_account_id())[1:]:
@@ -2466,6 +2543,18 @@ async def _dispatch_service_request(
                     )
                     if denied:
                         break
+            if (
+                denied
+                and service == "bedrock-agentcore"
+                and iam_action == "bedrock-agentcore:InvokeAgentRuntime"
+                and not isinstance(denied, AuthError)
+            ):
+                from ministack.services import bedrock_agentcore
+
+                if bedrock_agentcore.resource_policy_allows_without_identity(
+                    path, query_params
+                ):
+                    denied = None
             if denied:
                 if isinstance(denied, AuthError):
                     return access_denied_response(
@@ -2477,7 +2566,10 @@ async def _dispatch_service_request(
                         message=denied.message,
                         headers=headers,
                     )
-                return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers)
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id, headers=headers,
+                    resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                )
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
@@ -2559,13 +2651,13 @@ async def app(scope, receive, send):
             return
         try:
             if parsed:
-                ws_api_id, _stage, _execute_path = parsed
+                ws_api_id, ws_stage, ws_execute_path = parsed
                 await _get_module("apigateway").handle_websocket(
                     scope,
                     receive,
                     send,
                     ws_api_id,
-                    path_override=_execute_path,
+                    path_override=f"/{ws_stage}{ws_execute_path}",
                 )
             elif appsync_rt_m:
                 await _get_module("appsync_events").handle_websocket(scope, receive, send, appsync_rt_m.group(1))
@@ -2674,7 +2766,12 @@ async def app(scope, receive, send):
 
     if await _send_if_handled(
         send,
-        await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id),
+        await _handle_special_data_plane_request(
+            method, path, headers, body, query_params, request_id,
+            raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+            raw_query_string=query_string,
+            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+        ),
         receive,
     ):
         return

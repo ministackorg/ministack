@@ -32,7 +32,10 @@ from ministack.core.responses import (
     now_iso,
 )
 from ministack.services.ses import (
+    _account_details,
     _build_mime_message,
+    _dkim_tokens,
+    _message_rejection,
     _parse_raw_mime,
     _render_template,
     _restore_regional_store,
@@ -113,6 +116,22 @@ def _resource_arn(kind, name):
     return f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
 
 
+def _easy_dkim_attributes(identity, identity_type, signing_attributes):
+    """A DOMAIN identity uses Easy DKIM unless DkimSigningAttributes brings its
+    own key (BYODKIM): three tokens for its CNAME records, verification
+    pending. An EMAIL_ADDRESS identity has no DKIM tokens."""
+    byodkim = any(signing_attributes.get(k) for k in ("DomainSigningPrivateKey", "DomainSigningSelector"))
+    if identity_type != "DOMAIN" or byodkim:
+        return {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []}
+    tokens = _dkim_tokens(identity)
+    return {
+        "SigningEnabled": False,
+        "SigningAttributesOrigin": "AWS_SES",
+        "Status": "PENDING",
+        "Tokens": tokens,
+    }
+
+
 def _invalid_resource_arn(arn):
     return _json_err("BadRequestException", f"Invalid ResourceArn: {arn}")
 
@@ -169,8 +188,13 @@ def _page_size(query_params, default, maximum=100):
     return size, None
 
 
-def _paginate(items, query_params, default_size):
-    size, err = _page_size(query_params, default_size)
+def _body_paging(data):
+    """NextToken / PageSize sent in a JSON body, in the query-parameter form."""
+    return {k: str(data[k]) for k in ("NextToken", "PageSize") if data.get(k) is not None}
+
+
+def _paginate(items, query_params, default_size, maximum=100):
+    size, err = _page_size(query_params, default_size, maximum)
     if err:
         return [], None, err
     start, err = _decode_page_token(_first_query_value(query_params, "NextToken"))
@@ -291,14 +315,33 @@ async def handle_request(method, path, headers, body, query_params):
         cutoff = time.time() - 86400
         sent_list = _sent_emails_list()
         sent_24h = sum(1 for e in sent_list if e["Timestamp"] >= cutoff)
-        return json_response({
+        account = _account_details.get("account") or {}
+        out = {
             "DedicatedIpAutoWarmupEnabled": False,
             "EnforcementStatus": "HEALTHY",
-            "ProductionAccessEnabled": True,
+            "ProductionAccessEnabled": account.get("ProductionAccessEnabled", True),
             "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": float(sent_24h)},
             "SendingEnabled": True,
             "SuppressionAttributes": {"SuppressedReasons": []},
-        })
+        }
+        if account.get("Details"):
+            out["Details"] = account["Details"]
+        return json_response(out)
+
+    # POST /v2/email/account/details  (PutAccountDetails)
+    if sub == "/account/details" and method == "POST":
+        if data.get("MailType") not in ("MARKETING", "TRANSACTIONAL"):
+            return _json_err("BadRequestException", "MailType must be MARKETING or TRANSACTIONAL")
+        if not data.get("WebsiteURL"):
+            return _json_err("BadRequestException", "WebsiteURL is required")
+        account = dict(_account_details.get("account") or {})
+        account["Details"] = {k: data[k] for k in (
+            "MailType", "WebsiteURL", "ContactLanguage", "UseCaseDescription",
+            "AdditionalContactEmailAddresses") if k in data}
+        if "ProductionAccessEnabled" in data:
+            account["ProductionAccessEnabled"] = bool(data["ProductionAccessEnabled"])
+        _account_details["account"] = account
+        return json_response({})
 
     # PUT /v2/email/account/suppression
     if sub == "/account/suppression" and method == "PUT":
@@ -355,6 +398,9 @@ async def handle_request(method, path, headers, body, query_params):
             body_html = rendered.get("Html", "")
 
         all_addrs = to_addrs + cc_addrs + bcc_addrs
+        rejected = _message_rejection(source or (parsed.get("From", "") if raw else ""), all_addrs)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         if source and all_addrs:
             mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                            subj, body_text, body_html, msg_id)
@@ -398,6 +444,9 @@ async def handle_request(method, path, headers, body, query_params):
         if not entries:
             return _json_err("BadRequestException", "BulkEmailEntries is required")
 
+        rejected = _message_rejection(source)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         results = []
         for entry in entries:
             dest = entry.get("Destination", {})
@@ -409,6 +458,10 @@ async def handle_request(method, path, headers, body, query_params):
                      .get("ReplacementTemplate", {})
                      .get("ReplacementTemplateData", default_data)
             )
+            rejected = _message_rejection(None, to_addrs + cc_addrs + bcc_addrs)
+            if rejected:
+                results.append({"Status": "MESSAGE_REJECTED", "Error": rejected})
+                continue
             rendered = _render_template(stored, template_data)
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
@@ -451,11 +504,13 @@ async def handle_request(method, path, headers, body, query_params):
         if not identity:
             return _json_err("BadRequestException", "EmailIdentity is required")
         identity_type = "DOMAIN" if "." in identity and "@" not in identity else "EMAIL_ADDRESS"
+        dkim_attributes = _easy_dkim_attributes(
+            identity, identity_type, data.get("DkimSigningAttributes") or {})
         _identities[identity] = {
             "EmailIdentity": identity,
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
             "MailFromAttributes": {"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"},
             "Tags": data.get("Tags", []),
             "CreatedTimestamp": now_iso(),
@@ -464,17 +519,30 @@ async def handle_request(method, path, headers, body, query_params):
         return json_response({
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
         })
 
-    # GET /v2/email/identities  (ListEmailIdentities)
-    if sub == "/identities" and method == "GET":
-        return json_response({
-            "EmailIdentities": [
-                {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True}
-                for k, v in _identities.items()
-            ],
-        })
+    # ListEmailIdentities: GET /v2/email/identities, or POST /v2/email/list-identities
+    # with paging and Filter in the body (newer SDKs)
+    if (sub == "/identities" and method == "GET") or (sub == "/list-identities" and method == "POST"):
+        params = query_params if method == "GET" else _body_paging(data)
+        wanted = (data.get("Filter") or {}) if method == "POST" else {}
+        items = [
+            {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True,
+             "VerificationStatus": "SUCCESS"}
+            for k, v in _identities.items()
+        ]
+        items = [i for i in items
+                 if wanted.get("IDENTITY_NAME_CONTAINS", "") in i["IdentityName"]
+                 and wanted.get("IDENTITY_TYPE", i["IdentityType"]) == i["IdentityType"]
+                 and wanted.get("VERIFICATION_STATUS", "SUCCESS") == "SUCCESS"]
+        page, next_token, err = _paginate(items, params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"EmailIdentities": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET /v2/email/identities/{identity}
     m = re.match(r"^/identities/(.+)$", sub)
@@ -498,9 +566,21 @@ async def handle_request(method, path, headers, body, query_params):
         _ses_tags[_resource_arn("configuration-set", name)] = list(data.get("Tags", []))
         return json_response({})
 
-    # GET /v2/email/configuration-sets  (ListConfigurationSets)
-    if sub == "/configuration-sets" and method == "GET":
-        return json_response({"ConfigurationSets": list(_config_sets.keys())})
+    # ListConfigurationSets: GET /v2/email/configuration-sets, or
+    # POST /v2/email/list-configuration-sets with paging and Filter in the body
+    if ((sub == "/configuration-sets" and method == "GET")
+            or (sub == "/list-configuration-sets" and method == "POST")):
+        params = query_params if method == "GET" else _body_paging(data)
+        contains = ((data.get("Filter") or {}).get("CONFIGURATION_SET_NAME_CONTAINS", "")
+                    if method == "POST" else "")
+        page, next_token, err = _paginate(
+            [n for n in _config_sets if contains in n], params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"ConfigurationSets": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET/DELETE /v2/email/configuration-sets/{name}
     m = re.match(r"^/configuration-sets/([^/]+)$", sub)

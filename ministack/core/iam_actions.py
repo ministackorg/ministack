@@ -40,7 +40,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock": "bedrock",
     "bedrock-agent": "bedrock",
     "bedrock-agent-runtime": "bedrock",
-    "bedrock-agentcore": "bedrock",
+    "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
@@ -456,7 +456,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    "bedrock-agentcore": [],  # no botocore model yet
+    "bedrock-agentcore": [],  # InvokeAgentRuntime is mapped in extract_iam_action
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -656,6 +656,20 @@ def _match_rest_action(service: str, method: str, path: str,
     return best_match
 
 
+def _agentcore_runtime_arn(path: str) -> str | None:
+    """Extract the runtime ARN from an InvokeAgentRuntime URI."""
+    match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
+    return match.group(1) if match else None
+
+
+def agentcore_endpoint_arn(path: str, query_params: dict) -> str | None:
+    """The runtime-endpoint ARN InvokeAgentRuntime also authorizes: the qualifier, else DEFAULT."""
+    runtime_arn = _agentcore_runtime_arn(path)
+    if not runtime_arn:
+        return None
+    return f"{runtime_arn}/runtime-endpoint/{_query_param(query_params, 'qualifier') or 'DEFAULT'}"
+
+
 def extract_iam_action(service: str, method: str, path: str,
                        headers: dict, body: bytes,
                        query_params: dict) -> str | None:
@@ -686,6 +700,25 @@ def extract_iam_action(service: str, method: str, path: str,
         action_name = _lambda_action(method, path)
         if action_name:
             return f"lambda:{action_name}"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        if _agentcore_runtime_arn(path):
+            return "bedrock-agentcore:InvokeAgentRuntime"
+
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        policy_action = {
+            "PUT": "PutResourcePolicy",
+            "GET": "GetResourcePolicy",
+            "DELETE": "DeleteResourcePolicy",
+        }.get(method)
+        if policy_action:
+            return f"bedrock-agentcore:{policy_action}"
+
+    # The control-plane model also declares ``GET /runtimes/{id}``. Its
+    # permissive ARN route would otherwise misclassify an invalid GET against
+    # the data-plane invocation path as GetAgentRuntime.
+    if service == "bedrock-agentcore" and "/invocations" in unquote(path):
+        return None
 
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
@@ -847,6 +880,12 @@ def extract_resource_arn(service: str, method: str, path: str,
             return resources[0]
         return "*"
 
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        return unquote(path[len("/resourcepolicy/"):]) or "*"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        return _agentcore_runtime_arn(path) or "*"
+
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
         path_parts = [p for p in path.split("/") if p]
@@ -951,7 +990,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "sts":
-        role_arn = _query_param(query_params, "RoleArn")
+        role_arn = _query_param(query_params, "RoleArn") or _safe_json_field(body, "RoleArn")
         if role_arn:
             return role_arn
         return "*"
@@ -1222,6 +1261,29 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "ssm":
+        action = _action_from_target(headers)
+        if action in {"AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource"}:
+            try:
+                data = json.loads(body) if body else {}
+            except (json.JSONDecodeError, TypeError):
+                return "*"
+            if not isinstance(data, dict) or data.get("ResourceType", "Parameter") != "Parameter":
+                return "*"
+            resource_id = data.get("ResourceId", "")
+            if not isinstance(resource_id, str) or not resource_id:
+                return "*"
+            if resource_id.startswith("arn:"):
+                # The handler also accepts parameter ARN aliases. Authorize
+                # accepted local aliases as the canonical parameter resource,
+                # while retaining foreign and malformed ARNs as supplied.
+                from ministack.services.ssm import _parameter_name_from_arn
+
+                parsed = _parameter_name_from_arn(resource_id)
+                if parsed and parsed[0] == account_id and parsed[1] == region:
+                    resource_id = parsed[2]
+                else:
+                    return resource_id
+            return f"arn:aws:ssm:{region}:{account_id}:parameter/{resource_id.lstrip('/')}"
         name = _param(body, query_params, "Name")
         if name:
             return f"arn:aws:ssm:{region}:{account_id}:parameter{name if name.startswith('/') else '/' + name}"
@@ -1678,14 +1740,30 @@ def dynamodb_service_context(body: bytes) -> dict:
 
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
-                           message: str = "", headers: dict | None = None) -> tuple:
-    """Format a 403 error response matching the service's protocol.
+                           message: str = "", headers: dict | None = None,
+                           resource_arn: str = "*", explicit_deny: bool = False) -> tuple:
+    """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
     surfaces as a bare 403 with the code buried in an unread body, so a client
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
+    if service == "ssm" and not error_code:
+        # SSM authorization denials are HTTP 400, JSON 1.1, with a capitalized
+        # Message naming the resource.
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
+        )
+        message = (
+            f"User: {principal_arn} is not authorized to perform: {action} "
+            f"on resource: {resource_arn} {reason}"
+        )
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
     if not message:
         message = (
             f"User: {principal_arn} is not authorized to perform: {action} "

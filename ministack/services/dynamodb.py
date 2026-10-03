@@ -42,6 +42,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
@@ -708,7 +709,8 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
     return record
 
 
-def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, new_item: dict | None):
+def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, new_item: dict | None,
+                       replicate: bool = True):
     """Emit a change to DynamoDB Streams (if enabled) and to any ACTIVE Kinesis
     streaming destinations registered for this table.
 
@@ -719,6 +721,8 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     table = _tables.get(table_name)
     if not table:
         return
+    if replicate:
+        _replicate_write(table, event_name, old_item, new_item)
 
     spec = table.get("StreamSpecification") or {}
     streams_enabled = bool(spec.get("StreamEnabled"))
@@ -1267,7 +1271,10 @@ def _delete_table(data):
             "Table is protected against deletion. To delete the table, disable deletion protection.", 400)
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
+    remaining = [r for r in _replica_group(_tables[name]) if r != get_region()]
     del _tables[name]
+    if remaining:
+        _set_replica_group(name, remaining)
     _tags.pop(desc.get("TableArn", ""), None)
     _ttl_settings.pop(name, None)
     _pitr_settings.pop(name, None)
@@ -1294,6 +1301,115 @@ def _list_tables(data):
     if len(names) == limit and names:
         result["LastEvaluatedTableName"] = names[-1]
     return json_response(result)
+
+
+_GLOBAL_TABLE_VERSION = "2019.11.21"
+
+
+def _replica_group(table) -> list:
+    """Every region of the global table ``table`` belongs to, its own included."""
+    return table.get("_global_regions") or []
+
+
+def _set_replica_group(name, regions):
+    account = get_account_id()
+    for region in regions:
+        member = _tables.get_scoped(account, region, name)
+        if member is not None:
+            member["_global_regions"] = sorted(regions) if len(regions) > 1 else []
+
+
+def _create_replica(name, table, region):
+    """Copy ``table`` into ``region`` as a replica, with its items."""
+    account = get_account_id()
+    replica = copy.deepcopy({k: v for k, v in table.items() if k != "items"})
+    replica["items"] = defaultdict(dict, copy.deepcopy(dict(table["items"])))
+    arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
+    replica.update({
+        "TableArn": arn, "TableId": new_uuid(), "CreationDateTime": int(time.time()),
+        "TableStatus": "ACTIVE", "DeletionProtectionEnabled": False,
+    })
+    for index in replica.get("GlobalSecondaryIndexes", []) + replica.get("LocalSecondaryIndexes", []):
+        index["IndexArn"] = f"{arn}/index/{index['IndexName']}"
+    label = _stream_label()
+    replica["LatestStreamLabel"] = label
+    replica["LatestStreamArn"] = f"{arn}/stream/{label}"
+    _tables.set_scoped(account, region, name, replica)
+    ttl = _ttl_settings.get(name)
+    if ttl:
+        _ttl_settings.set_scoped(account, region, name, copy.deepcopy(ttl))
+
+
+def _apply_replica_updates(name, table, updates):
+    """UpdateTable ReplicaUpdates (global tables version 2019.11.21)."""
+    account, home = get_account_id(), get_region()
+    regions = set(_replica_group(table)) or {home}
+    for update in updates:
+        action = next(iter(update), None)
+        region = (update.get(action) or {}).get("RegionName", "")
+        if region == home:
+            return error_response_json("ValidationException",
+                "Cannot add, delete, or update the local region through ReplicaUpdates. "
+                "Use CreateTable, DeleteTable, or UpdateTable as required.", 400)
+        if action == "Create":
+            if _tables.get_scoped(account, region, name) is not None:
+                return error_response_json("ValidationException",
+                    f"Failed to create a the new replica of table with name: '{name}' "
+                    "because one or more replicas already existed as tables.", 400)
+            # MREC replicates through Streams, so they are on for every replica.
+            if not (table.get("StreamSpecification") or {}).get("StreamEnabled"):
+                table["StreamSpecification"] = {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+                label = _stream_label()
+                table["LatestStreamLabel"] = label
+                table["LatestStreamArn"] = f"{table['TableArn']}/stream/{label}"
+            _create_replica(name, table, region)
+            regions.add(region)
+        elif action in ("Update", "Delete"):
+            if region not in regions:
+                return error_response_json("ValidationException",
+                    "Replica specified in the Replica Update or Replica Delete action of the request was not found.", 400)
+            if action == "Delete":
+                _tables.pop_scoped(account, region, name, None)
+                _ttl_settings.pop_scoped(account, region, name, None)
+                _pitr_settings.pop_scoped(account, region, name, None)
+                with request_scope(account, region):
+                    drop_stream_records(name)
+                regions.discard(region)
+    _set_replica_group(name, regions)
+    if len(regions) <= 1:
+        table["_global_regions"] = []
+    return None
+
+
+def _replicate_write(table, event_name, old_item, new_item):
+    """Apply a write to the table's other replicas, as MREC global tables do."""
+    regions = _replica_group(table)
+    if not regions:
+        return
+    account, home, name = get_account_id(), get_region(), table["TableName"]
+    item = new_item if new_item is not None else old_item
+    for region in regions:
+        if region == home:
+            continue
+        with request_scope(account, region):
+            replica = _tables.get(name)
+            if replica is None:
+                continue
+            pk_val = _extract_key_val(item.get(replica["pk_name"]))
+            sk_val = _extract_key_val(item.get(replica["sk_name"])) if replica["sk_name"] else "__no_sort__"
+            previous = replica["items"].get(pk_val, {}).get(sk_val)
+            if new_item is None:
+                replica["items"].get(pk_val, {}).pop(sk_val, None)
+                if pk_val in replica["items"] and not replica["items"][pk_val]:
+                    del replica["items"][pk_val]
+            else:
+                replica["items"][pk_val][sk_val] = copy.deepcopy(new_item)
+            _update_counts(replica)
+            if new_item is None and previous is None:
+                continue
+            replica_event = "REMOVE" if new_item is None else ("MODIFY" if previous else "INSERT")
+            _emit_stream_event(name, replica_event, previous,
+                               copy.deepcopy(new_item) if new_item is not None else None, replicate=False)
 
 
 def _update_table(data):
@@ -1449,6 +1565,11 @@ def _update_table(data):
         if ad["AttributeName"] in referenced
     ]
 
+    if data.get("ReplicaUpdates"):
+        err = _apply_replica_updates(name, table, data["ReplicaUpdates"])
+        if err:
+            return err
+
     return json_response({"TableDescription": _table_description(name)})
 
 
@@ -1483,6 +1604,10 @@ def _table_description(name):
     if t.get("OnDemandThroughput"):
         desc["OnDemandThroughput"] = t["OnDemandThroughput"]
     desc["DeletionProtectionEnabled"] = t.get("DeletionProtectionEnabled", False)
+    if _replica_group(t):
+        desc["GlobalTableVersion"] = _GLOBAL_TABLE_VERSION
+        desc["Replicas"] = [{"RegionName": r, "ReplicaStatus": "ACTIVE"}
+                            for r in _replica_group(t) if r != get_region()]
     desc["WarmThroughput"] = t.get("WarmThroughput", {
         "ReadUnitsPerSecond": 0,
         "WriteUnitsPerSecond": 0,
@@ -4449,6 +4574,10 @@ def _update_ttl(data):
         "TimeToLiveStatus": "ENABLED" if enabled else "DISABLED",
         "AttributeName": attr_name,
     }
+    # A global table's TTL settings are synchronized to every replica.
+    for region in _replica_group(_tables[name]):
+        if region != get_region():
+            _ttl_settings.set_scoped(get_account_id(), region, name, dict(_ttl_settings[name]))
     return json_response({"TimeToLiveSpecification": spec})
 
 

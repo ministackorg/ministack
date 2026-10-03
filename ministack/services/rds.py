@@ -14,7 +14,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DeleteDBClusterParameterGroup, DescribeDBClusterParameters,
           ModifyDBClusterParameterGroup, ResetDBClusterParameterGroup,
           CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
-          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DeleteDBClusterSnapshot,
+          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DescribeDBClusterSnapshotAttributes,
+          DeleteDBClusterSnapshot,
           CreateOptionGroup, DeleteOptionGroup, DescribeOptionGroups, DescribeOptionGroupOptions,
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
@@ -71,6 +72,7 @@ from ministack.core.responses import (
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
+    configure_iam_auth_broker,
     ensure_iam_auth_plugin,
     iam_auth_plugin_enabled,
 )
@@ -91,11 +93,10 @@ BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
-# When set, skip ministack's own Docker network auto-detect so DescribeDBInstances
-# returns {MINISTACK_HOST, host_port} — the address that's actually reachable
-# from outside the Docker network (remote ministack deployments, host-side
-# clients of a containerised ministack). Off by default: existing in-network
-# behavior unchanged.
+# When set, DescribeDBInstances returns {MINISTACK_HOST, host_port} — the
+# address that's actually reachable from outside the Docker network (remote
+# ministack deployments, host-side clients of a containerised ministack).
+# Off by default: existing in-network behavior unchanged.
 RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 # Opt-in: per-instance Aurora PostgreSQL reader containers backed by real
 # streaming replication (#1325). Scoped to aurora-postgresql by name and by
@@ -1132,6 +1133,10 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
     keep working, as they do on AWS without rds.force_ssl.
     """
     if engine not in ("postgres", "aurora-postgresql"):
+        if _is_mysql_engine(engine):
+            # The IAM auth plugin calls back to a host-run MiniStack.
+            container_kwargs.setdefault("extra_hosts", {}).setdefault(
+                "host.docker.internal", "host-gateway")
         return docker_client.containers.run(**container_kwargs)
     # Injecting the certificate needs create -> put_archive -> start, so a
     # client that cannot do that keeps the plain launch and serves plaintext.
@@ -1367,13 +1372,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(ms_network, {}).get("IPAddress", "")
             if container_ip:
-                # Report the alias, not the address behind it. An address changes
+                # Report the alias (or, under MINISTACK_RDS_PUBLIC_ENDPOINT, the
+                # published port), not the address behind it. An address changes
                 # when the container is replaced, and every consumer holding the
                 # old one is then pointing at whatever took over that IP. Internal
                 # wiring and the readiness probe keep using the address.
-                endpoint_host = (endpoint_aliases[0] if endpoint_aliases
-                                 else container_ip)
-                endpoint_port = container_port
+                endpoint_host, endpoint_port = _reported_endpoint(
+                    endpoint_aliases[0] if endpoint_aliases else container_ip,
+                    container_port, host_port)
                 internal_host = container_ip
                 internal_port = container_port
                 readiness_host = container_ip
@@ -1609,8 +1615,8 @@ def _start_pg_reader_container(db_id, cluster):
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
-            endpoint_port = container_port
+            endpoint_host, endpoint_port = _reported_endpoint(
+                container_ip, container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
     except Exception:
@@ -2280,13 +2286,13 @@ def _restart_cluster_shared_container(cluster_id, cluster):
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            # Report the alias, not the address behind it — same rule as first
-            # launch. StopDBCluster/StartDBCluster must not rewrite a stored
+            # Report the alias (or the published port), not the address behind
+            # it — same rule as first launch. StopDBCluster/StartDBCluster must not rewrite a stored
             # DNS name into a raw address: the name keeps resolving to the
             # restarted container, while the address may not survive.
-            endpoint_host = (endpoint_aliases[0] if endpoint_aliases
-                             else container_ip)
-            endpoint_port = container_port
+            endpoint_host, endpoint_port = _reported_endpoint(
+                endpoint_aliases[0] if endpoint_aliases else container_ip,
+                container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
             readiness_host = container_ip
@@ -2372,16 +2378,6 @@ def _start_rds_container_for_instance(db_id, instance):
     # Legacy instances persisted before `_HostPort` was stored fall back to a
     # fresh free port from `_next_port()`.
     host_port = instance.get("_HostPort") or _next_port()
-    # If the stored host port was claimed by something else between
-    # restarts (another ministack, another db instance, a user app),
-    # docker bind would fail with "port is already allocated". Fall
-    # back to a fresh free port and persist it so subsequent restarts
-    # converge on a stable mapping again.
-    if not _is_host_port_free(host_port):
-        logger.info("RDS: persisted host port %d for %s is in use; "
-                    "allocating fresh free port", host_port, db_id)
-        host_port = _next_port()
-    instance["_HostPort"] = host_port
 
     image, env_vars, container_port, data_path = _docker_image_for_engine(
         engine, engine_version, master_user, master_pass, db_name,
@@ -2423,6 +2419,18 @@ def _start_rds_container_for_instance(db_id, instance):
                 pass  # Good — name is gone.
         except Exception:
             pass  # No existing container with that name — fine
+
+    # Checked after our own stale container is gone. If the port is still
+    # taken, move and republish it so the endpoint stays reachable.
+    if not _is_host_port_free(host_port):
+        logger.info("RDS: persisted host port %d for %s is in use; "
+                    "allocating fresh free port", host_port, db_id)
+        if endpoint.get("Port") == host_port:
+            endpoint["Port"] = _next_port()
+            host_port = endpoint["Port"]
+        else:
+            host_port = _next_port()
+    instance["_HostPort"] = host_port
 
     ms_network = _get_ministack_network(docker_client)
     container_kwargs = dict(
@@ -2494,8 +2502,9 @@ def _start_rds_container_for_instance(db_id, instance):
             if container_ip:
                 internal_host = container_ip
                 internal_port = container_port
-                instance.setdefault("Endpoint", {})["Address"] = container_ip
-                instance["Endpoint"]["Port"] = container_port
+                endpoint = instance.setdefault("Endpoint", {})
+                endpoint["Address"], endpoint["Port"] = _reported_endpoint(
+                    container_ip, container_port, host_port)
         except Exception:
             pass
     instance["_internal_address"] = internal_host
@@ -2542,19 +2551,26 @@ def _get_docker():
     return _docker
 
 
+def _in_container():
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
+
+
 def _get_ministack_network(docker_client):
     """Detect the Docker network MiniStack is running on (if containerised).
 
-    Honors MINISTACK_RDS_PUBLIC_ENDPOINT — when set, returns None so the
-    DescribeDBInstances endpoint resolves to {MINISTACK_HOST, host_port}
-    instead of the container-internal address (useful for remote-ministack
-    deployments where external clients can't reach the Docker network).
+    Under MINISTACK_RDS_PUBLIC_ENDPOINT a host-run MiniStack keeps its
+    database containers off the network, since it cannot reach their
+    addresses; a containerised one detects its network as usual, so
+    readiness and internal wiring reach them while _reported_endpoint
+    reports the published port.
     """
     global _ministack_network
-    if RDS_PUBLIC_ENDPOINT:
-        return None
     if _ministack_network is not None:
         return _ministack_network or None
+    if RDS_PUBLIC_ENDPOINT and not _in_container():
+        _ministack_network = ""
+        return None
     if DOCKER_NETWORK:
         _ministack_network = DOCKER_NETWORK
         logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
@@ -2574,6 +2590,13 @@ def _get_ministack_network(docker_client):
                      "using localhost")
     _ministack_network = ""
     return None
+
+
+def _reported_endpoint(host, port, host_port):
+    """The endpoint DescribeDB* report for a container on MiniStack's network."""
+    if RDS_PUBLIC_ENDPOINT:
+        return _MINISTACK_HOST, host_port
+    return host, port
 
 
 def _wait_for_port(host, port, timeout=60):
@@ -2841,7 +2864,31 @@ def _ensure_mysql_compatibility(
             engine_series,
             resource_id,
         )
+        if plugin_ready:
+            configure_iam_auth_broker(
+                container,
+                "cluster" if engine.startswith("aurora") else "instance",
+                resource_id,
+                _iam_broker_host(),
+                os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566",
+            )
     return procedures_ready, plugin_ready
+
+
+def _iam_broker_host():
+    """The address a MySQL container reaches this server's IAM broker on."""
+    docker_client = _get_docker()
+    ms_network = _get_ministack_network(docker_client) if docker_client else None
+    if ms_network:
+        try:
+            me = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+            address = me.attrs["NetworkSettings"]["Networks"][ms_network]["IPAddress"]
+            if address:
+                return address
+        except Exception:
+            pass
+    # Mapped to host-gateway on every MySQL container (_run_rds_container).
+    return "host.docker.internal"
 
 
 def _mysql_replication_connection(cluster, *, timeout=None):
@@ -4412,6 +4459,10 @@ def _sync_cluster_endpoints(cluster):
                 reader_address = writer_address.replace(
                     ".cluster-", ".cluster-ro-", 1,
                 )
+        elif RDS_PUBLIC_ENDPOINT:
+            # The internal address is not reachable by the clients the
+            # published endpoint is reported to.
+            reader_address = writer_address
         else:
             reader_address = (
                 cluster.get("_shared_internal_address")
@@ -4736,8 +4787,8 @@ def _create_db_instance_impl(p):
                     if container_ip:
                         internal_host = container_ip
                         internal_port = container_port
-                        endpoint_host = container_ip
-                        endpoint_port = container_port
+                        endpoint_host, endpoint_port = _reported_endpoint(
+                            container_ip, container_port, host_port)
                         readiness_host = container_ip
                         readiness_port = container_port
                     else:
@@ -5340,6 +5391,10 @@ def _modify_db_instance(p):
         "MonitoringInterval": "MonitoringInterval",
         "MonitoringRoleArn": "MonitoringRoleArn",
         "CopyTagsToSnapshot": "CopyTagsToSnapshot",
+        # Aurora members take it from the DB cluster.
+        "EnableIAMDatabaseAuthentication": (
+            None if instance.get("DBClusterIdentifier") else "IAMDatabaseAuthenticationEnabled"
+        ),
     }
 
     pending = {}
@@ -5352,8 +5407,8 @@ def _modify_db_instance(p):
         if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
                          "MonitoringInterval", "Iops", "MaxAllocatedStorage"):
             val = int(val)
-        elif param_key in ("MultiAZ", "PubliclyAccessible",
-                           "DeletionProtection", "CopyTagsToSnapshot"):
+        elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection",
+                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
         if apply_immediately:
@@ -6729,6 +6784,24 @@ def _describe_db_cluster_snapshots(p):
         f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
 
 
+def _describe_db_cluster_snapshot_attributes(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    if not snap_id or snap_id not in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotNotFoundFault",
+            f"DB cluster snapshot {snap_id} not found.", 404)
+    # Never shared: ModifyDBClusterSnapshotAttribute is not implemented.
+    result = (
+        f"<DBClusterSnapshotAttributesResult>"
+        f"<DBClusterSnapshotIdentifier>{_esc(snap_id)}</DBClusterSnapshotIdentifier>"
+        f"<DBClusterSnapshotAttributes>"
+        f"<DBClusterSnapshotAttribute><AttributeName>restore</AttributeName><AttributeValues></AttributeValues></DBClusterSnapshotAttribute>"
+        f"</DBClusterSnapshotAttributes>"
+        f"</DBClusterSnapshotAttributesResult>"
+    )
+    return _xml(200, "DescribeDBClusterSnapshotAttributesResponse",
+        f"<DescribeDBClusterSnapshotAttributesResult>{result}</DescribeDBClusterSnapshotAttributesResult>")
+
+
 def _delete_db_cluster_snapshot(p):
     snap_id = _p(p, "DBClusterSnapshotIdentifier")
     snap = _db_cluster_snapshots.pop(snap_id, None)
@@ -7749,7 +7822,7 @@ def _describe_global_clusters(p):
         gcs = snapshots
 
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
@@ -9140,6 +9213,7 @@ def _instance_xml(i):
 
     pending_xml = ""
     for pk, pv in i.get("PendingModifiedValues", {}).items():
+        pv = str(pv).lower() if isinstance(pv, bool) else pv
         pending_xml += f"<{pk}>{pv}</{pk}>"
 
     iops_xml = ""
@@ -11046,6 +11120,7 @@ _ACTION_MAP = {
     "DescribeDBSnapshots": _describe_db_snapshots,
     "CreateDBClusterSnapshot": _create_db_cluster_snapshot,
     "DescribeDBClusterSnapshots": _describe_db_cluster_snapshots,
+    "DescribeDBClusterSnapshotAttributes": _describe_db_cluster_snapshot_attributes,
     "DeleteDBClusterSnapshot": _delete_db_cluster_snapshot,
     "CreateDBSubnetGroup": _create_subnet_group,
     "DeleteDBSubnetGroup": _delete_subnet_group,

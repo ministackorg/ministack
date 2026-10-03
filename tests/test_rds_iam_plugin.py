@@ -329,3 +329,34 @@ def test_mariadb_compatibility_skips_plugin_and_roles(monkeypatch):
         engine="mariadb",
     ) == (True, False)
     assert calls == [("procedures", "db-1", "mariadb", None)]
+
+
+def test_rds_iam_plugin_broker_config_carries_a_live_capability(monkeypatch):
+    from ministack.core import rds_iam
+
+    issued = {}
+
+    def issue(**kwargs):
+        issued.update(kwargs)
+        return "c" * 64
+
+    monkeypatch.setattr(rds_iam, "issue_capability", issue)
+    container = FakeContainer()
+    assert plugin.configure_iam_auth_broker(container, "cluster", "aurora-1", "172.18.0.2", "4566")
+    assert issued["resource_kind"] == "cluster" and issued["resource_identifier"] == "aurora-1"
+    path, data = container.archives[0]
+    assert path == "/"
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        member = archive.getmember(plugin.CONFIG_PATH.lstrip("/"))
+        assert member.mode == 0o644
+        assert archive.extractfile(member).read() == b"172.18.0.2 4566 " + b"c" * 64 + b"\n"
+
+
+def test_rds_iam_plugin_broker_config_failure_is_swallowed(monkeypatch, caplog):
+    from ministack.core import rds_iam
+
+    monkeypatch.setattr(rds_iam, "issue_capability", lambda **kwargs: "c" * 64)
+    with caplog.at_level(logging.WARNING, logger="rds"):
+        assert not plugin.configure_iam_auth_broker(
+            FakeContainer(put_result=False), "instance", "db-1", "host.docker.internal", "4566")
+    assert "failed to configure AWSAuthenticationPlugin for db-1" in caplog.text

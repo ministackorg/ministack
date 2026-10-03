@@ -1166,6 +1166,12 @@ def test_ec2_internet_gateway_crud(ec2):
     desc = ec2.describe_internet_gateways(InternetGatewayIds=[igw_id])
     assert len(desc["InternetGateways"][0]["Attachments"]) == 1
 
+    other_vpc = ec2.create_vpc(CidrBlock="10.4.0.0/16")["Vpc"]["VpcId"]
+    with pytest.raises(ClientError) as exc:
+        ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=other_vpc)
+    assert exc.value.response["Error"]["Code"] == "Resource.AlreadyAssociated"
+    ec2.delete_vpc(VpcId=other_vpc)
+
     ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
     ec2.delete_internet_gateway(InternetGatewayId=igw_id)
     ec2.delete_vpc(VpcId=vpc_id)

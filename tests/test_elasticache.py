@@ -1384,18 +1384,277 @@ def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
 
 
 # ---------------------------------------------------------------------------
-# 12. Serverless cache operations — not implemented in MiniStack
+# 12. Serverless caches
 # ---------------------------------------------------------------------------
 
-@requires_docker
+def _wait_serverless(ec, name, timeout=180):
+    deadline = time.time() + timeout
+    while True:
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        if cache["Status"] not in ("creating", "modifying") or time.time() > deadline:
+            return cache
+        time.sleep(0.5)
+
+
+def _serverless_ca_file(tmp_path):
+    import urllib.request
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/elasticache/ca.pem", timeout=10) as resp:
+        pem = resp.read()
+    assert pem.startswith(b"-----BEGIN CERTIFICATE-----")
+    path = tmp_path / "elasticache-ca.pem"
+    path.write_bytes(pem)
+    return str(path)
+
+
+def _tls_command(endpoint, ca_file, command):
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+            parts = command.split()
+            conn.sendall(f"*{len(parts)}\r\n".encode()
+                         + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+            return conn.recv(65536)
+
+
+def test_serverless_cache_create_describe_delete(ec):
+    name = f"sls-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name,
+        Engine="valkey",
+        MajorEngineVersion="8",
+        Description="cache & <counters>",
+        SecurityGroupIds=["sg-0123"],
+        SubnetIds=["subnet-a", "subnet-b"],
+        CacheUsageLimits={"DataStorage": {"Maximum": 1, "Unit": "GB"},
+                          "ECPUPerSecond": {"Maximum": 1000}},
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )["ServerlessCache"]
+    try:
+        assert created["Status"] in ("creating", "available")
+        assert created["Engine"] == "valkey"
+        assert created["MajorEngineVersion"] == "8"
+        assert created["FullEngineVersion"] == "8.1"
+        assert created["Description"] == "cache & <counters>"
+        assert created["SecurityGroupIds"] == ["sg-0123"]
+        assert created["SubnetIds"] == ["subnet-a", "subnet-b"]
+        assert created["CacheUsageLimits"] == {"DataStorage": {"Maximum": 1, "Unit": "GB"},
+                                               "ECPUPerSecond": {"Maximum": 1000}}
+        assert created["SnapshotRetentionLimit"] == 0
+        assert "KmsKeyId" not in created and "UserGroupId" not in created
+        assert created["StorageEncryptionType"] == "sse-elasticache"
+        arn = created["ARN"]
+        assert arn.startswith("arn:aws:elasticache:us-east-1:") and arn.endswith(f":serverlesscache:{name}")
+
+        described = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"]
+        assert [c["ARN"] for c in described] == [arn]
+        assert {t["Key"]: t["Value"] for t in ec.list_tags_for_resource(ResourceName=arn)["TagList"]} == {"env": "dev"}
+        ec.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "team", "Value": "core"}])
+        ec.remove_tags_from_resource(ResourceName=arn, TagKeys=["env"])
+        assert ec.list_tags_for_resource(ResourceName=arn)["TagList"] == [{"Key": "team", "Value": "core"}]
+
+        with pytest.raises(ClientError) as exc:
+            ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+        assert exc.value.response["Error"]["Code"] == "ServerlessCacheAlreadyExistsFault"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        deleted = ec.delete_serverless_cache(ServerlessCacheName=name)["ServerlessCache"]
+    assert deleted["Status"] == "deleting"
+    for call in (lambda: ec.describe_serverless_caches(ServerlessCacheName=name),
+                 lambda: ec.delete_serverless_cache(ServerlessCacheName=name),
+                 lambda: ec.list_tags_for_resource(ResourceName=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+@pytest.mark.parametrize("engine,major", [("memcached", None), ("valkey", "6"), ("redis", "8")])
+def test_serverless_cache_rejects_unsupported_engine_version(ec, engine, major):
+    kwargs = {"MajorEngineVersion": major} if major else {}
+    with pytest.raises(ClientError) as exc:
+        ec.create_serverless_cache(ServerlessCacheName=f"sls-bad-{_uid()}", Engine=engine, **kwargs)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_serverless_cache_storage_encryption_type_sse_kms(ec):
+    name = f"sls-kms-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="valkey",
+        KmsKeyId="arn:aws:kms:us-east-1:000000000000:key/test-key",
+    )["ServerlessCache"]
+    try:
+        assert created["KmsKeyId"] == "arn:aws:kms:us-east-1:000000000000:key/test-key"
+        assert created["StorageEncryptionType"] == "sse-kms"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_valkey_major_9(ec):
+    name = f"sls-v9-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="9",
+    )["ServerlessCache"]
+    try:
+        assert created["MajorEngineVersion"] == "9"
+        assert created["FullEngineVersion"] == "9.0"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_name_is_lowercased(ec):
+    mixed = f"MyCache-{_uid()}"
+    lower = mixed.lower()
+    created = ec.create_serverless_cache(ServerlessCacheName=mixed, Engine="valkey")["ServerlessCache"]
+    try:
+        assert created["ServerlessCacheName"] == lower
+        assert created["ARN"].endswith(f":serverlesscache:{lower}")
+        described = ec.describe_serverless_caches(ServerlessCacheName=mixed.upper())["ServerlessCaches"]
+        assert [c["ServerlessCacheName"] for c in described] == [lower]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=mixed)
+    with pytest.raises(ClientError) as exc:
+        ec.describe_serverless_caches(ServerlessCacheName=lower)
+    assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+
+
+def test_serverless_cache_modify_rejects_invalid_engine_change(ec):
+    name = f"sls-engchg-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8")
+    try:
+        cache = _wait_serverless(ec, name)
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, MajorEngineVersion="7")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, Engine="redis")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_modify(ec):
+    name = f"sls-mod-{_uid()}"
+    ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="redis",
+        CacheUsageLimits={"DataStorage": {"Maximum": 5, "Unit": "GB"}},
+    )
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        assert (cache["MajorEngineVersion"], cache["FullEngineVersion"]) == ("7", "7.1")
+
+        modified = ec.modify_serverless_cache(ServerlessCacheName=name, Description="rate limits")
+        assert modified["ServerlessCache"]["Description"] == "rate limits"
+        ec.modify_serverless_cache(ServerlessCacheName=name, SnapshotRetentionLimit=3,
+                                   DailySnapshotTime="09:00")
+        # All-zero limits remove them, as the Terraform provider sends to clear the block.
+        ec.modify_serverless_cache(ServerlessCacheName=name, CacheUsageLimits={
+            "DataStorage": {"Maximum": 0, "Minimum": 0, "Unit": "GB"},
+            "ECPUPerSecond": {"Maximum": 0, "Minimum": 0}})
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert cache["SnapshotRetentionLimit"] == 3
+        assert cache["DailySnapshotTime"] == "09:00"
+        assert "CacheUsageLimits" not in cache
+
+        for kwargs, code in (
+            ({}, "InvalidParameterCombination"),
+            ({"UserGroupId": "missing-group", "RemoveUserGroup": True}, "InvalidParameterCombination"),
+            ({"UserGroupId": "missing-group"}, "UserGroupNotFound"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                ec.modify_serverless_cache(ServerlessCacheName=name, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+    with pytest.raises(ClientError) as exc:
+        ec.modify_serverless_cache(ServerlessCacheName=name, Description="gone")
+    assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+
+
+def test_serverless_cache_describe_pages(ec):
+    names = [f"sls-page-{_uid()}" for _ in range(3)]
+    for name in names:
+        ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        seen, token = [], None
+        while True:
+            kwargs = {"MaxResults": 2, **({"NextToken": token} if token else {})}
+            page = ec.describe_serverless_caches(**kwargs)
+            assert len(page["ServerlessCaches"]) <= 2
+            seen += [c["ServerlessCacheName"] for c in page["ServerlessCaches"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(seen)
+        assert len(seen) == len(set(seen))
+    finally:
+        for name in names:
+            ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
 @pytest.mark.data_plane
-def test_serverless_cache_not_implemented(ec):
-    """Serverless cache operations are not yet implemented; verify graceful error."""
-    with pytest.raises(ClientError):
-        ec.create_serverless_cache(
-            ServerlessCacheName="test-serverless",
-            Engine="redis",
-        )
+def test_serverless_cache_serves_tls_only(ec, tmp_path):
+    """Serverless caches have no plaintext listener; a client that trusts
+    MiniStack's ElastiCache CA connects with TLS and verifies the hostname."""
+    import socket
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-tls-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        endpoint = cache["Endpoint"]
+        assert cache["ReaderEndpoint"] == endpoint
+        assert _tls_command(endpoint, ca_file, "PING") == b"+PONG\r\n"
+        assert b"valkey_version:8.1" in _tls_command(endpoint, ca_file, "INFO server")
+
+        with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+            raw.sendall(b"*1\r\n$4\r\nPING\r\n")
+            raw.settimeout(5)
+            try:
+                reply = raw.recv(64)
+            except (ConnectionResetError, socket.timeout):
+                reply = b""
+        assert b"PONG" not in reply
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+    with pytest.raises(OSError):
+        _tls_command(endpoint, ca_file, "PING")
+
+
+@pytest.mark.data_plane
+def test_serverless_cache_engine_change_replaces_container_on_same_endpoint(ec, tmp_path):
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-eng-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="redis")
+    try:
+        before = _wait_serverless(ec, name)
+        assert b"redis_version:" in _tls_command(before["Endpoint"], ca_file, "INFO server")
+        assert b"valkey_version" not in _tls_command(before["Endpoint"], ca_file, "INFO server")
+
+        modified = ec.modify_serverless_cache(ServerlessCacheName=name, Engine="valkey",
+                                              MajorEngineVersion="8")["ServerlessCache"]
+        assert modified["Status"] == "modifying"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, Description="busy")
+        assert exc.value.response["Error"]["Code"] == "InvalidServerlessCacheStateFault"
+
+        after = _wait_serverless(ec, name)
+        assert (after["Status"], after["Engine"], after["FullEngineVersion"]) == ("available", "valkey", "8.1")
+        if not os.environ.get("DOCKER_NETWORK"):
+            assert after["Endpoint"] == before["Endpoint"]
+        assert b"valkey_version:8.1" in _tls_command(after["Endpoint"], ca_file, "INFO server")
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
 
 
 
@@ -1868,3 +2127,148 @@ def test_elasticache_cluster_create_time_present_and_parsed(ec):
         assert isinstance(cluster.get("CacheClusterCreateTime"), datetime.datetime)
     finally:
         ec.delete_cache_cluster(CacheClusterId="cluster-createtime")
+
+
+# ---------------------------------------------------------------------------
+# Serverless caches — provisioning state, not liveness
+# ---------------------------------------------------------------------------
+
+def _serverless_create_params(name, engine="valkey"):
+    return {"ServerlessCacheName": [name], "Engine": [engine]}
+
+
+@pytest.mark.serial
+def test_serverless_cache_without_docker_points_at_sidecar(monkeypatch):
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: None)
+    status, _headers, _body = ec._create_serverless_cache(_serverless_create_params("nodocker"))
+    assert status == 200
+    rec = ec._serverless_caches["nodocker"]
+    assert rec["Status"] == "available"
+    assert rec["Endpoint"] == {"Address": ec.REDIS_DEFAULT_HOST, "Port": ec.REDIS_DEFAULT_PORT}
+    ec.reset()
+
+
+@pytest.mark.serial
+def test_serverless_cache_deleted_while_provisioning_leaves_no_container(fake_docker, monkeypatch):
+    """A container that comes up after its cache was deleted is removed by the
+    finisher itself: the delete had nothing to find, by id or by name."""
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def fake_spawn(name, engine, full_version, host_port, labels, wait=True):
+        started.set()
+        release.wait(timeout=10)
+        container = fake_docker.containers.run(name=name, labels=labels)
+        return "localhost", host_port, container.id
+    monkeypatch.setattr(ec, "_spawn_serverless_container", fake_spawn)
+
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), finished.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_serverless_cache(_serverless_create_params("race"))
+    assert started.wait(timeout=10)
+    ec._delete_serverless_cache({"ServerlessCacheName": ["race"]})
+    release.set()
+    assert finished.wait(timeout=10)
+
+    assert "race" not in ec._serverless_caches
+    assert fake_docker.live() == [], f"leaked container(s) {fake_docker.live()}"
+
+
+@pytest.mark.serial
+def test_serverless_cache_failed_start_reports_create_failed(fake_docker, monkeypatch):
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+
+    def boom(**_kw):
+        raise RuntimeError("valkey never answered a TLS PING")
+    monkeypatch.setattr(ec, "_spawn_serverless_container", boom)
+    finished = threading.Event()
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), finished.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_serverless_cache(_serverless_create_params("broken"))
+    assert finished.wait(timeout=10)
+    assert ec._serverless_caches["broken"]["Status"] == "create-failed"
+    assert "Endpoint" not in ec._serverless_caches["broken"]
+    ec.reset()
+
+
+def test_serverless_cache_persists_and_respawns_on_the_same_port(monkeypatch):
+    from ministack.services import elasticache as ec
+
+    ec.reset()
+    record = {
+        "ServerlessCacheName": "kept", "Status": "available", "Engine": "valkey",
+        "MajorEngineVersion": "8", "FullEngineVersion": "8.1", "CreateTime": time.time(),
+        "ARN": "arn:aws:elasticache:us-west-2:000000000000:serverlesscache:kept",
+        "Endpoint": {"Address": "localhost", "Port": 16400},
+        "_host_port": 16400, "_docker_container_id": "dead",
+    }
+    ec._serverless_caches.set_scoped("000000000000", "us-west-2", "kept", record)
+    state = ec.get_state()
+    persisted = state["serverless_caches"].get_scoped("000000000000", "us-west-2", "kept")
+    assert "_docker_container_id" not in persisted
+    ec.reset()
+
+    spawned = []
+
+    def fake_spawn(name, engine, full_version, host_port, labels, wait=True):
+        spawned.append((name, engine, full_version, host_port, labels["region"], wait))
+        return "localhost", host_port, "cid-new"
+    monkeypatch.setattr(ec, "_spawn_serverless_container", fake_spawn)
+    monkeypatch.setattr(ec, "_get_docker", lambda: object())
+
+    ec.load_persisted_state(state)
+    ec._ensure_live_containers()
+    assert spawned == [("ministack-elasticache-serverless-000000000000-us-west-2-kept",
+                        "valkey", "8.1", 16400, "us-west-2", False)]
+    restored = ec._serverless_caches.get_scoped("000000000000", "us-west-2", "kept")
+    assert restored["_docker_container_id"] == "cid-new"
+    assert restored["Endpoint"] == {"Address": "localhost", "Port": 16400}
+    assert "cid-new" in ec._live_container_ids()
+    ec.reset()
+
+
+def test_serverless_ca_persists_across_restart(monkeypatch):
+    from ministack.services import elasticache as ec
+
+    pem = ec.serverless_ca_cert_pem()
+    state = ec.get_state()
+    assert state["serverless_ca"]["ca_cert_pem"] == pem
+
+    monkeypatch.setattr(ec, "_serverless_ca", None)
+    ec.load_persisted_state(state)
+    assert ec.serverless_ca_cert_pem() == pem

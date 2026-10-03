@@ -518,6 +518,7 @@ def test_lambda_direct_arn_version_delete_rejects_weighted_alias_version():
         Code={"ZipFile": _region_marker_code("latest")},
     )
     primary = lam.publish_version(FunctionName=name)
+    lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("weighted"))
     weighted = lam.publish_version(FunctionName=name)
     lam.create_alias(
         FunctionName=name,
@@ -1268,6 +1269,22 @@ def test_lambda_list_versions(lam):
     resp = lam.list_versions_by_function(FunctionName="lam-invoke-test")
     versions = resp["Versions"]
     assert any(v["Version"] == "$LATEST" for v in versions)
+
+def test_lambda_publish_version_of_an_unchanged_function_returns_the_latest(lam):
+    """Lambda doesn't publish a version when code and configuration are unchanged."""
+    name = f"lambda-publish-unchanged-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": _region_marker_code("one")})
+    try:
+        first = lam.publish_version(FunctionName=name, Description="one")
+        again = lam.publish_version(FunctionName=name, Description="two")
+        assert (again["Version"], again["Description"]) == (first["Version"], "one")
+        lam.update_function_code(FunctionName=name, ZipFile=_region_marker_code("two"))
+        second = lam.publish_version(FunctionName=name)
+        assert int(second["Version"]) == int(first["Version"]) + 1
+    finally:
+        lam.delete_function(FunctionName=name)
+
 
 def test_lambda_publish_version(lam):
     resp = lam.publish_version(
@@ -4875,7 +4892,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"  # sadscan:disable np.aws.1 - synthetic fixture key
+    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
@@ -7594,7 +7611,7 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
 # ──────────────────── host.docker.internal → host-gateway ────────────────────
 
 
-def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_overrides=None):
     """Spawn one Lambda container against fakes and return the docker kwargs.
 
     Captures both entry points: the DinD path uses ``containers.create`` (code
@@ -7619,14 +7636,76 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
-    lsvc._spawn_lambda_container(
-        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
-         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
-         "MemorySize": 128,
-         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
-        _make_zip("def handler(e, c): pass"),
-    )
+    config = {
+        "FunctionName": "test-hg-fn", "Runtime": "python3.12",
+        "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+        "MemorySize": 128,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn",
+    }
+    config.update(config_overrides or {})
+    lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
     return captured
+
+
+@pytest.mark.parametrize("timeout", [3, 301, 900])
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("in_container", [False, True])
+def test_lambda_container_passes_configured_timeout_to_rie(monkeypatch, timeout, package_type, in_container):
+    """RIE reads AWS_LAMBDA_FUNCTION_TIMEOUT, otherwise it defaults to 300s (#1844)."""
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: in_container)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566",
+        config_overrides={
+            "Timeout": timeout,
+            "PackageType": package_type,
+            "ImageUri": "public.ecr.aws/lambda/python:3.12",
+            "Environment": {"Variables": {
+                "AWS_LAMBDA_FUNCTION_TIMEOUT": "1",
+                "_LAMBDA_TIMEOUT": "1",
+            }},
+        },
+    )
+    assert captured["environment"]["AWS_LAMBDA_FUNCTION_TIMEOUT"] == str(timeout)
+    assert captured["environment"]["_LAMBDA_TIMEOUT"] == str(timeout)
+
+
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_timeout_update_evicts_warm_container(monkeypatch, package_type, old_timeout, new_timeout):
+    """A warm RIE container must not keep its previous invocation deadline."""
+    name = f"lam-timeout-update-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name, "Timeout": old_timeout, "PackageType": package_type,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+        "ImageUri": "public.ecr.aws/lambda/python:3.12",
+    }
+    monkeypatch.setattr(lsvc, "_functions", {name: {"config": config}})
+    monkeypatch.setattr(lsvc, "invalidate_worker", Mock())
+    monkeypatch.setattr(lsvc, "_schedule_state_transition", Mock())
+    key = lsvc._warm_pool_key(name, config)
+    container = _mk_container()
+    entry = lsvc._pool_register(key, container, None)
+    lsvc._pool_release(entry)
+
+    response = lsvc._update_config(name, {"Timeout": new_timeout})
+
+    assert response[0] == 200
+    assert config["Timeout"] == new_timeout
+    acquired, reason = lsvc._pool_acquire(key, max_concurrency=None)
+    assert acquired is None
+    assert reason == "spawn"
+    container.stop.assert_called_once()
+    container.remove.assert_called_once()
+
+
+@pytest.mark.parametrize("use_ssl, scheme", [("1", "https"), ("", "http")])
+def test_lambda_container_default_endpoint_follows_gateway_scheme(monkeypatch, use_ssl, scheme):
+    """With no endpoint configured, a Docker Lambda is pointed at the gateway with the scheme it serves."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    captured = _spawn_capture_run_kwargs(monkeypatch, endpoint="")
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == f"{scheme}://host.docker.internal:4566"
 
 
 def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
@@ -10826,6 +10905,71 @@ def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
 @pytest.mark.data_plane
+def test_lambda_docker_rie_uses_configured_deadline(lam):
+    """Check the real RIE deadline without waiting for its old 300s limit (#1844)."""
+    fname = f"lam-rie-deadline-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=900,
+        Code={"ZipFile": _make_zip(
+            "def handler(event, context):\n"
+            "    return {'remaining_ms': context.get_remaining_time_in_millis()}\n"
+        )},
+    )
+    try:
+        # Both cold and warm invocations must receive the configured deadline.
+        for _ in range(2):
+            resp, payload = _invoke_lambda_payload(lam, fname, {})
+            assert not resp.get("FunctionError"), payload
+            assert 850_000 < payload["remaining_ms"] <= 900_000, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_docker_timeout_update_changes_rie_deadline(lam, old_timeout, new_timeout):
+    """Timeout updates replace the warm container and reach the real RIE."""
+    fname = f"lam-rie-update-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=old_timeout,
+        Code={"ZipFile": _make_zip(
+            "import time\n"
+            "def handler(event, context):\n"
+            "    remaining = context.get_remaining_time_in_millis()\n"
+            "    time.sleep(event.get('sleep', 0))\n"
+            "    return {'remaining_ms': remaining, 'ok': True}\n"
+        )},
+    )
+    try:
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert payload["ok"] is True
+        lam.update_function_configuration(FunctionName=fname, Timeout=new_timeout)
+        lam.get_waiter("function_updated_v2").wait(
+            FunctionName=fname, WaiterConfig={"Delay": 1, "MaxAttempts": 10},
+        )
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert new_timeout * 500 < payload["remaining_ms"] <= new_timeout * 1000, payload
+        if new_timeout > old_timeout:
+            resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": old_timeout + 1})
+            assert not resp.get("FunctionError"), payload
+            assert isinstance(payload, dict) and payload.get("ok") is True, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -12421,6 +12565,52 @@ def test_node_context_shim_downgrades_https_to_the_gateway(tmp_path):
         server.server_close()
 
 
+def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
+    """Under USE_SSL the gateway speaks only TLS: the container shim must not downgrade a request to it."""
+    import http.server
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve) => {\n"
+            "  https.get({hostname: '127.0.0.1', port: event.port, path: '/probe'}, (res) => resolve({status: res.statusCode}))\n"
+            "    .on('error', (e) => resolve({error: e.code || String(e)}));\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "index.handler",
+               "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}"}
+        script = ("require(process.argv[1]).handler({port: Number(process.argv[2])}, {})"
+                  ".then((r) => process.stdout.write(JSON.stringify(r)));")
+        proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), str(port)],
+                              env=env, capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        # Still TLS: the plain-HTTP listener never sees the request as HTTP.
+        assert "error" in json.loads(proc.stdout)
+        assert seen == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
     """The sweep drops extracted trees whose blob no longer backs any
     function, version, or layer version — and only those. References are read
@@ -13700,7 +13890,7 @@ def test_provided_env_uses_execution_role_credentials(monkeypatch):
     assert {key: env[key] for key in credentials} == credentials
 
 
-@pytest.mark.parametrize("operation", ["code", "configuration", "delete"])
+@pytest.mark.parametrize("operation", ["code", "configuration", "timeout", "delete"])
 def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool, operation):
     config = _provided_dispatch_config()
     name = config["FunctionName"]
@@ -13716,6 +13906,8 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
         result = lambda_svc._update_code(name, {})
     elif operation == "configuration":
         result = lambda_svc._update_config(name, {"Environment": {"Variables": {"UPDATED": "yes"}}})
+    elif operation == "timeout":
+        result = lambda_svc._update_config(name, {"Timeout": config["Timeout"] + 1})
     else:
         result = lambda_svc._delete_function(name, {})
     assert result[0] in (200, 204)
@@ -13763,6 +13955,50 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
         assert container_env[var] == lsvc._CONTAINER_BUNDLE_PATH
     assert [(m["Target"], m["ReadOnly"]) for m in mounts] == [
         (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
+
+
+def test_lambda_trust_files_are_copied_not_mounted_when_ministack_runs_in_docker(monkeypatch, tmp_path):
+    """In a container the trust files are docker cp'd, not bind-mounted; a symlink is followed."""
+    import tarfile
+
+    real = tmp_path / "real.crt"
+    real.write_text("-----BEGIN CERTIFICATE-----\n")
+    (tmp_path / "server.crt").symlink_to(real)
+    (tmp_path / "server.key").write_text("key")
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setenv("MINISTACK_SSL_CERT", str(tmp_path / "server.crt"))
+    monkeypatch.setenv("MINISTACK_SSL_KEY", str(tmp_path / "server.key"))
+    monkeypatch.setattr(lsvc, "_is_in_container", True)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "")
+
+    captured, archived = {}, {}
+    container = _mk_container()
+    container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _put_archive(path, data):
+        with tarfile.open(fileobj=data) as tar:
+            archived.update({(path, m.name): m.isfile() for m in tar.getmembers()})
+
+    container.put_archive.side_effect = _put_archive
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return container
+
+    client = MagicMock()
+    client.containers.run = _capture
+    client.containers.create = _capture
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "trust-fn", "PackageType": "Image", "ImageUri": "my-repo/my-image:latest",
+         "Timeout": 3, "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:trust-fn"},
+        None,
+    )
+    assert [m["Target"] for m in captured.get("mounts", []) if m["Target"].startswith("/var/ministack/")] == []
+    assert archived[("/", "var/ministack/ministack-ca.pem")] is True
 
 
 def test_cognito_issuer_wiring_never_overrides_the_caller(monkeypatch, tmp_path):
@@ -13974,3 +14210,38 @@ def test_proxy_via_apigw_aws_proxy_integration(proxy_server):
     forwarded = json.loads(_ProxyHandler.received[-1]["body"])
     assert forwarded.get("rawPath") == "/hello"
     assert forwarded.get("requestContext", {}).get("http", {}).get("method") == "GET"
+
+
+def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
+    """RIE can end a run with a plain-text "Task timed out" body and HTTP 200.
+
+    That body is not JSON, so it reached callers as a successful payload:
+    Step Functions recorded TaskSucceeded and never ran Catch. It must take
+    the same shape as the read-timeout path.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return b"Task timed out after 300.00 seconds"
+
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _FakeResp()):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"] == {
+        "errorMessage": "Task timed out after 300.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    assert result["timeout"] is True
+
+
+def test_classify_function_error_bare_timeout_string_is_unhandled():
+    import ministack.services.lambda_svc as lsvc
+
+    assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
+    # Only the exact runtime message counts; other handler strings stay successes.
+    assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None

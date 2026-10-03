@@ -736,6 +736,99 @@ def test_secretsmanager_batch_get_secret_value_with_missing(sm):
     assert len(resp["Errors"]) == 1
     assert resp["Errors"][0]["SecretId"] == "nonexistent-secret"
 
+
+# ---------------------------------------------------------------------------
+# BatchGetSecretValue checks GetSecretValue per secret, ListSecrets for Filters
+# ---------------------------------------------------------------------------
+
+_BGSV_USER = "bgsv-user"
+_BGSV_KEY = "AKIABGSVTESTUSER0001"
+_BGSV_BATCH = {"Effect": "Allow", "Action": "secretsmanager:BatchGetSecretValue", "Resource": "*"}
+_BGSV_GET_A = {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "{A}"}
+_BGSV_LIST = {"Effect": "Allow", "Action": "secretsmanager:ListSecrets", "Resource": "*"}
+_BGSV_FILTER = {"Filters": [{"Key": "name", "Values": ["bgsv-probe-"]}]}
+
+
+def _bgsv_denied(action, resource=None):
+    on = f" on resource: {resource}" if resource else ""
+    return (f"User: arn:aws:iam::000000000000:user/{_BGSV_USER} is not authorized to perform: "
+            f"{action}{on} because no identity-based policy allows the {action} action")
+
+
+@pytest.mark.parametrize("auth_enabled, statements, request_body, values, errors, denied", [
+    pytest.param(True, [_BGSV_BATCH, _BGSV_GET_A], {"SecretIdList": ["{a}", "{b}"]}, ["{a}"],
+                 [("{b}", "AccessDeniedException")], None, id="names"),
+    pytest.param(True, [_BGSV_BATCH, _BGSV_GET_A], {"SecretIdList": ["{A}", "{B}"]}, ["{a}"],
+                 [("{B}", "AccessDeniedException")], None, id="arns"),
+    pytest.param(True, [_BGSV_BATCH, _BGSV_GET_A], _BGSV_FILTER, None, None,
+                 "secretsmanager:ListSecrets", id="filters-without-list"),
+    pytest.param(True, [_BGSV_BATCH, _BGSV_GET_A, _BGSV_LIST], _BGSV_FILTER, ["{a}"],
+                 [("{B}", "AccessDeniedException")], None, id="filters-with-list"),
+    pytest.param(True, [dict(_BGSV_GET_A, Resource=["{A}", "{B}"])], {"SecretIdList": ["{a}"]}, None, None,
+                 "secretsmanager:BatchGetSecretValue", id="no-batch-grant"),
+    pytest.param(True, [_BGSV_BATCH, dict(_BGSV_GET_A, Resource="*")], {"SecretIdList": ["{a}", "bgsv-missing"]},
+                 ["{a}"], [("bgsv-missing", "ResourceNotFoundException")], None, id="missing"),
+    pytest.param(False, [], _BGSV_FILTER, ["{a}", "{b}"], [], None, id="no-auth-filters"),
+])
+def test_secretsmanager_batch_get_secret_value_authorizes_each_secret(
+        monkeypatch, auth_enabled, statements, request_body, values, errors, denied):
+    import asyncio
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import secretsmanager as sm_svc
+
+    account = "000000000000"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    names = {"a": "bgsv-probe-a", "b": "bgsv-probe-b", "c": "bgsv-other"}
+    with request_scope(account, "us-east-1"):
+        arns = {k.upper(): json.loads(sm_svc._create_secret({"Name": n, "SecretString": n})[2])["ARN"]
+                for k, n in names.items()}
+        fill = {**names, **arns}
+
+        def render(value):
+            text = json.dumps(value)
+            for placeholder, real in fill.items():
+                text = text.replace(f"{{{placeholder}}}", real)
+            return json.loads(text)
+
+        iam_svc._users.set_scoped(account, None, _BGSV_USER, {
+            "UserName": _BGSV_USER, "UserId": "AIDABGSVTESTUSER", "AttachedPolicies": [],
+            "Arn": f"arn:aws:iam::{account}:user/{_BGSV_USER}",
+        })
+        iam_svc._user_inline_policies[_BGSV_USER] = {"p": {"Statement": render(statements)}}
+        iam_svc._access_keys.set_scoped(account, None, _BGSV_KEY, {
+            "AccessKeyId": _BGSV_KEY, "SecretAccessKey": "secret", "Status": "Active", "UserName": _BGSV_USER,
+        })
+        try:
+            status, _, payload = asyncio.run(app_mod._dispatch_service_request(
+                "POST", "/", {
+                    "host": "secretsmanager.us-east-1.localhost",
+                    "authorization": f"AWS4-HMAC-SHA256 Credential={_BGSV_KEY}/20260915/us-east-1/secretsmanager/aws4_request",
+                    "content-type": "application/x-amz-json-1.1",
+                    "x-amz-target": "secretsmanager.BatchGetSecretValue",
+                }, json.dumps(render(request_body)).encode(), {}, "req-1",
+            ))
+        finally:
+            iam_svc._access_keys.pop_scoped(account, None, _BGSV_KEY, None)
+            iam_svc._user_inline_policies.pop(_BGSV_USER, None)
+            iam_svc._users.pop_scoped(account, None, _BGSV_USER, None)
+            for name in names.values():
+                sm_svc._secrets.pop(name, None)
+    body = json.loads(payload)
+    if denied:
+        assert body["__type"] == "AccessDeniedException"
+        assert body["message"] == _bgsv_denied(denied)
+        return
+    assert status == 200
+    assert [v["Name"] for v in body["SecretValues"]] == render(values)
+    expected_errors = [(render(sid), code) for sid, code in errors]
+    assert [(e["SecretId"], e["ErrorCode"]) for e in body["Errors"]] == expected_errors
+    for (sid, code), error in zip(expected_errors, body["Errors"]):
+        if code == "AccessDeniedException":
+            assert error["Message"] == _bgsv_denied("secretsmanager:GetSecretValue", sid)
+
 def test_secretsmanager_kms_key_id_on_create_and_describe(sm):
     sm.create_secret(Name="kms-test-secret", SecretString="val", KmsKeyId="alias/my-key")
     resp = sm.describe_secret(SecretId="kms-test-secret")

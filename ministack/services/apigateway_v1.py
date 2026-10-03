@@ -93,6 +93,9 @@ Custom domains:
 import base64
 import copy
 import datetime
+import decimal
+import functools
+import ipaddress
 import json
 import logging
 import re
@@ -222,6 +225,10 @@ _GATEWAY_RESPONSE_ERROR_TYPES = {
     "AUTHORIZER_FAILURE": "AuthorizerConfigurationException",
     "AUTHORIZER_CONFIGURATION_ERROR": "AuthorizerConfigurationException",
     "API_CONFIGURATION_ERROR": "InternalServerErrorException",
+    "BAD_REQUEST_PARAMETERS": "BadRequestException",
+    "BAD_REQUEST_BODY": "BadRequestException",
+    "DEFAULT_5XX": "InternalServerErrorException",
+    "THROTTLED": "TooManyRequestsException",
 }
 
 _GATEWAY_TEMPLATE_VARIABLE = re.compile(
@@ -1493,12 +1500,12 @@ def _gateway_error_response(error, request):
     message = error.message
     message_string = "null" if message is None else json.dumps(message)
     rendered_type = response_type
-    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR"):
-        # AWS renders the messageString of both types with a leading space, and
-        # $context.error.responseType of an authorizer configuration error as
-        # API_CONFIGURATION_ERROR, while the response entry, its status and
-        # x-amzn-ErrorType stay those of AUTHORIZER_CONFIGURATION_ERROR (measured).
+    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR",
+                         "BAD_REQUEST_BODY", "BAD_REQUEST_PARAMETERS", "DEFAULT_5XX"):
+        # AWS renders the messageString of these types with a leading space (measured).
         message_string = " " + message_string
+    if response_type == "AUTHORIZER_CONFIGURATION_ERROR":
+        # Rendered as API_CONFIGURATION_ERROR; entry, status and error type stay AUTHORIZER_* (measured).
         rendered_type = "API_CONFIGURATION_ERROR"
     variables = {
         "context.error.message": "" if message is None else message,
@@ -1513,7 +1520,7 @@ def _gateway_error_response(error, request):
     body = _GATEWAY_TEMPLATE_VARIABLE.sub(
         lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
     )
-    return int(response["statusCode"]), headers, body.encode("utf-8")
+    return int(response.get("statusCode") or 500), headers, body.encode("utf-8")
 
 
 def _arn_matches(pattern, arn):
@@ -2026,6 +2033,7 @@ _GATEWAY_ERROR_MESSAGES = {
     "QUOTA_EXCEEDED": "Limit Exceeded",  # not captured
     "UNSUPPORTED_MEDIA_TYPE": "Unsupported Media Type",
     "BAD_REQUEST_BODY": "Invalid request body",
+    "DEFAULT_5XX": "Internal server error",
 }
 
 # In-process only; a restart forgets them.
@@ -2089,27 +2097,45 @@ def _method_throttle_settings(stage, resource_path, http_method):
     return None
 
 
-def _check_throttle(stage, api_id, stage_name, resource_path, http_method):
-    """Token bucket per method: rate refills, burst caps, 0/0 refuses all."""
-    entry = _method_throttle_settings(stage, resource_path, http_method)
-    if entry is None:
-        return None
-    rate = entry.get("throttlingRateLimit")
-    burst = entry.get("throttlingBurstLimit")
+def _take_token(slot, limits):
+    """Token bucket per slot: rate refills, burst caps, 0/0 refuses all."""
+    rate = limits.get("rateLimit")
+    burst = limits.get("burstLimit")
     if rate is None and burst is None:
-        return None
-    rate = float(rate if rate is not None else 0)
-    burst = float(burst if burst is not None else 0)
+        return True
+    rate = float(rate or 0)
+    burst = float(burst or 0)
     if rate <= 0 and burst <= 0:
-        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
-    slot = (api_id, stage_name, resource_path, http_method)
+        return False
     now = time.time()
     tokens, last = _throttle_state.get(slot, (burst, now))
     tokens = min(burst, tokens + (now - last) * rate)
     if tokens < 1:
         _throttle_state[slot] = (tokens, now)
-        return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+        return False
     _throttle_state[slot] = (tokens - 1, now)
+    return True
+
+
+def _check_throttle(stage, api_id, stage_name, resource_path, http_method, key):
+    """Usage-plan limits for the caller's key, then the stage method limit."""
+    buckets = []
+    if key is not None:
+        for plan_id, plan, entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+            buckets.append((("plan", plan_id, key["id"]), plan.get("throttle") or {}))
+            method_limits = (entry.get("throttle") or {}).get(f"{resource_path}/{http_method}")
+            if method_limits:
+                buckets.append((("plan", plan_id, key["id"], api_id, stage_name, resource_path,
+                                 http_method), method_limits))
+    entry = _method_throttle_settings(stage, resource_path, http_method)
+    if entry is not None:
+        buckets.append((("stage", api_id, stage_name, resource_path, http_method), {
+            "rateLimit": entry.get("throttlingRateLimit"),
+            "burstLimit": entry.get("throttlingBurstLimit"),
+        }))
+    for slot, limits in buckets:
+        if not _take_token(slot, limits):
+            return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
     return None
 
 
@@ -2158,29 +2184,221 @@ def _missing_request_parameters(method_obj, request, headers, query_params):
     return missing
 
 
-def _json_schema_violation(schema, document):
-    """The first violation, or None. Subset: type, required, property type."""
-    if not isinstance(schema, dict):
+_JSON_TYPES = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+}
+
+
+def _parse_date_time(value):
+    """Parse an RFC 3339 date-time, raising ValueError otherwise."""
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\d)[Tt](\d\d:\d\d:\d\d)(\.\d+)?([Zz]|[+-]\d\d:\d\d)", value)
+    if not match:
+        raise ValueError(value)
+    datetime.datetime.strptime(match[1] + match[2], "%Y-%m-%d%H:%M:%S")
+
+
+def _parses(parse):
+    """A format check that holds when parse accepts the value."""
+    def check(value):
+        try:
+            parse(value)
+        except ValueError:
+            return False
+        return True
+    return check
+
+
+_HOST_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_JSON_FORMATS = {
+    "date-time": _parses(_parse_date_time),
+    "email": lambda v: re.fullmatch(r"[^@\s]+@[^@\s]+", v) is not None,
+    "hostname": lambda v: re.fullmatch(rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*", v) is not None,
+    "ipv4": _parses(ipaddress.IPv4Address),
+    "ipv6": _parses(ipaddress.IPv6Address),
+    "uri": lambda v: re.search(r"[\s<>\"{}|\\^`]", v) is None,
+}
+
+
+def _regex_search(pattern, text):
+    """Whether pattern matches somewhere in text; None when Python cannot compile it."""
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
         return None
-    expected = schema.get("type")
-    if expected == "object" and not isinstance(document, dict):
-        return "expected an object"
-    if expected == "array" and not isinstance(document, list):
-        return "expected an array"
-    if expected == "string" and not isinstance(document, str):
-        return "expected a string"
-    if expected in ("number", "integer") and not isinstance(document, (int, float)):
-        return "expected a number"
-    if isinstance(document, dict):
-        for name in schema.get("required") or []:
-            if name not in document:
-                return f"missing required property {name}"
-        for name, sub in (schema.get("properties") or {}).items():
-            if name in document:
-                violation = _json_schema_violation(sub, document[name])
-                if violation:
-                    return violation
-    return None
+
+
+def _multiple_of(value, divisor):
+    """Exact multipleOf on the decimal representations."""
+    try:
+        return decimal.Decimal(str(value)) % decimal.Decimal(str(divisor)) == 0
+    except (decimal.DecimalException, ValueError):
+        return True
+
+
+def _json_equal(a, b):
+    """JSON equality: booleans are not numbers."""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(map(_json_equal, a, b))
+    return a == b
+
+
+def _json_key(value):
+    """A hashable key, equal for two values exactly when _json_equal says so."""
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", decimal.Decimal(str(value)).normalize())
+    if isinstance(value, list):
+        return ("l", tuple(map(_json_key, value)))
+    if isinstance(value, dict):
+        return ("d", frozenset((k, _json_key(v)) for k, v in value.items()))
+    return ("v", value)
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_schema(text):
+    """A parsed schema, shared per text so it keeps its identity across $refs; None if not JSON."""
+    try:
+        return json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return None
+
+
+def _model_schema(api_id, model_name):
+    """The parsed schema of a model of the API, or None."""
+    schema = (_models.get(api_id, {}).get(model_name) or {}).get("schema")
+    return _parse_schema(schema) if isinstance(schema, str) else schema
+
+
+def _resolve_schema_ref(ref, root):
+    """The schema a $ref names, and the document its own refs resolve in."""
+    base, _, pointer = ref.partition("#")
+    if base:
+        match = re.search(r"/restapis/([^/]+)/models/([^/]+)$", base)
+        root = _model_schema(match[1], urllib.parse.unquote(match[2])) if match else None
+    target = root
+    for part in filter(None, pointer.split("/")):
+        part = urllib.parse.unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(target, list) and part.isdigit() and int(part) < len(target):
+            target = target[int(part)]
+        else:
+            target = target.get(part) if isinstance(target, dict) else None
+    return target, root
+
+
+# Bodies nested deeper than this are refused before the schema applies.
+_MAX_BODY_DEPTH = 1000
+
+
+def _json_depth(value):
+    """How deeply arrays and objects nest in a parsed JSON value."""
+    depth, level = 0, [value]
+    while level := [c for c in level if isinstance(c, (dict, list))]:
+        depth += 1
+        level = [v for c in level for v in (c.values() if isinstance(c, dict) else c)]
+    return depth
+
+
+class _SchemaLoop(Exception):
+    """A schema that applies itself to the same value again."""
+
+
+def _json_schema_valid(schema, value, root, seen=()):
+    """Whether value satisfies the JSON Schema draft 4 schema; _SchemaLoop on a validation loop."""
+    chain = set()
+    while isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+        if id(schema) in chain:
+            return True
+        chain.add(id(schema))
+        schema, root = _resolve_schema_ref(schema["$ref"], root)
+    if not isinstance(schema, dict):
+        return True
+    if id(schema) in seen:
+        raise _SchemaLoop
+    seen += (id(schema),)
+
+    def valid(sub):
+        return _json_schema_valid(sub, value, root, seen)
+
+    # Every subschema that applies to the same value runs, so any loop among them is found.
+    all_of = [valid(sub) for sub in schema.get("allOf") or []]
+    any_of = [valid(sub) for sub in schema.get("anyOf") or []]
+    one_of = [valid(sub) for sub in schema.get("oneOf") or []]
+    negated = "not" in schema and valid(schema["not"])
+    depends = [all(n in value for n in needs) if isinstance(needs, list) else valid(needs)
+               for name, needs in (schema.get("dependencies") or {}).items()
+               if isinstance(value, dict) and name in value]
+    if (not all(all_of + depends) or "anyOf" in schema and not any(any_of)
+            or "oneOf" in schema and sum(one_of) != 1 or negated):
+        return False
+    types = schema.get("type")
+    if types is not None and not any(
+            _JSON_TYPES.get(t, lambda v: True)(value)
+            for t in (types if isinstance(types, list) else [types])):
+        return False
+    if "enum" in schema and not any(_json_equal(value, e) for e in schema["enum"]):
+        return False
+    if _JSON_TYPES["number"](value):
+        if "minimum" in schema and (value <= schema["minimum"] if schema.get(
+                "exclusiveMinimum") else value < schema["minimum"]):
+            return False
+        if "maximum" in schema and (value >= schema["maximum"] if schema.get(
+                "exclusiveMaximum") else value > schema["maximum"]):
+            return False
+        if "multipleOf" in schema and not _multiple_of(value, schema["multipleOf"]):
+            return False
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+            return False
+        if "pattern" in schema and _regex_search(schema["pattern"], value) is False:
+            return False
+        if not _JSON_FORMATS.get(schema.get("format"), lambda v: True)(value):
+            return False
+    children = []
+    if isinstance(value, list):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+            return False
+        if schema.get("uniqueItems") and len({_json_key(v) for v in value}) != len(value):
+            return False
+        items = schema.get("items", {})
+        if isinstance(items, list):
+            extra = schema.get("additionalItems", True)
+            if extra is False and len(value) > len(items):
+                return False
+            subs = items + [extra if isinstance(extra, dict) else {}] * (len(value) - len(items))
+        else:
+            subs = [items] * len(value)
+        children = zip(subs, value)
+    if isinstance(value, dict):
+        if not schema.get("minProperties", 0) <= len(value) <= schema.get("maxProperties", len(value)):
+            return False
+        if any(name not in value for name in schema.get("required") or []):
+            return False
+        properties = schema.get("properties") or {}
+        patterns = schema.get("patternProperties") or {}
+        extra = schema.get("additionalProperties", True)
+        for name, item in value.items():
+            matched = [sub for pattern, sub in patterns.items() if _regex_search(pattern, name)]
+            if name in properties:
+                matched.append(properties[name])
+            elif not matched:
+                if extra is False:
+                    return False
+                matched.append(extra)
+            children += [(sub, item) for sub in matched]
+    # Once the value passes, every child runs, so a loop below a refused sibling is still found.
+    results = [_json_schema_valid(sub, item, root) for sub, item in children if sub]
+    return all(results)
 
 
 def _check_request_validation(method_obj, api_id, request, headers, body, query_params):
@@ -2205,21 +2423,22 @@ def _check_request_validation(method_obj, api_id, request, headers, body, query_
         method_obj.get("requestModels") or {}).get("application/json")
     if not model_name:
         return None
-    model = _models.get(api_id, {}).get(model_name)
-    if not model:
+    schema = _model_schema(api_id, model_name)
+    if schema is None:
         return None
-    schema = model.get("schema")
-    if isinstance(schema, str):
-        try:
-            schema = json.loads(schema or "{}")
-        except json.JSONDecodeError:
-            return None
     try:
-        document = json.loads(body or b"{}")
-    except (json.JSONDecodeError, TypeError, ValueError):
+        document = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         return _gw_error("BAD_REQUEST_BODY",
                          _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
-    if _json_schema_violation(schema, document):
+    try:
+        valid = _json_depth(document) <= _MAX_BODY_DEPTH and _json_schema_valid(
+            schema, document, schema)
+    except _SchemaLoop:
+        return _gw_error("DEFAULT_5XX", _GATEWAY_ERROR_MESSAGES["DEFAULT_5XX"])
+    except (RecursionError, TypeError, AttributeError):
+        return None
+    if not valid:
         return _gw_error("BAD_REQUEST_BODY",
                          _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
     return None
@@ -2333,7 +2552,8 @@ async def _execute_in_scope(
     if key_error is not None:
         return key_error
     throttle_error = _check_throttle(
-        stage, api_id, stage_name, resource["path"], method)
+        stage, api_id, stage_name, resource["path"], method,
+        api_key or _resolve_api_key(_api_key_from_request(headers)))
     if throttle_error is not None:
         return throttle_error
     quota_error = _check_quota(api_key, api_id, stage_name)

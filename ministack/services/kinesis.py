@@ -9,7 +9,7 @@ Supports: CreateStream, DeleteStream, DescribeStream, DescribeStreamSummary,
           IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod,
           AddTagsToStream, RemoveTagsFromStream, ListTagsForStream,
           RegisterStreamConsumer, DeregisterStreamConsumer, ListStreamConsumers,
-          DescribeStreamConsumer,
+          DescribeStreamConsumer, SubscribeToShard,
           StartStreamEncryption, StopStreamEncryption,
           EnableEnhancedMonitoring, DisableEnhancedMonitoring.
 """
@@ -22,11 +22,13 @@ import logging
 import os
 import threading
 import time
+import zlib
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    StreamingResponse,
     error_response_json,
     get_account_id,
     get_region,
@@ -44,6 +46,11 @@ ITERATOR_EXPIRY_SECONDS = 300
 _streams = AccountRegionScopedDict()
 _shard_iterators = AccountRegionScopedDict()
 _consumers = AccountRegionScopedDict()
+# (ConsumerARN, ShardId) -> {"id", "started"} of the live SubscribeToShard
+_subscriptions = {}
+SUBSCRIPTION_SECONDS = 300
+_SUBSCRIPTION_TAKEOVER_SECONDS = 5
+_SUBSCRIPTION_IDLE_SECONDS = 5
 _sequence_counter = 0
 _sequence_lock = threading.Lock()
 
@@ -326,7 +333,7 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
     shard_id = _route_to_shard(hash_int, stream)
     stream["shards"][shard_id]["records"].append({
         "SequenceNumber": _next_sequence_number(),
-        "ApproximateArrivalTimestamp": int(time.time()),
+        "ApproximateArrivalTimestamp": round(time.time(), 3),
         "Data": base64.b64encode(data).decode("ascii"),
         "PartitionKey": partition_key,
     })
@@ -387,6 +394,7 @@ async def handle_request(method, path, headers, body, query_params):
         "DeregisterStreamConsumer": _deregister_consumer,
         "ListStreamConsumers": _list_consumers,
         "DescribeStreamConsumer": _describe_stream_consumer,
+        "SubscribeToShard": lambda d: _subscribe_to_shard(d, is_cbor),
         "StartStreamEncryption": _start_stream_encryption,
         "StopStreamEncryption": _stop_stream_encryption,
         "EnableEnhancedMonitoring": _enable_enhanced_monitoring,
@@ -400,6 +408,8 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
 
     status, resp_headers, resp_body = handler(data)
+    if isinstance(resp_body, StreamingResponse):
+        return status, resp_headers, resp_body
     if is_cbor:
         import cbor2
         # Re-encode JSON response body as CBOR
@@ -621,7 +631,7 @@ def _put_record(data):
 
     stream["shards"][shard_id]["records"].append({
         "SequenceNumber": seq,
-        "ApproximateArrivalTimestamp": int(time.time()),
+        "ApproximateArrivalTimestamp": round(time.time(), 3),
         "Data": record_data,
         "PartitionKey": partition_key,
     })
@@ -690,7 +700,7 @@ def _put_records(data):
         seq = _next_sequence_number()
         stream["shards"][sid]["records"].append({
             "SequenceNumber": seq,
-            "ApproximateArrivalTimestamp": int(time.time()),
+            "ApproximateArrivalTimestamp": round(time.time(), 3),
             "Data": rd,
             "PartitionKey": pk,
         })
@@ -740,20 +750,10 @@ def _get_shard_iterator(data):
     seq = data.get("StartingSequenceNumber", "")
     at_ts = data.get("Timestamp")
 
-    if it_type == "TRIM_HORIZON":
-        position = 0
-    elif it_type == "LATEST":
-        position = len(records)
-    elif it_type == "AT_SEQUENCE_NUMBER":
-        position = next((i for i, r in enumerate(records) if r["SequenceNumber"] >= seq), len(records))
-    elif it_type == "AFTER_SEQUENCE_NUMBER":
-        position = next((i for i, r in enumerate(records) if r["SequenceNumber"] > seq), len(records))
-    elif it_type == "AT_TIMESTAMP":
-        if at_ts is None:
-            return error_response_json("ValidationException", "Timestamp required for AT_TIMESTAMP", 400)
-        ts_val = float(at_ts)
-        position = next((i for i, r in enumerate(records) if r["ApproximateArrivalTimestamp"] >= ts_val), len(records))
-    else:
+    if it_type == "AT_TIMESTAMP" and at_ts is None:
+        return error_response_json("ValidationException", "Timestamp required for AT_TIMESTAMP", 400)
+    position = _start_position(records, it_type, seq, at_ts)
+    if position is None:
         return error_response_json("ValidationException", f"Invalid ShardIteratorType: {it_type}", 400)
 
     resolved_name = name if name else next((n for n, s in _streams.items() if s is stream), "")
@@ -766,6 +766,23 @@ def _get_shard_iterator(data):
         "created_at": time.time(),
     }
     return json_response({"ShardIterator": token})
+
+
+def _start_position(records, it_type, seq, at_ts):
+    """Index into ``records`` where an iterator type starts; None for an unknown type."""
+    if it_type == "TRIM_HORIZON":
+        return 0
+    if it_type == "LATEST":
+        return len(records)
+    if it_type == "AT_SEQUENCE_NUMBER":
+        return next((i for i, r in enumerate(records) if r["SequenceNumber"] >= seq), len(records))
+    if it_type == "AFTER_SEQUENCE_NUMBER":
+        return next((i for i, r in enumerate(records) if r["SequenceNumber"] > seq), len(records))
+    if it_type == "AT_TIMESTAMP":
+        ts_val = float(at_ts)
+        return next((i for i, r in enumerate(records)
+                     if r["ApproximateArrivalTimestamp"] >= ts_val), len(records))
+    return None
 
 
 def _ensure_base64(value):
@@ -1123,6 +1140,156 @@ def _describe_stream_consumer(data):
 # Stream encryption
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SubscribeToShard (enhanced fan-out eventstream)
+# ---------------------------------------------------------------------------
+
+def _eventstream_message(headers, payload):
+    """One ``application/vnd.amazon.eventstream`` message with string headers."""
+    raw = bytearray()
+    for name, value in headers.items():
+        name_b, value_b = name.encode(), value.encode()
+        raw += bytes([len(name_b)]) + name_b + b"\x07" + len(value_b).to_bytes(2, "big") + value_b
+    prelude = (12 + len(raw) + len(payload) + 4).to_bytes(4, "big") + len(raw).to_bytes(4, "big")
+    head = prelude + zlib.crc32(prelude).to_bytes(4, "big") + bytes(raw) + payload
+    return head + zlib.crc32(head).to_bytes(4, "big")
+
+
+def _subscribe_to_shard(data, is_cbor):
+    consumer_arn = data.get("ConsumerARN")
+    shard_id = data.get("ShardId")
+    starting = data.get("StartingPosition") or {}
+    it_type = starting.get("Type")
+    if not consumer_arn or not shard_id or not it_type:
+        return error_response_json("InvalidArgumentException",
+                                   "ConsumerARN, ShardId and StartingPosition.Type are required", 400)
+    consumer = _consumer_from_arn(consumer_arn)
+    if not consumer:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Consumer {consumer_arn} not found", 400)
+    if consumer.get("ConsumerStatus") != "ACTIVE":
+        return error_response_json("ResourceInUseException",
+                                   f"Consumer {consumer_arn} is not ACTIVE", 400)
+    stream = _resolve_stream_by_arn(consumer["StreamARN"])
+    if not stream or shard_id not in stream["shards"]:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Shard {shard_id} in stream {consumer['StreamARN']} not found", 400)
+    if it_type in ("AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER") and not starting.get("SequenceNumber"):
+        return error_response_json("InvalidArgumentException",
+                                   f"SequenceNumber is required for {it_type}", 400)
+    if it_type == "AT_TIMESTAMP" and starting.get("Timestamp") is None:
+        return error_response_json("InvalidArgumentException",
+                                   "Timestamp is required for AT_TIMESTAMP", 400)
+    _expire_records(stream)
+    position = _start_position(stream["shards"][shard_id]["records"], it_type,
+                               starting.get("SequenceNumber", ""), starting.get("Timestamp"))
+    if position is None:
+        return error_response_json("InvalidArgumentException",
+                                   f"Invalid StartingPosition.Type: {it_type}", 400)
+
+    # A second call within 5 seconds is refused; later, it takes the subscription over.
+    key = (consumer_arn, shard_id)
+    now = time.time()
+    live = _subscriptions.get(key)
+    if live and now - live["started"] < _SUBSCRIPTION_TAKEOVER_SECONDS:
+        return error_response_json("ResourceInUseException",
+                                   f"Another active subscription exists for consumer {consumer_arn} "
+                                   f"and shard {shard_id}", 400)
+    subscription_id = new_uuid()
+    _subscriptions[key] = {"id": subscription_id, "started": now}
+    content_type = "application/x-amz-cbor-1.1" if is_cbor else "application/json"
+    account_id, region = get_account_id(), get_region()
+    stream_name = stream["StreamName"]
+
+    def encode(payload):
+        if is_cbor:
+            import cbor2
+            return cbor2.dumps(payload)
+        return json.dumps(payload).encode()
+
+    def event(event_type, payload):
+        return _eventstream_message({":message-type": "event", ":event-type": event_type,
+                                     ":content-type": content_type}, encode(payload))
+
+    def exception(error_type, message):
+        return _eventstream_message({":message-type": "exception", ":exception-type": error_type,
+                                     ":content-type": content_type}, encode({"message": message}))
+
+    def record_out(r, encryption):
+        raw = base64.b64decode(_ensure_base64(r["Data"]))
+        return {"SequenceNumber": r["SequenceNumber"],
+                "ApproximateArrivalTimestamp": r["ApproximateArrivalTimestamp"],
+                "Data": raw if is_cbor else base64.b64encode(raw).decode("ascii"),
+                "PartitionKey": r["PartitionKey"],
+                "EncryptionType": encryption}
+
+    async def run(send, receive):
+        import asyncio
+
+        async def chunk(body, more=True):
+            await send({"type": "http.response.body", "body": body, "more_body": more})
+
+        async def disconnected():
+            while (await receive()).get("type") != "http.disconnect":
+                pass
+
+        pos = position
+        records = stream["shards"][shard_id]["records"]
+        continuation = (records[pos - 1]["SequenceNumber"] if 0 < pos <= len(records)
+                        else stream["shards"][shard_id]["starting_sequence_number"])
+        deadline = now + SUBSCRIPTION_SECONDS
+        last_sent = 0.0
+        watcher = asyncio.create_task(disconnected())
+        try:
+            await chunk(_eventstream_message({":message-type": "event", ":event-type": "initial-response",
+                                              ":content-type": content_type}, encode({})))
+            while not watcher.done() and time.time() < deadline:
+                if (_subscriptions.get(key) or {}).get("id") != subscription_id:
+                    await chunk(exception("ResourceInUseException",
+                                          f"Subscription to shard {shard_id} was taken over"))
+                    return
+                current = _streams.get_scoped(account_id, region, stream_name)
+                if current is not stream or _consumers.get_scoped(account_id, region, consumer_arn) is None:
+                    await chunk(exception("ResourceNotFoundException",
+                                          f"Stream {stream_name} or consumer {consumer_arn} not found"))
+                    return
+                shard = stream["shards"].get(shard_id)
+                if shard is None:
+                    children = [{"ShardId": sid, "ParentShards": [p for p in (s.get("parent_shard_id"),
+                                                                              s.get("adjacent_parent_shard_id")) if p],
+                                 "HashKeyRange": {"StartingHashKey": s["starting_hash_key"],
+                                                  "EndingHashKey": s["ending_hash_key"]}}
+                                for sid, s in sorted(stream["shards"].items())
+                                if shard_id in (s.get("parent_shard_id"), s.get("adjacent_parent_shard_id"))]
+                    await chunk(event("SubscribeToShardEvent", {
+                        "Records": [], "ContinuationSequenceNumber": continuation,
+                        "MillisBehindLatest": 0, "ChildShards": children}))
+                    return
+                records = shard["records"]
+                batch = records[min(pos, len(records)):]
+                if batch or not last_sent or time.time() - last_sent >= _SUBSCRIPTION_IDLE_SECONDS:
+                    encryption = stream.get("EncryptionType", "NONE")
+                    if batch:
+                        pos += len(batch)
+                        continuation = batch[-1]["SequenceNumber"]
+                    await chunk(event("SubscribeToShardEvent", {
+                        "Records": [record_out(r, encryption) for r in batch],
+                        "ContinuationSequenceNumber": continuation,
+                        "MillisBehindLatest": 0}))
+                    last_sent = time.time()
+                await asyncio.wait({watcher}, timeout=0.2)
+        finally:
+            if (_subscriptions.get(key) or {}).get("id") == subscription_id:
+                _subscriptions.pop(key, None)
+            watcher.cancel()
+            try:
+                await chunk(b"", more=False)
+            except Exception:
+                pass
+
+    return 200, {"Content-Type": "application/vnd.amazon.eventstream"}, StreamingResponse(run)
+
+
 def _start_stream_encryption(data):
     name, stream = _resolve_stream(data)
     if not stream:
@@ -1232,3 +1399,4 @@ def reset():
     _streams.clear()
     _shard_iterators.clear()
     _consumers.clear()
+    _subscriptions.clear()
