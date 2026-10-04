@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cognito — app client secret hashes** — clients created with `GenerateSecret=true` require a valid `SecretHash` on signup, confirmation and password recovery, and `SECRET_HASH` on authentication and challenge responses. Missing or incorrect hashes return `NotAuthorizedException` before user changes, email delivery or Lambda triggers. Clients without a secret reject a supplied hash on self-service and initial authentication calls, while refresh and challenge responses ignore it, as on AWS. Refresh authentication verifies the token owner's username, or `sub` when the pool uses `UsernameAttributes`, and custom challenge sessions cannot be answered through a different client. The checks apply in both `AUTH` modes.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
