@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **AppConfig — predefined deployment strategies** — `AppConfig.AllAtOnce`, `AppConfig.Linear50PercentEvery30Seconds`, `AppConfig.Canary10Percent20Minutes` and `AppConfig.Linear20PercentEvery6Minutes` now exist in every account and region and cannot be updated or deleted, as on AWS. A deployment records its strategy's parameters, and `StartDeployment` and `AWS::AppConfig::Deployment` fail with `ResourceNotFoundException` for a strategy that does not exist, where they used to accept any id. Contributed by @koh-sh.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
