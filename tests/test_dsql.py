@@ -1205,10 +1205,6 @@ class TestIndexLimits:
              "USING not supported for CREATE INDEX"),
             ("CREATE INDEX ASYNC i ON t USING btree (a)", "0A000",
              "USING not supported for CREATE INDEX"),
-            ("CREATE INDEX i ON t (a) WHERE a > 0", "0A000",
-             "WHERE not supported for CREATE INDEX"),
-            ("CREATE INDEX ASYNC i ON t (a) WHERE a > 0", "0A000",
-             "WHERE not supported for CREATE INDEX"),
             # plain (synchronous) mode is rejected outright, empty table or not
             ("CREATE INDEX i ON t (a)", "0A000",
              "unsupported mode. please use CREATE INDEX ASYNC."),
@@ -1228,6 +1224,19 @@ class TestIndexLimits:
              "expressions are not supported in included columns"),
             ("CREATE UNIQUE INDEX ASYNC i ON t (a) INCLUDE ((b + c))", "0A000",
              "included columns"),
+            # partial indexes: plain mode still needs ASYNC
+            ("CREATE INDEX i ON t (a) WHERE a > 0", "0A000",
+             "unsupported mode. please use CREATE INDEX ASYNC."),
+            # the predicate must be immutable too (Postgres' own message)
+            ("CREATE INDEX ASYNC i ON t (a) WHERE created > now()", "42P17",
+             "functions in index predicate must be marked IMMUTABLE"),
+            ("CREATE INDEX ASYNC i ON t (a) INCLUDE (b) WHERE random() < 0.5",
+             "42P17", "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (a) WHERE b IN (SELECT id FROM u)",
+             "0A000", "cannot use subquery in index predicate"),
+            # Postgres checks the predicate before the key expressions
+            ("CREATE INDEX ASYNC i ON t (now()) WHERE random() < 0.5", "42P17",
+             "index predicate"),
         ],
     )
     def test_unsupported_index_forms_denied(self, sql, sqlstate, message):
@@ -1246,11 +1255,26 @@ class TestIndexLimits:
             "CREATE INDEX ASYNC i ON t (lower(email))",
             "CREATE INDEX ASYNC i ON t ((data->>'city'))",
             "CREATE INDEX ASYNC ON t (upper(title), (a + b) NULLS LAST)",
+            # partial indexes (AWS DSQL, 2026-09-15)
+            "CREATE INDEX ASYNC high_rating_idx ON films (title) WHERE rating > 5",
+            "CREATE UNIQUE INDEX ASYNC i ON t (email) WHERE NOT archived",
+            "CREATE UNIQUE INDEX ASYNC i ON t (a) INCLUDE (b) NULLS NOT DISTINCT "
+            "WHERE status = 'active'",
+            "CREATE INDEX ASYNC i ON t (lower(title)) WHERE deleted_at IS NULL",
+            # function names and keywords inside literals aren't calls
+            "CREATE INDEX ASYNC i ON t (a) WHERE note <> 'now() or SELECT'",
         ],
     )
     def test_supported_index_forms_allowed(self, sql):
         result = pgproxy.validate(sql, pgproxy.TxnState())
         assert isinstance(result, pgproxy.Rewrite), sql
+
+    def test_partial_index_predicate_reaches_the_backend(self):
+        result = pgproxy.validate(
+            "CREATE INDEX ASYNC i ON t (a) WHERE a > 0", pgproxy.TxnState()
+        )
+        assert result.sql == "CREATE INDEX i ON t (a) WHERE a > 0"
+        assert result.job_type == "INDEX_BUILD"
 
     def test_more_than_8_columns_denied(self):
         err = pgproxy.validate(
@@ -1265,6 +1289,48 @@ class TestIndexLimits:
             "CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h)", pgproxy.TxnState()
         )
         assert isinstance(result, pgproxy.Rewrite)
+
+
+class TestDsqlSettings:
+    """dsql.* planner settings (dsql.enable_batched_nestloop, 2026-09-11)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SET dsql.enable_batched_nestloop = off",
+            "SET dsql.enable_batched_nestloop TO on",
+            "SET SESSION dsql.enable_batched_nestloop = 'false'",
+            "SET LOCAL dsql.enable_batched_nestloop = true",
+            "set dsql.enable_batched_nestloop = 0;",
+            "SET dsql.enable_batched_nestloop = of",  # unique prefix of off
+            "SET dsql.enable_batched_nestloop = y",
+            "SET dsql.enable_batched_nestloop TO DEFAULT",
+            "RESET dsql.enable_batched_nestloop",
+            "SHOW dsql.enable_batched_nestloop",
+        ],
+    )
+    def test_accepted(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    @pytest.mark.parametrize(
+        "value", ["banana", "'maybe'", "2", "o", "''", "onn"],
+    )
+    def test_non_boolean_rejected(self, value):
+        err = pgproxy.validate(
+            f"SET dsql.enable_batched_nestloop = {value}", pgproxy.TxnState()
+        )
+        assert isinstance(err, pgproxy.DsqlError), value
+        assert err.sqlstate == "22023"
+        assert err.message == (
+            'parameter "dsql.enable_batched_nestloop" requires a Boolean value'
+        )
+
+    def test_backend_starts_with_dsql_defaults(self):
+        from ministack.services import dsql as dsql_mod
+
+        assert dsql_mod.PG_COMMAND == [
+            "postgres", "-c", "dsql.enable_batched_nestloop=on",
+        ]
 
 
 class TestWaitForJob:
@@ -1694,8 +1760,11 @@ def pg_backend(pg_image):
     docker = pytest.importorskip("docker")
     psycopg2 = pytest.importorskip("psycopg2")
     client = docker.from_env()
+    from ministack.services import dsql as dsql_mod
+
     container = client.containers.run(
         image=pg_image,
+        command=dsql_mod.PG_COMMAND,
         detach=True,
         environment={
             "POSTGRES_USER": "postgres",
@@ -2498,7 +2567,9 @@ class TestLiveProxy:
                 ("CREATE INDEX fi1 ON form_live USING gin (data)", "0A000",
                  "USING not supported"),
                 ("CREATE INDEX fi2 ON form_live (a) WHERE a > 0", "0A000",
-                 "WHERE not supported"),
+                 "unsupported mode"),
+                ("CREATE INDEX ASYNC fi5 ON form_live (a) WHERE now() > now()",
+                 "42P17", "index predicate"),
                 ("CREATE INDEX fi3 ON form_live (now())", "0A000",
                  "unsupported mode"),
                 ("CREATE INDEX ASYNC fi4 ON form_live (now())", "42P17",
@@ -2528,6 +2599,141 @@ class TestLiveProxy:
             cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is True
             cur.execute("DROP TABLE expr_live")
+        finally:
+            conn.close()
+
+    def test_partial_index_built(self, dsql_proxy):
+        """Partial indexes (AWS DSQL, 2026-09-15) are built with their predicate."""
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE pi_live (id int PRIMARY KEY, rating int, title text)")
+            cur.execute(
+                "CREATE INDEX ASYNC pi_live_high ON pi_live (title) WHERE rating > 5"
+            )
+            job_id = cur.fetchone()[0]
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is True
+            cur.execute(
+                "SELECT pg_get_expr(indpred, indrelid) FROM pg_index "
+                "WHERE indexrelid = 'pi_live_high'::regclass"
+            )
+            assert cur.fetchone()[0] == "(rating > 5)"
+            cur.execute("DROP TABLE pi_live")
+        finally:
+            conn.close()
+
+    def test_unique_partial_index_scopes_uniqueness(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE upi_live (id int PRIMARY KEY, email text, archived bool)"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX ASYNC upi_live_email ON upi_live (email) "
+                "WHERE NOT archived"
+            )
+            job_id = cur.fetchone()[0]
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is True
+            # Duplicates are fine among archived rows...
+            cur.execute(
+                "INSERT INTO upi_live VALUES (1, 'a@x', true), (2, 'a@x', true), "
+                "(3, 'a@x', false)"
+            )
+            # ...but not among the rows the predicate covers.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO upi_live VALUES (4, 'a@x', false)")
+            assert exc.value.pgcode == "23505"
+            cur.execute("DROP TABLE upi_live")
+        finally:
+            conn.close()
+
+    def test_volatile_predicate_fails_the_submit(self, dsql_proxy):
+        """A bad predicate is refused up front, not handed back as a failed job."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE vp_live (id int, created timestamptz)")
+            cur.execute("SELECT job_id FROM sys.jobs")
+            jobs_before = len(cur.fetchall())
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(
+                    "CREATE INDEX ASYNC vp_live_i ON vp_live (id) WHERE created > now()"
+                )
+            assert exc.value.pgcode == "42P17"
+            assert "index predicate must be marked IMMUTABLE" in str(exc.value)
+            cur.execute("SELECT job_id FROM sys.jobs")
+            assert len(cur.fetchall()) == jobs_before
+            cur.execute("DROP TABLE vp_live")
+        finally:
+            conn.close()
+
+    def test_batched_nestloop_setting(self, dsql_proxy):
+        """dsql.enable_batched_nestloop (AWS DSQL, 2026-09-11) defaults to on."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "on"
+            cur.execute("SET dsql.enable_batched_nestloop = off")
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "off"
+            cur.execute("RESET dsql.enable_batched_nestloop")
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "on"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SET dsql.enable_batched_nestloop = banana")
+            assert exc.value.pgcode == "22023"
+        finally:
+            conn.close()
+
+    def test_max_5_statistics_per_table(self, dsql_proxy):
+        """Extended statistics (AWS DSQL, 2026-08-27): at most 5 per table."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE st_live (a int, b int, c int)")
+            for i in range(5):
+                cur.execute(f"CREATE STATISTICS st_live_{i} ON a, b FROM st_live")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_5 ON a, c FROM st_live")
+            assert exc.value.pgcode == "54000"
+            assert "more than 5 extended statistics per table are not allowed" in str(
+                exc.value
+            )
+            with pytest.raises(psycopg2.Error):
+                cur.execute("CREATE STATISTICS ON (a + b) FROM st_live")
+            # IF NOT EXISTS on an existing name is a no-op, not a sixth object.
+            cur.execute(
+                "CREATE STATISTICS IF NOT EXISTS st_live_0 ON a, b FROM st_live"
+            )
+            # ALTER and DROP pass through; dropping one frees a slot.
+            cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 200")
+            cur.execute("DROP STATISTICS st_live_0")
+            cur.execute("CREATE STATISTICS st_live_5 (mcv) ON a, c FROM st_live")
+            cur.execute("DROP TABLE st_live")
+        finally:
+            conn.close()
+
+    def test_numeric_precision_and_scale_limits(self, dsql_proxy):
+        """numeric takes precision up to 1000, scale -1000..1000 (2026-08-25)."""
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE num_live (id int PRIMARY KEY, "
+                "big numeric(1000, 500), neg numeric(1000, -1000))"
+            )
+            cur.execute("INSERT INTO num_live VALUES (1, 1.5, 1234)")
+            cur.execute("SELECT neg FROM num_live")
+            assert cur.fetchone()[0] == 0  # rounded to the 10^1000 place
+            cur.execute("DROP TABLE num_live")
         finally:
             conn.close()
 

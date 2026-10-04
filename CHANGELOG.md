@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Aurora DSQL — partial indexes** — `CREATE INDEX ASYNC ... WHERE predicate` was refused `0A000` although the service supports it since 2026-09-15; the predicate now reaches the backend and builds a real partial index (unique partial indexes scope uniqueness to the rows they cover). A predicate calling a volatile function fails at submit with Postgres' `42P17` "functions in index predicate must be marked IMMUTABLE", and a subquery with `0A000`, instead of coming back as a failed job. Contributed by @vivedo.
+- **Aurora DSQL — `dsql.enable_batched_nestloop`** — the session setting added with batched nested-loop joins (2026-09-11) shows `on` before any `SET`, `RESET` returns to `on`, and a non-Boolean value is refused `22023` instead of being stored as a placeholder. Plans stay Postgres-shaped: no `Nested Loop (Batched Join)` node. Contributed by @vivedo.
+- **Aurora DSQL — 5 extended statistics per table** — `CREATE STATISTICS` reached the backend without a cap; a sixth object on a table now fails with the service's "more than 5 extended statistics per table are not allowed" (`54000`; the SQLSTATE isn't documented). `IF NOT EXISTS` on an existing name stays a no-op. Contributed by @vivedo.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added

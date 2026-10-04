@@ -1014,14 +1014,22 @@ def _check_cache_value(sql):
 
 # DSQL index rules, verified against a live Aurora DSQL cluster (Aug 2026):
 # index creation is always asynchronous — plain CREATE INDEX fails with
-# "unsupported mode". No CONCURRENTLY, no USING (not even btree), no partial
-# (WHERE). IF NOT EXISTS requires a name (grammar). Expression index keys are
-# supported, but every function must be immutable (42P17) and INCLUDE columns
-# can't be expressions. At most 8 key columns per index (54011); 24 indexes
-# per table is enforced at runtime.
+# "unsupported mode". No CONCURRENTLY, no USING (not even btree). IF NOT
+# EXISTS requires a name (grammar). Expression index keys are supported, but
+# every function must be immutable (42P17) and INCLUDE columns can't be
+# expressions. At most 8 key columns per index (54011); 24 indexes per table
+# is enforced at runtime.
 #
-# Error precedence (observed on real DSQL): name-grammar → CONCURRENTLY →
-# USING → WHERE → mode → key-expression rules → key count.
+# Partial indexes (WHERE predicate) are supported since 2026-09-15. The
+# predicate follows the same immutability rule as key expressions; the proxy
+# checks it up front so a bad predicate fails the submit, not the job.
+#
+# Error precedence (observed on real DSQL, Aug 2026): name-grammar →
+# CONCURRENTLY → USING → mode → key-expression rules → key count. Where the
+# predicate checks sit was not observable before partial indexes shipped;
+# they run just before the key-expression rules, the order Postgres uses
+# (parse analysis rejects subqueries, then DefineIndex checks the predicate
+# before it computes the key columns).
 _VOLATILE_FUNCTIONS = frozenset({
     "now", "random", "setseed", "nextval", "currval", "lastval", "setval",
     "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
@@ -1042,8 +1050,6 @@ def _check_index_rules(sql):
         return DsqlError("0A000", "CONCURRENTLY not supported for CREATE INDEX")
     if re.search(r"\bUSING\s+\w+", sql, re.I):
         return DsqlError("0A000", "USING not supported for CREATE INDEX")
-    if re.search(r"\bWHERE\b", sql, re.I):
-        return DsqlError("0A000", "WHERE not supported for CREATE INDEX")
     if not _INDEX_ASYNC_RE.match(sql):
         return DsqlError(
             "0A000", "unsupported mode. please use CREATE INDEX ASYNC."
@@ -1054,17 +1060,25 @@ def _check_index_rules(sql):
     end = _match_paren(sql, start)
     if end < 0:
         return None
+    # Neither INCLUDE (...) nor NULLS [NOT] DISTINCT can hold a WHERE, so the
+    # first one after the key list starts the partial-index predicate.
+    pred = re.search(r"\bWHERE\b", sql[end + 1 :], re.I)
+    if pred:
+        predicate = sql[end + 1 + pred.end() :]
+        if re.search(r"\bSELECT\b", _strip_literals(predicate), re.I):
+            return DsqlError("0A000", "cannot use subquery in index predicate")
+        if _calls_volatile_function(predicate):
+            return DsqlError(
+                "42P17", "functions in index predicate must be marked IMMUTABLE"
+            )
     parts = _split_top_level(sql[start + 1 : end])
-    for part in parts:
-        for fn in re.findall(r"(\w+)\s*\(", part):
-            if fn.lower() in _VOLATILE_FUNCTIONS:
-                # Same code/message the backend (and real DSQL) produce; the
-                # proxy fails fast so CREATE INDEX ASYNC rejects at submit
-                # time instead of returning a job_id.
-                return DsqlError(
-                    "42P17",
-                    "functions in index expression must be marked IMMUTABLE",
-                )
+    if any(_calls_volatile_function(part) for part in parts):
+        # Same code/message the backend (and real DSQL) produce; the proxy
+        # fails fast so CREATE INDEX ASYNC rejects at submit time instead of
+        # returning a job_id.
+        return DsqlError(
+            "42P17", "functions in index expression must be marked IMMUTABLE"
+        )
     # INCLUDE columns are non-key: expressions are not supported there.
     inc = re.search(r"\bINCLUDE\s*\(", sql[end:], re.I)
     if inc:
@@ -1081,6 +1095,17 @@ def _check_index_rules(sql):
             "54011", "more than 8 column keys in an index are not supported"
         )
     return None
+
+
+def _strip_literals(text):
+    return re.sub(r"'(?:[^']|'')*'", "''", text)
+
+
+def _calls_volatile_function(text):
+    return any(
+        fn.lower() in _VOLATILE_FUNCTIONS
+        for fn in re.findall(r"(\w+)\s*\(", _strip_literals(text))
+    )
 
 
 _ALTER_ASYNC_VALIDATE_RE = re.compile(
@@ -1222,6 +1247,43 @@ def _check_locking_clause(sql):
 # --- Top-level validator -----------------------------------------------------
 
 
+# DSQL-specific planner settings (all boolean). Postgres takes any dotted name
+# as an untyped placeholder, so the backend would accept SET ... = 'banana';
+# real DSQL rejects it. The backend container starts with each one set to its
+# DSQL default (dsql.py), so SHOW and RESET behave too.
+DSQL_SETTINGS = {
+    "dsql.enable_batched_nestloop": "on",  # 2026-09-11
+}
+
+_SET_DSQL_RE = re.compile(
+    r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?(dsql\.\w+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
+    re.I | re.S,
+)
+
+
+def _parse_pg_bool(value):
+    """Postgres parse_bool: case-insensitive unique prefixes, plus 1/0."""
+    v = value.strip().lower()
+    if v in ("1", "0"):
+        return True
+    if len(v) >= 2 and v in ("on", "off"[: len(v)]):
+        return True
+    return bool(v) and any(w.startswith(v) for w in ("true", "false", "yes", "no"))
+
+
+def _check_dsql_settings(sql):
+    m = _SET_DSQL_RE.match(sql)
+    if not m or m.group(1).lower() not in DSQL_SETTINGS:
+        return None
+    name, raw = m.group(1).lower(), m.group(2)
+    if raw.upper() == "DEFAULT":
+        return None
+    value = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] == "'" else raw
+    if _parse_pg_bool(value):
+        return None
+    return DsqlError("22023", f'parameter "{name}" requires a Boolean value')
+
+
 def validate(sql, txn_state=None):
     """Validate one statement. Returns DsqlError | Rewrite | None.
 
@@ -1291,6 +1353,9 @@ def validate(sql, txn_state=None):
     if err:
         return err
     err = _check_locking_clause(s)
+    if err:
+        return err
+    err = _check_dsql_settings(s)
     if err:
         return err
 
@@ -1433,13 +1498,18 @@ async def _index_count(conn, b_writer, table):
     schema, _, bare = table.rpartition(".")
     schema = schema.strip('"') or "public"
     bare = bare.strip('"')
+    return await _probe_count(
+        conn,
+        b_writer,
+        "SELECT count(*) FROM pg_indexes "
+        f"WHERE schemaname = '{schema}' AND tablename = '{bare}'",
+    )
+
+
+async def _probe_count(conn, b_writer, query):
+    """Run a single-integer probe on the backend. None on probe error."""
     try:
-        frames = await _run_backend_capture(
-            conn,
-            b_writer,
-            "SELECT count(*) FROM pg_indexes "
-            f"WHERE schemaname = '{schema}' AND tablename = '{bare}'",
-        )
+        frames = await _run_backend_capture(conn, b_writer, query)
     except Exception:
         return None
     for type_byte, payload in frames:
@@ -1599,6 +1669,48 @@ async def _check_drop_column(conn, b_writer, sql):
     return None
 
 
+# At most 5 extended statistics objects per table (AWS DSQL, 2026-08-27). The
+# message is the documented one; the SQLSTATE is not documented, so this uses
+# Postgres' program_limit_exceeded.
+_CREATE_STATISTICS_RE = re.compile(
+    r"\s*CREATE\s+STATISTICS\s+(IF\s+NOT\s+EXISTS\s+)?([\w\".]+)?.*"
+    r"\bFROM\s+([\w\".]+)\s*;?\s*$",
+    re.I | re.S,
+)
+
+
+async def _check_statistics_limit(conn, b_writer, sql):
+    m = _CREATE_STATISTICS_RE.match(sql)
+    if not m:
+        return None
+    if_not_exists, name, table = m.group(1), m.group(2), m.group(3)
+    if name and name.upper() == "ON":
+        name = None  # unnamed form: CREATE STATISTICS ON ... FROM t
+    # regclass resolves the name the way the backend will (search_path,
+    # quoting); an unknown table fails the probe and the backend answers.
+    count = await _probe_count(
+        conn,
+        b_writer,
+        f"SELECT count(*) FROM pg_statistic_ext WHERE stxrelid = '{table}'::regclass",
+    )
+    if count is None or count < 5:
+        return None
+    if if_not_exists and name:
+        # An existing name is a NOTICE and a no-op, not a sixth object.
+        bare = name.rpartition(".")[2]
+        bare = bare[1:-1] if bare.startswith('"') else bare.lower()
+        exists = await _probe_count(
+            conn,
+            b_writer,
+            f"SELECT count(*) FROM pg_statistic_ext WHERE stxname = '{bare}'",
+        )
+        if exists:
+            return None
+    return DsqlError(
+        "54000", "more than 5 extended statistics per table are not allowed"
+    )
+
+
 _ASYNC_BATCH_ERR = DsqlError(
     "0A000", "asynchronous DDL is not supported in multi-statement queries"
 )
@@ -1663,6 +1775,9 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
 
     if allow_probe:
         err = await _check_drop_column(conn, b_writer, s)
+        if err:
+            return "error", err
+        err = await _check_statistics_limit(conn, b_writer, s)
         if err:
             return "error", err
 
