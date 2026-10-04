@@ -1474,6 +1474,33 @@ class TestWaitForJob:
         assert pgproxy.match_wait_for_job("SELECT 1") is None
         assert pgproxy.match_wait_for_job("SELECT sys.wait_for_job(job_id)") is None
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CALL sys.wait_for_job($1)",
+            "CALL sys.wait_for_job( $1::text )",
+            "SELECT sys.wait_for_job($1)",
+        ],
+    )
+    def test_bound_parameter_form(self, sql):
+        # A client that binds the job id over the extended protocol sends
+        # the statement text as ...($1).
+        assert pgproxy.match_wait_for_job(sql) == pgproxy.BindParam(1)
+
+    def test_literal_with_cast(self):
+        sql = "CALL sys.wait_for_job('abc123'::text)"
+        assert pgproxy.match_wait_for_job(sql) == "abc123"
+
+    def test_sys_jobs_bound_filter(self):
+        assert pgproxy.match_sys_jobs(
+            "SELECT job_id, status FROM sys.jobs WHERE job_id = $2"
+        ) == (["job_id", "status"], pgproxy.BindParam(2))
+
+    def test_job_ids_are_base32(self):
+        job = pgproxy._register_job("idtest", "public.i")
+        assert re.fullmatch(r"[a-z2-7]{26}", job["job_id"])
+        pgproxy._jobs.pop("idtest", None)
+
 
 class TestReset:
     def test_reset_stops_proxies_and_clears_jobs(self):
@@ -2033,7 +2060,7 @@ class _WireClient:
         params = f"user\0{user}\0database\0{database}\0\0".encode()
         payload = struct.pack("!I", 196608) + params
         self.sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
-        self._until_ready()
+        self.startup = self._until_ready()
 
     def __enter__(self):
         return self
@@ -2105,9 +2132,19 @@ class _WireResult:
         self.sqlstate = None
         self.message = None
         self.rows = []
+        self.columns = []  # (name, type oid) from RowDescription
         self.tag = None
         self.txn_status = None
         for type_byte, payload in frames:
+            if type_byte == b"T":
+                (n,) = struct.unpack("!H", payload[:2])
+                off = 2
+                for _ in range(n):
+                    end = payload.index(b"\0", off)
+                    name = payload[off:end].decode()
+                    (oid,) = struct.unpack("!I", payload[end + 7 : end + 11])
+                    self.columns.append((name, oid))
+                    off = end + 19
             if type_byte == b"E":
                 for part in payload.split(b"\0"):
                     if part[:1] == b"C":
@@ -2480,6 +2517,156 @@ class TestLockingReads:
             self._setup(c, "fu_lit")
             result = c.simple("SELECT s FROM fu_lit WHERE s = 'FOR SHARE'")
             assert result.ok, f"{result.sqlstate} {result.message}"
+
+
+@requires_docker
+@pytest.mark.data_plane
+class TestWaitForJobOverTheWire:
+    """``CALL sys.wait_for_job`` as drivers send it. Shapes measured on Aurora
+    DSQL (eu-central-1, 2026-10-04): one bool OUT column named ``succeeded``,
+    command tag ``CALL``, with a literal or a bound ``$1`` alike."""
+
+    def _job(self, c, table, unique=False, dup=False):
+        c.simple(f"DROP TABLE IF EXISTS {table}")
+        c.simple(f"CREATE TABLE {table} (id int PRIMARY KEY, a int)")
+        if dup:
+            c.simple(f"INSERT INTO {table} VALUES (1, 1), (2, 1)")
+        kind = "UNIQUE INDEX" if unique else "INDEX"
+        result = c.extended(f"CREATE {kind} ASYNC {table}_a ON {table} (a)")
+        assert result.ok, result.message
+        return result.rows[0][0]
+
+    def test_bound_job_id(self, dsql_proxy):
+        """``CALL sys.wait_for_job($1)`` with the id bound, read back through
+        the ``succeeded`` column."""
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_drz")
+            result = c.extended("CALL sys.wait_for_job($1)", params=(job,))
+            assert result.ok, f"{result.sqlstate} {result.message}"
+            assert result.columns == [("succeeded", 16)]
+            assert result.rows == [("t",)]
+            assert result.tag == "CALL"
+            c.simple("DROP TABLE wfj_drz")
+
+    def test_cast_and_literal_forms(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_forms")
+            cast = c.extended("CALL sys.wait_for_job($1::text)", params=(job,))
+            assert (cast.columns, cast.rows, cast.tag) == (
+                [("succeeded", 16)], [("t",)], "CALL",
+            )
+            literal = c.simple(f"CALL sys.wait_for_job('{job}')")
+            assert (literal.columns, literal.rows, literal.tag) == (
+                [("succeeded", 16)], [("t",)], "CALL",
+            )
+            c.simple("DROP TABLE wfj_forms")
+
+    def test_failed_job_answers_false(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_fail", unique=True, dup=True)
+            result = c.extended("CALL sys.wait_for_job($1)", params=(job,))
+            assert result.rows == [("f",)]
+            jobs = c.extended(
+                "SELECT status, details FROM sys.jobs WHERE job_id = $1",
+                params=(job,),
+            )
+            assert jobs.rows == [
+                ("failed", "found duplicate key(s) while validating index uniqueness")
+            ]
+            c.simple("DROP TABLE wfj_fail")
+
+    def test_sys_jobs_bound_filter(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_jobs")
+            result = c.extended(
+                "SELECT job_id, status FROM sys.jobs WHERE job_id = $1", params=(job,)
+            )
+            assert result.rows == [(job, "completed")]
+            assert result.tag == "SELECT 1"
+            c.simple("DROP TABLE wfj_jobs")
+
+    def test_async_ddl_command_tags(self, dsql_proxy):
+        """CREATE INDEX ASYNC answers CREATE INDEX, ALTER TABLE ASYNC answers
+        ALTER TABLE; both carry the job_id row."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("DROP TABLE IF EXISTS wfj_tags")
+            c.simple("CREATE TABLE wfj_tags (id int PRIMARY KEY, a int)")
+            c.simple("ALTER TABLE wfj_tags ADD CONSTRAINT wfj_ck CHECK (a > 0) NOT VALID")
+            for result in (
+                c.simple("CREATE INDEX ASYNC wfj_tags_a ON wfj_tags (a)"),
+                c.extended("CREATE INDEX ASYNC wfj_tags_b ON wfj_tags (a)"),
+            ):
+                assert (result.tag, result.columns) == ("CREATE INDEX", [("job_id", 25)])
+            for sql in (
+                "ALTER TABLE ASYNC wfj_tags VALIDATE CONSTRAINT wfj_ck",
+            ):
+                result = c.simple(sql)
+                assert result.tag == "ALTER TABLE", sql
+                validate_job = result.rows[0][0]
+            jobs = c.extended(
+                "SELECT class_id, start_time FROM sys.jobs WHERE job_id = $1",
+                params=(validate_job,),
+            )
+            # oid and timestamptz, rendered the way Postgres renders them
+            assert jobs.columns == [("class_id", 26), ("start_time", 1184)]
+            assert jobs.rows[0][0] == "2606"  # pg_constraint
+            assert re.fullmatch(
+                r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\+00", jobs.rows[0][1]
+            )
+            c.simple("DROP TABLE wfj_tags")
+
+    def test_startup_reports_timezone(self, dsql_proxy):
+        """Drivers decode timestamptz by the reported TimeZone. Values as
+        real DSQL reports them."""
+        with _WireClient(dsql_proxy) as c:
+            status = dict(
+                p[:-1].decode().split("\0", 1) for t, p in c.startup if t == b"S"
+            )
+        assert status["TimeZone"] == "UTC"
+        assert status["DateStyle"] == "ISO, MDY"
+        assert status["IntervalStyle"] == "postgres"
+
+    def test_malformed_job_id_rejected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            result = c.extended("CALL sys.wait_for_job($1)", params=("not-a-job",))
+            assert (result.sqlstate, result.message) == (
+                "22P02", "Unable to convert text to UUID",
+            )
+            # The error ends at Sync; the session carries on.
+            assert c.simple("SELECT 1").rows == [("1",)]
+
+    def test_placeholder_in_a_simple_query(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            result = c.simple("CALL sys.wait_for_job($1)")
+            assert (result.sqlstate, result.message) == (
+                "42P02", "there is no parameter $1",
+            )
+
+    def test_named_statement_rebinds(self, dsql_proxy):
+        """One prepared statement, two Binds: each portal gets its own answer."""
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_named")
+            f = c._frame
+
+            def bind(portal, value):
+                raw = value.encode()
+                return f(
+                    b"B",
+                    portal + b"\0wfj\0" + struct.pack("!HHi", 0, 1, len(raw)) + raw
+                    + struct.pack("!H", 0),
+                )
+
+            msg = f(b"P", b"wfj\0CALL sys.wait_for_job($1)\0" + struct.pack("!H", 0))
+            msg += f(b"D", b"Swfj\0")
+            msg += bind(b"p1", job) + f(b"E", b"p1\0" + struct.pack("!I", 0))
+            msg += bind(b"p2", "a" * 26) + f(b"E", b"p2\0" + struct.pack("!I", 0))
+            msg += f(b"S", b"")
+            c.sock.sendall(msg)
+            frames = c._until_ready()
+            param_desc = next(p for t, p in frames if t == b"t")
+            assert param_desc == struct.pack("!HI", 1, 25)  # one text parameter
+            assert _WireResult(frames).rows == [("t",), ("f",)]
+            c.simple("DROP TABLE wfj_named")
 
 
 @requires_docker

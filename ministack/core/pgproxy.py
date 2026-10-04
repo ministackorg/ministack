@@ -61,13 +61,23 @@ _GSSENC_REQUEST = 80877104
 _CANCEL_REQUEST = 80877102
 _PROTOCOL_3 = 196608
 
+# ParameterStatus sent at startup. Drivers depend on these: one that decodes
+# timestamptz by TimeZone can stall on the first value without it. Values
+# as real DSQL reports them (measured, eu-central-1 2026-10-04), bar the
+# per-session session_authorization.
 _STARTUP_PARAMS = (
     ("server_version", "16.4"),
     ("server_encoding", "UTF8"),
     ("client_encoding", "UTF8"),
-    ("DateStyle", "ISO"),
+    ("DateStyle", "ISO, MDY"),
+    ("IntervalStyle", "postgres"),
+    ("TimeZone", "UTC"),
     ("integer_datetimes", "on"),
     ("standard_conforming_strings", "on"),
+    ("application_name", ""),
+    ("is_superuser", "off"),
+    ("default_transaction_read_only", "off"),
+    ("in_hot_standby", "off"),
 )
 
 _TEXT_OID = 25
@@ -141,12 +151,39 @@ _proxies = {}  # cluster_id -> asyncio.Server
 _jobs = {}  # cluster_id -> [job dict]
 _catalog_versions = {}  # cluster_id -> int, bumped on every DDL statement
 
-_ID_ALPHABET = string.ascii_lowercase + string.digits
+# DSQL job ids are 26 base32 characters (a UUID); wait_for_job refuses any
+# other text with 22P02 "Unable to convert text to UUID".
+_ID_ALPHABET = string.ascii_lowercase + "234567"
 
 _JOB_COLUMNS = (
     "job_id", "status", "details", "job_type", "class_id", "object_id",
     "object_name", "start_time", "update_time",
 )
+# Column types sys.jobs declares on real DSQL (measured, eu-central-1
+# 2026-10-04); the rest are text. Drivers decode values by these oids.
+_OID_OID, _TIMESTAMPTZ_OID = 26, 1184
+_JOB_COLUMN_TYPES = {
+    "class_id": _OID_OID, "object_id": _OID_OID,
+    "start_time": _TIMESTAMPTZ_OID, "update_time": _TIMESTAMPTZ_OID,
+}
+# Catalog a job's object lives in: pg_class for an index, pg_constraint for
+# a constraint validation.
+_JOB_CLASS_IDS = {"INDEX_BUILD": "1259", "VALIDATE_CONSTRAINT": "2606"}
+# What CREATE INDEX ASYNC / ALTER TABLE ASYNC answer, as on real DSQL.
+_JOB_COMMAND_TAGS = {"INDEX_BUILD": "CREATE INDEX", "VALIDATE_CONSTRAINT": "ALTER TABLE"}
+
+
+def _pg_timestamptz(value):
+    """Postgres' text output for a UTC timestamptz (DSQL keeps whole seconds).
+
+    Jobs persisted by older versions hold ISO 8601 strings; they render the
+    same way.
+    """
+    if isinstance(value, str) and "T" in value:
+        value = datetime.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00")
+    return value
 
 
 def get_jobs(cluster_id):
@@ -171,13 +208,13 @@ def _bump_catalog(cluster_id):
 
 def _register_job(cluster_id, object_name, job_type="INDEX_BUILD",
                   status="completed", details=None):
-    now = datetime.now(timezone.utc).isoformat()
+    now = _pg_timestamptz(datetime.now(timezone.utc))
     job = {
         "job_id": "".join(secrets.choice(_ID_ALPHABET) for _ in range(26)),
         "status": status,
         "details": details,
         "job_type": job_type,
-        "class_id": "1259",
+        "class_id": _JOB_CLASS_IDS.get(job_type, "1259"),
         "object_id": str(16384 + secrets.randbelow(100000)),
         "object_name": object_name,
         "start_time": now,
@@ -1178,12 +1215,29 @@ def _index_object_name(sql, on_end, index_name, table):
 # --- sys.jobs / sys.wait_for_job (rules 5 & 6) ------------------------------
 
 _SYS_JOBS_RE = re.compile(r"\s*SELECT\s+(.+?)\s+FROM\s+sys\.jobs\b", re.I | re.S)
-_JOB_ID_FILTER_RE = re.compile(r"job_id\s*=\s*'([^']*)'", re.I)
+_JOB_ID_FILTER_RE = re.compile(
+    r"job_id\s*=\s*(?:'([^']*)'|\$(\d+))(?:\s*::\s*\w+)?", re.I
+)
 _WAIT_JOB_RE = re.compile(
-    r"\s*(?:SELECT|CALL)\s+sys\.wait_for_job\s*\(\s*"
-    r"(?:job_id\s*\)\s*'([^']*)'|'([^']*)'\s*\))",
+    r"\s*(SELECT|CALL)\s+sys\.wait_for_job\s*\(\s*"
+    r"(?:job_id\s*\)\s*'([^']*)'|'([^']*)'(?:\s*::\s*\w+)?\s*\)"
+    r"|\$(\d+)(?:\s*::\s*\w+)?\s*\))",
     re.I,
 )
+_JOB_ID_RE = re.compile(r"[a-z2-7]{26}")
+
+
+class BindParam:
+    """A ``$n`` placeholder whose value only arrives with Bind."""
+
+    def __init__(self, index):
+        self.index = index
+
+    def __eq__(self, other):
+        return isinstance(other, BindParam) and other.index == self.index
+
+    def __repr__(self):
+        return f"BindParam({self.index})"
 
 
 def match_sys_jobs(sql):
@@ -1200,16 +1254,29 @@ def match_sys_jobs(sql):
     if select_list != "*":
         columns = [c.strip().strip('"') for c in select_list.split(",")]
     f = _JOB_ID_FILTER_RE.search(sql)
-    return columns, (f.group(1) if f else None)
+    if not f:
+        return columns, None
+    return columns, (BindParam(int(f.group(2))) if f.group(2) else f.group(1))
 
 
 def match_wait_for_job(sql):
-    """Match both documented call forms: ``sys.wait_for_job(job_id) '<id>'``
-    and the conventional ``sys.wait_for_job('<id>')``."""
+    """The job id ``sys.wait_for_job`` is called with, or None.
+
+    A ``BindParam`` when the id is a ``$n`` placeholder (the client binds it
+    over the extended protocol). Accepts the literal forms
+    ``sys.wait_for_job('<id>')`` and ``sys.wait_for_job(job_id) '<id>'``.
+    """
     m = _WAIT_JOB_RE.match(sql)
     if not m:
         return None
-    return m.group(1) or m.group(2)
+    if m.group(4):
+        return BindParam(int(m.group(4)))
+    return m.group(2) or m.group(3)
+
+
+def _wait_is_call(sql):
+    m = _WAIT_JOB_RE.match(sql)
+    return bool(m) and m.group(1).upper() == "CALL"
 
 
 # --- Locking clauses (measured against Aurora DSQL, 2026-08-18) -------------
@@ -1794,6 +1861,53 @@ _ASYNC_BATCH_ERR = DsqlError(
 )
 
 
+def _sys_jobs_rows(conn, cols, job_filter):
+    jobs = get_jobs(conn.cluster_id)
+    if job_filter is not None:
+        jobs = [j for j in jobs if j["job_id"] == job_filter]
+    return {
+        "cols": [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+        "rows": [
+            [_pg_timestamptz(job[c]) if c.endswith("_time") else job[c] for c in cols]
+            for job in jobs
+        ],
+        "tag": f"SELECT {len(jobs)}",
+    }
+
+
+def _wait_columns(call):
+    # Real DSQL: wait_for_job is a procedure whose one OUT parameter is
+    # ``succeeded`` (bool), so CALL answers a "succeeded" column and the CALL
+    # tag (measured, eu-central-1 2026-10-04). The SELECT form, which DSQL
+    # refuses with 42809, is kept as a lenient alias.
+    return [("succeeded" if call else "wait_for_job", 16)]  # bool oid
+
+
+def _wait_for_job_rows(conn, job_id, call):
+    if call and (job_id is None or not _JOB_ID_RE.fullmatch(job_id)):
+        return DsqlError("22P02", "Unable to convert text to UUID")
+    known = any(
+        j["job_id"] == job_id and j["status"] == "completed"
+        for j in get_jobs(conn.cluster_id)
+    )
+    return {
+        "cols": _wait_columns(call),
+        "rows": [["t" if known else "f"]],
+        "tag": "CALL" if call else "SELECT 1",
+    }
+
+
+def _deferred(cols, param, resolve):
+    """A synthetic result that needs a bound parameter: resolved at Bind."""
+    return {
+        "cols": cols,
+        "nparams": param.index,
+        "resolve": lambda params: resolve(
+            params[param.index - 1] if len(params) >= param.index else None
+        ),
+    }
+
+
 async def _plan_statement(conn, s, b_writer, allow_probe=True):
     """Decide what to do with one statement, for either wire protocol.
 
@@ -1815,26 +1929,25 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
         bad = [c for c in cols if c not in _JOB_COLUMNS]
         if bad:
             return "error", DsqlError("42703", f'column "{bad[0]}" does not exist')
-        jobs = get_jobs(conn.cluster_id)
-        if job_filter:
-            jobs = [j for j in jobs if j["job_id"] == job_filter]
-        return "rows", {
-            "cols": cols,
-            "rows": [[job[c] for c in cols] for job in jobs],
-            "tag": f"SELECT {len(jobs)}",
-        }
+        if isinstance(job_filter, BindParam):
+            return "rows", _deferred(
+                [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+                job_filter, lambda v: _sys_jobs_rows(conn, cols, v),
+            )
+        return "rows", _sys_jobs_rows(conn, cols, job_filter)
 
     job_id = match_wait_for_job(s)
     if job_id is not None:
-        known = any(
-            j["job_id"] == job_id and j["status"] == "completed"
-            for j in get_jobs(conn.cluster_id)
-        )
-        return "rows", {
-            "cols": [("wait_for_job", 16)],  # bool oid
-            "rows": [["t" if known else "f"]],
-            "tag": "SELECT 1",
-        }
+        call = _wait_is_call(s)
+        if isinstance(job_id, BindParam):
+            return "rows", _deferred(
+                _wait_columns(call), job_id,
+                lambda v: _wait_for_job_rows(conn, v, call),
+            )
+        result = _wait_for_job_rows(conn, job_id, call)
+        if isinstance(result, DsqlError):
+            return "error", result
+        return "rows", result
 
     result = validate(s, conn.txn)
     if isinstance(result, DsqlError):
@@ -1914,6 +2027,9 @@ async def _run_rewrite(conn, b_writer, rewrite):
         # unresolvable relation, a syntax error — is refused on the spot. In a
         # transaction the backend is left aborted, so relay there either way.
         if sqlstate.startswith("23") and not conn.txn.in_txn:
+            if sqlstate == "23505" and rewrite.job_type == "INDEX_BUILD":
+                # DSQL's own wording (measured, eu-central-1 2026-10-04).
+                message = "found duplicate key(s) while validating index uniqueness"
             job = _register_job(
                 conn.cluster_id, rewrite.object_name, rewrite.job_type,
                 status="failed", details=message,
@@ -1955,6 +2071,11 @@ async def _handle_query(conn, sql, b_writer, c_writer):
             return
 
         kind, result = await _plan_statement(conn, s, b_writer)
+        if kind == "rows" and "resolve" in result:
+            # A $n placeholder means nothing outside the extended protocol.
+            kind, result = "error", DsqlError(
+                "42P02", f"there is no parameter ${result['nparams']}"
+            )
         if kind == "error":
             _reject(conn, c_writer, result)
             await c_writer.drain()
@@ -1980,7 +2101,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
                 return
             out = _row_description(["job_id"])
             out += _data_row([job["job_id"]])
-            out += _command_complete("SELECT 1")
+            out += _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
             c_writer.write(out + _ready(_status(conn)))
             await c_writer.drain()
             return
@@ -2147,12 +2268,44 @@ async def _ext_bind(conn, payload, b_writer, c_writer):
     if entry is None:
         await _ext_forward(conn, b_writer, b"B", payload)
         return
-    conn.ext_portals[portal] = entry
     if entry["synth"] is None:
+        conn.ext_portals[portal] = entry
         await _ext_forward(conn, b_writer, b"B", payload)
         return
+    kind, result = entry["synth"]
+    if kind == "rows" and "resolve" in result:
+        resolved = result["resolve"](_bind_params(payload))
+        if isinstance(resolved, DsqlError):
+            await _ext_error(conn, c_writer, resolved)
+            return
+        entry = {**entry, "synth": ("rows", resolved)}
+    conn.ext_portals[portal] = entry
     c_writer.write(_frame(b"2", b""))  # BindComplete
     await c_writer.drain()
+
+
+def _bind_params(payload):
+    """Parameter values of a Bind payload, as text (None for NULL)."""
+    try:
+        i = payload.index(b"\0")
+        i = payload.index(b"\0", i + 1) + 1
+        (nfmt,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2 + 2 * nfmt
+        (nparams,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2
+        values = []
+        for _ in range(nparams):
+            (vlen,) = struct.unpack("!i", payload[i : i + 4])
+            i += 4
+            if vlen < 0:
+                values.append(None)
+                continue
+            # A job id is text; its binary encoding is the same UTF-8 bytes.
+            values.append(payload[i : i + vlen].decode("utf-8", "replace"))
+            i += vlen
+        return values
+    except (ValueError, struct.error):
+        return []
 
 
 async def _ext_describe(conn, payload, b_writer, c_writer):
@@ -2164,7 +2317,10 @@ async def _ext_describe(conn, payload, b_writer, c_writer):
         return
     out = b""
     if target == b"S":
-        out += _frame(b"t", struct.pack("!H", 0))  # ParameterDescription
+        nparams = entry["synth"][1].get("nparams", 0)
+        out += _frame(  # ParameterDescription: every placeholder is text
+            b"t", struct.pack("!H", nparams) + struct.pack("!I", 25) * nparams
+        )
     out += _row_description(_synth_columns(*entry["synth"]))
     c_writer.write(out)
     await c_writer.drain()
@@ -2194,7 +2350,10 @@ async def _ext_execute(conn, payload, b_writer, c_writer):
         c_writer.write(_frame(b"E", backend_err))
         await c_writer.drain()
         return
-    c_writer.write(_data_row([job["job_id"]]) + _command_complete("SELECT 1"))
+    c_writer.write(
+        _data_row([job["job_id"]])
+        + _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
+    )
     await c_writer.drain()
 
 

@@ -16,6 +16,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Aurora DSQL — the 8-key index limit comes first** — measured live, DSQL reports `54011` before the mode, key-expression and `INCLUDE` rules; the proxy reported those first, so a plain `CREATE INDEX` on nine columns drew "unsupported mode". `sys.jobs.details` is now NULL for a job that succeeded, where it was an empty string. Contributed by @vivedo.
+- **Aurora DSQL — `CALL sys.wait_for_job($1)` with a bound job id** — a job id bound as a parameter over the extended protocol went through to the backing Postgres and failed `3F000` schema "sys" does not exist, after the index had been built. Bound job ids now work for `sys.wait_for_job` and for `sys.jobs ... WHERE job_id = $1`, and `CALL` answers the procedure's `succeeded` column with the `CALL` tag, as measured on the live service (eu-central-1, 2026-10-04); a malformed id is refused `22P02`. `CREATE INDEX ASYNC` and `ALTER TABLE ASYNC` answer the `CREATE INDEX` / `ALTER TABLE` tags, `sys.jobs` declares its `oid` and `timestamptz` columns, a constraint validation job carries `class_id` 2606, and a unique index that fails on duplicates reports the service's `details`. Contributed by @vivedo.
+- **Aurora DSQL — `TimeZone` missing at startup** — the proxy's startup greeting reported no `TimeZone`, so a driver that decodes `timestamptz` by it could stall on the first value; it now reports `TimeZone`, `IntervalStyle` and the rest of the parameters the live service does. Contributed by @vivedo.
 
 ## [1.5.21] — 2026-10-03
 
