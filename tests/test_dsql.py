@@ -1234,9 +1234,32 @@ class TestIndexLimits:
              "42P17", "index predicate"),
             ("CREATE INDEX ASYNC i ON t (a) WHERE b IN (SELECT id FROM u)",
              "0A000", "cannot use subquery in index predicate"),
-            # Postgres checks the predicate before the key expressions
+            # Precedence measured on real DSQL (eu-central-1, 2026-10-04):
+            # key count -> mode -> predicate -> key expressions -> INCLUDE.
+            ("CREATE INDEX i ON t (a,b,c,d,e,f,g,h,i)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX i ON t (now(),a,b,c,d,e,f,g,h)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (now(),a,b,c,d,e,f,g,h)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h,i) INCLUDE ((b + c))",
+             "54011", "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h,i) WHERE b IN (SELECT 1)",
+             "54011", "more than 8 column keys"),
+            ("CREATE INDEX CONCURRENTLY i ON t (a,b,c,d,e,f,g,h,i)", "0A000",
+             "CONCURRENTLY"),
+            ("CREATE INDEX i ON t (a) WHERE random() < 0.5", "0A000",
+             "unsupported mode"),
+            ("CREATE INDEX i ON t (a) INCLUDE ((b + c))", "0A000",
+             "unsupported mode"),
             ("CREATE INDEX ASYNC i ON t (now()) WHERE random() < 0.5", "42P17",
              "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (now()) WHERE b IN (SELECT 1)", "0A000",
+             "subquery"),
+            ("CREATE INDEX ASYNC i ON t (a) INCLUDE ((b + c)) WHERE random() < 0.5",
+             "42P17", "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (now()) INCLUDE ((b + c))", "42P17",
+             "index expression"),
         ],
     )
     def test_unsupported_index_forms_denied(self, sql, sqlstate, message):
@@ -1305,12 +1328,71 @@ class TestDsqlSettings:
             "SET dsql.enable_batched_nestloop = of",  # unique prefix of off
             "SET dsql.enable_batched_nestloop = y",
             "SET dsql.enable_batched_nestloop TO DEFAULT",
+            'SET dsql.enable_batched_nestloop = "on"',
+            "SET DSQL.ENABLE_BATCHED_NESTLOOP = OFF",
             "RESET dsql.enable_batched_nestloop",
             "SHOW dsql.enable_batched_nestloop",
+            "SELECT set_config('dsql.enable_batched_nestloop', 'off', false)",
+            # Ordinary settings DSQL lets a session change.
+            "SET enable_hashjoin = off",
+            "SET search_path = public",
+            # Refused settings can still be reset.
+            "RESET default_statistics_target",
+            "SET default_statistics_target TO DEFAULT",
         ],
     )
     def test_accepted(self, sql):
         assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    def test_value_list_rejected(self):
+        err = pgproxy.validate(
+            "SET dsql.enable_batched_nestloop = on, off", pgproxy.TxnState()
+        )
+        assert (err.sqlstate, err.message) == (
+            "22023", "SET dsql.enable_batched_nestloop takes only one argument",
+        )
+
+    def test_set_config_validates_the_value(self):
+        err = pgproxy.validate(
+            "SELECT set_config('dsql.enable_batched_nestloop', 'banana', false)",
+            pgproxy.TxnState(),
+        )
+        assert err.sqlstate == "22023"
+        assert "requires a Boolean value" in err.message
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SET dsql.bogus = 1",
+            "SET LOCAL dsql.bogus = 1",
+            "SET SESSION dsql.bogus TO 1",
+            "RESET dsql.bogus",
+            "SET dsql.bogus TO DEFAULT",
+            "SELECT set_config('dsql.bogus', '1', false)",
+        ],
+    )
+    def test_dsql_prefix_is_reserved(self, sql):
+        # Exact message and detail from real DSQL (eu-central-1, 2026-10-04).
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert err.sqlstate == "42602", sql
+        assert err.message == 'invalid configuration parameter name "dsql.bogus"'
+        assert err.detail == '"dsql" is a reserved prefix.'
+
+    @pytest.mark.parametrize(
+        "sql,param",
+        [
+            ("SET default_statistics_target = 200", "default_statistics_target"),
+            ("SET LOCAL default_statistics_target = 50", "default_statistics_target"),
+            ("SELECT set_config('default_statistics_target', '50', false)",
+             "default_statistics_target"),
+            ("SET work_mem = '64MB'", "work_mem"),
+            ("SET statement_timeout = '5s'", "statement_timeout"),
+        ],
+    )
+    def test_unsettable_parameters_rejected(self, sql, param):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert err.sqlstate == "0A000", sql
+        assert err.message == f'setting configuration parameter "{param}" not supported'
 
     @pytest.mark.parametrize(
         "value", ["banana", "'maybe'", "2", "o", "''", "onn"],
@@ -1331,6 +1413,49 @@ class TestDsqlSettings:
         assert dsql_mod.PG_COMMAND == [
             "postgres", "-c", "dsql.enable_batched_nestloop=on",
         ]
+
+
+class TestStatisticsRules:
+    """Extended statistics (AWS DSQL, 2026-08-27); messages measured live."""
+
+    @pytest.mark.parametrize("target", ["100", "-1", "0"])
+    def test_statistics_target_up_to_100_allowed(self, target):
+        sql = f"ALTER STATISTICS s SET STATISTICS {target}"
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
+
+    def test_statistics_target_over_100_rejected(self):
+        err = pgproxy.validate(
+            "ALTER STATISTICS s SET STATISTICS 101", pgproxy.TxnState()
+        )
+        assert (err.sqlstate, err.message) == (
+            "22023", "statistics target 101 exceeds maximum allowed value of 100",
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "ALTER TABLE t ALTER COLUMN a SET STATISTICS 50",
+            "ALTER TABLE t ALTER a SET STATISTICS 200",
+        ],
+    )
+    def test_column_statistics_target_rejected(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert (err.sqlstate, err.message) == (
+            "0A000",
+            "unsupported ALTER TABLE ALTER COLUMN ... SET STATISTICS statement",
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CREATE STATISTICS s1 (dependencies) ON a, b FROM t",
+            "CREATE STATISTICS ON (lower(a)) FROM public.t",
+            "ALTER STATISTICS s1 RENAME TO s2",
+            "DROP STATISTICS s1",
+        ],
+    )
+    def test_statements_pass_text_validation(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
 
 
 class TestWaitForJob:
@@ -2429,9 +2554,10 @@ class TestLiveProxy:
             job_id = cur.fetchone()[0]
             assert re.match(r"^[a-z0-9]{26}$", job_id)
 
-            cur.execute("SELECT job_id, status, job_type FROM sys.jobs")
+            cur.execute("SELECT job_id, status, job_type, details FROM sys.jobs")
             jobs = cur.fetchall()
-            assert (job_id, "completed", "INDEX_BUILD") in jobs
+            # details is NULL for a job that succeeded (as on real DSQL).
+            assert (job_id, "completed", "INDEX_BUILD", None) in jobs
         finally:
             conn.close()
 
@@ -2689,6 +2815,13 @@ class TestLiveProxy:
             with pytest.raises(psycopg2.Error) as exc:
                 cur.execute("SET dsql.enable_batched_nestloop = banana")
             assert exc.value.pgcode == "22023"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SET dsql.bogus_setting = 1")
+            assert exc.value.pgcode == "42602"
+            assert exc.value.diag.message_detail == '"dsql" is a reserved prefix.'
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SHOW dsql.bogus_setting")
+            assert exc.value.pgcode == "42704"
         finally:
             conn.close()
 
@@ -2709,12 +2842,41 @@ class TestLiveProxy:
             )
             with pytest.raises(psycopg2.Error):
                 cur.execute("CREATE STATISTICS ON (a + b) FROM st_live")
-            # IF NOT EXISTS on an existing name is a no-op, not a sixth object.
+            # IF NOT EXISTS on an existing name is a no-op, not a sixth object;
+            # on a new name it is refused like any other.
             cur.execute(
                 "CREATE STATISTICS IF NOT EXISTS st_live_0 ON a, b FROM st_live"
             )
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(
+                    "CREATE STATISTICS IF NOT EXISTS st_live_9 ON a, b FROM st_live"
+                )
+            assert exc.value.pgcode == "54000"
+            # The statement's own errors come before the limit, as on DSQL.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_x ON a FROM st_live")
+            assert exc.value.pgcode == "42P17"
+            assert "at least 2 columns" in str(exc.value)
+            # The dry run leaves nothing behind.
+            cur.execute(
+                "SELECT count(*) FROM pg_statistic_ext "
+                "WHERE stxrelid = 'st_live'::regclass"
+            )
+            assert cur.fetchone()[0] == 5
+            # The limit holds inside a transaction too, and aborts it.
+            cur.execute("BEGIN")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_t ON a, c FROM st_live")
+            assert exc.value.pgcode == "54000"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SELECT 1")
+            assert exc.value.pgcode == "25P02"
+            cur.execute("ROLLBACK")
             # ALTER and DROP pass through; dropping one frees a slot.
-            cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 200")
+            cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 100")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 200")
+            assert exc.value.pgcode == "22023"
             cur.execute("DROP STATISTICS st_live_0")
             cur.execute("CREATE STATISTICS st_live_5 (mcv) ON a, c FROM st_live")
             cur.execute("DROP TABLE st_live")

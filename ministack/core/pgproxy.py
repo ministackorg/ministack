@@ -77,11 +77,12 @@ def _frame(type_byte, payload):
     return type_byte + struct.pack("!I", len(payload) + 4) + payload
 
 
-def _error_response(sqlstate, message):
+def _error_response(sqlstate, message, detail=None):
     payload = (
         b"SERROR\0VERROR\0"
         + b"C" + sqlstate.encode() + b"\0"
         + b"M" + message.encode() + b"\0"
+        + (b"D" + detail.encode() + b"\0" if detail else b"")
         + b"\0"
     )
     return _frame(b"E", payload)
@@ -169,7 +170,7 @@ def _bump_catalog(cluster_id):
 
 
 def _register_job(cluster_id, object_name, job_type="INDEX_BUILD",
-                  status="completed", details=""):
+                  status="completed", details=None):
     now = datetime.now(timezone.utc).isoformat()
     job = {
         "job_id": "".join(secrets.choice(_ID_ALPHABET) for _ in range(26)),
@@ -389,9 +390,10 @@ def _sql_tokens(sql):
 class DsqlError:
     """Validator rejection: rendered as a PG ErrorResponse."""
 
-    def __init__(self, sqlstate, message):
+    def __init__(self, sqlstate, message, detail=None):
         self.sqlstate = sqlstate
         self.message = message
+        self.detail = detail
 
     def __repr__(self):
         return f"DsqlError({self.sqlstate!r}, {self.message!r})"
@@ -873,6 +875,12 @@ def _check_alter_table(sql):
         return DsqlError(
             "0A000", "SET NOT NULL is not supported (only DROP NOT NULL)"
         )
+    if re.search(r"\bALTER\s+(?:COLUMN\s+)?[\w\"]+\s+SET\s+STATISTICS\b", sql, re.I):
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "0A000",
+            "unsupported ALTER TABLE ALTER COLUMN ... SET STATISTICS statement",
+        )
     add = re.search(r"\bADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?(\w+)", sql, re.I)
     if add and add.group(1).upper() != "COLUMN":
         what = add.group(1).upper()
@@ -1024,12 +1032,10 @@ def _check_cache_value(sql):
 # predicate follows the same immutability rule as key expressions; the proxy
 # checks it up front so a bad predicate fails the submit, not the job.
 #
-# Error precedence (observed on real DSQL, Aug 2026): name-grammar →
-# CONCURRENTLY → USING → mode → key-expression rules → key count. Where the
-# predicate checks sit was not observable before partial indexes shipped;
-# they run just before the key-expression rules, the order Postgres uses
-# (parse analysis rejects subqueries, then DefineIndex checks the predicate
-# before it computes the key columns).
+# Error precedence (measured, eu-central-1 2026-10-04): name-grammar →
+# CONCURRENTLY → USING → key count → mode → predicate (subquery, then
+# immutability) → key-expression immutability → INCLUDE expressions. The key
+# count comes before the mode: a plain CREATE INDEX on 9 columns draws 54011.
 _VOLATILE_FUNCTIONS = frozenset({
     "now", "random", "setseed", "nextval", "currval", "lastval", "setval",
     "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
@@ -1050,14 +1056,17 @@ def _check_index_rules(sql):
         return DsqlError("0A000", "CONCURRENTLY not supported for CREATE INDEX")
     if re.search(r"\bUSING\s+\w+", sql, re.I):
         return DsqlError("0A000", "USING not supported for CREATE INDEX")
+    start = sql.find("(", m.end())
+    end = _match_paren(sql, start) if start >= 0 else -1
+    parts = _split_top_level(sql[start + 1 : end]) if end > 0 else []
+    if len(parts) > 8:
+        return DsqlError(
+            "54011", "more than 8 column keys in an index are not supported"
+        )
     if not _INDEX_ASYNC_RE.match(sql):
         return DsqlError(
             "0A000", "unsupported mode. please use CREATE INDEX ASYNC."
         )
-    start = sql.find("(", m.end())
-    if start < 0:
-        return None
-    end = _match_paren(sql, start)
     if end < 0:
         return None
     # Neither INCLUDE (...) nor NULLS [NOT] DISTINCT can hold a WHERE, so the
@@ -1071,7 +1080,6 @@ def _check_index_rules(sql):
             return DsqlError(
                 "42P17", "functions in index predicate must be marked IMMUTABLE"
             )
-    parts = _split_top_level(sql[start + 1 : end])
     if any(_calls_volatile_function(part) for part in parts):
         # Same code/message the backend (and real DSQL) produce; the proxy
         # fails fast so CREATE INDEX ASYNC rejects at submit time instead of
@@ -1090,10 +1098,6 @@ def _check_index_rules(sql):
             return DsqlError(
                 "0A000", "expressions are not supported in included columns"
             )
-    if len(parts) > 8:
-        return DsqlError(
-            "54011", "more than 8 column keys in an index are not supported"
-        )
     return None
 
 
@@ -1255,9 +1259,21 @@ DSQL_SETTINGS = {
     "dsql.enable_batched_nestloop": "on",  # 2026-09-11
 }
 
-_SET_DSQL_RE = re.compile(
-    r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?(dsql\.\w+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
+# Settings DSQL refuses to change (SET, SET LOCAL, set_config); RESET and
+# SET ... TO DEFAULT are accepted. Observed, not exhaustive (eu-central-1,
+# 2026-10-04): planner switches like enable_hashjoin and search_path are
+# settable.
+_UNSETTABLE_PARAMS = frozenset({
+    "default_statistics_target", "statement_timeout", "work_mem",
+})
+
+_SET_RE = re.compile(
+    r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?([\w.]+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
     re.I | re.S,
+)
+_RESET_RE = re.compile(r"\s*RESET\s+([\w.]+)", re.I)
+_SET_CONFIG_RE = re.compile(
+    r"\bset_config\s*\(\s*'([^']*)'\s*,\s*'((?:[^']|'')*)'", re.I
 )
 
 
@@ -1271,17 +1287,70 @@ def _parse_pg_bool(value):
     return bool(v) and any(w.startswith(v) for w in ("true", "false", "yes", "no"))
 
 
-def _check_dsql_settings(sql):
-    m = _SET_DSQL_RE.match(sql)
-    if not m or m.group(1).lower() not in DSQL_SETTINGS:
+def _check_setting(name, values):
+    """Rules for one assignment; ``values`` is None for RESET / TO DEFAULT."""
+    name = name.lower()
+    if name.startswith("dsql.") and name not in DSQL_SETTINGS:
+        # Exact message and detail from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "42602",
+            f'invalid configuration parameter name "{name}"',
+            '"dsql" is a reserved prefix.',
+        )
+    if values is None:
         return None
-    name, raw = m.group(1).lower(), m.group(2)
-    if raw.upper() == "DEFAULT":
-        return None
-    value = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] == "'" else raw
-    if _parse_pg_bool(value):
-        return None
-    return DsqlError("22023", f'parameter "{name}" requires a Boolean value')
+    if name in _UNSETTABLE_PARAMS:
+        return DsqlError(
+            "0A000", f'setting configuration parameter "{name}" not supported'
+        )
+    if name in DSQL_SETTINGS and values:
+        if len(values) > 1:
+            return DsqlError("22023", f"SET {name} takes only one argument")
+        if not _parse_pg_bool(values[0]):
+            return DsqlError("22023", f'parameter "{name}" requires a Boolean value')
+    return None
+
+
+def _unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+_ALTER_STATISTICS_TARGET_RE = re.compile(
+    r"\s*ALTER\s+STATISTICS\s+.+?\s+SET\s+STATISTICS\s+(-?\d+)", re.I | re.S
+)
+
+
+def _check_statistics_target(sql):
+    """DSQL caps statistics targets at 100 (Postgres allows 10000)."""
+    m = _ALTER_STATISTICS_TARGET_RE.match(sql)
+    if m and int(m.group(1)) > 100:
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "22023",
+            f"statistics target {m.group(1)} exceeds maximum allowed value of 100",
+        )
+    return None
+
+
+def _check_settings(sql):
+    m = _SET_RE.match(sql)
+    if m:
+        raw = m.group(2)
+        values = (
+            None if raw.upper() == "DEFAULT"
+            else [_unquote(v.strip()) for v in _split_top_level(raw)]
+        )
+        return _check_setting(m.group(1), values)
+    m = _RESET_RE.match(sql)
+    if m:
+        return _check_setting(m.group(1), None)
+    for name, value in _SET_CONFIG_RE.findall(sql):
+        err = _check_setting(name, [value.replace("''", "'")])
+        if err:
+            return err
+    return None
 
 
 def validate(sql, txn_state=None):
@@ -1355,7 +1424,10 @@ def validate(sql, txn_state=None):
     err = _check_locking_clause(s)
     if err:
         return err
-    err = _check_dsql_settings(s)
+    err = _check_settings(s)
+    if err:
+        return err
+    err = _check_statistics_target(s)
     if err:
         return err
 
@@ -1544,7 +1616,7 @@ def _reject(conn, c_writer, err):
     """
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
-    c_writer.write(_error_response(err.sqlstate, err.message) + _ready(_status(conn)))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn)))
 
 
 _ABORTED_ERR = DsqlError(
@@ -1669,13 +1741,13 @@ async def _check_drop_column(conn, b_writer, sql):
     return None
 
 
-# At most 5 extended statistics objects per table (AWS DSQL, 2026-08-27). The
-# message is the documented one; the SQLSTATE is not documented, so this uses
-# Postgres' program_limit_exceeded.
+# At most 5 extended statistics objects per table (AWS DSQL, 2026-08-27).
+# Message and SQLSTATE measured on real DSQL (eu-central-1, 2026-10-04).
 _CREATE_STATISTICS_RE = re.compile(
-    r"\s*CREATE\s+STATISTICS\s+(IF\s+NOT\s+EXISTS\s+)?([\w\".]+)?.*"
-    r"\bFROM\s+([\w\".]+)\s*;?\s*$",
-    re.I | re.S,
+    r"\s*CREATE\s+STATISTICS\b.*\bFROM\s+([\w\".]+)\s*;?\s*$", re.I | re.S
+)
+_STATISTICS_LIMIT_ERR = DsqlError(
+    "54000", "more than 5 extended statistics per table are not allowed"
 )
 
 
@@ -1683,32 +1755,38 @@ async def _check_statistics_limit(conn, b_writer, sql):
     m = _CREATE_STATISTICS_RE.match(sql)
     if not m:
         return None
-    if_not_exists, name, table = m.group(1), m.group(2), m.group(3)
-    if name and name.upper() == "ON":
-        name = None  # unnamed form: CREATE STATISTICS ON ... FROM t
     # regclass resolves the name the way the backend will (search_path,
     # quoting); an unknown table fails the probe and the backend answers.
-    count = await _probe_count(
-        conn,
-        b_writer,
-        f"SELECT count(*) FROM pg_statistic_ext WHERE stxrelid = '{table}'::regclass",
+    count_sql = (
+        "SELECT count(*) FROM pg_statistic_ext "
+        f"WHERE stxrelid = '{m.group(1)}'::regclass"
     )
-    if count is None or count < 5:
+    before = await _probe_count(conn, b_writer, count_sql)
+    if before is None or before < 5:
         return None
-    if if_not_exists and name:
-        # An existing name is a NOTICE and a no-op, not a sixth object.
-        bare = name.rpartition(".")[2]
-        bare = bare[1:-1] if bare.startswith('"') else bare.lower()
-        exists = await _probe_count(
-            conn,
-            b_writer,
-            f"SELECT count(*) FROM pg_statistic_ext WHERE stxname = '{bare}'",
+    # At the limit, dry-run the statement and roll it back. DSQL reports the
+    # statement's own errors (fewer than two columns, an unknown column) ahead
+    # of the limit, and IF NOT EXISTS on an existing name is still a no-op;
+    # only a statement that would really add a sixth object is refused.
+    if conn.txn.in_txn:
+        begin = "SAVEPOINT ministack_statistics"
+        undo = (
+            "ROLLBACK TO SAVEPOINT ministack_statistics; "
+            "RELEASE SAVEPOINT ministack_statistics"
         )
-        if exists:
-            return None
-    return DsqlError(
-        "54000", "more than 5 extended statistics per table are not allowed"
-    )
+    else:
+        begin, undo = "BEGIN", "ROLLBACK"
+    after = None
+    await _run_backend_capture(conn, b_writer, begin)
+    try:
+        frames = await _run_backend_capture(conn, b_writer, sql)
+        if not any(t == b"E" for t, _ in frames):
+            after = await _probe_count(conn, b_writer, count_sql)
+    finally:
+        await _run_backend_capture(conn, b_writer, undo)
+    if after is not None and after > before:
+        return _STATISTICS_LIMIT_ERR
+    return None
 
 
 _ASYNC_BATCH_ERR = DsqlError(
@@ -1858,7 +1936,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
         err, forward_sql = _abort_gate(conn, s)
         if err:
             c_writer.write(
-                _error_response(err.sqlstate, err.message) + _ready(_status(conn))
+                _error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn))
             )
             await c_writer.drain()
             return
@@ -2010,7 +2088,7 @@ async def _ext_error(conn, c_writer, err):
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
     conn.ext_skip = True
-    c_writer.write(_error_response(err.sqlstate, err.message))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail))
     await c_writer.drain()
 
 
