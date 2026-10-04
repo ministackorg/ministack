@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ALB — repeated HTTP target response headers** — forwards every `Set-Cookie` as a separate header, preserving cookie attributes and repeated fields even when their names use different casing; previously only the first value survived.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
