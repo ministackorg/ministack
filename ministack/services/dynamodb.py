@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -116,8 +117,15 @@ _lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    tables = AccountRegionScopedDict()
+    for (account_id, region, table_name), table in _tables.all_items():
+        table_state = {
+            key: value for key, value in table.items()
+            if key != "_secondary_indexes"
+        }
+        tables.set_scoped(account_id, region, table_name, copy.deepcopy(table_state))
     return {
-        "tables": copy.deepcopy(_tables),
+        "tables": tables,
         "tags": copy.deepcopy(_tags),
         "ttl_settings": copy.deepcopy(_ttl_settings),
         "pitr_settings": copy.deepcopy(_pitr_settings),
@@ -214,6 +222,9 @@ def _restore_state(data):
             sse = tbl.get("SSEDescription")
             if sse and "Status" not in sse and ("Enabled" in sse or "KMSMasterKeyId" in sse):
                 tbl["SSEDescription"] = _sse_description_from_spec(sse)
+            tbl.pop("_secondary_indexes", None)
+            _update_counts(tbl)
+            _rebuild_secondary_indexes(tbl)
         _tags.update(data.get("tags", {}))
         _restore_table_name_metadata(_ttl_settings, data.get("ttl_settings", {}))
         _restore_table_name_metadata(_pitr_settings, data.get("pitr_settings", {}))
@@ -800,13 +811,10 @@ def _ttl_reaper():
                             ttl_val = _extract_key_val(ttl_attr)
                             try:
                                 if float(ttl_val) <= now:
-                                    del sk_map[sk_val]
+                                    _remove_item(table, pk_val, sk_val)
                                     logger.debug("TTL expired item %s/%s from %s", pk_val, sk_val, table_name)
                             except (ValueError, TypeError):
                                 pass
-                        if not sk_map:
-                            del table["items"][pk_val]
-                    _update_counts(table)
         except Exception as exc:
             logger.error("TTL reaper error: %s", exc)
 
@@ -1222,6 +1230,7 @@ def _create_table(data):
         "pk_name": pk_name,
         "sk_name": sk_name,
         "items": defaultdict(dict),
+        "_secondary_indexes": {},
         "TableStatus": "ACTIVE",
         "CreationDateTime": int(time.time()),
         "ItemCount": 0,
@@ -1258,6 +1267,7 @@ def _create_table(data):
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
+    _rebuild_secondary_indexes(_tables[name])
     logger.info("DynamoDB table created: %s", name)
     return json_response({"TableDescription": _table_description(name)})
 
@@ -1322,13 +1332,15 @@ def _set_replica_group(name, regions):
 def _create_replica(name, table, region):
     """Copy ``table`` into ``region`` as a replica, with its items."""
     account = get_account_id()
-    replica = copy.deepcopy({k: v for k, v in table.items() if k != "items"})
+    replica = copy.deepcopy({k: v for k, v in table.items()
+                             if k not in ("items", "_secondary_indexes")})
     replica["items"] = defaultdict(dict, copy.deepcopy(dict(table["items"])))
     arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
     replica.update({
         "TableArn": arn, "TableId": new_uuid(), "CreationDateTime": int(time.time()),
         "TableStatus": "ACTIVE", "DeletionProtectionEnabled": False,
     })
+    _rebuild_secondary_indexes(replica)
     for index in replica.get("GlobalSecondaryIndexes", []) + replica.get("LocalSecondaryIndexes", []):
         index["IndexArn"] = f"{arn}/index/{index['IndexName']}"
     label = _stream_label()
@@ -1399,12 +1411,9 @@ def _replicate_write(table, event_name, old_item, new_item):
             sk_val = _extract_key_val(item.get(replica["sk_name"])) if replica["sk_name"] else "__no_sort__"
             previous = replica["items"].get(pk_val, {}).get(sk_val)
             if new_item is None:
-                replica["items"].get(pk_val, {}).pop(sk_val, None)
-                if pk_val in replica["items"] and not replica["items"][pk_val]:
-                    del replica["items"][pk_val]
+                _remove_item(replica, pk_val, sk_val)
             else:
-                replica["items"][pk_val][sk_val] = copy.deepcopy(new_item)
-            _update_counts(replica)
+                _set_item(replica, pk_val, sk_val, copy.deepcopy(new_item))
             if new_item is None and previous is None:
                 continue
             replica_event = "REMOVE" if new_item is None else ("MODIFY" if previous else "INSERT")
@@ -1564,6 +1573,8 @@ def _update_table(data):
         ad for ad in table.get("AttributeDefinitions", [])
         if ad["AttributeName"] in referenced
     ]
+    if data.get("GlobalSecondaryIndexUpdates"):
+        _rebuild_secondary_indexes(table)
 
     if data.get("ReplicaUpdates"):
         err = _apply_replica_updates(name, table, data["ReplicaUpdates"])
@@ -1818,8 +1829,7 @@ def _put_item(data):
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -1910,9 +1920,8 @@ def _delete_item(data):
             return _conditional_check_failed(data, old_item)
 
     if old_item is not None:
-        table["items"].get(pk_val, {}).pop(sk_val, None)
+        _remove_item(table, pk_val, sk_val)
         _emit_stream_event(name, "REMOVE", old_item, None)
-    _update_counts(table)
 
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
@@ -2044,8 +2053,7 @@ def _update_item(data):
     if err:
         return err
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -2285,50 +2293,48 @@ def _query(data):
                 return error_response_json("ValidationException",
                     "The provided starting key does not match the range key predicate", 400)
 
-    if is_gsi or index_name:
-        candidates = []
-        for pk_bucket in table["items"].values():
-            for it in pk_bucket.values():
-                if pk_name in it and _extract_key_val(it[pk_name]) == pk_val:
-                    # Sparse index: for composite GSIs/LSIs, items that have the index
-                    # hash key but are missing the index range key are excluded.
-                    if sk_name and sk_name not in it:
-                        continue
-                    candidates.append(it)
+    if index_name:
+        index = table.get("_secondary_indexes", {}).get(index_name)
+        if index is None:
+            _rebuild_secondary_indexes(table)
+            index = table["_secondary_indexes"].get(index_name)
+        if index is None:
+            candidates, has_more = [], False
+        else:
+            def size_fn(item):
+                return _item_size_bytes(
+                    _apply_index_projection(item, table, index_name)
+                )
+
+            try:
+                candidates, has_more = _paginate_evaluated_items(
+                    _iter_secondary_index_candidates(
+                        table, index, pk_val, key_cond, key_conditions, eav, ean,
+                        esk, scan_forward,
+                    ),
+                    limit,
+                    size_fn,
+                )
+            except ValueError as exc:
+                return error_response_json("ValidationException", str(exc), 400)
     else:
         candidates = list(table["items"].get(pk_val, {}).values())
+        if sk_name:
+            sk_type = _get_attr_type(table, sk_name)
+            candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
 
-    if is_gsi or index_name:
-        # GSI/LSI: order by (INDEX_SORT, BASE_PK, BASE_SK). The base-table keys
-        # tiebreak rows with equal INDEX_SORT (or hash-only GSIs), matching
-        # real DynamoDB's hidden ordering and making pagination cursors stable.
-        sort_keys = _index_order_keys(table, sk_name)
-        candidates.sort(
-            key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys),
-            reverse=not scan_forward,
-        )
-    elif sk_name:
-        sk_type = _get_attr_type(table, sk_name)
-        candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
+        if key_conditions:
+            candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
+        elif key_cond:
+            try:
+                candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean, slot="KeyConditionExpression")]
+            except ValueError as exc:
+                return error_response_json("ValidationException", str(exc), 400)
 
-    if key_conditions:
-        candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
-    elif key_cond:
-        try:
-            candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean, slot="KeyConditionExpression")]
-        except ValueError as exc:
-            return error_response_json("ValidationException", str(exc), 400)
+        if esk:
+            candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
 
-    if esk:
-        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
-
-    # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
-    # limit — including when the results end exactly at the limit, since it
-    # doesn't look ahead. The follow-up page then returns 0 items and no key.
-    has_more = False
-    if limit is not None and len(candidates) >= limit:
-        has_more = len(candidates) > 0
-        candidates = candidates[:limit]
+        candidates, has_more = _paginate_evaluated_items(candidates, limit)
 
     scanned_count = len(candidates)
     query_filter = data.get("QueryFilter")
@@ -2546,12 +2552,14 @@ def _scan(data):
         else:
             all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
-    # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
-    # still yields a key, because AWS doesn't look ahead.
-    has_more = False
-    if limit is not None and len(all_items) >= limit:
-        has_more = len(all_items) > 0
-        all_items = all_items[:limit]
+    size_fn = None
+    if index_name:
+        def size_fn(item):
+            return _item_size_bytes(
+                _apply_index_projection(item, table, index_name)
+            )
+
+    all_items, has_more = _paginate_evaluated_items(all_items, limit, size_fn)
 
     scanned_count = len(all_items)
 
@@ -2826,8 +2834,7 @@ def _partiql_insert(table, parsed):
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
         return error_response_json("DuplicateItemException",
                                    "Duplicate primary key exists in table", 400)
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
     return json_response({})
 
 
@@ -3127,9 +3134,8 @@ def _partiql_update(table, parsed):
         _partiql_remove_path(work, parts)
         applied_paths.append(parts)
     # Nothing failed — commit the working copy.
-    item.clear()
-    item.update(work)
-    item_after = item
+    _set_item(table, pk_key, sk_key, work)
+    item_after = work
 
     if returning:
         r = returning.upper().strip()
@@ -3175,10 +3181,7 @@ def _partiql_delete(table, parsed):
         return _conditional_check_failed({}, item)
 
     item_before = copy.deepcopy(item) if returning else None
-    del table["items"][pk_key][sk_key]
-    if not table["items"][pk_key]:
-        del table["items"][pk_key]
-    _update_counts(table)
+    _remove_item(table, pk_key, sk_key)
 
     if returning and returning.upper().strip() == "ALL OLD *":
         return json_response({"Items": [item_before] if item_before else []})
@@ -3402,6 +3405,8 @@ def _execute_transaction(data):
             tbl = _tables.get(tname)
             if tbl is not None:
                 tbl["items"] = defaultdict(dict, items)
+                _update_counts(tbl)
+                _rebuild_secondary_indexes(tbl)
         idx, code, msg = failure
         reasons = [{"Code": "None"} for _ in statements]
         reasons[idx] = {"Code": code.split("#")[-1], "Message": msg}
@@ -4040,7 +4045,7 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"][pk_val][sk_val] = item
+                _set_item(table, pk_val, sk_val, item)
                 _emit_stream_event(_normalize_table_name(table_name), "MODIFY" if old_item else "INSERT", old_item, item)
                 _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
@@ -4049,11 +4054,10 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"].get(pk_val, {}).pop(sk_val, None)
+                _remove_item(table, pk_val, sk_val)
                 if old_item:
                     _emit_stream_event(_normalize_table_name(table_name), "REMOVE", old_item, None)
                 _accumulate_write_capacity(cap, table, old_item, None)
-        _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
@@ -4329,7 +4333,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(item.get(tbl["pk_name"]))
             sk_val = _extract_key_val(item.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
         elif op_type == "Delete":
@@ -4337,7 +4341,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(key.get(tbl["pk_name"]))
             sk_val = _extract_key_val(key.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"].get(pk_val, {}).pop(sk_val, None)
+            _remove_item(tbl, pk_val, sk_val)
             if old_item:
                 _emit_stream_event(table_name, "REMOVE", old_item, None)
             _txn_write_effects.setdefault(table_name, []).append((old_item, None))
@@ -4350,11 +4354,9 @@ def _transact_write_items(data):
             ue = op.get("UpdateExpression", "")
             if ue:
                 item, _ = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
-        _update_counts(tbl)
-
     # ConsumedCapacity: a transactional write costs 2 x ceil(size/1KB) WCU per
     # item on the table (measured against real DynamoDB, eu-west-2, by
     # paritysuite); index replication is asynchronous, so index arms carry the
@@ -5854,6 +5856,7 @@ def _restore_table_from_backup(data):
     snap = desc.get("_items_snapshot") or {}
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(snap))
     _update_counts(_tables[target])
+    _rebuild_secondary_indexes(_tables[target])
     # AWS attaches a RestoreSummary to the response — clients (Terraform, the
     # AWS SDK) read SourceBackupArn / RestoreInProgress to track the restore.
     _tables[target]["RestoreSummary"] = {
@@ -5893,6 +5896,7 @@ def _restore_table_to_point_in_time(data):
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(dict(src.get("items", {}))))
     _update_counts(_tables[target])
+    _rebuild_secondary_indexes(_tables[target])
     return json_response({"TableDescription": _table_description(target)})
 
 
@@ -7148,6 +7152,32 @@ def _key_condition_av(condition, key_conditions, eav, attr_names, key_name):
 # Pagination helpers
 # ---------------------------------------------------------------------------
 
+_DDB_PAGE_SIZE_BYTES = 1_048_576
+
+
+def _paginate_evaluated_items(items, limit, size_fn=None):
+    """Apply DynamoDB's item-count and 1 MiB evaluated-data page limits."""
+    page = []
+    page_bytes = 0
+    has_more = False
+    item_limit = int(limit) if limit is not None else None
+    get_item_size = size_fn or _item_size_bytes
+
+    for item in items:
+        item_bytes = get_item_size(item)
+        if page and page_bytes + item_bytes > _DDB_PAGE_SIZE_BYTES:
+            has_more = True
+            break
+        page.append(item)
+        page_bytes += item_bytes
+        if ((item_limit is not None and len(page) >= item_limit)
+                or page_bytes >= _DDB_PAGE_SIZE_BYTES):
+            has_more = True
+            break
+
+    return page, has_more
+
+
 def _index_order_value(item, name, type_hint):
     """Single position in the GSI/LSI ordering tuple. Hash-only items, sparse
     GSIs, or items missing a key get a stable filler so tuples remain
@@ -7171,6 +7201,281 @@ def _index_order_keys(table, sk_name):
             seen.add(n)
             keys.append((n, _get_attr_type(table, n)))
     return keys
+
+
+class _SecondaryIndexNode:
+    __slots__ = ("key", "base_pk", "base_sk", "priority", "left", "right")
+
+    def __init__(self, key, base_pk, base_sk):
+        self.key = key
+        self.base_pk = base_pk
+        self.base_sk = base_sk
+        self.priority = random.getrandbits(64)
+        self.left = None
+        self.right = None
+
+
+def _rotate_secondary_index_right(root):
+    pivot = root.left
+    root.left = pivot.right
+    pivot.right = root
+    return pivot
+
+
+def _rotate_secondary_index_left(root):
+    pivot = root.right
+    root.right = pivot.left
+    pivot.left = root
+    return pivot
+
+
+def _insert_secondary_index_node(root, node):
+    if root is None:
+        return node
+    if node.key < root.key:
+        root.left = _insert_secondary_index_node(root.left, node)
+        if root.left.priority < root.priority:
+            root = _rotate_secondary_index_right(root)
+    elif node.key > root.key:
+        root.right = _insert_secondary_index_node(root.right, node)
+        if root.right.priority < root.priority:
+            root = _rotate_secondary_index_left(root)
+    return root
+
+
+def _merge_secondary_index_nodes(left, right):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    if left.priority < right.priority:
+        left.right = _merge_secondary_index_nodes(left.right, right)
+        return left
+    right.left = _merge_secondary_index_nodes(left, right.left)
+    return right
+
+
+def _remove_secondary_index_node(root, key):
+    if root is None:
+        return None
+    if key < root.key:
+        root.left = _remove_secondary_index_node(root.left, key)
+    elif key > root.key:
+        root.right = _remove_secondary_index_node(root.right, key)
+    else:
+        return _merge_secondary_index_nodes(root.left, root.right)
+    return root
+
+
+def _iter_secondary_index_nodes(root, scan_forward, cursor=None,
+                                 start_sort_value=None, start_inclusive=True):
+    stack = []
+    node = root
+    while node is not None:
+        if cursor is not None:
+            eligible = node.key > cursor if scan_forward else node.key < cursor
+        elif start_sort_value is not None:
+            sort_value = node.key[0]
+            if scan_forward:
+                eligible = (sort_value > start_sort_value
+                            or (start_inclusive and sort_value == start_sort_value))
+            else:
+                eligible = (sort_value < start_sort_value
+                            or (start_inclusive and sort_value == start_sort_value))
+        else:
+            eligible = True
+        if eligible:
+            stack.append(node)
+            node = node.left if scan_forward else node.right
+        else:
+            node = node.right if scan_forward else node.left
+
+    while stack:
+        node = stack.pop()
+        yield node
+        node = node.right if scan_forward else node.left
+        while node is not None:
+            stack.append(node)
+            node = node.left if scan_forward else node.right
+
+
+def _parse_index_sort_condition(table, index, key_condition,
+                                key_conditions, expression_values,
+                                expression_names):
+    sort_key = index["sort_key"]
+    if not sort_key:
+        return None
+    operator = None
+    values = []
+    if key_conditions:
+        condition = key_conditions.get(sort_key) or {}
+        operator = condition.get("ComparisonOperator")
+        values = condition.get("AttributeValueList") or []
+    else:
+        references = [sort_key] + [
+            alias for alias, name in expression_names.items() if name == sort_key
+        ]
+        for reference in references:
+            escaped = re.escape(reference)
+            pattern = rf"(?<![\w#]){escaped}\s+BETWEEN\s+(:\w+)\s+AND\s+(:\w+)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = "BETWEEN"
+                values = [expression_values.get(match.group(1)),
+                          expression_values.get(match.group(2))]
+                break
+            pattern = rf"\bbegins_with\s*\(\s*{escaped}\s*,\s*(:\w+)\s*\)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = "BEGINS_WITH"
+                values = [expression_values.get(match.group(1))]
+                break
+            pattern = rf"(?<![\w#]){escaped}\s*(<=|>=|=|<|>)\s*(:\w+)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = {"=": "EQ", "<": "LT", "<=": "LE",
+                            ">": "GT", ">=": "GE"}[match.group(1)]
+                values = [expression_values.get(match.group(2))]
+                break
+            pattern = rf"(:\w+)\s*(<=|>=|=|<|>)\s*{escaped}(?![\w#])"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                reverse_operator = {"=": "EQ", "<": "GT", "<=": "GE",
+                                    ">": "LT", ">=": "LE"}
+                operator = reverse_operator[match.group(2)]
+                values = [expression_values.get(match.group(1))]
+                break
+    operator = (operator or "").upper()
+    if operator not in {"EQ", "LT", "LE", "GT", "GE", "BETWEEN", "BEGINS_WITH"}:
+        return None
+    if not values or any(value is None for value in values):
+        return None
+    type_hint = _get_attr_type(table, sort_key)
+    return operator, tuple(_sort_key_value(value, type_hint) for value in values)
+
+
+def _prefix_successor(prefix):
+    if isinstance(prefix, bytes):
+        value = bytearray(prefix)
+        for index in range(len(value) - 1, -1, -1):
+            if value[index] < 255:
+                return bytes(value[:index] + bytes([value[index] + 1]))
+        return None
+    if isinstance(prefix, str):
+        for index in range(len(prefix) - 1, -1, -1):
+            codepoint = ord(prefix[index])
+            if codepoint < 0x10FFFF:
+                return prefix[:index] + chr(codepoint + 1)
+    return None
+
+
+def _index_sort_bounds(condition):
+    if condition is None:
+        return {}
+    operator, values = condition
+    if operator == "EQ":
+        return {"lower": (values[0], True), "upper": (values[0], True)}
+    if operator == "GT":
+        return {"lower": (values[0], False)}
+    if operator == "GE":
+        return {"lower": (values[0], True)}
+    if operator == "LT":
+        return {"upper": (values[0], False)}
+    if operator == "LE":
+        return {"upper": (values[0], True)}
+    if operator == "BETWEEN":
+        return {"lower": (values[0], True), "upper": (values[1], True)}
+    if operator == "BEGINS_WITH":
+        successor = _prefix_successor(values[0])
+        bounds = {"lower": (values[0], True), "prefix": values[0]}
+        if successor is not None:
+            bounds["upper"] = (successor, False)
+        return bounds
+    return {}
+
+
+def _index_sort_value_in_bounds(value, bounds):
+    lower = bounds.get("lower")
+    if lower and (value < lower[0] or (value == lower[0] and not lower[1])):
+        return False
+    upper = bounds.get("upper")
+    if upper and (value > upper[0] or (value == upper[0] and not upper[1])):
+        return False
+    prefix = bounds.get("prefix")
+    if prefix is not None and (not isinstance(value, type(prefix)) or not value.startswith(prefix)):
+        return False
+    return True
+
+
+def _index_sort_range_ended(value, bounds, scan_forward):
+    if scan_forward:
+        upper = bounds.get("upper")
+        if upper and (value > upper[0] or (value == upper[0] and not upper[1])):
+            return True
+        prefix = bounds.get("prefix")
+        if prefix is not None:
+            successor = bounds.get("upper")
+            return successor is not None and value >= successor[0]
+    else:
+        lower = bounds.get("lower")
+        if lower and (value < lower[0] or (value == lower[0] and not lower[1])):
+            return True
+        prefix = bounds.get("prefix")
+        if prefix is not None:
+            return value < prefix
+    return False
+
+
+def _iter_secondary_index_candidates(table, index, partition_value,
+                                     key_condition, key_conditions,
+                                     expression_values, expression_names,
+                                     exclusive_start_key, scan_forward):
+    root = index["roots"].get(partition_value)
+    if root is None:
+        return
+    condition = _parse_index_sort_condition(
+        table, index, key_condition, key_conditions,
+        expression_values, expression_names,
+    )
+    bounds = _index_sort_bounds(condition)
+    cursor = None
+    start_sort_value = None
+    start_inclusive = True
+    if exclusive_start_key:
+        cursor = tuple(
+            _index_order_value(exclusive_start_key, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+    elif "prefix" in bounds:
+        if scan_forward:
+            start_sort_value = bounds["prefix"]
+        elif "upper" in bounds:
+            start_sort_value = bounds["upper"][0]
+            start_inclusive = False
+    elif scan_forward and "lower" in bounds:
+        start_sort_value, start_inclusive = bounds["lower"]
+    elif not scan_forward and "upper" in bounds:
+        start_sort_value, start_inclusive = bounds["upper"]
+
+    for node in _iter_secondary_index_nodes(
+            root, scan_forward, cursor, start_sort_value, start_inclusive):
+        if index["sort_key"]:
+            sort_value = node.key[0]
+            if _index_sort_range_ended(sort_value, bounds, scan_forward):
+                break
+            if not _index_sort_value_in_bounds(sort_value, bounds):
+                continue
+        item = table["items"].get(node.base_pk, {}).get(node.base_sk)
+        if item is None:
+            continue
+        if key_conditions:
+            if not _evaluate_key_conditions_item(item, key_conditions, index["hash_key"]):
+                continue
+        elif key_condition and not _evaluate_condition(
+                key_condition, item, expression_values, expression_names,
+                slot="KeyConditionExpression"):
+            continue
+        yield item
 
 
 def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=True, table=None):
@@ -7507,6 +7812,96 @@ def _update_counts(table):
     count = sum(len(v) for v in table["items"].values())
     table["ItemCount"] = count
     table["TableSizeBytes"] = count * 200
+
+
+def _index_key_names(index):
+    hash_key = sort_key = None
+    for key in index.get("KeySchema", []):
+        if key.get("KeyType") == "HASH":
+            hash_key = key.get("AttributeName")
+        elif key.get("KeyType") == "RANGE":
+            sort_key = key.get("AttributeName")
+    return hash_key, sort_key
+
+
+def _rebuild_secondary_indexes(table):
+    indexes = {}
+    for definition in (table.get("GlobalSecondaryIndexes", [])
+                       + table.get("LocalSecondaryIndexes", [])):
+        hash_key, sort_key = _index_key_names(definition)
+        indexes[definition["IndexName"]] = {
+            "hash_key": hash_key,
+            "sort_key": sort_key,
+            "order_keys": _index_order_keys(table, sort_key),
+            "roots": {},
+        }
+    table["_secondary_indexes"] = indexes
+    for base_pk, base_items in table["items"].items():
+        for base_sk, item in base_items.items():
+            _add_item_to_secondary_indexes(table, base_pk, base_sk, item)
+
+
+def _add_item_to_secondary_indexes(table, base_pk, base_sk, item):
+    for index in table.get("_secondary_indexes", {}).values():
+        hash_key = index["hash_key"]
+        sort_key = index["sort_key"]
+        if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+            continue
+        hash_value = _extract_key_val(item[hash_key])
+        key = tuple(
+            _index_order_value(item, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+        root = index["roots"].get(hash_value)
+        index["roots"][hash_value] = _insert_secondary_index_node(
+            root, _SecondaryIndexNode(key, base_pk, base_sk)
+        )
+
+
+def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item):
+    for index in table.get("_secondary_indexes", {}).values():
+        hash_key = index["hash_key"]
+        sort_key = index["sort_key"]
+        if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+            continue
+        hash_value = _extract_key_val(item[hash_key])
+        root = index["roots"].get(hash_value)
+        if root is None:
+            continue
+        key = tuple(
+            _index_order_value(item, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+        root = _remove_secondary_index_node(root, key)
+        if root is None:
+            del index["roots"][hash_value]
+        else:
+            index["roots"][hash_value] = root
+
+
+def _set_item(table, pk_val, sk_val, item):
+    old_item = table["items"].get(pk_val, {}).get(sk_val)
+    if old_item is not None:
+        _remove_item_from_secondary_indexes(table, pk_val, sk_val, old_item)
+    else:
+        table["ItemCount"] = table.get("ItemCount", 0) + 1
+    table["items"][pk_val][sk_val] = item
+    _add_item_to_secondary_indexes(table, pk_val, sk_val, item)
+    table["TableSizeBytes"] = table["ItemCount"] * 200
+    return old_item
+
+
+def _remove_item(table, pk_val, sk_val):
+    old_item = table["items"].get(pk_val, {}).get(sk_val)
+    if old_item is None:
+        return None
+    _remove_item_from_secondary_indexes(table, pk_val, sk_val, old_item)
+    del table["items"][pk_val][sk_val]
+    if not table["items"][pk_val]:
+        del table["items"][pk_val]
+    table["ItemCount"] = max(0, table.get("ItemCount", 0) - 1)
+    table["TableSizeBytes"] = table["ItemCount"] * 200
+    return old_item
 
 
 def _check_legacy_comparison(item_val, op, attr_vals):

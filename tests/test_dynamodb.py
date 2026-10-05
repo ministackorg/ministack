@@ -1490,6 +1490,133 @@ def test_dynamodb_gsi_query(ddb):
     for item in resp["Items"]:
         assert item["gsi_pk"]["S"] == "shared_gsi"
 
+def test_dynamodb_gsi_membership_tracks_item_mutations(ddb):
+    table = f"qa-ddb-gsi-maintenance-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi_index",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    def index_count(value):
+        return ddb.query(
+            TableName=table,
+            IndexName="gsi_index",
+            KeyConditionExpression="gsi_pk = :value",
+            ExpressionAttributeValues={":value": {"S": value}},
+        )["Count"]
+
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "row-1"}, "gsi_pk": {"S": "first"}},
+    )
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "row-1"}, "gsi_pk": {"S": "second"}},
+    )
+    assert index_count("first") == 0
+    assert index_count("second") == 1
+
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "row-1"}},
+        UpdateExpression="SET gsi_pk = :next",
+        ExpressionAttributeValues={":next": {"S": "third"}},
+    )
+    assert index_count("second") == 0
+    assert index_count("third") == 1
+
+    ddb.batch_write_item(RequestItems={table: [{
+        "PutRequest": {"Item": {"pk": {"S": "row-2"}, "gsi_pk": {"S": "batch"}}},
+    }]})
+    assert index_count("batch") == 1
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 2
+
+    ddb.transact_write_items(TransactItems=[{
+        "Update": {
+            "TableName": table,
+            "Key": {"pk": {"S": "row-1"}},
+            "UpdateExpression": "SET gsi_pk = :next",
+            "ExpressionAttributeValues": {":next": {"S": "transaction"}},
+        },
+    }])
+    assert index_count("third") == 0
+    assert index_count("transaction") == 1
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 2
+
+    ddb.batch_write_item(RequestItems={table: [{
+        "DeleteRequest": {"Key": {"pk": {"S": "row-2"}}},
+    }]})
+    ddb.delete_item(TableName=table, Key={"pk": {"S": "row-1"}})
+    assert index_count("batch") == 0
+    assert index_count("transaction") == 0
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 0
+
+def test_dynamodb_keys_only_gsi_query_ranges_and_paginates_by_index_size(ddb):
+    table = f"qa-ddb-gsi-byte-page-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_sk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi_index",
+            "KeySchema": [
+                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
+                {"AttributeName": "gsi_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(8):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": f"row-{index}"},
+                "gsi_pk": {"S": "shared"},
+                "gsi_sk": {"S": f"{index:02d}"},
+                "payload": {"S": "x" * 150_000},
+            },
+        )
+
+    query = {
+        "TableName": table,
+        "IndexName": "gsi_index",
+        "KeyConditionExpression": "gsi_pk = :pk AND gsi_sk BETWEEN :lo AND :hi",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "shared"},
+            ":lo": {"S": "00"},
+            ":hi": {"S": "07"},
+        },
+    }
+    full_page = ddb.query(**query)
+    assert full_page["Count"] == 8
+    assert "LastEvaluatedKey" not in full_page
+    assert all("payload" not in item for item in full_page["Items"])
+
+    page = ddb.query(**query, Limit=3)
+    paged_sort_keys = []
+    while True:
+        paged_sort_keys.extend(item["gsi_sk"]["S"] for item in page["Items"])
+        last_key = page.get("LastEvaluatedKey")
+        if last_key is None:
+            break
+        page = ddb.query(**query, Limit=3, ExclusiveStartKey=last_key)
+    assert paged_sort_keys == [f"{index:02d}" for index in range(8)]
+
 def test_dynamodb_ttl(ddb):
     import uuid as _uuid
 
@@ -1970,6 +2097,46 @@ def test_dynamodb_scan_with_limit_and_pagination(ddb):
         if not lek:
             break
     assert len(all_items) == 10
+
+def test_dynamodb_query_and_scan_paginate_at_one_megabyte(ddb):
+    table = f"qa-ddb-byte-page-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(3):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": "shared"},
+                "sk": {"S": f"item-{index}"},
+                "payload": {"S": "x" * 400_000},
+            },
+        )
+
+    query = {
+        "TableName": table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "shared"}},
+    }
+    for operation, request in ((ddb.query, query), (ddb.scan, {"TableName": table})):
+        first_page = operation(**request)
+        assert 0 < first_page["Count"] < 3
+        assert "LastEvaluatedKey" in first_page
+
+        second_page = operation(
+            **request, ExclusiveStartKey=first_page["LastEvaluatedKey"]
+        )
+        assert first_page["Count"] + second_page["Count"] == 3
+        assert "LastEvaluatedKey" not in second_page
 
 def test_dynamodb_transact_write_condition_cancel(ddb):
     """TransactWriteItems cancels entire transaction if one condition fails."""
