@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — just-in-time registration under a CA in `SNI_ONLY` mode** — a device certificate signed by a CA registered with `certificateMode` `SNI_ONLY` and auto-registration enabled was refused on its first mTLS connect, so only `DEFAULT` CAs auto-registered. Such a CA now registers the certificate `PENDING_ACTIVATION` and publishes the registered event when the device's TLS ClientHello names the account's endpoint (its DescribeEndpoint prefix in any region) or a host the gateway serves (`localhost`, a compose service name, `MINISTACK_HOST`), and does nothing without a server name. Under a `DEFAULT` CA, a server name with another account's endpoint prefix or a name the gateway does not serve (`mqtt.example.com`) no longer auto-registers, as on AWS. Contributed by @iot-rocket.
+
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 

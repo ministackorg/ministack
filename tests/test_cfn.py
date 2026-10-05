@@ -1358,6 +1358,46 @@ def test_cfn_iot_ca_certificate_registration_config_and_mode_immutability(cfn, i
     _wait_stack(cfn, "cfn-iot-ca-regcfg")
 
 
+def test_cfn_iot_sni_only_ca_certificate_auto_registers_with_sni():
+    """A CACertificate declared with CertificateMode SNI_ONLY and
+    AutoRegistrationStatus ENABLE (how a CDK app declares a JITR CA without a
+    verification certificate) is stored as RegisterCACertificate stores it, and
+    just-in-time registration under it runs for a device that sent a server
+    name (SNI) and not for one that did not. In-process, so no MQTT listener is needed."""
+    pytest.importorskip("cryptography")
+    import asyncio
+    import ssl
+
+    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+    from ministack.services import iot as iot_module
+
+    ca_pem, ca_key = generate_ca(common_name="cfn-jitr-sni-ca")
+    leaf_pem = sign_leaf_certificate(ca_pem, ca_key, common_name="cfn-jitr-sni-device")[0]
+    cert_id = get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    handler = _RESOURCE_HANDLERS["AWS::IoT::CACertificate"]
+    props = {"CACertificatePem": ca_pem, "Status": "ACTIVE",
+             "AutoRegistrationStatus": "ENABLE", "CertificateMode": "SNI_ONLY"}
+    ca_id, _attrs = handler["create"]("CA", props, "cfn-jitr-sni")
+
+    async def _connects():
+        return (await iot_module._mtls_auto_register(der, peer),
+                await iot_module._mtls_auto_register(der, peer, "localhost"))
+
+    try:
+        ca = iot_module._ca_certificates[ca_id]
+        assert (ca["status"], ca["autoRegistrationStatus"], ca["certificateMode"]) == (
+            "ACTIVE", "ENABLE", "SNI_ONLY")
+        assert asyncio.run(_connects()) == (False, True)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+    finally:
+        iot_module._certificates.pop(cert_id, None)
+        handler["delete"](ca_id, props)
+
+
 def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
     """CACertificatePem is the physical identity — the certificate id derives
     from it — so an update that changes the PEM fails loudly and rolls back

@@ -68,6 +68,7 @@ import ssl
 import struct
 import time
 import uuid
+import weakref
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
@@ -83,6 +84,7 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.router import _host_served_by_stack
 from ministack.core.x509_utils import (
     certificate_is_signed_by,
     generate_ca,
@@ -642,6 +644,11 @@ _RETIRED_ENDPOINT_TYPES = {
 }
 
 
+def _endpoint_prefix(account_id: str) -> str:
+    """The account's endpoint host prefix: the first 14 hex chars of SHA-256(account_id)."""
+    return hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
+
+
 def _describe_endpoint(qp: dict) -> tuple:
     """Return a per-account endpoint hostname.
 
@@ -652,7 +659,7 @@ def _describe_endpoint(qp: dict) -> tuple:
     """
     endpoint_type = qp.get("endpointType", "iot:Data-ATS")
     account_id = get_account_id()
-    prefix = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
+    prefix = _endpoint_prefix(account_id)
     region = get_region()
 
     if endpoint_type in _RETIRED_ENDPOINT_TYPES:
@@ -7843,6 +7850,9 @@ _mtls_sessions: set[asyncio.StreamWriter] = set()
 # Digests of the trust anchors already loaded into the live TLS context;
 # emptied whenever a context is built, since a fresh one starts with none.
 _mtls_loaded_anchors: set[str] = set()
+# The server name (SNI) each handshake's ClientHello carried, by its TLS
+# object; just-in-time registration depends on it (see _mtls_server_name_reaches).
+_mtls_server_names: weakref.WeakKeyDictionary[ssl.SSLObject, str] = weakref.WeakKeyDictionary()
 
 import importlib.util as _importlib_util
 
@@ -8009,10 +8019,14 @@ def _mtls_on_client_hello(
     restart, and ``sni_callback`` is the only hook that runs late enough to see
     the current registry yet early enough to matter. It runs on every
     handshake, including those carrying no server name — which is what a
-    device dialling the broker by IP sends. An exception here aborts the
-    handshake with an internal-error alert, so nothing is allowed to escape.
+    device dialling the broker by IP sends. It is also the only place the
+    server side sees that name, so it records whether one was sent. An
+    exception here aborts the handshake with an internal-error alert, so
+    nothing is allowed to escape.
     """
     try:
+        if server_name:
+            _mtls_server_names[ssl_object] = server_name
         _mtls_refresh_trust_anchors(ctx)
     except Exception:
         _mtls_logger.warning("IoT mTLS: trust-anchor refresh failed", exc_info=True)
@@ -8225,30 +8239,69 @@ def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
     return None
 
 
-def _mtls_auto_registering_ca(account_id: str, region: str, ca_id: str | None) -> dict | None:
-    """The CA record when it would auto-register a device certificate now."""
+def _mtls_server_name_reaches(server_name: str, account_id: str) -> bool:
+    """Whether a device that sent ``server_name`` as its SNI dialled ``account_id``'s endpoint.
+
+    On AWS the endpoint prefix names the account: ``<prefix>-ats.iot.<region>...``
+    reaches it whichever region the name carries, while another account's
+    prefix, or any name that is not an IoT endpoint (``example.com``,
+    ``ministack``), auto-registers nothing, whatever the CA mode. Here a name
+    of a shape DescribeEndpoint hands out (``<prefix>-ats.iot.`` or
+    ``<prefix>.credentials.iot.``, under any suffix) counts only with this
+    account's prefix, and any other name counts when the gateway serves it
+    (``_host_served_by_stack``: ``localhost``, a compose service name,
+    ``MINISTACK_HOST``, any two-label alias, so ``example.com`` too), since
+    those are the names devices dial an emulator by.
+    """
+    name = server_name.lower().rstrip(".")
+    first, _, rest = name.partition(".")
+    if first.endswith("-ats") and rest.startswith("iot."):
+        prefix = first[: -len("-ats")]
+    elif rest.startswith("credentials.iot."):
+        prefix = first
+    else:
+        prefix = None
+    if prefix is not None and prefix != _endpoint_prefix(account_id):
+        return False
+    return _host_served_by_stack(name)
+
+
+def _mtls_auto_registering_ca(
+    account_id: str, region: str, ca_id: str | None, server_name: str | None = None
+) -> dict | None:
+    """The CA record when it would auto-register a device certificate now.
+
+    Without a server name (SNI) only a CA in DEFAULT mode does. With one, a
+    CA in either mode does when the name reaches the CA's account.
+    """
     ca = _ca_certificates.get_scoped(account_id, region, ca_id) if ca_id else None
     if (
         isinstance(ca, dict)
         and ca.get("status") == "ACTIVE"
         and ca.get("autoRegistrationStatus") == "ENABLE"
-        and ca.get("certificateMode", "DEFAULT") == "DEFAULT"
+        and (
+            ca.get("certificateMode", "DEFAULT") == "DEFAULT"
+            if server_name is None
+            else _mtls_server_name_reaches(server_name, account_id)
+        )
     ):
         return ca
     return None
 
 
-def _mtls_auto_registering_signers(cert_pem: str) -> list[tuple[str, str, str]]:
+def _mtls_auto_registering_signers(
+    cert_pem: str, server_name: str | None = None
+) -> list[tuple[str, str, str]]:
     """Every (account_id, region, ca_id) of an auto-registering CA that signed ``cert_pem``."""
     return [
         (account_id, region, ca_id)
         for (account_id, region, ca_id), ca in list(_ca_certificates._data.items())
-        if _mtls_auto_registering_ca(account_id, region, ca_id) is not None
+        if _mtls_auto_registering_ca(account_id, region, ca_id, server_name) is not None
         and certificate_is_signed_by(cert_pem, ca.get("certificatePem") or "")
     ]
 
 
-async def _mtls_auto_register(der: bytes, peername) -> bool:
+async def _mtls_auto_register(der: bytes, peername, server_name: str | None = None) -> bool:
     """Just-in-time registration for a presented certificate that no scope
     holds ACTIVE. True when it applied, and the caller closes without a
     CONNACK; False leaves the refusal to ``_mtls_refuse``.
@@ -8257,7 +8310,8 @@ async def _mtls_auto_register(der: bytes, peername) -> bool:
     auto-registering CA that signed it. A certificate already
     PENDING_ACTIVATION under such a CA only publishes the event again. AWS
     does both on every such connect, and nothing for an INACTIVE certificate
-    or a CA with auto-registration disabled.
+    or a CA with auto-registration disabled. Which CAs qualify depends on
+    the server name the device sent, if any (``_mtls_auto_registering_ca``).
     """
     cert_id = hashlib.sha256(der).hexdigest()
     held = _mtls_active_registrations(cert_id, status=None)
@@ -8267,14 +8321,14 @@ async def _mtls_auto_register(der: bytes, peername) -> bool:
         account_id, region, record = held[0]
         if record.get("status") != "PENDING_ACTIVATION":
             return False
-        if _mtls_auto_registering_ca(account_id, region, record.get("caCertificateId")) is None:
+        if _mtls_auto_registering_ca(account_id, region, record.get("caCertificateId"), server_name) is None:
             return False
         registration_timestamp = str(int(record["creationDate"] * 1000))
     else:
         cert_pem = ssl.DER_cert_to_PEM_cert(der)
         # One signature check per auto-registering CA, off the broker's loop:
         # a device retrying with a refused certificate must not stall it.
-        signers = await asyncio.to_thread(_mtls_auto_registering_signers, cert_pem)
+        signers = await asyncio.to_thread(_mtls_auto_registering_signers, cert_pem, server_name)
         # The same CA registered in several scopes cannot be attributed, for
         # the same reason an ambiguous ACTIVE certificate is refused.
         if len(signers) != 1:
@@ -8401,7 +8455,7 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
             packet = await _mtls_first_packet(reader)
             protocol_level = _connect_protocol_level(packet) if packet else None
             if protocol_level is not None and await _mtls_auto_register(
-                der, writer.get_extra_info("peername")
+                der, writer.get_extra_info("peername"), _mtls_server_names.get(ssl_object)
             ):
                 return
             await _mtls_refuse(writer, hashlib.sha256(der).hexdigest(), protocol_level)

@@ -5514,13 +5514,18 @@ def _jitr_registration_code(iot_module) -> str:
 async def _jitr_scope_with_ca(
     iot_module, ca_pem: str, verification_pem: str, received: list, allow_auto=True
 ) -> str:
-    """Pin the JITR test scope, register ``ca_pem`` ACTIVE and collect every
-    registered event into ``received``. Returns the CA id."""
+    """Pin the JITR test scope, register ``ca_pem`` ACTIVE (in SNI_ONLY mode
+    when ``verification_pem`` is None) and collect every registered event into
+    ``received``. Returns the CA id."""
     _jitr_registration_code(iot_module)
     qp = {"setAsActive": "true"}
     if allow_auto:
         qp["allowAutoRegistration"] = "true"
-    body = {"caCertificate": ca_pem, "verificationCertificate": verification_pem}
+    body = {"caCertificate": ca_pem}
+    if verification_pem is None:
+        body["certificateMode"] = "SNI_ONLY"
+    else:
+        body["verificationCertificate"] = verification_pem
     status, _, body = await iot_module.handle_request(
         "POST", "/cacertificate", {}, json.dumps(body).encode(), qp
     )
@@ -5645,6 +5650,110 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
         "sourceIp": "192.0.2.10",
     }
     assert second["certificateRegistrationTimestamp"] == str(int(record["creationDate"] * 1000))
+
+
+def test_iot_jitr_under_an_sni_only_ca_needs_sni():
+    """A CA in SNI_ONLY mode auto-registers only on a connect whose ClientHello
+    named the account's endpoint, as on AWS: the account's endpoint prefix
+    counts in any region (and so do the names the gateway serves), while no
+    server name, an unrelated one or another account's prefix creates
+    nothing. A certificate already PENDING_ACTIVATION gets a repeat event only
+    with SNI. A DEFAULT CA auto-registers nothing for an unrelated name
+    either, but still does for a compose service name."""
+    import ssl
+
+    from ministack.services import iot as iot_module
+
+    code = _jitr_registration_code(iot_module)
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf(code)
+    def_ca_pem, def_verification_pem, def_leaf_pem = _generate_ca_and_leaf(code)
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    prefix = iot_module._endpoint_prefix(_JITR_ACCOUNT)
+    other_prefix = iot_module._endpoint_prefix("111111111111")
+    received: list = []
+
+    async def _run():
+        ca_id = await _jitr_scope_with_ca(iot_module, ca_pem, None, received)
+        await _jitr_scope_with_ca(iot_module, def_ca_pem, def_verification_pem, [])
+        for server_name in (
+            None,
+            "mqtt.example.com",
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.amazonaws.com",
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.localhost",
+            f"{other_prefix}.credentials.iot.{_TEST_REGION}.localhost",
+        ):
+            assert not await iot_module._mtls_auto_register(der, peer, server_name)
+            assert cert_id not in iot_module._certificates
+        def_der = ssl.PEM_cert_to_DER_cert(def_leaf_pem)
+        assert not await iot_module._mtls_auto_register(def_der, peer, "mqtt.example.com")
+        assert iot_module.get_certificate_id(def_leaf_pem) not in iot_module._certificates
+        assert await iot_module._mtls_auto_register(def_der, peer, "ministack")
+
+        other_region = f"{prefix.upper()}-ats.iot.us-east-1.amazonaws.com"
+        assert await iot_module._mtls_auto_register(der, peer, other_region)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+        assert not await iot_module._mtls_auto_register(der, peer)
+        assert await iot_module._mtls_auto_register(der, peer, "localhost")
+        return ca_id
+
+    try:
+        ca_id = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+    topic = f"$aws/events/certificates/registered/{ca_id}"
+    events = [event for t, event in received if t == topic]
+    assert [event["certificateId"] for event in events] == [cert_id] * 2
+    assert events[0]["certificateRegistrationTimestamp"] is None
+    assert isinstance(events[1]["certificateRegistrationTimestamp"], str)
+
+
+def test_iot_jitr_sni_only_ca_in_two_accounts_registers_where_the_name_points():
+    """The same SNI_ONLY CA registered in two accounts: an endpoint name picks
+    the account it names, while a name both accounts are served under
+    (``localhost``) is ambiguous and registers nothing."""
+    import ssl
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf("unused")
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    accounts = ("111111111111", "222222222222")
+
+    async def _run():
+        for account in accounts:
+            set_request_account_id(account)
+            set_request_region(_TEST_REGION)
+            status, _, _body = await iot_module.handle_request(
+                "POST", "/cacertificate", {},
+                json.dumps({"caCertificate": ca_pem, "certificateMode": "SNI_ONLY"}).encode(),
+                {"setAsActive": "true", "allowAutoRegistration": "true"},
+            )
+            assert status == 200
+        assert not await iot_module._mtls_auto_register(der, peer, "localhost")
+        prefix = iot_module._endpoint_prefix(accounts[1])
+        name = f"{prefix}-ats.iot.{_TEST_REGION}.localhost"
+        assert await iot_module._mtls_auto_register(der, peer, name)
+        return [
+            iot_module._certificates.get_scoped(account, _TEST_REGION, cert_id)
+            for account in accounts
+        ]
+
+    try:
+        first, second = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+    assert first is None
+    assert second["status"] == "PENDING_ACTIVATION"
 
 
 # ----------------------------------------------------------------------
