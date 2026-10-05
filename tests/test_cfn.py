@@ -33553,3 +33553,124 @@ def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
     with pytest.raises(ClientError):
         apigw.get_domain_name(DomainName=domain)
 
+
+
+def _rds_groups_template(uid, *, params, subnet_desc="db subnets", attach=True):
+    resources = {
+        "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.42.0.0/16"}},
+        "SubnetA": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.1.0/24", "AvailabilityZone": "us-east-1a"}},
+        "SubnetB": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.2.0/24", "AvailabilityZone": "us-east-1b"}},
+        "Subnets": {"Type": "AWS::RDS::DBSubnetGroup", "Properties": {
+            "DBSubnetGroupDescription": subnet_desc,
+            "SubnetIds": [{"Ref": "SubnetA"}, {"Ref": "SubnetB"}],
+            "Tags": [{"Key": "team", "Value": "db"}]}},
+        "Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "Description": "instance params", "Family": "mysql8.0", "Parameters": params}},
+        "ClusterParams": {"Type": "AWS::RDS::DBClusterParameterGroup", "Properties": {
+            "DBClusterParameterGroupName": f"cpg-{uid}", "Description": "cluster params",
+            "Family": "aurora-mysql8.0", "Parameters": {"time_zone": "UTC"}}},
+        "Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+            "GenerateSecretString": {"SecretStringTemplate": '{"username":"admin"}',
+                                     "GenerateStringKey": "password",
+                                     "ExcludeCharacters": "\"@/\\\\"}}},
+        "Db": {"Type": "AWS::RDS::DBInstance", "DeletionPolicy": "Delete", "Properties": {
+            "DBInstanceIdentifier": f"cfn-groups-{uid}", "Engine": "mysql",
+            "DBInstanceClass": "db.t3.micro", "AllocatedStorage": "20", "DBName": "app",
+            "MasterUsername": "admin", "MasterUserPassword": "password123",
+            "DBSubnetGroupName": {"Ref": "Subnets"}, "DBParameterGroupName": {"Ref": "Params"}}},
+    }
+    if attach:
+        resources["Attach"] = {"Type": "AWS::SecretsManager::SecretTargetAttachment", "Properties": {
+            "SecretId": {"Ref": "Secret"}, "TargetId": {"Ref": "Db"},
+            "TargetType": "AWS::RDS::DBInstance"}}
+    outputs = {
+        "SubnetGroup": {"Value": {"Ref": "Subnets"}},
+        "SubnetGroupArn": {"Value": {"Fn::GetAtt": ["Subnets", "DBSubnetGroupArn"]}},
+        "ParamGroup": {"Value": {"Ref": "Params"}},
+        "ParamGroupName": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupName"]}},
+        "ParamGroupArn": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupArn"]}},
+        "ClusterParamGroup": {"Value": {"Ref": "ClusterParams"}},
+        "SecretArn": {"Value": {"Ref": "Secret"}},
+    }
+    if attach:
+        outputs["Attachment"] = {"Value": {"Ref": "Attach"}}
+    return json.dumps({"Resources": resources, "Outputs": outputs})
+
+
+def test_cfn_rds_groups_and_secret_target_attachment(cfn, rds, sm):
+    """The resources rds.DatabaseInstance emits: a DBSubnetGroup, parameter
+    groups and a SecretTargetAttachment that writes the connection keys."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-groups-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+        uid, params={"max_connections": 100, "sql_mode": "STRICT_ALL_TABLES"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupArn"] == out["SubnetGroupArn"]
+        assert len(group["Subnets"]) == 2
+        tags = rds.list_tags_for_resource(ResourceName=out["SubnetGroupArn"])["TagList"]
+        assert {"Key": "team", "Value": "db"} in tags
+        assert out["ParamGroup"] == out["ParamGroupName"]
+        assert out["ParamGroupArn"].endswith(f":pg:{out['ParamGroup']}")
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "100", "sql_mode": "STRICT_ALL_TABLES"}
+        assert out["ClusterParamGroup"] == f"cpg-{uid}"
+        db = rds.describe_db_instances(DBInstanceIdentifier=f"cfn-groups-{uid}")["DBInstances"][0]
+        assert db["DBSubnetGroup"]["DBSubnetGroupName"] == out["SubnetGroup"]
+
+        assert out["Attachment"] == sm.describe_secret(SecretId=out["SecretArn"])["ARN"]
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert value["username"] == "admin" and value["password"]
+        assert value["engine"] == "mysql"
+        assert value["host"] == db["Endpoint"]["Address"]
+        assert value["port"] == db["Endpoint"]["Port"]
+        assert value["dbname"] == "app"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+            uid, params={"max_connections": 200}, subnet_desc="changed", attach=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupDescription"] == "changed"
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "200"}
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert set(value) == {"username", "password"}
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError):
+            rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_parameters(DBParameterGroupName=out["ParamGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_cluster_parameters(DBClusterParameterGroupName=f"cpg-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_rds_custom_named_parameter_group_cannot_be_replaced(cfn):
+    """Family is Update requires: Replacement, so a custom-named group refuses it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-pg-repl-{uid}"
+
+    def template(family):
+        return json.dumps({"Resources": {"Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "DBParameterGroupName": f"pg-{uid}", "Description": "d", "Family": family}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("mysql8.0"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("mysql5.7"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
