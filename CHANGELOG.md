@@ -54,6 +54,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `Fn::Select` in a condition** — a condition such as `!Not [!Equals [!Select [2, !Ref KeySpec], ""]]` was always true; conditions now resolve `Fn::Select`, and an index outside the list fails with `Template error: Fn::Select cannot select nonexistent value at index N`, in conditions and in properties. Contributed by @mishukdutta-cz.
 - **CloudFormation — `Ref` to a list parameter** — a `Ref` to a `CommaDelimitedList` or `List<...>` parameter gave the raw string, so a list property got one item per character; it now gives the space-trimmed list. A list in a nested stack's `Parameters` or in an `AWS::SSM::Parameter` `Value` fails the resource. Contributed by @mishukdutta-cz.
 
+### Fixed
+
+- **Lambda — a timed-out invocation reports `Sandbox.Timedout`** — a function that ran past its `Timeout` returned `errorType` `Runtime.ExitError`, so a Step Functions `Retry` or `Catch` on `Sandbox.Timedout` never matched, and the execution failed where it recovers on AWS. All executors now return `Sandbox.Timedout` with the message `Task timed out after N.00 seconds`, as the Lambda and Step Functions error-handling docs describe. A runtime that exits before it responds still reports `Runtime.ExitError`.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
