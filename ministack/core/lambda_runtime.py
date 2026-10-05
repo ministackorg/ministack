@@ -2130,6 +2130,7 @@ class ProvidedWorker(Worker):
 
             deadline = time.monotonic() + timeout
             failure = None
+            failure_type = "Runtime.ExitError"
             while not self._response_ready.wait(
                     min(_PROVIDED_POLL, max(0.0, deadline - time.monotonic()))):
                 proc = self._proc
@@ -2142,6 +2143,7 @@ class ProvidedWorker(Worker):
                     break
                 if time.monotonic() >= deadline:
                     failure = f"Task timed out after {timeout}.00 seconds"
+                    failure_type = "Sandbox.Timedout"
                     break
             if failure is not None:
                 logger.warning("Lambda %s: %s", self.func_name, failure)
@@ -2149,7 +2151,7 @@ class ProvidedWorker(Worker):
                 return {
                     "status": "error",
                     "error": failure,
-                    "error_payload": {"errorMessage": failure, "errorType": "Runtime.ExitError"},
+                    "error_payload": {"errorMessage": failure, "errorType": failure_type},
                     "cold_start": cold,
                     "log": self._drain_stderr(),
                 }
