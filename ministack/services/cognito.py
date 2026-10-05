@@ -11,7 +11,7 @@ User Pools operations:
   CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool,
   AddCustomAttributes,
   CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient,
-  ListUserPoolClients, UpdateUserPoolClient,
+  ListUserPoolClients, UpdateUserPoolClient, GetUICustomization, SetUICustomization,
   AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers,
   AdminSetUserPassword, AdminUpdateUserAttributes,
   AdminInitiateAuth, AdminRespondToAuthChallenge,
@@ -455,6 +455,7 @@ _user_pools = AccountRegionScopedDict()
 #   _groups:  {group_name -> group_dict},
 #   _identity_providers: {provider_name -> provider_dict},
 #   _resource_servers: {identifier -> resource_server_dict},
+#   _ui_customizations: {client_id or ALL -> UICustomizationType},
 # }
 
 _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
@@ -2252,9 +2253,96 @@ def _pin_unsigned_idp_scope(data: dict) -> None:
         set_request_region(region)
 
 
+_SECRET_HASH_PARAMETERS = {
+    "SignUp": "",
+    "ConfirmSignUp": "",
+    "ResendConfirmationCode": "",
+    "ForgotPassword": "",
+    "ConfirmForgotPassword": "",
+    "InitiateAuth": "AuthParameters",
+    "AdminInitiateAuth": "AuthParameters",
+    "RespondToAuthChallenge": "ChallengeResponses",
+    "AdminRespondToAuthChallenge": "ChallengeResponses",
+}
+
+
+def _validate_client_secret_hash(action: str, data: dict):
+    """Authenticate confidential app clients before user changes or triggers.
+
+    This is Cognito's app-client contract, independent of IAM's AUTH flag.
+    Refresh authentication uses the token owner's username (or sub for a
+    UsernameAttributes pool), rather than the alias used at initial sign-in.
+    """
+    parameter = _SECRET_HASH_PARAMETERS.get(action)
+    if parameter is None:
+        return None
+    cid = data.get("ClientId")
+    if action.startswith("Admin"):
+        pool = _user_pools.get(data.get("UserPoolId"))
+    else:
+        pool, _pid = _pool_for_client(cid)
+    client = (pool or {}).get("_clients", {}).get(cid)
+    if not client:
+        # Let the operation retain its own missing-pool/client errors.
+        return None
+
+    params = data.get(parameter, {}) if parameter else data
+    if parameter == "ChallengeResponses":
+        session = _challenge_sessions.get(data.get("Session"))
+        if session and (session["client_id"] != cid or session["pool_id"] != pool["Id"]):
+            return error_response_json("NotAuthorizedException", "Invalid session for the user.", 400)
+
+    username = params.get("USERNAME" if parameter else "Username")
+    refreshing = parameter == "AuthParameters" and data.get("AuthFlow") in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN")
+    if refreshing:
+        # AWS rejects invalid refresh tokens before examining their secret hash.
+        user, error = _refresh_auth_user(pool, pool["Id"], cid, params.get("REFRESH_TOKEN", ""))
+        if error:
+            return error
+        username = (
+            _attr_list_to_dict(user.get("Attributes", [])).get("sub")
+            if pool.get("UsernameAttributes") else user["Username"]
+        )
+
+    supplied = params.get("SECRET_HASH" if parameter else "SecretHash")
+    if not client.get("ClientSecret"):
+        # AWS ignores an extra hash on refresh and challenge responses, but
+        # rejects it on initial authentication and the self-service APIs.
+        if refreshing or parameter == "ChallengeResponses":
+            return None
+        if supplied:
+            return error_response_json(
+                "InvalidParameterException",
+                f"App client {cid} is not configured for secret but secret hash was received", 400,
+            )
+        return None
+    if not supplied:
+        return error_response_json(
+            "NotAuthorizedException",
+            f"Client {cid} is configured with secret but SECRET_HASH was not received", 400,
+        )
+    if isinstance(username, str) and isinstance(supplied, str) and supplied.isascii():
+        try:
+            expected = base64.b64encode(hmac.new(
+                client["ClientSecret"].encode("utf-8"),
+                (username + cid).encode("utf-8"), hashlib.sha256,
+            ).digest())
+        except UnicodeEncodeError:
+            pass
+        else:
+            if hmac.compare_digest(expected, supplied.encode("ascii")):
+                return None
+    return error_response_json(
+        "NotAuthorizedException", f"Unable to verify secret hash for client {cid}", 400,
+    )
+
+
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
+    error = _validate_client_secret_hash(action, data)
+    if error:
+        return error
     return handler(data)
 
 
@@ -2280,6 +2368,8 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        "GetUICustomization": _get_ui_customization,
+        "SetUICustomization": _set_ui_customization,
         # Resource Servers
         "CreateResourceServer": _create_resource_server,
         "UpdateResourceServer": _update_resource_server,
@@ -2734,6 +2824,42 @@ def _update_user_pool_client(data):
             client[k] = data[k]
     client["LastModifiedDate"] = _now_epoch()
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+
+
+def _ui_customization_target(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return None, None, err
+    cid = data.get("ClientId") or "ALL"
+    if cid != "ALL" and cid not in pool["_clients"]:
+        return None, None, error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    return pool, cid, None
+
+
+def _set_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    if not (pool.get("Domain") or pool.get("CustomDomain")):
+        return error_response_json(
+            "InvalidParameterException", "There has to be an existing domain associated with this user pool", 400)
+    # ImageFile is accepted but not stored: ministack does not serve the classic hosted UI assets.
+    now = _now_epoch()
+    ui = pool.setdefault("_ui_customizations", {})
+    ui[cid] = {
+        "UserPoolId": pool["Id"], "ClientId": cid, "CSS": data.get("CSS", ""), "CSSVersion": str(int(now * 1000)),
+        "CreationDate": ui.get(cid, {}).get("CreationDate", now), "LastModifiedDate": now,
+    }
+    return json_response({"UICustomization": ui[cid]})
+
+
+def _get_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    ui = pool.get("_ui_customizations", {})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {"UserPoolId": pool["Id"], "ClientId": cid}})
 
 
 # ---------------------------------------------------------------------------
@@ -3718,6 +3844,8 @@ def _admin_respond_to_auth_challenge(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if cid not in pool["_clients"]:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
@@ -3854,10 +3982,8 @@ def _pool_for_client(cid):
     return None, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token):
-    """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
-    exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
-    by GetTokensFromRefreshToken so both mint tokens identically."""
+def _refresh_auth_user(pool, pid, cid, refresh_token):
+    """Resolve a refresh-token owner without issuing tokens or invoking triggers."""
     if not refresh_token:
         return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
     try:
@@ -3877,6 +4003,16 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
+    return user, None
+
+
+def _refresh_auth_result(pool, pid, cid, refresh_token):
+    """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
+    exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
+    by GetTokensFromRefreshToken so both mint tokens identically."""
+    user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
+    if err:
+        return None, err
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None

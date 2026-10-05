@@ -3802,7 +3802,7 @@ def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict
             "__type": "TooManyRequestsException",
             "message": msg,
             "Reason": reason_code,
-            "retryAfterSeconds": retry_after,
+            "retryAfterSeconds": str(retry_after),
         },
         "error": True,
         "log": "",

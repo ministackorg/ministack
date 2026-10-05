@@ -5414,6 +5414,8 @@ _persistent_sessions: dict[tuple[str, str, str], "_PersistentSessionState"] = {}
 # the broker's own session registry, so the two can never disagree and a
 # restart cannot leave a thing stuck reporting itself online.
 _connectivity: dict[tuple[str, str, str], dict] = {}
+# Next lifecycle-event ``versionNumber`` per (account, region, client id).
+_presence_versions: dict[tuple[str, str, str], int] = {}
 _broker_lock = asyncio.Lock()
 
 _SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
@@ -5423,13 +5425,17 @@ _MAX_QUEUED_MESSAGES = 1000
 
 
 class _PersistentSessionState:
-    __slots__ = ("subscriptions", "queued_messages", "created_at", "expiry_interval")
+    __slots__ = (
+        "subscriptions", "queued_messages", "created_at", "expiry_interval",
+        "session_identifier",
+    )
 
     def __init__(
         self,
         subscriptions: list[str],
         created_at: float,
         expiry_interval: int | None = None,
+        session_identifier: str | None = None,
     ):
         self.subscriptions: list[str] = subscriptions
         self.queued_messages: list[tuple[str, bytes, int]] = []
@@ -5439,6 +5445,8 @@ class _PersistentSessionState:
         # named no interval (every 3.1.1 client, and a v5 client that omitted
         # the property), so the module-wide default applies.
         self.expiry_interval: int | None = expiry_interval
+        # Reported as ``sessionIdentifier`` by every connection that resumes it.
+        self.session_identifier: str = session_identifier or str(uuid.uuid4())
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
@@ -5571,6 +5579,13 @@ def _topic_matches(filter_: str, topic: str) -> bool:
     return ti == len(t_parts)
 
 
+def _subscription_matches(filter_: str, topic: str) -> bool:
+    """Whether a subscription's or rule's filter matches; ``$aws/events`` skips filters that start with a wildcard."""
+    if topic.startswith("$aws/events/") and filter_[:1] in ("#", "+"):
+        return False
+    return _topic_matches(filter_, topic)
+
+
 # ---------------------------------------------------------------------------
 # Topic validation
 # ---------------------------------------------------------------------------
@@ -5627,6 +5642,7 @@ async def broker_stop() -> None:
         _connected_clients.clear()
         _persistent_sessions.clear()
         _connectivity.clear()
+        _presence_versions.clear()
 
 
 _BASIC_INGEST_PREFIX = "$aws/rules/"
@@ -6047,7 +6063,7 @@ async def _evaluate_topic_rules(
 ) -> None:
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
-        if filter_ and _topic_matches(filter_, topic):
+        if filter_ and _subscription_matches(filter_, topic):
             await _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
@@ -6561,7 +6577,9 @@ async def broker_publish(
                 continue
             if sub.no_local and client_id is not None and sub.client_id == client_id:
                 continue
-            if _topic_matches(sub.filter_prefixed, scoped):
+            if _subscription_matches(
+                _unscope_topic(sub.account_id, sub.region, sub.filter_prefixed), topic
+            ):
                 # Retain As Published forwards the publisher's flag; without
                 # it the flag is cleared, so a subscriber can tell a live
                 # message from a retained one (§3.3.1.3).
@@ -6593,8 +6611,7 @@ async def broker_publish(
             if _is_session_expired(ps):
                 continue
             for filt in ps.subscriptions:
-                scoped_filter = _scoped_topic(ps_account_id, ps_region, filt)
-                if _topic_matches(scoped_filter, scoped):
+                if _subscription_matches(filt, topic):
                     ps.queued_messages.append((topic, payload, qos))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
@@ -6608,9 +6625,9 @@ async def broker_publish(
     # recursive `accepted`/`delta`/`documents` publishes then flow back
     # through this function to drive their own subscribers and rules. The
     # response suffixes parse as None, so the bridge never re-triggers itself.
-    # NOTE known divergence: `_topic_matches` lets a bare `#` subscription
-    # match `$aws/...` topics, unlike real AWS where `#` excludes the
-    # reserved topic space.
+    # As on AWS, a `#` subscription or rule also gets these `$aws/things`
+    # topics; only `$aws/events` is kept from a leading wildcard
+    # (`_subscription_matches`).
     shadow = _parse_shadow_topic(topic)
     if shadow is not None:
         try:
@@ -6682,7 +6699,7 @@ async def broker_subscribe(
                 r
                 for k, r in _retained.items()
                 if k.startswith(scope_prefix)
-                and _topic_matches(filter_prefixed, k)
+                and _subscription_matches(topic_filter, k[len(scope_prefix):])
             ]
         else:
             retained_to_send = []
@@ -6723,6 +6740,7 @@ def broker_reset() -> None:
     _connected_clients.clear()
     _persistent_sessions.clear()
     _connectivity.clear()
+    _presence_versions.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -6761,7 +6779,7 @@ def _register_client(
 
 def _deregister_client(
     account_id: str, region: str, client_id: str, session: "_WSSession | None" = None
-) -> None:
+) -> bool:
     """Drop a session from the registry and record its disconnect.
 
     ``session`` identifies the caller so a session that has already been
@@ -6770,10 +6788,11 @@ def _deregister_client(
     its socket close then drives its own handler through cleanup a second time.
     Without this guard that late second pass would evict the live session from
     the registry and backdate its connectivity to the moment the loser died.
+    Returns whether this call recorded the disconnect.
     """
     key = (account_id, region, client_id)
     if session is not None and _connected_clients.get(key) is not session:
-        return
+        return False
     _connected_clients.pop(key, None)
     _connectivity[key] = {
         "timestamp": _now_epoch_millis(),
@@ -6781,6 +6800,15 @@ def _deregister_client(
             session.disconnect_reason() if session is not None else "CONNECTION_LOST"
         ),
     }
+    return True
+
+
+def _next_presence_version(account_id: str, region: str, client_id: str) -> int:
+    """Take the client id's next lifecycle-event version; connects and disconnects each take one."""
+    key = (account_id, region, client_id)
+    version = _presence_versions.get(key, 0)
+    _presence_versions[key] = version + 1
+    return version
 
 
 async def _force_disconnect_duplicate(
@@ -7204,10 +7232,16 @@ def _max_frame_buffer_bytes() -> int:
 
 
 class _WSSession:
-    def __init__(self, send_coro, account_id: str, region: str):
+    def __init__(
+        self, send_coro, account_id: str, region: str, principal: str | None = None
+    ):
         self._send = send_coro
         self.account_id = account_id
         self.region = region
+        # Lifecycle-event principal: the client certificate id, else the account.
+        self._principal = principal or account_id
+        self._session_identifier = ""
+        self._presence_version = 0
         self._sub_ids: list[str] = []
         self._sub_filters: dict[str, str] = {}
         self._sub_granted_qos: dict[str, int] = {}
@@ -7252,6 +7286,36 @@ class _WSSession:
             "CLIENT_INITIATED_DISCONNECT"
             if self._graceful_disconnect
             else "CONNECTION_LOST"
+        )
+
+    async def _publish_lifecycle(self, event_type: str, **fields) -> None:
+        """Publish this session's ``$aws/events`` presence or subscription event.
+
+        AWS documents that client ids containing ``#`` or ``+`` receive no
+        lifecycle events, so none is published for them."""
+        if "#" in self._client_id or "+" in self._client_id:
+            return
+        group ="presence" if event_type.endswith("connected") else "subscriptions"
+        await _publish_event(
+            self.account_id,
+            self.region,
+            f"$aws/events/{group}/{event_type}/{self._client_id}",
+            {
+                "clientId": self._client_id,
+                "timestamp": _now_epoch_millis(),
+                "eventType": event_type,
+                "sessionIdentifier": self._session_identifier,
+                "principalIdentifier": self._principal,
+                **fields,
+            },
+        )
+
+    async def _publish_connected(self) -> None:
+        """Publish this session's ``connected`` event."""
+        await self._publish_lifecycle(
+            "connected",
+            ipAddress=_publish_source_ip.get(),
+            versionNumber=self._presence_version,
         )
 
     def _alloc_packet_id(self) -> int:
@@ -7527,6 +7591,11 @@ class _WSSession:
 
             self._graceful_disconnect = False
             self._forced_disconnect_reason = None
+            self._session_identifier = str(uuid.uuid4())
+            # Taken before the takeover, so the evicted session's disconnect follows it.
+            self._presence_version = _next_presence_version(
+                self.account_id, self.region, self._client_id
+            )
             takeover_reason = await _force_disconnect_duplicate(
                 self.account_id, self.region, self._client_id
             )
@@ -7543,6 +7612,7 @@ class _WSSession:
                 existing_ps = _persistent_sessions.get(session_key)
                 if existing_ps is not None and not _is_session_expired(existing_ps):
                     session_present = True
+                    self._session_identifier = existing_ps.session_identifier
                     for topic_filter in existing_ps.subscriptions:
                         # A stored session keeps its topic filters, not the
                         # subscription options they were made with: those live
@@ -7566,17 +7636,20 @@ class _WSSession:
                     existing_ps.queued_messages.clear()
                     for q_topic, q_payload, q_qos in queued:
                         await self.deliver_to_client(q_topic, q_payload, q_qos)
+                    await self._publish_connected()
                     return True
                 else:
                     _persistent_sessions[session_key] = _PersistentSessionState(
                         subscriptions=[],
                         created_at=time.time(),
                         expiry_interval=self._session_expiry_interval,
+                        session_identifier=self._session_identifier,
                     )
 
             await self._send_connack(
                 session_present=session_present, assigned_client_id=assigned_client_id
             )
+            await self._publish_connected()
             return True
 
         if pkt_type == PKT_PUBLISH:
@@ -7632,8 +7705,10 @@ class _WSSession:
                 # as unavailable in CONNACK and ignores it if sent anyway.
                 _subscribe_props, off = _decode_properties(body, off)
             granted = []
+            topics = []
             while off < len(body):
                 topic, off = _read_string(body, off)
+                topics.append(topic)
                 # MQTT 5 replaces 3.1.1's bare QoS byte with a subscription
                 # options byte: the low two bits are the QoS, the rest are No
                 # Local, Retain As Published and Retain Handling. In 3.1.1 the
@@ -7668,6 +7743,7 @@ class _WSSession:
             await self.send_bytes(
                 _make_suback(packet_id, granted, protocol_version=self.protocol_version)
             )
+            await self._publish_lifecycle("subscribed", topics=topics)
             return True
 
         if pkt_type == PKT_PUBACK:
@@ -7732,6 +7808,7 @@ class _WSSession:
             else:
                 # 3.1.1's UNSUBACK is the packet identifier and nothing else.
                 await self.send_bytes(_make_unsuback(packet_id))
+            await self._publish_lifecycle("unsubscribed", topics=filters)
             return True
 
         if pkt_type == PKT_PINGREQ:
@@ -7786,9 +7863,16 @@ class _WSSession:
         self._sub_ids.clear()
         self._sub_filters.clear()
         self._sub_granted_qos.clear()
-        if self._client_id:
-            _deregister_client(
-                self.account_id, self.region, self._client_id, self
+        if self._client_id and _deregister_client(
+            self.account_id, self.region, self._client_id, self
+        ):
+            _next_presence_version(self.account_id, self.region, self._client_id)
+            reason = self.disconnect_reason()
+            await self._publish_lifecycle(
+                "disconnected",
+                clientInitiatedDisconnect=reason == "CLIENT_INITIATED_DISCONNECT",
+                disconnectReason=reason,
+                versionNumber=self._presence_version,
             )
 
     def _preserve_session(self) -> None:
@@ -7804,6 +7888,7 @@ class _WSSession:
                 subscriptions=unprefixed_filters,
                 created_at=time.time(),
                 expiry_interval=self._session_expiry_interval,
+                session_identifier=self._session_identifier,
             )
 
 
@@ -8539,7 +8624,9 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
     account_token = _request_account_id.set(account_id)
     region_token = _request_region.set(region)
-    session = _WSSession(_tcp_send, account_id, region)
+    session = _WSSession(
+        _tcp_send, account_id, region, hashlib.sha256(der).hexdigest() if der else None
+    )
     max_buffer = _max_frame_buffer_bytes()
     _mtls_logger.info(
         "IoT mTLS: connection from %s serving %s/%s (%s)",
