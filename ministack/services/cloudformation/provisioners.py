@@ -705,6 +705,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             for p in ("ThingTypeDescription", "SearchableAttributes")
         ),
     },
+    "AWS::IoT::DomainConfiguration": {"name": "DomainConfigurationName"},
     # BackupVaultName is required, so every vault is custom-named. Measured on
     # an account: adding EncryptionKeyArn fails with the refusal sentence.
     "AWS::Backup::BackupVault": {
@@ -13072,6 +13073,79 @@ def _iot_ca_certificate_delete(physical_id, props):
     _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
 
 
+# --- IoT DomainConfiguration ---
+# Measured on an account: an omitted DomainConfigurationName is
+# ``{LogicalId}-{suffix}`` (no stack name); a create that does not declare
+# DomainConfigurationStatus leaves the configuration DISABLED; an update sends
+# only the declared members, so a dropped one keeps its value; and the delete
+# disables an ENABLED configuration before deleting it.
+
+_IOT_DOMAIN_CONFIG_UPDATABLE = (
+    "AuthorizerConfig", "DomainConfigurationStatus", "TlsConfig",
+    "ServerCertificateConfig", "AuthenticationType", "ApplicationProtocol",
+    "ClientCertificateConfig",
+)
+
+
+def _iot_domain_configuration_attrs(name):
+    rec = _iot._domain_configurations.get(name) or {}
+    return {
+        "Arn": rec.get("domainConfigurationArn", ""),
+        "DomainType": rec.get("domainType", ""),
+        "ServerCertificates": [
+            {k[:1].upper() + k[1:]: v for k, v in cert.items()}
+            for cert in rec.get("serverCertificates", [])
+        ],
+    }
+
+
+def _iot_domain_configuration_set(name, payload, verb):
+    resp = _iot._update_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration {verb} failed: {resp[2]!r}")
+
+
+def _iot_domain_configuration_create(logical_id, props, stack_name):
+    name = props.get("DomainConfigurationName")
+    if not name:
+        suffix = _physical_name(stack_name, logical_id)[-12:]
+        name = f"{logical_id[:115]}-{suffix}"
+    payload = _pascal_to_camel({
+        k: v for k, v in props.items()
+        if k not in ("DomainConfigurationName", "DomainConfigurationStatus", "Tags")
+    })
+    resp = _iot._create_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration create failed: {resp[2]!r}")
+    if props.get("DomainConfigurationStatus") != "ENABLED":
+        _iot_domain_configuration_set(name, {"domainConfigurationStatus": "DISABLED"}, "create")
+    return name, _iot_domain_configuration_attrs(name)
+
+
+def _iot_domain_configuration_update(physical_id, old_props, new_props, stack_name):
+    """Apply the declared updatable members in place; the create-only ones
+    (name, DomainName, ServiceType, the certificate ARNs) replace the
+    configuration before this runs."""
+    payload = _pascal_to_camel({
+        k: new_props[k] for k in _IOT_DOMAIN_CONFIG_UPDATABLE if k in new_props
+    })
+    if payload:
+        _iot_domain_configuration_set(physical_id, payload, "update")
+    return physical_id, _iot_domain_configuration_attrs(physical_id)
+
+
+def _iot_domain_configuration_delete(physical_id, props):
+    rec = _iot._domain_configurations.get(physical_id)
+    if rec is None:
+        return
+    if rec["domainConfigurationStatus"] == "ENABLED":
+        _iot_domain_configuration_set(
+            physical_id, {"domainConfigurationStatus": "DISABLED"}, "delete")
+    resp = _iot._delete_domain_configuration(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(f"Invalid request provided: {json.loads(resp[2])['message']}")
+
+
 def _cognito_identity_pool_role_attachment_apply(props):
     """Push Roles and RoleMappings onto the identity pool through
     SetIdentityPoolRoles, which takes the whole configuration: a property the
@@ -13391,6 +13465,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
     "AWS::IoT::ThingType": ("ThingTypeName",),
+    "AWS::IoT::DomainConfiguration": (
+        "DomainConfigurationName", "DomainName", "ServiceType",
+        "ValidationCertificateArn", "ServerCertificateArns",
+    ),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
@@ -14297,6 +14375,11 @@ _RESOURCE_HANDLERS = {
         "update": _iot_ca_certificate_update,
         "delete": _iot_ca_certificate_delete,
         "import": _iot_ca_certificate_import,
+    },
+    "AWS::IoT::DomainConfiguration": {
+        "create": _iot_domain_configuration_create,
+        "update": _iot_domain_configuration_update,
+        "delete": _iot_domain_configuration_delete,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,

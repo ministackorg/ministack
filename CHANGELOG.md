@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — domain configurations** — `CreateDomainConfiguration`, `DescribeDomainConfiguration`, `ListDomainConfigurations`, `UpdateDomainConfiguration` and `DeleteDomainConfiguration`, and the CloudFormation type `AWS::IoT::DomainConfiguration`, were missing. The list now shows the `iot:Data-ATS` and `iot:CredentialProvider` configurations IoT owns (their `domainName` is the `DescribeEndpoint` address). A configuration without a server certificate is AWS-managed with a generated `-ats` host, one with an ACM certificate is customer-managed, and requests are validated with AWS's messages (TLS security policy, authentication type and protocol combinations, certificates, the IoT-owned entries). As on AWS, only a DISABLED configuration can be deleted (AWS's seven-day hold on an AWS-managed one is not enforced), and CloudFormation leaves a configuration DISABLED unless the template enables it, and disables it before deleting it. The broker does not serve a configured domain. Contributed by @iot-rocket.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added

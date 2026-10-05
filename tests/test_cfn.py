@@ -1477,6 +1477,116 @@ def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-ca-pem")
 
 
+def _iot_domain_configuration_template(resources):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            logical_id: {"Type": "AWS::IoT::DomainConfiguration", "Properties": props}
+            for logical_id, props in resources.items()
+        },
+        "Outputs": {
+            f"{logical_id}{attr}": {"Value": {"Fn::GetAtt": [logical_id, attr]}}
+            for logical_id in resources for attr in ("Arn", "DomainType")
+        } | {f"{logical_id}Ref": {"Value": {"Ref": logical_id}} for logical_id in resources},
+    })
+
+
+def test_cfn_iot_domain_configuration_lifecycle(cfn, iot_client):
+    """Ref is the name (``{LogicalId}-{suffix}`` when generated); a create that
+    does not declare DomainConfigurationStatus leaves the configuration
+    DISABLED; an update applies the declared members in place and keeps the
+    dropped ones; the delete disables an ENABLED configuration and then
+    deletes it (AWS's seven-day hold on an AWS-managed one is not enforced)."""
+    stack_name = f"cfn-iot-dc-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn-dc-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {
+            "DomainConfigurationName": named,
+            "DomainConfigurationStatus": "ENABLED",
+            "TlsConfig": {"SecurityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"},
+            "AuthenticationType": "AWS_X509",
+            "ApplicationProtocol": "SECURE_MQTT",
+        },
+        "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    assert _output(stack, "NamedRef") == named
+    unnamed = _output(stack, "UnnamedRef")
+    assert re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", unnamed)
+    for logical_id, name in (("Named", named), ("Unnamed", unnamed)):
+        d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+        assert _output(stack, f"{logical_id}Arn") == d["domainConfigurationArn"]
+        assert _output(stack, f"{logical_id}DomainType") == "AWS_MANAGED"
+    named_desc = iot_client.describe_domain_configuration(domainConfigurationName=named)
+    assert named_desc["domainConfigurationStatus"] == "ENABLED"
+    assert named_desc["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"}
+    assert (named_desc["authenticationType"], named_desc["applicationProtocol"]) == (
+        "AWS_X509", "SECURE_MQTT")
+    assert iot_client.describe_domain_configuration(domainConfigurationName=unnamed)[
+        "domainConfigurationStatus"] == "DISABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {
+            "DomainConfigurationName": named,
+            "TlsConfig": {"SecurityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"},
+        },
+        "Unnamed": {"DomainConfigurationStatus": "ENABLED"},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    assert _output(stack, "UnnamedRef") == unnamed
+    after = iot_client.describe_domain_configuration(domainConfigurationName=named)
+    assert after["domainConfigurationArn"] == named_desc["domainConfigurationArn"]
+    assert after["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"}
+    assert after["domainConfigurationStatus"] == "ENABLED"
+    assert (after["authenticationType"], after["applicationProtocol"]) == ("AWS_X509", "SECURE_MQTT")
+    assert iot_client.describe_domain_configuration(domainConfigurationName=unnamed)[
+        "domainConfigurationStatus"] == "ENABLED"
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    listed = [d["domainConfigurationName"]
+              for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert named not in listed and unnamed not in listed
+
+
+def test_cfn_iot_domain_configuration_create_only_properties(cfn, iot_client):
+    """ServiceType and the other create-only properties replace the
+    configuration: refused under a custom name, a new generated name
+    otherwise, with the predecessor deleted in the cleanup."""
+    stack_name = f"cfn-iot-dc-replace-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn-dc-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named}, "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    first = _output(stack, "UnnamedRef")
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named, "ServiceType": "DATA"}, "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named}, "Unnamed": {"ServiceType": "DATA"},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    second = _output(stack, "UnnamedRef")
+    assert second != first and second.startswith("Unnamed-")
+    listed = [d["domainConfigurationName"]
+              for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert second in listed and first not in listed
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_deleted_stack_name_is_reusable(cfn):
     """A DELETE_COMPLETE stack is addressable only by stack ID; its name is free
     to re-create, and an UpdateStack against the deleted name is "does not
