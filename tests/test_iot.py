@@ -6155,6 +6155,167 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
             iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def _delete_certificates_and_cas(iot_client, cert_ids, ca_ids):
+    for cert_id in cert_ids:
+        iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+        iot_client.delete_certificate(certificateId=cert_id)
+    for ca_id in ca_ids:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_list_certificates_by_ca_lists_what_was_registered_under_the_ca(iot_client):
+    """As measured on AWS: every certificate registered with the CA's
+    ``caCertificatePem`` is listed whatever its status, newest first unless
+    ``isAscendingOrder=true``, with the four ``ListCertificates`` members. A
+    leaf the CA issued but registered through RegisterCertificateWithoutCA is
+    not listed, nor is a leaf of another CA."""
+    code = _registration_code(iot_client)
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(code, count=4)
+    other_ca_pem, other_verification_pem, other_leaf = _generate_ca_and_leaf(code)
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    other_ca_id = iot_client.register_ca_certificate(
+        caCertificate=other_ca_pem, verificationCertificate=other_verification_pem,
+        setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        for leaf_pem, status in zip(leaves[:3], ("ACTIVE", "INACTIVE", "REVOKED")):
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status=status,
+            )["certificateId"])
+        under_ca = list(created)
+        created.append(iot_client.register_certificate_without_ca(
+            certificatePem=leaves[3], status="ACTIVE",
+        )["certificateId"])
+        other = iot_client.register_certificate(
+            certificatePem=other_leaf, caCertificatePem=other_ca_pem, status="ACTIVE",
+        )["certificateId"]
+        created.append(other)
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+        assert "nextMarker" not in listing
+        certificates = listing["certificates"]
+        assert [c["certificateId"] for c in certificates] == under_ca[::-1]
+        assert [c["status"] for c in certificates] == ["REVOKED", "INACTIVE", "ACTIVE"]
+        for c in certificates:
+            assert set(c) == {"certificateArn", "certificateId", "status", "creationDate"}
+            assert c["certificateArn"].endswith(":cert/" + c["certificateId"])
+
+        ascending = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, ascendingOrder=True
+        )["certificates"]
+        assert [c["certificateId"] for c in ascending] == under_ca
+
+        other_listing = iot_client.list_certificates_by_ca(caCertificateId=other_ca_id)
+        assert [c["certificateId"] for c in other_listing["certificates"]] == [other]
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id, other_ca_id))
+
+
+def test_iot_list_certificates_by_ca_pages_from_the_last_certificate(iot_client):
+    """``pageSize`` pages carry a ``nextMarker`` until the last one. The marker
+    names a position, the way AWS's does: continuing a descending page with
+    ``isAscendingOrder=true`` yields the certificates newer than that page's
+    last one. A CA without certificates, an id that names no CA and the
+    upper-case form of a CA id all answer an empty list."""
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+        _registration_code(iot_client), count=3
+    )
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        assert iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"] == []
+        for leaf_pem in leaves:
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        seen, marker = [], None
+        for _ in range(len(created)):
+            kwargs = {"marker": marker} if marker else {}
+            page = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=1, **kwargs)
+            assert len(page["certificates"]) == 1
+            seen.append(page["certificates"][0]["certificateId"])
+            marker = page.get("nextMarker")
+            if marker:
+                assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", marker)
+        assert marker is None
+        assert seen == created[::-1]
+
+        paginator = iot_client.get_paginator("list_certificates_by_ca")
+        pages = paginator.paginate(
+            caCertificateId=ca_id, ascendingOrder=True, PaginationConfig={"PageSize": 2}
+        )
+        assert [c["certificateId"] for p in pages for c in p["certificates"]] == created
+
+        first = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=2)
+        flipped = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, pageSize=2, marker=first["nextMarker"], ascendingOrder=True
+        )
+        assert [c["certificateId"] for c in flipped["certificates"]] == [created[2]]
+
+        for unknown in ("0" * 64, ca_id.upper()):
+            assert iot_client.list_certificates_by_ca(caCertificateId=unknown)["certificates"] == []
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id,))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"pageSize": 0},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value greater than or equal to 1",
+        ),
+        (
+            {"pageSize": 251},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value less than or equal to 250",
+        ),
+        (
+            {"caCertificateId": "not-a-ca-id"},
+            "2 validation errors detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            "(0x)?[a-fA-F0-9]+; Value at 'caCertificateId' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"caCertificateId": "a" * 63},
+            "1 validation error detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"marker": "not-a-marker!"},
+            "1 validation error detected: Value at 'marker' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            "[A-Za-z0-9+/]+={0,2}",
+        ),
+        (
+            {"marker": "bm90LWEtbWFya2Vy"},
+            "Invalid/Malformed marker passed for listCertificateByCA",
+        ),
+    ],
+    ids=["page-size-0", "page-size-251", "malformed-id", "short-id", "marker-pattern", "unissued-marker"],
+)
+def test_iot_list_certificates_by_ca_rejects_what_aws_rejects(kwargs, message):
+    """The messages AWS answers once the SDK's own validation is out of the
+    way; the base64 marker is well formed but was never issued."""
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    with pytest.raises(ClientError) as ei:
+        raw.list_certificates_by_ca(**{"caCertificateId": "0" * 64, **kwargs})
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
 def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):
     """newStatus / newAutoRegistrationStatus are modeled in the query string,
     but a raw caller that sends them in the JSON body must not get a 200 that

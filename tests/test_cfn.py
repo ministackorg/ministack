@@ -1228,6 +1228,46 @@ def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_iot_ca_certificate_lists_certificates_registered_under_it(cfn, iot_client):
+    """A CA the stack registered is the same registry entry the API uses:
+    device certificates registered under it by RegisterCertificate come back
+    from ListCertificatesByCA for the stack's CA id, newest first."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-iot-ca-by-ca-{suffix}"
+    ca_pem, ca_key = generate_ca(common_name=f"cfn-by-ca-{suffix}")
+    template = json.dumps({
+        "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem, "Status": "ACTIVE", "CertificateMode": "SNI_ONLY",
+        }}},
+        "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+    })
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    cert_ids = []
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        ca_id = stack["Outputs"][0]["OutputValue"]
+        for i in range(2):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=f"cfn-by-ca-device-{i}"
+            )[0]
+            cert_ids.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [c["certificateId"] for c in listing] == cert_ids[::-1]
+    finally:
+        for cert_id in cert_ids:
+            iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot_client.delete_certificate(certificateId=cert_id)
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
 def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_client):
     """A CA already registered out of band answers ResourceAlreadyExists when
     the stack's create re-registers the PEM (the certificate id is derived

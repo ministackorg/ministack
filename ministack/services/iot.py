@@ -13,9 +13,10 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
     ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
-    ``ListCACertificates``, ``DeleteCACertificate``; an mTLS connect with an
-    unknown certificate signed by a CA with auto-registration enabled creates
-    it PENDING_ACTIVATION and publishes the AWS JITR event to
+    ``ListCACertificates``, ``DeleteCACertificate``, ``ListCertificatesByCA``;
+    an mTLS connect with an unknown certificate signed by a CA with
+    auto-registration enabled creates it PENDING_ACTIVATION and publishes the
+    AWS JITR event to
     ``$aws/events/certificates/registered/{caCertificateId}``
   - Provisioning templates: ``CreateProvisioningTemplate``,
     ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
@@ -565,6 +566,8 @@ async def _route_request(
 
     if path == "/certificates" and method == "GET":
         return _list_certificates(qp)
+    if path.startswith("/certificates-by-ca/") and method == "GET":
+        return _list_certificates_by_ca(path, qp)
     if path.startswith("/certificates/") and method in ("GET", "PUT", "DELETE"):
         return _handle_certificate(method, path, body, qp)
 
@@ -1596,6 +1599,132 @@ def _list_certificates(qp: dict) -> tuple:
             for c in _certificates.values()
         ]
     })
+
+
+_CERTIFICATE_ID_RE = re.compile(r"(0x)?[a-fA-F0-9]+")
+_MARKER_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+_BY_CA_MARKER_PREFIX = "certificates-by-ca"
+
+
+def _by_ca_sort_key(record: dict) -> tuple[float, str]:
+    """Creation order, the certificate id breaking ties within one timestamp."""
+    return record.get("creationDate") or 0.0, record["certificateId"]
+
+
+def _by_ca_marker(record: dict) -> str:
+    """An opaque page cursor naming the last certificate of a page.
+
+    It is the position, not an offset: AWS continues after that certificate in
+    whatever order the next request asks for, so a marker from a descending
+    page followed by ``isAscendingOrder=true`` yields the newer certificates.
+    Standard base64, so it matches the ``Marker`` pattern botocore checks.
+    """
+    created, cert_id = _by_ca_sort_key(record)
+    raw = f"{_BY_CA_MARKER_PREFIX}:{created!r}:{cert_id}"
+    return base64.b64encode(raw.encode()).decode()
+
+
+def _by_ca_marker_position(marker: str) -> tuple[float, str] | None:
+    """The (creationDate, certificateId) a marker stands for, or None."""
+    try:
+        raw = base64.b64decode(marker, validate=True).decode()
+        prefix, created, cert_id = raw.split(":")
+        if prefix != _BY_CA_MARKER_PREFIX:
+            return None
+        return float(created), cert_id
+    except ValueError:
+        return None
+
+
+def _list_certificates_by_ca(path: str, qp: dict) -> tuple:
+    """``GET /certificates-by-ca/{caCertificateId}`` (``ListCertificatesByCA``).
+
+    Lists the device certificates whose record names the CA: those registered
+    with that ``caCertificatePem``, in every status as on AWS, and those the
+    CA's auto-registration created. ``RegisterCertificateWithoutCA`` leaves
+    are not listed even when the CA issued them, as on AWS. Newest first unless
+    ``isAscendingOrder=true``. A well-formed id that names no CA is an empty
+    list, not an error.
+    """
+    ca_id = path[len("/certificates-by-ca/"):]
+    errors = []
+    if not _CERTIFICATE_ID_RE.fullmatch(ca_id):
+        errors.append(
+            "Value at 'caCertificateId' failed to satisfy constraint: Member must "
+            "satisfy regular expression pattern: (0x)?[a-fA-F0-9]+"
+        )
+    if len(ca_id) != 64:
+        bound = "greater than or equal to" if len(ca_id) < 64 else "less than or equal to"
+        errors.append(
+            "Value at 'caCertificateId' failed to satisfy constraint: Member must "
+            f"have length {bound} 64"
+        )
+    page_size = qp.get("pageSize")
+    if page_size is not None:
+        try:
+            page_size = int(page_size)
+        except ValueError:
+            return error_response_json(
+                "InvalidRequestException", "pageSize must be an integer", 400
+            )
+        if page_size < 1:
+            errors.append(
+                "Value at 'pageSize' failed to satisfy constraint: Member must have "
+                "value greater than or equal to 1"
+            )
+        elif page_size > 250:
+            errors.append(
+                "Value at 'pageSize' failed to satisfy constraint: Member must have "
+                "value less than or equal to 250"
+            )
+    marker = qp.get("marker")
+    if marker is not None and not _MARKER_RE.fullmatch(marker):
+        errors.append(
+            "Value at 'marker' failed to satisfy constraint: Member must satisfy "
+            "regular expression pattern: [A-Za-z0-9+/]+={0,2}"
+        )
+    if errors:
+        noun = "error" if len(errors) == 1 else "errors"
+        return error_response_json(
+            "InvalidRequestException",
+            f"{len(errors)} validation {noun} detected: " + "; ".join(errors),
+            400,
+        )
+    position = None
+    if marker is not None:
+        position = _by_ca_marker_position(marker)
+        if position is None:
+            return error_response_json(
+                "InvalidRequestException",
+                "Invalid/Malformed marker passed for listCertificateByCA",
+                400,
+            )
+    ascending = _qp_bool(qp, "isAscendingOrder")
+    matched = sorted(
+        (c for c in _certificates.values() if c.get("caCertificateId") == ca_id),
+        key=_by_ca_sort_key,
+        reverse=not ascending,
+    )
+    if position is not None:
+        matched = [
+            c for c in matched
+            if (_by_ca_sort_key(c) > position if ascending else _by_ca_sort_key(c) < position)
+        ]
+    page = matched[:page_size or 250]
+    body = {
+        "certificates": [
+            {
+                "certificateArn": c["certificateArn"],
+                "certificateId": c["certificateId"],
+                "status": c["status"],
+                "creationDate": c.get("creationDate"),
+            }
+            for c in page
+        ]
+    }
+    if len(matched) > len(page):
+        body["nextMarker"] = _by_ca_marker(page[-1])
+    return json_response(body)
 
 
 def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
