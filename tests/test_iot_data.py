@@ -3617,6 +3617,37 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_jitr_certificate_is_listed_by_its_ca(broker, tmp_path):
+    """As measured on AWS, ListCertificatesByCA lists the certificate that
+    just-in-time registration created, while it is still PENDING_ACTIVATION."""
+    from ministack.core.x509_utils import get_certificate_id, sign_leaf_certificate
+
+    iot = broker.client("iot")
+    ca_pem, ca_key, verification_pem = iot_test_ca(
+        iot.get_registration_code()["registrationCode"], _unique("jitr-list-ca")
+    )
+    ca_id = iot.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        setAsActive=True, allowAutoRegistration=True,
+    )["certificateId"]
+    leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name="jitr-listed")
+    cert_id = get_certificate_id(leaf_pem)
+    try:
+        assert _refused_below_mqtt(broker, leaf_pem, leaf_key, tmp_path, _unique("jitr-listed"))
+        listing = iot.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [(c["certificateId"], c["status"]) for c in listing] == [
+            (cert_id, "PENDING_ACTIVATION")
+        ]
+    finally:
+        try:
+            iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot.delete_certificate(certificateId=cert_id, forceDelete=True)
+        except ClientError:
+            pass
+        iot.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot.delete_ca_certificate(certificateId=ca_id)
+
+
 def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_path):
     """Just-in-time registration, as on AWS: an unknown certificate signed by a
     CA with auto-registration enabled is created PENDING_ACTIVATION, the

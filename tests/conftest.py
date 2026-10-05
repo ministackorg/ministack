@@ -320,6 +320,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
     "tests/test_iot_data.py::test_mtls_registered_cert_connects_whatever_its_ca",
     "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_jitr_certificate_is_listed_by_its_ca",
     "tests/test_iot_data.py::test_mtls_jitr_auto_registers_an_unknown_cert_without_connack",
     "tests/test_iot_data.py::test_mtls_jitr_under_an_sni_only_ca_needs_sni",
     "tests/test_iot_data.py::test_mtls_account_scoped_delivery",

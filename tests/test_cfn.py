@@ -1228,6 +1228,46 @@ def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_iot_ca_certificate_lists_certificates_registered_under_it(cfn, iot_client):
+    """A CA the stack registered is the same registry entry the API uses:
+    device certificates registered under it by RegisterCertificate come back
+    from ListCertificatesByCA for the stack's CA id, newest first."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-iot-ca-by-ca-{suffix}"
+    ca_pem, ca_key = generate_ca(common_name=f"cfn-by-ca-{suffix}")
+    template = json.dumps({
+        "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem, "Status": "ACTIVE", "CertificateMode": "SNI_ONLY",
+        }}},
+        "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+    })
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    cert_ids = []
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        ca_id = stack["Outputs"][0]["OutputValue"]
+        for i in range(2):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=f"cfn-by-ca-device-{i}"
+            )[0]
+            cert_ids.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [c["certificateId"] for c in listing] == cert_ids[::-1]
+    finally:
+        for cert_id in cert_ids:
+            iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot_client.delete_certificate(certificateId=cert_id)
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
 def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_client):
     """A CA already registered out of band answers ResourceAlreadyExists when
     the stack's create re-registers the PEM (the certificate id is derived
@@ -28405,6 +28445,61 @@ def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appc
         with pytest.raises(ClientError) as exc:
             call()
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def _cfn_appconfig_deployment_template(name, strategy_id):
+    """An application, environment, profile, hosted version and a deployment with `strategy_id`."""
+    return json.dumps({
+        "Resources": {
+            "App": {"Type": "AWS::AppConfig::Application", "Properties": {"Name": name}},
+            "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name}},
+            "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name, "LocationUri": "hosted"}},
+            "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "ConfigurationProfileId": {"Ref": "Profile"},
+                "ContentType": "application/json", "Content": "{}"}},
+            "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                "ConfigurationProfileId": {"Ref": "Profile"},
+                "DeploymentStrategyId": strategy_id,
+                "ConfigurationVersion": {"Ref": "HCV"}}},
+        },
+        "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                    "EnvId": {"Value": {"Ref": "Env"}},
+                    "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+    })
+
+
+def test_cfn_appconfig_deployment_with_a_predefined_strategy(cfn, appconfig_client):
+    """The deployment records the parameters of the predefined strategy it names."""
+    stack_name = f"cfn-ac-predef-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "AppConfig.AllAtOnce"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        deployment = appconfig_client.get_deployment(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"),
+            DeploymentNumber=int(_cfn_output(cfn, stack_name, "Number")))
+        assert deployment["DeploymentStrategyId"] == "AppConfig.AllAtOnce"
+        assert (deployment["DeploymentDurationInMinutes"], deployment["GrowthType"],
+                deployment["GrowthFactor"], deployment["FinalBakeTimeInMinutes"]) == (0, "LINEAR", 100.0, 10)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_with_a_missing_strategy_rolls_back(cfn):
+    """A deployment naming a strategy that does not exist fails and rolls the stack back."""
+    stack_name = f"cfn-ac-nostrat-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "abcdefg"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "DeploymentStrategy with Id abcdefg could not be found." in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):

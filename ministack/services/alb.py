@@ -1894,7 +1894,14 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
 
-    status, out_headers = resp.status, dict(resp.headers)
+    # Header names are case-insensitive; repeated fields must reach ASGI as
+    # separate values, especially Set-Cookie whose Expires can contain commas.
+    out_headers = {}
+    for name, value in resp.getheaders():
+        out_headers.setdefault(name.lower(), []).append(value)
+    out_headers = {name: values[0] if len(values) == 1 else values
+                   for name, values in out_headers.items()}
+    status = resp.status
 
     async def _stream(send, receive):
         disconnected = asyncio.create_task(_await_http_disconnect(receive))
