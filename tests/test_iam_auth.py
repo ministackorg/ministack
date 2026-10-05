@@ -2107,6 +2107,75 @@ class TestResourceArn:
         ))
         assert seen["action"] == "execute-api:Invoke"
 
+    @pytest.mark.parametrize("granted,refusal", [
+        ("d9506af4/prod/$connect", None),
+        ("d9506af4/prod/$default", (403, (
+            "User: arn:aws:iam::000000000000:user/ws-user is not authorized to perform: execute-api:Invoke "
+            "on resource: arn:aws:execute-api:eu-central-1:000000000000:d9506af4/prod/$connect "
+            "because no identity-based policy allows the execute-api:Invoke action"))),
+    ], ids=["connect", "other-route"])
+    def test_websocket_aws_iam_connect_asks_for_invoke_on_connect(self, monkeypatch, granted, refusal):
+        """A handshake on an AWS_IAM $connect route is authorized as execute-api:Invoke on <api>/<stage>/$connect."""
+        import ministack.app as app
+        from ministack.services import apigateway as apigw_svc
+        from ministack.services import iam as iam_svc
+
+        fake_key = "AKIATESTWSCONNECT01"
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "ws-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["ws-user"] = {
+            "UserName": "ws-user", "Arn": "arn:aws:iam::000000000000:user/ws-user",
+            "UserId": "AIDAWSCONN1", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["ws-user"] = {"p": json.dumps({"Statement": [{
+            "Effect": "Allow", "Action": "execute-api:Invoke",
+            "Resource": f"arn:aws:execute-api:eu-central-1:000000000000:{granted}",
+        }]})}
+        monkeypatch.setattr(app, "AUTH", True)
+        monkeypatch.setattr(apigw_svc, "_api_owner", lambda api_id: ("WEBSOCKET", "000000000000", "eu-central-1"))
+        monkeypatch.setattr(apigw_svc, "_match_ws_route",
+                            lambda api_id, key: {"routeKey": "$connect", "authorizationType": "AWS_IAM"})
+        stages = apigw_svc.AccountRegionScopedDict()
+        stages.set_scoped("000000000000", "eu-central-1", "d9506af4", {"prod": {}})
+        monkeypatch.setattr(apigw_svc, "_stages", stages)
+        connected = []
+
+        async def connect_integration(*args, **kwargs):
+            connected.append(args[4])
+            return {"statusCode": 403}
+
+        monkeypatch.setattr(apigw_svc, "_invoke_ws_lambda", connect_integration)
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        def handshake(query):
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(), "headers": [],
+                     "extensions": {"websocket.http.response": {}}}
+            asyncio.run(apigw_svc.handle_websocket(scope, receive, send, "d9506af4"))
+            return sent[0].get("status"), json.loads(sent[1]["body"])["message"] if len(sent) > 1 else None
+
+        try:
+            unsigned = handshake("")
+            signed = handshake(f"X-Amz-Credential={fake_key}%2F20260101%2Feu-central-1%2Fexecute-api%2Faws4_request")
+        finally:
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("ws-user", None)
+            iam_svc._user_inline_policies.pop("ws-user", None)
+        assert unsigned == (403, "Missing Authentication Token")
+        if refusal is None:
+            assert connected == ["prod"]
+        else:
+            assert (connected, signed) == ([], refusal)
+
     # --- Lambda Function URLs ---
     @pytest.mark.parametrize("resolved,arn,context", [
         (("000000000000", "eu-central-1", "notify", None, {"AuthType": "AWS_IAM"}),
