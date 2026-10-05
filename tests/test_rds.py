@@ -5288,6 +5288,48 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     m._instances.clear()
 
 
+def test_rds_deferred_mysql_start_grants_master_privileges(monkeypatch):
+    """A MySQL instance started in the background (cold image cache, or a
+    restore) gets the same master-user admin grant as one started inline."""
+    from ministack.services import rds as m
+
+    class FakeContainer:
+        id = "cid-mysql"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+
+    class FakeContainers:
+        def get(self, name):
+            raise Exception("not found")
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    grants = []
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda port: True)
+    monkeypatch.setattr(m, "_run_rds_container", lambda *_args, **_kwargs: FakeContainer())
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *args: grants.append(args))
+
+    db_id = "deferred-mysql"
+    instance = {
+        "DBInstanceIdentifier": db_id, "Engine": "mysql", "EngineVersion": "8.4",
+        "MasterUsername": "admin", "_MasterUserPassword": "password123",
+        "DBName": "mydb", "DBInstanceStatus": "creating", "_HostPort": 15600,
+    }
+    m._instances.clear()
+    m._instances[db_id] = instance
+    try:
+        m._start_rds_container_for_instance(db_id, instance)
+        assert grants == [("127.0.0.1", 15600, "admin", "password123", db_id)]
+        assert instance["DBInstanceStatus"] == "available"
+    finally:
+        m._instances.clear()
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -8166,6 +8208,30 @@ def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE
         autocommit=True,
         connect_timeout=5,
     )
+
+
+@pytest.mark.data_plane
+def test_rds_mysql_binary_logging_follows_backup_retention(rds):
+    """On RDS a backup retention period of 0 turns binary logging off."""
+    suffix = uuid.uuid4().hex[:8]
+    expected = {f"binlog-off-{suffix}": 0, f"binlog-on-{suffix}": 1}
+    try:
+        for db_id, retention in zip(expected, (0, 1)):
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, Engine="mysql", EngineVersion="8.0",
+                DBInstanceClass="db.t3.micro", AllocatedStorage=20, DBName=DATABASE,
+                MasterUsername="admin", MasterUserPassword=PASSWORD,
+                BackupRetentionPeriod=retention,
+            )
+        for db_id, log_bin in expected.items():
+            conn = _aurora_connect(_wait_for_instance(rds, db_id)["Endpoint"])
+            with conn.cursor() as cur:
+                cur.execute("SELECT @@log_bin")
+                assert cur.fetchone()[0] == log_bin
+            conn.close()
+    finally:
+        for db_id in expected:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 
 @contextlib.contextmanager

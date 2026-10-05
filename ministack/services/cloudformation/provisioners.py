@@ -3151,6 +3151,9 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
             "AWS::AppConfig::Deployment requires ApplicationId, EnvironmentId, "
             "DeploymentStrategyId, and ConfigurationProfileId"
         )
+    strategy = _appconfig._find_deployment_strategy(strategy_id)
+    if not strategy:
+        raise ValueError(f"DeploymentStrategy with Id {strategy_id} could not be found.")
     existing = [
         v for k, v in _appconfig._deployments.items()
         if k.startswith(f"{app_id}/{env_id}/")
@@ -3169,6 +3172,7 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
         "ConfigurationLocationUri": "hosted",
         "ConfigurationVersion": props.get("ConfigurationVersion", ""),
         "Description": props.get("Description", ""),
+        **_appconfig._deployment_params_from_strategy(strategy),
         "State": "COMPLETE",
         "PercentageComplete": 100.0,
         "StartedAt": now,
@@ -12467,6 +12471,11 @@ def _iot_thing_group_properties(props):
 
 def _iot_thing_group_create(logical_id, props, stack_name):
     name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    # CreateThingGroup answers 200 for an identical existing group, but a stack
+    # never adopts one: AWS fails its name-conflict validation before creating
+    # anything, whatever the properties (measured eu-central-1, 2026-10-05).
+    if name in _iot._thing_groups:
+        raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
     payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]
