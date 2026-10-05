@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — `CreateCertificateFromCsr`** — the operation was missing: `POST /certificates` answered `Unsupported IoT path`. It now signs the CSR with the local CA, as AWS signs it with its own: the certificate keeps the CSR's subject and public key and is `INACTIVE` unless `setAsActive`, and a CSR that does not parse or verify, or whose key is not RSA of at least 2048 bits or EC on P-256, P-384 or P-521, gets `InvalidRequestException` `CSR violates constraints`. Contributed by @iot-rocket.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added

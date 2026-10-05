@@ -491,6 +491,53 @@ def test_iot_create_keys_and_certificate_inactive(iot_client):
     iot_client.delete_certificate(certificateId=resp["certificateId"])
 
 
+def test_iot_create_certificate_from_csr(iot_client):
+    """CreateCertificateFromCsr signs the CSR with the local CA: the
+    certificate keeps the CSR's subject and key and is INACTIVE unless
+    setAsActive; a CSR that does not parse or verify, or carries a key AWS
+    refuses, is refused with AWS's message."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "csr-device"),
+                         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "csr-org")])
+    csr = (x509.CertificateSigningRequestBuilder().subject_name(subject)
+           .sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode())
+
+    inactive = iot_client.create_certificate_from_csr(certificateSigningRequest=csr)
+    active = iot_client.create_certificate_from_csr(certificateSigningRequest=csr, setAsActive=True)
+    assert inactive["certificateId"] != active["certificateId"]
+    assert inactive["certificateArn"].endswith(":cert/" + inactive["certificateId"])
+    issued = x509.load_pem_x509_certificate(inactive["certificatePem"].encode())
+    spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    assert issued.subject == subject
+    assert issued.public_key().public_bytes(*spki) == key.public_key().public_bytes(*spki)
+    assert not issued.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    desc = iot_client.describe_certificate(certificateId=inactive["certificateId"])["certificateDescription"]
+    assert (desc["status"], desc["certificatePem"]) == ("INACTIVE", inactive["certificatePem"])
+    assert iot_client.describe_certificate(
+        certificateId=active["certificateId"])["certificateDescription"]["status"] == "ACTIVE"
+
+    tampered = csr.replace(csr.splitlines()[-2], csr.splitlines()[-2][:-6] + "AAAAAA")
+    weak = [rsa.generate_private_key(public_exponent=65537, key_size=1024),
+            ec.generate_private_key(ec.SECP224R1()), ec.generate_private_key(ec.SECP256K1())]
+    refused = [(x509.CertificateSigningRequestBuilder().subject_name(subject)
+                .sign(k, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode()) for k in weak]
+    for bad in ("not a csr", tampered, *refused):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_certificate_from_csr(certificateSigningRequest=bad)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == "CSR violates constraints"
+
+    iot_client.update_certificate(certificateId=active["certificateId"], newStatus="INACTIVE")
+    for resp in (inactive, active):
+        iot_client.delete_certificate(certificateId=resp["certificateId"])
+
+
 def test_iot_delete_active_certificate_rejected(iot_client):
     pytest.importorskip("cryptography")
     resp = iot_client.create_keys_and_certificate(setAsActive=True)
