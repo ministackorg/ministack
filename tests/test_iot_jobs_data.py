@@ -728,6 +728,250 @@ def test_iot_jobs_continuous_late_thing_first_call_is_update(
         _cleanup(iot_client, jobs=[job_id], things=[late], groups=[group])
 
 
+def _executions_for(iot_client, thing, job_id):
+    """(executionNumber, status) pairs ListJobExecutionsForThing lists."""
+    summaries = iot_client.list_job_executions_for_thing(
+        thingName=thing, jobId=job_id
+    )["executionSummaries"]
+    return [
+        (s["jobExecutionSummary"]["executionNumber"], s["jobExecutionSummary"]["status"])
+        for s in summaries
+    ]
+
+
+def _drive(iot_jobs_data, thing, job_id, status):
+    """Start the thing's pending execution, then report `status` unless it
+    is IN_PROGRESS."""
+    iot_jobs_data.start_next_pending_job_execution(thingName=thing)
+    if status != "IN_PROGRESS":
+        iot_jobs_data.update_job_execution(
+            thingName=thing, jobId=job_id, status=status
+        )
+
+
+def test_iot_jobs_continuous_thing_rejoining_group_runs_job_again(
+    iot_client, iot_jobs_data
+):
+    """A thing that leaves a CONTINUOUS job's target group and rejoins it
+    after its execution finished gets the next execution number, QUEUED.
+    Leaving moves a QUEUED execution to REMOVED; IN_PROGRESS, SUCCEEDED and
+    FAILED keep their status, and a thing rejoining while IN_PROGRESS gets
+    nothing new (measured eu-central-1 2026-10-05)."""
+    group = _unique("jobs-group")
+    job_id = _unique("job-cont")
+    cases = ["queued", "inprogress", "succeeded", "failed", "stays"]
+    things = {case: _unique(f"jobs-{case}") for case in cases}
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        for thing in things.values():
+            _create_thing(iot_client, thing)
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        _drive(iot_jobs_data, things["inprogress"], job_id, "IN_PROGRESS")
+        _drive(iot_jobs_data, things["succeeded"], job_id, "SUCCEEDED")
+        _drive(iot_jobs_data, things["failed"], job_id, "FAILED")
+        _drive(iot_jobs_data, things["stays"], job_id, "SUCCEEDED")
+
+        movers = [things[case] for case in cases if case != "stays"]
+        for thing in movers:
+            iot_client.remove_thing_from_thing_group(
+                thingGroupName=group, thingName=thing
+            )
+        removed = iot_client.describe_job_execution(
+            jobId=job_id, thingName=things["queued"]
+        )["execution"]
+        assert (removed["status"], removed["versionNumber"]) == ("REMOVED", 1)
+        pending = iot_jobs_data.get_pending_job_executions(thingName=things["queued"])
+        assert pending["queuedJobs"] == []
+        assert _executions_for(iot_client, things["inprogress"], job_id) == [
+            (1, "IN_PROGRESS")
+        ]
+        assert _executions_for(iot_client, things["failed"], job_id) == [(1, "FAILED")]
+
+        for thing in movers:
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        assert _executions_for(iot_client, things["queued"], job_id) == [
+            (2, "QUEUED"), (1, "REMOVED"),
+        ]
+        assert _executions_for(iot_client, things["succeeded"], job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+        assert _executions_for(iot_client, things["failed"], job_id) == [
+            (2, "QUEUED"), (1, "FAILED"),
+        ]
+        assert _executions_for(iot_client, things["inprogress"], job_id) == [
+            (1, "IN_PROGRESS")
+        ]
+        assert _executions_for(iot_client, things["stays"], job_id) == [
+            (1, "SUCCEEDED")
+        ]
+
+        # The device sees the new execution; the newest one answers a
+        # describe without executionNumber, a number picks an older one.
+        pending = iot_jobs_data.get_pending_job_executions(
+            thingName=things["succeeded"]
+        )
+        assert [(q["jobId"], q["executionNumber"]) for q in pending["queuedJobs"]] == [
+            (job_id, 2)
+        ]
+        newest = iot_client.describe_job_execution(
+            jobId=job_id, thingName=things["succeeded"]
+        )["execution"]
+        assert (newest["executionNumber"], newest["status"]) == (2, "QUEUED")
+        assert newest["versionNumber"] == 1
+        first = iot_client.describe_job_execution(
+            jobId=job_id, thingName=things["succeeded"], executionNumber=1
+        )["execution"]
+        assert (first["executionNumber"], first["status"]) == (1, "SUCCEEDED")
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_job_execution(
+                jobId=job_id, thingName=things["succeeded"], executionNumber=3
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # Every execution counts, the earlier ones of a rejoined thing too.
+        details = iot_client.describe_job(jobId=job_id)["job"]["jobProcessDetails"]
+        assert details["numberOfQueuedThings"] == 3
+        assert details["numberOfInProgressThings"] == 1
+        assert details["numberOfRemovedThings"] == 1
+        assert details["numberOfSucceededThings"] == 2
+        assert details["numberOfFailedThings"] == 1
+
+        # The IN_PROGRESS execution that rejoined finishes as a member: no new
+        # execution follows. A second leave and rejoin runs the job again.
+        _drive(iot_jobs_data, things["inprogress"], job_id, "SUCCEEDED")
+        assert _executions_for(iot_client, things["inprogress"], job_id) == [
+            (1, "SUCCEEDED")
+        ]
+        _drive(iot_jobs_data, things["succeeded"], job_id, "SUCCEEDED")
+        for thing in (things["inprogress"], things["succeeded"]):
+            iot_client.remove_thing_from_thing_group(
+                thingGroupName=group, thingName=thing
+            )
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        assert _executions_for(iot_client, things["inprogress"], job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+        assert _executions_for(iot_client, things["succeeded"], job_id) == [
+            (3, "QUEUED"), (2, "SUCCEEDED"), (1, "SUCCEEDED"),
+        ]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=list(things.values()), groups=[group])
+
+
+def test_iot_jobs_continuous_execution_finished_outside_group_runs_again(
+    iot_client, iot_jobs_data
+):
+    """An IN_PROGRESS execution can still finish after its thing left the
+    target group; rejoining afterwards queues execution 2 (measured
+    eu-central-1 2026-10-05)."""
+    group = _unique("jobs-group")
+    thing = _unique("jobs-thing")
+    job_id = _unique("job-cont")
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        _create_thing(iot_client, thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        _drive(iot_jobs_data, thing, job_id, "IN_PROGRESS")
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=thing)
+
+        state = iot_jobs_data.update_job_execution(
+            thingName=thing, jobId=job_id, status="SUCCEEDED",
+            includeJobExecutionState=True,
+        )["executionState"]
+        assert state["status"] == "SUCCEEDED"
+        assert _executions_for(iot_client, thing, job_id) == [(1, "SUCCEEDED")]
+
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        assert _executions_for(iot_client, thing, job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing], groups=[group])
+
+
+def test_iot_jobs_continuous_join_event_queues_only_without_pending_execution(
+    iot_client, iot_jobs_data
+):
+    """The job runs again when a thing JOINS one of its target groups while
+    its newest execution is finished; membership alone does not re-run it
+    (measured eu-central-1 2026-10-05). In both groups and finished, leaving
+    one adds nothing and rejoining it queues #2; AWS also queued #2 right at
+    the leave in 2 of 4 runs, and this pins the other answer. Finished in
+    one group, joining the other queues #2. Adding a thing to a group it is
+    already in is no join. IN_PROGRESS through a leave and rejoin stays the
+    only execution, also after it finishes."""
+    groups = [_unique("jobs-group"), _unique("jobs-group")]
+    job_id = _unique("job-cont")
+    cases = ["both", "second", "again", "busy"]
+    things = {case: _unique(f"jobs-{case}") for case in cases}
+    try:
+        arns = [
+            iot_client.create_thing_group(thingGroupName=g)["thingGroupArn"]
+            for g in groups
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=arns, document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        for case, thing in things.items():
+            _create_thing(iot_client, thing)
+            for g in groups if case in ("both", "busy") else groups[:1]:
+                iot_client.add_thing_to_thing_group(thingGroupName=g, thingName=thing)
+        for case in ("both", "second", "again"):
+            _drive(iot_jobs_data, things[case], job_id, "SUCCEEDED")
+        _drive(iot_jobs_data, things["busy"], job_id, "IN_PROGRESS")
+
+        for case in ("both", "busy"):
+            iot_client.remove_thing_from_thing_group(
+                thingGroupName=groups[0], thingName=things[case]
+            )
+        iot_client.add_thing_to_thing_group(
+            thingGroupName=groups[1], thingName=things["second"]
+        )
+        iot_client.add_thing_to_thing_group(
+            thingGroupName=groups[0], thingName=things["again"]
+        )
+        assert _executions_for(iot_client, things["both"], job_id) == [(1, "SUCCEEDED")]
+        assert _executions_for(iot_client, things["busy"], job_id) == [
+            (1, "IN_PROGRESS")
+        ]
+        assert _executions_for(iot_client, things["second"], job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+        assert _executions_for(iot_client, things["again"], job_id) == [
+            (1, "SUCCEEDED")
+        ]
+
+        for case in ("both", "busy"):
+            iot_client.add_thing_to_thing_group(
+                thingGroupName=groups[0], thingName=things[case]
+            )
+        assert _executions_for(iot_client, things["both"], job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+        assert _executions_for(iot_client, things["busy"], job_id) == [
+            (1, "IN_PROGRESS")
+        ]
+        _drive(iot_jobs_data, things["busy"], job_id, "SUCCEEDED")
+        assert _executions_for(iot_client, things["busy"], job_id) == [
+            (1, "SUCCEEDED")
+        ]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=list(things.values()), groups=groups)
+
+
 # ---------------------------------------------------------------------------
 # Listing + cancel/delete paths
 # ---------------------------------------------------------------------------
@@ -1544,6 +1788,84 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     assert topics.index(f"{base}/{job_id}/update/accepted") < topics.index(
         f"{base}/notify"
     ) < topics.index(f"{base}/notify-next")
+
+
+def test_jobs_mqtt_leaving_continuous_job_group_notifies(iot_client, iot_data_client):
+    """A thing leaving a CONTINUOUS job's target group loses its QUEUED
+    execution (REMOVED): its pending set and front changed, so notify carries
+    the emptied aggregate and notify-next goes bare."""
+    group = _unique("jobs-mqtt-group")
+    thing = _unique("jobs-mqtt-leave")
+    job_id = _unique("job-cont")
+    base = f"$aws/things/{thing}/jobs"
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        _create_thing(iot_client, thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.remove_thing_from_thing_group(
+                thingGroupName=group, thingName=thing
+            ),
+            want=2,
+        )
+        frames = _frames_by_topic(received)
+        assert frames[f"{base}/notify"]["jobs"] == {}
+        assert set(frames[f"{base}/notify-next"]) == {"timestamp"}
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing], groups=[group])
+
+
+def test_jobs_mqtt_rejoining_continuous_job_group_notifies(
+    iot_client, iot_data_client, iot_jobs_data
+):
+    """A thing that finished a CONTINUOUS job and rejoins its target group
+    gets execution 2 QUEUED: notify lists it and notify-next carries it."""
+    group = _unique("jobs-mqtt-group")
+    thing = _unique("jobs-mqtt-rejoin")
+    job_id = _unique("job-cont")
+    base = f"$aws/things/{thing}/jobs"
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        _create_thing(iot_client, thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        _drive(iot_jobs_data, thing, job_id, "SUCCEEDED")
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=thing)
+
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.add_thing_to_thing_group(
+                thingGroupName=group, thingName=thing
+            ),
+            want=2,
+        )
+        frames = _frames_by_topic(received)
+        queued = frames[f"{base}/notify"]["jobs"]["QUEUED"]
+        assert [(q["jobId"], q["executionNumber"]) for q in queued] == [(job_id, 2)]
+        execution = frames[f"{base}/notify-next"]["execution"]
+        assert (execution["executionNumber"], execution["status"]) == (2, "QUEUED")
+        assert execution["jobDocument"] == _DOCUMENT_OBJECT
+        # The members AWS sends (measured eu-central-1 2026-10-05): no
+        # thingName, and no statusDetails while it is empty.
+        assert set(execution) == {
+            "jobId", "status", "queuedAt", "lastUpdatedAt", "versionNumber",
+            "executionNumber", "jobDocument",
+        }
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing], groups=[group])
 
 
 def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):

@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — a CONTINUOUS job runs again for a thing that rejoins its target group** — executions were kept one per thing and job, so a thing that finished the job, left the group and was added back never got another execution. Joining a target group now queues the next execution number when the thing's newest execution is finished, leaving the group moves a QUEUED execution to `REMOVED`, both publish `jobs/notify(-next)`, the `notify-next` execution leaves out `thingName` and an empty `statusDetails`, and `ListJobExecutionsForThing`, `DescribeJobExecution` with `executionNumber` and `jobProcessDetails` include the earlier executions, as AWS does. Contributed by @iot-rocket.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 

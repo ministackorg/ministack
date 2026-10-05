@@ -527,9 +527,9 @@ async def _route_request(
     # ThingGroups — special add/remove paths must come BEFORE the
     # generic ``/thing-groups/{name}`` handler.
     if path == "/thing-groups/addThingToThingGroup" and method in ("PUT", "POST"):
-        return _add_thing_to_group(_parse_body(body))
+        return await _add_thing_to_group(_parse_body(body))
     if path == "/thing-groups/removeThingFromThingGroup" and method in ("PUT", "POST"):
-        return _remove_thing_from_group(_parse_body(body))
+        return await _remove_thing_from_group(_parse_body(body))
     if path == "/thing-groups" and method == "GET":
         return _list_thing_groups(qp)
     if path.startswith("/thing-groups/") and path.endswith("/things") and method == "GET":
@@ -1173,7 +1173,9 @@ def _delete_thing_group(name: str) -> tuple:
     return json_response({})
 
 
-def _add_thing_to_group(payload: dict) -> tuple:
+async def _add_thing_to_group(payload: dict) -> tuple:
+    """Async because a CONTINUOUS job the thing joins publishes
+    jobs/notify(-next) through the broker."""
     gname = payload.get("thingGroupName")
     tname = payload.get("thingName")
     if not gname or not tname:
@@ -1186,17 +1188,23 @@ def _add_thing_to_group(payload: dict) -> tuple:
     thing = _things.get(tname)
     if thing is None:
         return _error_not_found("Thing", tname)
-    if tname not in group.get("things", []):
+    joined = tname not in group.get("things", [])
+    if joined:
+        prev_next = jobs_first_pending_job_id(tname)
         group.setdefault("things", []).append(tname)
         _thing_groups[gname] = group
         _membership_event("ADDED", group, thing)
     if gname not in thing.get("thingGroupNames", []):
         thing.setdefault("thingGroupNames", []).append(gname)
         _things[tname] = thing
+    if joined and _jobs_thing_joined_group(tname, _thing_group_arn(gname)):
+        await jobs_notify_thing(get_account_id(), get_region(), tname, prev_next)
     return json_response({})
 
 
-def _remove_thing_from_group(payload: dict) -> tuple:
+async def _remove_thing_from_group(payload: dict) -> tuple:
+    """Async because a QUEUED CONTINUOUS execution the removal retires
+    publishes jobs/notify(-next) through the broker."""
     gname = payload.get("thingGroupName")
     tname = payload.get("thingName")
     group = _thing_groups.get(gname) if gname else None
@@ -1205,6 +1213,7 @@ def _remove_thing_from_group(payload: dict) -> tuple:
         return _error_not_found("ThingGroup", gname or "")
     if thing is None:
         return _error_not_found("Thing", tname or "")
+    prev_next = jobs_first_pending_job_id(tname)
     if tname in group.get("things", []):
         group["things"].remove(tname)
         _thing_groups[gname] = group
@@ -1212,6 +1221,8 @@ def _remove_thing_from_group(payload: dict) -> tuple:
     if gname in thing.get("thingGroupNames", []):
         thing["thingGroupNames"].remove(gname)
         _things[tname] = thing
+    if _jobs_thing_left_group(tname):
+        await jobs_notify_thing(get_account_id(), get_region(), tname, prev_next)
     return json_response({})
 
 
@@ -4043,13 +4054,15 @@ def _list_topic_rules(qp: dict) -> tuple:
 #
 # `versionNumber` gives optimistic concurrency: every transition bumps it, and
 # a stale `expectedVersion` is rejected with a 409. `executionNumber` is NOT a
-# concurrency token here — an execution is created once at 1 and nothing
-# re-queues it, so it never changes (AWS increments it when a job execution is
-# retried, which MiniStack does not model).
+# concurrency token here. It counts a thing's executions of one job: 1 for the
+# first, one more each time the thing joins a CONTINUOUS job's target group
+# again after its last execution finished (AWS also increments it when a job
+# execution is retried, which MiniStack does not model). `_job_executions`
+# holds the newest execution per (thing, job); the older, terminal ones ride
+# along newest first under its internal `history` key.
 #
-# TIMED_OUT and REMOVED are recognized as terminal (so a restored record in
-# either state behaves, and `jobProcessDetails` counts them) but nothing sets
-# them: there are no execution timeouts, and deleting a thing DELETES its
+# A thing leaving every target of a CONTINUOUS job moves its QUEUED execution
+# to REMOVED (see `_jobs_thing_left_group`). Deleting a thing DELETES its
 # executions (see `_delete_thing`) rather than marking them REMOVED.
 
 # Job ids are stricter than thing names, and identically so in both service
@@ -4170,19 +4183,95 @@ def _jobs_materialize_executions(job_id: str) -> None:
         key = (thing, job_id)
         if key in _job_executions:
             continue
-        _job_executions[key] = {
-            "jobId": job_id,
-            "thingName": thing,
-            "status": "QUEUED",
-            "statusDetails": {},
-            "queuedAt": now,
-            "startedAt": None,
-            "lastUpdatedAt": now,
-            "executionNumber": 1,
-            "versionNumber": 1,
-        }
+        _jobs_queue_execution(thing, job_id, now)
     if job.get("targetSelection") == "SNAPSHOT":
         job["snapshotted"] = True
+
+
+def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
+    """Queue the thing's next execution of a job, at version 1.
+
+    The first one is number 1. A later one takes the next number and keeps
+    the finished one before it under `history`.
+    """
+    previous = _job_executions.get((thing, job_id))
+    execution = {
+        "jobId": job_id,
+        "thingName": thing,
+        "status": "QUEUED",
+        "statusDetails": {},
+        "queuedAt": now,
+        "startedAt": None,
+        "lastUpdatedAt": now,
+        "executionNumber": 1,
+        "versionNumber": 1,
+    }
+    if previous is not None:
+        execution["executionNumber"] = previous["executionNumber"] + 1
+        execution["history"] = [
+            {k: v for k, v in previous.items() if k != "history"},
+            *previous.get("history", []),
+        ]
+    _job_executions[(thing, job_id)] = execution
+
+
+def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
+    """Run every CONTINUOUS job targeting a group for a thing that just
+    joined it.
+
+    The thing gets a new QUEUED execution unless its newest one is still
+    QUEUED or IN_PROGRESS. That covers a thing rejoining after its execution
+    finished, and a thing that finished the job joining another target group
+    of it (measured eu-central-1 2026-10-05). Returns whether anything was
+    queued, i.e. whether the thing's jobs/notify topics have news.
+    """
+    now = _jobs_now_ms()
+    queued = False
+    for job_id, job in _jobs.items():
+        if (
+            job.get("targetSelection") != "CONTINUOUS"
+            or job.get("status") == "CANCELED"
+            or group_arn not in (job.get("targets") or [])
+        ):
+            continue
+        previous = _job_executions.get((thing, job_id))
+        if previous is not None and previous["status"] not in _JOB_EXECUTION_TERMINAL:
+            continue
+        _jobs_queue_execution(thing, job_id, now)
+        queued = True
+    return queued
+
+
+def _jobs_thing_left_group(thing: str) -> bool:
+    """Retire a thing's QUEUED CONTINUOUS executions after it left a group.
+
+    Call after the membership change. For every CONTINUOUS job the thing no
+    longer resolves into, a QUEUED execution becomes REMOVED with its
+    `versionNumber` unchanged. IN_PROGRESS, SUCCEEDED and FAILED executions
+    keep their status (measured eu-central-1 2026-10-05). Returns whether a
+    pending execution went away, i.e. whether jobs/notify has news.
+    """
+    now = _jobs_now_ms()
+    removed = False
+    for job_id, job in _jobs.items():
+        execution = _job_executions.get((thing, job_id))
+        if (
+            execution is None
+            or execution["status"] != "QUEUED"
+            or job.get("targetSelection") != "CONTINUOUS"
+            or job.get("status") == "CANCELED"
+            or thing in _job_target_things(job.get("targets"))
+        ):
+            continue
+        execution["status"] = "REMOVED"
+        execution["lastUpdatedAt"] = now
+        removed = True
+    return removed
+
+
+def _jobs_with_history(execution: dict) -> list[dict]:
+    """A thing's executions of one job, newest first."""
+    return [execution, *execution.get("history", [])]
 
 
 def _jobs_materialize_all() -> None:
@@ -4512,10 +4601,13 @@ def _describe_job(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     _jobs_materialize_executions(job_id)
+    # Every execution counts, a rejoined thing's earlier ones included
+    # (measured eu-central-1 2026-10-05).
     counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
-    for execution in _job_executions.values():
-        if execution["jobId"] == job_id:
-            counts[execution["status"]] += 1
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            for execution in _jobs_with_history(latest):
+                counts[execution["status"]] += 1
     job_doc = {
         **_job_summary(job),
         "targets": list(job.get("targets") or []),
@@ -4695,7 +4787,7 @@ async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> t
             thing, tail[:-len("/cancel")], _parse_body(body), qp
         )
     if "/" not in tail and method == "GET":
-        return _describe_job_execution(thing, tail)
+        return _describe_job_execution(thing, tail, qp)
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
     )
@@ -4709,7 +4801,13 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     # The wire shape nests the detail under `jobExecutionSummary`, with only
     # the jobId beside it (JobExecutionSummaryForThing).
     summaries = []
-    for execution in _job_executions.values():
+    # A rejoined thing's executions of one job come newest first, as on AWS.
+    executions = [
+        execution
+        for latest in _job_executions.values()
+        for execution in _jobs_with_history(latest)
+    ]
+    for execution in executions:
         if execution["thingName"] != thing:
             continue
         if wanted_status and execution["status"] != wanted_status:
@@ -4731,9 +4829,22 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     return json_response({"executionSummaries": summaries})
 
 
-def _describe_job_execution(thing: str, job_id: str) -> tuple:
+def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
+    """Without `executionNumber` the newest execution, with it that one."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
+    number = qp.get("executionNumber")
+    if execution is not None and number is not None:
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return error_response_json(
+                "InvalidRequestException", f"Invalid executionNumber: {number!r}", 400
+            )
+        execution = next(
+            (e for e in _jobs_with_history(execution) if e["executionNumber"] == number),
+            None,
+        )
     if execution is None:
         return _error_not_found("Job execution", f"{thing}/{job_id}")
     view = {
@@ -5025,12 +5136,13 @@ async def jobs_notify_thing(
     Payloads (all timestamps epoch seconds): ``notify`` carries
     ``{"timestamp", "jobs": {<STATUS>: [summaries]}}`` with empty status
     lists omitted (``{}`` once nothing is pending); ``notify-next`` carries
-    the full execution view — status and ``jobDocument`` as a JSON object
-    included — or a bare ``{"timestamp"}`` when the queue emptied.
+    the execution view (``jobDocument`` as a JSON object, no ``thingName``)
+    or a bare ``{"timestamp"}`` when the queue emptied.
 
-    Known boundaries: a CONTINUOUS job's execution materialized lazily on a
-    *read* (a thing that joined the target group later) does not notify —
-    the materialization sites are synchronous read paths — and DeleteThing's
+    Known boundaries: an execution materialized lazily on a *read* does not
+    notify — the materialization sites are synchronous read paths (a thing
+    joining a CONTINUOUS job's target group is queued eagerly by
+    AddThingToThingGroup, which does notify) — and DeleteThing's
     execution sweep does not notify the deleted thing (that sweep is itself
     a divergence: AWS keeps a deleted thing's executions, so it publishes
     nothing there either)."""
@@ -5042,6 +5154,12 @@ async def jobs_notify_thing(
             if nxt is not None
             else None
         )
+    if next_view is not None:
+        # AWS sends no thingName and no empty statusDetails here (measured
+        # eu-central-1 2026-10-05).
+        del next_view["thingName"]
+        if not next_view["statusDetails"]:
+            del next_view["statusDetails"]
     ts = int(time.time())
     jobs_by_status: dict = {}
     for execution in pending:
