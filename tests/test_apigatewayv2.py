@@ -1940,6 +1940,69 @@ def test_apigw_request_authorizer_iam_policy_response_enforced_in_data_plane(api
         lam.delete_function(FunctionName=int_fn)
 
 
+def test_apigw_jwt_claims_delivered_to_lambda_as_strings(apigw, lam, cognito_idp):
+    """Every JWT claim value reaches the Lambda event as a string, as on AWS."""
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"jwt-claims-str-{suffix}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    claims = event['requestContext']['authorizer']['jwt']['claims']\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(claims)}\n"
+    )
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-str-{suffix}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+    api_id = apigw.create_api(Name=f"jwt-str-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        integ_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="JWT",
+            Name="jwt-str-auth",
+            IdentitySource=["$request.header.Authorization"],
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
+        )["AuthorizerId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /secure",
+            Target=f"integrations/{integ_id}",
+            AuthorizationType="JWT",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        now = int(time.time())
+        token = _make_signed_token(
+            {"sub": "u1", "iss": issuer, "aud": "ms-client", "iat": now, "exp": now + 3600,
+             "email_verified": True, "cognito:groups": ["admin", "dev"]}
+        )
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/secure"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", f"Bearer {token}")
+        claims = json.loads(_urlreq.urlopen(req).read())
+        assert claims["iat"] == str(now)
+        assert claims["exp"] == str(now + 3600)
+        assert claims["email_verified"] == "true"
+        assert claims["cognito:groups"] == "[admin dev]"
+        assert all(isinstance(v, str) for v in claims.values())
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+        lam.delete_function(FunctionName=fn)
+
+
 def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
     import urllib.request as _urlreq
 
@@ -3182,6 +3245,21 @@ def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
         "principalId": "alice", "user": "alice", "n": "7", "ok": "true", "type": "REQUEST", "eventType": "CONNECT",
         "methodArn": f"arn:aws:execute-api:us-east-1:000000000000:{api_id}/prod/$connect",
     }
+
+
+def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
+    """An AWS_IAM $connect refuses an unsigned handshake with 403 and accepts a SigV4-signed one."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"iam-{uuid.uuid4().hex[:6]}", connect_code=_ECHO_CODE)
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="AWS_IAM")
+
+    status, body = _ws_handshake(api_id, "/prod")
+    assert (status, body["message"]) == (403, "Missing Authentication Token")
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/execute-api/aws4_request, "
+                               "SignedHeaders=host;x-amz-date, Signature=0"}
+    assert _ws_handshake(api_id, "/prod", signed)[0] == 101
+    presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
+    assert _ws_handshake(api_id, presigned)[0] == 101
 
 
 @pytest.mark.parametrize("resource, message", [

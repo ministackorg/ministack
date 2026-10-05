@@ -22,6 +22,7 @@ which stay account-scoped because their ARN keys embed region.
 
 import contextvars
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -334,12 +335,18 @@ def _get_docker():
     return _docker_client
 
 
+def _scope() -> str:
+    # A short account+region hash, as RDS names its containers: Dashboards reaches
+    # the data container by name, a single DNS label of at most 63 characters.
+    return hashlib.sha1(f"{get_account_id()}:{get_region()}".encode()).hexdigest()[:12]
+
+
 def _container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-{get_region()}-{domain_name}"
+    return f"ministack-opensearch-{_scope()}-{domain_name}"
 
 
 def _dashboards_container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-dashboards-{get_region()}-{domain_name}"
+    return f"ministack-opensearch-dashboards-{_scope()}-{domain_name}"
 
 
 def _image_is_local(docker_client, image: str) -> bool:
@@ -367,6 +374,53 @@ def _remove_container_by_id(cid: str) -> None:
         c.remove(force=True, v=True)
     except Exception:
         pass
+
+
+def start_engine_container(docker, name: str, labels: dict, host_port=None, volumes=None):
+    """Run one single-node OpenSearch engine container.
+
+    Returns ``(container_id, host, port)`` for reaching its HTTP API. With
+    ``host_port=None`` Docker picks the published port. ``volumes``, if given,
+    is passed through to ``containers.run`` unchanged (a named volume bound to
+    the data dir, so data survives a container restart). Raises on failure.
+    Shared with the OpenSearch Serverless data plane.
+    """
+    run_kwargs = dict(
+        image=apply_image_prefix(DEFAULT_IMAGE), detach=True,
+        ports={"9200/tcp": host_port},
+        name=name,
+        labels=labels,
+        environment={
+            "discovery.type": "single-node",
+            # Disable security plugin so test code can talk to the cluster
+            # without bootstrapping a CA chain. Real AWS requires HTTPS+IAM;
+            # matching that here would block every smoke test.
+            "DISABLE_SECURITY_PLUGIN": "true",
+            "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
+        },
+        ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
+    )
+    if volumes is not None:
+        run_kwargs["volumes"] = volumes
+    if DOCKER_NETWORK:
+        run_kwargs["network"] = DOCKER_NETWORK
+    container = docker.containers.run(**run_kwargs)
+    try:
+        host, port = _MINISTACK_HOST, host_port
+        if DOCKER_NETWORK or host_port is None:
+            container.reload()
+            settings = container.attrs.get("NetworkSettings", {})
+        if DOCKER_NETWORK:
+            ip = settings.get("Networks", {}).get(DOCKER_NETWORK, {}).get("IPAddress", "")
+            if ip:
+                host, port = ip, 9200
+        if port is None:
+            bindings = (settings.get("Ports") or {}).get("9200/tcp") or []
+            port = int(bindings[0]["HostPort"])
+    except Exception:
+        _remove_container_by_id(container.id)
+        raise
+    return container.id, host, port
 
 
 def _spawn_dataplane(domain_name: str, engine_version: str):
@@ -399,7 +453,6 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         dash_host_port = _dashboards_port_counter[0]
         _dashboards_port_counter[0] += 1
 
-    image = apply_image_prefix(DEFAULT_IMAGE)
     labels = {
         # Standard label so the boot/shutdown orphan reap finds these; the
         # com.ministack.* keys below are what the service's own lookups use.
@@ -409,40 +462,13 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         "com.ministack.region": get_region(),
         "com.docker.compose.project": "ministack",
     }
-    env_vars = {
-        "discovery.type": "single-node",
-        # Disable security plugin so test code can talk to the cluster
-        # without bootstrapping a CA chain. Real AWS requires HTTPS+IAM;
-        # matching that here would block every smoke test.
-        "DISABLE_SECURITY_PLUGIN": "true",
-        "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
-    }
-    run_kwargs = dict(
-        image=image, detach=True,
-        ports={"9200/tcp": host_port},
-        name=_container_name(domain_name),
-        labels=labels,
-        environment=env_vars,
-        ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
-    )
-    if DOCKER_NETWORK:
-        run_kwargs["network"] = DOCKER_NETWORK
-
-    cid = None
-    endpoint_host, endpoint_port = _MINISTACK_HOST, host_port
     try:
-        container = docker.containers.run(**run_kwargs)
-        cid = container.id
-        if DOCKER_NETWORK:
-            container.reload()
-            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
-            if ip:
-                endpoint_host = ip
-                endpoint_port = 9200
+        cid, endpoint_host, endpoint_port = start_engine_container(
+            docker, _container_name(domain_name), labels, host_port
+        )
         logger.info(
-            "OpenSearch: started container %s at %s:%s (image=%s)",
-            domain_name, endpoint_host, endpoint_port, image,
+            "OpenSearch: started container %s at %s:%s",
+            domain_name, endpoint_host, endpoint_port,
         )
     except Exception as e:
         logger.warning("OpenSearch: Docker failed for %s: %s", domain_name, e)

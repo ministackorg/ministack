@@ -11,7 +11,7 @@ User Pools operations:
   CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool,
   AddCustomAttributes,
   CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient,
-  ListUserPoolClients, UpdateUserPoolClient,
+  ListUserPoolClients, UpdateUserPoolClient, GetUICustomization, SetUICustomization,
   AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers,
   AdminSetUserPassword, AdminUpdateUserAttributes,
   AdminInitiateAuth, AdminRespondToAuthChallenge,
@@ -455,6 +455,7 @@ _user_pools = AccountRegionScopedDict()
 #   _groups:  {group_name -> group_dict},
 #   _identity_providers: {provider_name -> provider_dict},
 #   _resource_servers: {identifier -> resource_server_dict},
+#   _ui_customizations: {client_id or ALL -> UICustomizationType},
 # }
 
 _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
@@ -2367,6 +2368,8 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        "GetUICustomization": _get_ui_customization,
+        "SetUICustomization": _set_ui_customization,
         # Resource Servers
         "CreateResourceServer": _create_resource_server,
         "UpdateResourceServer": _update_resource_server,
@@ -2821,6 +2824,42 @@ def _update_user_pool_client(data):
             client[k] = data[k]
     client["LastModifiedDate"] = _now_epoch()
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+
+
+def _ui_customization_target(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return None, None, err
+    cid = data.get("ClientId") or "ALL"
+    if cid != "ALL" and cid not in pool["_clients"]:
+        return None, None, error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    return pool, cid, None
+
+
+def _set_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    if not (pool.get("Domain") or pool.get("CustomDomain")):
+        return error_response_json(
+            "InvalidParameterException", "There has to be an existing domain associated with this user pool", 400)
+    # ImageFile is accepted but not stored: ministack does not serve the classic hosted UI assets.
+    now = _now_epoch()
+    ui = pool.setdefault("_ui_customizations", {})
+    ui[cid] = {
+        "UserPoolId": pool["Id"], "ClientId": cid, "CSS": data.get("CSS", ""), "CSSVersion": str(int(now * 1000)),
+        "CreationDate": ui.get(cid, {}).get("CreationDate", now), "LastModifiedDate": now,
+    }
+    return json_response({"UICustomization": ui[cid]})
+
+
+def _get_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    ui = pool.get("_ui_customizations", {})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {"UserPoolId": pool["Id"], "ClientId": cid}})
 
 
 # ---------------------------------------------------------------------------
