@@ -421,6 +421,52 @@ def test_sqs_fifo_queue(sqs):
     assert len(msgs["Messages"]) >= 1
     assert msgs["Messages"][0]["Body"] == "fifo-msg-0"
 
+def test_sqs_fifo_queue_delay_seconds(sqs):
+    url = sqs.create_queue(
+        QueueName="intg-sqs-fifo-delay.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+            "DelaySeconds": "1",
+        },
+    )["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="fifo-delayed", MessageGroupId="g1")
+
+    msgs = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=0
+    )
+    assert msgs.get("Messages", []) == []
+    time.sleep(1.1)
+    msgs = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=0
+    )
+    assert [message["Body"] for message in msgs.get("Messages", [])] == ["fifo-delayed"]
+
+def test_sqs_fifo_send_message_rejects_delay_seconds(sqs):
+    url = sqs.create_queue(
+        QueueName="intg-sqs-fifo-message-delay.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+        },
+    )["QueueUrl"]
+
+    with pytest.raises(ClientError) as exc:
+        sqs.send_message(
+            QueueUrl=url,
+            MessageBody="not-enqueued",
+            MessageGroupId="g1",
+            DelaySeconds=5,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert "The request include parameter that is not valid for this queue type." \
+        in exc.value.response["Error"]["Message"]
+
+    msgs = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=0
+    )
+    assert msgs.get("Messages", []) == []
+
 def test_sqs_fifo_deduplication(sqs):
     url = sqs.create_queue(
         QueueName="intg-sqs-dedup.fifo",
@@ -571,6 +617,18 @@ def test_sqs_delay_seconds(sqs):
     msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
     assert len(msgs["Messages"]) == 1
     assert msgs["Messages"][0]["Body"] == "delayed"
+
+def test_sqs_message_delay_seconds_zero_overrides_queue_delay(sqs):
+    url = sqs.create_queue(
+        QueueName="intg-sqs-delay-zero",
+        Attributes={"DelaySeconds": "10"},
+    )["QueueUrl"]
+    sqs.send_message(QueueUrl=url, MessageBody="immediate", DelaySeconds=0)
+
+    msgs = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=0
+    )
+    assert [message["Body"] for message in msgs.get("Messages", [])] == ["immediate"]
 
 def test_sqs_message_system_attributes(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-sysattr")["QueueUrl"]

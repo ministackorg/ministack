@@ -641,8 +641,15 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
         )
 
-    delay = int(data.get("DelaySeconds")
-                or q["attributes"].get("DelaySeconds", "0"))
+    message_delay = data.get("DelaySeconds")
+    if q["is_fifo"] and message_delay is not None:
+        raise _Err(
+            "InvalidParameterValue",
+            f"Value {message_delay} for parameter DelaySeconds is invalid. "
+            "Reason: The request include parameter that is not valid for this queue type.",
+        )
+    delay = int(message_delay if message_delay is not None
+                else q["attributes"].get("DelaySeconds", "0"))
     msg_attrs = data.get("MessageAttributes") or {}
     sys_attrs = data.get("MessageSystemAttributes") or {}
     group_id = data.get("MessageGroupId")
@@ -681,8 +688,6 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             return r
         q["fifo_seq"] += 1
         seq = str(q["fifo_seq"]).zfill(20)
-        delay = 0
-
     now = time.time()
     mid = new_uuid()
     md5b = hashlib.md5(body_text.encode()).hexdigest()
