@@ -22,6 +22,7 @@ which stay account-scoped because their ARN keys embed region.
 
 import contextvars
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -334,12 +335,18 @@ def _get_docker():
     return _docker_client
 
 
+def _scope() -> str:
+    # A short account+region hash, as RDS names its containers: Dashboards reaches
+    # the data container by name, a single DNS label of at most 63 characters.
+    return hashlib.sha1(f"{get_account_id()}:{get_region()}".encode()).hexdigest()[:12]
+
+
 def _container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-{get_region()}-{domain_name}"
+    return f"ministack-opensearch-{_scope()}-{domain_name}"
 
 
 def _dashboards_container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-dashboards-{get_region()}-{domain_name}"
+    return f"ministack-opensearch-dashboards-{_scope()}-{domain_name}"
 
 
 def _image_is_local(docker_client, image: str) -> bool:

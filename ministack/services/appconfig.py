@@ -457,6 +457,40 @@ def _delete_hosted_configuration_version(app_id, profile_id, version_number):
 # ---------------------------------------------------------------------------
 
 
+def _predefined_strategy(strategy_id, fields):
+    """A predefined strategy record; AWS names it by its id."""
+    return {
+        "Id": strategy_id,
+        "Name": strategy_id,
+        **fields,
+        "ReplicateTo": "NONE",
+    }
+
+
+# Values as ListDeploymentStrategies returns them on AWS.
+_PREDEFINED_DEPLOYMENT_STRATEGIES = {
+    strategy_id: _predefined_strategy(strategy_id, fields)
+    for strategy_id, fields in {
+        "AppConfig.AllAtOnce": {
+            "Description": "Quick", "DeploymentDurationInMinutes": 0, "GrowthType": "LINEAR",
+            "GrowthFactor": 100.0, "FinalBakeTimeInMinutes": 10,
+        },
+        "AppConfig.Linear50PercentEvery30Seconds": {
+            "Description": "Test/Demo", "DeploymentDurationInMinutes": 1, "GrowthType": "LINEAR",
+            "GrowthFactor": 50.0, "FinalBakeTimeInMinutes": 1,
+        },
+        "AppConfig.Canary10Percent20Minutes": {
+            "Description": "AWS Recommended", "DeploymentDurationInMinutes": 20, "GrowthType": "EXPONENTIAL",
+            "GrowthFactor": 10.0, "FinalBakeTimeInMinutes": 10,
+        },
+        "AppConfig.Linear20PercentEvery6Minutes": {
+            "Description": "AWS Recommended", "DeploymentDurationInMinutes": 30, "GrowthType": "LINEAR",
+            "GrowthFactor": 20.0, "FinalBakeTimeInMinutes": 30,
+        },
+    }.items()
+}
+
+
 def _create_deployment_strategy(body):
     name = body.get("Name")
     if not name:
@@ -478,8 +512,23 @@ def _create_deployment_strategy(body):
     return _json(201, record)
 
 
+def _find_deployment_strategy(strategy_id):
+    """A stored strategy of this account and region, or else the predefined one with that id."""
+    return _deployment_strategies.get(strategy_id) or _PREDEFINED_DEPLOYMENT_STRATEGIES.get(strategy_id)
+
+
+def _deployment_params_from_strategy(strategy):
+    """The strategy fields a deployment copies when it starts; later strategy changes do not reach it."""
+    return {
+        "DeploymentDurationInMinutes": strategy["DeploymentDurationInMinutes"],
+        "GrowthType": strategy["GrowthType"],
+        "GrowthFactor": strategy["GrowthFactor"],
+        "FinalBakeTimeInMinutes": strategy["FinalBakeTimeInMinutes"],
+    }
+
+
 def _get_deployment_strategy(strategy_id):
-    strategy = _deployment_strategies.get(strategy_id)
+    strategy = _find_deployment_strategy(strategy_id)
     if not strategy:
         return _error(404, "ResourceNotFoundException", f"Deployment strategy {strategy_id} not found")
     return _json(200, strategy)
@@ -487,11 +536,13 @@ def _get_deployment_strategy(strategy_id):
 
 def _list_deployment_strategies(query):
     max_results = int(query.get("max_results", 50))
-    items = list(_deployment_strategies.values())
+    items = [*_deployment_strategies.values(), *_PREDEFINED_DEPLOYMENT_STRATEGIES.values()]
     return _json(200, {"Items": items[:max_results]})
 
 
 def _update_deployment_strategy(strategy_id, body):
+    if strategy_id in _PREDEFINED_DEPLOYMENT_STRATEGIES:
+        return _error(400, "BadRequestException", f"Cannot update predefined Deployment Strategy {strategy_id}")
     strategy = _deployment_strategies.get(strategy_id)
     if not strategy:
         return _error(404, "ResourceNotFoundException", f"Deployment strategy {strategy_id} not found")
@@ -503,6 +554,9 @@ def _update_deployment_strategy(strategy_id, body):
 
 
 def _delete_deployment_strategy(strategy_id):
+    # AWS ends this message with a period; the update message has none.
+    if strategy_id in _PREDEFINED_DEPLOYMENT_STRATEGIES:
+        return _error(400, "BadRequestException", f"Cannot delete predefined Deployment Strategy {strategy_id}.")
     if strategy_id not in _deployment_strategies:
         return _error(404, "ResourceNotFoundException", f"Deployment strategy {strategy_id} not found")
     del _deployment_strategies[strategy_id]
@@ -528,6 +582,11 @@ def _start_deployment(app_id, env_id, body):
     if profile_id and f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
 
+    strategy = _find_deployment_strategy(strategy_id)
+    if not strategy:
+        return _error(404, "ResourceNotFoundException",
+                      f"DeploymentStrategy with Id {strategy_id} could not be found.")
+
     existing = [
         v for k, v in _deployments.items()
         if k.startswith(f"{app_id}/{env_id}/")
@@ -545,10 +604,7 @@ def _start_deployment(app_id, env_id, body):
         "ConfigurationLocationUri": "hosted",
         "ConfigurationVersion": version,
         "Description": body.get("Description", ""),
-        "DeploymentDurationInMinutes": 0,
-        "GrowthType": "LINEAR",
-        "GrowthFactor": 100.0,
-        "FinalBakeTimeInMinutes": 0,
+        **_deployment_params_from_strategy(strategy),
         "State": "COMPLETE",
         "PercentageComplete": 100.0,
         "StartedAt": now,
@@ -661,7 +717,7 @@ def _resolve_tag_resource_arn(resource_arn):
         return None, _missing_tag_resource(resource_arn)
 
     if len(parts) == 2 and parts[0] == "deploymentstrategy" and parts[1]:
-        if parts[1] in _deployment_strategies:
+        if _find_deployment_strategy(parts[1]):
             return str(spec), None
         return None, _missing_tag_resource(resource_arn)
 
