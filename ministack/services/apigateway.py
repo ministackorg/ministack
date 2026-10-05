@@ -1588,6 +1588,16 @@ def _v2_request_body_is_text(content_type: str | None) -> bool:
     )
 
 
+def _jwt_claim_to_string(value):
+    """API Gateway hands every JWT claim to a Lambda as a string: numbers as digits,
+    booleans as true/false, and an array as its items in brackets, e.g. "[admin dev]"."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "[" + " ".join(_jwt_claim_to_string(v) for v in value) + "]"
+    return json.dumps(value)
+
+
 async def _invoke_lambda_proxy(
     integration,
     api_id,
@@ -1687,7 +1697,7 @@ async def _invoke_lambda_proxy(
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
             "jwt": {
-                "claims": authorizer_claims or {},
+                "claims": {k: _jwt_claim_to_string(v) for k, v in (authorizer_claims or {}).items()},
                 "scopes": authorizer_scopes or [],
             }
         }

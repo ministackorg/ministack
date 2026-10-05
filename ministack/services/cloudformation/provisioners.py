@@ -3151,6 +3151,9 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
             "AWS::AppConfig::Deployment requires ApplicationId, EnvironmentId, "
             "DeploymentStrategyId, and ConfigurationProfileId"
         )
+    strategy = _appconfig._find_deployment_strategy(strategy_id)
+    if not strategy:
+        raise ValueError(f"DeploymentStrategy with Id {strategy_id} could not be found.")
     existing = [
         v for k, v in _appconfig._deployments.items()
         if k.startswith(f"{app_id}/{env_id}/")
@@ -3169,6 +3172,7 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
         "ConfigurationLocationUri": "hosted",
         "ConfigurationVersion": props.get("ConfigurationVersion", ""),
         "Description": props.get("Description", ""),
+        **_appconfig._deployment_params_from_strategy(strategy),
         "State": "COMPLETE",
         "PercentageComplete": 100.0,
         "StartedAt": now,

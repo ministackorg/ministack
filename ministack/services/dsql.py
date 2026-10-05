@@ -43,6 +43,13 @@ BASE_PORT = int(os.environ.get("DSQL_BASE_PORT", "25432"))
 # served metadata-only.
 _BACKEND_PORT_WINDOW = 30
 PG_IMAGE = os.environ.get("DSQL_PG_IMAGE", "postgres:16-alpine")
+# DSQL-only settings start at their DSQL defaults, so SHOW works before any
+# SET and RESET returns to the DSQL value rather than an empty placeholder.
+PG_COMMAND = ["postgres"] + [
+    arg
+    for name, default in pgproxy.DSQL_SETTINGS.items()
+    for arg in ("-c", f"{name}={default}")
+]
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
 DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
@@ -242,6 +249,7 @@ def _run_backend_container(identifier):
     ms_network = rds._get_ministack_network(docker_client)
     container_kwargs = dict(
         image=PG_IMAGE,
+        command=PG_COMMAND,
         detach=True,
         environment={
             "POSTGRES_USER": "postgres",
