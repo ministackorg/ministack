@@ -3021,21 +3021,30 @@ def _resolve_ctx_path(path, ctx):
 # Retry / Catch helpers
 # ===================================================================
 
+def _error_matches(error_equals, error):
+    """Return True when a retrier's or catcher's ErrorEquals list matches this error name.
+
+    States.TaskFailed matches every error name except States.Timeout, as the
+    AWS Step Functions error handling guide describes.
+    """
+    if "States.ALL" in error_equals or error in error_equals:
+        return True
+    return "States.TaskFailed" in error_equals and error != "States.Timeout"
+
+
 def _find_matching_retrier(retriers, error, retry_counts):
     for idx, retrier in enumerate(retriers):
-        equals = retrier.get("ErrorEquals", [])
         max_attempts = retrier.get("MaxAttempts", 3)
         if retry_counts.get(idx, 0) >= max_attempts:
             continue
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(retrier.get("ErrorEquals", []), error):
             return retrier, idx
     return None, -1
 
 
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
-        equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
 

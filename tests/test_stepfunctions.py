@@ -3425,6 +3425,41 @@ def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     desc = _wait_sfn(sfn, ex["executionArn"])
     assert desc["status"] == "SUCCEEDED"
 
+
+def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
+    """States.TaskFailed matches every error except States.Timeout, in Retry and in Catch."""
+    queue_url = sqs.create_queue(QueueName="sfn-taskfailed-timeout")["QueueUrl"]
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {
+            "Wait": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                "Parameters": {"QueueUrl": queue_url, "MessageBody": {"token.$": "$$.Task.Token"}},
+                "TimeoutSeconds": 1,
+                "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 1, "MaxAttempts": 1}],
+                "Catch": [
+                    {"ErrorEquals": ["States.TaskFailed"], "Next": "CaughtAsTaskFailed"},
+                    {"ErrorEquals": ["States.Timeout"], "Next": "CaughtAsTimeout"},
+                ],
+                "End": True,
+            },
+            "CaughtAsTaskFailed": {"Type": "Pass", "Result": "task-failed", "End": True},
+            "CaughtAsTimeout": {"Type": "Pass", "Result": "timeout", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-taskfailed-timeout", definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == "timeout"
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    assert [e["type"] for e in events].count("TaskScheduled") == 1
+
+
 def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):
     """lambda:invoke.waitForTaskToken must deliver the *unwrapped* Payload to
     the handler, exactly like the synchronous lambda:invoke path.
