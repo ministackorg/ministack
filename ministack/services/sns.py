@@ -23,6 +23,7 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -1189,7 +1190,7 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
     except ArnParseError:
         _owner, _region = get_account_id(), get_region()
 
-    parsed_message_body = _FILTER_BODY_UNPARSED
+    parsed_message_bodies = {}
     for sub in topic["subscriptions"]:
         if not sub.get("confirmed"):
             continue
@@ -1197,23 +1198,27 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         protocol = sub.get("protocol", "")
         endpoint = sub.get("endpoint", "")
         sub_attributes = sub.get("attributes", {})
-        if (sub_attributes.get("FilterPolicyScope") == "MessageBody"
-                and sub_attributes.get("FilterPolicy")
-                and parsed_message_body is _FILTER_BODY_UNPARSED):
-            try:
-                parsed_message_body = json.loads(message)
-                if not isinstance(parsed_message_body, dict):
-                    parsed_message_body = None
-            except (json.JSONDecodeError, TypeError):
-                parsed_message_body = None
-
-        if not _matches_filter_policy(
-                sub, message_attributes or {}, message, parsed_message_body):
-            continue
-
         effective_message = _resolve_message_for_protocol(
             message, message_structure, protocol
         )
+        parsed_message_body = _FILTER_BODY_UNPARSED
+        if (sub_attributes.get("FilterPolicyScope") == "MessageBody"
+                and sub_attributes.get("FilterPolicy")):
+            parsed_message_body = parsed_message_bodies.get(
+                protocol, _FILTER_BODY_UNPARSED
+            )
+            if parsed_message_body is _FILTER_BODY_UNPARSED:
+                try:
+                    parsed_message_body = json.loads(effective_message)
+                    if not isinstance(parsed_message_body, dict):
+                        parsed_message_body = None
+                except (json.JSONDecodeError, TypeError):
+                    parsed_message_body = None
+                parsed_message_bodies[protocol] = parsed_message_body
+
+        if not _matches_filter_policy(
+                sub, message_attributes or {}, effective_message, parsed_message_body):
+            continue
 
         raw = sub.get("attributes", {}).get("RawMessageDelivery", "false") == "true"
         envelope = _build_envelope(
@@ -1868,7 +1873,7 @@ def _matches_filter_policy(sub: dict, message_attributes: dict,
 
 _OR_RESERVED_MEMBER_KEYS = frozenset({
     "anything-but", "prefix", "suffix", "equals-ignore-case",
-    "numeric", "exists", "cidr",
+    "numeric", "exists", "cidr", "wildcard",
 })
 
 
@@ -1988,10 +1993,23 @@ def _attr_matches_any(attr_value: str, rules: list) -> bool:
             if "equals-ignore-case" in rule:
                 if attr_value.casefold() == rule["equals-ignore-case"].casefold():
                     return True
+            if "cidr" in rule:
+                try:
+                    if ipaddress.ip_address(attr_value) in ipaddress.ip_network(
+                            rule["cidr"], strict=False):
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if "wildcard" in rule:
+                if _wildcard_matches(attr_value, rule["wildcard"]):
+                    return True
             if "anything-but" in rule:
                 excluded = rule["anything-but"]
                 if isinstance(excluded, list):
                     if attr_value not in excluded:
+                        return True
+                elif isinstance(excluded, dict):
+                    if not _attr_matches_any(attr_value, [excluded]):
                         return True
                 elif attr_value != str(excluded):
                     return True
@@ -2004,6 +2022,26 @@ def _attr_matches_any(attr_value: str, rules: list) -> bool:
                 except (ValueError, TypeError):
                     pass
     return False
+
+
+def _wildcard_matches(value, pattern) -> bool:
+    if not isinstance(pattern, str):
+        return False
+    parts = []
+    escaped = False
+    for char in pattern:
+        if escaped:
+            parts.append(_re.escape(char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "*":
+            parts.append(".*")
+        else:
+            parts.append(_re.escape(char))
+    if escaped:
+        parts.append(_re.escape("\\"))
+    return _re.fullmatch("".join(parts), value) is not None
 
 
 def _check_numeric(value: float, conditions: list) -> bool:

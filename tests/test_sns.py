@@ -2103,6 +2103,31 @@ def test_sns_filter_policy_string_operators(
     assert sns_internal._matches_filter_policy(sub, attributes) is expected
 
 
+@pytest.mark.parametrize(
+    ("policy_value", "message_value", "expected"),
+    [
+        ({"cidr": "10.0.0.0/8"}, "10.5.4.3", True),
+        ({"cidr": "10.0.0.0/8"}, "192.168.1.1", False),
+        ({"cidr": "2001:db8::/32"}, "2001:db8::42", True),
+        ({"wildcard": "report-*.json"}, "report-final.json", True),
+        ({"wildcard": "report-*.json"}, "report-final.csv", False),
+        ({"anything-but": {"prefix": "internal-"}}, "public-event", True),
+        ({"anything-but": {"prefix": "internal-"}}, "internal-event", False),
+        ({"anything-but": {"suffix": ".tmp"}}, "report.json", True),
+        ({"anything-but": {"suffix": ".tmp"}}, "report.tmp", False),
+    ],
+)
+def test_sns_filter_policy_additional_string_operators(
+    sns_internal, policy_value, message_value, expected
+):
+    sub = {
+        "attributes": {"FilterPolicy": json.dumps({"value": [policy_value]})},
+    }
+    attributes = {"value": {"DataType": "String", "StringValue": message_value}}
+
+    assert sns_internal._matches_filter_policy(sub, attributes) is expected
+
+
 @pytest.mark.parametrize("message_body", ["not-json", "[]", "\"ready\""])
 def test_sns_message_body_filter_rejects_invalid_or_non_object_json(
     sns_internal, message_body
@@ -2184,6 +2209,48 @@ def test_sns_publish_internal_message_body_filter_preserves_delivery_formats(
     assert delivered[0][2:] == (True, body)
     assert json.loads(delivered[1][1])["Message"] == body
     assert delivered[1][2:] == (False, body)
+
+
+def test_sns_message_body_filter_uses_protocol_specific_message_structure(
+    sns_internal, monkeypatch
+):
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(
+            (endpoint, message)
+        ),
+    )
+    subscriptions = [
+        {
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": protocol,
+            "endpoint": endpoint,
+            "confirmed": True,
+            "attributes": {
+                "FilterPolicy": json.dumps({"kind": [expected_kind]}),
+                "FilterPolicyScope": "MessageBody",
+            },
+        }
+        for protocol, endpoint, expected_kind in (
+            ("sqs", "queue-match", "sqs"),
+            ("sqs", "queue-skip", "http"),
+        )
+    ]
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=subscriptions,
+    )
+    message = json.dumps({
+        "default": json.dumps({"kind": "default"}),
+        "sqs": json.dumps({"kind": "sqs"}),
+    })
+
+    sns_internal.publish_internal(arn, message, message_structure="json")
+
+    assert delivered == [("queue-match", json.dumps({"kind": "sqs"}))]
 
 
 def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(

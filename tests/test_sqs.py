@@ -467,6 +467,40 @@ def test_sqs_fifo_send_message_rejects_delay_seconds(sqs):
     )
     assert msgs.get("Messages", []) == []
 
+
+def test_sqs_fifo_batch_rejects_only_entries_with_message_delay(sqs):
+    url = sqs.create_queue(
+        QueueName="intg-sqs-fifo-batch-message-delay.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+            "DelaySeconds": "10",
+        },
+    )["QueueUrl"]
+
+    result = sqs.send_message_batch(
+        QueueUrl=url,
+        Entries=[
+            {"Id": "valid", "MessageBody": "queue-delay", "MessageGroupId": "g1"},
+            {
+                "Id": "invalid",
+                "MessageBody": "message-delay",
+                "MessageGroupId": "g1",
+                "DelaySeconds": 5,
+            },
+        ],
+    )
+
+    assert [entry["Id"] for entry in result["Successful"]] == ["valid"]
+    assert result["Failed"] == [{
+        "Id": "invalid",
+        "Code": "InvalidParameterValue",
+        "Message": "Value 5 for parameter DelaySeconds is invalid. "
+                   "Reason: The request include parameter that is not valid for this queue type.",
+        "SenderFault": True,
+    }]
+    assert sqs.receive_message(QueueUrl=url, WaitTimeSeconds=0).get("Messages", []) == []
+
 def test_sqs_fifo_deduplication(sqs):
     url = sqs.create_queue(
         QueueName="intg-sqs-dedup.fifo",
