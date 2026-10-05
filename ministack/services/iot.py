@@ -1020,7 +1020,11 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if err:
         return err
     if method == "POST":
-        return _create_thing_group(name, _parse_body(body))
+        payload = _parse_body(body)
+        existing = _thing_groups.get(name)
+        if existing is not None:
+            return _create_existing_thing_group(existing, payload)
+        return _create_thing_group(name, payload)
     if method == "GET":
         return _describe_thing_group(name)
     if method == "PATCH":
@@ -1029,6 +1033,47 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return _delete_thing_group(name)
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _thing_group_tag_pairs(tags: list | None) -> list:
+    return sorted((t.get("Key"), t.get("Value")) for t in tags or [])
+
+
+def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
+    """CreateThingGroup on a name that exists. AWS answers 200 with the
+    existing group when the request describes it exactly: description,
+    attributes (in any key order), parent and tags. The merge flag does not
+    count, and an empty attribute map or tag list equals none. Any difference
+    is a 409 that leaves the group as it was; a property or parent difference
+    names the group, a tag difference names the ARN, and both carry
+    resourceArn/resourceId as null (measured eu-central-1, 2026-10-05).
+
+    CloudFormation creates through ``_create_thing_group``, which keeps
+    refusing an existing name as the AWS::IoT::ThingGroup handler does."""
+    props = payload.get("thingGroupProperties") or {}
+    stored = group["thingGroupProperties"]
+    stored_parent = (group.get("thingGroupMetadata") or {}).get("parentGroupName")
+    if (
+        props.get("thingGroupDescription") != stored.get("thingGroupDescription")
+        or ((props.get("attributePayload") or {}).get("attributes") or {})
+        != ((stored.get("attributePayload") or {}).get("attributes") or {})
+        or (payload.get("parentGroupName") or None) != stored_parent
+    ):
+        message = f"Thing Group {group['thingGroupName']} already exists in current account"
+    elif _thing_group_tag_pairs(payload.get("tags")) != _thing_group_tag_pairs(group.get("tags")):
+        message = f"Resource {group['thingGroupArn']} already exists in current account"
+    else:
+        return json_response({
+            "thingGroupName": group["thingGroupName"],
+            "thingGroupArn": group["thingGroupArn"],
+            "thingGroupId": group["thingGroupId"],
+        })
+    return error_response_json(
+        "ResourceAlreadyExistsException",
+        f"{message} with different properties",
+        409,
+        extra={"resourceArn": None, "resourceId": None},
     )
 
 
@@ -1055,6 +1100,8 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "version": 1,
         "things": [],
         "creationDate": _now_epoch(),
+        # Kept for a repeated CreateThingGroup to compare; not echoed.
+        "tags": list(payload.get("tags") or []),
     }
     if parent:
         # DescribeThingGroup reports the parent under thingGroupMetadata, as
@@ -1078,7 +1125,7 @@ def _describe_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
         return _error_not_found("ThingGroup", name)
-    return json_response(g)
+    return json_response({k: v for k, v in g.items() if k != "tags"})
 
 
 def _list_thing_groups(qp: dict) -> tuple:

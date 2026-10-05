@@ -12467,6 +12467,11 @@ def _iot_thing_group_properties(props):
 
 def _iot_thing_group_create(logical_id, props, stack_name):
     name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    # CreateThingGroup answers 200 for an identical existing group, but a stack
+    # never adopts one: AWS fails its name-conflict validation before creating
+    # anything, whatever the properties (measured eu-central-1, 2026-10-05).
+    if name in _iot._thing_groups:
+        raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
     payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]

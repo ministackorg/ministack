@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — `CreateThingGroup` on an existing name returns the group when nothing differs** — a repeated `CreateThingGroup` always failed with `ResourceAlreadyExistsException`. It now returns the existing group's name, ARN and id when the description, attributes (in any order), parent and tags match, and answers 409 with AWS's message otherwise, leaving the group unchanged, as AWS does. An `AWS::IoT::ThingGroup` that names an existing group still fails its stack, with or without matching properties, now with AWS's name-conflict message. Contributed by @iot-rocket.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 
