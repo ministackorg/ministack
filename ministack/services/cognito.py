@@ -2269,7 +2269,7 @@ _SECRET_HASH_PARAMETERS = {
 def _validate_client_secret_hash(action: str, data: dict):
     """Authenticate confidential app clients before user changes or triggers.
 
-    This is Cognito's app-client contract, independent of IAM's AUTH flag.
+    Enforced under AUTH=true.
     Refresh authentication uses the token owner's username (or sub for a
     UsernameAttributes pool), rather than the alias used at initial sign-in.
     """
@@ -2340,7 +2340,8 @@ def _validate_client_secret_hash(action: str, data: dict):
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
-    error = _validate_client_secret_hash(action, data)
+    from ministack.app import AUTH
+    error = _validate_client_secret_hash(action, data) if AUTH else None
     if error:
         return error
     return handler(data)
