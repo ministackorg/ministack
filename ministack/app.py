@@ -56,6 +56,8 @@ _CLOUDFRONT_HOST_RE = re.compile(
 # than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
 # AWS-shaped hostname is the whole point of addressing a function this way.
 _LAMBDA_URL_RE = re.compile(r"^([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.lambda-url\.[a-z0-9-]+\.")
+# OpenSearch Serverless collection endpoint: {collectionId}.{region}.aoss.<anything>[:port].
+_AOSS_COLLECTION_HOST_RE = re.compile(r"^[a-z0-9]{3,40}\.[a-z0-9-]+\.aoss\.", re.IGNORECASE)
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
@@ -416,6 +418,7 @@ SERVICE_REGISTRY = {
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
     "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
+    "opensearchserverless": {"module": "opensearchserverless", "aliases": ("aoss",)},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
     "pipes": {"module": "pipes"},
@@ -2196,6 +2199,13 @@ async def _handle_special_data_plane_request(
         headers, body, query_params, client_ip,
     ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+    # Before S3 virtual hosting, which would read the collection id as a bucket.
+    if _AOSS_COLLECTION_HOST_RE.match(host) and (
+        response := await _get_module("opensearchserverless").handle_dataplane(
+            method, host, raw_path or path, raw_query_string, headers, body, query_params
+        )
+    ):
+        return _with_data_plane_headers(response, request_id)
     if response := await _handle_execute_api_request(
         host, path, method, headers, body, query_params, raw_path=raw_path
     ):

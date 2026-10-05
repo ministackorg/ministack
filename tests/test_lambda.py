@@ -6875,7 +6875,7 @@ def test_throttle_response_shape_matches_aws():
     body = r["body"]
     assert body["__type"] == "TooManyRequestsException"
     assert body["Reason"] == "ReservedFunctionConcurrentInvocationLimitExceeded"
-    assert "retryAfterSeconds" in body
+    assert body["retryAfterSeconds"] == "1"  # a string in the Lambda API model, not an int
     assert "message" in body
 
 
@@ -10722,7 +10722,7 @@ def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
     # The message and type the local and catch-all docker paths already emit.
     assert result["body"] == {
         "errorMessage": "Task timed out after 3.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     # Internal signal to _execute_function_docker: do not pool this container.
     assert result["timeout"] is True
@@ -10822,7 +10822,7 @@ def test_lambda_docker_timeout_recycles_the_container(monkeypatch):
 
     for result in (first, second):
         assert result["error"] is True
-        assert result["body"]["errorType"] == "Runtime.ExitError"
+        assert result["body"]["errorType"] == "Sandbox.Timedout"
         assert result["body"]["errorMessage"] == "Task timed out after 3.00 seconds"
         # The recycle signal is internal and must not reach the caller.
         assert "timeout" not in result
@@ -10997,7 +10997,7 @@ def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
         elapsed = time.time() - started
         assert resp.get("FunctionError") == "Unhandled"
         assert payload["errorMessage"] == "Task timed out after 3.00 seconds"
-        assert payload["errorType"] == "Runtime.ExitError"
+        assert payload["errorType"] == "Sandbox.Timedout"
         # One timeout, not a retry storm (broken code took 4x+ the Timeout and
         # surfaced a raw "Lambda RIE failed" instead).
         assert elapsed < 9, f"timeout took {elapsed:.1f}s — retry storm?"
@@ -14234,7 +14234,7 @@ def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
     assert result["function_error"] == "Unhandled"
     assert result["body"] == {
         "errorMessage": "Task timed out after 300.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     assert result["timeout"] is True
 

@@ -501,6 +501,30 @@ def test_rds_cluster_parameter_group(rds):
     assert groups[0]["DBClusterParameterGroupName"] == "test-cpg"
     rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="test-cpg")
 
+def test_rds_create_parameter_group_refuses_an_existing_name(rds):
+    """AWS refuses a second create of a parameter group; it must not replace the group with an empty one."""
+    name = f"pg-dup-{_uuid_mod.uuid4().hex[:8]}"
+    rds.create_db_parameter_group(DBParameterGroupName=name, DBParameterGroupFamily="mysql8.0", Description="d")
+    rds.create_db_cluster_parameter_group(DBClusterParameterGroupName=name,
+                                          DBParameterGroupFamily="aurora-mysql8.0", Description="d")
+    rds.modify_db_parameter_group(DBParameterGroupName=name, Parameters=[
+        {"ParameterName": "max_connections", "ParameterValue": "100", "ApplyMethod": "immediate"}])
+    try:
+        for create in (
+            lambda: rds.create_db_parameter_group(DBParameterGroupName=name,
+                                                  DBParameterGroupFamily="mysql8.0", Description="d"),
+            lambda: rds.create_db_cluster_parameter_group(DBClusterParameterGroupName=name,
+                                                          DBParameterGroupFamily="aurora-mysql8.0", Description="d"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                create()
+            assert exc.value.response["Error"]["Code"] == "DBParameterGroupAlreadyExists"
+        params = rds.describe_db_parameters(DBParameterGroupName=name, Source="user")["Parameters"]
+        assert [(p["ParameterName"], p["ParameterValue"]) for p in params] == [("max_connections", "100")]
+    finally:
+        rds.delete_db_parameter_group(DBParameterGroupName=name)
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName=name)
+
 def test_rds_modify_db_parameter_group(rds):
     rds.create_db_parameter_group(
         DBParameterGroupName="test-mpg",
@@ -5264,6 +5288,48 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     m._instances.clear()
 
 
+def test_rds_deferred_mysql_start_grants_master_privileges(monkeypatch):
+    """A MySQL instance started in the background (cold image cache, or a
+    restore) gets the same master-user admin grant as one started inline."""
+    from ministack.services import rds as m
+
+    class FakeContainer:
+        id = "cid-mysql"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self): pass
+
+    class FakeContainers:
+        def get(self, name):
+            raise Exception("not found")
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    grants = []
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda port: True)
+    monkeypatch.setattr(m, "_run_rds_container", lambda *_args, **_kwargs: FakeContainer())
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *args: grants.append(args))
+
+    db_id = "deferred-mysql"
+    instance = {
+        "DBInstanceIdentifier": db_id, "Engine": "mysql", "EngineVersion": "8.4",
+        "MasterUsername": "admin", "_MasterUserPassword": "password123",
+        "DBName": "mydb", "DBInstanceStatus": "creating", "_HostPort": 15600,
+    }
+    m._instances.clear()
+    m._instances[db_id] = instance
+    try:
+        m._start_rds_container_for_instance(db_id, instance)
+        assert grants == [("127.0.0.1", 15600, "admin", "password123", db_id)]
+        assert instance["DBInstanceStatus"] == "available"
+    finally:
+        m._instances.clear()
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -8142,6 +8208,84 @@ def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE
         autocommit=True,
         connect_timeout=5,
     )
+
+
+@pytest.mark.data_plane
+def test_rds_mysql_binary_logging_follows_backup_retention(rds):
+    """On RDS a backup retention period of 0 turns binary logging off."""
+    suffix = uuid.uuid4().hex[:8]
+    expected = {f"binlog-off-{suffix}": 0, f"binlog-on-{suffix}": 1}
+    try:
+        for db_id, retention in zip(expected, (0, 1)):
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, Engine="mysql", EngineVersion="8.0",
+                DBInstanceClass="db.t3.micro", AllocatedStorage=20, DBName=DATABASE,
+                MasterUsername="admin", MasterUserPassword=PASSWORD,
+                BackupRetentionPeriod=retention,
+            )
+        for db_id, log_bin in expected.items():
+            conn = _aurora_connect(_wait_for_instance(rds, db_id)["Endpoint"])
+            with conn.cursor() as cur:
+                cur.execute("SELECT @@log_bin")
+                assert cur.fetchone()[0] == log_bin
+            conn.close()
+    finally:
+        for db_id in expected:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.data_plane
+def test_rds_mysql_applies_db_parameter_group(rds):
+    """An instance starts with its DB parameter group (a name mysqld only takes
+    under another option, `time_zone`, does not stop it). An immediate change to
+    a dynamic parameter applies at once and a reset returns it to the default; AWS
+    refuses an immediate change to a static one, which pending-reboot accepts."""
+    suffix = uuid.uuid4().hex[:8]
+    group, db_id = f"pg-{suffix}", f"pg-db-{suffix}"
+    rds.create_db_parameter_group(DBParameterGroupName=group,
+                                  DBParameterGroupFamily="mysql8.0", Description="test")
+
+    def modify(name, value, method="immediate"):
+        rds.modify_db_parameter_group(DBParameterGroupName=group, Parameters=[
+            {"ParameterName": name, "ParameterValue": value, "ApplyMethod": method}])
+
+    def status():
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        return instance["DBParameterGroups"][0]["ParameterApplyStatus"]
+
+    modify("collation_server", "utf8mb4_bin")
+    modify("time_zone", "UTC")
+    try:
+        rds.create_db_instance(
+            DBInstanceIdentifier=db_id, Engine="mysql", EngineVersion="8.0",
+            DBInstanceClass="db.t3.micro", AllocatedStorage=20, DBName=DATABASE,
+            MasterUsername="admin", MasterUserPassword=PASSWORD, DBParameterGroupName=group,
+        )
+        conn = _aurora_connect(_wait_for_instance(rds, db_id)["Endpoint"])
+        cur = conn.cursor()
+
+        def variable(name):
+            cur.execute(f"SELECT @@GLOBAL.{name}")
+            return cur.fetchone()[0]
+
+        assert variable("collation_server") == "utf8mb4_bin"
+        modify("max_connections", "300")
+        assert (variable("max_connections"), status()) == (300, "in-sync")
+        modify("long_query_time", "0.5")
+        assert (float(variable("long_query_time")), status()) == (0.5, "in-sync")
+        rds.reset_db_parameter_group(DBParameterGroupName=group, Parameters=[
+            {"ParameterName": "max_connections", "ApplyMethod": "immediate"}])
+        assert variable("max_connections") == 151
+        with pytest.raises(ClientError) as exc:
+            modify("performance_schema", "0")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert status() == "in-sync"
+        modify("performance_schema", "0", "pending-reboot")
+        assert status() == "pending-reboot"
+        conn.close()
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        rds.delete_db_parameter_group(DBParameterGroupName=group)
 
 
 @contextlib.contextmanager

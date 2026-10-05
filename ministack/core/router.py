@@ -264,6 +264,11 @@ SERVICE_PATTERNS = {
         ],
         "credential_scope": "es",
     },
+    "opensearchserverless": {
+        "target_prefixes": ["OpenSearchServerless."],
+        "host_patterns": [r"^aoss\."],
+        "credential_scope": "aoss",
+    },
     "organizations": {
         "target_prefixes": ["AWSOrganizationsV20161128"],
         "host_patterns": [r"^organizations\."],
@@ -769,6 +774,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "waf-regional": "waf-regional",
                 "es": "opensearch",
                 "opensearch": "opensearch",
+                "aoss": "opensearchserverless",
                 "organizations": "organizations",
                 "account": "account",
                 "batch": "batch",

@@ -91,6 +91,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "monitoring": "cloudwatch",
     "mq": "mq",
     "opensearch": "es",
+    "opensearchserverless": "aoss",
     "organizations": "organizations",
     "pipes": "pipes",
     "rds": "rds",
