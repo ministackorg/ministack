@@ -12,12 +12,28 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import re
 import time
 from urllib.parse import parse_qs
+from xml.sax.saxutils import escape
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
-from ministack.core.responses import error_response_json, get_account_id, get_region, json_response, new_uuid
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    is_root_access_key,
+    resolve_credential,
+)
+from ministack.core.responses import (
+    _account_from_sts_session,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
@@ -95,6 +111,37 @@ def _credential_error_response(error: CredentialResolutionError):
     code = {"ExpiredTokenException": "ExpiredToken",
             "UnrecognizedClientException": "InvalidClientTokenId"}.get(error.code, error.code)
     return _error(403, code, error.message, ns="sts")
+
+
+def _access_key_id_problems(key_id: str | None) -> list[str]:
+    """The constraint violations AWS reports for a GetAccessKeyInfo AccessKeyId."""
+    if key_id is None:
+        return ["Value null at 'accessKeyId' failed to satisfy constraint: Member must not be null"]
+    constraints = [
+        ("Member must satisfy regular expression pattern: [\\w]*", not re.fullmatch(r"\w*", key_id, re.ASCII)),
+        ("Member must have length greater than or equal to 16", len(key_id) < 16),
+        ("Member must have length less than or equal to 128", len(key_id) > 128),
+    ]
+    return [f"Value '{escape(key_id)}' at 'accessKeyId' failed to satisfy constraint: {c}"
+            for c, failed in constraints if failed]
+
+
+def _access_key_account(key_id: str) -> str | None:
+    """The account owning a known key, else the account AWS decodes from an AKIA/ASIA id, else None."""
+    if is_root_access_key(key_id):
+        return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    try:
+        account = _account_from_sts_session(key_id) or find_iam_access_key_account(key_id)
+    except AmbiguousAccessKeyError:
+        account = None
+    if account:
+        return account
+    if key_id[:4] not in ("AKIA", "ASIA") or len(key_id) > 25:
+        return None
+    bits = 0
+    for char in key_id[4:14]:
+        bits = bits << 5 | max("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".find(char), 0)
+    return f"{bits >> 9 & (1 << 40) - 1:012d}" if bits >> 49 else None
 
 
 def reset():
@@ -364,11 +411,19 @@ async def handle_request(method, path, headers, body, query_params):
                     ns="sts")
 
     if action == "GetAccessKeyInfo":
+        key_id = _p(params, "AccessKeyId", None)
+        problems = _access_key_id_problems(key_id)
+        if problems:
+            count = f"{len(problems)} validation error{'s' if len(problems) > 1 else ''} detected"
+            return _error(400, "ValidationError", f"{count}: " + "; ".join(problems), ns="sts")
+        account = _access_key_account(key_id)
+        if account is None:
+            return _error(400, "ValidationError", "Access key ID is not valid.", ns="sts")
         if use_json:
-            return json_response({"Account": get_account_id()})
+            return json_response({"Account": account})
         return _xml(200, "GetAccessKeyInfoResponse",
                     f"<GetAccessKeyInfoResult>"
-                    f"<Account>{get_account_id()}</Account>"
+                    f"<Account>{account}</Account>"
                     f"</GetAccessKeyInfoResult>",
                     ns="sts")
 

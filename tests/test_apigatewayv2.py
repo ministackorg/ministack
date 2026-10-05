@@ -3184,6 +3184,21 @@ def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
     }
 
 
+def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
+    """An AWS_IAM $connect refuses an unsigned handshake with 403 and accepts a SigV4-signed one."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"iam-{uuid.uuid4().hex[:6]}", connect_code=_ECHO_CODE)
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="AWS_IAM")
+
+    status, body = _ws_handshake(api_id, "/prod")
+    assert (status, body["message"]) == (403, "Missing Authentication Token")
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/execute-api/aws4_request, "
+                               "SignedHeaders=host;x-amz-date, Signature=0"}
+    assert _ws_handshake(api_id, "/prod", signed)[0] == 101
+    presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
+    assert _ws_handshake(api_id, presigned)[0] == 101
+
+
 @pytest.mark.parametrize("resource, message", [
     ({"Type": "AWS::ApiGatewayV2::Authorizer", "Properties": {
         "AuthorizerType": "JWT", "Name": "jwt", "IdentitySource": ["route.request.querystring.token"],

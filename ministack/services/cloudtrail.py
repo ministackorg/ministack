@@ -42,6 +42,10 @@ _trails = AccountRegionScopedDict()           # trail_name -> trail_record, scop
 _event_selectors = AccountRegionScopedDict()  # trail_name -> list[EventSelector], scoped to HomeRegion
 _trail_tags = AccountScopedDict()             # trail_arn -> {tag_key: tag_value}
 
+_DEFAULT_EVENT_SELECTORS = [
+    {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
+]
+
 _SCRUB_KEYS = frozenset(
     {
         "secretaccesskey",
@@ -658,6 +662,11 @@ def _update_trail(body: dict):
     return _ok(resp)
 
 
+def _event_selectors_field(selectors: list) -> str:
+    """Response field for stored selectors; advanced selectors carry FieldSelectors."""
+    return "AdvancedEventSelectors" if selectors and "FieldSelectors" in selectors[0] else "EventSelectors"
+
+
 def _put_event_selectors(body: dict):
     raw = body.get("TrailName", "").strip()
     if not raw:
@@ -665,9 +674,26 @@ def _put_event_selectors(body: dict):
     name, home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
-    selectors = body.get("EventSelectors", [])
+    basic, advanced = body.get("EventSelectors"), body.get("AdvancedEventSelectors")
+    if basic is not None and advanced is not None:
+        return _err(
+            "InvalidEventSelectorsException",
+            "You can select events by using either EventSelectors or AdvancedEventSelectors, but not both.",
+        )
+    if basic is None and advanced is None:
+        return _err(
+            "InvalidEventSelectorsException",
+            "You must select events by using either EventSelectors or AdvancedEventSelectors, "
+            "but you cannot use both.",
+        )
+    if advanced == []:
+        return _err("InvalidEventSelectorsException", "Specify between 1 and 500 selectors for your trail.")
+    if basic is not None and not 1 <= len(basic) <= 5:
+        return _err("InvalidEventSelectorsException", "Specify a valid number of selectors (1 to 5) for your trail")
+    selectors = advanced or [{**_DEFAULT_EVENT_SELECTORS[0], **selector} for selector in basic]
     _event_selectors.set_scoped(get_account_id(), home_region, name, selectors)
-    return _ok({"TrailARN": trail["TrailARN"], "EventSelectors": selectors})
+    trail["HasCustomEventSelectors"] = selectors != _DEFAULT_EVENT_SELECTORS
+    return _ok({"TrailARN": trail["TrailARN"], _event_selectors_field(selectors): selectors})
 
 
 def _get_event_selectors(body: dict):
@@ -680,12 +706,11 @@ def _get_event_selectors(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
-    selectors = _event_selectors.get_scoped(get_account_id(), home_region, name) or []
+    selectors = _event_selectors.get_scoped(get_account_id(), home_region, name, _DEFAULT_EVENT_SELECTORS)
     return _ok(
         {
             "TrailARN": trail.get("TrailARN", _trail_arn(name)),
-            "EventSelectors": selectors,
-            "AdvancedEventSelectors": [],
+            _event_selectors_field(selectors): selectors,
         }
     )
 
