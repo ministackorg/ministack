@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway — `GetApiKeys` filters by `nameQuery`** — `GetApiKeys` ignored `nameQuery` and returned all the API keys, so a lookup by name could get the wrong key. It now returns only the keys whose names start with `nameQuery`.
 - **RDS — a MySQL master user started in the background keeps its admin grant** — an instance whose engine image was not cached yet, or one respawned on restore, started on a background path that skipped the master-user grant the inline path gives, so the master user held only its own database and `SET PERSIST` failed for lack of `SYSTEM_VARIABLES_ADMIN`. Both paths now grant it. Contributed by @skialpine.
 ### Added
 
