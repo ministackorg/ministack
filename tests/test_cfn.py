@@ -1228,6 +1228,46 @@ def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_iot_ca_certificate_lists_certificates_registered_under_it(cfn, iot_client):
+    """A CA the stack registered is the same registry entry the API uses:
+    device certificates registered under it by RegisterCertificate come back
+    from ListCertificatesByCA for the stack's CA id, newest first."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-iot-ca-by-ca-{suffix}"
+    ca_pem, ca_key = generate_ca(common_name=f"cfn-by-ca-{suffix}")
+    template = json.dumps({
+        "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem, "Status": "ACTIVE", "CertificateMode": "SNI_ONLY",
+        }}},
+        "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+    })
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    cert_ids = []
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        ca_id = stack["Outputs"][0]["OutputValue"]
+        for i in range(2):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=f"cfn-by-ca-device-{i}"
+            )[0]
+            cert_ids.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [c["certificateId"] for c in listing] == cert_ids[::-1]
+    finally:
+        for cert_id in cert_ids:
+            iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot_client.delete_certificate(certificateId=cert_id)
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
 def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_client):
     """A CA already registered out of band answers ResourceAlreadyExists when
     the stack's create re-registers the PEM (the certificate id is derived
@@ -1356,6 +1396,46 @@ def test_cfn_iot_ca_certificate_registration_config_and_mode_immutability(cfn, i
 
     cfn.delete_stack(StackName="cfn-iot-ca-regcfg")
     _wait_stack(cfn, "cfn-iot-ca-regcfg")
+
+
+def test_cfn_iot_sni_only_ca_certificate_auto_registers_with_sni():
+    """A CACertificate declared with CertificateMode SNI_ONLY and
+    AutoRegistrationStatus ENABLE (how a CDK app declares a JITR CA without a
+    verification certificate) is stored as RegisterCACertificate stores it, and
+    just-in-time registration under it runs for a device that sent a server
+    name (SNI) and not for one that did not. In-process, so no MQTT listener is needed."""
+    pytest.importorskip("cryptography")
+    import asyncio
+    import ssl
+
+    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+    from ministack.services import iot as iot_module
+
+    ca_pem, ca_key = generate_ca(common_name="cfn-jitr-sni-ca")
+    leaf_pem = sign_leaf_certificate(ca_pem, ca_key, common_name="cfn-jitr-sni-device")[0]
+    cert_id = get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    handler = _RESOURCE_HANDLERS["AWS::IoT::CACertificate"]
+    props = {"CACertificatePem": ca_pem, "Status": "ACTIVE",
+             "AutoRegistrationStatus": "ENABLE", "CertificateMode": "SNI_ONLY"}
+    ca_id, _attrs = handler["create"]("CA", props, "cfn-jitr-sni")
+
+    async def _connects():
+        return (await iot_module._mtls_auto_register(der, peer),
+                await iot_module._mtls_auto_register(der, peer, "localhost"))
+
+    try:
+        ca = iot_module._ca_certificates[ca_id]
+        assert (ca["status"], ca["autoRegistrationStatus"], ca["certificateMode"]) == (
+            "ACTIVE", "ENABLE", "SNI_ONLY")
+        assert asyncio.run(_connects()) == (False, True)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+    finally:
+        iot_module._certificates.pop(cert_id, None)
+        handler["delete"](ca_id, props)
 
 
 def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
@@ -25646,6 +25726,39 @@ def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_existing_name_fails_even_with_identical_properties(cfn, iot_client):
+    """CreateThingGroup returns an identical existing group, but a stack does not
+    adopt it: with the same or other properties the stack rolls back with the
+    name-conflict message, the group stays as it was and survives the stack's
+    delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-tg-taken-{uid}"
+    original = iot_client.create_thing_group(thingGroupName=name, thingGroupProperties={
+        "thingGroupDescription": "first", "attributePayload": {"attributes": {"a": "1"}}})
+    try:
+        for description in ("first", "second"):
+            stack_name = f"cfn-tg-taken-{description}-{uid}"
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+                "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+                    "ThingGroupName": name,
+                    "ThingGroupProperties": {
+                        "ThingGroupDescription": description,
+                        "AttributePayload": {"Attributes": {"a": "1"}}}}}}}))
+            try:
+                stack = _wait_stack(cfn, stack_name)
+                assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+                assert (f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists."
+                        in _stack_event_reasons(cfn, stack_name))
+            finally:
+                _delete_cfn_test_stack(cfn, stack_name)
+            group = iot_client.describe_thing_group(thingGroupName=name)
+            assert group["thingGroupId"] == original["thingGroupId"]
+            assert group["version"] == 1
+            assert group["thingGroupProperties"]["thingGroupDescription"] == "first"
+    finally:
+        iot_client.delete_thing_group(thingGroupName=name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
@@ -33440,3 +33553,124 @@ def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
     with pytest.raises(ClientError):
         apigw.get_domain_name(DomainName=domain)
 
+
+
+def _rds_groups_template(uid, *, params, subnet_desc="db subnets", attach=True):
+    resources = {
+        "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.42.0.0/16"}},
+        "SubnetA": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.1.0/24", "AvailabilityZone": "us-east-1a"}},
+        "SubnetB": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.2.0/24", "AvailabilityZone": "us-east-1b"}},
+        "Subnets": {"Type": "AWS::RDS::DBSubnetGroup", "Properties": {
+            "DBSubnetGroupDescription": subnet_desc,
+            "SubnetIds": [{"Ref": "SubnetA"}, {"Ref": "SubnetB"}],
+            "Tags": [{"Key": "team", "Value": "db"}]}},
+        "Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "Description": "instance params", "Family": "mysql8.0", "Parameters": params}},
+        "ClusterParams": {"Type": "AWS::RDS::DBClusterParameterGroup", "Properties": {
+            "DBClusterParameterGroupName": f"cpg-{uid}", "Description": "cluster params",
+            "Family": "aurora-mysql8.0", "Parameters": {"time_zone": "UTC"}}},
+        "Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+            "GenerateSecretString": {"SecretStringTemplate": '{"username":"admin"}',
+                                     "GenerateStringKey": "password",
+                                     "ExcludeCharacters": "\"@/\\\\"}}},
+        "Db": {"Type": "AWS::RDS::DBInstance", "DeletionPolicy": "Delete", "Properties": {
+            "DBInstanceIdentifier": f"cfn-groups-{uid}", "Engine": "mysql",
+            "DBInstanceClass": "db.t3.micro", "AllocatedStorage": "20", "DBName": "app",
+            "MasterUsername": "admin", "MasterUserPassword": "password123",
+            "DBSubnetGroupName": {"Ref": "Subnets"}, "DBParameterGroupName": {"Ref": "Params"}}},
+    }
+    if attach:
+        resources["Attach"] = {"Type": "AWS::SecretsManager::SecretTargetAttachment", "Properties": {
+            "SecretId": {"Ref": "Secret"}, "TargetId": {"Ref": "Db"},
+            "TargetType": "AWS::RDS::DBInstance"}}
+    outputs = {
+        "SubnetGroup": {"Value": {"Ref": "Subnets"}},
+        "SubnetGroupArn": {"Value": {"Fn::GetAtt": ["Subnets", "DBSubnetGroupArn"]}},
+        "ParamGroup": {"Value": {"Ref": "Params"}},
+        "ParamGroupName": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupName"]}},
+        "ParamGroupArn": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupArn"]}},
+        "ClusterParamGroup": {"Value": {"Ref": "ClusterParams"}},
+        "SecretArn": {"Value": {"Ref": "Secret"}},
+    }
+    if attach:
+        outputs["Attachment"] = {"Value": {"Ref": "Attach"}}
+    return json.dumps({"Resources": resources, "Outputs": outputs})
+
+
+def test_cfn_rds_groups_and_secret_target_attachment(cfn, rds, sm):
+    """The resources rds.DatabaseInstance emits: a DBSubnetGroup, parameter
+    groups and a SecretTargetAttachment that writes the connection keys."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-groups-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+        uid, params={"max_connections": 100, "sql_mode": "STRICT_ALL_TABLES"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupArn"] == out["SubnetGroupArn"]
+        assert len(group["Subnets"]) == 2
+        tags = rds.list_tags_for_resource(ResourceName=out["SubnetGroupArn"])["TagList"]
+        assert {"Key": "team", "Value": "db"} in tags
+        assert out["ParamGroup"] == out["ParamGroupName"]
+        assert out["ParamGroupArn"].endswith(f":pg:{out['ParamGroup']}")
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "100", "sql_mode": "STRICT_ALL_TABLES"}
+        assert out["ClusterParamGroup"] == f"cpg-{uid}"
+        db = rds.describe_db_instances(DBInstanceIdentifier=f"cfn-groups-{uid}")["DBInstances"][0]
+        assert db["DBSubnetGroup"]["DBSubnetGroupName"] == out["SubnetGroup"]
+
+        assert out["Attachment"] == sm.describe_secret(SecretId=out["SecretArn"])["ARN"]
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert value["username"] == "admin" and value["password"]
+        assert value["engine"] == "mysql"
+        assert value["host"] == db["Endpoint"]["Address"]
+        assert value["port"] == db["Endpoint"]["Port"]
+        assert value["dbname"] == "app"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+            uid, params={"max_connections": 200}, subnet_desc="changed", attach=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupDescription"] == "changed"
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "200"}
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert set(value) == {"username", "password"}
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError):
+            rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_parameters(DBParameterGroupName=out["ParamGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_cluster_parameters(DBClusterParameterGroupName=f"cpg-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_rds_custom_named_parameter_group_cannot_be_replaced(cfn):
+    """Family is Update requires: Replacement, so a custom-named group refuses it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-pg-repl-{uid}"
+
+    def template(family):
+        return json.dumps({"Resources": {"Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "DBParameterGroupName": f"pg-{uid}", "Description": "d", "Family": family}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("mysql8.0"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("mysql5.7"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

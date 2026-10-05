@@ -817,6 +817,8 @@ _CUSTOM_NAME_REPLACEMENT = {
         "requires_replacement": lambda old, new: any(
             old.get(p) != new.get(p) for p in _RDS_DB_INSTANCE_CREATE_ONLY + ("Engine",)),
     },
+    "AWS::RDS::DBParameterGroup": {"name": "DBParameterGroupName"},
+    "AWS::RDS::DBClusterParameterGroup": {"name": "DBClusterParameterGroupName"},
     # Type and WorkflowName are "Update requires: Replacement" in the
     # aws-resource-glue-trigger reference.
     "AWS::Glue::Trigger": {
@@ -1124,6 +1126,9 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Logs::LogGroup": ("Tags", "list"),
     "AWS::OpenSearchService::Domain": ("Tags", "list"),
     "AWS::RDS::DBInstance": ("Tags", "list"),
+    "AWS::RDS::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::RDS::DBParameterGroup": ("Tags", "list"),
+    "AWS::RDS::DBSubnetGroup": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -11010,6 +11015,257 @@ def _rds_db_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# RDS DBSubnetGroup / DBParameterGroup / DBClusterParameterGroup
+# ---------------------------------------------------------------------------
+
+def _rds_raise(status, body, resource_type, action):
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    code = re.search(r"<Code>(.*?)</Code>", text)
+    message = re.search(r"<Message>(.*?)</Message>", text, re.S)
+    raise ValueError(
+        f"{resource_type} {action} failed: "
+        f"{code.group(1) if code else status}: {message.group(1) if message else text}")
+
+
+def _rds_call(fn, params, resource_type, action):
+    status, _headers, body = fn(params)
+    if status >= 400:
+        _rds_raise(status, body, resource_type, action)
+
+
+def _rds_sync_tags(arn, old_props, new_props, resource_type):
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
+        _rds_call(_rds._remove_tags, {"ResourceName": arn, **_ec_query({"TagKeys": removed})},
+                  resource_type, "untag")
+    changed = {k: v for k, v in new_tags.items() if old_tags.get(k) != v}
+    if changed:
+        _rds_call(_rds._add_tags, {"ResourceName": arn, **_ec_query({
+            "Tags": [{"Key": k, "Value": v} for k, v in changed.items()]})},
+            resource_type, "tag")
+
+
+def _rds_parameter_values(props):
+    return {str(k): str(v).lower() if isinstance(v, bool) else str(v)
+            for k, v in (props.get("Parameters") or {}).items()}
+
+
+def _rds_set_parameters(fn, name_key, name, values, resource_type, action):
+    # CloudFormation uses each parameter's default apply method: a static
+    # parameter refused as immediate goes pending-reboot.
+    for pname, pvalue in values.items():
+        for method in ("immediate", "pending-reboot"):
+            status, _headers, body = fn({
+                name_key: name,
+                "Parameters.member.1.ParameterName": pname,
+                "Parameters.member.1.ParameterValue": pvalue,
+                "Parameters.member.1.ApplyMethod": method,
+            })
+            if status < 400:
+                break
+            if method == "immediate" and b"InvalidParameterCombination" in body:
+                continue
+            _rds_raise(status, body, resource_type, action)
+
+
+def _rds_reset_parameters(fn, name_key, name, names, resource_type, action):
+    params = {name_key: name}
+    for i, pname in enumerate(names, 1):
+        params[f"Parameters.member.{i}.ParameterName"] = pname
+        params[f"Parameters.member.{i}.ApplyMethod"] = "immediate"
+    _rds_call(fn, params, resource_type, action)
+
+
+def _rds_update_parameters(modify_fn, reset_fn, name_key, name, old_props, new_props,
+                           resource_type):
+    old_values = _rds_parameter_values(old_props)
+    new_values = _rds_parameter_values(new_props)
+    changed = {k: v for k, v in new_values.items() if old_values.get(k) != v}
+    if changed:
+        _rds_set_parameters(modify_fn, name_key, name, changed, resource_type, "update")
+    dropped = sorted(old_values.keys() - new_values.keys())
+    if dropped:
+        _rds_reset_parameters(reset_fn, name_key, name, dropped, resource_type, "update")
+
+
+def _rds_subnet_group_create(logical_id, props, stack_name):
+    name = props.get("DBSubnetGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_subnet_group, {
+        "DBSubnetGroupName": name,
+        **_ec_query({"DBSubnetGroupDescription": props.get("DBSubnetGroupDescription", ""),
+                     "SubnetIds": props.get("SubnetIds") or []}),
+    }, "AWS::RDS::DBSubnetGroup", "create")
+    arn = _rds._subnet_groups[name]["DBSubnetGroupArn"]
+    _rds_sync_tags(arn, {}, props, "AWS::RDS::DBSubnetGroup")
+    return name, {"DBSubnetGroupArn": arn}
+
+
+def _rds_subnet_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if physical_id not in _rds._subnet_groups:
+        return _rds_subnet_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_call(_rds._modify_subnet_group, {
+        "DBSubnetGroupName": physical_id,
+        **_ec_query({"DBSubnetGroupDescription": new_props.get("DBSubnetGroupDescription", ""),
+                     "SubnetIds": new_props.get("SubnetIds") or []}),
+    }, "AWS::RDS::DBSubnetGroup", "update")
+    arn = _rds._subnet_groups[physical_id]["DBSubnetGroupArn"]
+    _rds_sync_tags(arn, old_props, new_props, "AWS::RDS::DBSubnetGroup")
+    return physical_id, {"DBSubnetGroupArn": arn}
+
+
+def _rds_subnet_group_delete(physical_id, props):
+    _rds._delete_subnet_group({"DBSubnetGroupName": physical_id})
+
+
+def _rds_param_group_attrs(name):
+    return {"DBParameterGroupName": name,
+            "DBParameterGroupArn": _rds._param_groups[name]["DBParameterGroupArn"]}
+
+
+def _rds_param_group_create(logical_id, props, stack_name):
+    name = props.get("DBParameterGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_param_group, {
+        "DBParameterGroupName": name,
+        "DBParameterGroupFamily": props.get("Family", ""),
+        "Description": props.get("Description", ""),
+    }, "AWS::RDS::DBParameterGroup", "create")
+    _rds_set_parameters(_rds._modify_param_group, "DBParameterGroupName", name,
+                        _rds_parameter_values(props), "AWS::RDS::DBParameterGroup", "create")
+    _rds_sync_tags(_rds._param_groups[name]["DBParameterGroupArn"], {}, props,
+                   "AWS::RDS::DBParameterGroup")
+    return name, _rds_param_group_attrs(name)
+
+
+def _rds_param_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if physical_id not in _rds._param_groups:
+        return _rds_param_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_update_parameters(_rds._modify_param_group, _rds._reset_param_group,
+                           "DBParameterGroupName", physical_id, old_props, new_props,
+                           "AWS::RDS::DBParameterGroup")
+    _rds_sync_tags(_rds._param_groups[physical_id]["DBParameterGroupArn"], old_props, new_props,
+                   "AWS::RDS::DBParameterGroup")
+    return physical_id, _rds_param_group_attrs(physical_id)
+
+
+def _rds_param_group_delete(physical_id, props):
+    _rds._delete_param_group({"DBParameterGroupName": physical_id})
+
+
+def _rds_cluster_param_group_create(logical_id, props, stack_name):
+    name = props.get("DBClusterParameterGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_db_cluster_param_group, {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": props.get("Family", ""),
+        "Description": props.get("Description", ""),
+    }, "AWS::RDS::DBClusterParameterGroup", "create")
+    _rds_set_parameters(_rds._modify_db_cluster_param_group, "DBClusterParameterGroupName", name,
+                        _rds_parameter_values(props), "AWS::RDS::DBClusterParameterGroup", "create")
+    _rds_sync_tags(_rds._db_cluster_param_groups[name]["DBClusterParameterGroupArn"], {}, props,
+                   "AWS::RDS::DBClusterParameterGroup")
+    return name, {}
+
+
+def _rds_cluster_param_group_update(physical_id, old_props, new_props, stack_name,
+                                    logical_id=None):
+    if physical_id not in _rds._db_cluster_param_groups:
+        return _rds_cluster_param_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_update_parameters(_rds._modify_db_cluster_param_group, _rds._reset_db_cluster_param_group,
+                           "DBClusterParameterGroupName", physical_id, old_props, new_props,
+                           "AWS::RDS::DBClusterParameterGroup")
+    _rds_sync_tags(_rds._db_cluster_param_groups[physical_id]["DBClusterParameterGroupArn"],
+                   old_props, new_props, "AWS::RDS::DBClusterParameterGroup")
+    return physical_id, {}
+
+
+def _rds_cluster_param_group_delete(physical_id, props):
+    _rds._delete_db_cluster_param_group({"DBClusterParameterGroupName": physical_id})
+
+
+# ---------------------------------------------------------------------------
+# SecretsManager SecretTargetAttachment
+# ---------------------------------------------------------------------------
+
+_SM_TARGET_KEYS = ("engine", "host", "port", "dbname")
+
+
+def _sm_target_connection(target_type, target_id):
+    """The connection keys the attachment writes into the secret JSON."""
+    if target_type == "AWS::RDS::DBInstance":
+        record = _rds._instances.get(target_id)
+        if record:
+            endpoint = record.get("Endpoint") or {}
+            host, port, dbname = endpoint.get("Address"), endpoint.get("Port"), record.get("DBName")
+    elif target_type == "AWS::RDS::DBCluster":
+        record = _rds._clusters.get(target_id)
+        if record:
+            host, port, dbname = record.get("Endpoint"), record.get("Port"), record.get("DatabaseName")
+    else:
+        raise ValueError(f"AWS::SecretsManager::SecretTargetAttachment: TargetType {target_type} "
+                         "is not supported")
+    if not record:
+        raise ValueError(f"AWS::SecretsManager::SecretTargetAttachment: {target_type} "
+                         f"{target_id} not found")
+    engine = record.get("Engine", "")
+    for prefix, name in (("aurora-postgresql", "postgres"), ("aurora", "mysql"),
+                         ("oracle", "oracle"), ("sqlserver", "sqlserver")):
+        if engine.startswith(prefix):
+            engine = name
+            break
+    info = {"engine": engine, "host": host, "port": int(port)}
+    if dbname:
+        info["dbname"] = dbname
+    return info
+
+
+def _sm_rewrite_secret(secret_id, info, resource_type, action):
+    _key, secret = _sm._resolve(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        if action == "delete":
+            return None
+        raise ValueError(f"{resource_type} {action} failed: "
+                         "Secrets Manager can't find the specified secret.")
+    current = next((v.get("SecretString") for v in secret["Versions"].values()
+                    if "AWSCURRENT" in v.get("Stages", [])), None)
+    try:
+        value = json.loads(current or "{}")
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        if action == "delete":
+            return None
+        raise ValueError(f"{resource_type} {action} failed: the secret value is not a JSON object")
+    value = {k: v for k, v in value.items() if k not in _SM_TARGET_KEYS}
+    value.update(info)
+    resp = _sm._put_secret_value({"SecretId": secret["ARN"], "SecretString": json.dumps(value)})
+    if resp[0] >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {resp[2]!r}")
+    return secret["ARN"]
+
+
+def _sm_target_attachment_create(logical_id, props, stack_name):
+    info = _sm_target_connection(props.get("TargetType"), props.get("TargetId"))
+    arn = _sm_rewrite_secret(props.get("SecretId"), info,
+                             "AWS::SecretsManager::SecretTargetAttachment", "create")
+    return arn, {}
+
+
+def _sm_target_attachment_update(physical_id, old_props, new_props, stack_name):
+    info = _sm_target_connection(new_props.get("TargetType"), new_props.get("TargetId"))
+    arn = _sm_rewrite_secret(physical_id, info,
+                             "AWS::SecretsManager::SecretTargetAttachment", "update")
+    return arn, {}
+
+
+def _sm_target_attachment_delete(physical_id, props):
+    _sm_rewrite_secret(physical_id, {}, "AWS::SecretsManager::SecretTargetAttachment", "delete")
+
+
+# ---------------------------------------------------------------------------
 # AutoScaling Group
 # ---------------------------------------------------------------------------
 
@@ -12471,6 +12727,11 @@ def _iot_thing_group_properties(props):
 
 def _iot_thing_group_create(logical_id, props, stack_name):
     name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    # CreateThingGroup answers 200 for an identical existing group, but a stack
+    # never adopts one: AWS fails its name-conflict validation before creating
+    # anything, whatever the properties (measured eu-central-1, 2026-10-05).
+    if name in _iot._thing_groups:
+        raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
     payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]
@@ -13166,6 +13427,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::SubnetGroup": ("CacheSubnetGroupName",),
     "AWS::ElastiCache::ParameterGroup": ("CacheParameterGroupFamily",),
+    "AWS::RDS::DBSubnetGroup": ("DBSubnetGroupName",),
+    "AWS::RDS::DBParameterGroup": ("DBParameterGroupName", "Description", "Family"),
+    "AWS::RDS::DBClusterParameterGroup": ("DBClusterParameterGroupName", "Description", "Family"),
+    "AWS::SecretsManager::SecretTargetAttachment": ("SecretId",),
     "AWS::ElastiCache::CacheCluster": (
         "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName", "ClusterName",
         "Engine", "NetworkType",
@@ -13972,6 +14237,29 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "update": _rds_db_instance_update,
                              "update_with_logical_id": True, "delete": _rds_db_instance_delete,
                              "snapshot": _rds_db_instance_snapshot},
+    "AWS::RDS::DBSubnetGroup": {
+        "create": _rds_subnet_group_create,
+        "update": _rds_subnet_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_subnet_group_delete,
+    },
+    "AWS::RDS::DBParameterGroup": {
+        "create": _rds_param_group_create,
+        "update": _rds_param_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_param_group_delete,
+    },
+    "AWS::RDS::DBClusterParameterGroup": {
+        "create": _rds_cluster_param_group_create,
+        "update": _rds_cluster_param_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_cluster_param_group_delete,
+    },
+    "AWS::SecretsManager::SecretTargetAttachment": {
+        "create": _sm_target_attachment_create,
+        "update": _sm_target_attachment_update,
+        "delete": _sm_target_attachment_delete,
+    },
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,
         "update": _iot_topic_rule_update,

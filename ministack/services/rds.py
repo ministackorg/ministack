@@ -2457,6 +2457,13 @@ def _start_rds_container_for_instance(db_id, instance):
         container_kwargs["tmpfs"] = {
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
+    groups = instance.get("DBParameterGroups") or [{}]
+    if _is_mysql_engine(engine) and (options := _mysql_server_options(
+        instance.get("BackupRetentionPeriod", 1), groups[0].get("DBParameterGroupName"),
+    )):
+        container_kwargs["command"] = options
+    if groups[0].get("ParameterApplyStatus") in ("pending-reboot", "applying"):
+        groups[0]["ParameterApplyStatus"] = "in-sync"
 
     try:
         container = _run_rds_container(
@@ -2617,6 +2624,97 @@ def _wait_for_port(host, port, timeout=60):
 
 def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
+
+
+# A DB parameter group name that is also a server variable (RDS-only names such
+# as `rds.force_ssl` are not).
+_MYSQL_SERVER_PARAMETER = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _mysql_server_options(backup_retention_period, param_group_name=None):
+    """Server options for a standalone MySQL/MariaDB instance, as RDS starts one:
+    a backup retention period of 0 turns binary logging off, and the instance's
+    DB parameter group's set values are server options. `--loose-` keeps a name
+    the server does not know as a startup option (such as `time_zone`) from
+    stopping it; formula values (`{DBInstanceClassMemory*3/4}`) are not evaluated."""
+    options = [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
+    group = _param_groups.get(param_group_name) if param_group_name else None
+    for name, param in ((group or {}).get("Parameters") or {}).items():
+        value = param.get("ParameterValue")
+        if _MYSQL_SERVER_PARAMETER.fullmatch(name) and value is not None and not value.startswith("{"):
+            options.append(f"--loose-{name}={value}")
+    return options
+
+
+def _mysql_parameter_value(value):
+    """A parameter value as SET GLOBAL takes it: numeric variables refuse a string."""
+    for parse in (int, float):
+        try:
+            return parse(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _apply_parameter_group_changes(group_name, changes, refuse_static=True):
+    """Apply `(name, value, apply_method)` changes to the running MySQL instances
+    in a DB parameter group, as RDS does: an `immediate` change to a dynamic
+    parameter takes effect now (a `None` value resets it to the engine default);
+    a `pending-reboot` change leaves the instance `pending-reboot` until the next
+    start, which applies the whole group (`_mysql_server_options`). An `immediate`
+    change to a static parameter, which the server reports as a read-only
+    variable, is refused as AWS refuses it, before anything is applied; with
+    `refuse_static=False` (a reset) it is left pending-reboot instead. Returns
+    the refusal, or None."""
+    for instance in list(_instances.values()):
+        groups = instance.get("DBParameterGroups") or []
+        if not (
+            groups and groups[0].get("DBParameterGroupName") == group_name
+            and _is_mysql_engine(instance.get("Engine", ""))
+            and instance.get("_docker_container_id")
+            and not instance.get("DBClusterIdentifier")
+        ):
+            continue
+        pending = any(method != "immediate" for _name, _value, method in changes)
+        immediate = [(name, value) for name, value, method in changes
+                     if method == "immediate" and _MYSQL_SERVER_PARAMETER.fullmatch(name)]
+        if immediate:
+            try:
+                conn = _mysql_endpoint_admin_connection(
+                    instance.get("_internal_address") or "127.0.0.1",
+                    instance.get("_internal_port") or instance.get("_HostPort"),
+                    instance.get("_MasterUserPassword", "password"),
+                )
+            except Exception as e:
+                logger.warning("RDS: cannot apply parameter group %s to %s: %s",
+                               group_name, instance.get("DBInstanceIdentifier"), e)
+                pending = True
+            else:
+                try:
+                    with conn.cursor() as cur:
+                        for name, _value in immediate if refuse_static else ():
+                            try:
+                                cur.execute(f"SET GLOBAL {name} = @@GLOBAL.{name}")
+                            except Exception as e:
+                                if e.args and e.args[0] == 1238:  # ER_INCORRECT_GLOBAL_LOCAL_VAR: read-only
+                                    return _error("InvalidParameterCombination",
+                                                  "cannot use immediate apply method for static parameter", 400)
+                        for name, value in immediate:
+                            try:
+                                if value is None:
+                                    cur.execute(f"SET GLOBAL {name} = DEFAULT")
+                                else:
+                                    cur.execute(f"SET GLOBAL {name} = %s", (_mysql_parameter_value(value),))
+                            except Exception as e:
+                                # A static (read-only) variable takes effect at the next start.
+                                logger.info("RDS: parameter %s for %s applies at the next start: %s",
+                                            name, instance.get("DBInstanceIdentifier"), e)
+                                pending = True
+                finally:
+                    conn.close()
+        if pending:
+            groups[0]["ParameterApplyStatus"] = "pending-reboot"
+    return None
 
 
 def _is_postgres_engine(engine):
@@ -4775,6 +4873,10 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
+                if _is_mysql_engine(engine) and (options := _mysql_server_options(
+                    _p(p, "BackupRetentionPeriod") or "1", param_group_name,
+                )):
+                    container_kwargs["command"] = options
                 container = _run_rds_container(
                     docker_client, engine, container_kwargs,
                     tls_names=[endpoint_host or "",
@@ -6451,6 +6553,8 @@ def _create_param_group(p):
     name = _p(p, "DBParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBParameterGroupName is required", 400)
+    if name in _param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "postgres15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:pg:{name}"
@@ -6530,13 +6634,19 @@ def _modify_param_group(p):
 
     params = pg.setdefault("Parameters", {})
     prefix = _parameter_member_prefix(p)
+    changes = []
     idx = 1
     while _p(p, f"{prefix}.{idx}.ParameterName"):
         pname = _p(p, f"{prefix}.{idx}.ParameterName")
         pvalue = _p(p, f"{prefix}.{idx}.ParameterValue")
         apply_method = _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"
-        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
+        changes.append((pname, pvalue, apply_method))
         idx += 1
+    refusal = _apply_parameter_group_changes(name, changes)
+    if refusal:
+        return refusal
+    for pname, pvalue, apply_method in changes:
+        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
 
     return _xml(200, "ModifyDBParameterGroupResponse",
         f"<ModifyDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ModifyDBParameterGroupResult>")
@@ -6560,12 +6670,17 @@ def _reset_param_group(p):
         )
 
     if reset_all or not has_explicit_parameters:
+        reset = [(pname, None, "immediate") for pname in params]
         params.clear()
     else:
+        reset = []
         idx = 1
         while _p(p, f"{prefix}.{idx}.ParameterName"):
-            params.pop(_p(p, f"{prefix}.{idx}.ParameterName"), None)
+            pname = _p(p, f"{prefix}.{idx}.ParameterName")
+            if params.pop(pname, None) is not None:
+                reset.append((pname, None, _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"))
             idx += 1
+    _apply_parameter_group_changes(name, reset, refuse_static=False)
 
     return _xml(200, "ResetDBParameterGroupResponse",
         f"<ResetDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ResetDBParameterGroupResult>")
@@ -6579,6 +6694,8 @@ def _create_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBClusterParameterGroupName is required", 400)
+    if name in _db_cluster_param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "aurora-postgresql15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}"

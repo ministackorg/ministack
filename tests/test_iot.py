@@ -305,6 +305,95 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
 # ---------------------------------------------------------------------------
 
 
+def test_iot_create_thing_group_repeat_returns_the_existing_group(iot_client):
+    parent, other, name = _unique("parent"), _unique("parent"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=parent)
+    iot_client.create_thing_group(thingGroupName=other)
+    props = {
+        "thingGroupDescription": "first",
+        "attributePayload": {"attributes": {"a": "1", "b": "2"}},
+    }
+    first = iot_client.create_thing_group(
+        thingGroupName=name, parentGroupName=parent, thingGroupProperties=props,
+    )
+
+    # Attribute order and the merge flag do not count (AWS, 2026-10-05).
+    for repeat in (
+        props,
+        {**props, "attributePayload": {"attributes": {"b": "2", "a": "1"}}},
+        {**props, "attributePayload": {"attributes": {"a": "1", "b": "2"}, "merge": True}},
+    ):
+        again = iot_client.create_thing_group(
+            thingGroupName=name, parentGroupName=parent, thingGroupProperties=repeat,
+        )
+        assert (again["thingGroupName"], again["thingGroupArn"], again["thingGroupId"]) == (
+            name, first["thingGroupArn"], first["thingGroupId"])
+
+    for differs in (
+        {"thingGroupProperties": {**props, "thingGroupDescription": "second"}},
+        {"thingGroupProperties": {"thingGroupDescription": "first"}},
+        {"thingGroupProperties": {**props, "attributePayload": {
+            "attributes": {"a": "1"}, "merge": True}}},
+        {},
+    ):
+        kwargs = {"parentGroupName": parent, **differs}
+        for params in (kwargs, {**kwargs, "parentGroupName": other}):
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_thing_group(thingGroupName=name, **params)
+            assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+            assert ei.value.response["Error"]["Message"] == (
+                f"Thing Group {name} already exists in current account with different properties")
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(thingGroupName=name, thingGroupProperties=props)
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+
+    described = iot_client.describe_thing_group(thingGroupName=name)
+    assert described["version"] == 1
+    assert described["thingGroupProperties"]["thingGroupDescription"] == "first"
+    assert described["thingGroupMetadata"]["parentGroupName"] == parent
+    iot_client.delete_thing_group(thingGroupName=name)
+    iot_client.delete_thing_group(thingGroupName=parent)
+    iot_client.delete_thing_group(thingGroupName=other)
+
+
+def test_iot_create_thing_group_repeat_compares_tags(iot_client):
+    bare, tagged = _unique("group"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=bare)
+    first = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+
+    # No properties equals empty properties, empty attributes and no tags.
+    for repeat in (
+        {},
+        {"thingGroupProperties": {}},
+        {"thingGroupProperties": {"attributePayload": {"attributes": {}}}},
+        {"tags": []},
+    ):
+        iot_client.create_thing_group(thingGroupName=bare, **repeat)
+    again = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+    assert again["thingGroupId"] == first["thingGroupId"]
+
+    for name, tags in (
+        (bare, [{"Key": "k", "Value": "v"}]),
+        (tagged, []),
+        (tagged, [{"Key": "k", "Value": "w"}]),
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_thing_group(thingGroupName=name, tags=tags)
+        arn = iot_client.describe_thing_group(thingGroupName=name)["thingGroupArn"]
+        assert ei.value.response["Error"]["Message"] == (
+            f"Resource {arn} already exists in current account with different properties")
+    # A property difference is reported before a tag difference.
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(
+            thingGroupName=tagged, thingGroupProperties={"thingGroupDescription": "x"})
+    assert ei.value.response["Error"]["Message"] == (
+        f"Thing Group {tagged} already exists in current account with different properties")
+    iot_client.delete_thing_group(thingGroupName=bare)
+    iot_client.delete_thing_group(thingGroupName=tagged)
+
+
 def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     parent, child = _unique("parent"), _unique("child")
     iot_client.create_thing_group(thingGroupName=parent)
@@ -5792,13 +5881,18 @@ def _jitr_registration_code(iot_module) -> str:
 async def _jitr_scope_with_ca(
     iot_module, ca_pem: str, verification_pem: str, received: list, allow_auto=True
 ) -> str:
-    """Pin the JITR test scope, register ``ca_pem`` ACTIVE and collect every
-    registered event into ``received``. Returns the CA id."""
+    """Pin the JITR test scope, register ``ca_pem`` ACTIVE (in SNI_ONLY mode
+    when ``verification_pem`` is None) and collect every registered event into
+    ``received``. Returns the CA id."""
     _jitr_registration_code(iot_module)
     qp = {"setAsActive": "true"}
     if allow_auto:
         qp["allowAutoRegistration"] = "true"
-    body = {"caCertificate": ca_pem, "verificationCertificate": verification_pem}
+    body = {"caCertificate": ca_pem}
+    if verification_pem is None:
+        body["certificateMode"] = "SNI_ONLY"
+    else:
+        body["verificationCertificate"] = verification_pem
     status, _, body = await iot_module.handle_request(
         "POST", "/cacertificate", {}, json.dumps(body).encode(), qp
     )
@@ -5923,6 +6017,110 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
         "sourceIp": "192.0.2.10",
     }
     assert second["certificateRegistrationTimestamp"] == str(int(record["creationDate"] * 1000))
+
+
+def test_iot_jitr_under_an_sni_only_ca_needs_sni():
+    """A CA in SNI_ONLY mode auto-registers only on a connect whose ClientHello
+    named the account's endpoint, as on AWS: the account's endpoint prefix
+    counts in any region (and so do the names the gateway serves), while no
+    server name, an unrelated one or another account's prefix creates
+    nothing. A certificate already PENDING_ACTIVATION gets a repeat event only
+    with SNI. A DEFAULT CA auto-registers nothing for an unrelated name
+    either, but still does for a compose service name."""
+    import ssl
+
+    from ministack.services import iot as iot_module
+
+    code = _jitr_registration_code(iot_module)
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf(code)
+    def_ca_pem, def_verification_pem, def_leaf_pem = _generate_ca_and_leaf(code)
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    prefix = iot_module._endpoint_prefix(_JITR_ACCOUNT)
+    other_prefix = iot_module._endpoint_prefix("111111111111")
+    received: list = []
+
+    async def _run():
+        ca_id = await _jitr_scope_with_ca(iot_module, ca_pem, None, received)
+        await _jitr_scope_with_ca(iot_module, def_ca_pem, def_verification_pem, [])
+        for server_name in (
+            None,
+            "mqtt.example.com",
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.amazonaws.com",
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.localhost",
+            f"{other_prefix}.credentials.iot.{_TEST_REGION}.localhost",
+        ):
+            assert not await iot_module._mtls_auto_register(der, peer, server_name)
+            assert cert_id not in iot_module._certificates
+        def_der = ssl.PEM_cert_to_DER_cert(def_leaf_pem)
+        assert not await iot_module._mtls_auto_register(def_der, peer, "mqtt.example.com")
+        assert iot_module.get_certificate_id(def_leaf_pem) not in iot_module._certificates
+        assert await iot_module._mtls_auto_register(def_der, peer, "ministack")
+
+        other_region = f"{prefix.upper()}-ats.iot.us-east-1.amazonaws.com"
+        assert await iot_module._mtls_auto_register(der, peer, other_region)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+        assert not await iot_module._mtls_auto_register(der, peer)
+        assert await iot_module._mtls_auto_register(der, peer, "localhost")
+        return ca_id
+
+    try:
+        ca_id = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+    topic = f"$aws/events/certificates/registered/{ca_id}"
+    events = [event for t, event in received if t == topic]
+    assert [event["certificateId"] for event in events] == [cert_id] * 2
+    assert events[0]["certificateRegistrationTimestamp"] is None
+    assert isinstance(events[1]["certificateRegistrationTimestamp"], str)
+
+
+def test_iot_jitr_sni_only_ca_in_two_accounts_registers_where_the_name_points():
+    """The same SNI_ONLY CA registered in two accounts: an endpoint name picks
+    the account it names, while a name both accounts are served under
+    (``localhost``) is ambiguous and registers nothing."""
+    import ssl
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf("unused")
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    accounts = ("111111111111", "222222222222")
+
+    async def _run():
+        for account in accounts:
+            set_request_account_id(account)
+            set_request_region(_TEST_REGION)
+            status, _, _body = await iot_module.handle_request(
+                "POST", "/cacertificate", {},
+                json.dumps({"caCertificate": ca_pem, "certificateMode": "SNI_ONLY"}).encode(),
+                {"setAsActive": "true", "allowAutoRegistration": "true"},
+            )
+            assert status == 200
+        assert not await iot_module._mtls_auto_register(der, peer, "localhost")
+        prefix = iot_module._endpoint_prefix(accounts[1])
+        name = f"{prefix}-ats.iot.{_TEST_REGION}.localhost"
+        assert await iot_module._mtls_auto_register(der, peer, name)
+        return [
+            iot_module._certificates.get_scoped(account, _TEST_REGION, cert_id)
+            for account in accounts
+        ]
+
+    try:
+        first, second = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+    assert first is None
+    assert second["status"] == "PENDING_ACTIVATION"
 
 
 # ----------------------------------------------------------------------
@@ -6369,6 +6567,41 @@ def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
         iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client):
+    """Without ``caCertificatePem``, AWS links the certificate to the
+    registered ACTIVE CA that signed it: DescribeCertificate names that CA and
+    ListCertificatesByCA lists it. Two CAs share a subject here, so only the
+    signature tells them apart."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    subject = _unique("twin-ca")
+    twins = [generate_ca(common_name=subject) for _ in range(2)]
+    ca_ids, cert_ids = [], []
+    try:
+        for ca_pem, _key in twins:
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, certificateMode="SNI_ONLY", setAsActive=True,
+            )["certificateId"])
+        for ca_pem, ca_key in reversed(twins):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=_unique("twin-device")
+            )[0]
+            cert_ids.insert(0, iot_client.register_certificate(
+                certificatePem=leaf_pem, status="ACTIVE"
+            )["certificateId"])
+
+        for ca_id, cert_id in zip(ca_ids, cert_ids):
+            desc = iot_client.describe_certificate(certificateId=cert_id)[
+                "certificateDescription"
+            ]
+            assert desc["caCertificateId"] == ca_id
+            listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+            assert [c["certificateId"] for c in listing["certificates"]] == [cert_id]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
+
+
 def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
     """``caCertificatePem`` naming a CA that was never registered is a
     ``CertificateValidationException``, and nothing is stored — otherwise the
@@ -6431,6 +6664,167 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
         for ca_id in (ca_x_id, ca_y_id):
             iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
             iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def _delete_certificates_and_cas(iot_client, cert_ids, ca_ids):
+    for cert_id in cert_ids:
+        iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+        iot_client.delete_certificate(certificateId=cert_id)
+    for ca_id in ca_ids:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_list_certificates_by_ca_lists_what_was_registered_under_the_ca(iot_client):
+    """As measured on AWS: every certificate registered with the CA's
+    ``caCertificatePem`` is listed whatever its status, newest first unless
+    ``isAscendingOrder=true``, with the four ``ListCertificates`` members. A
+    leaf the CA issued but registered through RegisterCertificateWithoutCA is
+    not listed, nor is a leaf of another CA."""
+    code = _registration_code(iot_client)
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(code, count=4)
+    other_ca_pem, other_verification_pem, other_leaf = _generate_ca_and_leaf(code)
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    other_ca_id = iot_client.register_ca_certificate(
+        caCertificate=other_ca_pem, verificationCertificate=other_verification_pem,
+        setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        for leaf_pem, status in zip(leaves[:3], ("ACTIVE", "INACTIVE", "REVOKED")):
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status=status,
+            )["certificateId"])
+        under_ca = list(created)
+        created.append(iot_client.register_certificate_without_ca(
+            certificatePem=leaves[3], status="ACTIVE",
+        )["certificateId"])
+        other = iot_client.register_certificate(
+            certificatePem=other_leaf, caCertificatePem=other_ca_pem, status="ACTIVE",
+        )["certificateId"]
+        created.append(other)
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+        assert "nextMarker" not in listing
+        certificates = listing["certificates"]
+        assert [c["certificateId"] for c in certificates] == under_ca[::-1]
+        assert [c["status"] for c in certificates] == ["REVOKED", "INACTIVE", "ACTIVE"]
+        for c in certificates:
+            assert set(c) == {"certificateArn", "certificateId", "status", "creationDate"}
+            assert c["certificateArn"].endswith(":cert/" + c["certificateId"])
+
+        ascending = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, ascendingOrder=True
+        )["certificates"]
+        assert [c["certificateId"] for c in ascending] == under_ca
+
+        other_listing = iot_client.list_certificates_by_ca(caCertificateId=other_ca_id)
+        assert [c["certificateId"] for c in other_listing["certificates"]] == [other]
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id, other_ca_id))
+
+
+def test_iot_list_certificates_by_ca_pages_from_the_last_certificate(iot_client):
+    """``pageSize`` pages carry a ``nextMarker`` until the last one. The marker
+    names a position, the way AWS's does: continuing a descending page with
+    ``isAscendingOrder=true`` yields the certificates newer than that page's
+    last one. A CA without certificates, an id that names no CA and the
+    upper-case form of a CA id all answer an empty list."""
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+        _registration_code(iot_client), count=3
+    )
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        assert iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"] == []
+        for leaf_pem in leaves:
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        seen, marker = [], None
+        for _ in range(len(created)):
+            kwargs = {"marker": marker} if marker else {}
+            page = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=1, **kwargs)
+            assert len(page["certificates"]) == 1
+            seen.append(page["certificates"][0]["certificateId"])
+            marker = page.get("nextMarker")
+            if marker:
+                assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", marker)
+        assert marker is None
+        assert seen == created[::-1]
+
+        paginator = iot_client.get_paginator("list_certificates_by_ca")
+        pages = paginator.paginate(
+            caCertificateId=ca_id, ascendingOrder=True, PaginationConfig={"PageSize": 2}
+        )
+        assert [c["certificateId"] for p in pages for c in p["certificates"]] == created
+
+        first = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=2)
+        flipped = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, pageSize=2, marker=first["nextMarker"], ascendingOrder=True
+        )
+        assert [c["certificateId"] for c in flipped["certificates"]] == [created[2]]
+
+        for unknown in ("0" * 64, ca_id.upper()):
+            assert iot_client.list_certificates_by_ca(caCertificateId=unknown)["certificates"] == []
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id,))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"pageSize": 0},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value greater than or equal to 1",
+        ),
+        (
+            {"pageSize": 251},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value less than or equal to 250",
+        ),
+        (
+            {"caCertificateId": "not-a-ca-id"},
+            "2 validation errors detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            "(0x)?[a-fA-F0-9]+; Value at 'caCertificateId' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"caCertificateId": "a" * 63},
+            "1 validation error detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"marker": "not-a-marker!"},
+            "1 validation error detected: Value at 'marker' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            "[A-Za-z0-9+/]+={0,2}",
+        ),
+        (
+            {"marker": "bm90LWEtbWFya2Vy"},
+            "Invalid/Malformed marker passed for listCertificateByCA",
+        ),
+    ],
+    ids=["page-size-0", "page-size-251", "malformed-id", "short-id", "marker-pattern", "unissued-marker"],
+)
+def test_iot_list_certificates_by_ca_rejects_what_aws_rejects(kwargs, message):
+    """The messages AWS answers once the SDK's own validation is out of the
+    way; the base64 marker is well formed but was never issued."""
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    with pytest.raises(ClientError) as ei:
+        raw.list_certificates_by_ca(**{"caCertificateId": "0" * 64, **kwargs})
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):
