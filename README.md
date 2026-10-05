@@ -947,6 +947,8 @@ Then point the issuer host at MiniStack in `/etc/hosts` (`127.0.0.1 cognito-idp.
 
 The generated certificate covers every region's issuer host. Lambda containers MiniStack starts get the hosts entries and the trust settings automatically. Remove the `/etc/hosts` line before calling the real Cognito.
 
+The same certificate names the IoT `DescribeEndpoint` hosts, so an SDK can dial `https://<endpointAddress>`.
+
 ### Startup Scripts
 
 MiniStack supports two types of init scripts, with LocalStack-compatible paths:
