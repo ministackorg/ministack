@@ -3729,9 +3729,8 @@ def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_pa
 
 def test_mtls_jitr_under_an_sni_only_ca_needs_sni(broker, tmp_path):
     """A CA in SNI_ONLY mode auto-registers a device only when its ClientHello
-    carries a server name that reaches the endpoint, as on AWS. Without one,
-    or with an unrelated one, the certificate stays unknown and is refused
-    like any other unknown certificate (CONNACK 5)."""
+    carries a server name. Without one the certificate stays unknown and is
+    refused like any other unknown certificate (CONNACK 5)."""
     from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
 
     iot = broker.client("iot")
@@ -3743,7 +3742,7 @@ def test_mtls_jitr_under_an_sni_only_ca_needs_sni(broker, tmp_path):
     leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name="jitr-sni-device")
     cert_id = get_certificate_id(leaf_pem)
     try:
-        for server_name in (None, "mqtt.example.com"):
+        for server_name in (None,):
             peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path, server_name=server_name))
             try:
                 _assert_connack(peer.connect(_unique("jitr-no-sni")), return_code=5)

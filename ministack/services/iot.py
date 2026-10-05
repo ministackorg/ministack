@@ -85,7 +85,6 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
-from ministack.core.router import _host_served_by_stack
 from ministack.core.x509_utils import (
     certificate_is_signed_by,
     generate_ca,
@@ -1747,7 +1746,7 @@ def _list_certificates_by_ca(path: str, qp: dict) -> tuple:
             page_size = int(page_size)
         except ValueError:
             return error_response_json(
-                "InvalidRequestException", "pageSize must be an integer", 400
+                "InvalidRequestException", "The request is not valid.", 400
             )
         if page_size < 1:
             errors.append(
@@ -8636,30 +8635,18 @@ def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
 
 
 def _mtls_server_name_reaches(server_name: str, account_id: str) -> bool:
-    """Whether a device that sent ``server_name`` as its SNI dialled ``account_id``'s endpoint.
+    """Whether a device that sent ``server_name`` as its SNI may reach ``account_id``.
 
-    On AWS the endpoint prefix names the account: ``<prefix>-ats.iot.<region>...``
-    reaches it whichever region the name carries, while another account's
-    prefix, or any name that is not an IoT endpoint (``example.com``,
-    ``ministack``), auto-registers nothing, whatever the CA mode. Here a name
-    of a shape DescribeEndpoint hands out (``<prefix>-ats.iot.`` or
-    ``<prefix>.credentials.iot.``, under any suffix) counts only with this
-    account's prefix, and any other name counts when the gateway serves it
-    (``_host_served_by_stack``: ``localhost``, a compose service name,
-    ``MINISTACK_HOST``, any two-label alias, so ``example.com`` too), since
-    those are the names devices dial an emulator by.
+    An endpoint-shaped name (``<prefix>-ats.iot.`` or ``<prefix>.credentials.iot.``)
+    counts only with this account's prefix; any other name counts.
     """
     name = server_name.lower().rstrip(".")
     first, _, rest = name.partition(".")
     if first.endswith("-ats") and rest.startswith("iot."):
-        prefix = first[: -len("-ats")]
-    elif rest.startswith("credentials.iot."):
-        prefix = first
-    else:
-        prefix = None
-    if prefix is not None and prefix != _endpoint_prefix(account_id):
-        return False
-    return _host_served_by_stack(name)
+        return first[: -len("-ats")] == _endpoint_prefix(account_id)
+    if rest.startswith("credentials.iot."):
+        return first == _endpoint_prefix(account_id)
+    return True
 
 
 def _mtls_auto_registering_ca(

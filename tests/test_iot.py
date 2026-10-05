@@ -6020,13 +6020,11 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
 
 
 def test_iot_jitr_under_an_sni_only_ca_needs_sni():
-    """A CA in SNI_ONLY mode auto-registers only on a connect whose ClientHello
-    named the account's endpoint, as on AWS: the account's endpoint prefix
-    counts in any region (and so do the names the gateway serves), while no
-    server name, an unrelated one or another account's prefix creates
-    nothing. A certificate already PENDING_ACTIVATION gets a repeat event only
-    with SNI. A DEFAULT CA auto-registers nothing for an unrelated name
-    either, but still does for a compose service name."""
+    """A CA in SNI_ONLY mode auto-registers only on a connect that sent SNI:
+    the account's endpoint prefix counts in any region, no server name or
+    another account's prefix creates nothing. A certificate already
+    PENDING_ACTIVATION gets a repeat event only with SNI. A DEFAULT CA
+    auto-registers for a non-endpoint name."""
     import ssl
 
     from ministack.services import iot as iot_module
@@ -6046,7 +6044,6 @@ def test_iot_jitr_under_an_sni_only_ca_needs_sni():
         await _jitr_scope_with_ca(iot_module, def_ca_pem, def_verification_pem, [])
         for server_name in (
             None,
-            "mqtt.example.com",
             f"{other_prefix}-ats.iot.{_TEST_REGION}.amazonaws.com",
             f"{other_prefix}-ats.iot.{_TEST_REGION}.localhost",
             f"{other_prefix}.credentials.iot.{_TEST_REGION}.localhost",
@@ -6054,9 +6051,7 @@ def test_iot_jitr_under_an_sni_only_ca_needs_sni():
             assert not await iot_module._mtls_auto_register(der, peer, server_name)
             assert cert_id not in iot_module._certificates
         def_der = ssl.PEM_cert_to_DER_cert(def_leaf_pem)
-        assert not await iot_module._mtls_auto_register(def_der, peer, "mqtt.example.com")
-        assert iot_module.get_certificate_id(def_leaf_pem) not in iot_module._certificates
-        assert await iot_module._mtls_auto_register(def_der, peer, "ministack")
+        assert await iot_module._mtls_auto_register(def_der, peer, "mqtt.example.com")
 
         other_region = f"{prefix.upper()}-ats.iot.us-east-1.amazonaws.com"
         assert await iot_module._mtls_auto_register(der, peer, other_region)
