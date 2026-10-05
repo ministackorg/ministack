@@ -3958,7 +3958,7 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
     # agrees on one shape.
     body = {
         "errorMessage": f"Task timed out after {timeout}.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     return {
         "body": body, "error": True, "function_error": "Unhandled",
@@ -4027,7 +4027,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 result["function_error"] = function_error
                 if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
                     # A bare timeout string: same shape as _rie_terminal_result.
-                    result["body"] = {"errorMessage": parsed, "errorType": "Runtime.ExitError"}
+                    result["body"] = {"errorMessage": parsed, "errorType": "Sandbox.Timedout"}
                     result["timeout"] = True
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
@@ -4805,7 +4805,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
         msg = str(exc).lower()
         if "timed out" in msg or "read timed out" in msg:
             err_body = {"errorMessage": f"Task timed out after {timeout}.00 seconds",
-                        "errorType": "Runtime.ExitError"}
+                        "errorType": "Sandbox.Timedout"}
         else:
             err_body = {"errorMessage": str(exc), "errorType": type(exc).__name__}
         logger.error("Lambda %s invocation error: %s", fn_name, exc)
@@ -5279,7 +5279,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
             error_msg = result.get("error", "Unknown error")
             error_type = "Runtime.HandlerError"
             if "timed out" in error_msg.lower():
-                error_type = "Runtime.ExitError"
+                error_type = "Sandbox.Timedout"
             return {
                 "body": {
                     "errorMessage": error_msg,
@@ -5370,7 +5370,7 @@ def _execute_function_provided_warm(func: dict, event: dict,
         if isinstance(payload, dict):
             return {"body": payload, "error": True, "log": result.get("log", "")}
         error_msg = result.get("error", "Unknown error")
-        error_type = ("Runtime.ExitError" if "timed out" in error_msg.lower()
+        error_type = ("Sandbox.Timedout" if "timed out" in error_msg.lower()
                       else "Runtime.HandlerError")
         return {
             "body": {"errorMessage": error_msg, "errorType": error_type},
@@ -5548,7 +5548,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 proc.kill()
                 stdout, stderr = proc.communicate(timeout=5)
                 logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
-                return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
+                return {"body": {"errorMessage": f"Task timed out after {timeout}.00 seconds", "errorType": "Sandbox.Timedout"}, "error": True, "log": logs}
         finally:
             server.shutdown()
 
@@ -5730,7 +5730,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
         return {
             "body": {
                 "errorMessage": f"Task timed out after {timeout}.00 seconds",
-                "errorType": "Runtime.ExitError",
+                "errorType": "Sandbox.Timedout",
             },
             "error": True,
             "log": _log,
