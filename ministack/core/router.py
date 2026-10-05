@@ -489,6 +489,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cur\."],
         "credential_scope": "cur",
     },
+    "budgets": {
+        "target_prefixes": ["AWSBudgetServiceGateway"],
+        "host_patterns": [r"budgets\."],
+        "credential_scope": "budgets",
+    },
     "inspector2": {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
@@ -806,6 +811,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
+                "budgets": "budgets",
                 "inspector2": "inspector2",
                 "dsql": "dsql",
                 "s3tables": "s3tables",

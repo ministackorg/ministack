@@ -2329,6 +2329,10 @@ class TestActionExtraction:
         assert extract_iam_action("sqs", "POST", "/", {}, b"", {"Action": ["CreateQueue"]}) == "sqs:CreateQueue"
         assert extract_iam_action("monitoring", "POST", "/", {}, b"", {"Action": ["PutMetricData"]}) == "cloudwatch:PutMetricData"
 
+    def test_budgets_target_protocol(self):
+        from ministack.core.iam_actions import extract_iam_action
+        assert extract_iam_action("budgets", "POST", "/", {"x-amz-target": "AWSBudgetServiceGateway.CreateBudget"}, b"", {}) == "budgets:CreateBudget"
+
     def test_target_protocol(self):
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("dynamodb", "POST", "/", {"x-amz-target": "DynamoDB_20120810.PutItem"}, b"", {}) == "dynamodb:PutItem"

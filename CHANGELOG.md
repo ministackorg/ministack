@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **AWS Budgets** — `CreateBudget` (inline `NotificationsWithSubscribers` and `ResourceTags`), `DescribeBudget`, `DescribeBudgets`, `UpdateBudget`, `DeleteBudget`, `CreateNotification`, `UpdateNotification`, `DeleteNotification`, `DescribeNotificationsForBudget`, `CreateSubscriber`, `UpdateSubscriber`, `DeleteSubscriber`, `DescribeSubscribersForNotification`, `TagResource`, `UntagResource`, `ListTagsForResource`. Global (account-scoped, no region) JSON 1.1 service; a new or updated budget reports zero `CalculatedSpend.ActualSpend` and no `ForecastedSpend` rather than an invented number; an omitted `TimePeriod.Start` defaults to the start of the budget's `TimeUnit` period and an omitted `End` to `06/15/87 00:00 UTC`, and an omitted notification `ThresholdType` defaults to `PERCENTAGE`, as AWS does; the 10-notification/budget and 11-subscriber/notification quotas are enforced (`CreationLimitExceededException`); deleting a notification's last subscriber deletes the notification, matching AWS. Budget Actions (RI/Savings Plans auto-remediation) and `DescribeBudgetPerformanceHistory` are out of scope.
 ### Fixed
 
 - **Cognito — app client secret hashes** — clients created with `GenerateSecret=true` require a valid `SecretHash` on signup, confirmation and password recovery, and `SECRET_HASH` on authentication and challenge responses. Missing or incorrect hashes return `NotAuthorizedException` before user changes, email delivery or Lambda triggers. Clients without a secret reject a supplied hash on self-service and initial authentication calls, while refresh and challenge responses ignore it, as on AWS. Refresh authentication verifies the token owner's username, or `sub` when the pool uses `UsernameAttributes`, and custom challenge sessions cannot be answered through a different client. The checks apply under `AUTH=true`.
