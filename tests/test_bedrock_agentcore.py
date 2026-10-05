@@ -1119,3 +1119,244 @@ def test_agentcore_memory_strategies_are_recorded():
         assert [s["type"] for s in remaining] == ["SUMMARIZATION"]
     finally:
         control.delete_memory(memoryId=memory["id"])
+
+
+# --- Memory data plane (bedrock-agentcore) ---
+
+def _memory(control, **overrides):
+    args = {"name": f"memory_{_uuid_mod.uuid4().hex[:8]}",
+            "eventExpiryDuration": 30}
+    args.update(overrides)
+    return control.create_memory(**args)["memory"]
+
+
+_TS = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _convo(role, text):
+    return {"conversational": {"role": role, "content": {"text": text}}}
+
+
+def test_agentcore_memory_events_data_plane():
+    control = _client("bedrock-agentcore-control")
+    dp = _client("bedrock-agentcore")
+    memory = _memory(control)
+    memory_id = memory["id"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            dp.create_event(
+                memoryId=f"missing-{_uuid_mod.uuid4().hex[:10]}",
+                actorId="user-1", eventTimestamp=_TS, payload=[_convo("USER", "hi")])
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        event = dp.create_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventTimestamp=_TS, payload=[_convo("USER", "hello")],
+            metadata={"source": {"stringValue": "test"}},
+        )["event"]
+        assert re.fullmatch(r"[0-9]+#[a-fA-F0-9]+", event["eventId"])
+        assert event["sessionId"] == "s1" and event["actorId"] == "user-1"
+        assert event["metadata"] == {"source": {"stringValue": "test"}}
+
+        # A repeated clientToken replays the stored event.
+        once = dp.create_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventTimestamp=_TS, payload=[_convo("USER", "dup")],
+            clientToken="tok-1")["event"]
+        twice = dp.create_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventTimestamp=_TS, payload=[_convo("USER", "dup")],
+            clientToken="tok-1")["event"]
+        assert twice["eventId"] == once["eventId"]
+
+        # No sessionId generates one.
+        auto = dp.create_event(
+            memoryId=memory_id, actorId="user-2", eventTimestamp=_TS,
+            payload=[_convo("USER", "x")])["event"]
+        assert auto["sessionId"]
+
+        branched = dp.create_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventTimestamp=_TS, payload=[_convo("ASSISTANT", "alt reply")],
+            branch={"name": "alt", "rootEventId": event["eventId"]})["event"]
+
+        # The memory ARN is accepted where the id is.
+        via_arn = dp.create_event(
+            memoryId=memory["arn"], actorId="user-1", sessionId="s2",
+            eventTimestamp=_TS, payload=[_convo("USER", "arn path")])["event"]
+        assert via_arn["memoryId"] == memory_id
+
+        listed = dp.list_events(
+            memoryId=memory_id, actorId="user-1", sessionId="s1")["events"]
+        ids = [e["eventId"] for e in listed]
+        assert ids == [event["eventId"], once["eventId"], branched["eventId"]]
+
+        without = dp.list_events(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            includePayloads=False)["events"]
+        assert all("payload" not in e for e in without)
+
+        only_branch = dp.list_events(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            filter={"branch": {"name": "alt"}})["events"]
+        assert [e["eventId"] for e in only_branch] == [branched["eventId"]]
+        with_parents = dp.list_events(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            filter={"branch": {"name": "alt", "includeParentBranches": True}})["events"]
+        assert {e["eventId"] for e in with_parents} == {
+            event["eventId"], branched["eventId"]}
+
+        filtered = dp.list_events(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            filter={"eventMetadata": [
+                {"left": {"metadataKey": "source"}, "operator": "EQUALS_TO",
+                 "right": {"metadataValue": {"stringValue": "test"}}}]})["events"]
+        assert [e["eventId"] for e in filtered] == [event["eventId"]]
+
+        got = dp.get_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventId=event["eventId"])["event"]
+        assert got["payload"][0]["conversational"]["role"] == "USER"
+
+        sessions = dp.list_sessions(
+            memoryId=memory_id, actorId="user-1")["sessionSummaries"]
+        assert [s["sessionId"] for s in sessions] == ["s1", "s2"]
+        assert all(isinstance(s["createdAt"], datetime.datetime) for s in sessions)
+
+        actors = {a["actorId"] for a in
+                  dp.list_actors(memoryId=memory_id)["actorSummaries"]}
+        assert {"user-1", "user-2"} <= actors
+
+        assert dp.delete_event(
+            memoryId=memory_id, actorId="user-1", sessionId="s1",
+            eventId=branched["eventId"])["eventId"] == branched["eventId"]
+        with pytest.raises(ClientError) as exc:
+            dp.get_event(
+                memoryId=memory_id, actorId="user-1", sessionId="s1",
+                eventId=branched["eventId"])
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        control.delete_memory(memoryId=memory_id)
+
+
+def test_agentcore_memory_records_data_plane():
+    control = _client("bedrock-agentcore-control")
+    dp = _client("bedrock-agentcore")
+    memory = _memory(control, memoryStrategies=[{"semanticMemoryStrategy": {
+        "name": "facts", "namespaces": ["/facts"]}}])
+    memory_id = memory["id"]
+    strategy_id = memory["strategies"][0]["strategyId"]
+    try:
+        created = dp.batch_create_memory_records(
+            memoryId=memory_id,
+            records=[
+                {"requestIdentifier": "r1", "namespaces": ["/facts/user-1"],
+                 "content": {"text": "the user likes dogs"},
+                 "timestamp": _TS, "memoryStrategyId": strategy_id,
+                 "metadata": {"kind": {"stringValue": "fact"}}},
+                {"requestIdentifier": "r2", "namespaces": ["/facts/user-2"],
+                 "content": {"text": "the user prefers cats"},
+                 "timestamp": _TS, "memoryStrategyId": strategy_id},
+                {"requestIdentifier": "bad id!", "namespaces": ["/x"],
+                 "content": {"text": "y"}, "timestamp": _TS},
+            ])
+        assert [r["status"] for r in created["successfulRecords"]] == [
+            "SUCCEEDED", "SUCCEEDED"]
+        assert [r["status"] for r in created["failedRecords"]] == ["FAILED"]
+        ids = {r["requestIdentifier"]: r["memoryRecordId"]
+               for r in created["successfulRecords"]}
+        assert all(re.fullmatch(r"mem-.{40}", rid) for rid in ids.values())
+
+        got = dp.get_memory_record(
+            memoryId=memory_id, memoryRecordId=ids["r1"])["memoryRecord"]
+        assert got["content"]["text"] == "the user likes dogs"
+        assert got["namespaces"] == ["/facts/user-1"]
+        assert got["metadata"] == {"kind": {"stringValue": "fact"}}
+
+        listed = dp.list_memory_records(memoryId=memory_id)["memoryRecordSummaries"]
+        assert len(listed) == 2
+        one_ns = dp.list_memory_records(
+            memoryId=memory_id, namespace="/facts/user-1")["memoryRecordSummaries"]
+        assert [r["memoryRecordId"] for r in one_ns] == [ids["r1"]]
+        wild = dp.list_memory_records(
+            memoryId=memory_id, namespace="/facts/*")["memoryRecordSummaries"]
+        assert len(wild) == 2
+        by_meta = dp.list_memory_records(
+            memoryId=memory_id,
+            metadataFilters=[{"left": {"metadataKey": "kind"},
+                              "operator": "EQUALS_TO",
+                              "right": {"metadataValue": {"stringValue": "fact"}}}],
+        )["memoryRecordSummaries"]
+        assert [r["memoryRecordId"] for r in by_meta] == [ids["r1"]]
+
+        hits = dp.retrieve_memory_records(
+            memoryId=memory_id, namespace="/facts/*",
+            searchCriteria={"searchQuery": "dogs",
+                            "memoryStrategyId": strategy_id},
+        )["memoryRecordSummaries"]
+        assert [r["memoryRecordId"] for r in hits] == [ids["r1"]]
+        assert hits[0]["score"] > 0
+
+        updated = dp.batch_update_memory_records(
+            memoryId=memory_id,
+            records=[{"memoryRecordId": ids["r1"], "timestamp": _TS,
+                      "content": {"text": "the user likes dogs and cats"}}])
+        assert updated["successfulRecords"][0]["status"] == "SUCCEEDED"
+        assert dp.get_memory_record(
+            memoryId=memory_id, memoryRecordId=ids["r1"]
+        )["memoryRecord"]["content"]["text"] == "the user likes dogs and cats"
+        missing = dp.batch_update_memory_records(
+            memoryId=memory_id,
+            records=[{"memoryRecordId": "mem-" + "0" * 40, "timestamp": _TS}])
+        assert missing["failedRecords"][0]["status"] == "FAILED"
+
+        assert dp.delete_memory_record(
+            memoryId=memory_id, memoryRecordId=ids["r2"]
+        )["memoryRecordId"] == ids["r2"]
+        deleted = dp.batch_delete_memory_records(
+            memoryId=memory_id, records=[{"memoryRecordId": ids["r1"]}])
+        assert deleted["successfulRecords"][0]["status"] == "SUCCEEDED"
+        assert dp.list_memory_records(
+            memoryId=memory_id)["memoryRecordSummaries"] == []
+        with pytest.raises(ClientError) as exc:
+            dp.get_memory_record(memoryId=memory_id, memoryRecordId=ids["r1"])
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        control.delete_memory(memoryId=memory_id)
+
+
+def test_agentcore_memory_extraction_jobs_and_region_scope():
+    control = _client("bedrock-agentcore-control")
+    dp = _client("bedrock-agentcore")
+    memory = _memory(control)
+    memory_id = memory["id"]
+    try:
+        started = dp.start_memory_extraction_job(
+            memoryId=memory_id, extractionJob={"jobId": "job-1"})
+        assert started["jobId"] == "job-1"
+        jobs = dp.list_memory_extraction_jobs(memoryId=memory_id)["jobs"]
+        assert [j["jobID"] for j in jobs] == ["job-1"]
+        assert jobs[0]["status"] == "COMPLETED"
+        assert dp.list_memory_extraction_jobs(
+            memoryId=memory_id, filter={"status": "FAILED"})["jobs"] == []
+
+        west = _client("bedrock-agentcore", "us-west-2")
+        with pytest.raises(ClientError) as exc:
+            west.list_actors(memoryId=memory_id)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        control.delete_memory(memoryId=memory_id)
+
+
+def test_agentcore_memory_delete_purges_data_plane_state():
+    control = _client("bedrock-agentcore-control")
+    dp = _client("bedrock-agentcore")
+    memory = _memory(control)
+    memory_id = memory["id"]
+    dp.create_event(
+        memoryId=memory_id, actorId="user-1", sessionId="s1",
+        eventTimestamp=_TS, payload=[_convo("USER", "bye")])
+    control.delete_memory(memoryId=memory_id)
+    with pytest.raises(ClientError) as exc:
+        dp.list_events(memoryId=memory_id, actorId="user-1", sessionId="s1")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
