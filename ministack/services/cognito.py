@@ -6454,6 +6454,37 @@ def _handle_new_password_submit(np_token, form):
 
 # -- /oauth2/token (POST) ---------------------------------------------------
 
+def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
+    """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
+    ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
+    them at /oauth2/token. Validate them with the REFRESH_TOKEN_AUTH core, and the
+    client secret as the registry branch does."""
+    try:
+        claims = _decode_id_token_unverified(refresh_val)
+    except ValueError:
+        claims = None
+    if not isinstance(claims, dict) or claims.get("token_use") != "refresh":
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    pid = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    pool = _get_pool_unscoped(pid)
+    if not pool:
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    client_id = cid or str(claims.get("client_id", ""))
+    _, _, client = _find_pool_by_client_id(client_id)
+    if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+        return _oauth2_error("invalid_client", "Invalid client credentials.")
+    result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
+    if err:
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    resp = {
+        "access_token": result["AccessToken"],
+        "id_token": result["IdToken"],
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
+
+
 def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
     """/oauth2/token endpoint — supports authorization_code, refresh_token, client_credentials."""
     # Parse form-encoded body
@@ -6587,7 +6618,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         refresh_val = form.get("refresh_token", "")
         entry = _refresh_tokens.get(refresh_val)
         if not entry:
-            return _oauth2_error("invalid_grant", "Invalid refresh token.")
+            return _oauth2_refresh_api_issued_token(refresh_val, cid, csec)
 
         pool_id = entry["pool_id"]
         pool = _get_pool_unscoped(pool_id)

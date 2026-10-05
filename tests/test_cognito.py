@@ -9226,6 +9226,110 @@ def test_cognito_federation_access_token_pretoken_event_has_user_attributes(cogn
 # Secret-hash checks run under AUTH=true; server tests need a MiniStack started with it.
 _requires_auth = pytest.mark.skipif(os.environ.get("AUTH", "").lower() != "true",
                                     reason="secret-hash checks need a MiniStack server with AUTH=true")
+def _api_issued_tokens(cognito_idp, pool_name):
+    """A pool with a confidential client and a user signed in through InitiateAuth.
+
+    Returns (pool_id, client, AuthenticationResult).
+    """
+    pid = cognito_idp.create_user_pool(PoolName=pool_name)["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="bff", GenerateSecret=True,
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="apirefresh", MessageAction="SUPPRESS",
+        UserAttributes=[
+            {"Name": "email", "Value": "apirefresh@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="apirefresh", Password="Refresh-Pass1", Permanent=True)
+    tokens = cognito_idp.initiate_auth(
+        ClientId=client["ClientId"], AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "apirefresh", "PASSWORD": "Refresh-Pass1"},
+    )["AuthenticationResult"]
+    return pid, client, tokens
+
+
+def _oauth2_refresh(client, refresh_token, client_secret=None):
+    """POST a refresh_token grant to /oauth2/token, authenticating the client with HTTP Basic."""
+    secret = client["ClientSecret"] if client_secret is None else client_secret
+    basic = base64.b64encode(f"{client['ClientId']}:{secret}".encode()).decode()
+    status, _, body = _post_form(
+        f"{ENDPOINT}/oauth2/token",
+        {"grant_type": "refresh_token", "client_id": client["ClientId"], "refresh_token": refresh_token},
+        headers={"Authorization": f"Basic {basic}"},
+    )
+    return status, json.loads(body)
+
+
+def test_cognito_oauth2_token_refreshes_api_issued_refresh_token(cognito_idp):
+    """/oauth2/token refreshes a token issued by InitiateAuth, not only one from the Hosted UI code flow."""
+    _, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshPool")
+
+    status, body = _oauth2_refresh(client, tokens["RefreshToken"])
+
+    assert status == 200, body
+    assert set(body) >= {"access_token", "id_token", "token_type", "expires_in"}
+    assert "refresh_token" not in body
+    id_claims = _decode_jwt_claims(body["id_token"])
+    assert id_claims["token_use"] == "id"
+    assert id_claims["email"] == "apirefresh@example.com"
+    assert _decode_jwt_claims(body["access_token"])["client_id"] == client["ClientId"]
+    assert cognito_idp.get_user(AccessToken=body["access_token"])["Username"] == "apirefresh"
+
+
+def test_cognito_oauth2_token_rejects_revoked_api_issued_refresh_token(cognito_idp):
+    _, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshRevokedPool")
+    assert _oauth2_refresh(client, tokens["RefreshToken"])[0] == 200
+
+    cognito_idp.revoke_token(
+        Token=tokens["RefreshToken"], ClientId=client["ClientId"], ClientSecret=client["ClientSecret"])
+
+    status, body = _oauth2_refresh(client, tokens["RefreshToken"])
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+
+
+def test_cognito_oauth2_token_rejects_api_issued_refresh_token_of_another_client(cognito_idp):
+    pid, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshOtherClientPool")
+    other = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="other", GenerateSecret=True)["UserPoolClient"]
+    assert _oauth2_refresh(client, tokens["RefreshToken"])[0] == 200
+
+    status, body = _oauth2_refresh(other, tokens["RefreshToken"])
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+
+
+def test_cognito_oauth2_token_rejects_api_issued_refresh_token_with_wrong_secret(cognito_idp):
+    _, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshWrongSecretPool")
+
+    status, body = _oauth2_refresh(client, tokens["RefreshToken"], client_secret="wrong")
+
+    assert status == 400
+    assert body["error"] == "invalid_client"
+
+
+@pytest.mark.parametrize("case", ["garbage", "access_token", "deleted_pool"])
+def test_cognito_oauth2_token_rejects_invalid_refresh_token(cognito_idp, case):
+    """A string that is not a refresh token of an existing pool mints no tokens."""
+    pid, client, tokens = _api_issued_tokens(cognito_idp, f"OAuthApiRefreshInvalid-{case}")
+    token = {
+        "garbage": "not-a-refresh-token",
+        "access_token": tokens["AccessToken"],
+        "deleted_pool": tokens["RefreshToken"],
+    }[case]
+    if case == "deleted_pool":
+        assert _oauth2_refresh(client, token)[0] == 200
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+    status, body = _oauth2_refresh(client, token)
+
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+# App-client secrets are independent of the stack's IAM AUTH switch.
 
 def _cognito_secret_hash(client, username):
     digest = hmac.new(
