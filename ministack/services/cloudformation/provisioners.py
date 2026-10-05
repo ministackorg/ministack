@@ -10507,6 +10507,24 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 # platform, whose profiles need a certificate.
 _SIGNER_CFN_PLATFORMS = ("AWSLambda-SHA384-ECDSA", "Notation-OCI-SHA384-ECDSA")
 
+# Property enums of the resource schemas. AWS checks them before it
+# provisions anything (pre-deployment PROPERTY_VALIDATION): the stack fails
+# with no resource created, also when the value comes from a parameter.
+_PROPERTY_ENUMS = {
+    "AWS::Signer::SigningProfile": {"PlatformId": _SIGNER_CFN_PLATFORMS},
+}
+
+
+def _property_enum_errors(resource_type, props):
+    """``(property, reason)`` for each value outside its schema enum, with
+    AWS's ValidationStatusReason."""
+    return [
+        (prop, f"{props[prop]} is not a valid enum value. Supported values: "
+               f"[{', '.join(allowed)}]")
+        for prop, allowed in _PROPERTY_ENUMS.get(resource_type, {}).items()
+        if isinstance(props.get(prop), str) and props[prop] not in allowed
+    ]
+
 
 def _signer_raise_on_error(resp, resource_type):
     if resp[0] >= 400:
@@ -10540,10 +10558,11 @@ def _signer_signing_profile_create(logical_id, props, stack_name):
     The profile is created through PutSigningProfile's own path, so jobs treat
     it like any other profile."""
     import ministack.services.signer as _signer
+    # The stack checks the enum before provisioning; a value that came from
+    # another resource is only known here.
+    for _prop, reason in _property_enum_errors("AWS::Signer::SigningProfile", props):
+        raise ValueError(reason)
     platform = props.get("PlatformId")
-    if platform not in _SIGNER_CFN_PLATFORMS:
-        raise ValueError(f"{platform} is not a valid enum value. Supported values: "
-                         f"[{', '.join(_SIGNER_CFN_PLATFORMS)}]")
     suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
     # 51 + "_" + 12 keeps a long logical id inside the 64-character limit.
     name = props.get("ProfileName") or f"{logical_id[:51]}_{suffix}"

@@ -18395,20 +18395,41 @@ def test_cfn_signer_custom_named_replacement_is_refused(cfn, signer):
         _wait_stack(cfn, stack_name)
 
 
-def test_cfn_signer_signing_profile_platform_outside_the_schema_enum(cfn):
-    """The resource schema's PlatformId enum has two values; the IoT platform
-    PutSigningProfile accepts is refused in a template, with the schema's
-    message."""
+def test_cfn_signer_signing_profile_platform_outside_the_schema_enum(cfn, signer):
+    """The resource schema's PlatformId enum has two values. A value outside
+    it, literal or from a parameter, fails the create before anything is
+    provisioned: one stack-level CREATE_FAILED counting every error, then the
+    rollback, with no resource event and no profile created, not even for the
+    valid resource."""
+    iot = "AWSIoTDeviceManagement-SHA256-ECDSA"
     stack_name = f"cfn-signer-iot-{_uuid_mod.uuid4().hex[:8]}"
-    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Iot": {
-        "Type": "AWS::Signer::SigningProfile",
-        "Properties": {"PlatformId": "AWSIoTDeviceManagement-SHA256-ECDSA"}}}}))
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Parameters": {"Platform": {"Type": "String", "Default": iot}},
+        "Resources": {
+            "Iot": {"Type": "AWS::Signer::SigningProfile",
+                    "Properties": {"PlatformId": {"Ref": "Platform"}}},
+            "Bogus": {"Type": "AWS::Signer::SigningProfile",
+                      "Properties": {"PlatformId": "Bogus"}},
+            "Ok": {"Type": "AWS::Signer::SigningProfile",
+                   "Properties": {"ProfileName": stack_name.replace("-", "_"),
+                                  "PlatformId": "AWSLambda-SHA384-ECDSA"}},
+        }}))
     try:
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
-        reasons = [e.get("ResourceStatusReason", "") for e in
-                   cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
-        assert ("AWSIoTDeviceManagement-SHA256-ECDSA is not a valid enum value. Supported "
-                "values: [AWSLambda-SHA384-ECDSA, Notation-OCI-SHA384-ECDSA]") in reasons
+        events = list(reversed(cfn.describe_stack_events(StackName=stack_name)["StackEvents"]))
+        assert {e["LogicalResourceId"] for e in events} == {stack_name}
+        assert [(e["ResourceStatus"], e.get("ResourceStatusReason"), e.get("DetailedStatus"))
+                for e in events[1:]] == [
+            ("CREATE_FAILED", "Validation failed with 2 error(s). Call DescribeEvents to retrieve "
+             "the full list of issues with resource and property details, resolve each error, "
+             "then retry the operation.", "VALIDATION_FAILED"),
+            ("ROLLBACK_IN_PROGRESS",
+             "Validation failure detected. See the operation's FAILED event for details.", None),
+            ("ROLLBACK_COMPLETE", "", None),
+        ]
+        assert cfn.describe_stack_resources(StackName=stack_name)["StackResources"] == []
+        with pytest.raises(ClientError):
+            signer.get_signing_profile(profileName=stack_name.replace("-", "_"))
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
