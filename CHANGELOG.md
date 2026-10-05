@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway v2 — JWT claims reach a Lambda as strings** — `requestContext.authorizer.jwt.claims` holds every claim as a string, as on AWS: numbers as digits, booleans as `true`/`false` and arrays as their items in brackets, e.g. `[admin dev]`. Typed event models (for example `aws_lambda_events` in Rust, or Go's `map[string]string`) parse the event.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 
