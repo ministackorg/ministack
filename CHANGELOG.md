@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — job templates and `AWS::IoT::JobTemplate`** — `CreateJobTemplate`, `DescribeJobTemplate`, `ListJobTemplates` and `DeleteJobTemplate` were missing, so a `jobTemplateArn` could not be created or used. Templates now store a document or a `documentSource` (not fetched, like `CreateJob`'s), every job configuration member, maintenance windows and tags, can be copied from a job through `jobArn`, list newest first with `maxResults` / `nextToken` paging, and answer AWS's errors and messages. `CreateJob` with a `jobTemplateArn` takes the template's document, configuration and maintenance windows, and a member the request names replaces the template's. CloudFormation creates and deletes `AWS::IoT::JobTemplate` (Ref is the id, `Fn::GetAtt` `Arn`); every property is create-only, so an update under the same `JobTemplateId` fails with AWS's custom-name sentence and a new id replaces the template. Contributed by @iot-rocket.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added
