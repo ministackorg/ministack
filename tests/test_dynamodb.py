@@ -1490,6 +1490,176 @@ def test_dynamodb_gsi_query(ddb):
     for item in resp["Items"]:
         assert item["gsi_pk"]["S"] == "shared_gsi"
 
+
+def test_dynamodb_lsi_fetches_unprojected_attributes_but_gsi_does_not(ddb):
+    table = f"qa-ddb-index-projection-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            {"AttributeName": "lsi_sk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        LocalSecondaryIndexes=[{
+            "IndexName": "lsi",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsi_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(
+        TableName=table,
+        Item={
+            "pk": {"S": "partition"},
+            "sk": {"S": "base-sort"},
+            "gsi_pk": {"S": "global"},
+            "lsi_sk": {"S": "local-sort"},
+            "base_only": {"S": "fetched-from-table"},
+        },
+    )
+
+    lsi_query = ddb.query(
+        TableName=table,
+        IndexName="lsi",
+        KeyConditionExpression="pk = :pk",
+        ExpressionAttributeValues={":pk": {"S": "partition"}},
+    )
+    gsi_query = ddb.query(
+        TableName=table,
+        IndexName="gsi",
+        KeyConditionExpression="gsi_pk = :gsi",
+        ExpressionAttributeValues={":gsi": {"S": "global"}},
+    )
+    lsi_scan = ddb.scan(TableName=table, IndexName="lsi")
+
+    assert lsi_query["Items"][0]["base_only"] == {"S": "fetched-from-table"}
+    assert lsi_scan["Items"][0]["base_only"] == {"S": "fetched-from-table"}
+    assert "base_only" not in gsi_query["Items"][0]
+
+    lsi_projection = ddb.query(
+        TableName=table,
+        IndexName="lsi",
+        KeyConditionExpression="pk = :pk",
+        ProjectionExpression="base_only",
+        ExpressionAttributeValues={":pk": {"S": "partition"}},
+    )
+    assert lsi_projection["Items"] == [{"base_only": {"S": "fetched-from-table"}}]
+
+    for kwargs in (
+        {"ProjectionExpression": "base_only"},
+        {
+            "FilterExpression": "base_only = :base",
+        },
+    ):
+        expression_values = {":gsi": {"S": "global"}}
+        if "FilterExpression" in kwargs:
+            expression_values[":base"] = {"S": "fetched-from-table"}
+        with pytest.raises(ClientError) as exc:
+            ddb.query(
+                TableName=table,
+                IndexName="gsi",
+                KeyConditionExpression="gsi_pk = :gsi",
+                ExpressionAttributeValues=expression_values,
+                **kwargs,
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_update_table_adds_a_backfilled_gsi_with_index_metadata(ddb):
+    table = f"qa-ddb-gsi-add-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(2):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": f"row-{index}"},
+                "gsi_pk": {"S": "shared"},
+                "payload": {"S": "before-index"},
+            },
+        )
+
+    description = ddb.update_table(
+        TableName=table,
+        AttributeDefinitions=[{"AttributeName": "gsi_pk", "AttributeType": "S"}],
+        GlobalSecondaryIndexUpdates=[{"Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }}],
+    )["TableDescription"]
+    gsi = description["GlobalSecondaryIndexes"][0]
+    assert gsi["IndexStatus"] == "ACTIVE"
+    assert gsi["ItemCount"] == 2
+    assert gsi["IndexSizeBytes"] > 0
+
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "row-0"}},
+        UpdateExpression="SET payload = :payload",
+        ExpressionAttributeValues={":payload": {"S": "not-projected"}},
+    )
+    unchanged = ddb.describe_table(TableName=table)["Table"]["GlobalSecondaryIndexes"][0]
+    assert unchanged["ItemCount"] == 2
+    assert unchanged["IndexSizeBytes"] == gsi["IndexSizeBytes"]
+
+    result = ddb.query(
+        TableName=table,
+        IndexName="gsi",
+        KeyConditionExpression="gsi_pk = :gsi",
+        ExpressionAttributeValues={":gsi": {"S": "shared"}},
+    )
+    assert result["Count"] == 2
+
+
+def test_dynamodb_update_table_rejects_multiple_gsi_updates(ddb):
+    table = f"qa-ddb-gsi-multiple-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        ddb.update_table(
+            TableName=table,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+                {"AttributeName": "other_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[
+                {"Create": {
+                    "IndexName": "gsi-one",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }},
+                {"Create": {
+                    "IndexName": "gsi-two",
+                    "KeySchema": [{"AttributeName": "other_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }},
+            ],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
 def test_dynamodb_gsi_membership_tracks_item_mutations(ddb):
     table = f"qa-ddb-gsi-maintenance-{_uuid_mod.uuid4().hex[:8]}"
     ddb.create_table(

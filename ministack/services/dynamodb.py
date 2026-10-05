@@ -1000,6 +1000,8 @@ _VALID_KEY_TYPES = {"HASH", "RANGE"}
 _VALID_BILLING_MODES = {"PROVISIONED", "PAY_PER_REQUEST"}
 _VALID_TABLE_CLASSES = {"STANDARD", "STANDARD_INFREQUENT_ACCESS"}
 _VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
+_MAX_GLOBAL_SECONDARY_INDEXES = 20
+_MAX_LOCAL_SECONDARY_INDEXES = 5
 
 
 def _validate_table_name(name: str) -> tuple | None:
@@ -1018,6 +1020,58 @@ def _validate_table_name(name: str) -> tuple | None:
     if not _TABLE_NAME_RE.match(name):
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+    return None
+
+
+def _validate_index_name(name: str) -> tuple | None:
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'indexName' failed to satisfy constraint: Member must not be null", 400)
+    if len(name) < 3 or len(name) > 255 or not _TABLE_NAME_RE.match(name):
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Invalid index name", 400)
+    return None
+
+
+def _validate_index_projection(index) -> tuple | None:
+    projection = index.get("Projection") or {}
+    projection_type = projection.get("ProjectionType", "ALL")
+    if projection_type not in _VALID_PROJECTION_TYPES:
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Unknown ProjectionType: {projection_type}", 400)
+    non_key_attributes = projection.get("NonKeyAttributes") or []
+    if projection_type == "INCLUDE" and not non_key_attributes:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
+    if projection_type == "KEYS_ONLY" and non_key_attributes:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+    return None
+
+
+def _validate_secondary_index(index, attr_defs, *, is_lsi=False,
+                              table_pk=None, table_sk=None,
+                              billing_mode=None) -> tuple | None:
+    err = _validate_index_name(index.get("IndexName"))
+    if err:
+        return err
+    err = _validate_key_schema(index.get("KeySchema"), attr_defs)
+    if err:
+        return err
+    err = _validate_index_projection(index)
+    if err:
+        return err
+    hash_key, sort_key = _index_key_names(index)
+    if is_lsi and (hash_key != table_pk or not sort_key):
+        return error_response_json("ValidationException",
+            f"Local Secondary Index '{index.get('IndexName')}' must use the table's hash key and a non-key range key", 400)
+    if billing_mode == "PROVISIONED" and not is_lsi:
+        throughput = index.get("ProvisionedThroughput")
+        if not isinstance(throughput, dict) or min(
+                int(throughput.get("ReadCapacityUnits", 0)),
+                int(throughput.get("WriteCapacityUnits", 0))) <= 0:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ProvisionedThroughput must be specified for a global secondary index", 400)
     return None
 
 
@@ -1143,6 +1197,12 @@ def _create_table(data):
 
     gsis = copy.deepcopy(data.get("GlobalSecondaryIndexes", []))
     lsis = copy.deepcopy(data.get("LocalSecondaryIndexes", []))
+    if len(gsis) > _MAX_GLOBAL_SECONDARY_INDEXES:
+        return error_response_json("LimitExceededException",
+            "The number of global secondary indexes exceeds the maximum allowed", 400)
+    if len(lsis) > _MAX_LOCAL_SECONDARY_INDEXES:
+        return error_response_json("LimitExceededException",
+            "The number of local secondary indexes exceeds the maximum allowed", 400)
 
     # LSI validation: requires the base table to have a RANGE key, and each LSI
     # must have the same HASH key as the base table.
@@ -1153,10 +1213,12 @@ def _create_table(data):
         return error_response_json("ValidationException",
             "One or more parameter values were invalid: Table KeySchema does not have a range key, which is required when specifying a LocalSecondaryIndex", 400)
     for lsi in lsis:
-        lks = lsi.get("KeySchema") or []
-        if not any(k.get("KeyType") == "HASH" and k.get("AttributeName") == pk_name for k in lks):
-            return error_response_json("ValidationException",
-                f"Local Secondary Index '{lsi.get('IndexName')}' must use the table's hash key", 400)
+        err = _validate_secondary_index(
+            lsi, attr_defs, is_lsi=True, table_pk=pk_name, table_sk=sk_name,
+            billing_mode=billing_mode,
+        )
+        if err:
+            return err
 
     # Duplicate-index-name detection across LSI + GSI.
     seen_index_names = set()
@@ -1168,20 +1230,10 @@ def _create_table(data):
         if iname:
             seen_index_names.add(iname)
 
-    # Validate index Projection settings.
-    for idx in gsis + lsis:
-        idx_name = idx.get("IndexName", "<unnamed>")
-        proj = idx.get("Projection") or {}
-        ptype = proj.get("ProjectionType", "ALL")
-        if ptype not in _VALID_PROJECTION_TYPES:
-            return error_response_json("ValidationException",
-                f"One or more parameter values were invalid: Unknown ProjectionType: {ptype}", 400)
-        if ptype == "INCLUDE" and not proj.get("NonKeyAttributes"):
-            return error_response_json("ValidationException",
-                "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
-        if ptype == "KEYS_ONLY" and proj.get("NonKeyAttributes"):
-            return error_response_json("ValidationException",
-                "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+    for gsi in gsis:
+        err = _validate_secondary_index(gsi, attr_defs, billing_mode=billing_mode)
+        if err:
+            return err
 
     # Validate StreamSpecification: StreamEnabled:false with StreamViewType is invalid.
     stream_spec = data.get("StreamSpecification")
@@ -1515,11 +1567,15 @@ def _update_table(data):
         }
 
     existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
+    index_updates = data.get("GlobalSecondaryIndexUpdates", [])
+    if len(index_updates) > 1:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Only one global secondary index update is allowed per request", 400)
     # A new index's key attributes must all appear in the REQUEST's own
     # AttributeDefinitions — stored definitions do not satisfy the check
     # (measured eu-west-2, 2026-07-12, paritysuite).
     defined_attrs = {a["AttributeName"] for a in data.get("AttributeDefinitions", [])}
-    for update in data.get("GlobalSecondaryIndexUpdates", []):
+    for update in index_updates:
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
             idx_name = gsi_def.get("IndexName")
@@ -1531,6 +1587,15 @@ def _update_table(data):
                 if k.get("AttributeName") not in defined_attrs:
                     return error_response_json("ValidationException",
                         f"One or more parameter values were invalid: AttributeDefinitions does not contain {k.get('AttributeName')} referenced by GSI {idx_name}", 400)
+            err = _validate_secondary_index(
+                gsi_def, data.get("AttributeDefinitions", []),
+                billing_mode=table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+            )
+            if err:
+                return err
+            if len(existing_idx_names) >= _MAX_GLOBAL_SECONDARY_INDEXES:
+                return error_response_json("LimitExceededException",
+                    "The number of global secondary indexes exceeds the maximum allowed", 400)
             gsi_def.setdefault("IndexStatus", "ACTIVE")
             gsi_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
             gsi_def.setdefault(
@@ -1573,7 +1638,7 @@ def _update_table(data):
         ad for ad in table.get("AttributeDefinitions", [])
         if ad["AttributeName"] in referenced
     ]
-    if data.get("GlobalSecondaryIndexUpdates"):
+    if index_updates:
         _rebuild_secondary_indexes(table)
 
     if data.get("ReplicaUpdates"):
@@ -2190,6 +2255,10 @@ def _query(data):
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
             "Consistent reads are not supported on global secondary indexes", 400)
+    if is_gsi:
+        err = _validate_gsi_read_projection(table, index_name, data)
+        if err:
+            return err
 
     # ExclusiveStartKey must contain the base table's key attributes; when
     # querying an index, it must also contain the index's key attributes.
@@ -2302,9 +2371,11 @@ def _query(data):
             candidates, has_more = [], False
         else:
             def size_fn(item):
-                return _item_size_bytes(
-                    _apply_index_projection(item, table, index_name)
-                )
+                if is_gsi:
+                    return _item_size_bytes(
+                        _project_secondary_index_item(item, table, index_name)
+                    )
+                return _item_size_bytes(item)
 
             try:
                 candidates, has_more = _paginate_evaluated_items(
@@ -2503,6 +2574,10 @@ def _scan(data):
     if index_name:
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
         if is_gsi:
+            err = _validate_gsi_read_projection(table, index_name, data)
+            if err:
+                return err
+        if is_gsi:
             # Sparse GSI semantics: items lacking ANY of the index's key
             # attributes (hash, or range on a composite GSI) don't appear.
             all_items = [it for it in all_items if pk_name_idx in it and (not sk_name_idx or sk_name_idx in it)]
@@ -2555,9 +2630,11 @@ def _scan(data):
     size_fn = None
     if index_name:
         def size_fn(item):
-            return _item_size_bytes(
-                _apply_index_projection(item, table, index_name)
-            )
+            if is_gsi:
+                return _item_size_bytes(
+                    _project_secondary_index_item(item, table, index_name)
+                )
+            return _item_size_bytes(item)
 
     all_items, has_more = _paginate_evaluated_items(all_items, limit, size_fn)
 
@@ -7566,18 +7643,82 @@ def _apply_projection(item, data):
 def _apply_index_projection(item, table, index_name):
     """Restrict an item to the attributes that the queried index actually
     projects. AWS GSIs/LSIs declare a Projection of ALL / KEYS_ONLY / INCLUDE
-    [NonKeyAttributes]; only those attributes are visible through the index.
-    Returns the trimmed dict (with original wrapping)."""
+    [NonKeyAttributes]. GSI reads may access only that projection; an LSI can
+    fetch missing attributes from the base table, so its read view is the full
+    item."""
     if not index_name:
         return item
-    idx_def = None
+    _, _, is_gsi = _resolve_index_keys(table, index_name)
+    if not is_gsi:
+        return item
+    return _project_secondary_index_item(item, table, index_name)
+
+
+def _secondary_index_definition(table, index_name):
     for collection in ("GlobalSecondaryIndexes", "LocalSecondaryIndexes"):
-        for idx in (table.get(collection) or []):
-            if idx.get("IndexName") == index_name:
-                idx_def = idx
-                break
-        if idx_def:
-            break
+        for index in table.get(collection) or []:
+            if index.get("IndexName") == index_name:
+                return index
+    return None
+
+
+def _secondary_index_projected_attributes(table, index_name):
+    index = _secondary_index_definition(table, index_name)
+    if index is None:
+        return set()
+    attributes = {table.get("pk_name"), table.get("sk_name")}
+    attributes.update(
+        key.get("AttributeName") for key in index.get("KeySchema") or []
+    )
+    projection = index.get("Projection") or {}
+    if projection.get("ProjectionType", "ALL") == "ALL":
+        return None
+    if projection.get("ProjectionType") == "INCLUDE":
+        attributes.update(projection.get("NonKeyAttributes") or [])
+    attributes.discard(None)
+    return attributes
+
+
+def _expression_root_names(expression, attribute_names):
+    if not expression:
+        return set()
+    names = set()
+    tokens = _tokenize(expression)
+    for position, token in enumerate(tokens):
+        token_type, token_value = token
+        previous_type = tokens[position - 1][0] if position else None
+        if token_type == "NAME_REF" and previous_type != "DOT":
+            names.add(attribute_names.get(token_value, token_value))
+        elif token_type == "IDENT" and previous_type != "DOT":
+            if (token_value.lower() not in _DDB_EXPR_FUNCTIONS
+                    and token_value.upper() not in {"AND", "OR", "NOT", "BETWEEN", "IN"}):
+                names.add(token_value)
+    return names
+
+
+def _validate_gsi_read_projection(table, index_name, data):
+    projected = _secondary_index_projected_attributes(table, index_name)
+    if projected is None:
+        return None
+    attribute_names = data.get("ExpressionAttributeNames", {})
+    requested = set(data.get("AttributesToGet") or [])
+    requested.update(_expression_root_names(
+        data.get("ProjectionExpression", ""), attribute_names
+    ))
+    requested.update(_expression_root_names(
+        data.get("FilterExpression", ""), attribute_names
+    ))
+    unprojected = sorted(requested - projected)
+    if unprojected:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Global secondary index "
+            f"{index_name} does not project {unprojected}", 400)
+    return None
+
+
+def _project_secondary_index_item(item, table, index_name):
+    """Return the attributes physically stored by a secondary-index entry."""
+    idx_def = _secondary_index_definition(table, index_name)
     if not idx_def:
         return item
     proj_cfg = idx_def.get("Projection") or {}
@@ -7829,7 +7970,11 @@ def _rebuild_secondary_indexes(table):
     for definition in (table.get("GlobalSecondaryIndexes", [])
                        + table.get("LocalSecondaryIndexes", [])):
         hash_key, sort_key = _index_key_names(definition)
+        definition["ItemCount"] = 0
+        definition["IndexSizeBytes"] = 0
         indexes[definition["IndexName"]] = {
+            "name": definition["IndexName"],
+            "definition": definition,
             "hash_key": hash_key,
             "sort_key": sort_key,
             "order_keys": _index_order_keys(table, sort_key),
@@ -7841,12 +7986,22 @@ def _rebuild_secondary_indexes(table):
             _add_item_to_secondary_indexes(table, base_pk, base_sk, item)
 
 
-def _add_item_to_secondary_indexes(table, base_pk, base_sk, item):
+def _secondary_index_entry(table, index, item):
+    hash_key = index["hash_key"]
+    sort_key = index["sort_key"]
+    if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+        return None
+    return _project_secondary_index_item(item, table, index["name"])
+
+
+def _add_item_to_secondary_indexes(table, base_pk, base_sk, item, skip_names=frozenset()):
     for index in table.get("_secondary_indexes", {}).values():
-        hash_key = index["hash_key"]
-        sort_key = index["sort_key"]
-        if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+        if index["name"] in skip_names:
             continue
+        entry = _secondary_index_entry(table, index, item)
+        if entry is None:
+            continue
+        hash_key = index["hash_key"]
         hash_value = _extract_key_val(item[hash_key])
         key = tuple(
             _index_order_value(item, name, type_hint)
@@ -7856,14 +8011,19 @@ def _add_item_to_secondary_indexes(table, base_pk, base_sk, item):
         index["roots"][hash_value] = _insert_secondary_index_node(
             root, _SecondaryIndexNode(key, base_pk, base_sk)
         )
+        definition = index["definition"]
+        definition["ItemCount"] += 1
+        definition["IndexSizeBytes"] += _item_size_bytes(entry) + 100
 
 
-def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item):
+def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item, skip_names=frozenset()):
     for index in table.get("_secondary_indexes", {}).values():
-        hash_key = index["hash_key"]
-        sort_key = index["sort_key"]
-        if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+        if index["name"] in skip_names:
             continue
+        entry = _secondary_index_entry(table, index, item)
+        if entry is None:
+            continue
+        hash_key = index["hash_key"]
         hash_value = _extract_key_val(item[hash_key])
         root = index["roots"].get(hash_value)
         if root is None:
@@ -7877,16 +8037,28 @@ def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item):
             del index["roots"][hash_value]
         else:
             index["roots"][hash_value] = root
+        definition = index["definition"]
+        definition["ItemCount"] = max(0, definition["ItemCount"] - 1)
+        definition["IndexSizeBytes"] = max(
+            0, definition["IndexSizeBytes"] - _item_size_bytes(entry) - 100
+        )
 
 
 def _set_item(table, pk_val, sk_val, item):
     old_item = table["items"].get(pk_val, {}).get(sk_val)
+    unchanged_indexes = set()
     if old_item is not None:
-        _remove_item_from_secondary_indexes(table, pk_val, sk_val, old_item)
+        for index in table.get("_secondary_indexes", {}).values():
+            if (_secondary_index_entry(table, index, old_item)
+                    == _secondary_index_entry(table, index, item)):
+                unchanged_indexes.add(index["name"])
+        _remove_item_from_secondary_indexes(
+            table, pk_val, sk_val, old_item, unchanged_indexes
+        )
     else:
         table["ItemCount"] = table.get("ItemCount", 0) + 1
     table["items"][pk_val][sk_val] = item
-    _add_item_to_secondary_indexes(table, pk_val, sk_val, item)
+    _add_item_to_secondary_indexes(table, pk_val, sk_val, item, unchanged_indexes)
     table["TableSizeBytes"] = table["ItemCount"] * 200
     return old_item
 
