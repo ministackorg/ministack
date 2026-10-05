@@ -18258,6 +18258,162 @@ def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
         ses.describe_configuration_set(ConfigurationSetName=cs_name)
 
 
+def _signer_template(named, validity=30, tags=None, named_validity=None,
+                     action="signer:StartSigningJob"):
+    named_props = {"ProfileName": named, "PlatformId": "AWSLambda-SHA384-ECDSA"}
+    if named_validity:
+        named_props["SignatureValidityPeriod"] = {"Type": "DAYS", "Value": named_validity}
+    return json.dumps({
+        "Resources": {
+            "Prof": {"Type": "AWS::Signer::SigningProfile", "Properties": {
+                "PlatformId": "AWSLambda-SHA384-ECDSA",
+                "SignatureValidityPeriod": {"Type": "DAYS", "Value": validity},
+                "Tags": tags or [{"Key": "team", "Value": "a"}]}},
+            "Named": {"Type": "AWS::Signer::SigningProfile", "Properties": named_props},
+            "Perm": {"Type": "AWS::Signer::ProfilePermission", "Properties": {
+                "ProfileName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+                "Action": action,
+                "Principal": {"Ref": "AWS::AccountId"}, "StatementId": "p1"}},
+            "Perm2": {"Type": "AWS::Signer::ProfilePermission", "DependsOn": "Perm",
+                      "Properties": {
+                          "ProfileName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+                          "ProfileVersion": {"Fn::GetAtt": ["Prof", "ProfileVersion"]},
+                          "Action": "signer:GetSigningProfile",
+                          "Principal": {"Ref": "AWS::AccountId"}, "StatementId": "p2"}},
+        },
+        "Outputs": {k: {"Value": v} for k, v in {
+            "ProfRef": {"Ref": "Prof"}, "ProfArn": {"Fn::GetAtt": ["Prof", "Arn"]},
+            "ProfName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+            "ProfVersion": {"Fn::GetAtt": ["Prof", "ProfileVersion"]},
+            "ProfVersionArn": {"Fn::GetAtt": ["Prof", "ProfileVersionArn"]},
+            "NamedRef": {"Ref": "Named"}, "PermRef": {"Ref": "Perm"},
+        }.items()},
+    })
+
+
+def _signer_permission_ids(signer, name):
+    try:
+        listed = signer.list_profile_permissions(profileName=name)["permissions"]
+    except ClientError as exc:
+        return exc.response["code"]
+    return [p["statementId"] for p in listed]
+
+
+def test_cfn_signer_signing_profile_and_profile_permission(cfn, signer):
+    """Ref is the profile ARN (the permission's is ``StatementId|ProfileName``),
+    a generated ProfileName is ``<LogicalId>_`` plus 12 letters and digits,
+    the profile carries the template, stack and ``aws:cloudformation:`` tags,
+    a Tags change keeps the profile, a SignatureValidityPeriod change replaces
+    it and its permissions, and a delete cancels it: profiles are never
+    deleted on AWS."""
+    stack_name = f"cfn-signer-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn_named_{_uuid_mod.uuid4().hex[:8]}"
+    stack_tags = [{"Key": "stacktag", "Value": "x"}]
+    cfn.create_stack(StackName=stack_name, TemplateBody=_signer_template(named), Tags=stack_tags)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    gen = out["ProfName"]
+    assert re.fullmatch(r"Prof_[A-Za-z0-9]{12}", gen)
+    assert out["ProfRef"] == out["ProfArn"]
+    assert out["ProfArn"].endswith(f":/signing-profiles/{gen}")
+    assert out["ProfVersionArn"] == f"{out['ProfArn']}/{out['ProfVersion']}"
+    assert out["NamedRef"].endswith(f":/signing-profiles/{named}")
+    assert out["PermRef"] == f"p1|{gen}"
+
+    profile = signer.get_signing_profile(profileName=gen)
+    assert profile["signatureValidityPeriod"] == {"type": "DAYS", "value": 30}
+    assert profile["tags"] == {
+        "team": "a", "stacktag": "x",
+        "aws:cloudformation:stack-name": stack_name,
+        "aws:cloudformation:stack-id": stack["StackId"],
+        "aws:cloudformation:logical-id": "Prof",
+    }
+    listed = signer.list_profile_permissions(profileName=gen)["permissions"]
+    assert listed[1] == {"action": "signer:GetSigningProfile", "principal": listed[0]["principal"],
+                         "statementId": "p2", "profileVersion": out["ProfVersion"]}
+    assert _signer_permission_ids(signer, named) == "PolicyNotFound"
+
+    cfn.update_stack(StackName=stack_name, Tags=stack_tags, TemplateBody=_signer_template(
+        named, tags=[{"Key": "team", "Value": "b"}, {"Key": "k2", "Value": "v2"}]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    tagged = signer.get_signing_profile(profileName=gen)
+    assert tagged["profileVersion"] == out["ProfVersion"]
+    assert tagged["tags"]["team"] == "b" and tagged["tags"]["k2"] == "v2"
+
+    cfn.update_stack(StackName=stack_name, Tags=stack_tags, TemplateBody=_signer_template(
+        named, validity=31, tags=[{"Key": "team", "Value": "b"}, {"Key": "k2", "Value": "v2"}]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    gen2 = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ProfName"]
+    assert gen2 != gen
+    assert signer.get_signing_profile(profileName=gen)["status"] == "Canceled"
+    assert _signer_permission_ids(signer, gen) == "PolicyNotFound"
+    assert signer.get_signing_profile(profileName=gen2)["signatureValidityPeriod"]["value"] == 31
+    assert _signer_permission_ids(signer, gen2) == ["p1", "p2"]
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    for name in (gen2, named):
+        assert signer.get_signing_profile(profileName=name)["status"] == "Canceled"
+        assert _signer_permission_ids(signer, name) == "PolicyNotFound"
+    # The canceled name stays taken.
+    with pytest.raises(ClientError) as exc:
+        signer.put_signing_profile(profileName=named, platformId="AWSLambda-SHA384-ECDSA")
+    assert exc.value.response["code"] == "ProfileAlreadyExists"
+
+
+def test_cfn_signer_custom_named_replacement_is_refused(cfn, signer):
+    """A create-only change under a kept ProfileName, or under a kept
+    StatementId and ProfileName, fails with the custom-named refusal that
+    names the physical id; the stack rolls back."""
+    stack_name = f"cfn-signer-rn-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn_named_{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_signer_template(named))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    try:
+        for template, physical_id in (
+            (_signer_template(named, named_validity=7), out["NamedRef"]),
+            (_signer_template(named, action="signer:RevokeSignature"), out["PermRef"]),
+        ):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template)
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in
+                       cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
+            assert ("CloudFormation cannot update a stack when a custom-named resource "
+                    f"requires replacing. Rename {physical_id} and update the stack again."
+                    ) in reasons
+        assert signer.get_signing_profile(profileName=named)["status"] == "Active"
+        assert signer.list_profile_permissions(profileName=out["ProfName"])["permissions"][0][
+            "action"] == "signer:StartSigningJob"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def test_cfn_signer_signing_profile_platform_outside_the_schema_enum(cfn):
+    """The resource schema's PlatformId enum has two values; the IoT platform
+    PutSigningProfile accepts is refused in a template, with the schema's
+    message."""
+    stack_name = f"cfn-signer-iot-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Iot": {
+        "Type": "AWS::Signer::SigningProfile",
+        "Properties": {"PlatformId": "AWSIoTDeviceManagement-SHA256-ECDSA"}}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
+        assert ("AWSIoTDeviceManagement-SHA256-ECDSA is not a valid enum value. Supported "
+                "values: [AWSLambda-SHA384-ECDSA, Notation-OCI-SHA384-ECDSA]") in reasons
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # Loud deletes — DELETE_FAILED / ROLLBACK_FAILED stack states, and the
 # delete handlers for the types that used to leak silently

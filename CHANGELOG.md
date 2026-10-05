@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Signer — CloudFormation `AWS::Signer::SigningProfile` and `AWS::Signer::ProfilePermission`, profile permissions and `CancelSigningProfile`** — a template with either type was refused as an unrecognized resource type, and the profile permission API and `CancelSigningProfile` had no route. Both types now provision as AWS does: the profile's `Ref` is its ARN with `Arn`, `ProfileName`, `ProfileVersion` and `ProfileVersionArn` attributes, a generated name is `<LogicalId>_` plus 12 letters and digits, `Tags` (with the stack and `aws:cloudformation:` tags) update in place, a `PlatformId` or `SignatureValidityPeriod` change replaces the profile, a delete cancels it, and a `PlatformId` outside the schema's two values fails the resource with AWS's enum message; the permission's `Ref` is `<StatementId>|<ProfileName>`. `AddProfilePermission`, `ListProfilePermissions` and `RemoveProfilePermission` follow the revision id rules, error codes, 2000-byte policy limit and `policySizeBytes` measured on AWS, a canceled profile keeps its name and its permissions, `PutSigningProfile` refuses a name that is already taken, and `GetSigningProfile` reports the 135-month default validity period. Contributed by @iot-rocket.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added

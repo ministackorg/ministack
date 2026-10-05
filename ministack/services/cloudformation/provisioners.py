@@ -753,6 +753,12 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TopicName",
         "exists": "Topic creation failed because the topic already exists",
     },
+    # Measured on an account: a SignatureValidityPeriod change under a kept
+    # ProfileName, and an Action change under a kept StatementId and
+    # ProfileName (the permission's identity), both fail with the refusal
+    # sentence naming the physical id.
+    "AWS::Signer::SigningProfile": {"name": "ProfileName"},
+    "AWS::Signer::ProfilePermission": {"name": ("StatementId", "ProfileName")},
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
     # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
@@ -853,9 +859,16 @@ def _custom_named_replacement_error(resource_type, old_props, new_props,
 
 
 def _kept_custom_name(resource_type, old_props, new_props):
-    """The explicit name an update keeps unchanged, else None."""
+    """The explicit name an update keeps unchanged, else None. A ``name``
+    tuple is a name made of several properties, kept only when all are."""
     spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
-    name = old_props.get(spec["name"]) if spec else None
+    if not spec:
+        return None
+    if isinstance(spec["name"], tuple):
+        names = [old_props.get(p) for p in spec["name"]]
+        kept = all(names) and names == [new_props.get(p) for p in spec["name"]]
+        return "|".join(str(n) for n in names) if kept else None
+    name = old_props.get(spec["name"])
     return name if name and name == new_props.get(spec["name"]) else None
 
 
@@ -1138,6 +1151,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ServiceDiscovery::PrivateDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::PublicDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::Service": ("Tags", "list"),
+    "AWS::Signer::SigningProfile": ("Tags", "list"),
     "AWS::StepFunctions::StateMachine": ("Tags", "list"),
 }
 
@@ -10485,6 +10499,126 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# Signer SigningProfile and ProfilePermission
+# ---------------------------------------------------------------------------
+
+# The PlatformId enum of the resource schema (describe-type, 2026-10-05).
+# There is no SigningMaterial property, so no template reaches the IoT
+# platform, whose profiles need a certificate.
+_SIGNER_CFN_PLATFORMS = ("AWSLambda-SHA384-ECDSA", "Notation-OCI-SHA384-ECDSA")
+
+
+def _signer_raise_on_error(resp, resource_type):
+    if resp[0] >= 400:
+        try:
+            message = json.loads(resp[2]).get("message")
+        except (ValueError, AttributeError):
+            message = None
+        raise ValueError(message or f"{resource_type} failed: {resp[2]!r}")
+
+
+def _signer_profile_attrs(profile):
+    return {
+        "Arn": profile["arn"],
+        "ProfileName": profile["profileName"],
+        "ProfileVersion": profile["profileVersion"],
+        "ProfileVersionArn": profile["profileVersionArn"],
+    }
+
+
+def _signer_profile_name_from_arn(physical_id):
+    return str(physical_id).rsplit("/signing-profiles/", 1)[-1]
+
+
+def _signer_signing_profile_create(logical_id, props, stack_name):
+    """Ref is the profile ARN. Without a ProfileName the name is
+    ``<LogicalId>_<12 random letters and digits>`` (measured: Prof_s3JMHz2XvtHK).
+    The suffix is random, not hashed from the stack: a canceled profile keeps
+    its name for good, so recreating a deleted stack must not reuse one. The
+    tags, stack tags and ``aws:cloudformation:`` tags included, are stored as
+    given: the ``aws:`` prefix PutSigningProfile refuses is CloudFormation's own.
+    The profile is created through PutSigningProfile's own path, so jobs treat
+    it like any other profile."""
+    import ministack.services.signer as _signer
+    platform = props.get("PlatformId")
+    if platform not in _SIGNER_CFN_PLATFORMS:
+        raise ValueError(f"{platform} is not a valid enum value. Supported values: "
+                         f"[{', '.join(_SIGNER_CFN_PLATFORMS)}]")
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    # 51 + "_" + 12 keeps a long logical id inside the 64-character limit.
+    name = props.get("ProfileName") or f"{logical_id[:51]}_{suffix}"
+    body = {"platformId": platform}
+    period = props.get("SignatureValidityPeriod")
+    if isinstance(period, dict):
+        value = period.get("Value")
+        body["signatureValidityPeriod"] = {
+            k: v for k, v in (("type", period.get("Type")),
+                              ("value", int(value) if value is not None else None))
+            if v is not None
+        }
+    _signer_raise_on_error(_signer._put_signing_profile(name, body),
+                           "AWS::Signer::SigningProfile")
+    profile = _signer._profiles[name]
+    profile["tags"] = _tag_map(props.get("Tags"))
+    return profile["arn"], _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_update(physical_id, old_props, new_props, stack_name):
+    """Only Tags can reach this: the other properties are create-only and
+    replace the profile first. Tags change in place and the profile keeps
+    its version, as measured."""
+    import ministack.services.signer as _signer
+    profile = _signer._profiles.get(_signer_profile_name_from_arn(physical_id))
+    if profile is None:
+        raise ValueError(f"AWS::Signer::SigningProfile {physical_id} not found")
+    if not isinstance(profile.get("tags"), dict):
+        profile["tags"] = {}
+    _reconcile_tag_map(profile["tags"], old_props, new_props)
+    return physical_id, _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_delete(physical_id, props):
+    """A signing profile cannot be deleted: CloudFormation cancels it, and
+    the canceled profile keeps its name."""
+    import ministack.services.signer as _signer
+    _signer._cancel_signing_profile(_signer_profile_name_from_arn(physical_id))
+
+
+def _signer_current_revision(profile_name):
+    import ministack.services.signer as _signer
+    policy = (_signer._profiles.get(profile_name) or {}).get("policy")
+    return policy["revisionId"] if policy else None
+
+
+def _signer_profile_permission_create(logical_id, props, stack_name):
+    """Ref is ``<StatementId>|<ProfileName>``, as measured. The handler reads
+    the policy's current revision first, so permissions on one profile do
+    not conflict with each other."""
+    import ministack.services.signer as _signer
+    name = props.get("ProfileName", "")
+    sid = props.get("StatementId", "")
+    body = {
+        "action": props.get("Action"),
+        "principal": str(props.get("Principal", "")),
+        "statementId": sid,
+        "profileVersion": props.get("ProfileVersion"),
+        "revisionId": _signer_current_revision(name),
+    }
+    _signer_raise_on_error(
+        _signer._add_profile_permission(name, {k: v for k, v in body.items() if v is not None}),
+        "AWS::Signer::ProfilePermission")
+    return f"{sid}|{name}", {}
+
+
+def _signer_profile_permission_delete(physical_id, props):
+    import ministack.services.signer as _signer
+    sid, _, name = str(physical_id).partition("|")
+    revision = _signer_current_revision(name)
+    if revision is not None:
+        _signer._remove_profile_permission(name, sid, revision)
+
+
+# ---------------------------------------------------------------------------
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 
@@ -13417,6 +13551,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::SSM::Parameter": ("Name",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
+    "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
+    "AWS::Signer::ProfilePermission": (
+        "ProfileName", "Action", "Principal", "StatementId", "ProfileVersion",
+    ),
     "AWS::Cognito::UserPool": (),
     "AWS::Lambda::Function": (
         "FunctionName", "PackageType", "TenancyConfig",
@@ -14172,6 +14310,15 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
     "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::Signer::SigningProfile": {
+        "create": _signer_signing_profile_create,
+        "update": _signer_signing_profile_update,
+        "delete": _signer_signing_profile_delete,
+    },
+    "AWS::Signer::ProfilePermission": {
+        "create": _signer_profile_permission_create,
+        "delete": _signer_profile_permission_delete,
+    },
     "AWS::WAFv2::WebACL": {
         "create": _waf_web_acl_create,
         "update": _waf_web_acl_update,

@@ -583,6 +583,8 @@ subnet = ec2.create_subnet(
 | `AWS::SES::EmailIdentity` | Identity | EmailIdentity |
 | `AWS::SES::ConfigurationSet` | Configuration set name | None |
 | `AWS::SES::ConfigurationSetEventDestination` | Event destination ID | Id |
+| `AWS::Signer::SigningProfile` | Profile ARN | Arn, ProfileName, ProfileVersion, ProfileVersionArn |
+| `AWS::Signer::ProfilePermission` | `<statement id>\|<profile name>` | — |
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
 | `AWS::CloudWatch::Alarm` | Alarm name | Arn |
