@@ -665,6 +665,11 @@ def opensearch():
 
 
 @pytest.fixture(scope="session")
+def aoss():
+    return make_client("opensearchserverless")
+
+
+@pytest.fixture(scope="session")
 def kms_client():
     return make_client("kms")
 
