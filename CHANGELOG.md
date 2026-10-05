@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Bedrock AgentCore — Memory data plane** — the `bedrock-agentcore` data-plane endpoint now serves the short-term Memory event log (`CreateEvent` with generated session ids and `clientToken` replay, `GetEvent`, `ListEvents` with branch, parent-branch and metadata filters and `includePayloads`, `DeleteEvent`) plus `ListActors` and `ListSessions`, the long-term record store (`BatchCreateMemoryRecords`, `BatchUpdateMemoryRecords`, `BatchDeleteMemoryRecords` with per-record success/failure results, `GetMemoryRecord`, `ListMemoryRecords` with namespace, strategy and metadata filters, `DeleteMemoryRecord`), `RetrieveMemoryRecords`, and the extraction-job registry (`StartMemoryExtractionJob`, `ListMemoryExtractionJobs`). Extraction behind memory strategies still does not run, and with no embeddings `RetrieveMemoryRecords` scores records by the share of query word tokens present in the record text. Shapes, paths and id patterns verified against botocore `bedrock-agentcore`; not validated against AWS. Contributed by @pingedbrain.
+
 ### Fixed
 
 - **IoT — a CONTINUOUS job runs again for a thing that rejoins its target group** — executions were kept one per thing and job, so a thing that finished the job, left the group and was added back never got another execution. Joining a target group now queues the next execution number when the thing's newest execution is finished, leaving the group moves a QUEUED execution to `REMOVED`, both publish `jobs/notify(-next)`, the `notify-next` execution leaves out `thingName` and an empty `statusDetails`, and `ListJobExecutionsForThing`, `DescribeJobExecution` with `executionNumber` and `jobProcessDetails` include the earlier executions, as AWS does. Contributed by @iot-rocket.
