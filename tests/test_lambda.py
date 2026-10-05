@@ -6875,7 +6875,7 @@ def test_throttle_response_shape_matches_aws():
     body = r["body"]
     assert body["__type"] == "TooManyRequestsException"
     assert body["Reason"] == "ReservedFunctionConcurrentInvocationLimitExceeded"
-    assert "retryAfterSeconds" in body
+    assert body["retryAfterSeconds"] == "1"  # a string in the Lambda API model, not an int
     assert "message" in body
 
 
