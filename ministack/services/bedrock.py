@@ -273,6 +273,7 @@ _prompt_routers = AccountRegionScopedDict()
 _invocation_logging_config = AccountRegionScopedDict()  # 'config' -> dict (singleton)
 _tags = AccountRegionScopedDict()                  # arn -> {key: value}
 _USE_CASE = AccountRegionScopedDict()              # 'usecase' -> dict (model-access use case)
+_model_agreements = AccountRegionScopedDict()      # model id -> True (CreateFoundationModelAgreement)
 
 
 def reset():
@@ -282,7 +283,8 @@ def reset():
                    _model_import_jobs, _model_copy_jobs,
                    _model_invocation_jobs, _evaluation_jobs,
                    _marketplace_endpoints, _prompt_routers,
-                   _invocation_logging_config, _tags, _USE_CASE):
+                   _invocation_logging_config, _tags, _USE_CASE,
+                   _model_agreements):
         store.clear()
 
 
@@ -304,6 +306,7 @@ def get_state():
         "invocation_logging_config": _invocation_logging_config,
         "tags": _tags,
         "use_case": _USE_CASE,
+        "model_agreements": _model_agreements,
     })
 
 
@@ -330,6 +333,7 @@ def _restore_state(data):
     _invocation_logging_config.update(data.get("invocation_logging_config", {}))
     _tags.update(data.get("tags", {}))
     _USE_CASE.update(data.get("use_case", {}))
+    _model_agreements.update(data.get("model_agreements", {}))
 
 
 
@@ -426,11 +430,13 @@ def _get_foundation_model(identifier: str) -> tuple:
 
 
 def _get_foundation_model_availability(model_id: str) -> tuple:
-    if _find_model(model_id) is None:
+    entry = _find_model(model_id)
+    if entry is None:
         return _not_found(f"Could not find model {model_id}.")
+    agreed = entry[2] == "Amazon" or entry[0] in _model_agreements
     return _json({
         "ModelId": model_id,
-        "AgreementAvailability": {"Status": "AVAILABLE"},
+        "AgreementAvailability": {"Status": "AVAILABLE" if agreed else "NOT_AVAILABLE"},
         "AuthorizationStatus": "AUTHORIZED",
         "EntitlementAvailability": "AVAILABLE",
         "RegionAvailability": "AVAILABLE",
@@ -438,9 +444,21 @@ def _get_foundation_model_availability(model_id: str) -> tuple:
 
 
 def _list_foundation_model_agreement_offers(model_id: str) -> tuple:
-    if _find_model(model_id) is None:
+    entry = _find_model(model_id)
+    if entry is None:
         return _not_found(f"Could not find model {model_id}.")
-    return _json({"ModelId": model_id, "Offers": []})
+    if entry[2] == "Amazon":
+        return _json({"ModelId": model_id, "Offers": []})
+    offer_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"bedrock-offer:{model_id}"))
+    return _json({"ModelId": model_id, "Offers": [{
+        "OfferId": offer_id,
+        "OfferToken": offer_id,
+        "TermDetails": {
+            "UsageBasedPricingTerm": {"RateCard": []},
+            "LegalTerm": {},
+            "SupportTerm": {},
+        },
+    }]})
 
 
 def _create_foundation_model_agreement(body) -> tuple:
@@ -449,6 +467,12 @@ def _create_foundation_model_agreement(body) -> tuple:
         return err
     if not body_obj.get("modelId"):
         return _validation("modelId is required.")
+    if not body_obj.get("offerToken"):
+        return _validation("offerToken is required.")
+    entry = _find_model(body_obj["modelId"])
+    if entry is None:
+        return _not_found(f"Could not find model {body_obj['modelId']}.")
+    _model_agreements[entry[0]] = True
     return _json({"ModelId": body_obj["modelId"]}, status=202)
 
 
@@ -458,6 +482,9 @@ def _delete_foundation_model_agreement(body) -> tuple:
         return err
     if not body_obj.get("modelId"):
         return _validation("modelId is required.")
+    entry = _find_model(body_obj["modelId"])
+    if entry is not None:
+        _model_agreements.pop(entry[0], None)
     return _empty(status=202)
 
 
