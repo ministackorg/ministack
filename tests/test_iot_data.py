@@ -3150,10 +3150,18 @@ def _client_context(broker: _Broker, cert_pem: str | None, key_pem: str | None, 
     return ctx
 
 
-def _mtls_connect(broker: _Broker, cert_pem, key_pem, tmp_path, timeout: float = 10.0):
-    """Open a TLS socket to the listener, verifying the broker's chain."""
+def _mtls_connect(
+    broker: _Broker, cert_pem, key_pem, tmp_path, timeout: float = 10.0,
+    server_name: str | None = "localhost",
+):
+    """Open a TLS socket to the listener, verifying the broker's chain. Another
+    ``server_name`` is sent as the SNI without checking it against the
+    certificate; None sends no SNI, as when dialling by IP."""
     ctx = _client_context(broker, cert_pem, key_pem, tmp_path)
     raw = socket.create_connection(("127.0.0.1", broker.mqtt_port), timeout=timeout)
+    if server_name != "localhost":
+        ctx.check_hostname = False
+        return ctx.wrap_socket(raw, server_hostname=server_name)
     # `server_hostname` is checked against the certificate's SANs, so this also
     # pins that the broker certificate carries a usable `localhost` name.
     return ctx.wrap_socket(raw, server_hostname="localhost")
@@ -3609,6 +3617,37 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_jitr_certificate_is_listed_by_its_ca(broker, tmp_path):
+    """As measured on AWS, ListCertificatesByCA lists the certificate that
+    just-in-time registration created, while it is still PENDING_ACTIVATION."""
+    from ministack.core.x509_utils import get_certificate_id, sign_leaf_certificate
+
+    iot = broker.client("iot")
+    ca_pem, ca_key, verification_pem = iot_test_ca(
+        iot.get_registration_code()["registrationCode"], _unique("jitr-list-ca")
+    )
+    ca_id = iot.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem,
+        setAsActive=True, allowAutoRegistration=True,
+    )["certificateId"]
+    leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name="jitr-listed")
+    cert_id = get_certificate_id(leaf_pem)
+    try:
+        assert _refused_below_mqtt(broker, leaf_pem, leaf_key, tmp_path, _unique("jitr-listed"))
+        listing = iot.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [(c["certificateId"], c["status"]) for c in listing] == [
+            (cert_id, "PENDING_ACTIVATION")
+        ]
+    finally:
+        try:
+            iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot.delete_certificate(certificateId=cert_id, forceDelete=True)
+        except ClientError:
+            pass
+        iot.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot.delete_ca_certificate(certificateId=ca_id)
+
+
 def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_path):
     """Just-in-time registration, as on AWS: an unknown certificate signed by a
     CA with auto-registration enabled is created PENDING_ACTIVATION, the
@@ -3684,6 +3723,48 @@ def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_pa
                 iot.delete_certificate(certificateId=cid, forceDelete=True)
             except ClientError:
                 pass
+        iot.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_mtls_jitr_under_an_sni_only_ca_needs_sni(broker, tmp_path):
+    """A CA in SNI_ONLY mode auto-registers a device only when its ClientHello
+    carries a server name that reaches the endpoint, as on AWS. Without one,
+    or with an unrelated one, the certificate stays unknown and is refused
+    like any other unknown certificate (CONNACK 5)."""
+    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+
+    iot = broker.client("iot")
+    ca_pem, ca_key = generate_ca(common_name=_unique("jitr-sni-ca"))
+    ca_id = iot.register_ca_certificate(
+        caCertificate=ca_pem, certificateMode="SNI_ONLY",
+        setAsActive=True, allowAutoRegistration=True,
+    )["certificateId"]
+    leaf_pem, leaf_key, _public = sign_leaf_certificate(ca_pem, ca_key, common_name="jitr-sni-device")
+    cert_id = get_certificate_id(leaf_pem)
+    try:
+        for server_name in (None, "mqtt.example.com"):
+            peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path, server_name=server_name))
+            try:
+                _assert_connack(peer.connect(_unique("jitr-no-sni")), return_code=5)
+            finally:
+                peer.close()
+            with pytest.raises(ClientError) as exc:
+                iot.describe_certificate(certificateId=cert_id)
+            assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        assert _refused_below_mqtt(
+            broker, leaf_pem, leaf_key, tmp_path, _unique("jitr-sni")
+        ), "connect with SNI got a CONNACK"
+        desc = iot.describe_certificate(certificateId=cert_id)["certificateDescription"]
+        assert desc["status"] == "PENDING_ACTIVATION"
+        assert desc["caCertificateId"] == ca_id
+    finally:
+        try:
+            iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot.delete_certificate(certificateId=cert_id, forceDelete=True)
+        except ClientError:
+            pass
         iot.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
         iot.delete_ca_certificate(certificateId=ca_id)
 
