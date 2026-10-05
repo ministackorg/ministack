@@ -556,7 +556,7 @@ async def _route_request(
     if path == "/certificate/register" and method == "POST":
         return await _register_certificate(_parse_body(body), qp)
     if path == "/certificate/register-no-ca" and method == "POST":
-        return await _register_certificate(_parse_body(body), qp, without_ca=True)
+        return await _register_certificate_without_ca(_parse_body(body), qp)
 
     # CA certificates + JITR registration code
     if path == "/registrationcode" and method in ("GET", "DELETE"):
@@ -1580,6 +1580,16 @@ def _create_certificate_from_csr(payload: dict, qp: dict) -> tuple:
     })
 
 
+async def _register_certificate_without_ca(payload: dict, qp: dict) -> tuple:
+    """``RegisterCertificateWithoutCA``: a certificate registered without a
+    CA is in ``SNI_ONLY`` mode, which DescribeCertificate reports."""
+    response = await _register_certificate(payload, qp, without_ca=True)
+    if response[0] == 200:
+        cert_id = json.loads(response[2])["certificateId"]
+        _certificates[cert_id] = {**_certificates[cert_id], "certificateMode": "SNI_ONLY"}
+    return response
+
+
 def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     """409 for a duplicate PEM, carrying ``resourceId``/``resourceArn`` the way
     real AWS's ``ResourceAlreadyExistsException`` does — all register variants
@@ -1854,6 +1864,7 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
             "certificatePem": record["certificatePem"],
             "ownedBy": record["ownedBy"],
             "creationDate": record.get("creationDate"),
+            "certificateMode": record.get("certificateMode", "DEFAULT"),
         }
         # Present only for CA-signed registrations, so JITR consumers can
         # resolve the signing CA (per the CertificateDescription model).

@@ -493,9 +493,9 @@ def test_iot_create_keys_and_certificate_inactive(iot_client):
 
 def test_iot_create_certificate_from_csr(iot_client):
     """CreateCertificateFromCsr signs the CSR with the local CA: the
-    certificate keeps the CSR's subject and key and is INACTIVE unless
-    setAsActive; a CSR that does not parse or verify, or carries a key AWS
-    refuses, is refused with AWS's message."""
+    certificate keeps the CSR's subject and key, is INACTIVE unless
+    setAsActive, and is in DEFAULT mode; a CSR that does not parse or verify,
+    or carries a key AWS refuses, is refused with AWS's message."""
     pytest.importorskip("cryptography")
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -518,7 +518,8 @@ def test_iot_create_certificate_from_csr(iot_client):
     assert issued.public_key().public_bytes(*spki) == key.public_key().public_bytes(*spki)
     assert not issued.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
     desc = iot_client.describe_certificate(certificateId=inactive["certificateId"])["certificateDescription"]
-    assert (desc["status"], desc["certificatePem"]) == ("INACTIVE", inactive["certificatePem"])
+    assert (desc["status"], desc["certificateMode"], desc["certificatePem"]) == (
+        "INACTIVE", "DEFAULT", inactive["certificatePem"])
     assert iot_client.describe_certificate(
         certificateId=active["certificateId"])["certificateDescription"]["status"] == "ACTIVE"
 
@@ -747,6 +748,7 @@ def test_iot_register_certificate_without_ca_roundtrip(iot_client):
     desc = iot_client.describe_certificate(certificateId=cert_id)
     assert desc["certificateDescription"]["certificatePem"] == cert_pem
     assert desc["certificateDescription"]["status"] == "ACTIVE"
+    assert desc["certificateDescription"]["certificateMode"] == "SNI_ONLY"
 
     iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert_id)
