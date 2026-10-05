@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — throttle `retryAfterSeconds` is a string** — a `TooManyRequestsException` returns `retryAfterSeconds` as a string, as the Lambda API model declares, so SDK clients such as the AWS SDK for Rust parse the response as a throttle.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 
