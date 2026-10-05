@@ -199,7 +199,8 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
 
 
 async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
-    # Nothing re-queues here, so only execution number 1 exists.
+    # Only the newest execution takes updates; a rejoined thing's older ones
+    # are terminal.
     execution_number = payload.get("executionNumber")
     if execution_number is not None:
         try:
