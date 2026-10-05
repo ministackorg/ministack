@@ -11,6 +11,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **STS — `GetAccessKeyInfo` answers the account that owns the key** — it returned the caller's account whatever `AccessKeyId` said; it now returns the owning account for keys the emulator knows (its root key, IAM access keys and STS sessions), the account encoded in any other `AKIA` or `ASIA` key id as AWS does, and a `ValidationError` for an id that encodes no account or breaks the parameter's length and pattern constraints. Contributed by @iot-rocket.
 - **STS — `GetAccessKeyInfo` is authorized like other actions** — under `AUTH=true` it was allowed like `GetCallerIdentity` and `GetSessionToken`, whatever the caller's policies said. It now needs an identity policy that allows it and no deny, and otherwise answers `AccessDenied`, as AWS does; the other two stay allowed. Contributed by @iot-rocket.
+- **API Gateway v2 (WebSocket API) — `$connect` with `AWS_IAM`** — an unsigned handshake is refused with 403 `Missing Authentication Token`, and under `AUTH=true` the caller needs `execute-api:Invoke` on `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/$connect`. Contributed by @iot-rocket.
+- **SNS — `CreateTopic` keeps its tags** — the handler read `Tag.member.N` where the API sends `Tags.member.N`, so tags given at creation were dropped. Contributed by @iot-rocket.
 
 ## [1.5.21] — 2026-10-03
 
