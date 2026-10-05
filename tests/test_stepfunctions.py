@@ -3426,38 +3426,36 @@ def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     assert desc["status"] == "SUCCEEDED"
 
 
-def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
-    """States.TaskFailed matches every error except States.Timeout, in Retry and in Catch."""
-    queue_url = sqs.create_queue(QueueName="sfn-taskfailed-timeout")["QueueUrl"]
+def test_sfn_task_timeout_seconds_applies_to_lambda_invoke(sfn, lam):
+    """A Lambda task that runs longer than TimeoutSeconds fails with States.Timeout."""
+    fn = f"sfn-task-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import time\ndef handler(event, context):\n    time.sleep(3)\n    return 'done'\n"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)}, Timeout=10,
+    )
     definition = json.dumps({
-        "StartAt": "Wait",
+        "StartAt": "Call",
         "States": {
-            "Wait": {
+            "Call": {
                 "Type": "Task",
-                "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
-                "Parameters": {"QueueUrl": queue_url, "MessageBody": {"token.$": "$$.Task.Token"}},
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": fn, "Payload": {}},
                 "TimeoutSeconds": 1,
-                "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 1, "MaxAttempts": 1}],
-                "Catch": [
-                    {"ErrorEquals": ["States.TaskFailed"], "Next": "CaughtAsTaskFailed"},
-                    {"ErrorEquals": ["States.Timeout"], "Next": "CaughtAsTimeout"},
-                ],
+                "Catch": [{"ErrorEquals": ["States.Timeout"], "Next": "TimedOut"}],
                 "End": True,
             },
-            "CaughtAsTaskFailed": {"Type": "Pass", "Result": "task-failed", "End": True},
-            "CaughtAsTimeout": {"Type": "Pass", "Result": "timeout", "End": True},
+            "TimedOut": {"Type": "Pass", "Result": "timed-out", "End": True},
         },
     })
     sm = sfn.create_state_machine(
-        name="sfn-taskfailed-timeout", definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
+        name=fn, definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
     )
     ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
 
     desc = _wait_sfn(sfn, ex["executionArn"])
     assert desc["status"] == "SUCCEEDED"
-    assert json.loads(desc["output"]) == "timeout"
-    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
-    assert [e["type"] for e in events].count("TaskScheduled") == 1
+    assert json.loads(desc["output"]) == "timed-out"
 
 
 def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):

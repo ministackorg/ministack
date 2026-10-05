@@ -1205,10 +1205,6 @@ class TestIndexLimits:
              "USING not supported for CREATE INDEX"),
             ("CREATE INDEX ASYNC i ON t USING btree (a)", "0A000",
              "USING not supported for CREATE INDEX"),
-            ("CREATE INDEX i ON t (a) WHERE a > 0", "0A000",
-             "WHERE not supported for CREATE INDEX"),
-            ("CREATE INDEX ASYNC i ON t (a) WHERE a > 0", "0A000",
-             "WHERE not supported for CREATE INDEX"),
             # plain (synchronous) mode is rejected outright, empty table or not
             ("CREATE INDEX i ON t (a)", "0A000",
              "unsupported mode. please use CREATE INDEX ASYNC."),
@@ -1228,6 +1224,42 @@ class TestIndexLimits:
              "expressions are not supported in included columns"),
             ("CREATE UNIQUE INDEX ASYNC i ON t (a) INCLUDE ((b + c))", "0A000",
              "included columns"),
+            # partial indexes: plain mode still needs ASYNC
+            ("CREATE INDEX i ON t (a) WHERE a > 0", "0A000",
+             "unsupported mode. please use CREATE INDEX ASYNC."),
+            # the predicate must be immutable too (Postgres' own message)
+            ("CREATE INDEX ASYNC i ON t (a) WHERE created > now()", "42P17",
+             "functions in index predicate must be marked IMMUTABLE"),
+            ("CREATE INDEX ASYNC i ON t (a) INCLUDE (b) WHERE random() < 0.5",
+             "42P17", "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (a) WHERE b IN (SELECT id FROM u)",
+             "0A000", "cannot use subquery in index predicate"),
+            # Precedence measured on real DSQL (eu-central-1, 2026-10-04):
+            # key count -> mode -> predicate -> key expressions -> INCLUDE.
+            ("CREATE INDEX i ON t (a,b,c,d,e,f,g,h,i)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX i ON t (now(),a,b,c,d,e,f,g,h)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (now(),a,b,c,d,e,f,g,h)", "54011",
+             "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h,i) INCLUDE ((b + c))",
+             "54011", "more than 8 column keys"),
+            ("CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h,i) WHERE b IN (SELECT 1)",
+             "54011", "more than 8 column keys"),
+            ("CREATE INDEX CONCURRENTLY i ON t (a,b,c,d,e,f,g,h,i)", "0A000",
+             "CONCURRENTLY"),
+            ("CREATE INDEX i ON t (a) WHERE random() < 0.5", "0A000",
+             "unsupported mode"),
+            ("CREATE INDEX i ON t (a) INCLUDE ((b + c))", "0A000",
+             "unsupported mode"),
+            ("CREATE INDEX ASYNC i ON t (now()) WHERE random() < 0.5", "42P17",
+             "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (now()) WHERE b IN (SELECT 1)", "0A000",
+             "subquery"),
+            ("CREATE INDEX ASYNC i ON t (a) INCLUDE ((b + c)) WHERE random() < 0.5",
+             "42P17", "index predicate"),
+            ("CREATE INDEX ASYNC i ON t (now()) INCLUDE ((b + c))", "42P17",
+             "index expression"),
         ],
     )
     def test_unsupported_index_forms_denied(self, sql, sqlstate, message):
@@ -1246,11 +1278,26 @@ class TestIndexLimits:
             "CREATE INDEX ASYNC i ON t (lower(email))",
             "CREATE INDEX ASYNC i ON t ((data->>'city'))",
             "CREATE INDEX ASYNC ON t (upper(title), (a + b) NULLS LAST)",
+            # partial indexes (AWS DSQL, 2026-09-15)
+            "CREATE INDEX ASYNC high_rating_idx ON films (title) WHERE rating > 5",
+            "CREATE UNIQUE INDEX ASYNC i ON t (email) WHERE NOT archived",
+            "CREATE UNIQUE INDEX ASYNC i ON t (a) INCLUDE (b) NULLS NOT DISTINCT "
+            "WHERE status = 'active'",
+            "CREATE INDEX ASYNC i ON t (lower(title)) WHERE deleted_at IS NULL",
+            # function names and keywords inside literals aren't calls
+            "CREATE INDEX ASYNC i ON t (a) WHERE note <> 'now() or SELECT'",
         ],
     )
     def test_supported_index_forms_allowed(self, sql):
         result = pgproxy.validate(sql, pgproxy.TxnState())
         assert isinstance(result, pgproxy.Rewrite), sql
+
+    def test_partial_index_predicate_reaches_the_backend(self):
+        result = pgproxy.validate(
+            "CREATE INDEX ASYNC i ON t (a) WHERE a > 0", pgproxy.TxnState()
+        )
+        assert result.sql == "CREATE INDEX i ON t (a) WHERE a > 0"
+        assert result.job_type == "INDEX_BUILD"
 
     def test_more_than_8_columns_denied(self):
         err = pgproxy.validate(
@@ -1265,6 +1312,150 @@ class TestIndexLimits:
             "CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h)", pgproxy.TxnState()
         )
         assert isinstance(result, pgproxy.Rewrite)
+
+
+class TestDsqlSettings:
+    """dsql.* planner settings (dsql.enable_batched_nestloop, 2026-09-11)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SET dsql.enable_batched_nestloop = off",
+            "SET dsql.enable_batched_nestloop TO on",
+            "SET SESSION dsql.enable_batched_nestloop = 'false'",
+            "SET LOCAL dsql.enable_batched_nestloop = true",
+            "set dsql.enable_batched_nestloop = 0;",
+            "SET dsql.enable_batched_nestloop = of",  # unique prefix of off
+            "SET dsql.enable_batched_nestloop = y",
+            "SET dsql.enable_batched_nestloop TO DEFAULT",
+            'SET dsql.enable_batched_nestloop = "on"',
+            "SET DSQL.ENABLE_BATCHED_NESTLOOP = OFF",
+            "RESET dsql.enable_batched_nestloop",
+            "SHOW dsql.enable_batched_nestloop",
+            "SELECT set_config('dsql.enable_batched_nestloop', 'off', false)",
+            # Ordinary settings DSQL lets a session change.
+            "SET enable_hashjoin = off",
+            "SET search_path = public",
+            # Refused settings can still be reset.
+            "RESET default_statistics_target",
+            "SET default_statistics_target TO DEFAULT",
+        ],
+    )
+    def test_accepted(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    def test_value_list_rejected(self):
+        err = pgproxy.validate(
+            "SET dsql.enable_batched_nestloop = on, off", pgproxy.TxnState()
+        )
+        assert (err.sqlstate, err.message) == (
+            "22023", "SET dsql.enable_batched_nestloop takes only one argument",
+        )
+
+    def test_set_config_validates_the_value(self):
+        err = pgproxy.validate(
+            "SELECT set_config('dsql.enable_batched_nestloop', 'banana', false)",
+            pgproxy.TxnState(),
+        )
+        assert err.sqlstate == "22023"
+        assert "requires a Boolean value" in err.message
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SET dsql.bogus = 1",
+            "SET LOCAL dsql.bogus = 1",
+            "SET SESSION dsql.bogus TO 1",
+            "RESET dsql.bogus",
+            "SET dsql.bogus TO DEFAULT",
+            "SELECT set_config('dsql.bogus', '1', false)",
+        ],
+    )
+    def test_dsql_prefix_is_reserved(self, sql):
+        # Exact message and detail from real DSQL (eu-central-1, 2026-10-04).
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert err.sqlstate == "42602", sql
+        assert err.message == 'invalid configuration parameter name "dsql.bogus"'
+        assert err.detail == '"dsql" is a reserved prefix.'
+
+    @pytest.mark.parametrize(
+        "sql,param",
+        [
+            ("SET default_statistics_target = 200", "default_statistics_target"),
+            ("SET LOCAL default_statistics_target = 50", "default_statistics_target"),
+            ("SELECT set_config('default_statistics_target', '50', false)",
+             "default_statistics_target"),
+            ("SET work_mem = '64MB'", "work_mem"),
+            ("SET statement_timeout = '5s'", "statement_timeout"),
+        ],
+    )
+    def test_unsettable_parameters_rejected(self, sql, param):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert err.sqlstate == "0A000", sql
+        assert err.message == f'setting configuration parameter "{param}" not supported'
+
+    @pytest.mark.parametrize(
+        "value", ["banana", "'maybe'", "2", "o", "''", "onn"],
+    )
+    def test_non_boolean_rejected(self, value):
+        err = pgproxy.validate(
+            f"SET dsql.enable_batched_nestloop = {value}", pgproxy.TxnState()
+        )
+        assert isinstance(err, pgproxy.DsqlError), value
+        assert err.sqlstate == "22023"
+        assert err.message == (
+            'parameter "dsql.enable_batched_nestloop" requires a Boolean value'
+        )
+
+    def test_backend_starts_with_dsql_defaults(self):
+        from ministack.services import dsql as dsql_mod
+
+        assert dsql_mod.PG_COMMAND == [
+            "postgres", "-c", "dsql.enable_batched_nestloop=on",
+        ]
+
+
+class TestStatisticsRules:
+    """Extended statistics (AWS DSQL, 2026-08-27); messages measured live."""
+
+    @pytest.mark.parametrize("target", ["100", "-1", "0"])
+    def test_statistics_target_up_to_100_allowed(self, target):
+        sql = f"ALTER STATISTICS s SET STATISTICS {target}"
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
+
+    def test_statistics_target_over_100_rejected(self):
+        err = pgproxy.validate(
+            "ALTER STATISTICS s SET STATISTICS 101", pgproxy.TxnState()
+        )
+        assert (err.sqlstate, err.message) == (
+            "22023", "statistics target 101 exceeds maximum allowed value of 100",
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "ALTER TABLE t ALTER COLUMN a SET STATISTICS 50",
+            "ALTER TABLE t ALTER a SET STATISTICS 200",
+        ],
+    )
+    def test_column_statistics_target_rejected(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert (err.sqlstate, err.message) == (
+            "0A000",
+            "unsupported ALTER TABLE ALTER COLUMN ... SET STATISTICS statement",
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CREATE STATISTICS s1 (dependencies) ON a, b FROM t",
+            "CREATE STATISTICS ON (lower(a)) FROM public.t",
+            "ALTER STATISTICS s1 RENAME TO s2",
+            "DROP STATISTICS s1",
+        ],
+    )
+    def test_statements_pass_text_validation(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
 
 
 class TestWaitForJob:
@@ -1282,6 +1473,33 @@ class TestWaitForJob:
     def test_no_match(self):
         assert pgproxy.match_wait_for_job("SELECT 1") is None
         assert pgproxy.match_wait_for_job("SELECT sys.wait_for_job(job_id)") is None
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CALL sys.wait_for_job($1)",
+            "CALL sys.wait_for_job( $1::text )",
+            "SELECT sys.wait_for_job($1)",
+        ],
+    )
+    def test_bound_parameter_form(self, sql):
+        # A client that binds the job id over the extended protocol sends
+        # the statement text as ...($1).
+        assert pgproxy.match_wait_for_job(sql) == pgproxy.BindParam(1)
+
+    def test_literal_with_cast(self):
+        sql = "CALL sys.wait_for_job('abc123'::text)"
+        assert pgproxy.match_wait_for_job(sql) == "abc123"
+
+    def test_sys_jobs_bound_filter(self):
+        assert pgproxy.match_sys_jobs(
+            "SELECT job_id, status FROM sys.jobs WHERE job_id = $2"
+        ) == (["job_id", "status"], pgproxy.BindParam(2))
+
+    def test_job_ids_are_base32(self):
+        job = pgproxy._register_job("idtest", "public.i")
+        assert re.fullmatch(r"[a-z2-7]{26}", job["job_id"])
+        pgproxy._jobs.pop("idtest", None)
 
 
 class TestReset:
@@ -1694,8 +1912,11 @@ def pg_backend(pg_image):
     docker = pytest.importorskip("docker")
     psycopg2 = pytest.importorskip("psycopg2")
     client = docker.from_env()
+    from ministack.services import dsql as dsql_mod
+
     container = client.containers.run(
         image=pg_image,
+        command=dsql_mod.PG_COMMAND,
         detach=True,
         environment={
             "POSTGRES_USER": "postgres",
@@ -1839,7 +2060,7 @@ class _WireClient:
         params = f"user\0{user}\0database\0{database}\0\0".encode()
         payload = struct.pack("!I", 196608) + params
         self.sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
-        self._until_ready()
+        self.startup = self._until_ready()
 
     def __enter__(self):
         return self
@@ -1911,9 +2132,19 @@ class _WireResult:
         self.sqlstate = None
         self.message = None
         self.rows = []
+        self.columns = []  # (name, type oid) from RowDescription
         self.tag = None
         self.txn_status = None
         for type_byte, payload in frames:
+            if type_byte == b"T":
+                (n,) = struct.unpack("!H", payload[:2])
+                off = 2
+                for _ in range(n):
+                    end = payload.index(b"\0", off)
+                    name = payload[off:end].decode()
+                    (oid,) = struct.unpack("!I", payload[end + 7 : end + 11])
+                    self.columns.append((name, oid))
+                    off = end + 19
             if type_byte == b"E":
                 for part in payload.split(b"\0"):
                     if part[:1] == b"C":
@@ -2290,6 +2521,156 @@ class TestLockingReads:
 
 @requires_docker
 @pytest.mark.data_plane
+class TestWaitForJobOverTheWire:
+    """``CALL sys.wait_for_job`` as drivers send it. Shapes measured on Aurora
+    DSQL (eu-central-1, 2026-10-04): one bool OUT column named ``succeeded``,
+    command tag ``CALL``, with a literal or a bound ``$1`` alike."""
+
+    def _job(self, c, table, unique=False, dup=False):
+        c.simple(f"DROP TABLE IF EXISTS {table}")
+        c.simple(f"CREATE TABLE {table} (id int PRIMARY KEY, a int)")
+        if dup:
+            c.simple(f"INSERT INTO {table} VALUES (1, 1), (2, 1)")
+        kind = "UNIQUE INDEX" if unique else "INDEX"
+        result = c.extended(f"CREATE {kind} ASYNC {table}_a ON {table} (a)")
+        assert result.ok, result.message
+        return result.rows[0][0]
+
+    def test_bound_job_id(self, dsql_proxy):
+        """``CALL sys.wait_for_job($1)`` with the id bound, read back through
+        the ``succeeded`` column."""
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_drz")
+            result = c.extended("CALL sys.wait_for_job($1)", params=(job,))
+            assert result.ok, f"{result.sqlstate} {result.message}"
+            assert result.columns == [("succeeded", 16)]
+            assert result.rows == [("t",)]
+            assert result.tag == "CALL"
+            c.simple("DROP TABLE wfj_drz")
+
+    def test_cast_and_literal_forms(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_forms")
+            cast = c.extended("CALL sys.wait_for_job($1::text)", params=(job,))
+            assert (cast.columns, cast.rows, cast.tag) == (
+                [("succeeded", 16)], [("t",)], "CALL",
+            )
+            literal = c.simple(f"CALL sys.wait_for_job('{job}')")
+            assert (literal.columns, literal.rows, literal.tag) == (
+                [("succeeded", 16)], [("t",)], "CALL",
+            )
+            c.simple("DROP TABLE wfj_forms")
+
+    def test_failed_job_answers_false(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_fail", unique=True, dup=True)
+            result = c.extended("CALL sys.wait_for_job($1)", params=(job,))
+            assert result.rows == [("f",)]
+            jobs = c.extended(
+                "SELECT status, details FROM sys.jobs WHERE job_id = $1",
+                params=(job,),
+            )
+            assert jobs.rows == [
+                ("failed", "found duplicate key(s) while validating index uniqueness")
+            ]
+            c.simple("DROP TABLE wfj_fail")
+
+    def test_sys_jobs_bound_filter(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_jobs")
+            result = c.extended(
+                "SELECT job_id, status FROM sys.jobs WHERE job_id = $1", params=(job,)
+            )
+            assert result.rows == [(job, "completed")]
+            assert result.tag == "SELECT 1"
+            c.simple("DROP TABLE wfj_jobs")
+
+    def test_async_ddl_command_tags(self, dsql_proxy):
+        """CREATE INDEX ASYNC answers CREATE INDEX, ALTER TABLE ASYNC answers
+        ALTER TABLE; both carry the job_id row."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("DROP TABLE IF EXISTS wfj_tags")
+            c.simple("CREATE TABLE wfj_tags (id int PRIMARY KEY, a int)")
+            c.simple("ALTER TABLE wfj_tags ADD CONSTRAINT wfj_ck CHECK (a > 0) NOT VALID")
+            for result in (
+                c.simple("CREATE INDEX ASYNC wfj_tags_a ON wfj_tags (a)"),
+                c.extended("CREATE INDEX ASYNC wfj_tags_b ON wfj_tags (a)"),
+            ):
+                assert (result.tag, result.columns) == ("CREATE INDEX", [("job_id", 25)])
+            for sql in (
+                "ALTER TABLE ASYNC wfj_tags VALIDATE CONSTRAINT wfj_ck",
+            ):
+                result = c.simple(sql)
+                assert result.tag == "ALTER TABLE", sql
+                validate_job = result.rows[0][0]
+            jobs = c.extended(
+                "SELECT class_id, start_time FROM sys.jobs WHERE job_id = $1",
+                params=(validate_job,),
+            )
+            # oid and timestamptz, rendered the way Postgres renders them
+            assert jobs.columns == [("class_id", 26), ("start_time", 1184)]
+            assert jobs.rows[0][0] == "2606"  # pg_constraint
+            assert re.fullmatch(
+                r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\+00", jobs.rows[0][1]
+            )
+            c.simple("DROP TABLE wfj_tags")
+
+    def test_startup_reports_timezone(self, dsql_proxy):
+        """Drivers decode timestamptz by the reported TimeZone. Values as
+        real DSQL reports them."""
+        with _WireClient(dsql_proxy) as c:
+            status = dict(
+                p[:-1].decode().split("\0", 1) for t, p in c.startup if t == b"S"
+            )
+        assert status["TimeZone"] == "UTC"
+        assert status["DateStyle"] == "ISO, MDY"
+        assert status["IntervalStyle"] == "postgres"
+
+    def test_malformed_job_id_rejected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            result = c.extended("CALL sys.wait_for_job($1)", params=("not-a-job",))
+            assert (result.sqlstate, result.message) == (
+                "22P02", "Unable to convert text to UUID",
+            )
+            # The error ends at Sync; the session carries on.
+            assert c.simple("SELECT 1").rows == [("1",)]
+
+    def test_placeholder_in_a_simple_query(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            result = c.simple("CALL sys.wait_for_job($1)")
+            assert (result.sqlstate, result.message) == (
+                "42P02", "there is no parameter $1",
+            )
+
+    def test_named_statement_rebinds(self, dsql_proxy):
+        """One prepared statement, two Binds: each portal gets its own answer."""
+        with _WireClient(dsql_proxy) as c:
+            job = self._job(c, "wfj_named")
+            f = c._frame
+
+            def bind(portal, value):
+                raw = value.encode()
+                return f(
+                    b"B",
+                    portal + b"\0wfj\0" + struct.pack("!HHi", 0, 1, len(raw)) + raw
+                    + struct.pack("!H", 0),
+                )
+
+            msg = f(b"P", b"wfj\0CALL sys.wait_for_job($1)\0" + struct.pack("!H", 0))
+            msg += f(b"D", b"Swfj\0")
+            msg += bind(b"p1", job) + f(b"E", b"p1\0" + struct.pack("!I", 0))
+            msg += bind(b"p2", "a" * 26) + f(b"E", b"p2\0" + struct.pack("!I", 0))
+            msg += f(b"S", b"")
+            c.sock.sendall(msg)
+            frames = c._until_ready()
+            param_desc = next(p for t, p in frames if t == b"t")
+            assert param_desc == struct.pack("!HI", 1, 25)  # one text parameter
+            assert _WireResult(frames).rows == [("t",), ("f",)]
+            c.simple("DROP TABLE wfj_named")
+
+
+@requires_docker
+@pytest.mark.data_plane
 class TestTransactionAbortSemantics:
     """A statement the proxy rejects must poison the transaction block the way
     a real error does — otherwise the following statements still commit."""
@@ -2360,9 +2741,10 @@ class TestLiveProxy:
             job_id = cur.fetchone()[0]
             assert re.match(r"^[a-z0-9]{26}$", job_id)
 
-            cur.execute("SELECT job_id, status, job_type FROM sys.jobs")
+            cur.execute("SELECT job_id, status, job_type, details FROM sys.jobs")
             jobs = cur.fetchall()
-            assert (job_id, "completed", "INDEX_BUILD") in jobs
+            # details is NULL for a job that succeeded (as on real DSQL).
+            assert (job_id, "completed", "INDEX_BUILD", None) in jobs
         finally:
             conn.close()
 
@@ -2498,7 +2880,9 @@ class TestLiveProxy:
                 ("CREATE INDEX fi1 ON form_live USING gin (data)", "0A000",
                  "USING not supported"),
                 ("CREATE INDEX fi2 ON form_live (a) WHERE a > 0", "0A000",
-                 "WHERE not supported"),
+                 "unsupported mode"),
+                ("CREATE INDEX ASYNC fi5 ON form_live (a) WHERE now() > now()",
+                 "42P17", "index predicate"),
                 ("CREATE INDEX fi3 ON form_live (now())", "0A000",
                  "unsupported mode"),
                 ("CREATE INDEX ASYNC fi4 ON form_live (now())", "42P17",
@@ -2528,6 +2912,177 @@ class TestLiveProxy:
             cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is True
             cur.execute("DROP TABLE expr_live")
+        finally:
+            conn.close()
+
+    def test_partial_index_built(self, dsql_proxy):
+        """Partial indexes (AWS DSQL, 2026-09-15) are built with their predicate."""
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE pi_live (id int PRIMARY KEY, rating int, title text)")
+            cur.execute(
+                "CREATE INDEX ASYNC pi_live_high ON pi_live (title) WHERE rating > 5"
+            )
+            job_id = cur.fetchone()[0]
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is True
+            cur.execute(
+                "SELECT pg_get_expr(indpred, indrelid) FROM pg_index "
+                "WHERE indexrelid = 'pi_live_high'::regclass"
+            )
+            assert cur.fetchone()[0] == "(rating > 5)"
+            cur.execute("DROP TABLE pi_live")
+        finally:
+            conn.close()
+
+    def test_unique_partial_index_scopes_uniqueness(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE upi_live (id int PRIMARY KEY, email text, archived bool)"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX ASYNC upi_live_email ON upi_live (email) "
+                "WHERE NOT archived"
+            )
+            job_id = cur.fetchone()[0]
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is True
+            # Duplicates are fine among archived rows...
+            cur.execute(
+                "INSERT INTO upi_live VALUES (1, 'a@x', true), (2, 'a@x', true), "
+                "(3, 'a@x', false)"
+            )
+            # ...but not among the rows the predicate covers.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO upi_live VALUES (4, 'a@x', false)")
+            assert exc.value.pgcode == "23505"
+            cur.execute("DROP TABLE upi_live")
+        finally:
+            conn.close()
+
+    def test_volatile_predicate_fails_the_submit(self, dsql_proxy):
+        """A bad predicate is refused up front, not handed back as a failed job."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE vp_live (id int, created timestamptz)")
+            cur.execute("SELECT job_id FROM sys.jobs")
+            jobs_before = len(cur.fetchall())
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(
+                    "CREATE INDEX ASYNC vp_live_i ON vp_live (id) WHERE created > now()"
+                )
+            assert exc.value.pgcode == "42P17"
+            assert "index predicate must be marked IMMUTABLE" in str(exc.value)
+            cur.execute("SELECT job_id FROM sys.jobs")
+            assert len(cur.fetchall()) == jobs_before
+            cur.execute("DROP TABLE vp_live")
+        finally:
+            conn.close()
+
+    def test_batched_nestloop_setting(self, dsql_proxy):
+        """dsql.enable_batched_nestloop (AWS DSQL, 2026-09-11) defaults to on."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "on"
+            cur.execute("SET dsql.enable_batched_nestloop = off")
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "off"
+            cur.execute("RESET dsql.enable_batched_nestloop")
+            cur.execute("SHOW dsql.enable_batched_nestloop")
+            assert cur.fetchone()[0] == "on"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SET dsql.enable_batched_nestloop = banana")
+            assert exc.value.pgcode == "22023"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SET dsql.bogus_setting = 1")
+            assert exc.value.pgcode == "42602"
+            assert exc.value.diag.message_detail == '"dsql" is a reserved prefix.'
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SHOW dsql.bogus_setting")
+            assert exc.value.pgcode == "42704"
+        finally:
+            conn.close()
+
+    def test_max_5_statistics_per_table(self, dsql_proxy):
+        """Extended statistics (AWS DSQL, 2026-08-27): at most 5 per table."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE st_live (a int, b int, c int)")
+            for i in range(5):
+                cur.execute(f"CREATE STATISTICS st_live_{i} ON a, b FROM st_live")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_5 ON a, c FROM st_live")
+            assert exc.value.pgcode == "54000"
+            assert "more than 5 extended statistics per table are not allowed" in str(
+                exc.value
+            )
+            with pytest.raises(psycopg2.Error):
+                cur.execute("CREATE STATISTICS ON (a + b) FROM st_live")
+            # IF NOT EXISTS on an existing name is a no-op, not a sixth object;
+            # on a new name it is refused like any other.
+            cur.execute(
+                "CREATE STATISTICS IF NOT EXISTS st_live_0 ON a, b FROM st_live"
+            )
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(
+                    "CREATE STATISTICS IF NOT EXISTS st_live_9 ON a, b FROM st_live"
+                )
+            assert exc.value.pgcode == "54000"
+            # The statement's own errors come before the limit, as on DSQL.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_x ON a FROM st_live")
+            assert exc.value.pgcode == "42P17"
+            assert "at least 2 columns" in str(exc.value)
+            # The dry run leaves nothing behind.
+            cur.execute(
+                "SELECT count(*) FROM pg_statistic_ext "
+                "WHERE stxrelid = 'st_live'::regclass"
+            )
+            assert cur.fetchone()[0] == 5
+            # The limit holds inside a transaction too, and aborts it.
+            cur.execute("BEGIN")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CREATE STATISTICS st_live_t ON a, c FROM st_live")
+            assert exc.value.pgcode == "54000"
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("SELECT 1")
+            assert exc.value.pgcode == "25P02"
+            cur.execute("ROLLBACK")
+            # ALTER and DROP pass through; dropping one frees a slot.
+            cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 100")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("ALTER STATISTICS st_live_0 SET STATISTICS 200")
+            assert exc.value.pgcode == "22023"
+            cur.execute("DROP STATISTICS st_live_0")
+            cur.execute("CREATE STATISTICS st_live_5 (mcv) ON a, c FROM st_live")
+            cur.execute("DROP TABLE st_live")
+        finally:
+            conn.close()
+
+    def test_numeric_precision_and_scale_limits(self, dsql_proxy):
+        """numeric takes precision up to 1000, scale -1000..1000 (2026-08-25)."""
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE num_live (id int PRIMARY KEY, "
+                "big numeric(1000, 500), neg numeric(1000, -1000))"
+            )
+            cur.execute("INSERT INTO num_live VALUES (1, 1.5, 1234)")
+            cur.execute("SELECT neg FROM num_live")
+            assert cur.fetchone()[0] == 0  # rounded to the 10^1000 place
+            cur.execute("DROP TABLE num_live")
         finally:
             conn.close()
 

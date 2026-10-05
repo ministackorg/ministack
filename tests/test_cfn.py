@@ -28407,6 +28407,61 @@ def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appc
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def _cfn_appconfig_deployment_template(name, strategy_id):
+    """An application, environment, profile, hosted version and a deployment with `strategy_id`."""
+    return json.dumps({
+        "Resources": {
+            "App": {"Type": "AWS::AppConfig::Application", "Properties": {"Name": name}},
+            "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name}},
+            "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name, "LocationUri": "hosted"}},
+            "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "ConfigurationProfileId": {"Ref": "Profile"},
+                "ContentType": "application/json", "Content": "{}"}},
+            "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                "ConfigurationProfileId": {"Ref": "Profile"},
+                "DeploymentStrategyId": strategy_id,
+                "ConfigurationVersion": {"Ref": "HCV"}}},
+        },
+        "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                    "EnvId": {"Value": {"Ref": "Env"}},
+                    "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+    })
+
+
+def test_cfn_appconfig_deployment_with_a_predefined_strategy(cfn, appconfig_client):
+    """The deployment records the parameters of the predefined strategy it names."""
+    stack_name = f"cfn-ac-predef-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "AppConfig.AllAtOnce"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        deployment = appconfig_client.get_deployment(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"),
+            DeploymentNumber=int(_cfn_output(cfn, stack_name, "Number")))
+        assert deployment["DeploymentStrategyId"] == "AppConfig.AllAtOnce"
+        assert (deployment["DeploymentDurationInMinutes"], deployment["GrowthType"],
+                deployment["GrowthFactor"], deployment["FinalBakeTimeInMinutes"]) == (0, "LINEAR", 100.0, 10)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_with_a_missing_strategy_rolls_back(cfn):
+    """A deployment naming a strategy that does not exist fails and rolls the stack back."""
+    stack_name = f"cfn-ac-nostrat-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "abcdefg"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "DeploymentStrategy with Id abcdefg could not be found." in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
     """A GraphQL API update keeps its id and its data sources."""
     suffix = _uuid_mod.uuid4().hex[:8]
