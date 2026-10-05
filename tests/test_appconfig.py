@@ -411,6 +411,78 @@ def test_appconfig_delete_deployment_strategy(appconfig_client):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+# As ListDeploymentStrategies returned them on AWS, in AWS's order.
+_AWS_PREDEFINED_STRATEGIES = [
+    {"Id": "AppConfig.AllAtOnce", "Name": "AppConfig.AllAtOnce", "Description": "Quick",
+     "DeploymentDurationInMinutes": 0, "GrowthType": "LINEAR", "GrowthFactor": 100.0,
+     "FinalBakeTimeInMinutes": 10, "ReplicateTo": "NONE"},
+    {"Id": "AppConfig.Linear50PercentEvery30Seconds", "Name": "AppConfig.Linear50PercentEvery30Seconds",
+     "Description": "Test/Demo", "DeploymentDurationInMinutes": 1, "GrowthType": "LINEAR",
+     "GrowthFactor": 50.0, "FinalBakeTimeInMinutes": 1, "ReplicateTo": "NONE"},
+    {"Id": "AppConfig.Canary10Percent20Minutes", "Name": "AppConfig.Canary10Percent20Minutes",
+     "Description": "AWS Recommended", "DeploymentDurationInMinutes": 20, "GrowthType": "EXPONENTIAL",
+     "GrowthFactor": 10.0, "FinalBakeTimeInMinutes": 10, "ReplicateTo": "NONE"},
+    {"Id": "AppConfig.Linear20PercentEvery6Minutes", "Name": "AppConfig.Linear20PercentEvery6Minutes",
+     "Description": "AWS Recommended", "DeploymentDurationInMinutes": 30, "GrowthType": "LINEAR",
+     "GrowthFactor": 20.0, "FinalBakeTimeInMinutes": 30, "ReplicateTo": "NONE"},
+]
+
+
+def _strategy_fields(response):
+    return {k: v for k, v in response.items() if k != "ResponseMetadata"}
+
+
+def test_appconfig_get_predefined_deployment_strategies(appconfig_client):
+    for expected in _AWS_PREDEFINED_STRATEGIES:
+        resp = appconfig_client.get_deployment_strategy(DeploymentStrategyId=expected["Id"])
+        assert _strategy_fields(resp) == expected
+
+
+def test_appconfig_list_deployment_strategies_puts_predefined_after_own(appconfig_service_state):
+    status, created = _status_and_body(
+        appconfig_service._create_deployment_strategy({"Name": "own-strategy", "ReplicateTo": "NONE"})
+    )
+    assert status == 201
+    status, body = _status_and_body(appconfig_service._list_deployment_strategies({}))
+    assert status == 200
+    assert [s["Id"] for s in body["Items"]] == [
+        created["Id"],
+        "AppConfig.AllAtOnce",
+        "AppConfig.Linear50PercentEvery30Seconds",
+        "AppConfig.Canary10Percent20Minutes",
+        "AppConfig.Linear20PercentEvery6Minutes",
+    ]
+
+
+def test_appconfig_predefined_deployment_strategy_cannot_be_updated(appconfig_client):
+    strategy_id = "AppConfig.AllAtOnce"
+    with pytest.raises(ClientError) as exc:
+        appconfig_client.update_deployment_strategy(DeploymentStrategyId=strategy_id, Description="changed")
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Message"] == f"Cannot update predefined Deployment Strategy {strategy_id}"
+    resp = appconfig_client.get_deployment_strategy(DeploymentStrategyId=strategy_id)
+    assert _strategy_fields(resp) == _AWS_PREDEFINED_STRATEGIES[0]
+
+
+def test_appconfig_predefined_deployment_strategy_cannot_be_deleted(appconfig_client):
+    strategy_id = "AppConfig.AllAtOnce"
+    with pytest.raises(ClientError) as exc:
+        appconfig_client.delete_deployment_strategy(DeploymentStrategyId=strategy_id)
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Message"] == f"Cannot delete predefined Deployment Strategy {strategy_id}."
+    resp = appconfig_client.get_deployment_strategy(DeploymentStrategyId=strategy_id)
+    assert _strategy_fields(resp) == _AWS_PREDEFINED_STRATEGIES[0]
+
+
+def test_appconfig_predefined_deployment_strategies_stay_out_of_saved_state(appconfig_service_state):
+    status, body = _status_and_body(appconfig_service._get_deployment_strategy("AppConfig.AllAtOnce"))
+    assert status == 200
+    assert body["Id"] == "AppConfig.AllAtOnce"
+    assert not appconfig_service.get_state()["deployment_strategies"]
+
+
 # ---------------------------------------------------------------------------
 # Deployments
 # ---------------------------------------------------------------------------
@@ -530,6 +602,65 @@ def test_appconfig_stop_deployment(appconfig_client):
         DeploymentNumber=deploy["DeploymentNumber"],
     )
     assert resp["State"] == "ROLLED_BACK"
+
+
+def _deployment_target(appconfig_client, name):
+    app = appconfig_client.create_application(Name=name)
+    env = appconfig_client.create_environment(ApplicationId=app["Id"], Name="env")
+    profile = appconfig_client.create_configuration_profile(
+        ApplicationId=app["Id"], Name="profile", LocationUri="hosted",
+    )
+    appconfig_client.create_hosted_configuration_version(
+        ApplicationId=app["Id"], ConfigurationProfileId=profile["Id"],
+        Content=b"{}", ContentType="application/json",
+    )
+    return {"ApplicationId": app["Id"], "EnvironmentId": env["Id"]}, profile["Id"]
+
+
+def _rollout_params(deployment):
+    return (deployment["DeploymentDurationInMinutes"], deployment["GrowthType"],
+            deployment["GrowthFactor"], deployment["FinalBakeTimeInMinutes"])
+
+
+def test_appconfig_start_deployment_records_predefined_strategy_parameters(appconfig_client):
+    ids, profile_id = _deployment_target(appconfig_client, "deploy-predefined-app")
+    deploy = appconfig_client.start_deployment(
+        **ids, DeploymentStrategyId="AppConfig.Canary10Percent20Minutes",
+        ConfigurationProfileId=profile_id, ConfigurationVersion="1",
+    )
+    assert deploy["DeploymentStrategyId"] == "AppConfig.Canary10Percent20Minutes"
+    got = appconfig_client.get_deployment(**ids, DeploymentNumber=deploy["DeploymentNumber"])
+    listed = appconfig_client.list_deployments(**ids)["Items"][0]
+    for record in (deploy, got, listed):
+        assert _rollout_params(record) == (20, "EXPONENTIAL", 10.0, 10)
+
+
+def test_appconfig_start_deployment_records_own_strategy_parameters(appconfig_client):
+    ids, profile_id = _deployment_target(appconfig_client, "deploy-own-strategy-app")
+    strategy = appconfig_client.create_deployment_strategy(
+        Name="own-params", DeploymentDurationInMinutes=5, GrowthType="LINEAR",
+        GrowthFactor=25.0, FinalBakeTimeInMinutes=3, ReplicateTo="NONE",
+    )
+    deploy = appconfig_client.start_deployment(
+        **ids, DeploymentStrategyId=strategy["Id"],
+        ConfigurationProfileId=profile_id, ConfigurationVersion="1",
+    )
+    assert _rollout_params(deploy) == (5, "LINEAR", 25.0, 3)
+
+
+def test_appconfig_start_deployment_rejects_missing_strategy(appconfig_client):
+    ids, profile_id = _deployment_target(appconfig_client, "deploy-missing-strategy-app")
+    for strategy_id in ("abcdefg", "AppConfig.DoesNotExist"):
+        with pytest.raises(ClientError) as exc:
+            appconfig_client.start_deployment(
+                **ids, DeploymentStrategyId=strategy_id,
+                ConfigurationProfileId=profile_id, ConfigurationVersion="1",
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        assert exc.value.response["Error"]["Message"] == (
+            f"DeploymentStrategy with Id {strategy_id} could not be found.")
+    assert appconfig_client.list_deployments(**ids)["Items"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +1011,23 @@ def test_appconfig_applications_are_region_scoped():
                 client.delete_application(ApplicationId=app_id)
             except Exception:
                 pass
+
+
+def test_appconfig_predefined_deployment_strategy_tags_are_region_scoped():
+    """Tags on a predefined strategy belong to the account and region that set them."""
+    east = _make_appconfig_client("us-east-1")
+    west = _make_appconfig_client("us-west-2")
+    strategy_id = "AppConfig.Linear20PercentEvery6Minutes"
+    east_arn = f"arn:aws:appconfig:us-east-1:000000000000:deploymentstrategy/{strategy_id}"
+    west_arn = f"arn:aws:appconfig:us-west-2:000000000000:deploymentstrategy/{strategy_id}"
+
+    east.tag_resource(ResourceArn=east_arn, Tags={"probe": "east"})
+    try:
+        assert east.list_tags_for_resource(ResourceArn=east_arn)["Tags"] == {"probe": "east"}
+        assert west.list_tags_for_resource(ResourceArn=west_arn)["Tags"] == {}
+    finally:
+        east.untag_resource(ResourceArn=east_arn, TagKeys=["probe"])
+    assert east.list_tags_for_resource(ResourceArn=east_arn)["Tags"] == {}
 
 
 def _deploy_and_fetch(appconfig_client, appconfigdata_client, profile_type, content,

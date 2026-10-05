@@ -105,6 +105,28 @@ def test_cognito_list_user_pool_clients(cognito_idp):
     assert "App1" in names
     assert "App2" in names
 
+def test_cognito_ui_customization(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="UiPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="App")["UserPoolClient"]["ClientId"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.set_ui_customization(UserPoolId=pid, CSS=".banner-customizable {}")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"ui-{pid.split('_')[1].lower()}")
+    pool_ui = cognito_idp.set_ui_customization(UserPoolId=pid, CSS=".banner-customizable {}")["UICustomization"]
+    assert pool_ui["ClientId"] == "ALL" and pool_ui["CSS"] == ".banner-customizable {}" and pool_ui["CSSVersion"]
+    assert cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"]["CSS"] == pool_ui["CSS"]
+
+    ui = cognito_idp.set_ui_customization(UserPoolId=pid, ClientId=cid, CSS=".label-customizable {}", ImageFile=b"\x89PNG")
+    assert ui["UICustomization"]["ClientId"] == cid
+    got = cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"]
+    assert got["CSS"] == ".label-customizable {}"
+    assert cognito_idp.get_ui_customization(UserPoolId=pid)["UICustomization"]["CSS"] == pool_ui["CSS"]
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.set_ui_customization(UserPoolId=pid, ClientId="missing", CSS="")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 def test_cognito_create_and_describe_resource_server(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="ResourceServerPool")["UserPool"]["Id"]
     resp = cognito_idp.create_resource_server(
