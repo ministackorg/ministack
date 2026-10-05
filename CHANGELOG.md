@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — `AWS::IoT::Thing`, `AWS::IoT::Certificate`, `AWS::IoT::ThingPrincipalAttachment` and `AWS::IoT::PolicyPrincipalAttachment`** — a template using any of them failed with `Unrecognized resource types`. They now provision onto the IoT registry as AWS does: `Ref` and `Fn::GetAtt` return AWS's values (`{name}|{principal}` for the attachments), `AttributePayload` and `Status` update in place, the create-only properties replace the resource, a certificate is deactivated before its delete, a thing or certificate that still has an attachment made outside the stack fails its delete with the service's message, and a `ThingName` that already exists fails the create instead of adopting the thing. A certificate comes from `CertificateSigningRequest`, from `CertificatePem` with `CACertificatePem`, or from `CertificatePem` alone in `SNI_ONLY` mode. Thing and certificate can be imported. Contributed by @iot-rocket.
 - **IoT — `CreateCertificateFromCsr`** — the operation was missing: `POST /certificates` answered `Unsupported IoT path`. It now signs the CSR with the local CA, as AWS signs it with its own: the certificate keeps the CSR's subject and public key and is `INACTIVE` unless `setAsActive`, and a CSR that does not parse or verify, or whose key is not RSA of at least 2048 bits or EC on P-256, P-384 or P-521, gets `InvalidRequestException` `CSR violates constraints`. Contributed by @iot-rocket.
 
 ### Fixed
