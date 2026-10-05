@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **API Gateway v2 (WebSocket API) — `$connect` with `AWS_IAM`** — an unsigned handshake is refused with 403 `Missing Authentication Token`, and under `AUTH=true` the caller needs `execute-api:Invoke` on `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/$connect`. Contributed by @iot-rocket.
+- **SNS — `CreateTopic` keeps its tags** — the handler read `Tag.member.N` where the API sends `Tags.member.N`, so tags given at creation were dropped. Contributed by @iot-rocket.
 
 ## [1.5.21] — 2026-10-03
 
