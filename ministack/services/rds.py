@@ -2627,17 +2627,12 @@ def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
 
 
-# A DB parameter group name that is also a server variable (RDS-only names such
-# as `rds.force_ssl` are not).
+# Excludes RDS-only names such as `rds.force_ssl`.
 _MYSQL_SERVER_PARAMETER = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _mysql_server_options(backup_retention_period, param_group_name=None):
-    """Server options for a standalone MySQL/MariaDB instance, as RDS starts one:
-    a backup retention period of 0 turns binary logging off, and the instance's
-    DB parameter group's set values are server options. `--loose-` keeps a name
-    the server does not know as a startup option (such as `time_zone`) from
-    stopping it; formula values (`{DBInstanceClassMemory*3/4}`) are not evaluated."""
+    """Startup options: retention 0 disables the binlog; group values go as `--loose-` options."""
     options = [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
     group = _param_groups.get(param_group_name) if param_group_name else None
     for name, param in ((group or {}).get("Parameters") or {}).items():
@@ -2658,15 +2653,7 @@ def _mysql_parameter_value(value):
 
 
 def _apply_parameter_group_changes(group_name, changes, refuse_static=True):
-    """Apply `(name, value, apply_method)` changes to the running MySQL instances
-    in a DB parameter group, as RDS does: an `immediate` change to a dynamic
-    parameter takes effect now (a `None` value resets it to the engine default);
-    a `pending-reboot` change leaves the instance `pending-reboot` until the next
-    start, which applies the whole group (`_mysql_server_options`). An `immediate`
-    change to a static parameter, which the server reports as a read-only
-    variable, is refused as AWS refuses it, before anything is applied; with
-    `refuse_static=False` (a reset) it is left pending-reboot instead. Returns
-    the refusal, or None."""
+    """Apply `(name, value, apply_method)` changes to the group's running MySQL instances; returns a refusal or None."""
     for instance in list(_instances.values()):
         groups = instance.get("DBParameterGroups") or []
         if not (

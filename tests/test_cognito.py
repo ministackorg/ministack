@@ -9247,7 +9247,8 @@ def _api_issued_tokens(cognito_idp, pool_name):
         UserPoolId=pid, Username="apirefresh", Password="Refresh-Pass1", Permanent=True)
     tokens = cognito_idp.initiate_auth(
         ClientId=client["ClientId"], AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "apirefresh", "PASSWORD": "Refresh-Pass1"},
+        AuthParameters={"USERNAME": "apirefresh", "PASSWORD": "Refresh-Pass1",
+                        "SECRET_HASH": _cognito_secret_hash(client, "apirefresh")},
     )["AuthenticationResult"]
     return pid, client, tokens
 
