@@ -76,7 +76,6 @@ _resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
 _memories = AccountRegionScopedDict()    # memoryId -> memory record
 _memory_events = AccountRegionScopedDict()   # memoryId -> {actorId -> {sessionId -> session}}
 _memory_records = AccountRegionScopedDict()  # memoryId -> {memoryRecordId -> record}
-_extraction_jobs = AccountRegionScopedDict()  # memoryId -> [job metadata]
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
 
@@ -93,7 +92,6 @@ def get_state():
         "memories": _memories,
         "memoryEvents": _memory_events,
         "memoryRecords": _memory_records,
-        "extractionJobs": _extraction_jobs,
     })
 
 
@@ -110,14 +108,12 @@ def _restore_state(data):
     _memories.clear()
     _memory_events.clear()
     _memory_records.clear()
-    _extraction_jobs.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
     _memories.update(data.get("memories", {}))
     _memory_events.update(data.get("memoryEvents", {}))
     _memory_records.update(data.get("memoryRecords", {}))
-    _extraction_jobs.update(data.get("extractionJobs", {}))
     _migrate_legacy_arns()
     # Backfill one snapshot for state written before version history existed.
     for runtime in _runtimes._data.values():
@@ -160,7 +156,6 @@ def reset():
     _memories.clear()
     _memory_events.clear()
     _memory_records.clear()
-    _extraction_jobs.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +561,6 @@ def _delete_memory(memory_id):
         return _not_found(f"Memory '{memory_id}' not found")
     _memory_events.pop(memory_id, None)
     _memory_records.pop(memory_id, None)
-    _extraction_jobs.pop(memory_id, None)
     return json_response({"memoryId": memory_id, "status": "DELETING"}, 202)
 
 
@@ -606,6 +600,12 @@ def _resolve_memory(raw_id):
     scope = None
     if ":memory/" in memory_id:
         scope = _arn_owner(memory_id)
+        from ministack.app import AUTH
+        if AUTH and scope and scope[0] != get_account_id():
+            # Memory takes no resource policy, so no other account is granted.
+            return None, None, error_response_json(
+                "AccessDeniedException",
+                f"User is not authorized to access memory {memory_id}", 403)
         memory_id = memory_id.rsplit(":memory/", 1)[1]
     if not _MEMORY_ID_RE.fullmatch(memory_id):
         return None, None, _validation(
@@ -667,11 +667,11 @@ def _create_event(raw_memory_id, body):
             for session in sessions.values():
                 for existing in session["events"]:
                     if existing.get("_clientToken") == token:
-                        return json_response({"event": _public_event(existing)})
+                        return json_response({"event": _public_event(existing)}, 201)
 
     session = bucket.setdefault(actor_id, {}).get(session_id)
     if session is None:
-        session = {"createdAt": time.time(), "nextSeq": 0, "events": []}
+        session = {"createdAt": int(time.time()), "nextSeq": 0, "events": []}
         bucket[actor_id][session_id] = session
     session["nextSeq"] += 1
     event = {
@@ -691,7 +691,7 @@ def _create_event(raw_memory_id, body):
         event["_clientToken"] = token
     session["events"].append(event)
     _mem_set(_memory_events, memory_id, scope, bucket)
-    return json_response({"event": _public_event(event)})
+    return json_response({"event": _public_event(event)}, 201)
 
 
 def _find_event(memory_id, scope, actor_id, session_id, event_id):
@@ -1021,7 +1021,7 @@ def _batch_create_memory_records(raw_memory_id, body):
         succeeded.append(_batch_result(record_id, "SUCCEEDED", request_id))
     _mem_set(_memory_records, memory_id, scope, bucket)
     return json_response(
-        {"successfulRecords": succeeded, "failedRecords": failed})
+        {"successfulRecords": succeeded, "failedRecords": failed}, 201)
 
 
 def _batch_update_memory_records(raw_memory_id, body):
@@ -1094,34 +1094,23 @@ def _batch_delete_memory_records(raw_memory_id, body):
         {"successfulRecords": succeeded, "failedRecords": failed})
 
 
-def _find_memory_record(memory_id, scope, record_id, namespace=None):
-    record = _records_bucket(memory_id, scope).get(record_id)
-    if record is None:
-        return None
-    if namespace and namespace not in (record.get("namespaces") or []):
-        return None
-    return record
-
-
-def _get_memory_record(raw_memory_id, record_id, query_params):
+def _get_memory_record(raw_memory_id, record_id):
     memory_id, scope, error = _resolve_memory(raw_memory_id)
     if error:
         return error
     record_id = unquote(record_id)
-    namespace = _agentcore_query_value(query_params, "namespace")
-    record = _find_memory_record(memory_id, scope, record_id, namespace)
+    record = _records_bucket(memory_id, scope).get(record_id)
     if record is None:
         return _not_found(f"Memory record '{record_id}' not found")
     return json_response({"memoryRecord": _record_summary(record)})
 
 
-def _delete_memory_record(raw_memory_id, record_id, query_params):
+def _delete_memory_record(raw_memory_id, record_id):
     memory_id, scope, error = _resolve_memory(raw_memory_id)
     if error:
         return error
     record_id = unquote(record_id)
-    namespace = _agentcore_query_value(query_params, "namespace")
-    record = _find_memory_record(memory_id, scope, record_id, namespace)
+    record = _records_bucket(memory_id, scope).get(record_id)
     if record is None:
         return _not_found(f"Memory record '{record_id}' not found")
     bucket = dict(_records_bucket(memory_id, scope))
@@ -1199,58 +1188,30 @@ def _retrieve_memory_records(raw_memory_id, body):
     })
 
 
-# --- extraction jobs (registry only; extraction itself does not run) --------
-
-def _jobs_bucket(memory_id, scope):
-    return _mem_get(_extraction_jobs, memory_id, scope, [])
-
+# --- extraction jobs: extraction never runs, so no job is ever eligible ------
 
 def _start_extraction_job(raw_memory_id, body):
-    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    _memory_id, _scope, error = _resolve_memory(raw_memory_id)
     if error:
         return error
-    data = _parse_body(body)
-    job = data.get("extractionJob")
-    job_id = (job or {}).get("jobId") if isinstance(job, dict) else None
+    job = _parse_body(body).get("extractionJob")
+    job_id = job.get("jobId") if isinstance(job, dict) else None
     if not isinstance(job_id, str) or not job_id:
         return _validation("extractionJob.jobId is required")
-    jobs = list(_jobs_bucket(memory_id, scope))
-    if not any(existing["jobID"] == job_id for existing in jobs):
-        jobs.append({"jobID": job_id, "status": "COMPLETED",
-                     "messages": {"messagesList": []}})
-        _mem_set(_extraction_jobs, memory_id, scope, jobs)
-    return json_response({"jobId": job_id})
+    return _not_found(f"Extraction job '{job_id}' not found")
 
 
 def _list_extraction_jobs(raw_memory_id, body):
-    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    _memory_id, _scope, error = _resolve_memory(raw_memory_id)
     if error:
         return error
-    data = _parse_body(body)
-    filters = data.get("filter") or {}
-    items = []
-    for job in _jobs_bucket(memory_id, scope):
-        if filters.get("status") and job.get("status") != filters["status"]:
-            continue
-        if filters.get("strategyId") and \
-                job.get("strategyId") != filters["strategyId"]:
-            continue
-        if filters.get("sessionId") and \
-                job.get("sessionId") != filters["sessionId"]:
-            continue
-        if filters.get("actorId") and job.get("actorId") != filters["actorId"]:
-            continue
-        items.append(copy.deepcopy(job))
-    page, error = _memory_page(items, data)
+    page, error = _memory_page([], _parse_body(body))
     if error:
         return error
-    return json_response({
-        "jobs": page["items"],
-        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
-    })
+    return json_response({"jobs": page["items"]})
 
 
-def _memory_data_plane(method, rest, body, query_params):
+def _memory_data_plane(method, rest, body):
     """Dispatch ``/memories/...`` data-plane paths; None when not a match.
 
     ``memoryId`` and ``actorId`` may carry literal ``/`` (an ARN and the
@@ -1313,12 +1274,12 @@ def _memory_data_plane(method, rest, body, query_params):
     if "/memoryRecord/" in rest:
         memory_id, _, record_id = rest.partition("/memoryRecord/")
         if "/" not in record_id and method == "GET":
-            return _get_memory_record(memory_id, record_id, query_params)
+            return _get_memory_record(memory_id, record_id)
         return None
     if "/memoryRecords/" in rest:
         memory_id, _, record_id = rest.partition("/memoryRecords/")
         if "/" not in record_id and method == "DELETE":
-            return _delete_memory_record(memory_id, record_id, query_params)
+            return _delete_memory_record(memory_id, record_id)
         return None
     return None
 
@@ -2054,7 +2015,7 @@ async def handle_request(method, path, headers, body, query_params):
         return _create_memory(body)
     if inner.startswith("memories/"):
         rest = inner[len("memories/"):]
-        response = _memory_data_plane(method, rest, body, query_params)
+        response = _memory_data_plane(method, rest, body)
         if response is not None:
             return response
         memory_id, _, op = unquote(rest).rpartition("/")

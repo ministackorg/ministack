@@ -1149,11 +1149,13 @@ def test_agentcore_memory_events_data_plane():
                 actorId="user-1", eventTimestamp=_TS, payload=[_convo("USER", "hi")])
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
-        event = dp.create_event(
+        resp = dp.create_event(
             memoryId=memory_id, actorId="user-1", sessionId="s1",
             eventTimestamp=_TS, payload=[_convo("USER", "hello")],
             metadata={"source": {"stringValue": "test"}},
-        )["event"]
+        )
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+        event = resp["event"]
         assert re.fullmatch(r"[0-9]+#[a-fA-F0-9]+", event["eventId"])
         assert event["sessionId"] == "s1" and event["actorId"] == "user-1"
         assert event["metadata"] == {"source": {"stringValue": "test"}}
@@ -1266,6 +1268,7 @@ def test_agentcore_memory_records_data_plane():
         ids = {r["requestIdentifier"]: r["memoryRecordId"]
                for r in created["successfulRecords"]}
         assert all(re.fullmatch(r"mem-.{40}", rid) for rid in ids.values())
+        assert created["ResponseMetadata"]["HTTPStatusCode"] == 201
 
         got = dp.get_memory_record(
             memoryId=memory_id, memoryRecordId=ids["r1"])["memoryRecord"]
@@ -1331,14 +1334,12 @@ def test_agentcore_memory_extraction_jobs_and_region_scope():
     memory = _memory(control)
     memory_id = memory["id"]
     try:
-        started = dp.start_memory_extraction_job(
-            memoryId=memory_id, extractionJob={"jobId": "job-1"})
-        assert started["jobId"] == "job-1"
-        jobs = dp.list_memory_extraction_jobs(memoryId=memory_id)["jobs"]
-        assert [j["jobID"] for j in jobs] == ["job-1"]
-        assert jobs[0]["status"] == "COMPLETED"
-        assert dp.list_memory_extraction_jobs(
-            memoryId=memory_id, filter={"status": "FAILED"})["jobs"] == []
+        # Only FAILED extractions are listed and restartable; none ever run here.
+        with pytest.raises(ClientError) as exc:
+            dp.start_memory_extraction_job(
+                memoryId=memory_id, extractionJob={"jobId": "job-1"})
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert dp.list_memory_extraction_jobs(memoryId=memory_id)["jobs"] == []
 
         west = _client("bedrock-agentcore", "us-west-2")
         with pytest.raises(ClientError) as exc:
@@ -1360,3 +1361,22 @@ def test_agentcore_memory_delete_purges_data_plane_state():
     with pytest.raises(ClientError) as exc:
         dp.list_events(memoryId=memory_id, actorId="user-1", sessionId="s1")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.skipif(
+    not _AUTH_ENABLED,
+    reason="cross-account authorization requires a MiniStack server with AUTH=true",
+)
+def test_agentcore_memory_arn_from_another_account_is_denied():
+    """Memory takes no resource policy, so another account's ARN is refused."""
+    control = _client("bedrock-agentcore-control", access_key="111111111111")
+    memory = _memory(control)
+    try:
+        other = _client("bedrock-agentcore", access_key="222222222222")
+        with pytest.raises(ClientError) as exc:
+            other.list_actors(memoryId=memory["arn"])
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        owner = _client("bedrock-agentcore", access_key="111111111111")
+        assert owner.list_actors(memoryId=memory["arn"])["actorSummaries"] == []
+    finally:
+        control.delete_memory(memoryId=memory["id"])
