@@ -2083,6 +2083,109 @@ def test_sns_publish_internal_applies_the_subscription_filter_policy(
     assert delivered == ["queue-match"]
 
 
+@pytest.mark.parametrize(
+    ("policy_value", "message_value", "expected"),
+    [
+        ({"suffix": ".json"}, "report.json", True),
+        ({"suffix": ".json"}, "report.csv", False),
+        ({"equals-ignore-case": "ready"}, "READY", True),
+        ({"equals-ignore-case": "ready"}, "not-ready", False),
+    ],
+)
+def test_sns_filter_policy_string_operators(
+    sns_internal, policy_value, message_value, expected
+):
+    sub = {
+        "attributes": {"FilterPolicy": json.dumps({"state": [policy_value]})},
+    }
+    attributes = {"state": {"DataType": "String", "StringValue": message_value}}
+
+    assert sns_internal._matches_filter_policy(sub, attributes) is expected
+
+
+@pytest.mark.parametrize("message_body", ["not-json", "[]", "\"ready\""])
+def test_sns_message_body_filter_rejects_invalid_or_non_object_json(
+    sns_internal, message_body
+):
+    sub = {
+        "attributes": {
+            "FilterPolicy": json.dumps({"state": ["ready"]}),
+            "FilterPolicyScope": "MessageBody",
+        },
+    }
+
+    assert sns_internal._matches_filter_policy(sub, {}, message_body) is False
+
+
+@pytest.mark.parametrize(
+    ("policy", "message_body", "expected"),
+    [
+        ({"store": {"book": [{"suffix": ".json"}]}},
+         {"store": {"book": "report.json"}}, True),
+        ({"store": {"book": [{"suffix": ".json"}]}},
+         {"store": {"book": "report.csv"}}, False),
+        ({"$or": [{"store": {"state": ["ready"]}}, {"store": {"state": ["done"]}}]},
+         {"store": {"state": "done"}}, True),
+    ],
+)
+def test_sns_message_body_filter_matches_nested_json(
+    sns_internal, policy, message_body, expected
+):
+    sub = {
+        "attributes": {
+            "FilterPolicy": json.dumps(policy),
+            "FilterPolicyScope": "MessageBody",
+        },
+    }
+
+    assert sns_internal._matches_filter_policy(sub, {}, json.dumps(message_body)) is expected
+
+
+def test_sns_publish_internal_message_body_filter_preserves_delivery_formats(
+    sns_internal, monkeypatch
+):
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(
+            (endpoint, envelope, raw, message)
+        ),
+    )
+    subscriptions = [
+        {
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": "sqs",
+            "endpoint": endpoint,
+            "confirmed": True,
+            "attributes": {
+                "FilterPolicy": json.dumps({"state": [{"equals-ignore-case": expected_state}]}),
+                "FilterPolicyScope": "MessageBody",
+                "RawMessageDelivery": raw,
+            },
+        }
+        for endpoint, raw, expected_state in (
+            ("queue-raw", "true", "ready"),
+            ("queue-envelope", "false", "ready"),
+            ("queue-skip", "false", "stopped"),
+        )
+    ]
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=subscriptions,
+    )
+    body = json.dumps({"state": "READY"})
+
+    sns_internal.publish_internal(arn, body)
+
+    assert [endpoint for endpoint, *_ in delivered] == ["queue-raw", "queue-envelope"]
+    assert delivered[0][1] == body
+    assert delivered[0][2:] == (True, body)
+    assert json.loads(delivered[1][1])["Message"] == body
+    assert delivered[1][2:] == (False, body)
+
+
 def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     sns_internal, monkeypatch
 ):

@@ -1189,14 +1189,26 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
     except ArnParseError:
         _owner, _region = get_account_id(), get_region()
 
+    parsed_message_body = _FILTER_BODY_UNPARSED
     for sub in topic["subscriptions"]:
         if not sub.get("confirmed"):
             continue
 
         protocol = sub.get("protocol", "")
         endpoint = sub.get("endpoint", "")
+        sub_attributes = sub.get("attributes", {})
+        if (sub_attributes.get("FilterPolicyScope") == "MessageBody"
+                and sub_attributes.get("FilterPolicy")
+                and parsed_message_body is _FILTER_BODY_UNPARSED):
+            try:
+                parsed_message_body = json.loads(message)
+                if not isinstance(parsed_message_body, dict):
+                    parsed_message_body = None
+            except (json.JSONDecodeError, TypeError):
+                parsed_message_body = None
 
-        if not _matches_filter_policy(sub, message_attributes or {}):
+        if not _matches_filter_policy(
+                sub, message_attributes or {}, message, parsed_message_body):
             continue
 
         effective_message = _resolve_message_for_protocol(
@@ -1823,7 +1835,12 @@ def _resolve_message_for_protocol(message: str, message_structure: str,
     return parsed.get(protocol, parsed.get("default", message))
 
 
-def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
+_FILTER_BODY_UNPARSED = object()
+
+
+def _matches_filter_policy(sub: dict, message_attributes: dict,
+                           message_body: str = "",
+                           parsed_message_body=_FILTER_BODY_UNPARSED) -> bool:
     policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
     if not policy_json:
         return True
@@ -1837,7 +1854,14 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
     scope = sub.get("attributes", {}).get("FilterPolicyScope", "MessageAttributes")
 
     if scope == "MessageBody":
-        return True
+        if parsed_message_body is _FILTER_BODY_UNPARSED:
+            try:
+                parsed_message_body = json.loads(message_body)
+            except (json.JSONDecodeError, TypeError):
+                return False
+        if not isinstance(parsed_message_body, dict):
+            return False
+        return _body_policy_matches(policy, parsed_message_body)
 
     return _policy_matches(policy, message_attributes)
 
@@ -1886,6 +1910,35 @@ def _policy_matches(policy: dict, message_attributes: dict) -> bool:
     return True
 
 
+def _body_policy_matches(policy: dict, body: dict) -> bool:
+    for key, allowed_values in policy.items():
+        if key == "$or" and _is_or_operator(allowed_values):
+            if not any(_body_policy_matches(member, body) for member in allowed_values):
+                return False
+            continue
+        if key not in body:
+            return False
+        value = body[key]
+        if isinstance(allowed_values, dict):
+            if not isinstance(value, dict) or not _body_policy_matches(allowed_values, value):
+                return False
+            continue
+        if isinstance(value, dict):
+            return False
+        if not isinstance(allowed_values, list):
+            allowed_values = [allowed_values]
+        values = value if isinstance(value, list) else [value]
+        candidates = []
+        for candidate in values:
+            if isinstance(candidate, bool):
+                candidates.append("true" if candidate else "false")
+            elif isinstance(candidate, (str, int, float)):
+                candidates.append(str(candidate))
+        if not any(_attr_matches_any(candidate, allowed_values) for candidate in candidates):
+            return False
+    return True
+
+
 def _attr_candidate_values(attr: dict) -> list:
     """Values to match a message attribute against a filter policy. A scalar
     attribute yields its single StringValue; a String.Array yields each element
@@ -1928,6 +1981,12 @@ def _attr_matches_any(attr_value: str, rules: list) -> bool:
                 continue
             if "prefix" in rule:
                 if attr_value.startswith(rule["prefix"]):
+                    return True
+            if "suffix" in rule:
+                if attr_value.endswith(rule["suffix"]):
+                    return True
+            if "equals-ignore-case" in rule:
+                if attr_value.casefold() == rule["equals-ignore-case"].casefold():
                     return True
             if "anything-but" in rule:
                 excluded = rule["anything-but"]
