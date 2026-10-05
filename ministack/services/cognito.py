@@ -6458,7 +6458,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
     """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
     ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
     them at /oauth2/token. Validate them with the REFRESH_TOKEN_AUTH core, and the
-    client secret as the registry branch does."""
+    client as the authorization_code branch does."""
     try:
         claims = _decode_id_token_unverified(refresh_val)
     except ValueError:
@@ -6471,7 +6471,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         return _oauth2_error("invalid_grant", "Invalid refresh token.")
     client_id = cid or str(claims.get("client_id", ""))
     _, _, client = _find_pool_by_client_id(client_id)
-    if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
         return _oauth2_error("invalid_client", "Invalid client credentials.")
     result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
     if err:

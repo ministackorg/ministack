@@ -9312,6 +9312,19 @@ def test_cognito_oauth2_token_rejects_api_issued_refresh_token_with_wrong_secret
     assert body["error"] == "invalid_client"
 
 
+def test_cognito_oauth2_token_rejects_api_issued_refresh_token_without_secret(cognito_idp):
+    _, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshNoSecretPool")
+
+    status, _, body = _post_form(
+        f"{ENDPOINT}/oauth2/token",
+        {"grant_type": "refresh_token", "client_id": client["ClientId"],
+         "refresh_token": tokens["RefreshToken"]},
+    )
+
+    assert status == 400
+    assert json.loads(body)["error"] == "invalid_client"
+
+
 @pytest.mark.parametrize("case", ["garbage", "access_token", "deleted_pool"])
 def test_cognito_oauth2_token_rejects_invalid_refresh_token(cognito_idp, case):
     """A string that is not a refresh token of an existing pool mints no tokens."""
