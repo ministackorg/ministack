@@ -1499,6 +1499,18 @@ def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     )
 
 
+def _registered_issuer_id(cert_pem: str) -> str | None:
+    """The id of the ACTIVE CA registered in this account/region that signed
+    ``cert_pem``, or None. Several CAs may share a subject, so the signature
+    decides, not the issuer name."""
+    for ca in _ca_certificates.values():
+        if ca.get("status") == "ACTIVE" and certificate_is_signed_by(
+            cert_pem, ca.get("certificatePem") or ""
+        ):
+            return ca["certificateId"]
+    return None
+
+
 async def _register_certificate(
     payload: dict, qp: dict, *, without_ca: bool = False
 ) -> tuple:
@@ -1514,7 +1526,10 @@ async def _register_certificate(
 
     ``caCertificatePem`` must name a CA registered via
     ``RegisterCACertificate`` in this account/region that really signed the
-    leaf; anything else is a ``CertificateValidationException``. Registering
+    leaf; anything else is a ``CertificateValidationException``. Without it,
+    ``RegisterCertificate`` links the certificate to the registered ACTIVE CA
+    that signed it, as AWS does, so DescribeCertificate names that CA and
+    ListCertificatesByCA lists the certificate. Registering
     publishes no JITR event, whatever the CA's ``autoRegistrationStatus``: AWS
     sends that event only from a device connect (see ``_mtls_auto_register``),
     and refuses a registration with status PENDING_ACTIVATION.
@@ -1577,6 +1592,8 @@ async def _register_certificate(
             )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
+    if ca_id is None and not without_ca:
+        ca_id = _registered_issuer_id(cert_pem)
     record = _certificate_record(
         cert_id, cert_pem, status or ("ACTIVE" if set_active else "INACTIVE"), ca_id
     )

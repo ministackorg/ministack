@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **IoT — `RegisterCertificate` links the CA that signed the certificate** — a certificate registered without `caCertificatePem` carried no `caCertificateId`, even when a registered ACTIVE CA had signed it, so `DescribeCertificate` named no CA and `ListCertificatesByCA` left it out. It is now linked to that CA, as AWS does; when several registered CAs share a subject, the signature decides. Contributed by @iot-rocket.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 ### Added
 

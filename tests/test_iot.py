@@ -6091,6 +6091,41 @@ def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
         iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client):
+    """Without ``caCertificatePem``, AWS links the certificate to the
+    registered ACTIVE CA that signed it: DescribeCertificate names that CA and
+    ListCertificatesByCA lists it. Two CAs share a subject here, so only the
+    signature tells them apart."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    subject = _unique("twin-ca")
+    twins = [generate_ca(common_name=subject) for _ in range(2)]
+    ca_ids, cert_ids = [], []
+    try:
+        for ca_pem, _key in twins:
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, certificateMode="SNI_ONLY", setAsActive=True,
+            )["certificateId"])
+        for ca_pem, ca_key in reversed(twins):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=_unique("twin-device")
+            )[0]
+            cert_ids.insert(0, iot_client.register_certificate(
+                certificatePem=leaf_pem, status="ACTIVE"
+            )["certificateId"])
+
+        for ca_id, cert_id in zip(ca_ids, cert_ids):
+            desc = iot_client.describe_certificate(certificateId=cert_id)[
+                "certificateDescription"
+            ]
+            assert desc["caCertificateId"] == ca_id
+            listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+            assert [c["certificateId"] for c in listing["certificates"]] == [cert_id]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
+
+
 def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
     """``caCertificatePem`` naming a CA that was never registered is a
     ``CertificateValidationException``, and nothing is stored — otherwise the
