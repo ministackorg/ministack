@@ -38,6 +38,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
@@ -1704,6 +1705,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if is_callback:
                 task_result = _invoke_with_callback(
                     resource, effective, ctx["Task"]["Token"], state_def)
+            # Skip activities: their timeout starts when a worker gets the task, not here
+            elif "TimeoutSeconds" in state_def and ":activity:" not in resource:
+                task_result = _invoke_resource_with_timeout(
+                    resource, effective, state_def["TimeoutSeconds"])
             else:
                 task_result = _invoke_resource(resource, effective)
 
@@ -1824,6 +1829,21 @@ def _invoke_resource(resource, input_data):
         )
 
     return input_data
+
+
+def _invoke_resource_with_timeout(resource, input_data, timeout):
+    """Run the task, and raise States.Timeout when it runs longer than TimeoutSeconds.
+
+    This function does not stop the task thread. The task continues to run, but the state ignores its result.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    # Workers do not inherit contextvars, so copy them to keep the account and region scope (#639).
+    future = pool.submit(contextvars.copy_context().run, _invoke_resource, resource, input_data)
+    pool.shutdown(wait=False)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise _ExecutionError("States.Timeout", f"Task timed out after {timeout} seconds") from None
 
 
 def _invoke_activity(resource, input_data):

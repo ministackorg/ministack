@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Step Functions — `TimeoutSeconds` applies to Lambda and service integration tasks** — only `.waitForTaskToken` tasks used `TimeoutSeconds`; a Lambda or service integration task ran to the end, so a `Retry` or `Catch` on `States.Timeout` never ran. Such a task now fails with `States.Timeout` when it runs longer than `TimeoutSeconds`, as the Step Functions Task state reference describes. Activity tasks and `TimeoutSecondsPath` do not change.
+
 ## [1.5.21] — 2026-10-03
 
 ### Added
