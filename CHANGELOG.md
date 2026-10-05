@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Bedrock — foundation model agreement offers** — `ListFoundationModelAgreementOffers` always returned an empty `offers` list, so there was no `offerToken` to pass to `CreateFoundationModelAgreement`. It now returns one offer for third-party models (Amazon models have none), and `CreateFoundationModelAgreement` requires `offerToken` and answers `ResourceNotFoundException` for an unknown model. `GetFoundationModelAvailability` reports a third-party model's `agreementAvailability` as `AVAILABLE` only while an agreement exists, so the Terraform/OpenTofu `aws_bedrock_foundation_model_agreement` resource can be destroyed. Reported by @wparad.
 - **API Gateway — `GetApiKeys` filters by `nameQuery`** — `GetApiKeys` ignored `nameQuery` and returned all the API keys, so a lookup by name could get the wrong key. It now returns only the keys whose names start with `nameQuery`.
 - **RDS — creating an existing parameter group is refused** — `CreateDBParameterGroup` and `CreateDBClusterParameterGroup` with a name already in use replaced the group with an empty one, dropping its parameters; they now return `DBParameterGroupAlreadyExists`, as AWS does. Contributed by @skialpine.
 - **RDS — a backup retention period of 0 turns binary logging off** — on RDS for MySQL, `BackupRetentionPeriod=0` turns binary logging off; MiniStack's MySQL 8.0/8.4 instances kept the image default, binary logging on. Such an instance now starts with binary logging off. Contributed by @skialpine.
