@@ -1083,7 +1083,6 @@ def resolve_principal(access_key_id: str,
 _ALWAYS_ALLOWED_ACTIONS = frozenset({
     "sts:GetCallerIdentity",
     "sts:GetSessionToken",
-    "sts:GetAccessKeyInfo",
 })
 
 

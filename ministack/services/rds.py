@@ -2535,6 +2535,10 @@ def _start_rds_container_for_instance(db_id, instance):
             except Exception:
                 pass
             return
+        _grant_mysql_master_user_privileges(
+            internal_host or "127.0.0.1", internal_port or host_port,
+            master_user, master_pass, db_id,
+        )
     _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
                 container_name, db_id)

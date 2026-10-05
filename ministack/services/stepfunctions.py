@@ -38,6 +38,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
@@ -1704,6 +1705,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if is_callback:
                 task_result = _invoke_with_callback(
                     resource, effective, ctx["Task"]["Token"], state_def)
+            # Skip activities: their timeout starts when a worker gets the task, not here
+            elif "TimeoutSeconds" in state_def and ":activity:" not in resource:
+                task_result = _invoke_resource_with_timeout(
+                    resource, effective, state_def["TimeoutSeconds"])
             else:
                 task_result = _invoke_resource(resource, effective)
 
@@ -1824,6 +1829,21 @@ def _invoke_resource(resource, input_data):
         )
 
     return input_data
+
+
+def _invoke_resource_with_timeout(resource, input_data, timeout):
+    """Run the task, and raise States.Timeout when it runs longer than TimeoutSeconds.
+
+    This function does not stop the task thread. The task continues to run, but the state ignores its result.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    # Workers do not inherit contextvars, so copy them to keep the account and region scope (#639).
+    future = pool.submit(contextvars.copy_context().run, _invoke_resource, resource, input_data)
+    pool.shutdown(wait=False)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise _ExecutionError("States.Timeout", f"Task timed out after {timeout} seconds") from None
 
 
 def _invoke_activity(resource, input_data):
@@ -3021,21 +3041,30 @@ def _resolve_ctx_path(path, ctx):
 # Retry / Catch helpers
 # ===================================================================
 
+def _error_matches(error_equals, error):
+    """Return True when a retrier's or catcher's ErrorEquals list matches this error name.
+
+    States.TaskFailed matches every error name except States.Timeout, as the
+    AWS Step Functions error handling guide describes.
+    """
+    if "States.ALL" in error_equals or error in error_equals:
+        return True
+    return "States.TaskFailed" in error_equals and error != "States.Timeout"
+
+
 def _find_matching_retrier(retriers, error, retry_counts):
     for idx, retrier in enumerate(retriers):
-        equals = retrier.get("ErrorEquals", [])
         max_attempts = retrier.get("MaxAttempts", 3)
         if retry_counts.get(idx, 0) >= max_attempts:
             continue
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(retrier.get("ErrorEquals", []), error):
             return retrier, idx
     return None, -1
 
 
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
-        equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
 

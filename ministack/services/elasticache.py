@@ -23,7 +23,8 @@ Supports: CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters,
 When Docker is available, CreateCacheCluster spins up a real Redis/Valkey/Memcached
 container. Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 A serverless cache gets its own Valkey/Redis container that, like AWS's, only
-speaks TLS; its certificate chains to the CA served at
+speaks TLS and runs in cluster mode as a single shard announcing the cache's
+endpoint; its certificate chains to the CA served at
 ``GET /_ministack/elasticache/ca.pem``.
 """
 
@@ -659,12 +660,15 @@ def _bootstrap_redis_cluster(bootstrap_container, node_addrs, replicas_per_shard
         return False
 
 
-def _wait_cluster_ok(container, timeout=15):
-    """Poll ``CLUSTER INFO`` until ``cluster_state:ok`` is reported."""
+def _wait_cluster_ok(container, timeout=15, cli_args=()):
+    """Poll ``CLUSTER INFO`` until ``cluster_state:ok`` is reported.
+
+    ``cli_args`` are as for ``_wait_redis_ready``.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            result = container.exec_run(["redis-cli", "-p", "6379", "CLUSTER", "INFO"])
+            result = container.exec_run(["redis-cli", *cli_args, "-p", "6379", "CLUSTER", "INFO"])
             if result.exit_code == 0 and b"cluster_state:ok" in result.output:
                 return True
         except Exception:
@@ -2116,14 +2120,18 @@ _SERVERLESS_ENGINE_VERSIONS = {
 _SERVERLESS_DEFAULT_MAJOR = {"valkey": "8", "redis": "7"}
 _SERVERLESS_TLS_DIR = "/ministack-elasticache-tls"
 _SERVERLESS_TLS_CLI_ARGS = ("--tls", "--cacert", f"{_SERVERLESS_TLS_DIR}/ca.crt", "-h", "127.0.0.1")
-# The certificate has to name the container's address, which is only known once
-# it runs, so the server waits for the material; `ready` is the archive's last
-# member. The image's entrypoint then drops to the uid that owns /data.
+# The certificate and the announced endpoint name the container's address, which
+# is only known once it runs, so the server waits for the material; `ready` is
+# the archive's last member. AWS serves a serverless cache as one cluster-mode
+# shard, so once the server answers, it takes every slot. The image's entrypoint
+# then drops to the uid that owns /data.
 _SERVERLESS_TLS_WRAPPER = (
     f"d={_SERVERLESS_TLS_DIR}; "
     'while [ ! -e "$d/ready" ]; do sleep 0.1; done; '
     'chown -R "$(stat -c %u:%g /data)" "$d"; '
-    'exec docker-entrypoint.sh "$@"'
+    f'(until redis-cli {" ".join(_SERVERLESS_TLS_CLI_ARGS)} PING >/dev/null 2>&1; do sleep 0.1; done; '
+    f'redis-cli {" ".join(_SERVERLESS_TLS_CLI_ARGS)} CLUSTER ADDSLOTSRANGE 0 16383 >/dev/null) & '
+    'exec docker-entrypoint.sh "$@" $(cat "$d/announce")'
 )
 _serverless_ca_lock = _threading.Lock()
 _serverless_ca = None
@@ -2161,7 +2169,17 @@ def _is_ip(value):
         return False
 
 
-def _serverless_tls_archive(ca_pem, cert_pem, key_pem):
+def _serverless_announce_flags(address, port):
+    """Server flags that make CLUSTER SLOTS name the cache endpoint. A hostname
+    Redis refuses (it allows only letters, digits, '-' and '.') is left out, and
+    the node then announces its own address."""
+    flags = f"--cluster-announce-tls-port {port}"
+    if all(c.isascii() and (c.isalnum() or c in "-.") for c in address):
+        flags += f" --cluster-announce-hostname {address} --cluster-preferred-endpoint-type hostname"
+    return flags
+
+
+def _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce):
     root = _SERVERLESS_TLS_DIR.lstrip("/")
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as bundle:
@@ -2170,7 +2188,8 @@ def _serverless_tls_archive(ca_pem, cert_pem, key_pem):
         entry.mode = 0o755
         bundle.addfile(entry)
         for filename, content, mode in (("ca.crt", ca_pem, 0o644), ("server.crt", cert_pem, 0o644),
-                                        ("server.key", key_pem, 0o600), ("ready", "", 0o644)):
+                                        ("server.key", key_pem, 0o600), ("announce", announce, 0o644),
+                                        ("ready", "", 0o644)):
             data = content.encode()
             entry = tarfile.TarInfo(f"{root}/{filename}")
             entry.mode = mode
@@ -2202,6 +2221,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             "--tls-ca-cert-file", f"{_SERVERLESS_TLS_DIR}/ca.crt",
             "--tls-auth-clients", "no",
             "--protected-mode", "no",
+            "--cluster-enabled", "yes", "--tls-cluster", "yes",
         ],
     )
     if DOCKER_NETWORK:
@@ -2221,10 +2241,11 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
         ca_pem, ca_key = _ensure_serverless_ca()
         cert_pem, key_pem, _public = sign_leaf_certificate(
             ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
-        if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem)):
+        announce = _serverless_announce_flags(address, port)
+        if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
-        if wait and not _wait_redis_ready(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
-            raise RuntimeError(f"{engine} in {name} never answered a TLS PING")
+        if wait and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise

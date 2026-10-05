@@ -312,6 +312,11 @@ def test_sns_tags(sns):
     assert tags["env"] == "staging"
 
 
+def test_sns_create_topic_keeps_its_tags(sns):
+    arn = sns.create_topic(Name="intg-sns-create-tags", Tags=[{"Key": "env", "Value": "dev"}])["TopicArn"]
+    assert sns.list_tags_for_resource(ResourceArn=arn)["Tags"] == [{"Key": "env", "Value": "dev"}]
+
+
 def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
     arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     empty_account_arn = arn.replace(":000000000000:", "::")
