@@ -8263,6 +8263,60 @@ def test_rds_mysql_binary_logging_follows_backup_retention(rds):
             rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 
+@pytest.mark.data_plane
+def test_rds_mysql_applies_db_parameter_group(rds):
+    """An instance starts with its DB parameter group (a name mysqld only takes
+    under another option, `time_zone`, does not stop it). An immediate change to
+    a dynamic parameter applies at once and a reset returns it to the default; AWS
+    refuses an immediate change to a static one, which pending-reboot accepts."""
+    suffix = uuid.uuid4().hex[:8]
+    group, db_id = f"pg-{suffix}", f"pg-db-{suffix}"
+    rds.create_db_parameter_group(DBParameterGroupName=group,
+                                  DBParameterGroupFamily="mysql8.0", Description="test")
+
+    def modify(name, value, method="immediate"):
+        rds.modify_db_parameter_group(DBParameterGroupName=group, Parameters=[
+            {"ParameterName": name, "ParameterValue": value, "ApplyMethod": method}])
+
+    def status():
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        return instance["DBParameterGroups"][0]["ParameterApplyStatus"]
+
+    modify("collation_server", "utf8mb4_bin")
+    modify("time_zone", "UTC")
+    try:
+        rds.create_db_instance(
+            DBInstanceIdentifier=db_id, Engine="mysql", EngineVersion="8.0",
+            DBInstanceClass="db.t3.micro", AllocatedStorage=20, DBName=DATABASE,
+            MasterUsername="admin", MasterUserPassword=PASSWORD, DBParameterGroupName=group,
+        )
+        conn = _aurora_connect(_wait_for_instance(rds, db_id)["Endpoint"])
+        cur = conn.cursor()
+
+        def variable(name):
+            cur.execute(f"SELECT @@GLOBAL.{name}")
+            return cur.fetchone()[0]
+
+        assert variable("collation_server") == "utf8mb4_bin"
+        modify("max_connections", "300")
+        assert (variable("max_connections"), status()) == (300, "in-sync")
+        modify("long_query_time", "0.5")
+        assert (float(variable("long_query_time")), status()) == (0.5, "in-sync")
+        rds.reset_db_parameter_group(DBParameterGroupName=group, Parameters=[
+            {"ParameterName": "max_connections", "ApplyMethod": "immediate"}])
+        assert variable("max_connections") == 151
+        with pytest.raises(ClientError) as exc:
+            modify("performance_schema", "0")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert status() == "in-sync"
+        modify("performance_schema", "0", "pending-reboot")
+        assert status() == "pending-reboot"
+        conn.close()
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        rds.delete_db_parameter_group(DBParameterGroupName=group)
+
+
 @contextlib.contextmanager
 def _live_cluster(rds, engine_version=None):
     suffix = uuid.uuid4().hex[:10]
