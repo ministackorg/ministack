@@ -61,13 +61,23 @@ _GSSENC_REQUEST = 80877104
 _CANCEL_REQUEST = 80877102
 _PROTOCOL_3 = 196608
 
+# ParameterStatus sent at startup. Drivers depend on these: one that decodes
+# timestamptz by TimeZone can stall on the first value without it. Values
+# as real DSQL reports them (measured, eu-central-1 2026-10-04), bar the
+# per-session session_authorization.
 _STARTUP_PARAMS = (
     ("server_version", "16.4"),
     ("server_encoding", "UTF8"),
     ("client_encoding", "UTF8"),
-    ("DateStyle", "ISO"),
+    ("DateStyle", "ISO, MDY"),
+    ("IntervalStyle", "postgres"),
+    ("TimeZone", "UTC"),
     ("integer_datetimes", "on"),
     ("standard_conforming_strings", "on"),
+    ("application_name", ""),
+    ("is_superuser", "off"),
+    ("default_transaction_read_only", "off"),
+    ("in_hot_standby", "off"),
 )
 
 _TEXT_OID = 25
@@ -77,11 +87,12 @@ def _frame(type_byte, payload):
     return type_byte + struct.pack("!I", len(payload) + 4) + payload
 
 
-def _error_response(sqlstate, message):
+def _error_response(sqlstate, message, detail=None):
     payload = (
         b"SERROR\0VERROR\0"
         + b"C" + sqlstate.encode() + b"\0"
         + b"M" + message.encode() + b"\0"
+        + (b"D" + detail.encode() + b"\0" if detail else b"")
         + b"\0"
     )
     return _frame(b"E", payload)
@@ -140,12 +151,39 @@ _proxies = {}  # cluster_id -> asyncio.Server
 _jobs = {}  # cluster_id -> [job dict]
 _catalog_versions = {}  # cluster_id -> int, bumped on every DDL statement
 
-_ID_ALPHABET = string.ascii_lowercase + string.digits
+# DSQL job ids are 26 base32 characters (a UUID); wait_for_job refuses any
+# other text with 22P02 "Unable to convert text to UUID".
+_ID_ALPHABET = string.ascii_lowercase + "234567"
 
 _JOB_COLUMNS = (
     "job_id", "status", "details", "job_type", "class_id", "object_id",
     "object_name", "start_time", "update_time",
 )
+# Column types sys.jobs declares on real DSQL (measured, eu-central-1
+# 2026-10-04); the rest are text. Drivers decode values by these oids.
+_OID_OID, _TIMESTAMPTZ_OID = 26, 1184
+_JOB_COLUMN_TYPES = {
+    "class_id": _OID_OID, "object_id": _OID_OID,
+    "start_time": _TIMESTAMPTZ_OID, "update_time": _TIMESTAMPTZ_OID,
+}
+# Catalog a job's object lives in: pg_class for an index, pg_constraint for
+# a constraint validation.
+_JOB_CLASS_IDS = {"INDEX_BUILD": "1259", "VALIDATE_CONSTRAINT": "2606"}
+# What CREATE INDEX ASYNC / ALTER TABLE ASYNC answer, as on real DSQL.
+_JOB_COMMAND_TAGS = {"INDEX_BUILD": "CREATE INDEX", "VALIDATE_CONSTRAINT": "ALTER TABLE"}
+
+
+def _pg_timestamptz(value):
+    """Postgres' text output for a UTC timestamptz (DSQL keeps whole seconds).
+
+    Jobs persisted by older versions hold ISO 8601 strings; they render the
+    same way.
+    """
+    if isinstance(value, str) and "T" in value:
+        value = datetime.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00")
+    return value
 
 
 def get_jobs(cluster_id):
@@ -169,14 +207,14 @@ def _bump_catalog(cluster_id):
 
 
 def _register_job(cluster_id, object_name, job_type="INDEX_BUILD",
-                  status="completed", details=""):
-    now = datetime.now(timezone.utc).isoformat()
+                  status="completed", details=None):
+    now = _pg_timestamptz(datetime.now(timezone.utc))
     job = {
         "job_id": "".join(secrets.choice(_ID_ALPHABET) for _ in range(26)),
         "status": status,
         "details": details,
         "job_type": job_type,
-        "class_id": "1259",
+        "class_id": _JOB_CLASS_IDS.get(job_type, "1259"),
         "object_id": str(16384 + secrets.randbelow(100000)),
         "object_name": object_name,
         "start_time": now,
@@ -389,9 +427,10 @@ def _sql_tokens(sql):
 class DsqlError:
     """Validator rejection: rendered as a PG ErrorResponse."""
 
-    def __init__(self, sqlstate, message):
+    def __init__(self, sqlstate, message, detail=None):
         self.sqlstate = sqlstate
         self.message = message
+        self.detail = detail
 
     def __repr__(self):
         return f"DsqlError({self.sqlstate!r}, {self.message!r})"
@@ -873,6 +912,12 @@ def _check_alter_table(sql):
         return DsqlError(
             "0A000", "SET NOT NULL is not supported (only DROP NOT NULL)"
         )
+    if re.search(r"\bALTER\s+(?:COLUMN\s+)?[\w\"]+\s+SET\s+STATISTICS\b", sql, re.I):
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "0A000",
+            "unsupported ALTER TABLE ALTER COLUMN ... SET STATISTICS statement",
+        )
     add = re.search(r"\bADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?(\w+)", sql, re.I)
     if add and add.group(1).upper() != "COLUMN":
         what = add.group(1).upper()
@@ -1014,14 +1059,20 @@ def _check_cache_value(sql):
 
 # DSQL index rules, verified against a live Aurora DSQL cluster (Aug 2026):
 # index creation is always asynchronous — plain CREATE INDEX fails with
-# "unsupported mode". No CONCURRENTLY, no USING (not even btree), no partial
-# (WHERE). IF NOT EXISTS requires a name (grammar). Expression index keys are
-# supported, but every function must be immutable (42P17) and INCLUDE columns
-# can't be expressions. At most 8 key columns per index (54011); 24 indexes
-# per table is enforced at runtime.
+# "unsupported mode". No CONCURRENTLY, no USING (not even btree). IF NOT
+# EXISTS requires a name (grammar). Expression index keys are supported, but
+# every function must be immutable (42P17) and INCLUDE columns can't be
+# expressions. At most 8 key columns per index (54011); 24 indexes per table
+# is enforced at runtime.
 #
-# Error precedence (observed on real DSQL): name-grammar → CONCURRENTLY →
-# USING → WHERE → mode → key-expression rules → key count.
+# Partial indexes (WHERE predicate) are supported since 2026-09-15. The
+# predicate follows the same immutability rule as key expressions; the proxy
+# checks it up front so a bad predicate fails the submit, not the job.
+#
+# Error precedence (measured, eu-central-1 2026-10-04): name-grammar →
+# CONCURRENTLY → USING → key count → mode → predicate (subquery, then
+# immutability) → key-expression immutability → INCLUDE expressions. The key
+# count comes before the mode: a plain CREATE INDEX on 9 columns draws 54011.
 _VOLATILE_FUNCTIONS = frozenset({
     "now", "random", "setseed", "nextval", "currval", "lastval", "setval",
     "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
@@ -1042,29 +1093,37 @@ def _check_index_rules(sql):
         return DsqlError("0A000", "CONCURRENTLY not supported for CREATE INDEX")
     if re.search(r"\bUSING\s+\w+", sql, re.I):
         return DsqlError("0A000", "USING not supported for CREATE INDEX")
-    if re.search(r"\bWHERE\b", sql, re.I):
-        return DsqlError("0A000", "WHERE not supported for CREATE INDEX")
+    start = sql.find("(", m.end())
+    end = _match_paren(sql, start) if start >= 0 else -1
+    parts = _split_top_level(sql[start + 1 : end]) if end > 0 else []
+    if len(parts) > 8:
+        return DsqlError(
+            "54011", "more than 8 column keys in an index are not supported"
+        )
     if not _INDEX_ASYNC_RE.match(sql):
         return DsqlError(
             "0A000", "unsupported mode. please use CREATE INDEX ASYNC."
         )
-    start = sql.find("(", m.end())
-    if start < 0:
-        return None
-    end = _match_paren(sql, start)
     if end < 0:
         return None
-    parts = _split_top_level(sql[start + 1 : end])
-    for part in parts:
-        for fn in re.findall(r"(\w+)\s*\(", part):
-            if fn.lower() in _VOLATILE_FUNCTIONS:
-                # Same code/message the backend (and real DSQL) produce; the
-                # proxy fails fast so CREATE INDEX ASYNC rejects at submit
-                # time instead of returning a job_id.
-                return DsqlError(
-                    "42P17",
-                    "functions in index expression must be marked IMMUTABLE",
-                )
+    # Neither INCLUDE (...) nor NULLS [NOT] DISTINCT can hold a WHERE, so the
+    # first one after the key list starts the partial-index predicate.
+    pred = re.search(r"\bWHERE\b", sql[end + 1 :], re.I)
+    if pred:
+        predicate = sql[end + 1 + pred.end() :]
+        if re.search(r"\bSELECT\b", _strip_literals(predicate), re.I):
+            return DsqlError("0A000", "cannot use subquery in index predicate")
+        if _calls_volatile_function(predicate):
+            return DsqlError(
+                "42P17", "functions in index predicate must be marked IMMUTABLE"
+            )
+    if any(_calls_volatile_function(part) for part in parts):
+        # Same code/message the backend (and real DSQL) produce; the proxy
+        # fails fast so CREATE INDEX ASYNC rejects at submit time instead of
+        # returning a job_id.
+        return DsqlError(
+            "42P17", "functions in index expression must be marked IMMUTABLE"
+        )
     # INCLUDE columns are non-key: expressions are not supported there.
     inc = re.search(r"\bINCLUDE\s*\(", sql[end:], re.I)
     if inc:
@@ -1076,11 +1135,18 @@ def _check_index_rules(sql):
             return DsqlError(
                 "0A000", "expressions are not supported in included columns"
             )
-    if len(parts) > 8:
-        return DsqlError(
-            "54011", "more than 8 column keys in an index are not supported"
-        )
     return None
+
+
+def _strip_literals(text):
+    return re.sub(r"'(?:[^']|'')*'", "''", text)
+
+
+def _calls_volatile_function(text):
+    return any(
+        fn.lower() in _VOLATILE_FUNCTIONS
+        for fn in re.findall(r"(\w+)\s*\(", _strip_literals(text))
+    )
 
 
 _ALTER_ASYNC_VALIDATE_RE = re.compile(
@@ -1149,12 +1215,29 @@ def _index_object_name(sql, on_end, index_name, table):
 # --- sys.jobs / sys.wait_for_job (rules 5 & 6) ------------------------------
 
 _SYS_JOBS_RE = re.compile(r"\s*SELECT\s+(.+?)\s+FROM\s+sys\.jobs\b", re.I | re.S)
-_JOB_ID_FILTER_RE = re.compile(r"job_id\s*=\s*'([^']*)'", re.I)
+_JOB_ID_FILTER_RE = re.compile(
+    r"job_id\s*=\s*(?:'([^']*)'|\$(\d+))(?:\s*::\s*\w+)?", re.I
+)
 _WAIT_JOB_RE = re.compile(
-    r"\s*(?:SELECT|CALL)\s+sys\.wait_for_job\s*\(\s*"
-    r"(?:job_id\s*\)\s*'([^']*)'|'([^']*)'\s*\))",
+    r"\s*(SELECT|CALL)\s+sys\.wait_for_job\s*\(\s*"
+    r"(?:job_id\s*\)\s*'([^']*)'|'([^']*)'(?:\s*::\s*\w+)?\s*\)"
+    r"|\$(\d+)(?:\s*::\s*\w+)?\s*\))",
     re.I,
 )
+_JOB_ID_RE = re.compile(r"[a-z2-7]{26}")
+
+
+class BindParam:
+    """A ``$n`` placeholder whose value only arrives with Bind."""
+
+    def __init__(self, index):
+        self.index = index
+
+    def __eq__(self, other):
+        return isinstance(other, BindParam) and other.index == self.index
+
+    def __repr__(self):
+        return f"BindParam({self.index})"
 
 
 def match_sys_jobs(sql):
@@ -1171,16 +1254,29 @@ def match_sys_jobs(sql):
     if select_list != "*":
         columns = [c.strip().strip('"') for c in select_list.split(",")]
     f = _JOB_ID_FILTER_RE.search(sql)
-    return columns, (f.group(1) if f else None)
+    if not f:
+        return columns, None
+    return columns, (BindParam(int(f.group(2))) if f.group(2) else f.group(1))
 
 
 def match_wait_for_job(sql):
-    """Match both documented call forms: ``sys.wait_for_job(job_id) '<id>'``
-    and the conventional ``sys.wait_for_job('<id>')``."""
+    """The job id ``sys.wait_for_job`` is called with, or None.
+
+    A ``BindParam`` when the id is a ``$n`` placeholder (the client binds it
+    over the extended protocol). Accepts the literal forms
+    ``sys.wait_for_job('<id>')`` and ``sys.wait_for_job(job_id) '<id>'``.
+    """
     m = _WAIT_JOB_RE.match(sql)
     if not m:
         return None
-    return m.group(1) or m.group(2)
+    if m.group(4):
+        return BindParam(int(m.group(4)))
+    return m.group(2) or m.group(3)
+
+
+def _wait_is_call(sql):
+    m = _WAIT_JOB_RE.match(sql)
+    return bool(m) and m.group(1).upper() == "CALL"
 
 
 # --- Locking clauses (measured against Aurora DSQL, 2026-08-18) -------------
@@ -1220,6 +1316,108 @@ def _check_locking_clause(sql):
 
 
 # --- Top-level validator -----------------------------------------------------
+
+
+# DSQL-specific planner settings (all boolean). Postgres takes any dotted name
+# as an untyped placeholder, so the backend would accept SET ... = 'banana';
+# real DSQL rejects it. The backend container starts with each one set to its
+# DSQL default (dsql.py), so SHOW and RESET behave too.
+DSQL_SETTINGS = {
+    "dsql.enable_batched_nestloop": "on",  # 2026-09-11
+}
+
+# Settings DSQL refuses to change (SET, SET LOCAL, set_config); RESET and
+# SET ... TO DEFAULT are accepted. Observed, not exhaustive (eu-central-1,
+# 2026-10-04): planner switches like enable_hashjoin and search_path are
+# settable.
+_UNSETTABLE_PARAMS = frozenset({
+    "default_statistics_target", "statement_timeout", "work_mem",
+})
+
+_SET_RE = re.compile(
+    r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?([\w.]+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
+    re.I | re.S,
+)
+_RESET_RE = re.compile(r"\s*RESET\s+([\w.]+)", re.I)
+_SET_CONFIG_RE = re.compile(
+    r"\bset_config\s*\(\s*'([^']*)'\s*,\s*'((?:[^']|'')*)'", re.I
+)
+
+
+def _parse_pg_bool(value):
+    """Postgres parse_bool: case-insensitive unique prefixes, plus 1/0."""
+    v = value.strip().lower()
+    if v in ("1", "0"):
+        return True
+    if len(v) >= 2 and v in ("on", "off"[: len(v)]):
+        return True
+    return bool(v) and any(w.startswith(v) for w in ("true", "false", "yes", "no"))
+
+
+def _check_setting(name, values):
+    """Rules for one assignment; ``values`` is None for RESET / TO DEFAULT."""
+    name = name.lower()
+    if name.startswith("dsql.") and name not in DSQL_SETTINGS:
+        # Exact message and detail from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "42602",
+            f'invalid configuration parameter name "{name}"',
+            '"dsql" is a reserved prefix.',
+        )
+    if values is None:
+        return None
+    if name in _UNSETTABLE_PARAMS:
+        return DsqlError(
+            "0A000", f'setting configuration parameter "{name}" not supported'
+        )
+    if name in DSQL_SETTINGS and values:
+        if len(values) > 1:
+            return DsqlError("22023", f"SET {name} takes only one argument")
+        if not _parse_pg_bool(values[0]):
+            return DsqlError("22023", f'parameter "{name}" requires a Boolean value')
+    return None
+
+
+def _unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+_ALTER_STATISTICS_TARGET_RE = re.compile(
+    r"\s*ALTER\s+STATISTICS\s+.+?\s+SET\s+STATISTICS\s+(-?\d+)", re.I | re.S
+)
+
+
+def _check_statistics_target(sql):
+    """DSQL caps statistics targets at 100 (Postgres allows 10000)."""
+    m = _ALTER_STATISTICS_TARGET_RE.match(sql)
+    if m and int(m.group(1)) > 100:
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "22023",
+            f"statistics target {m.group(1)} exceeds maximum allowed value of 100",
+        )
+    return None
+
+
+def _check_settings(sql):
+    m = _SET_RE.match(sql)
+    if m:
+        raw = m.group(2)
+        values = (
+            None if raw.upper() == "DEFAULT"
+            else [_unquote(v.strip()) for v in _split_top_level(raw)]
+        )
+        return _check_setting(m.group(1), values)
+    m = _RESET_RE.match(sql)
+    if m:
+        return _check_setting(m.group(1), None)
+    for name, value in _SET_CONFIG_RE.findall(sql):
+        err = _check_setting(name, [value.replace("''", "'")])
+        if err:
+            return err
+    return None
 
 
 def validate(sql, txn_state=None):
@@ -1291,6 +1489,12 @@ def validate(sql, txn_state=None):
     if err:
         return err
     err = _check_locking_clause(s)
+    if err:
+        return err
+    err = _check_settings(s)
+    if err:
+        return err
+    err = _check_statistics_target(s)
     if err:
         return err
 
@@ -1433,13 +1637,18 @@ async def _index_count(conn, b_writer, table):
     schema, _, bare = table.rpartition(".")
     schema = schema.strip('"') or "public"
     bare = bare.strip('"')
+    return await _probe_count(
+        conn,
+        b_writer,
+        "SELECT count(*) FROM pg_indexes "
+        f"WHERE schemaname = '{schema}' AND tablename = '{bare}'",
+    )
+
+
+async def _probe_count(conn, b_writer, query):
+    """Run a single-integer probe on the backend. None on probe error."""
     try:
-        frames = await _run_backend_capture(
-            conn,
-            b_writer,
-            "SELECT count(*) FROM pg_indexes "
-            f"WHERE schemaname = '{schema}' AND tablename = '{bare}'",
-        )
+        frames = await _run_backend_capture(conn, b_writer, query)
     except Exception:
         return None
     for type_byte, payload in frames:
@@ -1474,7 +1683,7 @@ def _reject(conn, c_writer, err):
     """
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
-    c_writer.write(_error_response(err.sqlstate, err.message) + _ready(_status(conn)))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn)))
 
 
 _ABORTED_ERR = DsqlError(
@@ -1599,9 +1808,104 @@ async def _check_drop_column(conn, b_writer, sql):
     return None
 
 
+# At most 5 extended statistics objects per table (AWS DSQL, 2026-08-27).
+# Message and SQLSTATE measured on real DSQL (eu-central-1, 2026-10-04).
+_CREATE_STATISTICS_RE = re.compile(
+    r"\s*CREATE\s+STATISTICS\b.*\bFROM\s+([\w\".]+)\s*;?\s*$", re.I | re.S
+)
+_STATISTICS_LIMIT_ERR = DsqlError(
+    "54000", "more than 5 extended statistics per table are not allowed"
+)
+
+
+async def _check_statistics_limit(conn, b_writer, sql):
+    m = _CREATE_STATISTICS_RE.match(sql)
+    if not m:
+        return None
+    # regclass resolves the name the way the backend will (search_path,
+    # quoting); an unknown table fails the probe and the backend answers.
+    count_sql = (
+        "SELECT count(*) FROM pg_statistic_ext "
+        f"WHERE stxrelid = '{m.group(1)}'::regclass"
+    )
+    before = await _probe_count(conn, b_writer, count_sql)
+    if before is None or before < 5:
+        return None
+    # At the limit, dry-run the statement and roll it back. DSQL reports the
+    # statement's own errors (fewer than two columns, an unknown column) ahead
+    # of the limit, and IF NOT EXISTS on an existing name is still a no-op;
+    # only a statement that would really add a sixth object is refused.
+    if conn.txn.in_txn:
+        begin = "SAVEPOINT ministack_statistics"
+        undo = (
+            "ROLLBACK TO SAVEPOINT ministack_statistics; "
+            "RELEASE SAVEPOINT ministack_statistics"
+        )
+    else:
+        begin, undo = "BEGIN", "ROLLBACK"
+    after = None
+    await _run_backend_capture(conn, b_writer, begin)
+    try:
+        frames = await _run_backend_capture(conn, b_writer, sql)
+        if not any(t == b"E" for t, _ in frames):
+            after = await _probe_count(conn, b_writer, count_sql)
+    finally:
+        await _run_backend_capture(conn, b_writer, undo)
+    if after is not None and after > before:
+        return _STATISTICS_LIMIT_ERR
+    return None
+
+
 _ASYNC_BATCH_ERR = DsqlError(
     "0A000", "asynchronous DDL is not supported in multi-statement queries"
 )
+
+
+def _sys_jobs_rows(conn, cols, job_filter):
+    jobs = get_jobs(conn.cluster_id)
+    if job_filter is not None:
+        jobs = [j for j in jobs if j["job_id"] == job_filter]
+    return {
+        "cols": [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+        "rows": [
+            [_pg_timestamptz(job[c]) if c.endswith("_time") else job[c] for c in cols]
+            for job in jobs
+        ],
+        "tag": f"SELECT {len(jobs)}",
+    }
+
+
+def _wait_columns(call):
+    # Real DSQL: wait_for_job is a procedure whose one OUT parameter is
+    # ``succeeded`` (bool), so CALL answers a "succeeded" column and the CALL
+    # tag (measured, eu-central-1 2026-10-04). The SELECT form, which DSQL
+    # refuses with 42809, is kept as a lenient alias.
+    return [("succeeded" if call else "wait_for_job", 16)]  # bool oid
+
+
+def _wait_for_job_rows(conn, job_id, call):
+    if call and (job_id is None or not _JOB_ID_RE.fullmatch(job_id)):
+        return DsqlError("22P02", "Unable to convert text to UUID")
+    known = any(
+        j["job_id"] == job_id and j["status"] == "completed"
+        for j in get_jobs(conn.cluster_id)
+    )
+    return {
+        "cols": _wait_columns(call),
+        "rows": [["t" if known else "f"]],
+        "tag": "CALL" if call else "SELECT 1",
+    }
+
+
+def _deferred(cols, param, resolve):
+    """A synthetic result that needs a bound parameter: resolved at Bind."""
+    return {
+        "cols": cols,
+        "nparams": param.index,
+        "resolve": lambda params: resolve(
+            params[param.index - 1] if len(params) >= param.index else None
+        ),
+    }
 
 
 async def _plan_statement(conn, s, b_writer, allow_probe=True):
@@ -1625,26 +1929,25 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
         bad = [c for c in cols if c not in _JOB_COLUMNS]
         if bad:
             return "error", DsqlError("42703", f'column "{bad[0]}" does not exist')
-        jobs = get_jobs(conn.cluster_id)
-        if job_filter:
-            jobs = [j for j in jobs if j["job_id"] == job_filter]
-        return "rows", {
-            "cols": cols,
-            "rows": [[job[c] for c in cols] for job in jobs],
-            "tag": f"SELECT {len(jobs)}",
-        }
+        if isinstance(job_filter, BindParam):
+            return "rows", _deferred(
+                [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+                job_filter, lambda v: _sys_jobs_rows(conn, cols, v),
+            )
+        return "rows", _sys_jobs_rows(conn, cols, job_filter)
 
     job_id = match_wait_for_job(s)
     if job_id is not None:
-        known = any(
-            j["job_id"] == job_id and j["status"] == "completed"
-            for j in get_jobs(conn.cluster_id)
-        )
-        return "rows", {
-            "cols": [("wait_for_job", 16)],  # bool oid
-            "rows": [["t" if known else "f"]],
-            "tag": "SELECT 1",
-        }
+        call = _wait_is_call(s)
+        if isinstance(job_id, BindParam):
+            return "rows", _deferred(
+                _wait_columns(call), job_id,
+                lambda v: _wait_for_job_rows(conn, v, call),
+            )
+        result = _wait_for_job_rows(conn, job_id, call)
+        if isinstance(result, DsqlError):
+            return "error", result
+        return "rows", result
 
     result = validate(s, conn.txn)
     if isinstance(result, DsqlError):
@@ -1663,6 +1966,9 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
 
     if allow_probe:
         err = await _check_drop_column(conn, b_writer, s)
+        if err:
+            return "error", err
+        err = await _check_statistics_limit(conn, b_writer, s)
         if err:
             return "error", err
 
@@ -1721,6 +2027,9 @@ async def _run_rewrite(conn, b_writer, rewrite):
         # unresolvable relation, a syntax error — is refused on the spot. In a
         # transaction the backend is left aborted, so relay there either way.
         if sqlstate.startswith("23") and not conn.txn.in_txn:
+            if sqlstate == "23505" and rewrite.job_type == "INDEX_BUILD":
+                # DSQL's own wording (measured, eu-central-1 2026-10-04).
+                message = "found duplicate key(s) while validating index uniqueness"
             job = _register_job(
                 conn.cluster_id, rewrite.object_name, rewrite.job_type,
                 status="failed", details=message,
@@ -1743,7 +2052,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
         err, forward_sql = _abort_gate(conn, s)
         if err:
             c_writer.write(
-                _error_response(err.sqlstate, err.message) + _ready(_status(conn))
+                _error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn))
             )
             await c_writer.drain()
             return
@@ -1762,6 +2071,11 @@ async def _handle_query(conn, sql, b_writer, c_writer):
             return
 
         kind, result = await _plan_statement(conn, s, b_writer)
+        if kind == "rows" and "resolve" in result:
+            # A $n placeholder means nothing outside the extended protocol.
+            kind, result = "error", DsqlError(
+                "42P02", f"there is no parameter ${result['nparams']}"
+            )
         if kind == "error":
             _reject(conn, c_writer, result)
             await c_writer.drain()
@@ -1787,7 +2101,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
                 return
             out = _row_description(["job_id"])
             out += _data_row([job["job_id"]])
-            out += _command_complete("SELECT 1")
+            out += _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
             c_writer.write(out + _ready(_status(conn)))
             await c_writer.drain()
             return
@@ -1895,7 +2209,7 @@ async def _ext_error(conn, c_writer, err):
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
     conn.ext_skip = True
-    c_writer.write(_error_response(err.sqlstate, err.message))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail))
     await c_writer.drain()
 
 
@@ -1954,12 +2268,44 @@ async def _ext_bind(conn, payload, b_writer, c_writer):
     if entry is None:
         await _ext_forward(conn, b_writer, b"B", payload)
         return
-    conn.ext_portals[portal] = entry
     if entry["synth"] is None:
+        conn.ext_portals[portal] = entry
         await _ext_forward(conn, b_writer, b"B", payload)
         return
+    kind, result = entry["synth"]
+    if kind == "rows" and "resolve" in result:
+        resolved = result["resolve"](_bind_params(payload))
+        if isinstance(resolved, DsqlError):
+            await _ext_error(conn, c_writer, resolved)
+            return
+        entry = {**entry, "synth": ("rows", resolved)}
+    conn.ext_portals[portal] = entry
     c_writer.write(_frame(b"2", b""))  # BindComplete
     await c_writer.drain()
+
+
+def _bind_params(payload):
+    """Parameter values of a Bind payload, as text (None for NULL)."""
+    try:
+        i = payload.index(b"\0")
+        i = payload.index(b"\0", i + 1) + 1
+        (nfmt,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2 + 2 * nfmt
+        (nparams,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2
+        values = []
+        for _ in range(nparams):
+            (vlen,) = struct.unpack("!i", payload[i : i + 4])
+            i += 4
+            if vlen < 0:
+                values.append(None)
+                continue
+            # A job id is text; its binary encoding is the same UTF-8 bytes.
+            values.append(payload[i : i + vlen].decode("utf-8", "replace"))
+            i += vlen
+        return values
+    except (ValueError, struct.error):
+        return []
 
 
 async def _ext_describe(conn, payload, b_writer, c_writer):
@@ -1971,7 +2317,10 @@ async def _ext_describe(conn, payload, b_writer, c_writer):
         return
     out = b""
     if target == b"S":
-        out += _frame(b"t", struct.pack("!H", 0))  # ParameterDescription
+        nparams = entry["synth"][1].get("nparams", 0)
+        out += _frame(  # ParameterDescription: every placeholder is text
+            b"t", struct.pack("!H", nparams) + struct.pack("!I", 25) * nparams
+        )
     out += _row_description(_synth_columns(*entry["synth"]))
     c_writer.write(out)
     await c_writer.drain()
@@ -2001,7 +2350,10 @@ async def _ext_execute(conn, payload, b_writer, c_writer):
         c_writer.write(_frame(b"E", backend_err))
         await c_writer.drain()
         return
-    c_writer.write(_data_row([job["job_id"]]) + _command_complete("SELECT 1"))
+    c_writer.write(
+        _data_row([job["job_id"]])
+        + _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
+    )
     await c_writer.drain()
 
 

@@ -995,6 +995,53 @@ def _start_raw_server(script):
     return sock, thread
 
 
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+@pytest.mark.parametrize("cookie_names", [
+    ["Set-Cookie", "Set-Cookie", "Set-Cookie"],
+    ["Set-Cookie", "set-cookie", "SET-COOKIE"],
+], ids=["same-case", "mixed-case"])
+def test_elbv2_dataplane_preserves_repeated_target_headers(elbv2, chunked, cookie_names):
+    """Target cookies remain separate fields, including mixed-case names."""
+    cookies = [
+        "session=abc; Path=/; HttpOnly",
+        "theme=dark; Expires=Wed, 09 Jun 2027 10:18:14 GMT; Path=/",
+        "session=def; Path=/admin; Secure",
+    ]
+    body = b"target response"
+
+    def _script(conn):
+        framing = (b"Transfer-Encoding: chunked\r\n" if chunked
+                   else f"Content-Length: {len(body)}\r\n".encode())
+        cookie_fields = b"".join(f"{name}: {value}\r\n".encode()
+                                 for name, value in zip(cookie_names, cookies))
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            + cookie_fields
+            + b"X-Target: first\r\nx-target: second\r\n"
+            + framing + b"\r\n"
+            + (b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body) if chunked else body)
+        )
+
+    sock, thread = _start_raw_server(_script)
+    lb_name = f"dp-alb-headers-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "127.0.0.1", sock.getsockname()[1]
+    )
+    try:
+        with _req.urlopen(f"{_endpoint}/_alb/{lb_name}/", timeout=10) as resp:
+            assert resp.status == 200
+            assert resp.headers.get_all("Set-Cookie") == cookies
+            assert resp.headers.get_all("X-Target") == ["first", "second"]
+            assert resp.headers.get("Content-Type") == "text/plain"
+            assert resp.headers.get("Content-Length") == (None if chunked else str(len(body)))
+            assert (resp.headers.get("Transfer-Encoding") or "").lower() == ("chunked" if chunked else "")
+            assert resp.read() == body
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_connection_close_target_gets_the_idle_timeout(elbv2):
     """A `Connection: close` target must be bounded by the idle timeout too.
