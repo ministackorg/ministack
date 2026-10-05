@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import uuid as _uuid_mod
 from unittest.mock import MagicMock, patch
 
@@ -311,6 +312,13 @@ def test_ses_v2_send_email_with_v1_template(ses, sesv2):
     assert sent[0]["BodyText"] == "Hi Alice, order #42"
 
 @pytest.fixture(autouse=True)
+def _inline_smtp_relay(monkeypatch):
+    """Run the background SMTP relay inline so tests can assert on it."""
+    monkeypatch.setattr('ministack.services.ses.spawn_background',
+                        lambda fn, *args, **_kw: fn(*args))
+
+
+@pytest.fixture(autouse=True)
 def _clear_smtp_host():
     """Ensure SMTP_HOST is clean before/after each test."""
     old = os.environ.pop('SMTP_HOST', None)
@@ -389,10 +397,26 @@ def test_ses_smtp_relay_sends_when_host_set():
         mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
         mock_smtp.__exit__ = MagicMock(return_value=False)
         _smtp_relay('from@test.com', ['to@test.com'], 'message body')
-        mock_cls.assert_called_once_with('127.0.0.1', 1025)
+        mock_cls.assert_called_once_with('127.0.0.1', 1025, timeout=10)
         mock_smtp.sendmail.assert_called_once_with(
             'from@test.com', ['to@test.com'], 'message body',
         )
+
+
+def test_ses_smtp_relay_does_not_block_the_caller(monkeypatch):
+    """An unreachable SMTP_HOST must not stall the request that sent the email."""
+    import threading
+
+    from ministack.core.concurrency import spawn_background
+    from ministack.services.ses import _smtp_relay
+    monkeypatch.setattr('ministack.services.ses.spawn_background', spawn_background)
+    os.environ['SMTP_HOST'] = '127.0.0.1:1025'
+    release = threading.Event()
+    with patch('ministack.services.ses.smtplib.SMTP', side_effect=lambda *a, **k: release.wait(5)):
+        start = time.monotonic()
+        _smtp_relay('from@test.com', ['to@test.com'], 'message')
+        assert time.monotonic() - start < 1
+        release.set()
 
 
 def test_ses_smtp_relay_error_is_logged_not_raised():
