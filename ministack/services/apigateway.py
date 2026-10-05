@@ -3037,6 +3037,25 @@ _WS_DENY_REASONS = {
 }
 
 
+def _authorize_ws_iam(connect_arn, headers, query_params, region):
+    """``(status, message)`` refusing an AWS_IAM $connect, or None; the policy check runs under AUTH=true."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import AuthError, enforce
+    from ministack.core.router import extract_access_key_id
+
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key:
+        return 403, "Missing Authentication Token"
+    denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
+    if isinstance(denied, AuthError):
+        return 403, denied.message
+    if denied:
+        reason = _WS_DENY_REASONS["Deny" if denied.decision == "Deny" else "NoMatch"]
+        return 403, (f"User: {denied.principal_arn} is not authorized to perform: execute-api:Invoke "
+                     f"on resource: {connect_arn} {reason}")
+    return None
+
+
 async def _authorize_ws_connect(api_id, route, request_context, headers, query_params, account_id, region):
     """Run the $connect REQUEST authorizer: ``(refusal, context)``, a refusal being ``(status, message)``."""
     from ministack.services.apigateway_v1 import _stringify_context
@@ -3163,6 +3182,11 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     _ws_request_context(api_id, "$connect", stage, connection_id, "CONNECT",
                                         connect_request_id, source_ip, headers),
                     headers, query_params, account_id, owner_region,
+                )
+            elif auth_type == "AWS_IAM":
+                refusal = _authorize_ws_iam(
+                    execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
+                    headers, query_params, owner_region,
                 )
             elif auth_type == "JWT":
                 # only a route restored from state saved before the route checks existed
