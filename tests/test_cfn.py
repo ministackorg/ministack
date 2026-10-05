@@ -25726,6 +25726,39 @@ def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_existing_name_fails_even_with_identical_properties(cfn, iot_client):
+    """CreateThingGroup returns an identical existing group, but a stack does not
+    adopt it: with the same or other properties the stack rolls back with the
+    name-conflict message, the group stays as it was and survives the stack's
+    delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-tg-taken-{uid}"
+    original = iot_client.create_thing_group(thingGroupName=name, thingGroupProperties={
+        "thingGroupDescription": "first", "attributePayload": {"attributes": {"a": "1"}}})
+    try:
+        for description in ("first", "second"):
+            stack_name = f"cfn-tg-taken-{description}-{uid}"
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+                "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+                    "ThingGroupName": name,
+                    "ThingGroupProperties": {
+                        "ThingGroupDescription": description,
+                        "AttributePayload": {"Attributes": {"a": "1"}}}}}}}))
+            try:
+                stack = _wait_stack(cfn, stack_name)
+                assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+                assert (f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists."
+                        in _stack_event_reasons(cfn, stack_name))
+            finally:
+                _delete_cfn_test_stack(cfn, stack_name)
+            group = iot_client.describe_thing_group(thingGroupName=name)
+            assert group["thingGroupId"] == original["thingGroupId"]
+            assert group["version"] == 1
+            assert group["thingGroupProperties"]["thingGroupDescription"] == "first"
+    finally:
+        iot_client.delete_thing_group(thingGroupName=name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops

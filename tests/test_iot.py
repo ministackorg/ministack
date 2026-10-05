@@ -305,6 +305,95 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
 # ---------------------------------------------------------------------------
 
 
+def test_iot_create_thing_group_repeat_returns_the_existing_group(iot_client):
+    parent, other, name = _unique("parent"), _unique("parent"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=parent)
+    iot_client.create_thing_group(thingGroupName=other)
+    props = {
+        "thingGroupDescription": "first",
+        "attributePayload": {"attributes": {"a": "1", "b": "2"}},
+    }
+    first = iot_client.create_thing_group(
+        thingGroupName=name, parentGroupName=parent, thingGroupProperties=props,
+    )
+
+    # Attribute order and the merge flag do not count (AWS, 2026-10-05).
+    for repeat in (
+        props,
+        {**props, "attributePayload": {"attributes": {"b": "2", "a": "1"}}},
+        {**props, "attributePayload": {"attributes": {"a": "1", "b": "2"}, "merge": True}},
+    ):
+        again = iot_client.create_thing_group(
+            thingGroupName=name, parentGroupName=parent, thingGroupProperties=repeat,
+        )
+        assert (again["thingGroupName"], again["thingGroupArn"], again["thingGroupId"]) == (
+            name, first["thingGroupArn"], first["thingGroupId"])
+
+    for differs in (
+        {"thingGroupProperties": {**props, "thingGroupDescription": "second"}},
+        {"thingGroupProperties": {"thingGroupDescription": "first"}},
+        {"thingGroupProperties": {**props, "attributePayload": {
+            "attributes": {"a": "1"}, "merge": True}}},
+        {},
+    ):
+        kwargs = {"parentGroupName": parent, **differs}
+        for params in (kwargs, {**kwargs, "parentGroupName": other}):
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_thing_group(thingGroupName=name, **params)
+            assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+            assert ei.value.response["Error"]["Message"] == (
+                f"Thing Group {name} already exists in current account with different properties")
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(thingGroupName=name, thingGroupProperties=props)
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+
+    described = iot_client.describe_thing_group(thingGroupName=name)
+    assert described["version"] == 1
+    assert described["thingGroupProperties"]["thingGroupDescription"] == "first"
+    assert described["thingGroupMetadata"]["parentGroupName"] == parent
+    iot_client.delete_thing_group(thingGroupName=name)
+    iot_client.delete_thing_group(thingGroupName=parent)
+    iot_client.delete_thing_group(thingGroupName=other)
+
+
+def test_iot_create_thing_group_repeat_compares_tags(iot_client):
+    bare, tagged = _unique("group"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=bare)
+    first = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+
+    # No properties equals empty properties, empty attributes and no tags.
+    for repeat in (
+        {},
+        {"thingGroupProperties": {}},
+        {"thingGroupProperties": {"attributePayload": {"attributes": {}}}},
+        {"tags": []},
+    ):
+        iot_client.create_thing_group(thingGroupName=bare, **repeat)
+    again = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+    assert again["thingGroupId"] == first["thingGroupId"]
+
+    for name, tags in (
+        (bare, [{"Key": "k", "Value": "v"}]),
+        (tagged, []),
+        (tagged, [{"Key": "k", "Value": "w"}]),
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_thing_group(thingGroupName=name, tags=tags)
+        arn = iot_client.describe_thing_group(thingGroupName=name)["thingGroupArn"]
+        assert ei.value.response["Error"]["Message"] == (
+            f"Resource {arn} already exists in current account with different properties")
+    # A property difference is reported before a tag difference.
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(
+            thingGroupName=tagged, thingGroupProperties={"thingGroupDescription": "x"})
+    assert ei.value.response["Error"]["Message"] == (
+        f"Thing Group {tagged} already exists in current account with different properties")
+    iot_client.delete_thing_group(thingGroupName=bare)
+    iot_client.delete_thing_group(thingGroupName=tagged)
+
+
 def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     parent, child = _unique("parent"), _unique("child")
     iot_client.create_thing_group(thingGroupName=parent)
