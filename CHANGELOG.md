@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SSM — `PutParameter` validates `Type`, reserved names and `Tags` with `Overwrite`** — three requests that AWS refuses were accepted. Creating a parameter without `Type` now fails with `ValidationException` ("A parameter type is required when you create a parameter."), and an overwrite without `Type` keeps the stored type instead of resetting it to `String`, so a `SecureString` no longer turns into plaintext. Names whose first characters (after an optional leading `/`) are `aws` or `ssm`, in any case, are refused: `/aws...` with `AccessDeniedException`, everything else with `ValidationException`, all HTTP 400. `Tags` together with `Overwrite=true` fails with `ValidationException` whether or not the parameter exists; an empty `Tags` list is accepted. Matches AWS observed in us-east-1 on 2026-10-06. Reported by @jin-gizmo.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 

@@ -38,85 +38,85 @@ def test_ssm_overwrite(ssm):
     assert resp["Parameter"]["Value"] == "v2"
 
 def test_ssm_put_get_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/pg/host", Value="db.local", Type="String")
-    resp = ssm.get_parameter(Name="/ssm2/pg/host")
+    ssm.put_parameter(Name="/ps2/pg/host", Value="db.local", Type="String")
+    resp = ssm.get_parameter(Name="/ps2/pg/host")
     assert resp["Parameter"]["Value"] == "db.local"
     assert resp["Parameter"]["Type"] == "String"
     assert resp["Parameter"]["Version"] == 1
 
-    ssm.put_parameter(Name="/ssm2/pg/pass", Value="secret123", Type="SecureString")
-    resp_enc = ssm.get_parameter(Name="/ssm2/pg/pass", WithDecryption=True)
+    ssm.put_parameter(Name="/ps2/pg/pass", Value="secret123", Type="SecureString")
+    resp_enc = ssm.get_parameter(Name="/ps2/pg/pass", WithDecryption=True)
     assert resp_enc["Parameter"]["Value"] == "secret123"
 
 def test_ssm_overwrite_version_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v1", Type="String")
-    r1 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v1", Type="String")
+    r1 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r1["Parameter"]["Version"] == 1
 
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v2", Type="String", Overwrite=True)
-    r2 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v2", Type="String", Overwrite=True)
+    r2 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r2["Parameter"]["Value"] == "v2"
     assert r2["Parameter"]["Version"] == 2
 
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v3", Type="String", Overwrite=True)
-    r3 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v3", Type="String", Overwrite=True)
+    r3 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r3["Parameter"]["Version"] == 3
 
 def test_ssm_get_by_path_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/path/x", Value="vx", Type="String")
-    ssm.put_parameter(Name="/ssm2/path/y", Value="vy", Type="String")
-    ssm.put_parameter(Name="/ssm2/path/sub/z", Value="vz", Type="String")
+    ssm.put_parameter(Name="/ps2/path/x", Value="vx", Type="String")
+    ssm.put_parameter(Name="/ps2/path/y", Value="vy", Type="String")
+    ssm.put_parameter(Name="/ps2/path/sub/z", Value="vz", Type="String")
 
-    resp = ssm.get_parameters_by_path(Path="/ssm2/path", Recursive=True)
+    resp = ssm.get_parameters_by_path(Path="/ps2/path", Recursive=True)
     names = [p["Name"] for p in resp["Parameters"]]
-    assert "/ssm2/path/x" in names
-    assert "/ssm2/path/y" in names
-    assert "/ssm2/path/sub/z" in names
+    assert "/ps2/path/x" in names
+    assert "/ps2/path/y" in names
+    assert "/ps2/path/sub/z" in names
 
-    resp_shallow = ssm.get_parameters_by_path(Path="/ssm2/path", Recursive=False)
+    resp_shallow = ssm.get_parameters_by_path(Path="/ps2/path", Recursive=False)
     names_shallow = [p["Name"] for p in resp_shallow["Parameters"]]
-    assert "/ssm2/path/x" in names_shallow
-    assert "/ssm2/path/sub/z" not in names_shallow
+    assert "/ps2/path/x" in names_shallow
+    assert "/ps2/path/sub/z" not in names_shallow
 
 def test_ssm_get_parameters_multiple_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/multi/a", Value="va", Type="String")
-    ssm.put_parameter(Name="/ssm2/multi/b", Value="vb", Type="String")
-    resp = ssm.get_parameters(Names=["/ssm2/multi/a", "/ssm2/multi/b", "/ssm2/multi/nope"])
+    ssm.put_parameter(Name="/ps2/multi/a", Value="va", Type="String")
+    ssm.put_parameter(Name="/ps2/multi/b", Value="vb", Type="String")
+    resp = ssm.get_parameters(Names=["/ps2/multi/a", "/ps2/multi/b", "/ps2/multi/nope"])
     assert len(resp["Parameters"]) == 2
-    assert any(p["Name"] == "/ssm2/multi/a" for p in resp["Parameters"])
-    assert any(p["Name"] == "/ssm2/multi/b" for p in resp["Parameters"])
-    assert "/ssm2/multi/nope" in resp["InvalidParameters"]
+    assert any(p["Name"] == "/ps2/multi/a" for p in resp["Parameters"])
+    assert any(p["Name"] == "/ps2/multi/b" for p in resp["Parameters"])
+    assert "/ps2/multi/nope" in resp["InvalidParameters"]
 
 def test_ssm_delete_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/del/tmp", Value="bye", Type="String")
-    ssm.delete_parameter(Name="/ssm2/del/tmp")
+    ssm.put_parameter(Name="/ps2/del/tmp", Value="bye", Type="String")
+    ssm.delete_parameter(Name="/ps2/del/tmp")
     with pytest.raises(ClientError) as exc:
-        ssm.get_parameter(Name="/ssm2/del/tmp")
+        ssm.get_parameter(Name="/ps2/del/tmp")
     assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
     # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ParameterNotFound"
 
-    ssm.put_parameter(Name="/ssm2/del/b1", Value="v1", Type="String")
-    ssm.put_parameter(Name="/ssm2/del/b2", Value="v2", Type="String")
-    resp = ssm.delete_parameters(Names=["/ssm2/del/b1", "/ssm2/del/b2", "/ssm2/del/ghost"])
+    ssm.put_parameter(Name="/ps2/del/b1", Value="v1", Type="String")
+    ssm.put_parameter(Name="/ps2/del/b2", Value="v2", Type="String")
+    resp = ssm.delete_parameters(Names=["/ps2/del/b1", "/ps2/del/b2", "/ps2/del/ghost"])
     assert len(resp["DeletedParameters"]) == 2
-    assert "/ssm2/del/ghost" in resp["InvalidParameters"]
+    assert "/ps2/del/ghost" in resp["InvalidParameters"]
 
 def test_ssm_describe_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/desc/alpha", Value="va", Type="String", Description="alpha param")
-    ssm.put_parameter(Name="/ssm2/desc/beta", Value="vb", Type="SecureString")
+    ssm.put_parameter(Name="/ps2/desc/alpha", Value="va", Type="String", Description="alpha param")
+    ssm.put_parameter(Name="/ps2/desc/beta", Value="vb", Type="SecureString")
     resp = ssm.describe_parameters(
-        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": ["/ssm2/desc/"]}]
+        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": ["/ps2/desc/"]}]
     )
     names = [p["Name"] for p in resp["Parameters"]]
-    assert "/ssm2/desc/alpha" in names
-    assert "/ssm2/desc/beta" in names
+    assert "/ps2/desc/alpha" in names
+    assert "/ps2/desc/beta" in names
 
 def test_ssm_parameter_history_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h1", Type="String", Description="d1")
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h2", Type="String", Overwrite=True, Description="d2")
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h3", Type="String", Overwrite=True, Description="d3")
-    resp = ssm.get_parameter_history(Name="/ssm2/hist/h")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h1", Type="String", Description="d1")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h2", Type="String", Overwrite=True, Description="d2")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h3", Type="String", Overwrite=True, Description="d3")
+    resp = ssm.get_parameter_history(Name="/ps2/hist/h")
     assert len(resp["Parameters"]) == 3
     assert resp["Parameters"][0]["Value"] == "h1"
     assert resp["Parameters"][0]["Version"] == 1
@@ -124,23 +124,23 @@ def test_ssm_parameter_history_v2(ssm):
     assert resp["Parameters"][2]["Version"] == 3
 
 def test_ssm_tags_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/tag/t1", Value="v", Type="String")
+    ssm.put_parameter(Name="/ps2/tag/t1", Value="v", Type="String")
     ssm.add_tags_to_resource(
         ResourceType="Parameter",
-        ResourceId="/ssm2/tag/t1",
+        ResourceId="/ps2/tag/t1",
         Tags=[{"Key": "team", "Value": "platform"}, {"Key": "env", "Value": "staging"}],
     )
-    resp = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ssm2/tag/t1")
+    resp = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ps2/tag/t1")
     tag_map = {t["Key"]: t["Value"] for t in resp["TagList"]}
     assert tag_map["team"] == "platform"
     assert tag_map["env"] == "staging"
 
     ssm.remove_tags_from_resource(
         ResourceType="Parameter",
-        ResourceId="/ssm2/tag/t1",
+        ResourceId="/ps2/tag/t1",
         TagKeys=["team"],
     )
-    resp2 = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ssm2/tag/t1")
+    resp2 = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ps2/tag/t1")
     tag_map2 = {t["Key"]: t["Value"] for t in resp2["TagList"]}
     assert "team" not in tag_map2
     assert tag_map2["env"] == "staging"
@@ -709,6 +709,108 @@ def test_ssm_put_rejects_slash_variant_duplicate(ssm):
     assert exc.value.response["Error"]["Code"] == "ParameterAlreadyExists"
 
     assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "bare"
+    ssm.delete_parameter(Name=name)
+
+
+_SSM_PATH_MSG = (
+    'Parameter name: can\'t be prefixed with "ssm" (case-insensitive). If formed as a path, it can consist '
+    "of sub-paths divided by slash symbol; each sub-path can be formed as a mix of letters, numbers and "
+    "the following 3 symbols .-_"
+)
+_AWS_SSM_PLAIN_MSG = 'Parameter name: can\'t be prefixed with "aws" or "ssm" (case-insensitive).'
+_TAGS_OVERWRITE_MSG = (
+    "Invalid request: tags and overwrite can't be used together. To create a parameter "
+    "with tags, please remove overwrite flag. To update tags for an existing parameter, "
+    "please use AddTagsToResource or RemoveTagsFromResource."
+)
+
+
+def test_ssm_put_parameter_requires_type_on_create(ssm):
+    name = f"/ps-type/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x")
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == "A parameter type is required when you create a parameter."
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+
+def test_ssm_put_parameter_overwrite_keeps_type_when_omitted(ssm):
+    name = f"/ps-type/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="old", Type="SecureString")
+    ssm.put_parameter(Name=name, Value="new", Overwrite=True)
+    param = ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]
+    assert param["Type"] == "SecureString"
+    assert param["Version"] == 2
+    assert param["Value"] == "new"
+    ssm.delete_parameter(Name=name)
+
+
+@pytest.mark.parametrize(
+    "template,code,message",
+    [
+        ("/ssm/{id}", "ValidationException", _SSM_PATH_MSG),
+        ("/SSM/{id}", "ValidationException", _SSM_PATH_MSG),
+        ("/ssm2-{id}/y", "ValidationException", _SSM_PATH_MSG),
+        ("/aws/{id}", "AccessDeniedException", None),
+        ("/AWS/{id}", "AccessDeniedException", None),
+        ("/awsfoo{id}/y", "AccessDeniedException", None),
+        ("ssmTest{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+        ("awsTest{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+        ("SSM-test{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+    ],
+)
+def test_ssm_put_parameter_rejects_reserved_prefixes(ssm, template, code, message):
+    name = template.format(id=_uuid_mod.uuid4().hex[:8])
+    if message is None:
+        message = f"No access to reserved parameter name: {name[1:]}."
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x", Type="String")
+    err = exc.value.response
+    assert err["Error"]["Code"] == code
+    assert err["Error"]["Message"] == message
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_ssm_put_parameter_allows_reserved_words_later_in_path(ssm):
+    name = f"/app-{_uuid_mod.uuid4().hex[:8]}/ssm/aws"
+    ssm.put_parameter(Name=name, Value="ok", Type="String")
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "ok"
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_put_parameter_name_error_wins_over_other_checks(ssm):
+    name = f"/aws/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x", Overwrite=True, Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+def test_ssm_put_parameter_rejects_tags_with_overwrite(ssm):
+    tags = [{"Key": "k", "Value": "v"}]
+    new_name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=new_name, Value="x", Type="String", Overwrite=True, Tags=tags)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == _TAGS_OVERWRITE_MSG
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=new_name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+    name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="old", Type="String", Tags=tags)
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="new", Type="String", Overwrite=True, Tags=[{"Key": "a", "Value": "b"}])
+    assert exc.value.response["Error"]["Message"] == _TAGS_OVERWRITE_MSG
+    param = ssm.get_parameter(Name=name)["Parameter"]
+    assert (param["Value"], param["Version"]) == ("old", 1)
+    assert ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"] == tags
+
+    ssm.put_parameter(Name=name, Value="new", Type="String", Overwrite=True, Tags=[])
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "new"
     ssm.delete_parameter(Name=name)
 
 
