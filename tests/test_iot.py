@@ -439,7 +439,7 @@ def test_iot_domain_configurations_are_region_scoped_persisted_and_reset():
         saved = iot_module.get_state()
         iot_module.reset()
         assert await _request("eu-west-1", "GET") == 404
-        iot_module._restore_state(saved)
+        iot_module.load_persisted_state(saved)
         assert await _request("eu-west-1", "GET") == 200
         assert await _request("eu-west-3", "GET") == 200
 
