@@ -7547,6 +7547,152 @@ def test_annotations_replicate(s3):
     assert [(a["AnnotationName"], a["ReplicationStatus"]) for a in listed] == [("a", "REPLICA")]
 
 
+def _s3_account(account_id):
+    """An S3 client whose requests run inside *account_id* (12-digit key)."""
+    import boto3 as _boto3
+    return _boto3.client(
+        "s3", endpoint_url=ENDPOINT, region_name="us-east-1",
+        aws_access_key_id=account_id, aws_secret_access_key="test",
+    )
+
+
+_SOURCE_ACCOUNT = "111111111111"
+_DEST_ACCOUNT = "999999999999"
+_REPL_ROLE = f"arn:aws:iam::{_SOURCE_ACCOUNT}:role/replication"
+
+
+def _dest_policy(dest_bucket, actions=("s3:ReplicateObject", "s3:ObjectOwnerOverrideToBucketOwner")):
+    """The destination-side grant AWS requires for cross-account replication."""
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowReplication",
+            "Effect": "Allow",
+            "Principal": {"AWS": _REPL_ROLE},
+            "Action": list(actions),
+            "Resource": f"arn:aws:s3:::{dest_bucket}/*",
+        }],
+    })
+
+
+def _cross_account_pair(slug, policy="default", dest_account=_DEST_ACCOUNT):
+    """Source bucket in _SOURCE_ACCOUNT, destination bucket in _DEST_ACCOUNT,
+    one Enabled rule naming Destination.Account. ``policy`` selects the
+    destination bucket policy: ``"default"`` grants the replication role,
+    ``None`` leaves the bucket without a policy, anything else is applied
+    verbatim."""
+    src_client, dst_client = _s3_account(_SOURCE_ACCOUNT), _s3_account(_DEST_ACCOUNT)
+    src, dst = f"qa-xrepl-src-{slug}", f"qa-xrepl-dst-{slug}"
+    dst_client.create_bucket(Bucket=dst)
+    dst_client.put_bucket_versioning(Bucket=dst, VersioningConfiguration={"Status": "Enabled"})
+    if policy == "default":
+        dst_client.put_bucket_policy(Bucket=dst, Policy=_dest_policy(dst))
+    elif policy is not None:
+        dst_client.put_bucket_policy(Bucket=dst, Policy=policy)
+    src_client.create_bucket(Bucket=src)
+    src_client.put_bucket_versioning(Bucket=src, VersioningConfiguration={"Status": "Enabled"})
+    src_client.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": _REPL_ROLE,
+            "Rules": [{
+                "ID": "r1", "Status": "Enabled", "Filter": {"Prefix": ""},
+                "DeleteMarkerReplication": {"Status": "Disabled"},
+                "Destination": {
+                    "Bucket": f"arn:aws:s3:::{dst}",
+                    "Account": dest_account,
+                    "AccessControlTranslation": {"Owner": "Destination"},
+                },
+            }],
+        },
+    )
+    return src_client, dst_client, src, dst
+
+
+def _purge_foreign(s3_client, bucket):
+    lv = s3_client.list_object_versions(Bucket=bucket)
+    for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+        s3_client.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3_client.delete_bucket(Bucket=bucket)
+
+
+def test_s3_replication_cross_account_writes_replica(s3):
+    """A rule naming a destination in another account lands the replica there
+    once the destination policy grants the replication role, matching AWS's
+    documented cross-account requirement."""
+    src_client, dst_client, src, dst = _cross_account_pair("ok")
+    try:
+        src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"payload",
+                              Tagging="team=core")
+        head = src_client.head_object(Bucket=src, Key="telemetry/k")
+        assert head["ReplicationStatus"] == "COMPLETED"
+        replica = dst_client.get_object(Bucket=dst, Key="telemetry/k")
+        assert replica["ReplicationStatus"] == "REPLICA"
+        assert replica["Body"].read() == b"payload"
+        tags = dst_client.get_object_tagging(Bucket=dst, Key="telemetry/k")["TagSet"]
+        assert tags == [{"Key": "team", "Value": "core"}]
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_cross_account_requires_destination_policy(s3):
+    """Without a destination bucket policy granting the replication role,
+    AWS cannot write the replica — the source reports FAILED."""
+    src_client, dst_client, src, dst = _cross_account_pair("nopol", policy=None)
+    try:
+        src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
+        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "FAILED"
+        with pytest.raises(ClientError):
+            dst_client.head_object(Bucket=dst, Key="telemetry/k")
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_cross_account_requires_owner_override_grant(s3):
+    """AccessControlTranslation needs s3:ObjectOwnerOverrideToBucketOwner in
+    the destination policy; without it replication fails."""
+    partial = _dest_policy("qa-xrepl-dst-own", actions=("s3:ReplicateObject",))
+    src_client, dst_client, src, dst = _cross_account_pair("own", policy=partial)
+    try:
+        src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
+        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "FAILED"
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_cross_account_unknown_destination_account(s3):
+    """A Destination.Account that owns no such bucket resolves to nothing —
+    the replica cannot be written and the source reports FAILED."""
+    src_client, dst_client, src, dst = _cross_account_pair(
+        "ghost", dest_account="555555555555")
+    try:
+        src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
+        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "FAILED"
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_config_round_trips_cross_account_fields(s3):
+    """GetBucketReplication answers the cross-account fields the PUT stored."""
+    src_client, dst_client, src, dst = _cross_account_pair("cfg")
+    try:
+        config = src_client.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]
+        rule = config["Rules"][0]
+        dest = rule["Destination"]
+        assert dest["Account"] == _DEST_ACCOUNT
+        assert dest["AccessControlTranslation"] == {"Owner": "Destination"}
+        assert dest["Bucket"] == f"arn:aws:s3:::{dst}"
+        assert rule["Filter"] == {"Prefix": ""}
+        assert rule["DeleteMarkerReplication"] == {"Status": "Disabled"}
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
 # ── Event notifications ────────────────────────────────────────────────
 
 
