@@ -114,6 +114,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.services.apigateway import (
     _b64url_decode,
@@ -2571,13 +2572,21 @@ async def _execute_in_scope(
 
     if int_type in ("AWS_PROXY", "AWS"):
         # AWS_PROXY hands the function a response envelope to interpret; the
-        # non-proxy `AWS` (custom / "lambda") integration returns the handler's
-        # output as the body verbatim. Same event in, different response
-        # contract out.
+        # non-proxy `AWS` integration dispatches on the target service in the
+        # URI: `sqs:path/...` targets reach the SQS data plane, everything else
+        # takes the Lambda path (custom/"lambda" integrations return the
+        # handler's output as the body verbatim).
         caller_identity = None
         if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
             caller_identity = _iam_caller_identity(headers, query_params)
-        invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
+        if int_type == "AWS_PROXY":
+            invoke = _invoke_lambda_proxy_v1
+        else:
+            spec = _parse_service_integration_uri(integration.get("uri", ""))
+            if spec and spec[1] == "sqs" and spec[2] == "path":
+                invoke = _invoke_sqs_v1
+            else:
+                invoke = _invoke_lambda_custom_v1
         return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
@@ -2888,6 +2897,294 @@ async def _invoke_lambda_custom_v1(
         resp_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     return _default_integration_response_status_v1(integration), resp_headers, resp_body
+
+
+def _parse_service_integration_uri(uri: str):
+    """Split an ``arn:aws:apigateway:{region}:{service}:{verb}/{rest}`` URI.
+
+    Returns ``(region, service, verb, rest)`` — e.g. for
+    ``arn:aws:apigateway:us-east-1:sqs:path/123456789012/my-queue`` it returns
+    ``("us-east-1", "sqs", "path", "123456789012/my-queue")``. Returns ``None``
+    for URIs that are not service-integration ARNs (plain Lambda references,
+    HTTP endpoints); those keep their existing dispatch.
+    """
+    if not isinstance(uri, str):
+        return None
+    parts = uri.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[2] != "apigateway":
+        return None
+    region, service, remainder = parts[3], parts[4], parts[5]
+    if "/" not in remainder:
+        return None
+    verb, rest = remainder.split("/", 1)
+    return region, service, verb, rest
+
+
+# ── Minimal request-template (VTL) subset ────────────────────────────────
+#
+# Non-proxy AWS service integrations shape the backend call through a
+# `requestTemplates` mapping template. Only the subset real SQS templates use
+# is modeled: `$input.body`, `$input.json('<json-path>')` / `$input.path(...)`,
+# `$input.params('name')` (merged header < querystring < path params, the
+# precedence AWS documents), and `$util.urlEncode(...)` — e.g.
+# `Action=SendMessage&MessageBody=$util.urlEncode($input.body)`.
+# Anything the subset does not cover renders as an empty string.
+
+def _vtl_json_path(body_str: str, path: str):
+    """Evaluate the small ``$input.json('<path>')`` subset: ``$``, ``$.a.b``,
+    numeric indices. Returns "" for unparseable bodies or missing nodes."""
+    try:
+        node = json.loads(body_str)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    path = path.strip()
+    if path in ("", "$", "'$'", '"$"'):
+        return node
+    for seg in path.lstrip("$").lstrip(".").split("."):
+        if not seg:
+            continue
+        if isinstance(node, dict):
+            node = node.get(seg)
+        elif isinstance(node, list) and seg.isdigit() and int(seg) < len(node):
+            node = node[int(seg)]
+        else:
+            return ""
+        if node is None:
+            return ""
+    return node
+
+
+def _vtl_eval(expr: str, body_str: str, params_map: dict):
+    """Evaluate one template reference; unrecognised references render ""."""
+    expr = expr.strip()
+    if expr.startswith("$util.urlEncode(") and expr.endswith(")"):
+        inner = _vtl_eval(expr[len("$util.urlEncode("):-1], body_str, params_map)
+        return urllib.parse.quote(str(inner), safe="")
+    if expr == "$input.body":
+        return body_str
+    m = re.fullmatch(r"\$input\.(?:json|path)\(\s*(['\"])(.*?)\1\s*\)",
+                     expr, re.DOTALL)
+    if m:
+        value = _vtl_json_path(body_str, m.group(2))
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        return "" if value is None else str(value)
+    m = re.fullmatch(r"\$input\.params\(\s*(['\"])(.*?)\1\s*\)",
+                     expr, re.DOTALL)
+    if m:
+        return str(params_map.get(m.group(2), ""))
+    if len(expr) >= 2 and expr[0] == expr[-1] and expr[0] in ("'", '"'):
+        return expr[1:-1]
+    return ""
+
+
+def _vtl_expr_end(template: str, start: int) -> int:
+    """Index just past the ``$...`` expression at ``start`` in ``template``.
+
+    Bare references end at the first non-identifier/dot character; parenthesised
+    calls end at the closing paren, skipping over quoted strings.
+    """
+    i = start + 1
+    depth = 0
+    while i < len(template):
+        ch = template[i]
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            while i < len(template) and template[i] != quote:
+                i += 1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return i
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif depth == 0 and not (ch.isalnum() or ch in "._"):
+            return i
+        i += 1
+    return i
+
+
+def _render_request_template_v1(template: str, body_str: str,
+                                params_map: dict) -> str:
+    """Render the VTL subset; bare text passes through unchanged."""
+    out = []
+    i = 0
+    while i < len(template):
+        if template[i] != "$" or not template[i + 1:].startswith(("input", "util")):
+            out.append(template[i])
+            i += 1
+            continue
+        end = _vtl_expr_end(template, i)
+        out.append(str(_vtl_eval(template[i:end], body_str, params_map)))
+        i = end
+    return "".join(out)
+
+
+def _select_service_integration_response(integration, backend_status: int,
+                                         backend_text: str):
+    """Pick the integration response for a non-proxy service call.
+
+    ``selectionPattern`` entries match on the backend HTTP status
+    (``fullmatch`` on the numeric code) or on the backend body (``search``);
+    the entry with no pattern is the default and takes whatever remains.
+    """
+    responses = integration.get("integrationResponses") or {}
+    for resp in responses.values():
+        pattern = (resp or {}).get("selectionPattern")
+        if not pattern:
+            continue
+        try:
+            if (re.fullmatch(pattern, str(backend_status))
+                    or re.search(pattern, backend_text)):
+                return resp
+        except re.error:
+            continue
+    for resp in responses.values():
+        if not (resp or {}).get("selectionPattern"):
+            return resp
+    return None
+
+
+def _service_integration_response(integration, backend_status: int,
+                                  backend_ct: str, backend_text: str,
+                                  accept: str):
+    """Map a backend service result through the integration responses."""
+    responses = integration.get("integrationResponses") or {}
+    if not responses:
+        # No integration responses configured: pass the backend reply through.
+        return backend_status, {"Content-Type": backend_ct}, backend_text.encode()
+    selected = _select_service_integration_response(
+        integration, backend_status, backend_text)
+    if selected is None:
+        return (500, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    try:
+        status = int(selected.get("statusCode") or backend_status)
+    except (TypeError, ValueError):
+        status = backend_status
+    resp_headers = {"Content-Type": "application/json"}
+    for dest, src in (selected.get("responseParameters") or {}).items():
+        if not dest.startswith("method.response.header."):
+            continue
+        header = dest[len("method.response.header."):]
+        if isinstance(src, str) and len(src) >= 2 and src[0] == src[-1] == "'":
+            resp_headers[header] = src[1:-1]
+        else:
+            resp_headers[header] = src
+    templates = selected.get("responseTemplates") or {}
+    template = templates.get(accept) or templates.get("application/json")
+    if template is None and templates:
+        template = next(iter(templates.values()))
+    if template is not None:
+        body_out = _render_request_template_v1(
+            template, backend_text,
+            {k: v for k, v in resp_headers.items()})
+        return status, resp_headers, body_out.encode()
+    return status, resp_headers, backend_text.encode()
+
+
+async def _invoke_sqs_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Dispatch a non-proxy ``AWS`` integration whose URI targets SQS.
+
+    ``arn:aws:apigateway:{region}:sqs:path/{account}/{queue}`` renders the
+    request template for the request's Content-Type (the raw body passes
+    through when none matches, per WHEN_NO_MATCH/WHEN_NO_TEMPLATES), parses the
+    result as a form-encoded SQS Query call, and runs it in the scope the URI
+    names — the queue's own account and region, like the integration's
+    ``credentials`` role would on AWS. Backend errors flow through the
+    integration responses like successes do; nothing is a 504 here because the
+    queue lookup itself is part of the modeled call.
+    """
+    from ministack.services import sqs as _sqs_svc
+
+    spec = _parse_service_integration_uri(integration.get("uri", ""))
+    region = (spec[0] if spec else "") or owner_region or get_region()
+    account, queue_name = None, None
+    if spec and spec[1] == "sqs" and spec[2] == "path":
+        tail = spec[3].strip("/").split("/")
+        if len(tail) == 2:
+            account, queue_name = tail
+        elif len(tail) == 1:
+            account, queue_name = (owner_account_id or get_account_id(),
+                                   tail[0])
+    if not queue_name:
+        # A malformed sqs:path URI means the integration has no reachable
+        # backend — same failure class as an unresolvable Lambda reference.
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+
+    body_str = body.decode("utf-8", errors="replace") if body else ""
+    params_map = {}
+    for k, v in (headers or {}).items():
+        if isinstance(v, str):
+            params_map[k] = v
+    for k, v in (query_params or {}).items():
+        params_map[k] = v[0] if isinstance(v, (list, tuple)) else v
+    params_map.update(path_params or {})
+
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    template = None
+    for key, value in (integration.get("requestTemplates") or {}).items():
+        if key.split(";", 1)[0].strip().lower() == content_type:
+            template = value
+            break
+    rendered = (_render_request_template_v1(template, body_str, params_map)
+                if template is not None else body_str)
+    form = dict(urllib.parse.parse_qsl(rendered, keep_blank_values=True))
+    action = form.get("Action", "")
+
+    accept = (_header_ci(headers, "accept") or "application/json")
+    accept = accept.split(",", 1)[0].split(";", 1)[0].strip().lower()
+
+    if not action:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            "MissingAction", "Missing Action parameter", 400)
+        backend_text = xbody.decode("utf-8", errors="replace")
+        return _service_integration_response(
+            integration, backend_status, "application/xml", backend_text,
+            accept)
+
+    qurl = (_sqs_svc._queue_name_to_url.get_scoped(account, region, queue_name)
+            or _sqs_svc._queue_url_for_account(account, queue_name))
+    data = _sqs_svc._normalise(action, form)
+    data["QueueUrl"] = qurl
+    try:
+        with request_scope(account, region):
+            result = await _sqs_svc._dispatch(action, data, qurl)
+        backend_status, _h, xbody = _sqs_svc._to_xml(action, result)
+        backend_ct = "application/xml"
+    except _sqs_svc._Err as e:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            e.code, e.message, e.status)
+        backend_ct = "application/xml"
+    except Exception:
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    return _service_integration_response(
+        integration, backend_status, backend_ct,
+        xbody.decode("utf-8", errors="replace"), accept)
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):

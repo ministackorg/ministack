@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **API Gateway v1 — `AWS` integrations targeting SQS** — non-proxy integrations whose URI names `sqs:path/{account}/{queue}` now reach the queue: the matching `requestTemplates` entry is rendered with the `$input.body`, `$input.json('<json-path>')`, `$input.params('<name>')` and `$util.urlEncode(...)` subset (a request with no matching template passes its body through as the form-encoded Query call), the rendered `Action` dispatch runs against the queue's own account and region, and the backend reply or error flows through `integrationResponses` — `selectionPattern` matched against the backend status code or error body, else the default response — including `responseTemplates` and `method.response.header.*` parameters. Other `AWS` service URIs still take the Lambda path. Closes #2045. Contributed by @pingedbrain.
+
 ### Fixed
 
 - **IoT — a CONTINUOUS job runs again for a thing that rejoins its target group** — executions were kept one per thing and job, so a thing that finished the job, left the group and was added back never got another execution. Joining a target group now queues the next execution number when the thing's newest execution is finished, leaving the group moves a QUEUED execution to `REMOVED`, both publish `jobs/notify(-next)`, the `notify-next` execution leaves out `thingName` and an empty `statusDetails`, and `ListJobExecutionsForThing`, `DescribeJobExecution` with `executionNumber` and `jobProcessDetails` include the earlier executions, as AWS does. Contributed by @iot-rocket.
