@@ -542,7 +542,7 @@ def test_iot_jobs_create_from_a_job_template(iot_client):
 
 def test_iot_job_templates_are_scoped_and_persisted():
     """A template is visible to its own account and region only, travels
-    through get_state / _restore_state, and reset() drops it."""
+    through get_state / load_persisted_state, and reset() drops it."""
     from ministack.services import iot as iot_module
 
     template_id = _unique("tmpl")
@@ -568,7 +568,7 @@ def test_iot_job_templates_are_scoped_and_persisted():
     iot_module.reset()
     assert template_id not in iot_module._job_templates
     try:
-        iot_module._restore_state(state)
+        iot_module.load_persisted_state(state)
         assert iot_module._job_templates[template_id] == record
     finally:
         iot_module.reset()
