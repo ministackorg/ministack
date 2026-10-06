@@ -1161,6 +1161,132 @@ def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
         iot_client.describe_provisioning_template(templateName=name)
 
 
+def _cfn_job_template(template_id, **overrides):
+    props = {
+        "JobTemplateId": template_id,
+        "Description": "from cloudformation",
+        "Document": json.dumps({"operation": "cfn"}),
+        "TimeoutConfig": {"InProgressTimeoutInMinutes": 20},
+        "JobExecutionsRetryConfig": {
+            "RetryCriteriaList": [{"FailureType": "FAILED", "NumberOfRetries": 1}]},
+        "JobExecutionsRolloutConfig": {
+            "MaximumPerMinute": 40,
+            "ExponentialRolloutRate": {
+                "BaseRatePerMinute": 4, "IncrementFactor": 1.5,
+                "RateIncreaseCriteria": {"NumberOfSucceededThings": 3}}},
+        "AbortConfig": {"CriteriaList": [{
+            "Action": "CANCEL", "FailureType": "ALL",
+            "MinNumberOfExecutedThings": 2, "ThresholdPercentage": 25}]},
+        "PresignedUrlConfig": {
+            "RoleArn": "arn:aws:iam::000000000000:role/presign", "ExpiresInSec": 900},
+        "MaintenanceWindows": [
+            {"StartTime": "cron(0 3 ? * SUN *)", "DurationInMinutes": 90}],
+        "Tags": [{"Key": "k", "Value": "v"}],
+        **overrides,
+    }
+    return json.dumps({
+        "Resources": {"T": {"Type": "AWS::IoT::JobTemplate", "Properties": props}},
+        "Outputs": {"Ref": {"Value": {"Ref": "T"}},
+                    "Arn": {"Value": {"Fn::GetAtt": ["T", "Arn"]}}},
+    })
+
+
+def test_cfn_iot_job_template(cfn, iot_client):
+    """AWS::IoT::JobTemplate creates the template through the IoT API with the
+    two renamed members mapped (ExponentialRolloutRate, RetryCriteriaList), and
+    every property is create-only: an update under the same JobTemplateId
+    fails and rolls back, a new JobTemplateId replaces the template (measured
+    on AWS, eu-central-1, 2026-10-05)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, old_id, new_id = f"cfn-iot-jobtmpl-{uid}", f"cfn-jt-{uid}", f"cfn-jt2-{uid}"
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(old_id))
+        result = _wait_stack(cfn, stack)
+        assert result["StackStatus"] == "CREATE_COMPLETE"
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in result["Outputs"]}
+        assert outputs["Ref"] == old_id
+        assert outputs["Arn"] == f"arn:aws:iot:us-east-1:000000000000:jobtemplate/{old_id}"
+
+        desc = iot_client.describe_job_template(jobTemplateId=old_id)
+        assert desc["description"] == "from cloudformation"
+        assert desc["document"] == json.dumps({"operation": "cfn"})
+        assert desc["timeoutConfig"] == {"inProgressTimeoutInMinutes": 20}
+        assert desc["jobExecutionsRetryConfig"] == {
+            "criteriaList": [{"failureType": "FAILED", "numberOfRetries": 1}]}
+        assert desc["jobExecutionsRolloutConfig"] == {
+            "maximumPerMinute": 40,
+            "exponentialRate": {"baseRatePerMinute": 4, "incrementFactor": 1.5,
+                                "rateIncreaseCriteria": {"numberOfSucceededThings": 3}}}
+        assert desc["abortConfig"] == {"criteriaList": [{
+            "action": "CANCEL", "failureType": "ALL",
+            "minNumberOfExecutedThings": 2, "thresholdPercentage": 25.0}]}
+        assert desc["presignedUrlConfig"] == {
+            "roleArn": "arn:aws:iam::000000000000:role/presign", "expiresInSec": 900}
+        assert desc["maintenanceWindows"] == [
+            {"startTime": "cron(0 3 ? * SUN *)", "durationInMinutes": 90}]
+
+        for change in ({"Description": "changed"}, {"Tags": [{"Key": "k", "Value": "w"}]}):
+            cfn.update_stack(StackName=stack,
+                             TemplateBody=_cfn_job_template(old_id, **change))
+            assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in
+                       cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                       if e["ResourceStatus"] == "UPDATE_FAILED"]
+            assert (
+                "CloudFormation cannot update a stack when a custom-named resource "
+                f"requires replacing. Rename {old_id} and update the stack again."
+            ) in reasons, change
+        assert iot_client.describe_job_template(
+            jobTemplateId=old_id)["description"] == "from cloudformation"
+
+        cfn.update_stack(StackName=stack, TemplateBody=_cfn_job_template(
+            new_id, Description="renamed"))
+        result = _wait_stack(cfn, stack)
+        assert result["StackStatus"] == "UPDATE_COMPLETE"
+        assert {o["OutputKey"]: o["OutputValue"] for o in result["Outputs"]}["Ref"] == new_id
+        assert iot_client.describe_job_template(
+            jobTemplateId=new_id)["description"] == "renamed"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_job_template(jobTemplateId=old_id)
+
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack)
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_job_template(jobTemplateId=new_id)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        for template_id in (old_id, new_id):
+            try:
+                iot_client.delete_job_template(jobTemplateId=template_id)
+            except ClientError:
+                pass
+
+
+def test_cfn_iot_job_template_existing_id_fails_the_stack(cfn, iot_client):
+    """A JobTemplateId that already exists fails the create with AWS's
+    name-conflict text and rolls the stack back, leaving the existing
+    template alone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, template_id = f"cfn-iot-jobtmpl-dup-{uid}", f"cfn-jt-dup-{uid}"
+    iot_client.create_job_template(jobTemplateId=template_id, description="mine",
+                                   document="{}")
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(template_id))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert (
+            f"Resource of type 'AWS::IoT::JobTemplate' with identifier '{template_id}' "
+            "already exists."
+        ) in reasons
+        assert iot_client.describe_job_template(
+            jobTemplateId=template_id)["description"] == "mine"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        iot_client.delete_job_template(jobTemplateId=template_id)
+
+
 def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     """AWS::IoT::CACertificate provisions onto the real CA registry instead of
     rolling the stack back: create registers the PEM (readable back through
