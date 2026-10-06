@@ -5278,7 +5278,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         else:
             error_msg = result.get("error", "Unknown error")
             error_type = "Runtime.HandlerError"
-            if "timed out" in error_msg.lower():
+            if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg):
                 error_type = "Sandbox.Timedout"
             return {
                 "body": {
@@ -5370,7 +5370,7 @@ def _execute_function_provided_warm(func: dict, event: dict,
         if isinstance(payload, dict):
             return {"body": payload, "error": True, "log": result.get("log", "")}
         error_msg = result.get("error", "Unknown error")
-        error_type = ("Sandbox.Timedout" if "timed out" in error_msg.lower()
+        error_type = ("Sandbox.Timedout" if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg)
                       else "Runtime.HandlerError")
         return {
             "body": {"errorMessage": error_msg, "errorType": error_type},

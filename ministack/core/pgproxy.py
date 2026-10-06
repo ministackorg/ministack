@@ -2317,7 +2317,8 @@ async def _ext_describe(conn, payload, b_writer, c_writer):
         return
     out = b""
     if target == b"S":
-        nparams = entry["synth"][1].get("nparams", 0)
+        kind, result = entry["synth"]
+        nparams = result.get("nparams", 0) if kind == "rows" else 0
         out += _frame(  # ParameterDescription: every placeholder is text
             b"t", struct.pack("!H", nparams) + struct.pack("!I", 25) * nparams
         )

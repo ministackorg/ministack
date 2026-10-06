@@ -200,6 +200,7 @@ _NON_S3_VHOST_NAMES = frozenset(
         "codebuild",
         "transfer",
         "cur",
+        "budgets",
         "cloudfront-kvs",
         "appsync-api",
         "appsync-realtime-api",
@@ -446,6 +447,7 @@ SERVICE_REGISTRY = {
     "wafv2": {"module": "waf"},
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
+    "budgets": {"module": "budgets"},
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
@@ -2123,7 +2125,8 @@ def _enforce_data_plane(
             return access_denied_response(
                 service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
             )
-        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers)
+        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                      explicit_deny=denied.decision == "Deny")
     return None
 
 

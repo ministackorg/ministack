@@ -287,7 +287,8 @@ def test_airflow_runtime_identity_and_background_scope_include_region(
     account_id = "111111111111"
     region = "us-west-2"
     env_name = "regional-runtime"
-    expected_name = f"ministack-mwaa-{region}-{env_name}"
+    expected_name = f"ministack-mwaa-{account_id}-{region}-{env_name}"
+    regional_name = f"ministack-mwaa-{region}-{env_name}"
     legacy_name = f"ministack-mwaa-{env_name}"
     env = {
         "AirflowVersion": "3.0.6",
@@ -318,7 +319,7 @@ def test_airflow_runtime_identity_and_background_scope_include_region(
         mod._start_airflow_container(account_id, region, env_name, env)
 
         assert dag_sync_complete.wait(timeout=2)
-        assert docker_client.containers.get_calls == [expected_name, legacy_name]
+        assert docker_client.containers.get_calls == [expected_name, regional_name, legacy_name]
         # v=True reclaims the container's anonymous volume. Verified against
         # docker: named volumes (MWAA's dags/db persistence) are untouched
         # by remove(v=True), so this cannot lose persisted state.
@@ -330,6 +331,7 @@ def test_airflow_runtime_identity_and_background_scope_include_region(
             "ministack": "mwaa",
             "region": region,
             "env_name": env_name,
+            "account_id": account_id,
         }.items() <= docker_client.containers.run_kwargs["labels"].items()
         expected_volume_prefix = legacy_name if legacy_volumes else expected_name
         assert set(docker_client.containers.run_kwargs["volumes"]) == {

@@ -630,7 +630,8 @@ def _batch_get_secret_value(data, access_key=None):
         denied = authorize("secretsmanager:ListSecrets", "*")
         if denied:
             return access_denied_response("secretsmanager", "secretsmanager:ListSecrets",
-                                          getattr(denied, "principal_arn", ""), new_uuid())
+                                          getattr(denied, "principal_arn", ""), new_uuid(),
+                                          explicit_deny=getattr(denied, "decision", "") == "Deny")
         names = sorted(n for n, s in _secrets.items() if not s.get("DeletedDate"))
         targets = [_secrets[n]["ARN"] for n in _filter_secret_names(names, data.get("Filters", []))]
 
@@ -647,8 +648,10 @@ def _batch_get_secret_value(data, access_key=None):
                 "ErrorCode": "AccessDeniedException",
                 "Message": (
                     f"User: {principal} is not authorized to perform: "
-                    f"secretsmanager:GetSecretValue on resource: {sid} because no "
-                    "identity-based policy allows the secretsmanager:GetSecretValue action"
+                    f"secretsmanager:GetSecretValue on resource: {sid} "
+                    + ("with an explicit deny in an identity-based policy"
+                       if getattr(denied, "decision", "") == "Deny" else
+                       "because no identity-based policy allows the secretsmanager:GetSecretValue action")
                 ),
             })
             continue

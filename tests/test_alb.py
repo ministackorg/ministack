@@ -531,6 +531,23 @@ def test_elbv2_dataplane_lambda_target_emits_metrics(elbv2, lam, cw):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, fn_name)
 
 
+def test_elbv2_dataplane_lambda_multi_value_set_cookie(elbv2, lam):
+    import urllib.request as _req
+
+    fn_code = (
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': 'ok',\n"
+        "            'multiValueHeaders': {'Set-Cookie': ['a=1', 'b=2'], 'Content-Type': ['text/plain']}}\n"
+    )
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, "dp-alb-mvh", "dp-alb-mvh-fn", fn_code)
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/dp-alb-mvh/")
+        assert resp.headers.get_all("Set-Cookie") == ["a=1", "b=2"]
+        assert resp.headers.get("Content-Type") == "text/plain"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-mvh-fn")
+
+
 def test_elbv2_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""
     import urllib.request as _req

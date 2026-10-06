@@ -2269,7 +2269,7 @@ _SECRET_HASH_PARAMETERS = {
 def _validate_client_secret_hash(action: str, data: dict):
     """Authenticate confidential app clients before user changes or triggers.
 
-    This is Cognito's app-client contract, independent of IAM's AUTH flag.
+    Enforced under AUTH=true.
     Refresh authentication uses the token owner's username (or sub for a
     UsernameAttributes pool), rather than the alias used at initial sign-in.
     """
@@ -2340,7 +2340,8 @@ def _validate_client_secret_hash(action: str, data: dict):
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
-    error = _validate_client_secret_hash(action, data)
+    from ministack.app import AUTH
+    error = _validate_client_secret_hash(action, data) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -2859,7 +2860,7 @@ def _get_ui_customization(data):
     if err:
         return err
     ui = pool.get("_ui_customizations", {})
-    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {"UserPoolId": pool["Id"], "ClientId": cid}})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {}})
 
 
 # ---------------------------------------------------------------------------
@@ -3066,6 +3067,17 @@ def _expand_template(template: str, username: str, code: str) -> str:
     return template.replace("{username}", username or "").replace("{####}", code or "")
 
 
+def _template_username(pool: dict, username: str, attr_dict: dict) -> str:
+    """Value substituted for `{username}`. In a UsernameAttributes pool the
+    stored Username is an internal UUID, but the user-facing username is the
+    email / phone number they registered with."""
+    username_attrs = pool.get("UsernameAttributes") or []
+    for attr in ("email", "phone_number"):
+        if attr in username_attrs and (attr_dict or {}).get(attr):
+            return attr_dict[attr]
+    return username
+
+
 def _resolve_invite_template(pool: dict) -> tuple:
     """Return (subject, message_text, message_html) for invitation mail."""
     tpl = (pool.get("AdminCreateUserConfig") or {}).get("InviteMessageTemplate") or {}
@@ -3154,13 +3166,100 @@ def _wants_email_delivery(data: dict) -> bool:
     return "EMAIL" in [str(m).upper() for m in mediums]
 
 
-def _send_invitation_email(pool, username, temp_password, attr_dict):
+class _CustomMessageRejected(Exception):
+    """Raised when a CustomMessage Lambda trigger fails or reports an error."""
+
+
+class _CustomMessageInvalid(Exception):
+    """Raised when a CustomMessage Lambda returns a message AWS would refuse."""
+
+
+def _custom_message_error(exc):
+    code = ("InvalidLambdaResponseException" if isinstance(exc, _CustomMessageInvalid)
+            else "UserLambdaValidationException")
+    return error_response_json(code, str(exc), 400)
+
+
+def _apply_custom_message_trigger(pool: dict, trigger_source: str, username: str,
+                                  user_attrs: dict, client_metadata=None,
+                                  username_parameter: str = "{username}") -> dict:
+    """Invoke the pool's CustomMessage Lambda and return its ``response`` block.
+
+    Fail-closed like AWS, where a CustomMessage Lambda that throws fails the
+    calling API with ``UserLambdaValidationException``. Returns ``{}`` when the
+    pool has no ``LambdaConfig.CustomMessage``.
+    """
+    arn = (pool.get("LambdaConfig") or {}).get("CustomMessage")
+    if not arn:
+        return {}
+    pool_id = pool.get("Id", "")
+    event = {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": "CLIENT_ID_NOT_APPLICABLE",
+        },
+        "request": {
+            "userAttributes": {k: v for k, v in (user_attrs or {}).items()
+                               if isinstance(v, (str, int, float, bool))},
+            "codeParameter": "{####}",
+            "usernameParameter": username_parameter,
+            "clientMetadata": dict(client_metadata or {}),
+        },
+        "response": {"smsMessage": None, "emailMessage": None, "emailSubject": None},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"CustomMessage Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("CustomMessage Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _CustomMessageRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        raise _CustomMessageRejected(
+            str(result.get("body") or "CustomMessage Lambda rejected the request."))
+    payload = result.get("body") if isinstance(result, dict) else result
+    return _extract_trigger_response(payload) or {}
+
+
+def _render_invitation_message(pool, username, temp_password, attr_dict,
+                               client_metadata=None) -> tuple:
+    """Return the (subject, body) of an invitation email.
+
+    A CustomMessage Lambda's ``emailSubject`` / ``emailMessage`` replace the
+    pool's InviteMessageTemplate; either one left out falls back to the template.
+    Raises ``_CustomMessageRejected`` when the Lambda fails, and
+    ``_CustomMessageInvalid`` when its ``emailMessage`` lacks the ``{username}``
+    or ``{####}`` placeholder that AWS requires for AdminCreateUser messages.
+    """
+    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
+    custom = _apply_custom_message_trigger(
+        pool, "CustomMessage_AdminCreateUser", username, attr_dict, client_metadata,
+    )
+    custom_body = custom.get("emailMessage")
+    if custom_body and not ("{####}" in custom_body and "{username}" in custom_body):
+        raise _CustomMessageInvalid(
+            "CustomMessage emailMessage must contain both {username} and {####}.")
+    subject_tpl = custom.get("emailSubject") or subject_tpl
+    body_tpl = custom_body or body_tpl
+    display = _template_username(pool, username, attr_dict)
+    return (_expand_template(subject_tpl, display, temp_password),
+            _expand_template(body_tpl, display, temp_password))
+
+
+def _deliver_invitation_email(pool, username, attr_dict, subject, body):
     email = (attr_dict or {}).get("email")
     if not email:
         return None
-    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
-    subject = _expand_template(subject_tpl, username, temp_password)
-    body = _expand_template(body_tpl, username, temp_password)
     return _deliver_cognito_email(
         pool, email, subject, body,
         type_name="CognitoInvitationMessage",
@@ -3178,8 +3277,9 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
         "DefaultEmailOption"
     ) == "CONFIRM_WITH_LINK"
     subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
-    subject = _expand_template(subject_tpl, username, code)
-    body = _expand_template(body_tpl, username, code)
+    display = _template_username(pool, username, attr_dict)
+    subject = _expand_template(subject_tpl, display, code)
+    body = _expand_template(body_tpl, display, code)
     return _deliver_cognito_email(
         pool, email, subject, body,
         type_name="CognitoVerificationMessage",
@@ -3187,13 +3287,17 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
     )
 
 
-def _send_email_otp(pool, username, email, code):
+def _send_email_otp(pool, username, attr_dict, code):
     """Send the EMAIL_OTP first-factor sign-in code. AWS has no template
     configuration API for this message, so it always uses the built-in text."""
     return _deliver_cognito_email(
-        pool, email,
+        pool, attr_dict["email"],
         _DEFAULT_EMAIL_OTP_SUBJECT,
-        _expand_template(_DEFAULT_EMAIL_OTP_MESSAGE, username, code),
+        _expand_template(
+            _DEFAULT_EMAIL_OTP_MESSAGE,
+            _template_username(pool, username, attr_dict),
+            code,
+        ),
         type_name="CognitoEmailOtpMessage",
         extra={"Username": username},
     )
@@ -3241,12 +3345,17 @@ def _admin_create_user(data):
             return error_response_json(
                 "UserNotFoundException", "User does not exist.", 400,
             )
-        existing["UserLastModifiedDate"] = _now_epoch()
         attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
-        if _wants_email_delivery(data):
-            _send_invitation_email(
-                pool, existing["Username"], existing.get("_password", ""), attr_dict,
-            )
+        if _wants_email_delivery(data) and attr_dict.get("email"):
+            try:
+                subject, body = _render_invitation_message(
+                    pool, existing["Username"], existing.get("_password", ""),
+                    attr_dict, data.get("ClientMetadata"),
+                )
+            except (_CustomMessageRejected, _CustomMessageInvalid) as e:
+                return _custom_message_error(e)
+            _deliver_invitation_email(pool, existing["Username"], attr_dict, subject, body)
+        existing["UserLastModifiedDate"] = _now_epoch()
         return json_response({"User": _user_out(existing)})
 
     if existing:
@@ -3272,6 +3381,17 @@ def _admin_create_user(data):
         real_username = username
     attrs = _dict_to_attr_list(attr_dict)
 
+    # Rendered before the user is persisted: a failing CustomMessage Lambda
+    # fails the call without leaving the user behind, as on AWS.
+    invitation = None
+    if message_action != "SUPPRESS" and _wants_email_delivery(data) and attr_dict.get("email"):
+        try:
+            invitation = _render_invitation_message(
+                pool, real_username, temp_password, attr_dict, data.get("ClientMetadata"),
+            )
+        except (_CustomMessageRejected, _CustomMessageInvalid) as e:
+            return _custom_message_error(e)
+
     user = {
         "Username": real_username,
         "Attributes": attrs,
@@ -3288,8 +3408,8 @@ def _admin_create_user(data):
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
     logger.info("Cognito: AdminCreateUser %s in pool %s", real_username, pid)
 
-    if message_action != "SUPPRESS" and _wants_email_delivery(data):
-        _send_invitation_email(pool, real_username, temp_password, attr_dict)
+    if invitation:
+        _deliver_invitation_email(pool, real_username, attr_dict, *invitation)
 
     return json_response({"User": _user_out(user)})
 
@@ -6296,10 +6416,10 @@ def _begin_user_auth_challenge(pool, ua_token, session, challenge):
     session["challenge"] = challenge
     if challenge == "EMAIL_OTP":
         user, _err = _resolve_user(pool, session["username"])
-        email = _attr_list_to_dict(user.get("Attributes", [])).get("email") if user else ""
-        if user and email:
+        attr_dict = _attr_list_to_dict(user.get("Attributes", [])) if user else {}
+        if user and attr_dict.get("email"):
             session["otp_code"] = _EMAIL_OTP_CODE
-            _send_email_otp(pool, session["username"], email, _EMAIL_OTP_CODE)
+            _send_email_otp(pool, session["username"], attr_dict, _EMAIL_OTP_CODE)
         return _email_otp_page_html(ua_token)
     return _password_page_html(ua_token, session["username"])
 
@@ -6453,6 +6573,37 @@ def _handle_new_password_submit(np_token, form):
 
 # -- /oauth2/token (POST) ---------------------------------------------------
 
+def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
+    """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
+    ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
+    them at /oauth2/token. Validate them with the REFRESH_TOKEN_AUTH core, and the
+    client as the authorization_code branch does."""
+    try:
+        claims = _decode_id_token_unverified(refresh_val)
+    except ValueError:
+        claims = None
+    if not isinstance(claims, dict) or claims.get("token_use") != "refresh":
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    pid = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    pool = _get_pool_unscoped(pid)
+    if not pool:
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    client_id = cid or str(claims.get("client_id", ""))
+    _, _, client = _find_pool_by_client_id(client_id)
+    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
+        return _oauth2_error("invalid_client", "Invalid client credentials.")
+    result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
+    if err:
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    resp = {
+        "access_token": result["AccessToken"],
+        "id_token": result["IdToken"],
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
+
+
 def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
     """/oauth2/token endpoint — supports authorization_code, refresh_token, client_credentials."""
     # Parse form-encoded body
@@ -6586,7 +6737,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         refresh_val = form.get("refresh_token", "")
         entry = _refresh_tokens.get(refresh_val)
         if not entry:
-            return _oauth2_error("invalid_grant", "Invalid refresh token.")
+            return _oauth2_refresh_api_issued_token(refresh_val, cid, csec)
 
         pool_id = entry["pool_id"]
         pool = _get_pool_unscoped(pool_id)

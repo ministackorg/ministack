@@ -2190,7 +2190,36 @@ def _sleep_until(iso_ts):
 # Parallel state
 # ---------------------------------------------------------------------------
 
+def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
+    """Run a Parallel or Map attempt under the state's Retry and Catch fields."""
+    retry_counts: dict = {}
+    while True:
+        try:
+            return attempt()
+        except _ExecutionError as err:
+            retrier, retrier_idx = _find_matching_retrier(
+                state_def.get("Retry", []), err.error, retry_counts)
+            if retrier is not None:
+                count = retry_counts.get(retrier_idx, 0)
+                interval = retrier.get("IntervalSeconds", 1)
+                _scaled_sleep(min(interval * (retrier.get("BackoffRate", 2.0) ** count), 60))
+                retry_counts[retrier_idx] = count + 1
+                continue
+            catcher = _find_matching_catcher(state_def.get("Catch", []), err.error)
+            if catcher is None:
+                raise
+            error_output = {"Error": err.error, "Cause": err.cause}
+            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            return output, catcher["Next"]
+
+
 def _execute_parallel(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_parallel_branches(state_def, raw_input, execution, ctx))
+
+
+def _run_parallel_branches(state_def, raw_input, execution, ctx):
     effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
@@ -2241,6 +2270,12 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # ---------------------------------------------------------------------------
 
 def _execute_map(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_map_items(state_def, raw_input, execution, ctx))
+
+
+def _run_map_items(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input, ctx)

@@ -23,10 +23,9 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
+from conftest import ENDPOINT, GATEWAY_PORT
 
 from ministack.services import opensearchserverless as aoss_module
-
-from conftest import ENDPOINT, GATEWAY_PORT
 
 REGION = "us-east-1"
 

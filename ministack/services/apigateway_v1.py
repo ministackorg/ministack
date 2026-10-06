@@ -4681,7 +4681,12 @@ def _create_api_key(data):
 
 
 def _get_api_keys(query_params):
-    return _v1_paginated_response(list(_api_keys.values()), query_params)
+    keys = list(_api_keys.values())
+    name_query = _qp(query_params, "name")
+    if name_query:
+        # AWS returns the keys whose names start with nameQuery.
+        keys = [key for key in keys if key["name"].startswith(name_query)]
+    return _v1_paginated_response(keys, query_params)
 
 
 def _get_api_key(key_id):

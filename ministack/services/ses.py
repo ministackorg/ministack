@@ -36,6 +36,7 @@ from email.policy import default as default_policy
 from email.utils import parseaddr
 from urllib.parse import parse_qs
 
+from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -846,14 +847,21 @@ def _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
     return msg.as_string()
 
 
+_SMTP_TIMEOUT_SECONDS = 10
+
+
 def _smtp_relay(source, to_addrs, message_str):
-    """Relay email via external SMTP if SMTP_HOST is set. Best-effort."""
+    """Relay email via external SMTP if SMTP_HOST is set. Best-effort, off the event loop."""
     endpoint = _parse_smtp_host()
     if not endpoint:
         return
-    host, port = endpoint
+    spawn_background(_smtp_send, source, to_addrs, message_str, *endpoint,
+                     thread_name="ministack-ses-smtp")
+
+
+def _smtp_send(source, to_addrs, message_str, host, port):
     try:
-        with smtplib.SMTP(host, port) as conn:
+        with smtplib.SMTP(host, port, timeout=_SMTP_TIMEOUT_SECONDS) as conn:
             conn.sendmail(source, to_addrs, message_str)
         logger.info('SMTP relay: %s -> %s via %s:%d', source, to_addrs, host, port)
     except Exception:

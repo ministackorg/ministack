@@ -2239,6 +2239,19 @@ class TestExtendedProtocol:
             # ... while FOR UPDATE reaches the backend whatever the predicate.
             assert c.extended("SELECT * FROM xp_lock WHERE v > 1 FOR UPDATE").ok
 
+    def test_describe_statement_on_create_index_async(self, dsql_proxy):
+        """Parse + Describe('S'), as asyncpg prepares: no parameters, a job_id column."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_desc (id int, name text)")
+            c.sock.sendall(
+                c._frame(b"P", b"\0CREATE INDEX ASYNC xp_desc_i ON xp_desc (name)\0" + struct.pack("!H", 0))
+                + c._frame(b"D", b"S\0") + c._frame(b"S", b"")
+            )
+            frames = c._until_ready()
+            assert [t for t, _ in frames] == [b"1", b"t", b"T", b"Z"]
+            assert dict(frames)[b"t"] == struct.pack("!H", 0)
+            assert c.simple("SELECT 1").rows == [("1",)]
+
     def test_create_index_async_returns_a_job_over_parse(self, dsql_proxy):
         """DSQL-only syntax has to be rewritten on this path too, or the
         backend answers with a bare syntax error."""

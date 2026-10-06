@@ -10970,6 +10970,23 @@ def test_lambda_docker_timeout_update_changes_rie_deadline(lam, old_timeout, new
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
 @pytest.mark.data_plane
+def test_lambda_handler_error_mentioning_timed_out_is_not_a_timeout(lam):
+    fname = f"lam-read-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    code = "def handler(event, context):\n    raise Exception('Read timed out. (read timeout=5)')\n"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=10,
+    )
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        payload = json.loads(resp["Payload"].read())
+        assert resp.get("FunctionError") == "Unhandled"
+        assert payload["errorMessage"] == "Read timed out. (read timeout=5)"
+        assert payload["errorType"] != "Sandbox.Timedout"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 

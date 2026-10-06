@@ -2309,6 +2309,17 @@ def test_apigwv1_update_api_key(apigw_v1):
     assert isinstance(resp["lastUpdatedDate"], datetime.datetime)
     apigw_v1.delete_api_key(apiKey=key_id)
 
+def test_apigwv1_get_api_keys_filters_by_name_query(apigw_v1):
+    """GetApiKeys with nameQuery returns only the keys whose names start with it."""
+    key_ids = [
+        apigw_v1.create_api_key(name=name)["id"]
+        for name in ("v1-namequery-other", "v1-namequery-target", "v1-namequery-target-2")
+    ]
+    resp = apigw_v1.get_api_keys(nameQuery="v1-namequery-target")
+    assert sorted(item["name"] for item in resp["items"]) == ["v1-namequery-target", "v1-namequery-target-2"]
+    for key_id in key_ids:
+        apigw_v1.delete_api_key(apiKey=key_id)
+
 def test_apigwv1_update_usage_plan(apigw_v1):
     """UpdateUsagePlan updates name via patchOperations."""
     plan_id = apigw_v1.create_usage_plan(name="v1-plan-update-before")["id"]

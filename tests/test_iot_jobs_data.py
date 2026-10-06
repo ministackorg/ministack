@@ -229,6 +229,352 @@ def test_iot_jobs_create_duplicate_and_unknown_target_rejected(iot_client):
 
 
 # ---------------------------------------------------------------------------
+# Job templates — shapes and messages measured on AWS (eu-central-1,
+# 2026-10-05)
+# ---------------------------------------------------------------------------
+
+_TEMPLATE_ROLE = "arn:aws:iam::000000000000:role/presign"
+_TEMPLATE_CONFIG = {
+    "presignedUrlConfig": {"roleArn": _TEMPLATE_ROLE, "expiresInSec": 300},
+    "jobExecutionsRolloutConfig": {
+        "maximumPerMinute": 50,
+        "exponentialRate": {
+            "baseRatePerMinute": 5, "incrementFactor": 2,
+            "rateIncreaseCriteria": {"numberOfNotifiedThings": 10},
+        },
+    },
+    "abortConfig": {"criteriaList": [{
+        "failureType": "FAILED", "action": "CANCEL",
+        "thresholdPercentage": 50, "minNumberOfExecutedThings": 5,
+    }]},
+    "timeoutConfig": {"inProgressTimeoutInMinutes": 30},
+    "jobExecutionsRetryConfig": {
+        "criteriaList": [{"failureType": "FAILED", "numberOfRetries": 2}]
+    },
+}
+
+
+def _delete_templates(iot_client, *template_ids):
+    for template_id in template_ids:
+        try:
+            iot_client.delete_job_template(jobTemplateId=template_id)
+        except ClientError:
+            pass
+
+
+def _error(ei):
+    err = ei.value.response
+    return (
+        err["ResponseMetadata"]["HTTPStatusCode"],
+        err["Error"]["Code"],
+        err["Error"]["Message"],
+    )
+
+
+def _raw_bytes(method, path):
+    """Raw HTTP against the iot control plane; returns (status, body bytes)."""
+    req = urllib.request.Request(
+        f"{ENDPOINT}{path}", method=method, headers={"Authorization": _IOT_AUTH}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read()
+
+
+def test_iot_job_template_create_describe_list_delete(iot_client):
+    full, minimal = _unique("tmpl-full"), _unique("tmpl-min")
+    try:
+        created = iot_client.create_job_template(
+            jobTemplateId=full, description="full", document=_DOCUMENT,
+            tags=[{"Key": "k", "Value": "v"}], **_TEMPLATE_CONFIG,
+        )
+        assert created["jobTemplateId"] == full
+        assert created["jobTemplateArn"] == (
+            f"arn:aws:iot:us-east-1:000000000000:jobtemplate/{full}"
+        )
+        desc = iot_client.describe_job_template(jobTemplateId=full)
+        assert desc["description"] == "full"
+        assert desc["document"] == _DOCUMENT
+        assert isinstance(desc["createdAt"], datetime)
+        for member in ("presignedUrlConfig", "abortConfig", "timeoutConfig",
+                       "jobExecutionsRetryConfig"):
+            assert desc[member] == _TEMPLATE_CONFIG[member], member
+        rate = desc["jobExecutionsRolloutConfig"]["exponentialRate"]
+        assert rate["rateIncreaseCriteria"] == {"numberOfNotifiedThings": 10}
+        # The two `double` members read back as floats, as on AWS.
+        assert isinstance(rate["incrementFactor"], float)
+        assert isinstance(
+            desc["abortConfig"]["criteriaList"][0]["thresholdPercentage"], float
+        )
+
+        iot_client.create_job_template(
+            jobTemplateId=minimal, description="minimal", document=_DOCUMENT
+        )
+        # AWS writes every member, an unset one as null, and three structures
+        # as objects of nulls.
+        status, body = _raw(_IOT_AUTH, "GET", f"/job-templates/{minimal}")
+        assert status == 200
+        assert body["abortConfig"] is None
+        assert body["documentSource"] is None
+        assert body["maintenanceWindows"] is None
+        assert body["timeoutConfig"] == {"inProgressTimeoutInMinutes": None}
+        assert body["presignedUrlConfig"] == {"expiresInSec": None, "roleArn": None}
+        assert body["jobExecutionsRolloutConfig"] == {
+            "exponentialRate": None, "maximumPerMinute": None
+        }
+
+        # Newest first, one per page, behind an opaque token.
+        seen, token = [], None
+        while True:
+            page = iot_client.list_job_templates(
+                maxResults=1, **({"nextToken": token} if token else {})
+            )
+            assert len(page["jobTemplates"]) <= 1
+            seen += [t for t in page["jobTemplates"]
+                     if t["jobTemplateId"] in (full, minimal)]
+            token = page.get("nextToken")
+            if not token:
+                break
+        assert [t["jobTemplateId"] for t in seen] == [minimal, full]
+        assert set(seen[0]) == {
+            "jobTemplateArn", "jobTemplateId", "description", "createdAt"
+        }
+
+        # Delete answers 200 with an empty body.
+        assert _raw_bytes("DELETE", f"/job-templates/{full}") == (200, b"")
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_job_template(jobTemplateId=full)
+        assert _error(ei) == (
+            404, "ResourceNotFoundException", f"Job Template {full} cannot be found."
+        )
+    finally:
+        _delete_templates(iot_client, full, minimal)
+
+
+def test_iot_job_template_from_a_job(iot_client):
+    thing, job_id = _unique("jobs-thing"), _unique("job")
+    from_job, with_doc = _unique("tmpl-job"), _unique("tmpl-jobdoc")
+    try:
+        job_arn = iot_client.create_job(
+            jobId=job_id, targets=[_create_thing(iot_client, thing)],
+            document=_DOCUMENT,
+            timeoutConfig={"inProgressTimeoutInMinutes": 15},
+            jobExecutionsRetryConfig=_TEMPLATE_CONFIG["jobExecutionsRetryConfig"],
+        )["jobArn"]
+        iot_client.create_job_template(
+            jobTemplateId=from_job, description="from job", jobArn=job_arn
+        )
+        desc = iot_client.describe_job_template(jobTemplateId=from_job)
+        assert desc["description"] == "from job"
+        assert desc["document"] == _DOCUMENT
+        assert desc["timeoutConfig"] == {"inProgressTimeoutInMinutes": 15}
+        assert desc["jobExecutionsRetryConfig"] == (
+            _TEMPLATE_CONFIG["jobExecutionsRetryConfig"]
+        )
+        assert "abortConfig" not in desc
+
+        # A document in the request replaces the job's; the rest still comes
+        # from the job.
+        iot_client.create_job_template(
+            jobTemplateId=with_doc, description="d", jobArn=job_arn, document="{}"
+        )
+        desc = iot_client.describe_job_template(jobTemplateId=with_doc)
+        assert desc["document"] == "{}"
+        assert desc["timeoutConfig"] == {"inProgressTimeoutInMinutes": 15}
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job_template(
+                jobTemplateId=_unique("tmpl"), description="d",
+                jobArn=f"{job_arn}-gone",
+            )
+        assert _error(ei) == (
+            404, "ResourceNotFoundException", f"Job {job_id}-gone cannot be found."
+        )
+    finally:
+        _delete_templates(iot_client, from_job, with_doc)
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_job_template_rejects_what_aws_rejects(iot_client):
+    template_id = _unique("tmpl")
+    try:
+        iot_client.create_job_template(
+            jobTemplateId=template_id, description="d", document=_DOCUMENT
+        )
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job_template(
+                jobTemplateId=template_id, description="d", document=_DOCUMENT
+            )
+        assert _error(ei) == (
+            409, "ConflictException", f"Job Template {template_id} already exists."
+        )
+        cases = [
+            ({"description": "d", "document": "{}", "documentSource": "https://x/y"},
+             "Job document and job document source cannot be specified at the same "
+             "time."),
+            ({"description": "d"},
+             "Neither job document nor job document source is specified."),
+            ({"document": "{}"},
+             "1 validation error detected: Value null at 'description' failed to "
+             "satisfy constraint: Member must not be null"),
+            ({"description": "d", "document": "{}",
+              "timeoutConfig": {"inProgressTimeoutInMinutes": 0}},
+             "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 0."),
+            ({"description": "d", "document": "{}",
+              "timeoutConfig": {"inProgressTimeoutInMinutes": 10081}},
+             "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
+             "10081."),
+        ]
+        for payload, message in cases:
+            status, body = _raw(
+                _IOT_AUTH, "PUT", f"/job-templates/{_unique('tmpl')}", payload
+            )
+            assert (status, body["message"]) == (400, message), payload
+
+        for bad_id, constraint in (
+            ("has.dot", "Member must satisfy regular expression pattern: "
+                        "[a-zA-Z0-9_-]+"),
+            ("a" * 65, "Member must have length less than or equal to 64"),
+        ):
+            for method in ("PUT", "GET"):
+                status, body = _raw(
+                    _IOT_AUTH, method, f"/job-templates/{bad_id}",
+                    {"description": "d", "document": "{}"},
+                )
+                assert (status, body["message"]) == (
+                    400,
+                    f"1 validation error detected: Value '{bad_id}' at "
+                    f"'jobTemplateId' failed to satisfy constraint: {constraint}",
+                ), (bad_id, method)
+
+        for call in (iot_client.describe_job_template, iot_client.delete_job_template):
+            with pytest.raises(ClientError) as ei:
+                call(jobTemplateId=f"{template_id}-unknown")
+            assert _error(ei) == (
+                404, "ResourceNotFoundException",
+                f"Job Template {template_id}-unknown cannot be found.",
+            )
+
+        for query, message in (
+            ("maxResults=0", "1 validation error detected: Value '0' at 'maxResults' "
+             "failed to satisfy constraint: Member must have value greater than or "
+             "equal to 1"),
+            ("maxResults=251", "1 validation error detected: Value '251' at "
+             "'maxResults' failed to satisfy constraint: Member must have value less "
+             "than or equal to 250"),
+            ("nextToken=garbage", "Next token is invalid."),
+        ):
+            status, body = _raw(_IOT_AUTH, "GET", f"/job-templates?{query}")
+            assert (status, body["message"]) == (400, message), query
+    finally:
+        _delete_templates(iot_client, template_id)
+
+
+def test_iot_jobs_create_from_a_job_template(iot_client):
+    thing = _unique("jobs-thing")
+    template_id, mw_template = _unique("tmpl"), _unique("tmpl-mw")
+    plain, overridden = _unique("job"), _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        template_arn = iot_client.create_job_template(
+            jobTemplateId=template_id, description="from template",
+            document=_DOCUMENT, **_TEMPLATE_CONFIG,
+        )["jobTemplateArn"]
+
+        iot_client.create_job(jobId=plain, targets=[thing_arn],
+                              jobTemplateArn=template_arn)
+        job = iot_client.describe_job(jobId=plain)["job"]
+        assert job["jobTemplateArn"] == template_arn
+        assert job["timeoutConfig"] == {"inProgressTimeoutInMinutes": 30}
+        assert job["presignedUrlConfig"]["roleArn"] == _TEMPLATE_ROLE
+        assert job["jobExecutionsRolloutConfig"]["maximumPerMinute"] == 50
+        assert job["abortConfig"]["criteriaList"][0]["minNumberOfExecutedThings"] == 5
+        assert job["jobExecutionsRetryConfig"] == (
+            _TEMPLATE_CONFIG["jobExecutionsRetryConfig"]
+        )
+        assert "description" not in job, "the template's description is not inherited"
+        assert iot_client.get_job_document(jobId=plain)["document"] == _DOCUMENT
+
+        # A member the request names replaces the template's whole.
+        iot_client.create_job(
+            jobId=overridden, targets=[thing_arn], jobTemplateArn=template_arn,
+            document='{"own": true}', timeoutConfig={"inProgressTimeoutInMinutes": 99},
+            jobExecutionsRetryConfig={"criteriaList": [
+                {"failureType": "ALL", "numberOfRetries": 3}]},
+        )
+        job = iot_client.describe_job(jobId=overridden)["job"]
+        assert job["timeoutConfig"] == {"inProgressTimeoutInMinutes": 99}
+        assert job["jobExecutionsRetryConfig"] == {"criteriaList": [
+            {"failureType": "ALL", "numberOfRetries": 3}]}
+        assert job["jobExecutionsRolloutConfig"]["maximumPerMinute"] == 50
+        assert iot_client.get_job_document(jobId=overridden)["document"] == (
+            '{"own": true}'
+        )
+
+        # Deleting the template leaves the jobs made from it alone.
+        iot_client.delete_job_template(jobTemplateId=template_id)
+        assert iot_client.describe_job(jobId=plain)["job"]["jobTemplateArn"] == (
+            template_arn
+        )
+
+        mw_arn = iot_client.create_job_template(
+            jobTemplateId=mw_template, description="mw", document=_DOCUMENT,
+            maintenanceWindows=[{"startTime": "cron(0 2 ? * MON *)",
+                                 "durationInMinutes": 60}],
+        )["jobTemplateArn"]
+        job_arn = template_arn.replace(f":jobtemplate/{template_id}", f":job/{plain}")
+        for arn, status, code, message in (
+            (template_arn, 404, "ResourceNotFoundException",
+             f"Job Template {template_id} cannot be found."),
+            (job_arn, 400, "InvalidRequestException",
+             "Resource type should be jobtemplate but found invalid resource type job"),
+            (mw_arn, 400, "InvalidRequestException",
+             "TargetSelection is invalid. MaintenanceWindow cannot be used with "
+             "SNAPSHOT job."),
+        ):
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job(jobId=_unique("job"), targets=[thing_arn],
+                                      jobTemplateArn=arn)
+            assert _error(ei) == (status, code, message), arn
+    finally:
+        _delete_templates(iot_client, template_id, mw_template)
+        _cleanup(iot_client, jobs=[plain, overridden], things=[thing])
+
+
+def test_iot_job_templates_are_scoped_and_persisted():
+    """A template is visible to its own account and region only, travels
+    through get_state / load_persisted_state, and reset() drops it."""
+    from ministack.services import iot as iot_module
+
+    template_id = _unique("tmpl")
+    a = _account_client("iot", "111111111111")
+    b = _account_client("iot", "222222222222")
+    a_eu = _account_client("iot", "111111111111", region="eu-west-1")
+    try:
+        a.create_job_template(jobTemplateId=template_id, description="a",
+                              document=_DOCUMENT)
+        for other in (b, a_eu):
+            with pytest.raises(ClientError) as ei:
+                other.describe_job_template(jobTemplateId=template_id)
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+            assert template_id not in {
+                t["jobTemplateId"] for t in other.list_job_templates()["jobTemplates"]
+            }
+    finally:
+        _delete_templates(a, template_id)
+
+    record = {"jobTemplateId": template_id, "description": "restored"}
+    iot_module._job_templates[template_id] = record
+    state = iot_module.get_state()
+    iot_module.reset()
+    assert template_id not in iot_module._job_templates
+    try:
+        iot_module.load_persisted_state(state)
+        assert iot_module._job_templates[template_id] == record
+    finally:
+        iot_module.reset()
+
+
+# ---------------------------------------------------------------------------
 # Device lifecycle: start-next → update (optimistic concurrency) → job done
 # ---------------------------------------------------------------------------
 

@@ -3458,6 +3458,72 @@ def test_sfn_task_timeout_seconds_applies_to_lambda_invoke(sfn, lam):
     assert json.loads(desc["output"]) == "timed-out"
 
 
+def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
+    """States.TaskFailed matches every error except States.Timeout, in Retry and in Catch."""
+    queue_url = sqs.create_queue(QueueName="sfn-taskfailed-timeout")["QueueUrl"]
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {
+            "Wait": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                "Parameters": {"QueueUrl": queue_url, "MessageBody": {"token.$": "$$.Task.Token"}},
+                "TimeoutSeconds": 1,
+                "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 1, "MaxAttempts": 1}],
+                "Catch": [
+                    {"ErrorEquals": ["States.TaskFailed"], "Next": "CaughtAsTaskFailed"},
+                    {"ErrorEquals": ["States.Timeout"], "Next": "CaughtAsTimeout"},
+                ],
+                "End": True,
+            },
+            "CaughtAsTaskFailed": {"Type": "Pass", "Result": "task-failed", "End": True},
+            "CaughtAsTimeout": {"Type": "Pass", "Result": "timeout", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-taskfailed-timeout", definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == "timeout"
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    assert [e["type"] for e in events].count("TaskScheduled") == 1
+
+
+_SFN_FAIL_BRANCH = {"StartAt": "F", "States": {"F": {"Type": "Fail", "Error": "MyErr", "Cause": "c"}}}
+
+
+@pytest.mark.parametrize("state", [
+    {"Type": "Parallel", "Branches": [_SFN_FAIL_BRANCH]},
+    {"Type": "Map", "ItemsPath": "$.xs", "ItemProcessor": _SFN_FAIL_BRANCH},
+], ids=["parallel", "map"])
+def test_sfn_parallel_and_map_apply_retry_and_catch(sfn, state):
+    """A failed branch or iteration fails the state with its error, which the state's Retry and Catch handle."""
+    definition = json.dumps({
+        "StartAt": "S",
+        "States": {
+            "S": {
+                **state,
+                "Retry": [{"ErrorEquals": ["MyErr"], "IntervalSeconds": 1, "MaxAttempts": 1}],
+                "Catch": [{"ErrorEquals": ["MyErr"], "ResultPath": "$.err", "Next": "Caught"}],
+                "End": True,
+            },
+            "Caught": {"Type": "Pass", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-{state['Type'].lower()}-catch-{_uuid_mod.uuid4().hex[:8]}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input='{"xs": [1]}')
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == {"xs": [1], "err": {"Error": "MyErr", "Cause": "c"}}
+
+
 def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):
     """lambda:invoke.waitForTaskToken must deliver the *unwrapped* Payload to
     the handler, exactly like the synchronous lambda:invoke path.

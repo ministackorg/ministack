@@ -895,6 +895,7 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("MasterUsername", "admin"),
                             cluster.get("_MasterUserPassword", "password"),
                             cluster_id,
+                            cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
@@ -2457,6 +2458,13 @@ def _start_rds_container_for_instance(db_id, instance):
         container_kwargs["tmpfs"] = {
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
+    groups = instance.get("DBParameterGroups") or [{}]
+    if _is_mysql_engine(engine) and (options := _mysql_server_options(
+        instance.get("BackupRetentionPeriod", 1), groups[0].get("DBParameterGroupName"),
+    )):
+        container_kwargs["command"] = options
+    if groups[0].get("ParameterApplyStatus") in ("pending-reboot", "applying"):
+        groups[0]["ParameterApplyStatus"] = "in-sync"
 
     try:
         container = _run_rds_container(
@@ -2537,7 +2545,7 @@ def _start_rds_container_for_instance(db_id, instance):
             return
         _grant_mysql_master_user_privileges(
             internal_host or "127.0.0.1", internal_port or host_port,
-            master_user, master_pass, db_id,
+            master_user, master_pass, db_id, engine,
         )
     _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
@@ -2617,6 +2625,84 @@ def _wait_for_port(host, port, timeout=60):
 
 def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
+
+
+# Excludes RDS-only names such as `rds.force_ssl`.
+_MYSQL_SERVER_PARAMETER = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _mysql_server_options(backup_retention_period, param_group_name=None):
+    """Startup options: retention 0 disables the binlog; group values go as `--loose-` options."""
+    options = [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
+    group = _param_groups.get(param_group_name) if param_group_name else None
+    for name, param in ((group or {}).get("Parameters") or {}).items():
+        value = param.get("ParameterValue")
+        if _MYSQL_SERVER_PARAMETER.fullmatch(name) and value is not None and not value.startswith("{"):
+            options.append(f"--loose-{name}={value}")
+    return options
+
+
+def _mysql_parameter_value(value):
+    """A parameter value as SET GLOBAL takes it: numeric variables refuse a string."""
+    for parse in (int, float):
+        try:
+            return parse(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _apply_parameter_group_changes(group_name, changes, refuse_static=True):
+    """Apply `(name, value, apply_method)` changes to the group's running MySQL instances; returns a refusal or None."""
+    for instance in list(_instances.values()):
+        groups = instance.get("DBParameterGroups") or []
+        if not (
+            groups and groups[0].get("DBParameterGroupName") == group_name
+            and _is_mysql_engine(instance.get("Engine", ""))
+            and instance.get("_docker_container_id")
+            and not instance.get("DBClusterIdentifier")
+        ):
+            continue
+        pending = any(method != "immediate" for _name, _value, method in changes)
+        immediate = [(name, value) for name, value, method in changes
+                     if method == "immediate" and _MYSQL_SERVER_PARAMETER.fullmatch(name)]
+        if immediate:
+            try:
+                conn = _mysql_endpoint_admin_connection(
+                    instance.get("_internal_address") or "127.0.0.1",
+                    instance.get("_internal_port") or instance.get("_HostPort"),
+                    instance.get("_MasterUserPassword", "password"),
+                )
+            except Exception as e:
+                logger.warning("RDS: cannot apply parameter group %s to %s: %s",
+                               group_name, instance.get("DBInstanceIdentifier"), e)
+                pending = True
+            else:
+                try:
+                    with conn.cursor() as cur:
+                        for name, _value in immediate if refuse_static else ():
+                            try:
+                                cur.execute(f"SET GLOBAL {name} = @@GLOBAL.{name}")
+                            except Exception as e:
+                                if e.args and e.args[0] == 1238:  # ER_INCORRECT_GLOBAL_LOCAL_VAR: read-only
+                                    return _error("InvalidParameterCombination",
+                                                  "cannot use immediate apply method for static parameter", 400)
+                        for name, value in immediate:
+                            try:
+                                if value is None:
+                                    cur.execute(f"SET GLOBAL {name} = DEFAULT")
+                                else:
+                                    cur.execute(f"SET GLOBAL {name} = %s", (_mysql_parameter_value(value),))
+                            except Exception as e:
+                                # A static (read-only) variable takes effect at the next start.
+                                logger.info("RDS: parameter %s for %s applies at the next start: %s",
+                                            name, instance.get("DBInstanceIdentifier"), e)
+                                pending = True
+                finally:
+                    conn.close()
+        if pending:
+            groups[0]["ParameterApplyStatus"] = "pending-reboot"
+    return None
 
 
 def _is_postgres_engine(engine):
@@ -3769,8 +3855,39 @@ def _configure_or_defer_mysql_replication(cluster_id, cluster):
         _schedule_mysql_replication_retry(cluster_id, cluster)
 
 
-def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
-    """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
+_MYSQL_MASTER_PRIVILEGES = (
+    "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, REFERENCES, "
+    "INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, "
+    "REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, "
+    "ALTER ROUTINE, CREATE USER, EVENT, TRIGGER"
+)
+_AURORA_MYSQL_3_MASTER_PRIVILEGES = (
+    "CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "CONNECTION_ADMIN",
+    "ROLE_ADMIN", "XA_RECOVER_ADMIN", "SHOW_ROUTINE", "FLUSH_OPTIMIZER_COSTS",
+    "FLUSH_STATUS", "FLUSH_TABLES", "FLUSH_USER_RESOURCES",
+)
+
+
+def _mysql_master_extra_privileges(engine, server_version):
+    """Master-user privileges beyond _MYSQL_MASTER_PRIVILEGES, per the RDS and Aurora master user tables."""
+    version = tuple(int(n) for n in re.findall(r"\d+", server_version)[:3])
+    if "mariadb" in server_version.lower():
+        return ("SHOW CREATE ROUTINE",) if version >= (11, 4) else ()
+    if engine.startswith("aurora"):
+        if version < (8,):
+            return ("LOAD FROM S3", "SELECT INTO S3")
+        if version >= (8, 4):
+            return _AURORA_MYSQL_3_MASTER_PRIVILEGES + (
+                "ALLOW_NONEXISTENT_DEFINER", "FLUSH_PRIVILEGES", "OPTIMIZE_LOCAL_TABLE", "SET_ANY_DEFINER")
+        return _AURORA_MYSQL_3_MASTER_PRIVILEGES + ("SET_USER_ID",)
+    if version >= (8, 0, 36):
+        return ("CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "ROLE_ADMIN",
+                "SET_USER_ID", "XA_RECOVER_ADMIN")
+    return ()
+
+
+def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id, engine=""):
+    """Grant the emulated MySQL master user the privileges AWS gives it, and no others."""
     try:
         import pymysql
         conn = pymysql.connect(
@@ -3781,13 +3898,17 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
             (master_user, master_pass),
         )
+        if master_user != "root":
+            cur.execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM %s@'%%'", (master_user,))
         cur.execute(
-            "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+            f"GRANT {_MYSQL_MASTER_PRIVILEGES} ON *.* TO %s@'%%' WITH GRANT OPTION",
             (master_user,),
         )
-        for privilege in ("APPLICATION_PASSWORD_ADMIN",):
+        cur.execute("SELECT VERSION()")
+        server_version = cur.fetchone()[0]
+        for privilege in _mysql_master_extra_privileges(engine or "", server_version):
             try:
-                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%'", (master_user,))
+                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%' WITH GRANT OPTION", (master_user,))
             except Exception as e:
                 logger.debug(
                     "RDS: MySQL privilege %s unsupported for %s: %s",
@@ -4775,6 +4896,10 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
+                if _is_mysql_engine(engine) and (options := _mysql_server_options(
+                    _p(p, "BackupRetentionPeriod") or "1", param_group_name,
+                )):
+                    container_kwargs["command"] = options
                 container = _run_rds_container(
                     docker_client, engine, container_kwargs,
                     tls_names=[endpoint_host or "",
@@ -5085,7 +5210,7 @@ def _create_db_instance_impl(p):
                         _grant_mysql_master_user_privileges(
                             ready_host, ready_port, master_user,
                             cluster.get("_MasterUserPassword", master_pass),
-                            cluster_id,
+                            cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
                     if _aurora_mysql_8_replication_enabled(cluster):
@@ -5126,7 +5251,7 @@ def _create_db_instance_impl(p):
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
                     ready_host, ready_port, master_user, master_pass,
-                    cluster_id or db_id,
+                    cluster_id or db_id, engine,
                 )
             inst = _instances.get(db_id)
             if inst is not None:
@@ -5344,6 +5469,12 @@ def _rotate_instance_password(instance, old_pass, new_pass):
                          db_id, e)
 
 
+_IMMEDIATE_INSTANCE_SETTINGS = frozenset({
+    "DeletionProtection", "CopyTagsToSnapshot", "PreferredBackupWindow", "PreferredMaintenanceWindow",
+    "PubliclyAccessible", "MaxAllocatedStorage", "MonitoringInterval", "MonitoringRoleArn",
+})
+
+
 def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
@@ -5375,11 +5506,6 @@ def _modify_db_instance(p):
         return engine_version_error
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
-    standalone = not (
-        instance.get("DBClusterIdentifier")
-        or instance.get("_shared_cluster_id")
-        or instance.get("Engine", "").startswith("aurora")
-    )
 
     field_map = {
         "DBInstanceClass": "DBInstanceClass",
@@ -5420,11 +5546,8 @@ def _modify_db_instance(p):
                            "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
-        # These standalone settings take effect immediately and never enter
-        # PendingModifiedValues, regardless of ApplyImmediately (RDS settings).
-        if apply_immediately or (
-            standalone and param_key in ("DeletionProtection", "CopyTagsToSnapshot")
-        ):
+        # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
+        if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
         else:
             pending[instance_key] = val
@@ -6451,6 +6574,8 @@ def _create_param_group(p):
     name = _p(p, "DBParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBParameterGroupName is required", 400)
+    if name in _param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "postgres15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:pg:{name}"
@@ -6530,13 +6655,19 @@ def _modify_param_group(p):
 
     params = pg.setdefault("Parameters", {})
     prefix = _parameter_member_prefix(p)
+    changes = []
     idx = 1
     while _p(p, f"{prefix}.{idx}.ParameterName"):
         pname = _p(p, f"{prefix}.{idx}.ParameterName")
         pvalue = _p(p, f"{prefix}.{idx}.ParameterValue")
         apply_method = _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"
-        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
+        changes.append((pname, pvalue, apply_method))
         idx += 1
+    refusal = _apply_parameter_group_changes(name, changes)
+    if refusal:
+        return refusal
+    for pname, pvalue, apply_method in changes:
+        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
 
     return _xml(200, "ModifyDBParameterGroupResponse",
         f"<ModifyDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ModifyDBParameterGroupResult>")
@@ -6560,12 +6691,17 @@ def _reset_param_group(p):
         )
 
     if reset_all or not has_explicit_parameters:
+        reset = [(pname, None, "immediate") for pname in params]
         params.clear()
     else:
+        reset = []
         idx = 1
         while _p(p, f"{prefix}.{idx}.ParameterName"):
-            params.pop(_p(p, f"{prefix}.{idx}.ParameterName"), None)
+            pname = _p(p, f"{prefix}.{idx}.ParameterName")
+            if params.pop(pname, None) is not None:
+                reset.append((pname, None, _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"))
             idx += 1
+    _apply_parameter_group_changes(name, reset, refuse_static=False)
 
     return _xml(200, "ResetDBParameterGroupResponse",
         f"<ResetDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ResetDBParameterGroupResult>")
@@ -6579,6 +6715,8 @@ def _create_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBClusterParameterGroupName is required", 400)
+    if name in _db_cluster_param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "aurora-postgresql15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}"
@@ -7157,7 +7295,7 @@ def _start_db_cluster(p):
                     _grant_mysql_master_user_privileges(
                         ready_host, ready_port, master_user,
                         cluster.get("_MasterUserPassword", master_pass),
-                        cluster_id,
+                        cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
                 if _aurora_mysql_8_replication_enabled(cluster):

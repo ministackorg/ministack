@@ -659,7 +659,10 @@ def test_opensearch_dataplane_names_include_account_and_region():
     their containers must not collide, and the data container's name stays one
     DNS label (Dashboards reaches it by name) for the longest domain name."""
     from ministack.core.responses import (
-        get_account_id, get_region, set_request_account_id, set_request_region,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
     )
     from ministack.services import opensearch
 

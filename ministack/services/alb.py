@@ -1814,7 +1814,7 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         resp_code = int(result.get("statusCode", 200))
         out_headers = dict(result.get("headers") or {})
         for k, vals in (result.get("multiValueHeaders") or {}).items():
-            out_headers[k] = vals[-1]
+            out_headers[k] = vals[0] if len(vals) == 1 else vals
 
         out_body = result.get("body", "")
         if result.get("isBase64Encoded"):

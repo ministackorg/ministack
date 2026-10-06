@@ -1773,6 +1773,12 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_job_template(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot", "PUT", "/job-templates/ota", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:jobtemplate/ota"
+
     def test_iot_publish_topic_keeps_every_level(self):
         """A topic ARN carries the whole topic, not its first segment:
         arn:aws:iot:...:topic/sensors/rack-1/temperature. Truncating it to
@@ -2328,6 +2334,10 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("sqs", "POST", "/", {}, b"", {"Action": ["CreateQueue"]}) == "sqs:CreateQueue"
         assert extract_iam_action("monitoring", "POST", "/", {}, b"", {"Action": ["PutMetricData"]}) == "cloudwatch:PutMetricData"
+
+    def test_budgets_target_protocol(self):
+        from ministack.core.iam_actions import extract_iam_action
+        assert extract_iam_action("budgets", "POST", "/", {"x-amz-target": "AWSBudgetServiceGateway.CreateBudget"}, b"", {}) == "budgets:CreateBudget"
 
     def test_target_protocol(self):
         from ministack.core.iam_actions import extract_iam_action
@@ -4163,3 +4173,17 @@ def test_trust_denies_and_conditions_remain_permissive_without_auth(trust_api, m
     monkeypatch.setattr(app_mod, "AUTH", False)
     _install_policy(trust_api, operation, policy)
     _assume(trust_api, 200, RoleSessionName="unrestricted")
+
+
+@pytest.mark.parametrize("service, action", [("iam", "iam:ListUsers"), ("sqs", "sqs:ListQueues"), ("sns", "sns:ListTopics")])
+@pytest.mark.parametrize("explicit_deny, reason", [
+    (True, "with an explicit deny in an identity-based policy"),
+    (False, "because no identity-based policy allows the {action} action"),
+])
+def test_access_denied_message_names_an_explicit_deny(service, action, explicit_deny, reason):
+    from ministack.core.iam_actions import access_denied_response
+
+    _status, _headers, body = access_denied_response(
+        service, action, "arn:aws:iam::000000000000:user/u", "req-1", explicit_deny=explicit_deny)
+    expected = f"User: arn:aws:iam::000000000000:user/u is not authorized to perform: {action} "
+    assert (expected + reason.format(action=action)) in body.decode()

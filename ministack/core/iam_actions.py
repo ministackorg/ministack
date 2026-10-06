@@ -42,6 +42,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock-agent-runtime": "bedrock",
     "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
+    "budgets": "budgets",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
     "cloudfront": "cloudfront",
@@ -1526,6 +1527,7 @@ def extract_resource_arn(service: str, method: str, path: str,
             "rules": "rule",
             "jobs": "job",
             "provisioning-templates": "provisioningtemplate",
+            "job-templates": "jobtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
@@ -1766,10 +1768,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
     if not message:
-        message = (
-            f"User: {principal_arn} is not authorized to perform: {action} "
-            f"because no identity-based policy allows the {action} action"
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
         )
+        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
     code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
     if service in _CBOR_CAPABLE:

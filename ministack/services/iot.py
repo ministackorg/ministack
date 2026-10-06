@@ -13,9 +13,10 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
     ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
-    ``ListCACertificates``, ``DeleteCACertificate``; an mTLS connect with an
-    unknown certificate signed by a CA with auto-registration enabled creates
-    it PENDING_ACTIVATION and publishes the AWS JITR event to
+    ``ListCACertificates``, ``DeleteCACertificate``, ``ListCertificatesByCA``;
+    an mTLS connect with an unknown certificate signed by a CA with
+    auto-registration enabled creates it PENDING_ACTIVATION and publishes the
+    AWS JITR event to
     ``$aws/events/certificates/registered/{caCertificateId}``
   - Provisioning templates: ``CreateProvisioningTemplate``,
     ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
@@ -39,6 +40,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
     ``CancelJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
+  - Job templates: ``CreateJobTemplate``, ``DescribeJobTemplate``,
+    ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
+    ``jobTemplateArn`` takes the template's document and configuration
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -68,6 +72,7 @@ import ssl
 import struct
 import time
 import uuid
+import weakref
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
@@ -123,6 +128,7 @@ _provisioning_templates: AccountRegionScopedDict = AccountRegionScopedDict()
 _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
+_job_templates: AccountRegionScopedDict = AccountRegionScopedDict()  # jobTemplateId -> record
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -247,6 +253,7 @@ def get_state() -> dict:
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
+        "job_templates": copy.deepcopy(_job_templates),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -283,6 +290,7 @@ def _restore_state(data: dict | None) -> None:
     _provisioning_templates.update(data.get("provisioning_templates", {}))
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
+    _job_templates.update(data.get("job_templates", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -324,6 +332,7 @@ def reset() -> None:
     _provisioning_templates.clear()
     _jobs.clear()
     _job_executions.clear()
+    _job_templates.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -565,6 +574,8 @@ async def _route_request(
 
     if path == "/certificates" and method == "GET":
         return _list_certificates(qp)
+    if path.startswith("/certificates-by-ca/") and method == "GET":
+        return _list_certificates_by_ca(path, qp)
     if path.startswith("/certificates/") and method in ("GET", "PUT", "DELETE"):
         return _handle_certificate(method, path, body, qp)
 
@@ -614,6 +625,10 @@ async def _route_request(
         return _list_jobs(qp)
     if path.startswith("/jobs/"):
         return await _handle_job(method, path, body, qp)
+    if path == "/job-templates" and method == "GET":
+        return _list_job_templates(qp)
+    if path.startswith("/job-templates/"):
+        return _handle_job_template(method, path, body)
 
     # Topic rules
     if path == "/rules" and method == "GET":
@@ -642,6 +657,11 @@ _RETIRED_ENDPOINT_TYPES = {
 }
 
 
+def _endpoint_prefix(account_id: str) -> str:
+    """The account's endpoint host prefix: the first 14 hex chars of SHA-256(account_id)."""
+    return hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
+
+
 def _describe_endpoint(qp: dict) -> tuple:
     """Return a per-account endpoint hostname.
 
@@ -652,7 +672,7 @@ def _describe_endpoint(qp: dict) -> tuple:
     """
     endpoint_type = qp.get("endpointType", "iot:Data-ATS")
     account_id = get_account_id()
-    prefix = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:14]
+    prefix = _endpoint_prefix(account_id)
     region = get_region()
 
     if endpoint_type in _RETIRED_ENDPOINT_TYPES:
@@ -1020,7 +1040,11 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if err:
         return err
     if method == "POST":
-        return _create_thing_group(name, _parse_body(body))
+        payload = _parse_body(body)
+        existing = _thing_groups.get(name)
+        if existing is not None:
+            return _create_existing_thing_group(existing, payload)
+        return _create_thing_group(name, payload)
     if method == "GET":
         return _describe_thing_group(name)
     if method == "PATCH":
@@ -1029,6 +1053,47 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return _delete_thing_group(name)
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _thing_group_tag_pairs(tags: list | None) -> list:
+    return sorted((t.get("Key"), t.get("Value")) for t in tags or [])
+
+
+def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
+    """CreateThingGroup on a name that exists. AWS answers 200 with the
+    existing group when the request describes it exactly: description,
+    attributes (in any key order), parent and tags. The merge flag does not
+    count, and an empty attribute map or tag list equals none. Any difference
+    is a 409 that leaves the group as it was; a property or parent difference
+    names the group, a tag difference names the ARN, and both carry
+    resourceArn/resourceId as null (measured eu-central-1, 2026-10-05).
+
+    CloudFormation creates through ``_create_thing_group``, which keeps
+    refusing an existing name as the AWS::IoT::ThingGroup handler does."""
+    props = payload.get("thingGroupProperties") or {}
+    stored = group["thingGroupProperties"]
+    stored_parent = (group.get("thingGroupMetadata") or {}).get("parentGroupName")
+    if (
+        props.get("thingGroupDescription") != stored.get("thingGroupDescription")
+        or ((props.get("attributePayload") or {}).get("attributes") or {})
+        != ((stored.get("attributePayload") or {}).get("attributes") or {})
+        or (payload.get("parentGroupName") or None) != stored_parent
+    ):
+        message = f"Thing Group {group['thingGroupName']} already exists in current account"
+    elif _thing_group_tag_pairs(payload.get("tags")) != _thing_group_tag_pairs(group.get("tags")):
+        message = f"Resource {group['thingGroupArn']} already exists in current account"
+    else:
+        return json_response({
+            "thingGroupName": group["thingGroupName"],
+            "thingGroupArn": group["thingGroupArn"],
+            "thingGroupId": group["thingGroupId"],
+        })
+    return error_response_json(
+        "ResourceAlreadyExistsException",
+        f"{message} with different properties",
+        409,
+        extra={"resourceArn": None, "resourceId": None},
     )
 
 
@@ -1055,6 +1120,8 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "version": 1,
         "things": [],
         "creationDate": _now_epoch(),
+        # Kept for a repeated CreateThingGroup to compare; not echoed.
+        "tags": list(payload.get("tags") or []),
     }
     if parent:
         # DescribeThingGroup reports the parent under thingGroupMetadata, as
@@ -1078,7 +1145,7 @@ def _describe_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
         return _error_not_found("ThingGroup", name)
-    return json_response(g)
+    return json_response({k: v for k, v in g.items() if k != "tags"})
 
 
 def _list_thing_groups(qp: dict) -> tuple:
@@ -1507,6 +1574,18 @@ def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     )
 
 
+def _registered_issuer_id(cert_pem: str) -> str | None:
+    """The id of the ACTIVE CA registered in this account/region that signed
+    ``cert_pem``, or None. Several CAs may share a subject, so the signature
+    decides, not the issuer name."""
+    for ca in _ca_certificates.values():
+        if ca.get("status") == "ACTIVE" and certificate_is_signed_by(
+            cert_pem, ca.get("certificatePem") or ""
+        ):
+            return ca["certificateId"]
+    return None
+
+
 async def _register_certificate(
     payload: dict, qp: dict, *, without_ca: bool = False
 ) -> tuple:
@@ -1522,7 +1601,10 @@ async def _register_certificate(
 
     ``caCertificatePem`` must name a CA registered via
     ``RegisterCACertificate`` in this account/region that really signed the
-    leaf; anything else is a ``CertificateValidationException``. Registering
+    leaf; anything else is a ``CertificateValidationException``. Without it,
+    ``RegisterCertificate`` links the certificate to the registered ACTIVE CA
+    that signed it, as AWS does, so DescribeCertificate names that CA and
+    ListCertificatesByCA lists the certificate. Registering
     publishes no JITR event, whatever the CA's ``autoRegistrationStatus``: AWS
     sends that event only from a device connect (see ``_mtls_auto_register``),
     and refuses a registration with status PENDING_ACTIVATION.
@@ -1585,6 +1667,8 @@ async def _register_certificate(
             )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
+    if ca_id is None and not without_ca:
+        ca_id = _registered_issuer_id(cert_pem)
     record = _certificate_record(
         cert_id, cert_pem, status or ("ACTIVE" if set_active else "INACTIVE"), ca_id
     )
@@ -1607,6 +1691,132 @@ def _list_certificates(qp: dict) -> tuple:
             for c in _certificates.values()
         ]
     })
+
+
+_CERTIFICATE_ID_RE = re.compile(r"(0x)?[a-fA-F0-9]+")
+_MARKER_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+_BY_CA_MARKER_PREFIX = "certificates-by-ca"
+
+
+def _by_ca_sort_key(record: dict) -> tuple[float, str]:
+    """Creation order, the certificate id breaking ties within one timestamp."""
+    return record.get("creationDate") or 0.0, record["certificateId"]
+
+
+def _by_ca_marker(record: dict) -> str:
+    """An opaque page cursor naming the last certificate of a page.
+
+    It is the position, not an offset: AWS continues after that certificate in
+    whatever order the next request asks for, so a marker from a descending
+    page followed by ``isAscendingOrder=true`` yields the newer certificates.
+    Standard base64, so it matches the ``Marker`` pattern botocore checks.
+    """
+    created, cert_id = _by_ca_sort_key(record)
+    raw = f"{_BY_CA_MARKER_PREFIX}:{created!r}:{cert_id}"
+    return base64.b64encode(raw.encode()).decode()
+
+
+def _by_ca_marker_position(marker: str) -> tuple[float, str] | None:
+    """The (creationDate, certificateId) a marker stands for, or None."""
+    try:
+        raw = base64.b64decode(marker, validate=True).decode()
+        prefix, created, cert_id = raw.split(":")
+        if prefix != _BY_CA_MARKER_PREFIX:
+            return None
+        return float(created), cert_id
+    except ValueError:
+        return None
+
+
+def _list_certificates_by_ca(path: str, qp: dict) -> tuple:
+    """``GET /certificates-by-ca/{caCertificateId}`` (``ListCertificatesByCA``).
+
+    Lists the device certificates whose record names the CA: those registered
+    with that ``caCertificatePem``, in every status as on AWS, and those the
+    CA's auto-registration created. ``RegisterCertificateWithoutCA`` leaves
+    are not listed even when the CA issued them, as on AWS. Newest first unless
+    ``isAscendingOrder=true``. A well-formed id that names no CA is an empty
+    list, not an error.
+    """
+    ca_id = path[len("/certificates-by-ca/"):]
+    errors = []
+    if not _CERTIFICATE_ID_RE.fullmatch(ca_id):
+        errors.append(
+            "Value at 'caCertificateId' failed to satisfy constraint: Member must "
+            "satisfy regular expression pattern: (0x)?[a-fA-F0-9]+"
+        )
+    if len(ca_id) != 64:
+        bound = "greater than or equal to" if len(ca_id) < 64 else "less than or equal to"
+        errors.append(
+            "Value at 'caCertificateId' failed to satisfy constraint: Member must "
+            f"have length {bound} 64"
+        )
+    page_size = qp.get("pageSize")
+    if page_size is not None:
+        try:
+            page_size = int(page_size)
+        except ValueError:
+            return error_response_json(
+                "InvalidRequestException", "The request is not valid.", 400
+            )
+        if page_size < 1:
+            errors.append(
+                "Value at 'pageSize' failed to satisfy constraint: Member must have "
+                "value greater than or equal to 1"
+            )
+        elif page_size > 250:
+            errors.append(
+                "Value at 'pageSize' failed to satisfy constraint: Member must have "
+                "value less than or equal to 250"
+            )
+    marker = qp.get("marker")
+    if marker is not None and not _MARKER_RE.fullmatch(marker):
+        errors.append(
+            "Value at 'marker' failed to satisfy constraint: Member must satisfy "
+            "regular expression pattern: [A-Za-z0-9+/]+={0,2}"
+        )
+    if errors:
+        noun = "error" if len(errors) == 1 else "errors"
+        return error_response_json(
+            "InvalidRequestException",
+            f"{len(errors)} validation {noun} detected: " + "; ".join(errors),
+            400,
+        )
+    position = None
+    if marker is not None:
+        position = _by_ca_marker_position(marker)
+        if position is None:
+            return error_response_json(
+                "InvalidRequestException",
+                "Invalid/Malformed marker passed for listCertificateByCA",
+                400,
+            )
+    ascending = _qp_bool(qp, "isAscendingOrder")
+    matched = sorted(
+        (c for c in _certificates.values() if c.get("caCertificateId") == ca_id),
+        key=_by_ca_sort_key,
+        reverse=not ascending,
+    )
+    if position is not None:
+        matched = [
+            c for c in matched
+            if (_by_ca_sort_key(c) > position if ascending else _by_ca_sort_key(c) < position)
+        ]
+    page = matched[:page_size or 250]
+    body = {
+        "certificates": [
+            {
+                "certificateArn": c["certificateArn"],
+                "certificateId": c["certificateId"],
+                "status": c["status"],
+                "creationDate": c.get("creationDate"),
+            }
+            for c in page
+        ]
+    }
+    if len(matched) > len(page):
+        body["nextMarker"] = _by_ca_marker(page[-1])
+    return json_response(body)
 
 
 def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
@@ -4444,6 +4654,10 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
         )
+    if payload.get("jobTemplateArn") is not None:
+        payload, err = _job_payload_from_template(payload)
+        if err:
+            return err
     # Absent means SNAPSHOT (the AWS default); present means it has to be one
     # of the two modeled values — including the empty string, which would
     # otherwise default its way to a SNAPSHOT job the caller never asked for.
@@ -4709,6 +4923,286 @@ def _get_job_document(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     return json_response({"document": job.get("document") or "{}"})
+
+
+# ---------------------------------------------------------------------------
+# Job templates. A template has no update call; CreateJob copies what it needs
+# from one at create time, so deleting a template leaves its jobs as they are.
+# Messages and shapes below were measured on eu-central-1 2026-10-05.
+# ---------------------------------------------------------------------------
+
+# The configuration a template hands to a job created from it, and to a
+# template created from a job (jobArn). A member the request names wins whole.
+_JOB_TEMPLATE_CONFIG_MEMBERS = (
+    "presignedUrlConfig", "jobExecutionsRolloutConfig", "abortConfig",
+    "timeoutConfig", "jobExecutionsRetryConfig",
+)
+_JOB_TEMPLATE_PAGE_MAX = 250
+
+
+def _job_template_arn(template_id: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:jobtemplate/{template_id}"
+
+
+def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+    shown = "null" if value is None else f"'{value}'"
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value {shown} at '{member}' failed to "
+        f"satisfy constraint: {constraint}",
+        400,
+    )
+
+
+def _job_template_id_error(template_id: str) -> tuple | None:
+    if len(template_id) > 64:
+        return _job_template_validation_error(
+            template_id, "jobTemplateId",
+            "Member must have length less than or equal to 64",
+        )
+    if not _JOB_ID_RE.match(template_id):
+        return _job_template_validation_error(
+            template_id, "jobTemplateId",
+            "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+",
+        )
+    return None
+
+
+def _job_template_not_found(template_id: str) -> tuple:
+    return error_response_json(
+        "ResourceNotFoundException", f"Job Template {template_id} cannot be found.", 404
+    )
+
+
+def _handle_job_template(method: str, path: str, body: bytes) -> tuple:
+    template_id = path[len("/job-templates/"):]
+    if "/" in template_id:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    err = _job_template_id_error(template_id)
+    if err:
+        return err
+    if method == "PUT":
+        return _create_job_template(template_id, _parse_body(body))
+    if method == "GET":
+        return _describe_job_template(template_id)
+    if method == "DELETE":
+        return _delete_job_template(template_id)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _create_job_template(template_id: str, payload: dict) -> tuple:
+    if payload.get("description") is None:
+        return _job_template_validation_error(
+            None, "description", "Member must not be null"
+        )
+    document = payload.get("document")
+    if isinstance(document, str) and len(document) > 32768:
+        return _job_template_validation_error(
+            document, "document", "Member must have length less than or equal to 32768"
+        )
+    minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
+    if minutes is not None and not (isinstance(minutes, int) and 1 <= minutes <= 10080):
+        return error_response_json(
+            "InvalidRequestException",
+            "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
+            f"{minutes}.",
+            400,
+        )
+    source = payload.get("documentSource")
+    if document and source:
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document and job document source cannot be specified at the same time.",
+            400,
+        )
+    if not document and not source and not payload.get("jobArn"):
+        return error_response_json(
+            "InvalidRequestException",
+            "Neither job document nor job document source is specified.",
+            400,
+        )
+    if template_id in _job_templates:
+        return error_response_json(
+            "ConflictException", f"Job Template {template_id} already exists.", 409,
+            extra={"resourceId": None},
+        )
+    record = {
+        "jobTemplateArn": _job_template_arn(template_id),
+        "jobTemplateId": template_id,
+        "description": payload["description"],
+        "createdAt": _now_epoch(),
+    }
+    if payload.get("jobArn"):
+        job_id = str(payload["jobArn"]).rsplit("/", 1)[-1]
+        job = _jobs.get(job_id)
+        if job is None or job["jobArn"] != payload["jobArn"]:
+            return error_response_json(
+                "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+            )
+        record["document"] = job.get("document")
+        record["documentSource"] = job.get("documentSource")
+        for member in _JOB_TEMPLATE_CONFIG_MEMBERS:
+            record[member] = copy.deepcopy(job.get(member)) or None
+    if document or source:
+        record["document"] = document
+        record["documentSource"] = source
+    if source and not document:
+        # Same stand-in as CreateJob's: the S3 object is not fetched.
+        record["document"] = json.dumps({"documentSource": source})
+    for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
+        "maintenanceWindows", "destinationPackageVersions", "tags",
+    ):
+        if payload.get(member) is not None:
+            record[member] = copy.deepcopy(payload[member])
+    # The two `double` members read back as floats (25 comes back as 25.0).
+    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
+        if isinstance(criteria.get("thresholdPercentage"), int):
+            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
+    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
+    if isinstance(rate.get("incrementFactor"), int):
+        rate["incrementFactor"] = float(rate["incrementFactor"])
+    _job_templates[template_id] = record
+    return json_response({
+        "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
+    })
+
+
+def _describe_job_template(template_id: str) -> tuple:
+    t = _job_templates.get(template_id)
+    if t is None:
+        return _job_template_not_found(template_id)
+    # AWS writes every member, null when unset, and the three structures
+    # below as objects of nulls; botocore reads those as {}.
+    rollout = {"exponentialRate": None, "maximumPerMinute": None,
+               **(t.get("jobExecutionsRolloutConfig") or {})}
+    if rollout["exponentialRate"] is not None:
+        rate = dict(rollout["exponentialRate"])
+        rate["rateIncreaseCriteria"] = {
+            "numberOfNotifiedThings": None, "numberOfSucceededThings": None,
+            **(rate.get("rateIncreaseCriteria") or {}),
+        }
+        rollout["exponentialRate"] = rate
+    return json_response({
+        "jobTemplateArn": t["jobTemplateArn"],
+        "jobTemplateId": t["jobTemplateId"],
+        "description": t["description"],
+        "documentSource": t.get("documentSource"),
+        "document": t.get("document"),
+        "createdAt": t["createdAt"],
+        "presignedUrlConfig": {"expiresInSec": None, "roleArn": None,
+                               **(t.get("presignedUrlConfig") or {})},
+        "jobExecutionsRolloutConfig": rollout,
+        "abortConfig": t.get("abortConfig"),
+        "timeoutConfig": {"inProgressTimeoutInMinutes": None,
+                          **(t.get("timeoutConfig") or {})},
+        "jobExecutionsRetryConfig": t.get("jobExecutionsRetryConfig"),
+        "maintenanceWindows": t.get("maintenanceWindows"),
+        "destinationPackageVersions": t.get("destinationPackageVersions"),
+    })
+
+
+def _list_job_templates(qp: dict) -> tuple:
+    """``GET /job-templates``, newest first, paged by ``maxResults`` /
+    ``nextToken``; the token carries an offset into that order."""
+    raw = qp.get("maxResults")
+    try:
+        limit = _JOB_TEMPLATE_PAGE_MAX if raw in (None, "") else int(raw)
+    except (TypeError, ValueError):
+        limit = 0
+    if not 1 <= limit <= _JOB_TEMPLATE_PAGE_MAX:
+        bound = ("greater than or equal to 1" if limit < 1
+                 else f"less than or equal to {_JOB_TEMPLATE_PAGE_MAX}")
+        return _job_template_validation_error(
+            raw, "maxResults", f"Member must have value {bound}"
+        )
+    start = 0
+    token = qp.get("nextToken")
+    if token:
+        try:
+            raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+            prefix, _, offset = raw_token.partition(":")
+            start = int(offset) if prefix == "jobtemplates" else -1
+        except ValueError:  # binascii.Error and UnicodeDecodeError included
+            start = -1
+        if start < 0:
+            return error_response_json(
+                "InvalidRequestException", "Next token is invalid.", 400
+            )
+    ordered = sorted(_job_templates.values(), key=lambda t: t["createdAt"], reverse=True)
+    page = ordered[start:start + limit]
+    response = {"jobTemplates": [
+        {k: t[k] for k in ("jobTemplateArn", "jobTemplateId", "description", "createdAt")}
+        for t in page
+    ]}
+    if start + limit < len(ordered):
+        response["nextToken"] = base64.urlsafe_b64encode(
+            f"jobtemplates:{start + limit}".encode()
+        ).decode().rstrip("=")
+    return json_response(response)
+
+
+def _delete_job_template(template_id: str) -> tuple:
+    if _job_templates.get(template_id) is None:
+        return _job_template_not_found(template_id)
+    del _job_templates[template_id]
+    # AWS answers 200 with an empty body.
+    return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
+
+
+def _job_payload_from_template(payload: dict) -> tuple[dict | None, tuple | None]:
+    """CreateJob's request with its jobTemplateArn applied: the template's
+    document (unless the request names a document or a source), its
+    configuration and its maintenance windows; members of the request win.
+    Returns (payload, None) or (None, error)."""
+    arn = payload["jobTemplateArn"]
+    try:
+        parsed = parse_arn(arn)
+    except ArnParseError:
+        return None, error_response_json(
+            "InvalidRequestException", f"Invalid jobTemplateArn: {arn}", 400
+        )
+    resource_type, _, template_id = parsed.resource.partition("/")
+    if resource_type != "jobtemplate":
+        return None, error_response_json(
+            "InvalidRequestException",
+            "Resource type should be jobtemplate but found invalid resource type "
+            f"{resource_type}",
+            400,
+        )
+    template = _job_templates.get(template_id)
+    if template is None or template["jobTemplateArn"] != arn:
+        return None, _job_template_not_found(template_id)
+    merged = {
+        m: copy.deepcopy(template[m]) for m in _JOB_TEMPLATE_CONFIG_MEMBERS if template.get(m)
+    }
+    if not payload.get("document") and not payload.get("documentSource"):
+        merged["document"] = template.get("document")
+        merged["documentSource"] = template.get("documentSource")
+    merged.update({k: v for k, v in payload.items() if v is not None})
+    windows = template.get("maintenanceWindows")
+    if windows:
+        if merged.get("targetSelection", "SNAPSHOT") == "SNAPSHOT":
+            return None, error_response_json(
+                "InvalidRequestException",
+                "TargetSelection is invalid. MaintenanceWindow cannot be used with "
+                "SNAPSHOT job.",
+                400,
+            )
+        sched = dict(merged.get("schedulingConfig") or {})
+        if not sched.get("startTime"):
+            return None, error_response_json(
+                "InvalidRequestException",
+                "MaintenanceWindow cannot be used without StartTime of "
+                "SchedulingConfig.",
+                400,
+            )
+        sched.setdefault("maintenanceWindows", copy.deepcopy(windows))
+        merged["schedulingConfig"] = sched
+    return merged, None
 
 
 async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
@@ -8046,6 +8540,9 @@ _mtls_sessions: set[asyncio.StreamWriter] = set()
 # Digests of the trust anchors already loaded into the live TLS context;
 # emptied whenever a context is built, since a fresh one starts with none.
 _mtls_loaded_anchors: set[str] = set()
+# The server name (SNI) each handshake's ClientHello carried, by its TLS
+# object; just-in-time registration depends on it (see _mtls_server_name_reaches).
+_mtls_server_names: weakref.WeakKeyDictionary[ssl.SSLObject, str] = weakref.WeakKeyDictionary()
 
 import importlib.util as _importlib_util
 
@@ -8212,10 +8709,14 @@ def _mtls_on_client_hello(
     restart, and ``sni_callback`` is the only hook that runs late enough to see
     the current registry yet early enough to matter. It runs on every
     handshake, including those carrying no server name — which is what a
-    device dialling the broker by IP sends. An exception here aborts the
-    handshake with an internal-error alert, so nothing is allowed to escape.
+    device dialling the broker by IP sends. It is also the only place the
+    server side sees that name, so it records whether one was sent. An
+    exception here aborts the handshake with an internal-error alert, so
+    nothing is allowed to escape.
     """
     try:
+        if server_name:
+            _mtls_server_names[ssl_object] = server_name
         _mtls_refresh_trust_anchors(ctx)
     except Exception:
         _mtls_logger.warning("IoT mTLS: trust-anchor refresh failed", exc_info=True)
@@ -8428,30 +8929,57 @@ def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
     return None
 
 
-def _mtls_auto_registering_ca(account_id: str, region: str, ca_id: str | None) -> dict | None:
-    """The CA record when it would auto-register a device certificate now."""
+def _mtls_server_name_reaches(server_name: str, account_id: str) -> bool:
+    """Whether a device that sent ``server_name`` as its SNI may reach ``account_id``.
+
+    An endpoint-shaped name (``<prefix>-ats.iot.`` or ``<prefix>.credentials.iot.``)
+    counts only with this account's prefix; any other name counts.
+    """
+    name = server_name.lower().rstrip(".")
+    first, _, rest = name.partition(".")
+    if first.endswith("-ats") and rest.startswith("iot."):
+        return first[: -len("-ats")] == _endpoint_prefix(account_id)
+    if rest.startswith("credentials.iot."):
+        return first == _endpoint_prefix(account_id)
+    return True
+
+
+def _mtls_auto_registering_ca(
+    account_id: str, region: str, ca_id: str | None, server_name: str | None = None
+) -> dict | None:
+    """The CA record when it would auto-register a device certificate now.
+
+    Without a server name (SNI) only a CA in DEFAULT mode does. With one, a
+    CA in either mode does when the name reaches the CA's account.
+    """
     ca = _ca_certificates.get_scoped(account_id, region, ca_id) if ca_id else None
     if (
         isinstance(ca, dict)
         and ca.get("status") == "ACTIVE"
         and ca.get("autoRegistrationStatus") == "ENABLE"
-        and ca.get("certificateMode", "DEFAULT") == "DEFAULT"
+        and (
+            ca.get("certificateMode", "DEFAULT") == "DEFAULT"
+            if server_name is None
+            else _mtls_server_name_reaches(server_name, account_id)
+        )
     ):
         return ca
     return None
 
 
-def _mtls_auto_registering_signers(cert_pem: str) -> list[tuple[str, str, str]]:
+def _mtls_auto_registering_signers(
+    cert_pem: str, server_name: str | None = None
+) -> list[tuple[str, str, str]]:
     """Every (account_id, region, ca_id) of an auto-registering CA that signed ``cert_pem``."""
     return [
         (account_id, region, ca_id)
         for (account_id, region, ca_id), ca in list(_ca_certificates._data.items())
-        if _mtls_auto_registering_ca(account_id, region, ca_id) is not None
+        if _mtls_auto_registering_ca(account_id, region, ca_id, server_name) is not None
         and certificate_is_signed_by(cert_pem, ca.get("certificatePem") or "")
     ]
 
 
-async def _mtls_auto_register(der: bytes, peername) -> bool:
+async def _mtls_auto_register(der: bytes, peername, server_name: str | None = None) -> bool:
     """Just-in-time registration for a presented certificate that no scope
     holds ACTIVE. True when it applied, and the caller closes without a
     CONNACK; False leaves the refusal to ``_mtls_refuse``.
@@ -8460,7 +8988,8 @@ async def _mtls_auto_register(der: bytes, peername) -> bool:
     auto-registering CA that signed it. A certificate already
     PENDING_ACTIVATION under such a CA only publishes the event again. AWS
     does both on every such connect, and nothing for an INACTIVE certificate
-    or a CA with auto-registration disabled.
+    or a CA with auto-registration disabled. Which CAs qualify depends on
+    the server name the device sent, if any (``_mtls_auto_registering_ca``).
     """
     cert_id = hashlib.sha256(der).hexdigest()
     held = _mtls_active_registrations(cert_id, status=None)
@@ -8470,14 +8999,14 @@ async def _mtls_auto_register(der: bytes, peername) -> bool:
         account_id, region, record = held[0]
         if record.get("status") != "PENDING_ACTIVATION":
             return False
-        if _mtls_auto_registering_ca(account_id, region, record.get("caCertificateId")) is None:
+        if _mtls_auto_registering_ca(account_id, region, record.get("caCertificateId"), server_name) is None:
             return False
         registration_timestamp = str(int(record["creationDate"] * 1000))
     else:
         cert_pem = ssl.DER_cert_to_PEM_cert(der)
         # One signature check per auto-registering CA, off the broker's loop:
         # a device retrying with a refused certificate must not stall it.
-        signers = await asyncio.to_thread(_mtls_auto_registering_signers, cert_pem)
+        signers = await asyncio.to_thread(_mtls_auto_registering_signers, cert_pem, server_name)
         # The same CA registered in several scopes cannot be attributed, for
         # the same reason an ambiguous ACTIVE certificate is refused.
         if len(signers) != 1:
@@ -8604,7 +9133,7 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
             packet = await _mtls_first_packet(reader)
             protocol_level = _connect_protocol_level(packet) if packet else None
             if protocol_level is not None and await _mtls_auto_register(
-                der, writer.get_extra_info("peername")
+                der, writer.get_extra_info("peername"), _mtls_server_names.get(ssl_object)
             ):
                 return
             await _mtls_refuse(writer, hashlib.sha256(der).hexdigest(), protocol_level)
