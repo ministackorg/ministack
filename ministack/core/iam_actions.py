@@ -681,6 +681,12 @@ def extract_iam_action(service: str, method: str, path: str,
         logger.debug("AUTH: no IAM namespace for service %s — allowing", service)
         return None
 
+    # API Gateway management authorizes HTTP verbs, not SDK operation names.
+    # Handle it before Query/JSON extraction: those protocols cannot override
+    # the action of a REST management request (v1 and v2 share this namespace).
+    if service == "apigateway":
+        return f"apigateway:{method}" if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else None
+
     # Tier 1: Action query param (query-protocol services)
     action_name = _action_from_query(query_params, body,
                                      headers.get("content-type", ""))
@@ -1544,22 +1550,13 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- API Gateway (REST path-based) ---
 
     if service == "apigateway":
-        parts = [p for p in path.split("/") if p]
-        # v2: /v2/apis/{apiId}
-        if "apis" in parts:
-            ai = parts.index("apis")
-            if ai + 1 < len(parts):
-                api_id = parts[ai + 1]
-                return f"arn:aws:apigateway:{region}::/apis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/apis/*"
-        # v1: /restapis/{restApiId}
-        if "restapis" in parts:
-            ri = parts.index("restapis")
-            if ri + 1 < len(parts):
-                api_id = parts[ri + 1]
-                return f"arn:aws:apigateway:{region}::/restapis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/restapis/*"
-        return "*"
+        # Management ARNs retain the complete resource/collection path and
+        # have an empty account component. The v2 endpoint prefix is not part
+        # of the ARN. Decode URI labels, including the HTTP API $default stage.
+        # AWS ignores trailing slashes when authorizing management resources,
+        # as our control-plane handlers do when resolving the target resource.
+        resource_path = unquote(path[3:] if path.startswith("/v2/") else path).rstrip("/")
+        return f"arn:aws:apigateway:{region}::{resource_path}"
 
     # --- Bedrock (REST path-based, multiple sub-services) ---
 
