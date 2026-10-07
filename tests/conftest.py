@@ -875,7 +875,7 @@ class _FakeContainers:
                 return c
         raise RuntimeError(f"no such container: {key}")
 
-    def list(self, all=False, filters=None):
+    def list(self, all=False, filters=None, sparse=False):
         want = (filters or {}).get("label") or []
         want = [want] if isinstance(want, str) else want
         out = []

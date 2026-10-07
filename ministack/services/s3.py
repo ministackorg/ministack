@@ -55,6 +55,7 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     CredentialResolutionError,
@@ -3638,6 +3639,7 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
     }
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
+    esm_wake.set()
     logger.info("S3 notification → SQS %s", queue_name)
 
 

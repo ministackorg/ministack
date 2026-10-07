@@ -342,3 +342,47 @@ def test_java_truststore_carries_our_cert_and_the_public_roots(tmp_path, monkeyp
     subjects = [entry.certificate.subject for entry in loaded.additional_certs]
     assert ours.subject in subjects
     assert len(subjects) > 5
+
+
+def _fresh_tls(tmp_path, monkeypatch):
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+
+
+def test_generated_cert_is_a_server_certificate_not_a_ca(tmp_path, monkeypatch):
+    """webpki (rustls) refuses a CA certificate presented as the server's, CaUsedAsEndEntity."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    cert_path, _key = tls.resolve_tls_material()
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "basicConstraints,extendedKeyUsage"],
+        capture_output=True, text=True, check=True).stdout
+    assert "CA:FALSE" in out and "CA:TRUE" not in out
+    assert "TLS Web Server Authentication" in out
+    verify = subprocess.run(["openssl", "verify", "-CAfile", cert_path, cert_path],
+                            capture_output=True, text=True)
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+def test_cached_ca_certificate_is_regenerated(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    names = "".join(f"DNS:{h}," for h in tls._generated_cert_names())
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", f"subjectAltName={names}DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert "CA:FALSE" in subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-ext", "basicConstraints"],
+                                        capture_output=True, text=True, check=True).stdout

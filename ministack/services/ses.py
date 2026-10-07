@@ -14,7 +14,11 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             DeleteConfigurationSet, DescribeConfigurationSet,
             ListConfigurationSets, CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
-            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled.
+            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled,
+            CreateReceiptRuleSet, ListReceiptRuleSets, DescribeReceiptRuleSet,
+            DeleteReceiptRuleSet, SetActiveReceiptRuleSet,
+            DescribeActiveReceiptRuleSet, CreateReceiptRule, DescribeReceiptRule,
+            DeleteReceiptRule.
 
 All emails stored in-memory for test inspection.
 Send statistics aggregated into 15-minute buckets per AWS spec.
@@ -26,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import smtplib
 import time
 from datetime import datetime, timezone
@@ -40,6 +45,7 @@ from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    get_account_id,
     get_region,
     new_uuid,
 )
@@ -56,6 +62,8 @@ _templates = AccountRegionScopedDict()
 _configuration_sets = AccountRegionScopedDict()
 # SESv2 PutAccountDetails, under "account": ProductionAccessEnabled and the details.
 _account_details = AccountRegionScopedDict()
+_receipt_rule_sets = AccountRegionScopedDict()
+_active_receipt_rule_set = AccountRegionScopedDict()
 _SIMULATOR_DOMAIN = "simulator.amazonses.com"
 
 
@@ -77,6 +85,8 @@ def get_state() -> dict:
         "_templates": _templates,
         "_configuration_sets": _configuration_sets,
         "_account_details": _account_details,
+        "_receipt_rule_sets": _receipt_rule_sets,
+        "_active_receipt_rule_set": _active_receipt_rule_set,
     })
 
 
@@ -91,6 +101,10 @@ def _restore_state(data: dict):
         _configuration_sets, data.get("_configuration_sets", {})
     )
     _restore_regional_store(_account_details, data.get("_account_details", {}))
+    _restore_regional_store(_receipt_rule_sets, data.get("_receipt_rule_sets", {}))
+    _restore_regional_store(
+        _active_receipt_rule_set, data.get("_active_receipt_rule_set", {})
+    )
 
 
 def _restore_regional_store(store, restored):
@@ -124,13 +138,22 @@ async def handle_request(method, path, headers, body, query_params):
 
     params = dict(query_params)
     if method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 
     action = _p(params, "Action")
 
     handlers = {
+        "CreateReceiptRuleSet": _create_receipt_rule_set,
+        "ListReceiptRuleSets": _list_receipt_rule_sets,
+        "DescribeReceiptRuleSet": _describe_receipt_rule_set,
+        "DeleteReceiptRuleSet": _delete_receipt_rule_set,
+        "SetActiveReceiptRuleSet": _set_active_receipt_rule_set,
+        "DescribeActiveReceiptRuleSet": _describe_active_receipt_rule_set,
+        "CreateReceiptRule": _create_receipt_rule,
+        "DescribeReceiptRule": _describe_receipt_rule,
+        "DeleteReceiptRule": _delete_receipt_rule,
         "SendEmail": _send_email,
         "SendRawEmail": _send_raw_email,
         "SendTemplatedEmail": _send_templated_email,
@@ -163,6 +186,282 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return _error("InvalidAction", f"Unknown action: {action}", 400)
     return handler(params)
+
+
+# ---------------------------------------------------------------------------
+# v1 — Receipt-rule metadata (AddHeader/Stop only; no receiving execution)
+# ---------------------------------------------------------------------------
+
+_RECEIPT_ACTION_FIELDS = {
+    "S3Action": ("TopicArn", "BucketName", "ObjectKeyPrefix", "KmsKeyArn", "IamRoleArn"),
+    "BounceAction": ("TopicArn", "SmtpReplyCode", "StatusCode", "Message", "Sender"),
+    "WorkmailAction": ("TopicArn", "OrganizationArn"),
+    "LambdaAction": ("TopicArn", "FunctionArn", "InvocationType"),
+    "StopAction": ("Scope", "TopicArn"),
+    "AddHeaderAction": ("HeaderName", "HeaderValue"),
+    "SNSAction": ("TopicArn", "Encoding"),
+    "ConnectAction": ("InstanceARN", "IAMRoleARN"),
+}
+
+
+def _receipt_error(code, message):
+    return _error(code, message, 400, "Sender")
+
+
+def _receipt_result(action, data=None):
+    inner = _receipt_element(f"{action}Result", data or {})
+    # AWS stores headers containing NUL but returns InternalFailure when the
+    # metadata cannot be serialized as XML. Do not emit malformed success XML.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", inner):
+        return _error("InternalFailure", None, 500, "Receiver")
+    return _xml(200, f"{action}Response", inner)
+
+
+def _receipt_element(name, value):
+    if isinstance(value, dict):
+        inner = "".join(_receipt_element(k, v) for k, v in value.items())
+    elif isinstance(value, list):
+        inner = "".join(_receipt_element("member", v) for v in value)
+    elif isinstance(value, bool):
+        inner = str(value).lower()
+    else:
+        inner = _esc(str(value))
+    return f"<{name}>{inner}</{name}>"
+
+
+def _receipt_name_error(params, key, field, business_field=None):
+    if key not in params:
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must not be null"))
+    name = _p(params, key)
+    if not name:
+        return _receipt_error("ValidationError", (
+            f"2 validation errors detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1; "
+            f"Value at '{field}' failed to satisfy constraint: Member must satisfy "
+            "regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if business_field and (len(name) > 64 or not re.fullmatch(
+            r"[a-zA-Z0-9](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9])?", name)):
+        return _receipt_error("InvalidParameterValue", f"Not a valid {business_field}: {name}")
+    return None
+
+
+def _receipt_missing_set(name):
+    return _receipt_error("RuleSetDoesNotExist", f"Rule set does not exist: {name}")
+
+
+def _create_receipt_rule_set(params):
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name in _receipt_rule_sets:
+        return _receipt_error("AlreadyExists", f"Rule set already exists: {name}")
+    _receipt_rule_sets[name] = {
+        "Metadata": {"Name": name, "CreatedTimestamp": datetime.now(timezone.utc).isoformat()},
+        "Rules": [],
+    }
+    return _receipt_result("CreateReceiptRuleSet")
+
+
+def _list_receipt_rule_sets(params):
+    names = sorted(_receipt_rule_sets)
+    token = _p(params, "NextToken")
+    if token:
+        try:
+            last = base64.b64decode(token, validate=True).decode("utf-8")
+            start = names.index(last) + 1
+        except (ValueError, UnicodeError):
+            return _receipt_error("InvalidParameterValue", f"Invalid token: {token}")
+    else:
+        start = 0
+    page = names[start:start + 100]
+    result = {"RuleSets": [_receipt_rule_sets[n]["Metadata"] for n in page]}
+    if start + len(page) < len(names):
+        result["NextToken"] = base64.b64encode(page[-1].encode()).decode()
+    return _receipt_result("ListReceiptRuleSets", result)
+
+
+def _describe_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    return _receipt_result("DescribeReceiptRuleSet", _receipt_rule_sets[name])
+
+
+def _delete_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if _active_receipt_rule_set.get("name") == name:
+        return _receipt_error("CannotDelete", f"Cannot delete active rule set: {name}")
+    _receipt_rule_sets.pop(name, None)
+    return _receipt_result("DeleteReceiptRuleSet")
+
+
+def _set_active_receipt_rule_set(params):
+    if "RuleSetName" not in params:
+        _active_receipt_rule_set.pop("name", None)
+    else:
+        error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+        if error:
+            return error
+        name = _p(params, "RuleSetName")
+        if name not in _receipt_rule_sets:
+            return _receipt_missing_set(name)
+        _active_receipt_rule_set["name"] = name
+    return _receipt_result("SetActiveReceiptRuleSet")
+
+
+def _describe_active_receipt_rule_set(params):
+    name = _active_receipt_rule_set.get("name")
+    return _receipt_result("DescribeActiveReceiptRuleSet", _receipt_rule_sets.get(name, {}))
+
+
+def _receipt_rule_from_params(params):
+    rule = {
+        "Name": _p(params, "Rule.Name"),
+        "Enabled": _p(params, "Rule.Enabled").lower() == "true",
+        "TlsPolicy": _p(params, "Rule.TlsPolicy", "Optional"),
+        "Actions": [],
+        "ScanEnabled": _p(params, "Rule.ScanEnabled").lower() == "true",
+    }
+    if any(k == "Rule.Recipients" or k.startswith("Rule.Recipients.member.") for k in params):
+        recipients = []
+        i = 1
+        while f"Rule.Recipients.member.{i}" in params:
+            recipients.append(_p(params, f"Rule.Recipients.member.{i}"))
+            i += 1
+        rule["Recipients"] = recipients
+    indexes = sorted({int(k.split(".")[3]) for k in params
+                      if re.match(r"^Rule\.Actions\.member\.\d+\.", k)})
+    for i in indexes:
+        action = {}
+        for name, fields in _RECEIPT_ACTION_FIELDS.items():
+            prefix = f"Rule.Actions.member.{i}.{name}."
+            values = {f: _p(params, prefix + f) for f in fields if prefix + f in params}
+            if values:
+                action[name] = values
+        rule["Actions"].append(action)
+    return rule
+
+
+def _receipt_rule_error(rule):
+    tls = rule["TlsPolicy"]
+    if tls not in ("Optional", "Require"):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule.tlsPolicy' failed to satisfy "
+            "constraint: Member must satisfy enum value set: [Optional, Require]"))
+    for i, action in enumerate(rule["Actions"], 1):
+        if len(action) != 1:
+            return _receipt_error("InvalidParameterValue", (
+                "Exactly one action type must be specified for each ReceiptAction"))
+        if "StopAction" in action:
+            if action["StopAction"].get("Scope") != "RuleSet":
+                return _receipt_error("ValidationError", (
+                    f"1 validation error detected: Value at 'rule.actions.{i}.member.stopAction.scope' "
+                    "failed to satisfy constraint: Member must satisfy enum value set: [RuleSet]"))
+            if i != len(rule["Actions"]):
+                return _receipt_error("InvalidParameterValue", (
+                    "Stop action, if any, must be placed at the end of the actions list"))
+        header = action.get("AddHeaderAction")
+        if header is not None:
+            for field in ("HeaderName", "HeaderValue"):
+                if field not in header:
+                    return _receipt_error("ValidationError", (
+                        f"1 validation error detected: Value at 'rule.actions.{i}.member."
+                        f"addHeaderAction.{field[0].lower() + field[1:]}' failed to satisfy "
+                        "constraint: Member must not be null"))
+            name, value = header["HeaderName"], header["HeaderValue"]
+            if not re.fullmatch(r"[a-zA-Z0-9-]{1,50}", name):
+                return _receipt_error("InvalidParameterValue", f"Invalid header name: {name}")
+            if len(value) > 2048 or "\n" in value or "\r" in value:
+                printable = value.replace("\n", "0x000a").replace("\r", "0x000d")
+                return _receipt_error("InvalidParameterValue", f"Invalid header value: {printable}")
+    recipients = rule.get("Recipients", [])
+    for i, recipient in enumerate(recipients):
+        parts = recipient.rsplit("@", 1)
+        domain = parts[-1]
+        if (len(parts) == 2 and not parts[0]) or not re.fullmatch(
+                r"\.?[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
+                r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+", domain) or (
+                    len(parts) == 2 and ("@" in parts[0] or re.search(r"\s", parts[0]))):
+            return _receipt_error("InvalidParameterValue", f"Invalid recipient: {recipient}")
+        recipients[i] = recipient.lower()
+    if "Recipients" in rule:
+        rule["Recipients"] = sorted(set(recipients))
+    return None
+
+
+def _create_receipt_rule(params):
+    if not any(key.startswith("Rule.") for key in params):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule' failed to satisfy "
+            "constraint: Member must not be null"))
+    error = _receipt_name_error(params, "Rule.Name", "rule.name", "ruleName")
+    if error:
+        return error
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if "After" in params:
+        error = _receipt_name_error(params, "After", "after")
+        if error:
+            return error
+    rule = _receipt_rule_from_params(params)
+    error = _receipt_rule_error(rule)
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    if any(r["Name"] == rule["Name"] for r in rules):
+        return _receipt_error("AlreadyExists", f"Rule already exists: {rule['Name']}")
+    after = _p(params, "After")
+    position = 0
+    if after:
+        position = next((i + 1 for i, r in enumerate(rules) if r["Name"] == after), None)
+        if position is None:
+            return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {after}")
+    rules.insert(position, rule)
+    return _receipt_result("CreateReceiptRule")
+
+
+def _describe_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rule = next((r for r in _receipt_rule_sets[name]["Rules"] if r["Name"] == rule_name), None)
+    if rule is None:
+        return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {rule_name}")
+    return _receipt_result("DescribeReceiptRule", {"Rule": rule})
+
+
+def _delete_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    rules[:] = [r for r in rules if r["Name"] != rule_name]
+    return _receipt_result("DeleteReceiptRule")
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +532,7 @@ def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
         mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                        subject, body_text, body_html, msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
     return msg_id
 
 
@@ -311,10 +611,12 @@ def _send_raw_email(params):
                 decoded = base64.b64decode(raw_bytes)
             except Exception:
                 decoded = raw_bytes
-            raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded.decode('utf-8', errors='replace')
+            raw_str = f'Message-ID: <{msg_id}>\r\n' + _strip_message_id_header(
+                decoded.decode('utf-8', errors='replace'))
             _smtp_relay(actual_source, relay_addrs, raw_str)
         except Exception:
             logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
+    _send_notifications(msg_id, actual_source, relay_addrs)
     return _xml(200, "SendRawEmailResponse",
                 f"<SendRawEmailResult><MessageId>{msg_id}</MessageId></SendRawEmailResult>")
 
@@ -363,6 +665,7 @@ def _send_templated_email(params):
                                        rendered.get("Text", ""),
                                        rendered.get("Html", ""), msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
     return _xml(200, "SendTemplatedEmailResponse",
                 f"<SendTemplatedEmailResult><MessageId>{msg_id}</MessageId></SendTemplatedEmailResult>")
 
@@ -419,6 +722,7 @@ def _send_bulk_templated_email(params):
                                            rendered.get("Text", ""),
                                            rendered.get("Html", ""), msg_id)
             _smtp_relay(source, dest["To"], mime_str)
+        _send_notifications(msg_id, source, dest["To"])
         statuses.append(
             f"<member><Status>Success</Status>"
             f"<MessageId>{msg_id}</MessageId></member>")
@@ -501,8 +805,25 @@ def _get_identity_verification_attributes(params):
                 f"</GetIdentityVerificationAttributesResult>")
 
 
+def _tenant_delete_block(kind, name):
+    """Refuse v1 deletes of resources with SESv2 tenant associations, as AWS does."""
+    from ministack.services import ses_v2
+
+    arn = f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+    if any(arn in resources for resources in ses_v2._tenant_resources.values()):
+        return _error(
+            "InvalidParameterValue",
+            f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
+            400,
+        )
+    return None
+
+
 def _delete_identity(params):
     identity = _p(params, "Identity")
+    blocked = _tenant_delete_block("identity", identity)
+    if blocked:
+        return blocked
     _identities.pop(identity, None)
     return _xml(200, "DeleteIdentityResponse", "<DeleteIdentityResult/>")
 
@@ -612,6 +933,9 @@ def _create_configuration_set(params):
 
 def _delete_configuration_set(params):
     name = _p(params, "ConfigurationSetName")
+    blocked = _tenant_delete_block("configuration-set", name)
+    if blocked:
+        return blocked
     if name not in _configuration_sets:
         return _error("ConfigurationSetDoesNotExist",
                        f"Configuration set {name} does not exist", 400)
@@ -681,6 +1005,9 @@ def _get_template(params):
 
 def _delete_template(params):
     name = _p(params, "TemplateName")
+    blocked = _tenant_delete_block("template", name)
+    if blocked:
+        return blocked
     _templates.pop(name, None)
     return _xml(200, "DeleteTemplateResponse", "<DeleteTemplateResult/>")
 
@@ -724,6 +1051,12 @@ def _production_access_enabled() -> bool:
     return (_account_details.get("account") or {}).get("ProductionAccessEnabled", True)
 
 
+def _domain_and_parents(domain: str):
+    """`a.b.com` -> `a.b.com`, `b.com` (the bare TLD is never an identity)."""
+    labels = domain.split(".")
+    return (".".join(labels[i:]) for i in range(len(labels) - 1))
+
+
 def _identity_verified(address: str, *, simulator: bool = False) -> bool:
     """A verified address identity (case-sensitive) or a verified domain identity
     for the address's domain or any parent domain (case-insensitive), in v1 or v2."""
@@ -744,8 +1077,7 @@ def _identity_verified(address: str, *, simulator: bool = False) -> bool:
         return True
     v1 = {k.lower(): r for k, r in _identities.items() if "@" not in k}
     v2 = {k.lower(): r for k, r in ses_v2._identities.items() if "@" not in k}
-    labels = domain.split(".")
-    return any(ok(v1.get(d), v2.get(d)) for d in (".".join(labels[i:]) for i in range(len(labels) - 1)))
+    return any(ok(v1.get(d), v2.get(d)) for d in _domain_and_parents(domain))
 
 
 def _message_rejection(sender, recipients=()) -> str | None:
@@ -758,6 +1090,103 @@ def _message_rejection(sender, recipients=()) -> str | None:
         return None
     return ("Email address is not verified. The following identities failed the check "
             f"in region {get_region().upper()}: {', '.join(failed)}")
+
+
+# Mailbox simulator local part -> (notificationType, bounceSubType) it produces;
+# any other address (success@, ooto@) is delivered.
+_SIMULATOR_OUTCOMES = {
+    "bounce": (("Bounce", "General"),),
+    "suppressionlist": (("Bounce", "Suppressed"),),
+    # Accepted and delivered, then marked as spam.
+    "complaint": (("Delivery", None), ("Complaint", None)),
+}
+
+
+def _notification_identity(source: str) -> tuple[str, dict] | None:
+    """The (name, record) of the identity whose notification topics apply to a
+    sender: the address identity if verified, else the nearest verified parent domain."""
+    addr = parseaddr(source or "")[1]
+    if not addr:
+        return None
+    if addr in _identities:
+        return addr, _identities[addr]
+    domains = {k.lower(): (k, r) for k, r in _identities.items() if "@" not in k}
+    for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
+        if d in domains:
+            return domains[d]
+    return None
+
+
+def _publish_notification(topic_arn: str, payload: dict) -> None:
+    from ministack.services import sns
+
+    try:
+        sns.publish_internal(topic_arn, json.dumps(payload),
+                             "Amazon SES Email Event Notification")
+    except Exception:
+        logger.warning("SES notification publish to %s failed", topic_arn, exc_info=True)
+
+
+def _notification_detail(kind: str, rcpt: str, ts: str, bounce_subtype: str | None = None) -> dict:
+    if kind == "Delivery":
+        return {"delivery": {
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "smtpResponse": "250 2.6.0 Message received",
+            "reportingMTA": "a0-0.smtp-out.amazonses.com"}}
+    if kind == "Bounce" and bounce_subtype == "Suppressed":
+        # SES suppressed the send, so no remote MTA returned a DSN.
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "Suppressed",
+            "bouncedRecipients": [{"emailAddress": rcpt}],
+            "timestamp": ts, "feedbackId": new_uuid()}}
+    if kind == "Bounce":
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "General",
+            "bouncedRecipients": [{
+                "emailAddress": rcpt, "action": "failed", "status": "5.1.1",
+                "diagnosticCode": "smtp; 550 5.1.1 user unknown"}],
+            "timestamp": ts, "feedbackId": new_uuid(),
+            "reportingMTA": "dsn; a0-0.smtp-out.amazonses.com"}}
+    return {"complaint": {
+        "complainedRecipients": [{"emailAddress": rcpt}],
+        "timestamp": ts, "feedbackId": new_uuid(),
+        "userAgent": "Amazon SES Mailbox Simulator",
+        "complaintFeedbackType": "abuse", "arrivalDate": ts}}
+
+
+def _send_notifications(msg_id, source, recipients):
+    """Publish the Delivery / Bounce / Complaint notification of each recipient
+    to the SNS topic set on the sender's identity (SetIdentityNotificationTopic)."""
+    found = _notification_identity(source)
+    if not found:
+        return
+    identity_name, identity = found
+    topics = identity.get("NotificationTopics", {})
+    if not any(topics.values()):
+        return
+    recipients = [a for a in (parseaddr(r)[1] for r in recipients) if a]
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    mail = {
+        "timestamp": ts,
+        # The envelope MAIL FROM address and the identity used to send.
+        "source": parseaddr(source)[1],
+        "sourceArn": f"arn:aws:ses:{get_region()}:{get_account_id()}:identity/{identity_name}",
+        "sendingAccountId": get_account_id(),
+        "messageId": msg_id,
+        "destination": recipients,
+    }
+    for rcpt in recipients:
+        local, _, domain = rcpt.partition("@")
+        outcomes = (("Delivery", None),)
+        if domain.lower() == _SIMULATOR_DOMAIN:
+            outcomes = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], outcomes)
+        for kind, bounce_subtype in outcomes:
+            topic = topics.get(kind)
+            if not topic:
+                continue
+            detail = _notification_detail(kind, rcpt, ts, bounce_subtype)
+            _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
 
 
 def _make_identity(identity, identity_type):
@@ -848,6 +1277,27 @@ def _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
 
 
 _SMTP_TIMEOUT_SECONDS = 10
+
+
+def _strip_message_id_header(raw_str):
+    """Drop client-supplied Message-ID headers (incl. folded lines); real SES replaces it."""
+    lines = raw_str.splitlines(keepends=True)
+    out = []
+    in_headers = True
+    skipping = False
+    for line in lines:
+        if in_headers:
+            if line in ('\r\n', '\n', '\r'):
+                in_headers = False
+            elif line[0] in ' \t':
+                if skipping:
+                    continue
+            else:
+                skipping = line.lower().startswith('message-id:')
+                if skipping:
+                    continue
+        out.append(line)
+    return ''.join(out)
 
 
 def _smtp_relay(source, to_addrs, message_str):
@@ -944,10 +1394,12 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
-def _error(code, message, status):
+def _error(code, message, status, error_type=""):
+    type_xml = f"<Type>{error_type}</Type>" if error_type else ""
+    message_xml = f"<Message>{_esc(message)}</Message>" if message is not None else ""
     body = (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
-            f'<Error><Code>{code}</Code><Message>{_esc(message)}</Message></Error>'
+            f'<Error>{type_xml}<Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
@@ -959,3 +1411,5 @@ def reset():
     _templates.clear()
     _configuration_sets.clear()
     _account_details.clear()
+    _receipt_rule_sets.clear()
+    _active_receipt_rule_set.clear()

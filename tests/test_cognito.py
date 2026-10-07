@@ -384,6 +384,34 @@ def test_cognito_password_auth_unconfirmed_user_is_refused(cognito_idp, admin, p
     assert exc.value.response["Error"]["Code"] == "UserNotConfirmedException"
     assert exc.value.response["Error"]["Message"] == "User is not confirmed."
 
+@pytest.mark.parametrize("admin", [False, True], ids=["user-password-auth", "admin-user-password-auth"])
+def test_cognito_password_auth_reset_required_user_is_refused_until_reset(cognito_idp, admin):
+    """After AdminResetUserPassword, password sign-in is refused until ConfirmForgotPassword."""
+    pid = cognito_idp.create_user_pool(PoolName="ResetRequiredPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="ResetRequiredApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="ivy")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="ivy", Password="IvyPass1!", Permanent=True)
+    cognito_idp.admin_reset_user_password(UserPoolId=pid, Username="ivy")
+
+    def sign_in(password):
+        params = {"USERNAME": "ivy", "PASSWORD": password}
+        if admin:
+            return cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                                                   AuthParameters=params)
+        return cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)
+
+    with pytest.raises(ClientError) as exc:
+        sign_in("IvyPass1!")
+    assert exc.value.response["Error"]["Code"] == "PasswordResetRequiredException"
+    assert exc.value.response["Error"]["Message"] == "Password reset required for the user"
+
+    cognito_idp.confirm_forgot_password(ClientId=cid, Username="ivy", ConfirmationCode="654321", Password="IvyPass2!")
+    assert cognito_idp.admin_get_user(UserPoolId=pid, Username="ivy")["UserStatus"] == "CONFIRMED"
+    assert "AccessToken" in sign_in("IvyPass2!")["AuthenticationResult"]
+
 def test_cognito_signup_and_confirm(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="SignupPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="SignupApp")["UserPoolClient"]["ClientId"]
@@ -8979,7 +9007,9 @@ def test_cognito_srp_empty_challenge_responses(cognito_idp):
     ("sub as username", "UserNotFoundException", "User does not exist."),
     ("disabled", "NotAuthorizedException", "User is disabled."),
     ("unconfirmed", "UserNotConfirmedException", "User is not confirmed."),
-], ids=["missing-srp-a", "non-hex-srp-a", "client-without-srp", "unknown-user", "sub-as-username", "disabled", "unconfirmed"])
+    ("reset required", "PasswordResetRequiredException", "Password reset required for the user"),
+], ids=["missing-srp-a", "non-hex-srp-a", "client-without-srp", "unknown-user", "sub-as-username", "disabled", "unconfirmed",
+        "reset-required"])
 def test_cognito_srp_initiate_refusals(cognito_idp, case, code, message):
     flows = ["ALLOW_USER_PASSWORD_AUTH"] if case == "client without SRP" else ["ALLOW_USER_SRP_AUTH"]
     pid, cid = _srp_pool(cognito_idp, flows)
@@ -8998,6 +9028,8 @@ def test_cognito_srp_initiate_refusals(cognito_idp, case, code, message):
     elif case == "unconfirmed":
         username = "srp-unconfirmed"
         cognito_idp.sign_up(ClientId=cid, Username=username, Password="Correct1!")
+    elif case == "reset required":
+        cognito_idp.admin_reset_user_password(UserPoolId=pid, Username=username)
     auth_params = {"USERNAME": username, **({"SRP_A": srp_a} if srp_a else {})}
     with pytest.raises(ClientError) as exc:
         cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters=auth_params)
