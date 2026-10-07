@@ -190,6 +190,12 @@ async def run_reentrant(fn, *args, thread_name: str = "ministack-reentrant"):
         raise cancellation
 
 
+# Set by every producer of event-source work (an SQS message, a Kinesis record, a
+# DynamoDB stream record), so the Lambda ESM poller picks it up at once instead of
+# on its idle tick.
+esm_wake = threading.Event()
+
+
 def spawn_background(fn, *args, thread_name: str = "ministack-background", **kwargs):
     """Start named fire-and-forget work with its exceptions logged.
 

@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant, spawn_background
+from ministack.core.concurrency import esm_wake, run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
@@ -3772,6 +3772,7 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                     "group_id": None, "dedup_id": None,
                     "dedup_cache_key": None, "seq": None,
                 })
+                esm_wake.set()
                 return
         elif spec.service == "sns":
             import ministack.services.sns as _sns
@@ -7198,8 +7199,8 @@ _ESM_SQS_DEFAULT_CONCURRENCY = 5
 # esm_uuid -> dispatched batches not yet finished.
 _esm_inflight: dict[str, int] = {}
 _esm_inflight_lock = threading.Lock()
-# Set when a dispatched batch finishes, so _poll_loop refills the slot at once.
-_esm_wake = threading.Event()
+# Set when a dispatched batch finishes or a source gains work, so _poll_loop acts at once.
+_esm_wake = esm_wake
 
 
 def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | None = None) -> int:
@@ -7266,8 +7267,13 @@ def _ensure_poller():
             _poller_started = True
 
 
+# A wake that found nothing (another tenant's traffic, an unmapped source) delays the next wake by this much.
+_ESM_IDLE_WAKE_GAP_SECONDS = 0.05
+
+
 def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
+    idle_wake = False
     while True:
         processed = False
         _esm_wake.clear()
@@ -7287,7 +7293,11 @@ def _poll_loop():
         # immediately rather than waiting out the idle cadence below, so
         # throughput isn't throttled to batch_size-per-tick.
         if not processed:
-            _esm_wake.wait(1 if _esms.has_any() else 5)
+            if idle_wake:
+                time.sleep(_ESM_IDLE_WAKE_GAP_SECONDS)
+            idle_wake = bool(_esm_wake.wait(1 if _esms.has_any() else 5))
+        else:
+            idle_wake = False
 
 
 def _iter_all_esms():
@@ -7684,6 +7694,7 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
                     "sys": {"SenderId": get_account_id(), "SentTimestamp": str(int(now * 1000))},
                     "group_id": None, "dedup_id": None, "dedup_cache_key": None, "seq": None,
                 })
+                esm_wake.set()
         elif spec.service == "sns":
             import ministack.services.sns as _sns
             if dest in _sns._topics:

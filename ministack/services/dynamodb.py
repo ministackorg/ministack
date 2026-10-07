@@ -32,7 +32,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import spawn_background
+from ministack.core.concurrency import esm_wake, spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -736,6 +736,7 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
         if table_name not in _stream_records:
             _stream_records[table_name] = []
         _stream_records[table_name].append(record)
+        esm_wake.set()
         _trim_stream_records(table_name)
 
     if has_kinesis:

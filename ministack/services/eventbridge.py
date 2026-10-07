@@ -40,6 +40,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -2497,6 +2498,7 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     queue["messages"].append(msg)
     if hasattr(_sqs, "_ensure_msg_fields"):
         _sqs._ensure_msg_fields(queue["messages"][-1])
+    esm_wake.set()
     logger.info("EventBridge → SQS %s", queue_name)
 
 

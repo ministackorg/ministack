@@ -35,6 +35,7 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid, request_scope
 from ministack.services import sqs as _sqs
 
@@ -1298,6 +1299,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         msg["dedup_id"] = message_dedup_id
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
+    esm_wake.set()
     logger.info("SNS fanout → SQS %s", queue_name)
 
 
