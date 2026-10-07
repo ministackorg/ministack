@@ -25,11 +25,13 @@ from .engine import (
 from .provisioners import (
     _DEFERRED_PREDECESSOR_DELETES,
     _NAME_SEED,
+    _PROPERTY_ENUMS,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
     _custom_named_replacement_error,
     _delete_resource,
     _import_resource,
+    _property_enum_errors,
     _property_recreation,
     _provision_resource,
     _replacing_change,
@@ -79,13 +81,15 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
     signals on its handle, and a nested stack deploys inline and may contain
     either. ElastiCache clusters and replication groups start and stop their
     containers through the Docker daemon, the calls elasticache.py itself
-    keeps off the event loop."""
+    keeps off the event loop. An IoT certificate is registered through the
+    async IoT handler, which a worker thread can wait for."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
                                  "AWS::CloudFormation::Stack",
                                  "AWS::ElastiCache::CacheCluster",
-                                 "AWS::ElastiCache::ReplicationGroup"))
+                                 "AWS::ElastiCache::ReplicationGroup",
+                                 "AWS::IoT::Certificate"))
 
 
 def _update_keeping_seed(*args):
@@ -146,7 +150,7 @@ CLIENT_REQUEST_TOKEN = contextvars.ContextVar("cfn_client_request_token", defaul
 
 
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
-               reason="", physical_id=""):
+               reason="", physical_id="", detailed_status=""):
     """Record a stack event."""
     from ministack.services.cloudformation import _stack_events
     event = {
@@ -163,6 +167,8 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
     token = CLIENT_REQUEST_TOKEN.get()
     if token:
         event["ClientRequestToken"] = token
+    if detailed_status:
+        event["DetailedStatus"] = detailed_status
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
@@ -584,6 +590,52 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
                stack_id)
 
 
+# AWS's reasons for a create that fails its pre-deployment validation.
+_VALIDATION_FAILED = (
+    "Validation failed with {count} error(s). Call DescribeEvents to retrieve the "
+    "full list of issues with resource and property details, resolve each error, "
+    "then retry the operation.")
+_VALIDATION_ROLLBACK = "Validation failure detected. See the operation's FAILED event for details."
+
+
+def _fail_property_validation(stack, stack_id, stack_name, resources_defs, ordered,
+                              param_values, conditions, mappings, disable_rollback):
+    """Fail a create with a property outside its schema enum before provisioning anything."""
+    errors = []
+    for logical_id in ordered:
+        res_def = resources_defs[logical_id]
+        cond = res_def.get("Condition")
+        if cond and not conditions.get(cond, True):
+            continue
+        rtype = res_def.get("Type", "")
+        props = {}
+        for prop in _PROPERTY_ENUMS.get(rtype, {}):
+            raw = (res_def.get("Properties") or {}).get(prop)
+            if any(name in resources_defs for name, _ in _intrinsic_references(raw)):
+                continue
+            props[prop] = _resolve_refs(copy.deepcopy(raw), {}, param_values, conditions,
+                                        mappings, stack_name, stack_id)
+        errors += [(logical_id, prop, reason)
+                   for prop, reason in _property_enum_errors(rtype, props)]
+    if not errors:
+        return False
+    for logical_id, prop, reason in errors:
+        logger.warning("Stack %s validation: /Resources/%s/Properties/%s: %s",
+                       stack_name, logical_id, prop, reason)
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "CREATE_FAILED", _VALIDATION_FAILED.format(count=len(errors)), stack_id,
+               detailed_status="VALIDATION_FAILED")
+    if disable_rollback:
+        stack["StackStatus"] = "CREATE_FAILED"
+        return True
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "ROLLBACK_IN_PROGRESS", _VALIDATION_ROLLBACK, stack_id)
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "ROLLBACK_COMPLETE", "", stack_id)
+    stack["StackStatus"] = "ROLLBACK_COMPLETE"
+    return True
+
+
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
@@ -620,6 +672,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         _add_event(stack_id, stack_name, stack_name,
                    "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
                    str(exc), stack_id)
+        return
+
+    if not is_update and _fail_property_validation(
+            stack, stack_id, stack_name, resources_defs, ordered, param_values,
+            conditions, mappings, disable_rollback):
         return
 
     provisioned_resources: dict = stack.get("_resources", {})
