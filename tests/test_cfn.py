@@ -2005,7 +2005,8 @@ def test_cfn_iot_domain_configuration_lifecycle(cfn, iot_client):
 def test_cfn_iot_domain_configuration_create_only_properties(cfn, iot_client):
     """ServiceType and the other create-only properties replace the
     configuration: refused under a custom name, a new generated name
-    otherwise, with the predecessor deleted in the cleanup."""
+    otherwise, with the predecessor kept by AWS's seven-day hold on deleting
+    an AWS-managed configuration."""
     stack_name = f"cfn-iot-dc-replace-{_uuid_mod.uuid4().hex[:8]}"
     named = f"cfn-dc-{_uuid_mod.uuid4().hex[:8]}"
     cfn.create_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
@@ -2031,9 +2032,13 @@ def test_cfn_iot_domain_configuration_create_only_properties(cfn, iot_client):
     assert second != first and second.startswith("Unnamed-")
     listed = [d["domainConfigurationName"]
               for d in iot_client.list_domain_configurations()["domainConfigurations"]]
-    assert second in listed and first not in listed
+    assert second in listed and first in listed
+    assert iot_client.describe_domain_configuration(
+        domainConfigurationName=first)["domainConfigurationStatus"] == "DISABLED"
 
     cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_FAILED"
+    cfn.delete_stack(StackName=stack_name, RetainResources=["Named", "Unnamed"])
     assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
 
 
