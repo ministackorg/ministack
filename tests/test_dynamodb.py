@@ -7595,3 +7595,32 @@ def test_dynamodb_gsi_multi_attribute_keys(ddb):
             assert exc.value.response["Error"]["Message"] == "Query key condition not supported"
     finally:
         ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_and_scan_pages_stop_at_1mb(ddb):
+    name = f"page-1mb-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "sk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}])
+    try:
+        for i in range(30):
+            ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": f"{i:03}"}, "b": {"S": "x" * 100_000}})
+        for op, kwargs in (("query", {"KeyConditionExpression": "pk = :p",
+                                      "ExpressionAttributeValues": {":p": {"S": "p"}}}),
+                           ("scan", {})):
+            pages, start = [], None
+            while True:
+                extra = {"ExclusiveStartKey": start} if start else {}
+                resp = getattr(ddb, op)(TableName=name, **kwargs, **extra)
+                pages.append(resp["Count"])
+                start = resp.get("LastEvaluatedKey")
+                if not start:
+                    break
+            assert pages == [10, 10, 10], (op, pages)
+        filtered = ddb.scan(TableName=name, FilterExpression="sk = :none",
+                            ExpressionAttributeValues={":none": {"S": "none"}})
+        assert filtered["Count"] == 0 and filtered["ScannedCount"] == 10 and "LastEvaluatedKey" in filtered
+    finally:
+        ddb.delete_table(TableName=name)

@@ -510,6 +510,28 @@ def _attribute_value_size(value: dict) -> int:
     return 0
 
 
+# A Query/Scan page holds at most 1 MB of items read, before any filter.
+_DDB_PAGE_SIZE_BYTES = 1_048_576
+
+
+def _paginate_evaluated_items(items, limit, table, index_name=None):
+    """One Query/Scan page: up to ``Limit`` items, stopping before the item
+    that would take the data read past 1 MB. Index reads count the index
+    entry (its projected attributes). Returns (page, stopped_at_boundary)."""
+    page = []
+    page_bytes = 0
+    for item in items:
+        entry = _apply_index_projection(item, table, index_name) if index_name else item
+        item_bytes = _item_size_bytes(entry)
+        if page and page_bytes + item_bytes > _DDB_PAGE_SIZE_BYTES:
+            return page, True
+        page.append(item)
+        page_bytes += item_bytes
+        if (limit is not None and len(page) >= int(limit)) or page_bytes >= _DDB_PAGE_SIZE_BYTES:
+            return page, True
+    return page, False
+
+
 def _item_size_bytes(item: dict) -> int:
     total = 0
     if not isinstance(item, dict):
@@ -2388,10 +2410,7 @@ def _query(data):
     # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
     # limit — including when the results end exactly at the limit, since it
     # doesn't look ahead. The follow-up page then returns 0 items and no key.
-    has_more = False
-    if limit is not None and len(candidates) >= limit:
-        has_more = len(candidates) > 0
-        candidates = candidates[:limit]
+    candidates, has_more = _paginate_evaluated_items(candidates, limit, table, index_name)
 
     scanned_count = len(candidates)
     query_filter = data.get("QueryFilter")
@@ -2611,10 +2630,7 @@ def _scan(data):
 
     # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
     # still yields a key, because AWS doesn't look ahead.
-    has_more = False
-    if limit is not None and len(all_items) >= limit:
-        has_more = len(all_items) > 0
-        all_items = all_items[:limit]
+    all_items, has_more = _paginate_evaluated_items(all_items, limit, table, index_name)
 
     scanned_count = len(all_items)
 

@@ -37,6 +37,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **DynamoDB — Query and Scan stop each page at 1 MB** — without `Limit`, every matching item came back in one response with no `LastEvaluatedKey`. A page now stops before the item that would take the data read past 1 MB (index pages count the projected entry), before any filter, and returns `LastEvaluatedKey`. Contributed by @DimQ1.
 - **DynamoDB — index Query and write cost no longer grow with table size** — a `Query` on a GSI or LSI read every item in the table, and every write recounted the table. Index partitions and `ItemCount` are now maintained per write. Contributed by @DimQ1.
 - **DynamoDB — `ClientRequestToken` expires after 10 minutes** — `TransactWriteItems` and `ExecuteTransaction` tokens were kept forever; after 10 minutes a reused token is now a new request, and expired tokens are released. Contributed by @DimQ1.
 - **DynamoDB Streams — no record for a write that changes nothing** — a `PutItem` or `UpdateItem` leaving the item unchanged wrote a `MODIFY` record. Contributed by @DimQ1.
