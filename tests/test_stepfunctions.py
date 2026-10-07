@@ -353,6 +353,10 @@ def test_sfn_stop_execution_v2(sfn):
     sfn.stop_execution(executionArn=ex["executionArn"], error="UserAbort", cause="test stop")
     desc = sfn.describe_execution(executionArn=ex["executionArn"])
     assert desc["status"] == "ABORTED"
+    assert (desc["error"], desc["cause"]) == ("UserAbort", "test stop")
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    aborted = next(e for e in events if e["type"] == "ExecutionAborted")
+    assert aborted["executionAbortedEventDetails"] == {"error": "UserAbort", "cause": "test stop"}
 
 def test_sfn_get_execution_history_v2(sfn):
     definition = json.dumps(

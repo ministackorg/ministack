@@ -706,6 +706,8 @@ def _stop_execution(data):
     stop_date = now_iso()
     execution["status"] = "ABORTED"
     execution["stopDate"] = stop_date
+    execution["error"] = data.get("error")
+    execution["cause"] = data.get("cause")
     _add_event(execution, "ExecutionAborted", {
         "executionAbortedEventDetails": {
             "error": data.get("error", ""),

@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Step Functions — `StopExecution` keeps its `error` and `cause`** — they were recorded only in the `ExecutionAborted` history event, so `DescribeExecution` of the aborted execution returned neither. They are now kept on the execution and returned by `DescribeExecution`; AWS returns the `cause` of an execution stopped with one.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 
