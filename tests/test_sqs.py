@@ -777,14 +777,6 @@ def test_sqs_change_message_visibility_invalid_receipt_handle(sqs):
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
-def test_sqs_receive_max_10(sqs):
-    """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
-    url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
-    for i in range(15):
-        sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}")
-    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
-    assert len(msgs.get("Messages", [])) <= 10
-
 def test_sqs_visibility_timeout_zero_makes_visible(sqs):
     """ChangeMessageVisibility to 0 makes message immediately visible again."""
     url = sqs.create_queue(QueueName="qa-sqs-vis0")["QueueUrl"]
@@ -2290,3 +2282,40 @@ def test_queue_url_scheme_http_without_tls(monkeypatch):
     name = _uniq("plain-scheme")
     created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
     assert created.startswith("http://"), created
+
+
+def test_sqs_fifo_queue_delay_and_per_message_delay(sqs):
+    name = f"delay-{_uuid_mod.uuid4().hex[:8]}"
+    fifo = sqs.create_queue(QueueName=f"{name}.fifo", Attributes={
+        "FifoQueue": "true", "ContentBasedDeduplication": "true", "DelaySeconds": "2"})["QueueUrl"]
+    std = sqs.create_queue(QueueName=name, Attributes={"DelaySeconds": "2"})["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=fifo, MessageBody="n", MessageGroupId="g", DelaySeconds=1)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            "Value 1 for parameter DelaySeconds is invalid. "
+            "Reason: The request include parameter that is not valid for this queue type.")
+        sqs.send_message(QueueUrl=fifo, MessageBody="m", MessageGroupId="g", DelaySeconds=0)
+        sqs.send_message(QueueUrl=std, MessageBody="now", DelaySeconds=0)
+        assert "Messages" not in sqs.receive_message(QueueUrl=fifo)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=std)["Messages"]] == ["now"]
+        time.sleep(2.2)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=fifo)["Messages"]] == ["m"]
+    finally:
+        sqs.delete_queue(QueueUrl=fifo)
+        sqs.delete_queue(QueueUrl=std)
+
+
+@pytest.mark.parametrize("value", [0, 11])
+def test_sqs_receive_max_number_of_messages_out_of_range(sqs, value):
+    url = sqs.create_queue(QueueName=f"maxn-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=value)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            f"Value {value} for parameter MaxNumberOfMessages is invalid. "
+            "Reason: Must be between 1 and 10, if provided.")
+    finally:
+        sqs.delete_queue(QueueUrl=url)

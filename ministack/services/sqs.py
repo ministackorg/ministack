@@ -642,8 +642,16 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
         )
 
-    delay = int(data.get("DelaySeconds")
-                or q["attributes"].get("DelaySeconds", "0"))
+    # A per-message DelaySeconds overrides the queue's; FIFO queues accept
+    # only 0 and keep the queue-level delay (real AWS, ap-south-1).
+    _delay = data.get("DelaySeconds")
+    if q["is_fifo"] and _delay is not None and int(_delay) != 0:
+        raise _Err("InvalidParameterValue",
+                   f"Value {int(_delay)} for parameter DelaySeconds is invalid. "
+                   "Reason: The request include parameter that is not valid for this queue type.")
+    if _delay is None or q["is_fifo"]:
+        _delay = q["attributes"].get("DelaySeconds", "0")
+    delay = int(_delay)
     msg_attrs = data.get("MessageAttributes") or {}
     sys_attrs = data.get("MessageSystemAttributes") or {}
     group_id = data.get("MessageGroupId")
@@ -682,7 +690,6 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             return r
         q["fifo_seq"] += 1
         seq = str(q["fifo_seq"]).zfill(20)
-        delay = 0
 
     now = time.time()
     mid = new_uuid()
@@ -729,7 +736,11 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:ReceiveMessage")
 
-    max_n = min(int(data.get("MaxNumberOfMessages", 1)), 10)
+    max_n = int(data.get("MaxNumberOfMessages", 1))
+    if not 1 <= max_n <= 10:
+        raise _Err("InvalidParameterValue",
+                   f"Value {max_n} for parameter MaxNumberOfMessages is invalid. "
+                   "Reason: Must be between 1 and 10, if provided.")
     # An explicit request value wins even when it is 0 — a supplied
     # VisibilityTimeout=0 / WaitTimeSeconds=0 must NOT fall back to the queue
     # attribute (0 is falsy in Python; keying on presence is required).

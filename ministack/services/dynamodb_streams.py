@@ -236,12 +236,16 @@ def _describe_stream(data):
     spec, table_name = source
 
     info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
+    closed = None
     if info is None or info["StreamArn"] != stream_arn:
-        return error_response_json(
-            "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
-        )
+        closed = _ddb.closed_stream(stream_arn)
+        if closed is None:
+            return error_response_json(
+                "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+            )
+        info = closed
 
-    records = _records_for(spec.account_id, spec.region, table_name)
+    records = closed["records"] if closed else _records_for(spec.account_id, spec.region, table_name)
     starting_seq = records[0]["dynamodb"]["SequenceNumber"] if records else None
 
     shard: dict = {
@@ -250,9 +254,16 @@ def _describe_stream(data):
     }
     if starting_seq:
         shard["SequenceNumberRange"]["StartingSequenceNumber"] = starting_seq
+        if closed:
+            shard["SequenceNumberRange"]["EndingSequenceNumber"] = records[-1]["dynamodb"]["SequenceNumber"]
 
-    table = _ddb._tables.get_scoped(spec.account_id, spec.region, table_name, {})
-    key_schema = table.get("KeySchema", [])
+    if closed:
+        key_schema = closed["KeySchema"]
+        created = closed["CreationRequestDateTime"]
+    else:
+        table = _ddb._tables.get_scoped(spec.account_id, spec.region, table_name, {})
+        key_schema = table.get("KeySchema", [])
+        created = table.get("CreationDateTime", 0)
 
     # AWS shard pagination: Limit caps the number of Shards returned (max 100),
     # ExclusiveStartShardId skips past a previously-returned shard. We expose
@@ -269,9 +280,9 @@ def _describe_stream(data):
     description = {
         "StreamArn": stream_arn,
         "StreamLabel": info["StreamLabel"],
-        "StreamStatus": "ENABLED",
+        "StreamStatus": "DISABLED" if closed else "ENABLED",
         "StreamViewType": info["StreamViewType"],
-        "CreationRequestDateTime": table.get("CreationDateTime", 0),
+        "CreationRequestDateTime": created,
         "TableName": table_name,
         "KeySchema": key_schema,
         "Shards": page,
@@ -305,12 +316,15 @@ def _get_shard_iterator(data):
 
     info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
     if info is None or info["StreamArn"] != stream_arn:
-        return error_response_json(
-            "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
-        )
-
-    records = _records_for(spec.account_id, spec.region, table_name)
-    horizon = _horizon(spec.account_id, spec.region, table_name)
+        closed = _ddb.closed_stream(stream_arn)
+        if closed is None:
+            return error_response_json(
+                "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+            )
+        records, horizon = closed["records"], closed["trimmed"]
+    else:
+        records = _records_for(spec.account_id, spec.region, table_name)
+        horizon = _horizon(spec.account_id, spec.region, table_name)
     position = horizon
     if iterator_type == "TRIM_HORIZON":
         position = horizon
@@ -376,21 +390,35 @@ def _get_records(data):
         )
 
     info = _enabled_stream_info(table_name, account_id=account_id, region=region)
+    closed = None
     if info is None or (stream_arn and info["StreamArn"] != stream_arn):
-        return error_response_json(
-            "ExpiredIteratorException",
-            "Iterator references a stream that is no longer enabled",
-            400,
-        )
+        closed = _ddb.closed_stream(stream_arn) if stream_arn else None
+        if closed is None:
+            return error_response_json(
+                "ExpiredIteratorException",
+                "Iterator references a stream that is no longer enabled",
+                400,
+            )
 
     # ``position`` is absolute, so an iterator minted before records expired
     # still lands correctly; one that now points behind the trim horizon
     # resumes at the horizon rather than skipping live records.
-    position = max(position, _horizon(account_id, region, table_name))
-    page = _ddb.stream_records_since(
-        table_name, position, limit, account_id=account_id, region=region
-    )
+    if closed:
+        position = max(position, closed["trimmed"])
+        offset = position - closed["trimmed"]
+        page = closed["records"][offset:offset + limit]
+    else:
+        position = max(position, _horizon(account_id, region, table_name))
+        page = _ddb.stream_records_since(
+            table_name, position, limit, account_id=account_id, region=region
+        )
     next_position = position + len(page)
+    # The Streams Record shape carries no eventSourceARN (Lambda events do).
+    page = [{k: v for k, v in r.items() if k != "eventSourceARN"} for r in page]
+    if closed and next_position >= closed["trimmed"] + len(closed["records"]):
+        # "If set to null, the shard has been closed and the requested
+        # iterator will not return any more data."
+        return json_response({"Records": page})
     next_iterator = _encode_iterator(
         table_name,
         shard_id,

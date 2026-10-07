@@ -1936,8 +1936,7 @@ def _ddb_create(logical_id, props, stack_name):
 
 
 def _ddb_delete(physical_id, props):
-    _dynamodb._tables.pop(physical_id, None)
-    _dynamodb.drop_stream_records(physical_id)
+    _dynamodb.drop_stream_records(physical_id, _dynamodb._tables.pop(physical_id, None))
 
 
 def _ddb_update_call(data):

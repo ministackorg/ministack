@@ -990,3 +990,74 @@ def test_cloudwatch_json_timestamps_are_epoch_numbers(cw):
     for dp in datapoints:
         assert isinstance(dp["Timestamp"], int), (
             f"Timestamp must be int epoch over JSON, got {type(dp['Timestamp']).__name__}: {dp['Timestamp']}")
+
+
+def _cw_period_start():
+    return (int(time.time()) // 3600 - 1) * 3600
+
+
+def test_cloudwatch_values_counts_and_statistic_sets_aggregate_weighted(cw):
+    ns = f"Test/Weighted{_uuid_mod.uuid4().hex[:8]}"
+    ts = _cw_period_start() + 60
+    cw.put_metric_data(Namespace=ns, MetricData=[
+        {"MetricName": "Counted", "Timestamp": ts, "Values": [1.0, 2.0], "Counts": [3.0, 1.0]},
+        {"MetricName": "Set", "Timestamp": ts,
+         "StatisticValues": {"SampleCount": 4, "Sum": 10, "Minimum": 1, "Maximum": 4}},
+        {"MetricName": "Repeated", "Timestamp": ts,
+         "StatisticValues": {"SampleCount": 3, "Sum": 6, "Minimum": 2, "Maximum": 2}},
+        {"MetricName": "Negative", "Timestamp": ts, "Values": [-1.0, 5.0]},
+    ])
+
+    def stats(name, **kw):
+        return cw.get_metric_statistics(Namespace=ns, MetricName=name, StartTime=ts - 60,
+                                         EndTime=ts + 3000, Period=3600, **kw)["Datapoints"][0]
+
+    dp = stats("Counted", Statistics=["SampleCount", "Sum", "Average", "Minimum", "Maximum"])
+    assert (dp["SampleCount"], dp["Sum"], dp["Average"], dp["Minimum"], dp["Maximum"]) == (4, 5, 1.25, 1, 2)
+    assert stats("Counted", ExtendedStatistics=["p50", "p100"])["ExtendedStatistics"] == {"p50": 1, "p100": 2}
+
+    dp = stats("Set", Statistics=["SampleCount", "Sum", "Average", "Minimum", "Maximum"])
+    assert (dp["SampleCount"], dp["Sum"], dp["Average"], dp["Minimum"], dp["Maximum"]) == (4, 10, 2.5, 1, 4)
+    assert "ExtendedStatistics" not in stats("Set", ExtendedStatistics=["p50"])
+    assert stats("Repeated", ExtendedStatistics=["p50"])["ExtendedStatistics"] == {"p50": 2}
+    assert "ExtendedStatistics" not in stats("Negative", ExtendedStatistics=["p50"])
+
+    resp = cw.get_metric_data(StartTime=ts - 60, EndTime=ts + 3000, MetricDataQueries=[
+        {"Id": "neg", "MetricStat": {"Metric": {"Namespace": ns, "MetricName": "Negative"},
+                                     "Period": 3600, "Stat": "p50"}},
+        {"Id": "avg", "MetricStat": {"Metric": {"Namespace": ns, "MetricName": "Negative"},
+                                     "Period": 3600, "Stat": "Average"}}])
+    by_id = {r["Id"]: r["Values"] for r in resp["MetricDataResults"]}
+    assert by_id == {"neg": [], "avg": [2.0]}
+
+
+def test_cloudwatch_query_protocol_put_metric_data_values_and_statistic_values():
+    import urllib.parse
+    import urllib.request
+
+    from conftest import ENDPOINT
+    ns = f"Test/QueryWeighted{_uuid_mod.uuid4().hex[:8]}"
+    ts = _cw_period_start() + 60
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    form = {
+        "Action": "PutMetricData", "Version": "2010-08-01", "Namespace": ns,
+        "MetricData.member.1.MetricName": "Counted", "MetricData.member.1.Timestamp": stamp,
+        "MetricData.member.1.Values.member.1": "1", "MetricData.member.1.Values.member.2": "2",
+        "MetricData.member.1.Counts.member.1": "3", "MetricData.member.1.Counts.member.2": "1",
+        "MetricData.member.2.MetricName": "Set", "MetricData.member.2.Timestamp": stamp,
+        "MetricData.member.2.StatisticValues.SampleCount": "4",
+        "MetricData.member.2.StatisticValues.Sum": "10",
+        "MetricData.member.2.StatisticValues.Minimum": "1",
+        "MetricData.member.2.StatisticValues.Maximum": "4",
+    }
+    req = urllib.request.Request(
+        ENDPOINT, data=urllib.parse.urlencode(form).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/monitoring/aws4_request, "
+                                  "SignedHeaders=host, Signature=x"})
+    assert urllib.request.urlopen(req).status == 200
+    cw = __import__("conftest").make_client("cloudwatch")
+    for name, expected in (("Counted", (4, 5)), ("Set", (4, 10))):
+        dp = cw.get_metric_statistics(Namespace=ns, MetricName=name, StartTime=ts - 60, EndTime=ts + 3000,
+                                      Period=3600, Statistics=["SampleCount", "Sum"])["Datapoints"][0]
+        assert (dp["SampleCount"], dp["Sum"]) == expected

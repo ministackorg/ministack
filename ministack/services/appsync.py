@@ -2433,21 +2433,21 @@ def _ddb_put_item(table, table_name, args):
     if not isinstance(table["items"], defaultdict):
         table["items"] = defaultdict(dict, table["items"])
 
-    table["items"][pk_val][sk_val] = ddb_item
-    table["ItemCount"] = sum(len(v) for v in table["items"].values())
+    _ddb._set_item(table, pk_val, sk_val, ddb_item)
 
     return _strip_ddb_types(ddb_item, [])
 
 
 def _ddb_update_item(table, table_name, args):
     """Update an existing item — merge input fields."""
+    import ministack.services.dynamodb as _ddb
     input_data = args.get("input", args)
     pk_name = table["pk_name"]
     pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
 
     if pk_val in table["items"]:
         sk = next(iter(table["items"][pk_val]), "")
-        existing = table["items"][pk_val].get(sk, {})
+        existing = dict(table["items"][pk_val].get(sk, {}))
         for k, v in input_data.items():
             if isinstance(v, str):
                 existing[k] = {"S": v}
@@ -2455,21 +2455,22 @@ def _ddb_update_item(table, table_name, args):
                 existing[k] = {"N": str(v)}
             elif isinstance(v, bool):
                 existing[k] = {"BOOL": v}
+        if sk in table["items"][pk_val]:
+            _ddb._set_item(table, pk_val, sk, existing)
         return _strip_ddb_types(existing, [])
     return None
 
 
 def _ddb_delete_item(table, table_name, args):
     """Delete an item and return it."""
+    import ministack.services.dynamodb as _ddb
     input_data = args.get("input", args)
     pk_name = table["pk_name"]
     pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
 
     if pk_val in table["items"]:
         sk = next(iter(table["items"][pk_val]), "")
-        item = table["items"][pk_val].pop(sk, None)
-        if not table["items"][pk_val]:
-            table["items"].pop(pk_val, None)
+        item = _ddb._remove_item(table, pk_val, sk)
         if item:
             return _strip_ddb_types(item, [])
     return None

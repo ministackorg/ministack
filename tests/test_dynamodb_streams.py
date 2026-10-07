@@ -7,6 +7,10 @@ visible through the public Streams API used by boto3.client("dynamodbstreams")
 and by Lambda event-source mappings.
 """
 
+import contextlib
+import time
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -544,3 +548,39 @@ def test_records_expire_on_read_without_further_writes(streams_state):
     assert _seqs(_json(streams_service._get_records({
         "ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON"),
     }))) == ["1"]
+
+
+def test_closed_stream_stays_readable_and_new_stream_starts_empty(ddb, ddb_streams):
+    name = f"closed-stream-{uuid.uuid4().hex[:8]}"
+    _make_table(ddb, name)
+    old_arn = _stream_arn(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        ddb.update_table(TableName=name, StreamSpecification={"StreamEnabled": False})
+        desc = ddb_streams.describe_stream(StreamArn=old_arn)["StreamDescription"]
+        assert desc["StreamStatus"] == "DISABLED"
+        seq = desc["Shards"][0]["SequenceNumberRange"]
+        assert seq["EndingSequenceNumber"] == seq["StartingSequenceNumber"]
+        it = ddb_streams.get_shard_iterator(StreamArn=old_arn, ShardId=desc["Shards"][0]["ShardId"],
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        resp = ddb_streams.get_records(ShardIterator=it)
+        assert [r["eventName"] for r in resp["Records"]] == ["INSERT"]
+        assert "eventSourceARN" not in resp["Records"][0]
+        assert "NextShardIterator" not in resp
+
+        time.sleep(0.01)
+        ddb.update_table(TableName=name, StreamSpecification={"StreamEnabled": True,
+                                                              "StreamViewType": "NEW_IMAGE"})
+        new_arn = _stream_arn(ddb, name)
+        assert new_arn != old_arn
+        shard = ddb_streams.describe_stream(StreamArn=new_arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        it = ddb_streams.get_shard_iterator(StreamArn=new_arn, ShardId=shard,
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        assert ddb_streams.get_records(ShardIterator=it)["Records"] == []
+
+        ddb.delete_table(TableName=name)
+        assert ddb_streams.describe_stream(StreamArn=new_arn)["StreamDescription"]["StreamStatus"] == "DISABLED"
+        assert ddb_streams.describe_stream(StreamArn=old_arn)["StreamDescription"]["StreamStatus"] == "DISABLED"
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)

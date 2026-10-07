@@ -194,57 +194,87 @@ def _evict_old_metrics():
 # ---------------------------------------------------------------------------
 
 
-def _calc_stats(values):
-    if not values:
+def _point_stats(pt):
+    """(SampleCount, Sum, Minimum, Maximum) of one stored point: a value seen
+    ``Count`` times, or a published statistic set."""
+    sv = pt.get("_stat")
+    if sv is not None:
+        return (float(sv.get("SampleCount", 0)), float(sv.get("Sum", 0)),
+                float(sv.get("Minimum", 0)), float(sv.get("Maximum", 0)))
+    count = float(pt.get("Count", 1.0))
+    return count, pt["Value"] * count, pt["Value"], pt["Value"]
+
+
+def _calc_stats(points):
+    parts = [_point_stats(p) for p in points]
+    parts = [p for p in parts if p[0] > 0]
+    if not parts:
         return {}
+    count = sum(p[0] for p in parts)
+    total = sum(p[1] for p in parts)
     return {
-        "SampleCount": float(len(values)),
-        "Sum": sum(values),
-        "Average": sum(values) / len(values),
-        "Minimum": min(values),
-        "Maximum": max(values),
+        "SampleCount": count,
+        "Sum": total,
+        "Average": total / count,
+        "Minimum": min(p[2] for p in parts),
+        "Maximum": max(p[3] for p in parts),
     }
 
 
-def _percentile(values, pct):
-    """Extended-statistic percentile of values (0-100), computes the way
-    that CloudWatch documents it: sort ascending and linearly interpolate
-    between the two nearest ranks.
+def _percentile_samples(points):
+    """(value, weight) samples for percentiles, or None when CloudWatch has
+    none: any negative value, or a statistic set that is not a single
+    repeated value ("Min and Max are equal, and Sum is equal to Min
+    multiplied by SampleCount", or SampleCount 1 with Min, Max, Sum equal)."""
+    samples = []
+    for pt in points:
+        count, total, low, high = _point_stats(pt)
+        if count <= 0:
+            continue
+        if pt.get("_stat") is not None and not (low == high and total == low * count):
+            return None
+        if low < 0:
+            return None
+        samples.append((low, count))
+    return samples or None
 
-    Matches e.g. numpy's default ("linear") interpolation method."""
-    if not values:
-        return 0
-    ordered = sorted(values)
-    n = len(ordered)
-    if n == 1:
-        return ordered[0]
-    rank = (pct / 100.0) * (n - 1)
+
+def _percentile(samples, pct):
+    """Extended-statistic percentile (0-100) of weighted samples: sort
+    ascending and linearly interpolate between the two nearest ranks, as if
+    each value appeared ``weight`` times (numpy's default "linear" method)."""
+    ordered = sorted(samples)
+    total = sum(w for _, w in ordered)
+    rank = (pct / 100.0) * (total - 1) if total > 1 else 0.0
+
+    def at(index):
+        seen = 0.0
+        for value, weight in ordered:
+            seen += weight
+            if index < seen:
+                return value
+        return ordered[-1][0]
+
     lower = int(rank)
-    upper = min(lower + 1, n - 1)
     frac = rank - lower
-    return ordered[lower] + frac * (ordered[upper] - ordered[lower])
+    low = at(lower)
+    return low + frac * (at(lower + 1) - low) if frac else low
 
 
 def _is_percentile_stat(stat_name):
     return bool(stat_name) and stat_name[0] in ("p", "P") and stat_name[1:].replace(".", "", 1).isdigit()
 
 
-def _stat_value(stats, stat_name, values=None):
+def _stat_value(stats, stat_name, points=None):
     """Extract a single statistic. stat_name is either a basic statistic name
     already present in stats (Average/Sum/Minimum/Maximum/SampleCount) or an
-    extended-statistic percentile (e.g. "p95", "p99.9"), computed from the raw
-    sample values for this period via _percentile.
-
-    Falls back to Average if values are not available (e.g. callers that only
-    have pre-aggregated stats, not the raw samples) so behavior degrades
-    gracefully rather than raising.
-    """
+    extended-statistic percentile (e.g. "p95", "p99.9") computed from the
+    period's points; None when the percentile is not available for them."""
     if stat_name in stats:
         return stats[stat_name]
     if _is_percentile_stat(stat_name):
-        if values:
-            return _percentile(values, float(stat_name[1:]))
-        return stats.get("Average", 0)
+        samples = _percentile_samples(points or [])
+        return _percentile(samples, float(stat_name[1:])) if samples else None
     return stats.get("Average", 0)
 
 
@@ -273,12 +303,13 @@ def _evaluate_alarm(alarm):
     if not recent:
         return
 
-    recent_values = [p["Value"] for p in recent]
-    stats = _calc_stats(recent_values)
+    stats = _calc_stats(recent)
     # an alarm is configured with either Statistic (basic) or ExtendedStatistic (percentile),
     # never both thus prefer whichever is set.
     stat_name = alarm.get("ExtendedStatistic") or alarm.get("Statistic", "Average")
-    val = _stat_value(stats, stat_name, recent_values)
+    val = _stat_value(stats, stat_name, recent)
+    if val is None:
+        return
     threshold = alarm.get("Threshold", 0)
     op = alarm.get("ComparisonOperator", "")
 
@@ -531,6 +562,30 @@ async def handle_request(method, path, headers, body, query_params):
 # ---------------------------------------------------------------------------
 
 
+def _p_list(params, prefix):
+    out = []
+    while _p(params, f"{prefix}.member.{len(out) + 1}"):
+        out.append(float(_p(params, f"{prefix}.member.{len(out) + 1}")))
+    return out
+
+
+def _store_datum(namespace, name, dims, ts, unit, value, values, counts, stat_values):
+    """Store one MetricDatum: each of ``Values`` once per its ``Counts`` entry
+    (default 1), a statistic set as published, or a single ``Value``."""
+    bucket = _metric_bucket((namespace, name, _dims_key(dims)))
+    base = {"Timestamp": ts, "Unit": unit, "Dimensions": dims}
+    if values is not None:
+        counts = counts or [1.0] * len(values)
+        for v, c in zip(values, counts):
+            bucket.append({**base, "Value": float(v), "Count": float(c)})
+    elif stat_values is not None:
+        count = float(stat_values.get("SampleCount", 0))
+        bucket.append({**base, "Value": float(stat_values.get("Sum", 0)) / count if count else 0.0,
+                       "_stat": stat_values})
+    else:
+        bucket.append({**base, "Value": float(value or 0)})
+
+
 def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         namespace = cbor_data.get("Namespace", "")
@@ -538,40 +593,11 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
             mn = md.get("MetricName", "")
             dims = {d["Name"]: d["Value"] for d in md.get("Dimensions", [])}
 
-            if "Values" in md:
-                values = md["Values"]
-                counts = md.get("Counts", [1.0] * len(values))
-                for v, c in zip(values, counts):
-                    for _ in range(int(c)):
-                        _metric_bucket((namespace, mn, _dims_key(dims))).append(
-                            {
-                                "Timestamp": _parse_ts(md.get("Timestamp"))
-                                or time.time(),
-                                "Value": float(v),
-                                "Unit": md.get("Unit", "None"),
-                                "Dimensions": dims,
-                            }
-                        )
-            elif "StatisticValues" in md:
-                sv = md["StatisticValues"]
-                _metric_bucket((namespace, mn, _dims_key(dims))).append(
-                    {
-                        "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
-                        "Value": sv.get("Sum", 0) / max(sv.get("SampleCount", 1), 1),
-                        "Unit": md.get("Unit", "None"),
-                        "Dimensions": dims,
-                        "_stat": sv,
-                    }
-                )
-            else:
-                _metric_bucket((namespace, mn, _dims_key(dims))).append(
-                    {
-                        "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
-                        "Value": float(md.get("Value", 0)),
-                        "Unit": md.get("Unit", "None"),
-                        "Dimensions": dims,
-                    }
-                )
+            _store_datum(
+                namespace, mn, dims, _parse_ts(md.get("Timestamp")) or time.time(),
+                md.get("Unit", "None"), md.get("Value"), md.get("Values"),
+                md.get("Counts"), md.get("StatisticValues"),
+            )
     else:
         namespace = _p(params, "Namespace")
         i = 1
@@ -588,14 +614,15 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
                     _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Name")
                 ] = _p(params, f"MetricData.member.{i}.Dimensions.member.{j}.Value")
                 j += 1
-            _metric_bucket((namespace, mn, _dims_key(dims))).append(
-                {
-                    "Timestamp": ts,
-                    "Value": value,
-                    "Unit": unit,
-                    "Dimensions": dims,
-                }
-            )
+            values = _p_list(params, f"MetricData.member.{i}.Values")
+            counts = _p_list(params, f"MetricData.member.{i}.Counts")
+            sv = {
+                k: float(_p(params, f"MetricData.member.{i}.StatisticValues.{k}"))
+                for k in ("SampleCount", "Sum", "Minimum", "Maximum")
+                if _p(params, f"MetricData.member.{i}.StatisticValues.{k}")
+            }
+            _store_datum(namespace, mn, dims, ts, unit, value, values or None,
+                         counts or None, sv or None)
             i += 1
 
     _evaluate_all_alarms()
@@ -688,6 +715,7 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         start_time = _parse_ts(cbor_data.get("StartTime"))
         end_time = _parse_ts(cbor_data.get("EndTime"))
         req_stats = cbor_data.get("Statistics", [])
+        req_extended = cbor_data.get("ExtendedStatistics", [])
         req_dims = _dims_from_list(cbor_data.get("Dimensions") or [])
     else:
         namespace = _p(params, "Namespace")
@@ -707,8 +735,11 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         while _p(params, f"Statistics.member.{si}"):
             req_stats.append(_p(params, f"Statistics.member.{si}"))
             si += 1
+        req_extended = []
+        while _p(params, f"ExtendedStatistics.member.{len(req_extended) + 1}"):
+            req_extended.append(_p(params, f"ExtendedStatistics.member.{len(req_extended) + 1}"))
 
-    if not req_stats:
+    if not req_stats and not req_extended:
         req_stats = ["SampleCount", "Sum", "Average", "Minimum", "Maximum"]
 
     all_points = []
@@ -727,12 +758,12 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
     buckets = defaultdict(list)
     for pt in all_points:
         bucket_ts = int(pt["Timestamp"] // period) * period
-        buckets[bucket_ts].append(pt["Value"])
+        buckets[bucket_ts].append(pt)
 
     datapoints = []
     for ts in sorted(buckets):
-        vals = buckets[ts]
-        stats = _calc_stats(vals)
+        pts = buckets[ts]
+        stats = _calc_stats(pts)
         dp = {
             "Timestamp": _ts_iso(ts),
             "Unit": all_points[0]["Unit"] if all_points else "None",
@@ -740,6 +771,13 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         for s in req_stats:
             if s in stats:
                 dp[s] = stats[s]
+        extended = {}
+        for s in req_extended:
+            v = _stat_value(stats, s, pts) if _is_percentile_stat(s) else None
+            if v is not None:
+                extended[s] = v
+        if extended:
+            dp["ExtendedStatistics"] = extended
         datapoints.append(dp)
 
     if is_cbor:
@@ -877,15 +915,17 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
 
         buckets = defaultdict(list)
         for pt in all_pts:
-            buckets[int(pt["Timestamp"] // period) * period].append(pt["Value"])
+            buckets[int(pt["Timestamp"] // period) * period].append(pt)
 
         timestamps = []
         values = []
         for ts in sorted(buckets):
-            bucket_values = buckets[ts]
-            stats = _calc_stats(bucket_values)
+            bucket_pts = buckets[ts]
+            value = _stat_value(_calc_stats(bucket_pts), stat_name, bucket_pts)
+            if value is None:
+                continue
             timestamps.append(_ts_iso(ts))
-            values.append(_stat_value(stats, stat_name, bucket_values))
+            values.append(value)
 
         if return_data:
             results.append(
