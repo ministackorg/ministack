@@ -307,7 +307,7 @@ def run():
             "function_name": init.get("function_name", ""),
             "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
             "memory_limit_in_mb": init.get("memory", 128),
-            "invoked_function_arn": init.get("arn", ""),
+            "invoked_function_arn": _ms_ctx.get("invoked_function_arn", init.get("arn", "")),
             "aws_request_id": _ms_ctx.get("request_id", ""),
             "log_group_name": os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/" + _function_name),
             "log_stream_name": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", ""),
@@ -951,7 +951,7 @@ rl.on("line", async (line) => {
       functionName: process.env.AWS_LAMBDA_FUNCTION_NAME || "",
       functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION || "$LATEST",
       memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE || "128",
-      invokedFunctionArn: process.env._LAMBDA_FUNCTION_ARN || "",
+      invokedFunctionArn: ctx.invoked_function_arn || process.env._LAMBDA_FUNCTION_ARN || "",
       awsRequestId: ctx.request_id || "",
       logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME
         || ("/aws/lambda/" + (process.env.AWS_LAMBDA_FUNCTION_NAME || "")),
@@ -1335,7 +1335,7 @@ class Worker:
         return "\n".join(lines)
 
     def invoke(self, event, request_id: str, *, trace_id: str | None = None,
-               depth=None, durable: dict | None = None) -> dict:
+               depth=None, durable: dict | None = None, invoked_function_arn: str | None = None) -> dict:
         """Run one invocation on this worker.
 
         The per-invocation values travel beside the payload, not inside it:
@@ -1355,13 +1355,14 @@ class Worker:
 
             timeout = self.config.get("Timeout", 30)
             # Only what genuinely differs per invocation. The function's own
-            # identity (name, version, memory, ARN, log group and stream) is
+            # identity (name, version, memory, log group and stream) is
             # already in the worker's environment, where AWS puts it, and both
             # bootstraps build their context object from there.
             envelope = {
                 "event": event,
                 "ctx": {
                     "request_id": request_id,
+                    "invoked_function_arn": invoked_function_arn if invoked_function_arn is not None else self.config.get("FunctionArn", ""),
                     "timeout_ms": int(float(timeout) * 1000),
                     "trace_id": trace_id,
                     "depth": depth,
@@ -1869,7 +1870,7 @@ class ProvidedWorker(Worker):
                         self._stopped()
                         return
                     try:
-                        request_id, event, deadline_ms, trace_id = pending.get(
+                        request_id, event, deadline_ms, trace_id, invoked_function_arn = pending.get(
                             timeout=0.1)
                         break
                     except queue.Empty:
@@ -1880,7 +1881,7 @@ class ProvidedWorker(Worker):
                 self.send_header("Lambda-Runtime-Deadline-Ms", str(deadline_ms))
                 self.send_header(
                     "Lambda-Runtime-Invoked-Function-Arn",
-                    worker.config.get("FunctionArn", ""),
+                    invoked_function_arn,
                 )
                 if trace_id:
                     # The Runtime API header is how AWS hands X-Ray context to
@@ -2091,7 +2092,7 @@ class ProvidedWorker(Worker):
         log = self._drain_stderr_bounded(first_line_wait=0.1)
         return f": {log}" if log else ""
 
-    def invoke(self, event: dict, request_id: str, *, trace_id: str = None) -> dict:
+    def invoke(self, event: dict, request_id: str, *, trace_id: str = None, invoked_function_arn: str | None = None) -> dict:
         """Run one invocation on this environment.
 
         ``trace_id`` is per-invocation X-Ray context, passed separately rather
@@ -2126,7 +2127,8 @@ class ProvidedWorker(Worker):
                 self._current_request_id = request_id
                 pending = self._pending
             deadline_ms = int((time.time() + timeout) * 1000)
-            pending.put((request_id, event, deadline_ms, trace_id))
+            pending.put((request_id, event, deadline_ms, trace_id,
+                         invoked_function_arn if invoked_function_arn is not None else self.config.get("FunctionArn", "")))
 
             deadline = time.monotonic() + timeout
             failure = None

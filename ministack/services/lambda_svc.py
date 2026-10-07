@@ -2989,6 +2989,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             409,
         )
 
+    # Keep caller identity separate from the resolved version's stored config.
+    exec_record = dict(exec_record)
+    exec_record["config"] = dict(exec_record.get("config") or exec_record)
+    exec_record["config"]["FunctionArn"] = _func_arn(name) + (f":{qualifier}" if qualifier else "")
+
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
 
@@ -5270,6 +5275,7 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
             event,
             new_uuid(),
             trace_id=_xray_trace_id_for_invocation(config),
+            invoked_function_arn=config.get("FunctionArn", ""),
             depth=_invoke_depth.get(),
             durable=_durable_env_overlay(),
         )
@@ -5363,6 +5369,7 @@ def _execute_function_provided_warm(func: dict, event: dict,
         result = worker.invoke(
             event, request_id or new_uuid(),
             trace_id=_xray_trace_id_for_invocation(config),
+            invoked_function_arn=config.get("FunctionArn", ""),
         )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}

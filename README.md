@@ -540,7 +540,12 @@ subnet = ec2.create_subnet(
 | `AWS::Cognito::IdentityPool` | Pool ID | — |
 | `AWS::Cognito::IdentityPoolPrincipalTag` | `<pool ID>\|<provider name>` | — |
 | `AWS::Cognito::UserPoolDomain` | Domain | — |
+| `AWS::IoT::Thing` | Thing name | Arn, Id |
+| `AWS::IoT::Certificate` | Certificate id | Arn, Id |
+| `AWS::IoT::ThingPrincipalAttachment` | `{ThingName}\|{Principal}` | None |
+| `AWS::IoT::PolicyPrincipalAttachment` | `{PolicyName}\|{Principal}` | None |
 | `AWS::IoT::CACertificate` | Certificate id | Arn, Id |
+| `AWS::IoT::DomainConfiguration` | Domain configuration name | Arn, DomainType, ServerCertificates |
 | `AWS::IoT::ThingGroup` | Thing group id | Arn, Id |
 | `AWS::ECR::Repository` | Repo name | Arn, RepositoryUri |
 | `AWS::IAM::ManagedPolicy` | Policy ARN | — |
@@ -584,6 +589,8 @@ subnet = ec2.create_subnet(
 | `AWS::SES::EmailIdentity` | Identity | EmailIdentity |
 | `AWS::SES::ConfigurationSet` | Configuration set name | None |
 | `AWS::SES::ConfigurationSetEventDestination` | Event destination ID | Id |
+| `AWS::Signer::SigningProfile` | Profile ARN | Arn, ProfileName, ProfileVersion, ProfileVersionArn |
+| `AWS::Signer::ProfilePermission` | `<statement id>\|<profile name>` | — |
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
 | `AWS::CloudWatch::Alarm` | Alarm name | Arn |
