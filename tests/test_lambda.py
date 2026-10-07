@@ -14284,6 +14284,53 @@ while True:
         assert result["result"] == arn
 
 
+@pytest.mark.parametrize("source", ["sqs", "sqs-visibility", "dynamodb", "kinesis"])
+def test_new_event_source_work_wakes_poll_loop(esm_poll_state, source):
+    """New work for an event source is picked up at once, not on the poller's idle tick."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+    if source == "sqs":
+        _sqs._queues[_sqs._queue_url("wake-q")] = {"name": "wake-q", "messages": [], "attributes": {}, "is_fifo": False,
+                                                  "dedup_cache": {}, "fifo_seq": 0}
+        produce = lambda: _sqs._act_send_message({"MessageBody": "x"}, _sqs._queue_url("wake-q"))  # noqa: E731
+    elif source == "sqs-visibility":
+        url = _sqs_esm_fixture(_lsvc, _sqs, "wake-v")
+        _sqs._queues[url]["messages"][0]["receipt_handle"] = "rh"
+        produce = lambda: _sqs._act_change_visibility({"ReceiptHandle": "rh", "VisibilityTimeout": "0"}, url)  # noqa: E731
+    elif source == "dynamodb":
+        _ddb._create_table({"TableName": "wake-t", "BillingMode": "PAY_PER_REQUEST",
+                            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                            "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"}})
+        produce = lambda: _ddb._put_item({"TableName": "wake-t", "Item": {"pk": {"S": "1"}}})  # noqa: E731
+    else:
+        _kin._create_stream({"StreamName": "wake-s", "ShardCount": 1})
+        _kin._streams["wake-s"]["StreamStatus"] = "ACTIVE"
+        produce = lambda: _kin._put_record({"StreamName": "wake-s", "PartitionKey": "k", "Data": "eA=="})  # noqa: E731
+    _lsvc._esm_wake.clear()
+    produce()
+    assert _lsvc._esm_wake.is_set()
+
+
+def test_poll_loop_paces_wakes_that_find_nothing(esm_poll_state, monkeypatch):
+    """Traffic the poller has no mapping for must not keep it scanning back to back."""
+    waits, sleeps = [], []
+
+    def fake_wait(secs):
+        waits.append(secs)
+        if len(waits) > 2:
+            raise _StopPollLoop()
+        return True
+
+    monkeypatch.setattr(lsvc, "_poll_sqs", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
+    monkeypatch.setattr(lsvc._esm_wake, "wait", fake_wait)
+    monkeypatch.setattr(lsvc.time, "sleep", sleeps.append)
+    with pytest.raises(_StopPollLoop):
+        lsvc._poll_loop()
+    assert sleeps == [lsvc._ESM_IDLE_WAKE_GAP_SECONDS] * 2
+
+
 @pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_invocation_retains_alias_without_mutating_version(monkeypatch, asynchronous, runtime):

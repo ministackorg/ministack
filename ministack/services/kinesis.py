@@ -25,6 +25,7 @@ import time
 import zlib
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -337,6 +338,7 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
         "Data": base64.b64encode(data).decode("ascii"),
         "PartitionKey": partition_key,
     })
+    esm_wake.set()
     return True
 
 
@@ -635,6 +637,7 @@ def _put_record(data):
         "Data": record_data,
         "PartitionKey": partition_key,
     })
+    esm_wake.set()
 
     # Fan out to any Firehose delivery stream configured with this Kinesis
     # stream as its source. Best-effort, must not break this PutRecord.
@@ -714,6 +717,7 @@ def _put_records(data):
         except Exception:
             raw = rd.encode() if isinstance(rd, str) else rd
         fanout_pairs.append((pk, raw))
+    esm_wake.set()
 
     # Fan out the whole batch to any Firehose delivery stream configured with
     # this Kinesis stream as its source. Best-effort, must not break PutRecords.

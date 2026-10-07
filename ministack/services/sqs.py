@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 from ministack.core.tls import use_ssl_enabled
 
@@ -706,6 +707,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         "seq": seq,
     }
     q["messages"].append(msg)
+    esm_wake.set()
 
     if q["is_fifo"] and dedup_id:
         q["dedup_cache"][dedup_cache_key] = {
@@ -818,6 +820,8 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
             break
     if not found:
         raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
+    if vt == 0:
+        esm_wake.set()
     return {}
 
 
@@ -881,6 +885,8 @@ def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
                 break
         if found:
             ok.append({"Id": eid})
+            if vt == 0:
+                esm_wake.set()
         else:
             fail.append({
                 "Id": eid,
@@ -1334,6 +1340,7 @@ def _dlq_sweep(q: dict) -> None:
             moved["receipt_handle"] = None
             moved["visible_at"] = now
             dlq["messages"].append(moved)
+            esm_wake.set()
         else:
             keep.append(m)
     q["messages"] = keep

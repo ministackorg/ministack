@@ -29,6 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — event source mappings pick up new work at once** — a new SQS message, Kinesis record or DynamoDB stream record now wakes the poller instead of waiting for its idle tick, cutting the delay from send to invocation from 0.75 s to about 4 ms.
 - **TLS — the generated certificate works with rustls** — it was a CA certificate, which rustls refuses as a server's (`CaUsedAsEndEntity`). It is now a server certificate (`CA:FALSE`, `serverAuth`), and a cached CA certificate is regenerated.
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request. Contributed by @jayjanssen.
 - **IoT — `DescribeCertificate` reports `certificateMode`** — the field was missing from the description. It is now `SNI_ONLY` for a certificate registered with `RegisterCertificateWithoutCA` and `DEFAULT` for the others, as AWS reports it. Contributed by @iot-rocket.
