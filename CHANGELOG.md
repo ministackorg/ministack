@@ -29,6 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — invocation IDs and Docker logs** — one request ID is propagated to Docker RIE, warm/local Python and Node.js, and provided runtimes. RIE output is identified by executor metadata and saved without a second START / END / REPORT sequence. Other executors and empty RIE output retain synthetic platform logs.
 - **Lambda — event source mappings pick up new work at once** — a new SQS message, Kinesis record or DynamoDB stream record now wakes the poller instead of waiting for its idle tick, cutting the delay from send to invocation from 0.75 s to about 4 ms.
 - **TLS — the generated certificate works with rustls** — it was a CA certificate, which rustls refuses as a server's (`CaUsedAsEndEntity`). It is now a server certificate (`CA:FALSE`, `serverAuth`), and a cached CA certificate is regenerated.
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request. Contributed by @jayjanssen.
