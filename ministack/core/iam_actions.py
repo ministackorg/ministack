@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
 
@@ -1556,6 +1556,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         # AWS ignores trailing slashes when authorizing management resources,
         # as our control-plane handlers do when resolving the target resource.
         resource_path = unquote(path[3:] if path.startswith("/v2/") else path).rstrip("/")
+        if resource_path.startswith("/tags/"):
+            # Tags: ::/tags/{url-encoded-resource-arn} (API Gateway ARN reference).
+            resource_path = "/tags/" + quote(resource_path[len("/tags/"):], safe="")
         return f"arn:aws:apigateway:{region}::{resource_path}"
 
     # --- Bedrock (REST path-based, multiple sub-services) ---

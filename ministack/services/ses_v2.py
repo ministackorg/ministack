@@ -294,12 +294,13 @@ def _local_ses_v2_resource_arn(arn):
         return None, _invalid_resource_arn(arn)
 
     if (
-        spec.service != "ses"
+        spec.partition != "aws"
+        or spec.service != "ses"
         or spec.account_id != get_account_id()
         or spec.region != get_region()
     ):
         return None, _invalid_resource_arn(arn)
-    canonical = f"arn:aws:{spec.service}:{spec.region}:{spec.account_id}:{spec.resource}"
+    canonical = str(spec)
 
     kind, sep, name = spec.resource.partition("/")
     if sep != "/" or not name or ("/" in name and kind != "tenant"):
@@ -333,6 +334,12 @@ def _local_ses_v2_resource_arn(arn):
         return None, _invalid_resource_arn(arn)
 
     return canonical, None
+
+
+# The ResourceType enum of a tenant's associated resources, by ARN resource kind.
+_TENANT_RESOURCE_TYPES = {
+    "identity": "EMAIL_IDENTITY", "configuration-set": "CONFIGURATION_SET", "template": "EMAIL_TEMPLATE",
+}
 
 
 def _missing_tenant(name):
@@ -508,7 +515,7 @@ def _tenant_request(method, sub, data):
             "TenantName": name,
             "TenantId": tenant_id,
             "TenantArn": arn,
-            "CreatedTimestamp": time.time(),
+            "CreatedTimestamp": int(time.time()),
             "Tags": copy.deepcopy(data.get("Tags", [])),
             "SendingStatus": "ENABLED",
         }
@@ -561,7 +568,8 @@ def _tenant_request(method, sub, data):
         return json_response({})
     resources = _tenant_resources[name]
     if sub == "/tenants/resources/list":
-        items = [{"ResourceType": parse_arn(arn).resource.split("/")[0], "ResourceArn": arn} for arn in resources]
+        items = [{"ResourceType": _TENANT_RESOURCE_TYPES[parse_arn(arn).resource.split("/")[0]], "ResourceArn": arn}
+                 for arn in resources]
         filters = data.get("Filter") or {}
         if filters.keys() - {"RESOURCE_TYPE"}:
             return _json_err(
@@ -569,7 +577,7 @@ def _tenant_request(method, sub, data):
                 "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [RESOURCE_TYPE]]",
             )
         resource_type = filters.get("RESOURCE_TYPE")
-        if resource_type is not None and resource_type not in ("configuration-set", "identity", "template"):
+        if resource_type is not None and resource_type not in _TENANT_RESOURCE_TYPES.values():
             return _json_err("BadRequestException", f"Invalid resource type {resource_type} specified.")
         items = sorted(
             (
@@ -592,7 +600,7 @@ def _tenant_request(method, sub, data):
             return _json_err(
                 "AlreadyExistsException", f"Resources {arn} has already been associated with tenant {name}"
             )
-        resources[canonical] = time.time()
+        resources[canonical] = int(time.time())
     return json_response({})
 
 

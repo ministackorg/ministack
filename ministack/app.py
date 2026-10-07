@@ -2528,12 +2528,6 @@ async def _dispatch_service_request(
                 service_context = logs_service_context(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
-            denied = enforce(
-                access_key, iam_action, service, region,
-                resource_arn=resource_arn, service_context=service_context,
-            )
-            if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
-                return logs_validation_error
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (
@@ -2557,6 +2551,9 @@ async def _dispatch_service_request(
                     access_key, iam_action, service, region,
                     resource_arn=resource_arn, service_context=service_context,
                 )
+            # A malformed Logs tagging ARN fails validation ahead of a policy denial.
+            if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
+                return logs_validation_error
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
