@@ -2147,7 +2147,15 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
     if name in _buckets:
-        # Idempotent: same account already owns it — return 200 like real AWS
+        # Outside us-east-1 AWS returns BucketAlreadyOwnedByYou; in us-east-1,
+        # "returns 200 OK and resets the bucket access control lists (ACLs)".
+        if _buckets[name].get("region", "us-east-1") != "us-east-1":
+            return _error("BucketAlreadyOwnedByYou",
+                          "The bucket you tried to create already exists, and you own it.",
+                          409, f"/{name}")
+        _bucket_acl.pop(name, None)
+        if canned_acl:
+            _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
         return 200, {"Location": f"/{name}"}, b""
     if _bucket_owner_account(name) is not None:
         # "After creating a general purpose bucket in the shared global
@@ -3634,7 +3642,7 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
         "md5": hashlib.md5(body.encode()).hexdigest(),
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
     }
     _sqs._ensure_msg_fields(msg)

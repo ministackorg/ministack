@@ -612,6 +612,14 @@ def _act_get_queue_url(data: dict, _u: str) -> dict:
     return {"QueueUrl": url}
 
 
+def queue_delay(q: dict) -> int:
+    """The queue's DelaySeconds; internal producers' messages wait it too."""
+    try:
+        return int(q["attributes"].get("DelaySeconds", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ── SendMessage ─────────────────────────────────────────────
 
 def _act_send_message(data: dict, qurl: str) -> dict:

@@ -1930,8 +1930,6 @@ class TestCrossAccountSns:
             arn, ACCT_B, "sns:Publish"))
         assert _resp_code(_as(ACCT_B, sns_svc._publish, {
             "TopicArn": arn, "Message": "granted"})) == (200, "")
-        topic = sns_svc._topic_by_arn_any_scope(arn)
-        assert [m["message"] for m in topic["messages"]] == ["granted"]
 
     def test_explicit_deny_blocks_same_account(self, auth):
         name = _uniq("xpol-t")

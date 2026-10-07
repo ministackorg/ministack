@@ -306,14 +306,6 @@ def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
     message = json.dumps(record)
     subject = f"Pipes {pipe.get('Name', '')}"
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": "",
-        "message_attributes": {},
-        "timestamp": int(time.time()),
-    })
     _sns._fanout(topic_arn, msg_id, message, subject, "", {})
 
 

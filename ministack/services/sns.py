@@ -290,6 +290,8 @@ def load_persisted_state(data):
 def _restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
+        for topic in _topics.all_values():
+            topic.pop("messages", None)  # publish history is no longer kept
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
         _sms_messages.update(data.get("sms_messages", {}))
         _platform_applications.update(data.get("platform_applications", {}))
@@ -421,7 +423,6 @@ def _create_topic(params):
                 }),
             },
             "subscriptions": [],
-            "messages": [],
             "tags": {},
         }
 
@@ -943,14 +944,6 @@ def publish_internal(
     else:
         msg_id = new_uuid()
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": message_structure,
-        "message_attributes": msg_attrs,
-        "timestamp": int(time.time()),
-    })
     _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
             message_group_id=message_group_id, message_dedup_id=dedup_id)
     logger.info(
@@ -1128,15 +1121,6 @@ def _publish_batch(params):
                     "sequence_number": seq_number,
                 }
 
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
-
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
                     message_group_id=group_id, message_dedup_id=dedup_id)
 
@@ -1150,14 +1134,6 @@ def _publish_batch(params):
         else:
             # ── Standard (non-FIFO) batch entry ──
             msg_id = new_uuid()
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
 
             successful += (
@@ -1290,7 +1266,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         "md5_attrs": _sqs._md5_msg_attrs(sqs_attrs),
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
     }
     if message_group_id:

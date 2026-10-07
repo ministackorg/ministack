@@ -1990,7 +1990,6 @@ def _seed_internal_topic(_sns, name, *, attributes=None, subscriptions=()):
     _sns._topics[arn] = {
         "name": name,
         "arn": arn,
-        "messages": [],
         "subscriptions": list(subscriptions),
         "attributes": attributes or {},
     }
@@ -2000,10 +1999,9 @@ def _seed_internal_topic(_sns, name, *, attributes=None, subscriptions=()):
 def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monkeypatch):
     """A publish through the seam gets everything an HTTP one gets.
 
-    The message_structure and message_attributes here are the two fields the
-    hand-rolled `topic["messages"].append(...)` this replaced used to drop, and
-    both are load-bearing: the first picks the per-protocol body, the second is
-    what a subscription filter policy reads.
+    The message_structure and message_attributes here are both load-bearing:
+    the first picks the per-protocol body, the second is what a subscription
+    filter policy reads.
     """
     delivered = []
     monkeypatch.setattr(
@@ -2036,12 +2034,7 @@ def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monke
     assert result["sequence_number"] is None
     assert result["message_id"]
 
-    stored = sns_internal._topics[arn]["messages"]
-    assert len(stored) == 1
-    assert stored[0]["id"] == result["message_id"]
-    assert stored[0]["subject"] == "a subject"
-    assert stored[0]["message_structure"] == "json"
-    assert stored[0]["message_attributes"] == attrs
+    assert "messages" not in sns_internal._topics[arn]
     # message_structure picked the sqs body rather than the default one.
     assert delivered == ["for-sqs"]
 
@@ -2121,8 +2114,7 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     assert second["duplicate"] is True
     assert second["message_id"] == first["message_id"]
     assert second["sequence_number"] == first["sequence_number"]
-    # ...and neither the store nor the subscriber saw it twice.
-    assert len(sns_internal._topics[arn]["messages"]) == 1
+    # ...and the subscriber did not see it twice.
     assert delivered == ["once"]
 
     # A different dedup id inside the same group is a new message.
@@ -2131,7 +2123,7 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     )
     assert third["duplicate"] is False
     assert third["sequence_number"] == "2".zfill(20)
-    assert len(sns_internal._topics[arn]["messages"]) == 2
+    assert delivered == ["once", "twice"]
 
 
 def test_sns_publish_internal_rejections(sns_internal):
@@ -2319,3 +2311,21 @@ def test_sns_topic_publish_is_not_in_the_sms_log(sns):
 
     assert _sms_log(phoneNumber=phone)["sms_messages"] == {phone: []}
     sns.delete_topic(TopicArn=topic_arn)
+
+
+def test_sns_to_sqs_delivery_waits_for_queue_delay(sns, sqs):
+    name = f"delayed-{_uuid_mod.uuid4().hex[:8]}"
+    topic = sns.create_topic(Name=name)["TopicArn"]
+    url = sqs.create_queue(QueueName=name, Attributes={"DelaySeconds": "2"})["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(QueueUrl=url, Attributes={"Policy": json.dumps(sqs_policy_allow_sns(qarn, topic))})
+    try:
+        sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=qarn,
+                      Attributes={"RawMessageDelivery": "true"})
+        sns.publish(TopicArn=topic, Message="later")
+        assert "Messages" not in sqs.receive_message(QueueUrl=url)
+        time.sleep(2.2)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=url)["Messages"]] == ["later"]
+    finally:
+        sns.delete_topic(TopicArn=topic)
+        sqs.delete_queue(QueueUrl=url)

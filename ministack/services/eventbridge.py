@@ -2469,7 +2469,7 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
         "md5_body": md5,
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
         "attributes": {},
         "message_attributes": {},
@@ -2511,12 +2511,6 @@ def _dispatch_to_sns(arn, payload):
         return
 
     msg_id = new_uuid()
-    topic["messages"].append({
-        "id": msg_id,
-        "message": payload,
-        "subject": "EventBridge Notification",
-        "timestamp": int(time.time()),
-    })
     _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
 

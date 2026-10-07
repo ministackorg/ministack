@@ -479,16 +479,10 @@ def _send_email(params):
     cc_addrs = _collect_list(params, "Destination.CcAddresses.member")
     bcc_addrs = _collect_list(params, "Destination.BccAddresses.member")
     recipients = to_addrs + cc_addrs + bcc_addrs
-    if not source or not _valid_email_address(source):
-        return _error("InvalidParameterValue", "The address specified is not valid.", 400)
-    if not recipients or any(not _valid_email_address(address) for address in recipients):
-        return _error("InvalidParameterValue", "The destination address is not valid.", 400)
-    if "Message.Subject.Data" not in params:
-        return _error("InvalidParameterValue", "The Subject field is required.", 400)
-    if "Message.Body.Text.Data" not in params and "Message.Body.Html.Data" not in params:
-        return _error("InvalidParameterValue", "The message body must contain Text or Html content.", 400)
+    if any(_missing_domain(address) for address in [source, *recipients] if address):
+        return _error("InvalidParameterValue", "Missing final '@domain'", 400)
     if config_set and config_set not in _configuration_sets:
-        return _error("ConfigurationSetDoesNotExist", f"Configuration set {config_set} does not exist.", 400)
+        return _config_set_missing(config_set)
     rejected = _message_rejection(source, recipients)
     if rejected:
         return _error("MessageRejected", rejected, 400)
@@ -508,15 +502,14 @@ def _send_email(params):
                 f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
 
 
-def _valid_email_address(value: str) -> bool:
-    if not value.isascii():
-        return False
-    address = parseaddr(value)[1]
-    if not address or len(address) > 320:
-        return False
-    local, separator, domain = address.rpartition("@")
-    return bool(separator and local and domain and "." in domain
-                and not any(character.isspace() for character in address))
+def _missing_domain(value: str) -> bool:
+    _, separator, domain = parseaddr(value)[1].rpartition("@")
+    return not separator or not domain
+
+
+def _config_set_missing(name):
+    return _error("ConfigurationSetDoesNotExist", f"Configuration set {name} does not exist", 400,
+                  "Sender", fields={"ConfigurationSetName": name})
 
 
 def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
@@ -959,8 +952,7 @@ def _delete_configuration_set(params):
     if blocked:
         return blocked
     if name not in _configuration_sets:
-        return _error("ConfigurationSetDoesNotExist",
-                       f"Configuration set {name} does not exist", 400)
+        return _config_set_missing(name)
     del _configuration_sets[name]
     return _xml(200, "DeleteConfigurationSetResponse", "<DeleteConfigurationSetResult/>")
 
@@ -969,8 +961,7 @@ def _describe_configuration_set(params):
     name = _p(params, "ConfigurationSetName")
     cs = _configuration_sets.get(name)
     if not cs:
-        return _error("ConfigurationSetDoesNotExist",
-                       f"Configuration set {name} does not exist", 400)
+        return _config_set_missing(name)
     return _xml(200, "DescribeConfigurationSetResponse",
                 f"<DescribeConfigurationSetResult>"
                 f"<ConfigurationSet><Name>{cs['Name']}</Name></ConfigurationSet>"
@@ -1416,9 +1407,10 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
-def _error(code, message, status, error_type=""):
+def _error(code, message, status, error_type="", fields=None):
     type_xml = f"<Type>{error_type}</Type>" if error_type else ""
     message_xml = f"<Message>{_esc(message)}</Message>" if message is not None else ""
+    message_xml += "".join(f"<{k}>{_esc(v)}</{k}>" for k, v in (fields or {}).items())
     body = (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
             f'<Error>{type_xml}<Code>{code}</Code>{message_xml}</Error>'

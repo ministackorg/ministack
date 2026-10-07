@@ -1663,7 +1663,6 @@ def _sns_create(logical_id, props, stack_name):
             }),
         },
         "subscriptions": [],
-        "messages": [],
         "tags": _tag_map(props.get("Tags")),
     }
 

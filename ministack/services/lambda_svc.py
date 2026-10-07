@@ -3761,7 +3761,7 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                     "md5_attrs": "",
                     "receipt_handle": None,
                     "sent_at": now,
-                    "visible_at": now,
+                    "visible_at": now + _sqs.queue_delay(target_q),
                     "receive_count": 0,
                     "first_receive_at": None,
                     "message_attributes": {},
@@ -7705,7 +7705,7 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
                 target_q["messages"].append({
                     "id": new_uuid(), "body": body,
                     "md5_body": hashlib.md5(body.encode()).hexdigest(), "md5_attrs": "",
-                    "receipt_handle": None, "sent_at": now, "visible_at": now,
+                    "receipt_handle": None, "sent_at": now, "visible_at": now + _sqs.queue_delay(target_q),
                     "receive_count": 0, "first_receive_at": None, "message_attributes": {},
                     "sys": {"SenderId": get_account_id(), "SentTimestamp": str(int(now * 1000))},
                     "group_id": None, "dedup_id": None, "dedup_cache_key": None, "seq": None,
