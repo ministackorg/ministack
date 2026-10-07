@@ -1656,6 +1656,17 @@ class TestResourceArn:
         assert extract_resource_arn("signer", "GET", "/signing-jobs", {}, b"", {"status": "Succeeded"}, "us-east-1", "123") == "*"
         assert extract_resource_arn("signer", "POST", "/signing-jobs", {}, b"not json", {}, "us-east-1", "123") == "*"
 
+    def test_signer_cancel_and_profile_permissions(self):
+        """CancelSigningProfile and the three profile-permission actions
+        are scoped to the signing profile."""
+        from ministack.core.iam_actions import extract_resource_arn
+        arn = "arn:aws:signer:us-east-1:123:/signing-profiles/fleet"
+        for method, path in (("DELETE", "/signing-profiles/fleet"),
+                             ("POST", "/signing-profiles/fleet/permissions"),
+                             ("GET", "/signing-profiles/fleet/permissions"),
+                             ("DELETE", "/signing-profiles/fleet/permissions/s1")):
+            assert extract_resource_arn("signer", method, path, {}, b"{}", {}, "us-east-1", "123") == arn
+
     def test_elb_passthrough_arn(self):
         from ministack.core.iam_actions import extract_resource_arn
         lb_arn = "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-lb/abc"
