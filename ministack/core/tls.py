@@ -44,6 +44,29 @@ def cognito_idp_hosts() -> "list[str]":
     return list(dict.fromkeys(hosts))
 
 
+def iot_endpoint_hosts() -> "list[str]":
+    """Every region's IoT DescribeEndpoint hosts, which SDKs dial as https://<address>."""
+    import ipaddress
+
+    from ministack.services.account import _REGIONS_LIST
+
+    host = os.environ.get("MINISTACK_HOST", "localhost").strip().lower()
+    try:
+        ipaddress.ip_address(host)
+        return []  # An address under an IP literal is not a DNS name a cert can carry.
+    except ValueError:
+        pass
+    if not host or ":" in host:
+        return []
+    regions = [os.environ.get("MINISTACK_REGION", "us-east-1")] + _REGIONS_LIST
+    hosts = [name for r in regions for name in (f"*.iot.{r}.{host}", f"*.credentials.iot.{r}.{host}")]
+    return list(dict.fromkeys(hosts))
+
+
+def _generated_cert_names() -> "list[str]":
+    return cognito_idp_hosts() + iot_endpoint_hosts()
+
+
 def ca_bundle_path(cert_path: str) -> "str | None":
     """System roots plus `cert_path` (the *_CA_BUNDLE vars replace the store), or None."""
     import ssl
@@ -147,8 +170,8 @@ def resolve_tls_material() -> "tuple[str, str]":
     cert_path = os.path.join(tls_dir, "server.crt")
     key_path = os.path.join(tls_dir, "server.key")
     if (os.path.exists(cert_path) and os.path.exists(key_path)
-            and not _cert_names(cert_path, cognito_idp_hosts())):
-        # Cached by an older build: regenerate so every issuer host is covered.
+            and not _cert_names(cert_path, _generated_cert_names())):
+        # Cached by an older build or another MINISTACK_HOST: regenerate so every name is covered.
         os.remove(cert_path)
         os.remove(key_path)
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
@@ -159,7 +182,7 @@ def resolve_tls_material() -> "tuple[str, str]":
             "-subj", "/CN=ministack-local/O=MiniStack",
             "-addext",
             "subjectAltName=DNS:localhost,DNS:ministack,"
-            + "".join(f"DNS:{host}," for host in cognito_idp_hosts())
+            + "".join(f"DNS:{host}," for host in _generated_cert_names())
             + "IP:127.0.0.1,IP:0:0:0:0:0:0:0:1",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.chmod(cert_path, 0o600)

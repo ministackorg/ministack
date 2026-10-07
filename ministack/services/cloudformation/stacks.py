@@ -81,13 +81,15 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
     signals on its handle, and a nested stack deploys inline and may contain
     either. ElastiCache clusters and replication groups start and stop their
     containers through the Docker daemon, the calls elasticache.py itself
-    keeps off the event loop."""
+    keeps off the event loop. An IoT certificate is registered through the
+    async IoT handler, which a worker thread can wait for."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
                                  "AWS::CloudFormation::Stack",
                                  "AWS::ElastiCache::CacheCluster",
-                                 "AWS::ElastiCache::ReplicationGroup"))
+                                 "AWS::ElastiCache::ReplicationGroup",
+                                 "AWS::IoT::Certificate"))
 
 
 def _update_keeping_seed(*args):

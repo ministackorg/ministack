@@ -744,6 +744,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             != new.get("TemplateType", "FLEET_PROVISIONING")
         ),
     },
+    "AWS::IoT::JobTemplate": {"name": "JobTemplateId"},
     "AWS::Lambda::Function": {"name": "FunctionName"},
     "AWS::SQS::Queue": {
         "name": "QueueName",
@@ -12780,6 +12781,193 @@ def _glue_trigger_delete(physical_id, props):
     _glue._delete_trigger({"Name": physical_id})
 
 
+# --- IoT Thing, Certificate and the principal attachments ---
+# Each calls the IoT control-plane handler the matching API call reaches. The
+# delete handlers follow the CloudFormation resource handlers: a certificate
+# is deactivated first, and a thing or certificate that still has an
+# attachment made outside the stack fails the delete with the service's
+# message instead of losing it.
+
+
+def _iot_thing_attrs(name):
+    rec = _iot._things.get(name) or {}
+    return {"Arn": rec.get("thingArn", _iot._thing_arn(name)), "Id": rec.get("thingId", "")}
+
+
+def _iot_thing_create(logical_id, props, stack_name):
+    name = props.get("ThingName") or _physical_name(stack_name, logical_id)
+    # CreateThing answers 200 for an identical existing thing, but a stack
+    # never adopts one: AWS fails its name-conflict validation first.
+    if name in _iot._things:
+        raise ValueError(f"Resource of type 'AWS::IoT::Thing' with identifier '{name}' already exists.")
+    payload = {}
+    if props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._create_thing(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing create failed: {resp[2]!r}")
+    return name, _iot_thing_attrs(name)
+
+
+def _iot_thing_update(physical_id, old_props, new_props, stack_name):
+    """Apply AttributePayload in place: the declared attributes replace the
+    stored ones, and a template that drops AttributePayload leaves them as
+    they are (measured on an account). A ThingName change is a replacement,
+    performed before this runs."""
+    payload = {}
+    if new_props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": new_props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._update_thing(physical_id, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing update failed: {resp[2]!r}")
+    return physical_id, _iot_thing_attrs(physical_id)
+
+
+def _iot_thing_import(identifier):
+    return identifier["ThingName"], _iot_thing_attrs(identifier["ThingName"])
+
+
+def _iot_thing_delete(physical_id, props):
+    thing = _iot._things.get(physical_id)
+    if thing is None:
+        return
+    if any(p.rsplit("/", 1)[-1] in _iot._certificates for p in thing.get("principals", [])):
+        raise ValueError(
+            f"Cannot delete. Thing {physical_id} is still attached to one or more principals")
+    _iot._delete_thing(physical_id)
+
+
+def _iot_certificate_attrs(cert_id):
+    return {"Arn": _iot._cert_arn(cert_id), "Id": cert_id}
+
+
+def _iot_certificate_status(cert_id, status):
+    resp = _iot._handle_certificate("PUT", f"/certificates/{cert_id}", b"", {"newStatus": status})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate status update failed: {resp[2]!r}")
+
+
+def _iot_certificate_call(path, payload):
+    """POST to the IoT control plane. Its register handlers are async, so the
+    type runs on a worker thread (``_runs_on_worker_thread``) and waits for
+    the request on the serving loop."""
+    from ministack import app
+
+    return app.call_service_handler_sync(
+        _iot.handle_request, "POST", path, {}, json.dumps(payload).encode(), {})
+
+
+def _iot_certificate_create(logical_id, props, stack_name):
+    """Create the certificate the way the declared properties select:
+    SNI_ONLY registers CertificatePem without a CA, DEFAULT either signs
+    CertificateSigningRequest or registers CertificatePem under
+    CACertificatePem. Any other combination is refused with AWS's message."""
+    status = props.get("Status")
+    if not status:
+        raise ValueError("AWS::IoT::Certificate requires Status")
+    csr = props.get("CertificateSigningRequest")
+    pem = props.get("CertificatePem")
+    ca_pem = props.get("CACertificatePem")
+    if props.get("CertificateMode") == "SNI_ONLY":
+        if csr or ca_pem or not pem:
+            raise ValueError(
+                "Invalid request provided: For certificate mode SNI_ONLY, the following "
+                "combination must be specified exactly: [CertificatePem]")
+        resp = _iot_certificate_call(
+            "/certificate/register-no-ca", {"certificatePem": pem, "status": status})
+    elif csr and not pem and not ca_pem:
+        resp = _iot_certificate_call("/certificates", {"certificateSigningRequest": csr})
+    elif pem and ca_pem and not csr:
+        resp = _iot_certificate_call(
+            "/certificate/register", {"certificatePem": pem, "caCertificatePem": ca_pem, "status": status})
+    else:
+        raise ValueError(
+            "Invalid request provided: For certificate mode Default, one of the following "
+            "combinations must be specified exactly: [CertificatePem and CACertificatePem] "
+            "OR [CertificateSigningRequest]")
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate create failed: {resp[2]!r}")
+    cert_id = json.loads(resp[2])["certificateId"]
+    if csr and status != "INACTIVE":
+        # CreateCertificateFromCsr only knows setAsActive.
+        _iot_certificate_status(cert_id, status)
+    return cert_id, _iot_certificate_attrs(cert_id)
+
+
+def _iot_certificate_update(physical_id, old_props, new_props, stack_name):
+    """Status is the one property that updates in place; the PEM, CSR and
+    mode properties are create-only and replace the certificate."""
+    _iot_certificate_status(physical_id, new_props.get("Status"))
+    return physical_id, _iot_certificate_attrs(physical_id)
+
+
+def _iot_certificate_import(identifier):
+    return identifier["Id"], _iot_certificate_attrs(identifier["Id"])
+
+
+def _iot_certificate_delete(physical_id, props):
+    cert = _iot._certificates.get(physical_id)
+    if cert is None:
+        return
+    if cert["status"] == "ACTIVE":
+        _iot_certificate_status(physical_id, "INACTIVE")
+    arn = cert["certificateArn"]
+    # The service refuses DeleteCertificate while things are attached, then
+    # while policies are, in that order.
+    if any(_iot._thing_name_from_arn(t) in _iot._things for t in cert.get("attachedThings", [])):
+        raise ValueError(f"Things must be detached before deletion (arn: {arn})")
+    if _iot._policies_attached_to(arn):
+        raise ValueError(f"Certificate policies must be detached before deletion (arn: {arn})")
+    resp = _iot._handle_certificate("DELETE", f"/certificates/{physical_id}", b"", {})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate delete failed: {resp[2]!r}")
+
+
+def _iot_thing_principal_attachment_call(method, thing, principal, thing_principal_type=None):
+    qp = {"thingPrincipalType": thing_principal_type} if thing_principal_type else {}
+    return _iot._handle_thing_principals(
+        method, f"/things/{thing}/principals", {"x-amzn-principal": principal}, b"", qp)
+
+
+def _iot_thing_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{ThingName}|{Principal}``, the physical id AWS reports."""
+    thing, principal = props.get("ThingName"), props.get("Principal")
+    if not thing or not principal:
+        raise ValueError("AWS::IoT::ThingPrincipalAttachment requires ThingName and Principal")
+    resp = _iot_thing_principal_attachment_call(
+        "PUT", thing, principal, props.get("ThingPrincipalType"))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{thing}|{principal}", {}
+
+
+def _iot_thing_principal_attachment_delete(physical_id, props):
+    thing, _, principal = physical_id.partition("|")
+    resp = _iot_thing_principal_attachment_call("DELETE", thing, principal)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment delete failed: {resp[2]!r}")
+
+
+def _iot_policy_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{PolicyName}|{Principal}``, the physical id AWS reports."""
+    policy, principal = props.get("PolicyName"), props.get("Principal")
+    if not policy or not principal:
+        raise ValueError("AWS::IoT::PolicyPrincipalAttachment requires PolicyName and Principal")
+    resp = _iot._change_policy_target(policy, principal, attach=True)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{policy}|{principal}", {}
+
+
+def _iot_policy_principal_attachment_delete(physical_id, props):
+    policy, _, principal = physical_id.partition("|")
+    resp = _iot._change_policy_target(policy, principal, attach=False)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment delete failed: {resp[2]!r}")
+
+
 # --- IoT ThingType / Policy, Cognito IdentityPoolRoleAttachment,
 #     Lambda LayerVersionPermission (#1345, item 5) ---
 # Each maps onto the service's own control-plane create, so the resource is
@@ -13098,6 +13286,51 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
 
 def _iot_provisioning_template_delete(physical_id, props):
     _iot._delete_provisioning_template(physical_id)
+
+
+# AWS::IoT::JobTemplate. Every property is create-only (a change is a
+# replacement, refused under the required, custom JobTemplateId), so the type
+# has no update handler. Two CloudFormation member names differ from the API's.
+_IOT_JOB_TEMPLATE_RENAMES = {
+    "exponentialRolloutRate": "exponentialRate",
+    "retryCriteriaList": "criteriaList",
+}
+
+
+def _iot_job_template_payload(props):
+    props = dict(props)
+    if isinstance(props.get("Document"), (dict, list)):
+        props["Document"] = json.dumps(props["Document"])
+    tags = props.pop("Tags", None)
+    props.pop("JobTemplateId", None)
+    payload = {
+        key: ({_IOT_JOB_TEMPLATE_RENAMES.get(k, k): v for k, v in value.items()}
+              if isinstance(value, dict) else value)
+        for key, value in _pascal_to_camel(props).items()
+        if value is not None
+    }
+    if tags:
+        payload["tags"] = tags
+    return payload
+
+
+def _iot_job_template_create(logical_id, props, stack_name):
+    template_id = str(props.get("JobTemplateId") or "")
+    # A stack never adopts an existing template: AWS fails its name-conflict
+    # validation before creating anything (measured eu-central-1, 2026-10-05).
+    if template_id in _iot._job_templates:
+        raise ValueError(
+            f"Resource of type 'AWS::IoT::JobTemplate' with identifier '{template_id}' already exists."
+        )
+    resp = (_iot._job_template_id_error(template_id)
+            or _iot._create_job_template(template_id, _iot_job_template_payload(props)))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::JobTemplate create failed: {resp[2]!r}")
+    return template_id, {"Arn": _iot._job_template_arn(template_id)}
+
+
+def _iot_job_template_delete(physical_id, props):
+    _iot._delete_job_template(physical_id)
 
 
 def _registration_config_payload(props):
@@ -13542,6 +13775,12 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
+    "AWS::IoT::Thing": ("ThingName",),
+    "AWS::IoT::Certificate": (
+        "CACertificatePem", "CertificateMode", "CertificatePem", "CertificateSigningRequest",
+    ),
+    "AWS::IoT::ThingPrincipalAttachment": ("Principal", "ThingName", "ThingPrincipalType"),
+    "AWS::IoT::PolicyPrincipalAttachment": ("PolicyName", "Principal"),
     "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
     "AWS::IoT::ThingType": ("ThingTypeName",),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
@@ -13559,6 +13798,11 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
+    "AWS::IoT::JobTemplate": (
+        "JobTemplateId", "JobArn", "Description", "Document", "DocumentSource",
+        "TimeoutConfig", "JobExecutionsRolloutConfig", "AbortConfig", "PresignedUrlConfig",
+        "DestinationPackageVersions", "JobExecutionsRetryConfig", "MaintenanceWindows", "Tags",
+    ),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (
         "Name", "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
@@ -14426,6 +14670,26 @@ _RESOURCE_HANDLERS = {
         "update": _sm_target_attachment_update,
         "delete": _sm_target_attachment_delete,
     },
+    "AWS::IoT::Thing": {
+        "create": _iot_thing_create,
+        "update": _iot_thing_update,
+        "delete": _iot_thing_delete,
+        "import": _iot_thing_import,
+    },
+    "AWS::IoT::Certificate": {
+        "create": _iot_certificate_create,
+        "update": _iot_certificate_update,
+        "delete": _iot_certificate_delete,
+        "import": _iot_certificate_import,
+    },
+    "AWS::IoT::ThingPrincipalAttachment": {
+        "create": _iot_thing_principal_attachment_create,
+        "delete": _iot_thing_principal_attachment_delete,
+    },
+    "AWS::IoT::PolicyPrincipalAttachment": {
+        "create": _iot_policy_principal_attachment_create,
+        "delete": _iot_policy_principal_attachment_delete,
+    },
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,
         "update": _iot_topic_rule_update,
@@ -14457,6 +14721,10 @@ _RESOURCE_HANDLERS = {
         "update": _iot_provisioning_template_update,
         "update_with_logical_id": True,
         "delete": _iot_provisioning_template_delete,
+    },
+    "AWS::IoT::JobTemplate": {
+        "create": _iot_job_template_create,
+        "delete": _iot_job_template_delete,
     },
     "AWS::IoT::CACertificate": {
         "create": _iot_ca_certificate_create,

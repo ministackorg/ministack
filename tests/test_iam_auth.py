@@ -1784,6 +1784,12 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_job_template(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn(
+            "iot", "PUT", "/job-templates/ota", {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:jobtemplate/ota"
+
     def test_iot_publish_topic_keeps_every_level(self):
         """A topic ARN carries the whole topic, not its first segment:
         arn:aws:iot:...:topic/sensors/rack-1/temperature. Truncating it to
