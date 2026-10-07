@@ -11,7 +11,9 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           PutAccountSuppressionAttributes, TagResource, UntagResource,
           ListTagsForResource, CreateTenant, GetTenant, ListTenants, DeleteTenant,
           CreateTenantResourceAssociation, DeleteTenantResourceAssociation,
-          ListTenantResources, ListResourceTenants, PutTenantSuppressionAttributes.
+          ListTenantResources, ListResourceTenants, PutTenantSuppressionAttributes,
+          CreateDedicatedIpPool, GetDedicatedIpPool, ListDedicatedIpPools,
+          DeleteDedicatedIpPool.
 Email templates live in the v1 store, so either API version sees the other's.
 """
 
@@ -62,6 +64,7 @@ _config_sets = AccountRegionScopedDict()  # name -> dict
 _ses_tags = AccountRegionScopedDict()  # resource_arn -> [tags]
 _tenants = AccountRegionScopedDict()
 _tenant_resources = AccountRegionScopedDict()  # tenant name -> {ARN: timestamp}
+_dedicated_ip_pools = AccountRegionScopedDict()  # pool name -> {PoolName, ScalingMode}
 
 
 def get_state() -> dict:
@@ -71,6 +74,7 @@ def get_state() -> dict:
         "_ses_tags": _ses_tags,
         "_tenants": _tenants,
         "_tenant_resources": _tenant_resources,
+        "_dedicated_ip_pools": _dedicated_ip_pools,
     })
 
 
@@ -84,6 +88,7 @@ def _restore_state(data: dict):
     _restore_tag_store(data.get("_ses_tags", {}))
     _restore_regional_store(_tenants, data.get("_tenants", {}))
     _restore_regional_store(_tenant_resources, data.get("_tenant_resources", {}))
+    _restore_regional_store(_dedicated_ip_pools, data.get("_dedicated_ip_pools", {}))
 
 
 def _restore_tag_store(restored):
@@ -311,6 +316,9 @@ def _local_ses_v2_resource_arn(arn):
             return None, _not_found_resource_arn(arn)
     elif kind == "configuration-set":
         if name not in _config_sets:
+            return None, _not_found_resource_arn(arn)
+    elif kind == "dedicated-ip-pool":
+        if name not in _dedicated_ip_pools:
             return None, _not_found_resource_arn(arn)
     elif kind == "tenant":
         parts = name.split("/")
@@ -871,6 +879,38 @@ async def handle_request(method, path, headers, body, query_params):
             _identities.pop(identity, None)
             return json_response({})
 
+    # /v2/email/dedicated-ip-pools  (Create/Get/List/DeleteDedicatedIpPool)
+    if sub == "/dedicated-ip-pools" and method == "POST":
+        name = data.get("PoolName", "")
+        if not name:
+            return _json_err("BadRequestException", "PoolName is required")
+        if name in _dedicated_ip_pools:
+            return _json_err("AlreadyExistsException", f"Pool {name} already exists")
+        _dedicated_ip_pools[name] = {"PoolName": name, "ScalingMode": data.get("ScalingMode") or "STANDARD"}
+        _ses_tags[_resource_arn("dedicated-ip-pool", name)] = list(data.get("Tags", []))
+        return json_response({})
+
+    if sub == "/dedicated-ip-pools" and method == "GET":
+        page, next_token, err = _paginate(list(_dedicated_ip_pools.keys()), query_params, 100, maximum=1000)
+        if err:
+            return err
+        out = {"DedicatedIpPools": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
+
+    m = re.match(r"^/dedicated-ip-pools/([^/]+)$", sub)
+    if m and method in ("GET", "DELETE"):
+        name = m.group(1)
+        pool = _dedicated_ip_pools.get(name)
+        if pool is None:
+            return _json_err("NotFoundException", f"Pool {name} does not exist", 404)
+        if method == "GET":
+            return json_response({"DedicatedIpPool": dict(pool)})
+        _dedicated_ip_pools.pop(name, None)
+        _ses_tags.pop(_resource_arn("dedicated-ip-pool", name), None)
+        return json_response({})
+
     # POST /v2/email/configuration-sets  (CreateConfigurationSet)
     if sub == "/configuration-sets" and method == "POST":
         name = data.get("ConfigurationSetName", "")
@@ -1016,3 +1056,4 @@ def reset():
     _ses_tags.clear()
     _tenants.clear()
     _tenant_resources.clear()
+    _dedicated_ip_pools.clear()
