@@ -4921,19 +4921,25 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
             }
         stream = group["streams"][stream_name]
 
+        start = f"START RequestId: {request_id} Version: {qualifier}"
+        end = f"END RequestId: {request_id}"
+
+        def _report():
+            return (f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
+                    f"Billed Duration: {duration_ms} ms\tMemory Size: "
+                    f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {_probe_peak_memory_mb(func)} MB")
+
         if log_source == "rie" and log_text:
             lines = log_text.splitlines()
+            # RIE prints START on every invoke but no END/REPORT when init or the invoke fails (502).
+            if not any(line.startswith(f"START RequestId: {request_id}") for line in lines):
+                lines.insert(0, start)
+            if not any(line.startswith(end) for line in lines):
+                lines.append(end)
+            if not any(line.startswith(f"REPORT RequestId: {request_id}") for line in lines):
+                lines.append(_report())
         else:
-            lines = [f"START RequestId: {request_id} Version: {qualifier}"]
-            if log_text:
-                lines.extend(log_text.splitlines())
-            lines.append(f"END RequestId: {request_id}")
-            peak_mb = _probe_peak_memory_mb(func)
-            lines.append(
-                f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
-                f"Billed Duration: {duration_ms} ms\tMemory Size: "
-                f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {peak_mb} MB"
-            )
+            lines = [start, *(log_text.splitlines() if log_text else []), end, _report()]
         for line in lines:
             stream["events"].append({"timestamp": now_ms, "message": line, "ingestionTime": now_ms})
         if stream["firstEventTimestamp"] is None:
