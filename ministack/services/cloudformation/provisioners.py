@@ -705,6 +705,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             for p in ("ThingTypeDescription", "SearchableAttributes")
         ),
     },
+    "AWS::IoT::DomainConfiguration": {"name": "DomainConfigurationName"},
     # BackupVaultName is required, so every vault is custom-named. Measured on
     # an account: adding EncryptionKeyArn fails with the refusal sentence.
     "AWS::Backup::BackupVault": {
@@ -754,6 +755,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TopicName",
         "exists": "Topic creation failed because the topic already exists",
     },
+    # A permission's identity is StatementId + ProfileName.
+    "AWS::Signer::SigningProfile": {"name": "ProfileName"},
+    "AWS::Signer::ProfilePermission": {"name": ("StatementId", "ProfileName")},
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
     # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
@@ -854,9 +858,15 @@ def _custom_named_replacement_error(resource_type, old_props, new_props,
 
 
 def _kept_custom_name(resource_type, old_props, new_props):
-    """The explicit name an update keeps unchanged, else None."""
+    """The explicit name (or tuple of names) an update keeps unchanged, else None."""
     spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
-    name = old_props.get(spec["name"]) if spec else None
+    if not spec:
+        return None
+    if isinstance(spec["name"], tuple):
+        names = [old_props.get(p) for p in spec["name"]]
+        kept = all(names) and names == [new_props.get(p) for p in spec["name"]]
+        return "|".join(str(n) for n in names) if kept else None
+    name = old_props.get(spec["name"])
     return name if name and name == new_props.get(spec["name"]) else None
 
 
@@ -1139,6 +1149,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ServiceDiscovery::PrivateDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::PublicDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::Service": ("Tags", "list"),
+    "AWS::Signer::SigningProfile": ("Tags", "list"),
     "AWS::StepFunctions::StateMachine": ("Tags", "list"),
 }
 
@@ -10486,6 +10497,128 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# Signer SigningProfile and ProfilePermission
+# ---------------------------------------------------------------------------
+
+# PlatformId's allowed values in the CloudFormation template reference.
+_SIGNER_CFN_PLATFORMS = ("AWSLambda-SHA384-ECDSA", "Notation-OCI-SHA384-ECDSA")
+
+# Property enums checked before a stack create provisions anything.
+_PROPERTY_ENUMS = {
+    "AWS::Signer::SigningProfile": {"PlatformId": _SIGNER_CFN_PLATFORMS},
+}
+
+
+def _property_enum_errors(resource_type, props):
+    """(property, reason) for each value outside its schema enum."""
+    return [
+        (prop, f"{props[prop]} is not a valid enum value. Supported values: "
+               f"[{', '.join(allowed)}]")
+        for prop, allowed in _PROPERTY_ENUMS.get(resource_type, {}).items()
+        if isinstance(props.get(prop), str) and props[prop] not in allowed
+    ]
+
+
+def _signer_raise_on_error(resp, resource_type):
+    if resp[0] >= 400:
+        try:
+            message = json.loads(resp[2]).get("message")
+        except (ValueError, AttributeError):
+            message = None
+        raise ValueError(message or f"{resource_type} failed: {resp[2]!r}")
+
+
+def _signer_profile_attrs(profile):
+    return {
+        "Arn": profile["arn"],
+        "ProfileName": profile["profileName"],
+        "ProfileVersion": profile["profileVersion"],
+        "ProfileVersionArn": profile["profileVersionArn"],
+    }
+
+
+def _signer_profile_name_from_arn(physical_id):
+    return str(physical_id).rsplit("/signing-profiles/", 1)[-1]
+
+
+def _signer_signing_profile_create(logical_id, props, stack_name):
+    """Ref is the profile ARN; a generated name is <LogicalId>_ + 12 random letters and digits."""
+    import ministack.services.signer as _signer
+    # The stack checks the enum before provisioning; a value that came from
+    # another resource is only known here.
+    for _prop, reason in _property_enum_errors("AWS::Signer::SigningProfile", props):
+        raise ValueError(reason)
+    platform = props.get("PlatformId")
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    # 51 + "_" + 12 keeps a long logical id inside the 64-character limit.
+    name = props.get("ProfileName") or f"{logical_id[:51]}_{suffix}"
+    body = {"platformId": platform}
+    period = props.get("SignatureValidityPeriod")
+    if isinstance(period, dict):
+        value = period.get("Value")
+        body["signatureValidityPeriod"] = {
+            k: v for k, v in (("type", period.get("Type")),
+                              ("value", int(value) if value is not None else None))
+            if v is not None
+        }
+    _signer_raise_on_error(_signer._put_signing_profile(name, body),
+                           "AWS::Signer::SigningProfile")
+    profile = _signer._profiles[name]
+    profile["tags"] = _tag_map(props.get("Tags"))
+    return profile["arn"], _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_update(physical_id, old_props, new_props, stack_name):
+    """Only Tags update in place; the profile keeps its version."""
+    import ministack.services.signer as _signer
+    profile = _signer._profiles.get(_signer_profile_name_from_arn(physical_id))
+    if profile is None:
+        raise ValueError(f"AWS::Signer::SigningProfile {physical_id} not found")
+    if not isinstance(profile.get("tags"), dict):
+        profile["tags"] = {}
+    _reconcile_tag_map(profile["tags"], old_props, new_props)
+    return physical_id, _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_delete(physical_id, props):
+    """A profile cannot be deleted: CloudFormation cancels it."""
+    import ministack.services.signer as _signer
+    _signer._cancel_signing_profile(_signer_profile_name_from_arn(physical_id))
+
+
+def _signer_current_revision(profile_name):
+    import ministack.services.signer as _signer
+    policy = (_signer._profiles.get(profile_name) or {}).get("policy")
+    return policy["revisionId"] if policy else None
+
+
+def _signer_profile_permission_create(logical_id, props, stack_name):
+    """Ref is <StatementId>|<ProfileName>; adds at the policy's current revision."""
+    import ministack.services.signer as _signer
+    name = props.get("ProfileName", "")
+    sid = props.get("StatementId", "")
+    body = {
+        "action": props.get("Action"),
+        "principal": str(props.get("Principal", "")),
+        "statementId": sid,
+        "profileVersion": props.get("ProfileVersion"),
+        "revisionId": _signer_current_revision(name),
+    }
+    _signer_raise_on_error(
+        _signer._add_profile_permission(name, {k: v for k, v in body.items() if v is not None}),
+        "AWS::Signer::ProfilePermission")
+    return f"{sid}|{name}", {}
+
+
+def _signer_profile_permission_delete(physical_id, props):
+    import ministack.services.signer as _signer
+    sid, _, name = str(physical_id).partition("|")
+    revision = _signer_current_revision(name)
+    if revision is not None:
+        _signer._remove_profile_permission(name, sid, revision)
+
+
+# ---------------------------------------------------------------------------
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 
@@ -12628,6 +12761,193 @@ def _glue_trigger_delete(physical_id, props):
     _glue._delete_trigger({"Name": physical_id})
 
 
+# --- IoT Thing, Certificate and the principal attachments ---
+# Each calls the IoT control-plane handler the matching API call reaches. The
+# delete handlers follow the CloudFormation resource handlers: a certificate
+# is deactivated first, and a thing or certificate that still has an
+# attachment made outside the stack fails the delete with the service's
+# message instead of losing it.
+
+
+def _iot_thing_attrs(name):
+    rec = _iot._things.get(name) or {}
+    return {"Arn": rec.get("thingArn", _iot._thing_arn(name)), "Id": rec.get("thingId", "")}
+
+
+def _iot_thing_create(logical_id, props, stack_name):
+    name = props.get("ThingName") or _physical_name(stack_name, logical_id)
+    # CreateThing answers 200 for an identical existing thing, but a stack
+    # never adopts one: AWS fails its name-conflict validation first.
+    if name in _iot._things:
+        raise ValueError(f"Resource of type 'AWS::IoT::Thing' with identifier '{name}' already exists.")
+    payload = {}
+    if props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._create_thing(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing create failed: {resp[2]!r}")
+    return name, _iot_thing_attrs(name)
+
+
+def _iot_thing_update(physical_id, old_props, new_props, stack_name):
+    """Apply AttributePayload in place: the declared attributes replace the
+    stored ones, and a template that drops AttributePayload leaves them as
+    they are (measured on an account). A ThingName change is a replacement,
+    performed before this runs."""
+    payload = {}
+    if new_props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": new_props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._update_thing(physical_id, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing update failed: {resp[2]!r}")
+    return physical_id, _iot_thing_attrs(physical_id)
+
+
+def _iot_thing_import(identifier):
+    return identifier["ThingName"], _iot_thing_attrs(identifier["ThingName"])
+
+
+def _iot_thing_delete(physical_id, props):
+    thing = _iot._things.get(physical_id)
+    if thing is None:
+        return
+    if any(p.rsplit("/", 1)[-1] in _iot._certificates for p in thing.get("principals", [])):
+        raise ValueError(
+            f"Cannot delete. Thing {physical_id} is still attached to one or more principals")
+    _iot._delete_thing(physical_id)
+
+
+def _iot_certificate_attrs(cert_id):
+    return {"Arn": _iot._cert_arn(cert_id), "Id": cert_id}
+
+
+def _iot_certificate_status(cert_id, status):
+    resp = _iot._handle_certificate("PUT", f"/certificates/{cert_id}", b"", {"newStatus": status})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate status update failed: {resp[2]!r}")
+
+
+def _iot_certificate_call(path, payload):
+    """POST to the IoT control plane. Its register handlers are async, so the
+    type runs on a worker thread (``_runs_on_worker_thread``) and waits for
+    the request on the serving loop."""
+    from ministack import app
+
+    return app.call_service_handler_sync(
+        _iot.handle_request, "POST", path, {}, json.dumps(payload).encode(), {})
+
+
+def _iot_certificate_create(logical_id, props, stack_name):
+    """Create the certificate the way the declared properties select:
+    SNI_ONLY registers CertificatePem without a CA, DEFAULT either signs
+    CertificateSigningRequest or registers CertificatePem under
+    CACertificatePem. Any other combination is refused with AWS's message."""
+    status = props.get("Status")
+    if not status:
+        raise ValueError("AWS::IoT::Certificate requires Status")
+    csr = props.get("CertificateSigningRequest")
+    pem = props.get("CertificatePem")
+    ca_pem = props.get("CACertificatePem")
+    if props.get("CertificateMode") == "SNI_ONLY":
+        if csr or ca_pem or not pem:
+            raise ValueError(
+                "Invalid request provided: For certificate mode SNI_ONLY, the following "
+                "combination must be specified exactly: [CertificatePem]")
+        resp = _iot_certificate_call(
+            "/certificate/register-no-ca", {"certificatePem": pem, "status": status})
+    elif csr and not pem and not ca_pem:
+        resp = _iot_certificate_call("/certificates", {"certificateSigningRequest": csr})
+    elif pem and ca_pem and not csr:
+        resp = _iot_certificate_call(
+            "/certificate/register", {"certificatePem": pem, "caCertificatePem": ca_pem, "status": status})
+    else:
+        raise ValueError(
+            "Invalid request provided: For certificate mode Default, one of the following "
+            "combinations must be specified exactly: [CertificatePem and CACertificatePem] "
+            "OR [CertificateSigningRequest]")
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate create failed: {resp[2]!r}")
+    cert_id = json.loads(resp[2])["certificateId"]
+    if csr and status != "INACTIVE":
+        # CreateCertificateFromCsr only knows setAsActive.
+        _iot_certificate_status(cert_id, status)
+    return cert_id, _iot_certificate_attrs(cert_id)
+
+
+def _iot_certificate_update(physical_id, old_props, new_props, stack_name):
+    """Status is the one property that updates in place; the PEM, CSR and
+    mode properties are create-only and replace the certificate."""
+    _iot_certificate_status(physical_id, new_props.get("Status"))
+    return physical_id, _iot_certificate_attrs(physical_id)
+
+
+def _iot_certificate_import(identifier):
+    return identifier["Id"], _iot_certificate_attrs(identifier["Id"])
+
+
+def _iot_certificate_delete(physical_id, props):
+    cert = _iot._certificates.get(physical_id)
+    if cert is None:
+        return
+    if cert["status"] == "ACTIVE":
+        _iot_certificate_status(physical_id, "INACTIVE")
+    arn = cert["certificateArn"]
+    # The service refuses DeleteCertificate while things are attached, then
+    # while policies are, in that order.
+    if any(_iot._thing_name_from_arn(t) in _iot._things for t in cert.get("attachedThings", [])):
+        raise ValueError(f"Things must be detached before deletion (arn: {arn})")
+    if _iot._policies_attached_to(arn):
+        raise ValueError(f"Certificate policies must be detached before deletion (arn: {arn})")
+    resp = _iot._handle_certificate("DELETE", f"/certificates/{physical_id}", b"", {})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate delete failed: {resp[2]!r}")
+
+
+def _iot_thing_principal_attachment_call(method, thing, principal, thing_principal_type=None):
+    qp = {"thingPrincipalType": thing_principal_type} if thing_principal_type else {}
+    return _iot._handle_thing_principals(
+        method, f"/things/{thing}/principals", {"x-amzn-principal": principal}, b"", qp)
+
+
+def _iot_thing_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{ThingName}|{Principal}``, the physical id AWS reports."""
+    thing, principal = props.get("ThingName"), props.get("Principal")
+    if not thing or not principal:
+        raise ValueError("AWS::IoT::ThingPrincipalAttachment requires ThingName and Principal")
+    resp = _iot_thing_principal_attachment_call(
+        "PUT", thing, principal, props.get("ThingPrincipalType"))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{thing}|{principal}", {}
+
+
+def _iot_thing_principal_attachment_delete(physical_id, props):
+    thing, _, principal = physical_id.partition("|")
+    resp = _iot_thing_principal_attachment_call("DELETE", thing, principal)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment delete failed: {resp[2]!r}")
+
+
+def _iot_policy_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{PolicyName}|{Principal}``, the physical id AWS reports."""
+    policy, principal = props.get("PolicyName"), props.get("Principal")
+    if not policy or not principal:
+        raise ValueError("AWS::IoT::PolicyPrincipalAttachment requires PolicyName and Principal")
+    resp = _iot._change_policy_target(policy, principal, attach=True)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{policy}|{principal}", {}
+
+
+def _iot_policy_principal_attachment_delete(physical_id, props):
+    policy, _, principal = physical_id.partition("|")
+    resp = _iot._change_policy_target(policy, principal, attach=False)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment delete failed: {resp[2]!r}")
+
+
 # --- IoT ThingType / Policy, Cognito IdentityPoolRoleAttachment,
 #     Lambda LayerVersionPermission (#1345, item 5) ---
 # Each maps onto the service's own control-plane create, so the resource is
@@ -13118,6 +13438,79 @@ def _iot_ca_certificate_delete(physical_id, props):
     _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
 
 
+# --- IoT DomainConfiguration ---
+# Measured on an account: an omitted DomainConfigurationName is
+# ``{LogicalId}-{suffix}`` (no stack name); a create that does not declare
+# DomainConfigurationStatus leaves the configuration DISABLED; an update sends
+# only the declared members, so a dropped one keeps its value; and the delete
+# disables an ENABLED configuration before deleting it.
+
+_IOT_DOMAIN_CONFIG_UPDATABLE = (
+    "AuthorizerConfig", "DomainConfigurationStatus", "TlsConfig",
+    "ServerCertificateConfig", "AuthenticationType", "ApplicationProtocol",
+    "ClientCertificateConfig",
+)
+
+
+def _iot_domain_configuration_attrs(name):
+    rec = _iot._domain_configurations.get(name) or {}
+    return {
+        "Arn": rec.get("domainConfigurationArn", ""),
+        "DomainType": rec.get("domainType", ""),
+        "ServerCertificates": [
+            {k[:1].upper() + k[1:]: v for k, v in cert.items()}
+            for cert in rec.get("serverCertificates", [])
+        ],
+    }
+
+
+def _iot_domain_configuration_set(name, payload, verb):
+    resp = _iot._update_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration {verb} failed: {resp[2]!r}")
+
+
+def _iot_domain_configuration_create(logical_id, props, stack_name):
+    name = props.get("DomainConfigurationName")
+    if not name:
+        suffix = _physical_name(stack_name, logical_id)[-12:]
+        name = f"{logical_id[:115]}-{suffix}"
+    payload = _pascal_to_camel({
+        k: v for k, v in props.items()
+        if k not in ("DomainConfigurationName", "DomainConfigurationStatus", "Tags")
+    })
+    resp = _iot._create_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration create failed: {resp[2]!r}")
+    if props.get("DomainConfigurationStatus") != "ENABLED":
+        _iot_domain_configuration_set(name, {"domainConfigurationStatus": "DISABLED"}, "create")
+    return name, _iot_domain_configuration_attrs(name)
+
+
+def _iot_domain_configuration_update(physical_id, old_props, new_props, stack_name):
+    """Apply the declared updatable members in place; the create-only ones
+    (name, DomainName, ServiceType, the certificate ARNs) replace the
+    configuration before this runs."""
+    payload = _pascal_to_camel({
+        k: new_props[k] for k in _IOT_DOMAIN_CONFIG_UPDATABLE if k in new_props
+    })
+    if payload:
+        _iot_domain_configuration_set(physical_id, payload, "update")
+    return physical_id, _iot_domain_configuration_attrs(physical_id)
+
+
+def _iot_domain_configuration_delete(physical_id, props):
+    rec = _iot._domain_configurations.get(physical_id)
+    if rec is None:
+        return
+    if rec["domainConfigurationStatus"] == "ENABLED":
+        _iot_domain_configuration_set(
+            physical_id, {"domainConfigurationStatus": "DISABLED"}, "delete")
+    resp = _iot._delete_domain_configuration(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(f"Invalid request provided: {json.loads(resp[2])['message']}")
+
+
 def _cognito_identity_pool_role_attachment_apply(props):
     """Push Roles and RoleMappings onto the identity pool through
     SetIdentityPoolRoles, which takes the whole configuration: a property the
@@ -13435,8 +13828,18 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
+    "AWS::IoT::Thing": ("ThingName",),
+    "AWS::IoT::Certificate": (
+        "CACertificatePem", "CertificateMode", "CertificatePem", "CertificateSigningRequest",
+    ),
+    "AWS::IoT::ThingPrincipalAttachment": ("Principal", "ThingName", "ThingPrincipalType"),
+    "AWS::IoT::PolicyPrincipalAttachment": ("PolicyName", "Principal"),
     "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
     "AWS::IoT::ThingType": ("ThingTypeName",),
+    "AWS::IoT::DomainConfiguration": (
+        "DomainConfigurationName", "DomainName", "ServiceType",
+        "ValidationCertificateArn", "ServerCertificateArns",
+    ),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
@@ -13468,6 +13871,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::SSM::Parameter": ("Name",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
+    "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
+    "AWS::Signer::ProfilePermission": (
+        "ProfileName", "Action", "Principal", "StatementId", "ProfileVersion",
+    ),
     "AWS::Cognito::UserPool": (),
     "AWS::Lambda::Function": (
         "FunctionName", "PackageType", "TenancyConfig",
@@ -14223,6 +14630,15 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
     "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::Signer::SigningProfile": {
+        "create": _signer_signing_profile_create,
+        "update": _signer_signing_profile_update,
+        "delete": _signer_signing_profile_delete,
+    },
+    "AWS::Signer::ProfilePermission": {
+        "create": _signer_profile_permission_create,
+        "delete": _signer_profile_permission_delete,
+    },
     "AWS::WAFv2::WebACL": {
         "create": _waf_web_acl_create,
         "update": _waf_web_acl_update,
@@ -14311,6 +14727,26 @@ _RESOURCE_HANDLERS = {
         "update": _sm_target_attachment_update,
         "delete": _sm_target_attachment_delete,
     },
+    "AWS::IoT::Thing": {
+        "create": _iot_thing_create,
+        "update": _iot_thing_update,
+        "delete": _iot_thing_delete,
+        "import": _iot_thing_import,
+    },
+    "AWS::IoT::Certificate": {
+        "create": _iot_certificate_create,
+        "update": _iot_certificate_update,
+        "delete": _iot_certificate_delete,
+        "import": _iot_certificate_import,
+    },
+    "AWS::IoT::ThingPrincipalAttachment": {
+        "create": _iot_thing_principal_attachment_create,
+        "delete": _iot_thing_principal_attachment_delete,
+    },
+    "AWS::IoT::PolicyPrincipalAttachment": {
+        "create": _iot_policy_principal_attachment_create,
+        "delete": _iot_policy_principal_attachment_delete,
+    },
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,
         "update": _iot_topic_rule_update,
@@ -14352,6 +14788,11 @@ _RESOURCE_HANDLERS = {
         "update": _iot_ca_certificate_update,
         "delete": _iot_ca_certificate_delete,
         "import": _iot_ca_certificate_import,
+    },
+    "AWS::IoT::DomainConfiguration": {
+        "create": _iot_domain_configuration_create,
+        "update": _iot_domain_configuration_update,
+        "delete": _iot_domain_configuration_delete,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,

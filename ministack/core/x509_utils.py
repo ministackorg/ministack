@@ -231,6 +231,70 @@ def sign_leaf_certificate(
     return cert_pem, private_pem, public_pem
 
 
+def sign_certificate_request(ca_cert_pem: str, ca_key_pem: str, csr_pem: str) -> str:
+    """Issue a leaf certificate for a PEM CSR, signed by the given CA.
+
+    The certificate carries the CSR's subject and public key; the key never
+    leaves the caller. It is shaped like the certificates AWS IoT's
+    ``CreateCertificateFromCsr`` returns: not a CA, digital signature only,
+    valid until the end of 2049.
+
+    Raises:
+        ValueError: the CSR does not parse, its self-signature does not
+            verify, or its key is neither RSA of at least 2048 bits nor EC on
+            P-256, P-384 or P-521 (the keys AWS accepts).
+    """
+    _require_crypto()
+
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem.encode("utf-8"))
+        valid = csr.is_signature_valid
+    except Exception as e:
+        raise ValueError(f"invalid CSR: {e}") from e
+    if not valid:
+        raise ValueError("invalid CSR: the signature does not verify")
+    key = csr.public_key()
+    if not (
+        (isinstance(key, rsa.RSAPublicKey) and key.key_size >= 2048)
+        or (isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name in ("secp256r1", "secp384r1", "secp521r1"))
+    ):
+        raise ValueError("invalid CSR: the key type or size is not accepted")
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode("utf-8"))
+    ca_key = serialization.load_pem_private_key(ca_key_pem.encode("utf-8"), password=None)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(csr.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=1))
+        .not_valid_after(_dt.datetime(2049, 12, 31, 23, 59, 59, tzinfo=_dt.timezone.utc))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(csr.public_key()), critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+
 def certificate_is_signed_by(cert_pem: str, ca_cert_pem: str) -> bool:
     """Return True when ``cert_pem`` carries a valid signature from ``ca_cert_pem``.
 

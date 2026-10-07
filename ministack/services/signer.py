@@ -10,7 +10,8 @@ GET /signing-jobs/{jobId}, the profile pair lives on
 
 Supports:
   Jobs:     StartSigningJob, DescribeSigningJob, ListSigningJobs
-  Profiles: PutSigningProfile, GetSigningProfile
+  Profiles: PutSigningProfile, GetSigningProfile, CancelSigningProfile,
+            AddProfilePermission, ListProfilePermissions, RemoveProfilePermission
 
 Behaviour that follows the live service (measured 2026-08-26 unless noted):
 
@@ -731,6 +732,10 @@ def _put_signing_profile(name, body):
                     _validate_tags(body.get("tags"))):
         if problem is not None:
             return problem
+    if name in _profiles:
+        # A profile name is taken for good, Active or Canceled.
+        return _coded_error(400, "ValidationException", "ProfileAlreadyExists",
+                            f"Profile with name {name} already exists")
     profile = _register_profile(name, body)
     return json_response({
         "arn": profile["arn"],
@@ -747,7 +752,189 @@ def _get_signing_profile(name):
     if profile is None:
         return _error(404, "ResourceNotFoundException",
                       f"Signing profile {name} not found.")
-    return json_response(_drop_none(profile))
+    shown = _drop_none({k: v for k, v in profile.items() if k != "policy"})
+    # AWS reports the 135-month default on a profile put without a period.
+    shown.setdefault("signatureValidityPeriod", dict(_DEFAULT_VALIDITY))
+    return json_response(shown)
+
+
+# Profile permissions live on the profile record under "policy".
+
+_PERMISSION_ACTIONS = ("signer:StartSigningJob", "signer:GetSigningProfile",
+                       "signer:RevokeSignature")
+_STATEMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_PERMISSION_PRINCIPAL_RE = re.compile(r"[0-9]{12}|arn:aws:iam::[0-9]{12}:role/.+")
+_MAX_POLICY_BYTES = 2000
+
+
+def _coded_error(status, error_type, code, message):
+    """A signer error carrying the `code` member."""
+    return error_response_json(error_type, message, status, extra={"code": code},
+                               content_type=REST_JSON_CONTENT_TYPE)
+
+
+def _policy_statement(profile, permission, expand_principal):
+    principal = permission["principal"]
+    if expand_principal and _ACCOUNT_ID_RE.fullmatch(principal):
+        principal = f"arn:aws:iam::{principal}:root"
+    statement = {"Sid": permission["statementId"], "Effect": "Allow",
+                 "Principal": {"AWS": principal}, "Action": permission["action"],
+                 "Resource": profile["arn"]}
+    if permission.get("profileVersion"):
+        statement["Condition"] = {
+            "StringEquals": {"signer:ProfileVersion": permission["profileVersion"]}}
+    return statement
+
+
+def _policy_size(profile, permissions, expand_principal=True):
+    """Compact JSON length of the statements (policySizeBytes, or the 2000-byte limit with principals as given)."""
+    statements = [_policy_statement(profile, p, expand_principal) for p in permissions]
+    return len(json.dumps(statements, separators=(",", ":")))
+
+
+def _active_profile_for_permissions(name, verb):
+    """(profile, None) for an Active profile, else (None, error)."""
+    name_err = _validate_profile_name(name)
+    if name_err:
+        return None, name_err
+    profile = _profiles.get(name)
+    if profile is None:
+        return None, _coded_error(404, "ResourceNotFoundException", "ProfileNotFound",
+                                  f"SigningProfile with name {name} does not exist")
+    if verb and profile.get("status") != "Active":
+        return None, _coded_error(400, "ValidationException", "ProfileNotActive",
+                                  f"Cannot {verb} a profile in {profile.get('status')} state")
+    return profile, None
+
+
+def _add_profile_permission(name, body):
+    profile, err = _active_profile_for_permissions(name, "add permission to")
+    if err:
+        return err
+    sid = body.get("statementId")
+    if not isinstance(sid, str) or not sid:
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            "statementId cannot be empty.")
+    if not _STATEMENT_ID_RE.fullmatch(sid):
+        return _coded_error(400, "ValidationException", "InvalidPermissionStatement",
+                            "Statement ID must contain only alphanumeric characters, "
+                            "underscores, and dashes")
+    if len(sid) > 64:
+        # The message says "less than 64", yet a 64-character id is accepted.
+        return _coded_error(400, "ValidationException", "InvalidPermissionStatement",
+                            "Statement ID must be less than 64 characters length")
+    # Only the shape is checked. AWS also answers 404 "Principal not found"
+    # for an account or role it cannot resolve, which is not emulated.
+    principal = body.get("principal")
+    if not isinstance(principal, str) or not _PERMISSION_PRINCIPAL_RE.fullmatch(principal):
+        return _coded_error(400, "ValidationException", "InvalidPrincipal",
+                            "Principal is not a valid AWS account id or IAM Role Arn")
+    action = body.get("action")
+    if action not in _PERMISSION_ACTIONS:
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            f"Action {action} not supported for platform "
+                            f"{profile.get('platformId')}. Action must be one of "
+                            f"[{', '.join(_PERMISSION_ACTIONS)}]")
+    version = body.get("profileVersion")
+    if version is not None and version != profile.get("profileVersion"):
+        return _coded_error(404, "ResourceNotFoundException", "ProfileVersionNotFound",
+                            f"Version {version} does not exist for SigningProfile {name}.")
+    permission = _drop_none({"action": action, "principal": principal,
+                             "statementId": sid, "profileVersion": version})
+    policy = profile.get("policy")
+    if policy is not None:
+        for existing in policy["statements"]:
+            if existing["statementId"] != sid:
+                continue
+            # Repeating a statement exactly is a no-op answered with the
+            # current revision, before any revisionId check.
+            if existing == permission:
+                return json_response({"revisionId": policy["revisionId"]})
+            return _coded_error(400, "ValidationException", "InvalidPermissionStatement",
+                                f"Statement with statementId {sid} is already in the policy")
+    revision = body.get("revisionId")
+    if policy is None and revision is not None:
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            "Resource Policy does not exist but revisionId was "
+                            "specified in the request")
+    if policy is not None:
+        if revision is None:
+            return _coded_error(400, "ValidationException", "ValidationException",
+                                f"Resource Policy exists for Profile Name {name}. "
+                                "But no revisionId was provided in the request")
+        if revision != policy["revisionId"]:
+            return _revision_mismatch(revision, policy)
+    statements = (policy["statements"] if policy else []) + [permission]
+    if _policy_size(profile, statements, expand_principal=False) > _MAX_POLICY_BYTES:
+        return _coded_error(402, "ServiceLimitExceededException", "ServiceLimitExceeded",
+                            f"Policy cannot exceed maximum size of {_MAX_POLICY_BYTES} bytes")
+    profile["policy"] = {"revisionId": str(uuid.uuid4()), "statements": statements}
+    return json_response({"revisionId": profile["policy"]["revisionId"]})
+
+
+def _revision_mismatch(revision, policy):
+    return _coded_error(409, "ConflictException", "PolicyRevisionIdMismatch",
+                        f"Specified revisionId ({revision}) does not match the "
+                        f"revisionId of the existing policy ({policy['revisionId']})")
+
+
+def _no_policy(name):
+    return _coded_error(404, "ResourceNotFoundException", "PolicyNotFound",
+                        f"No policies associated with profile {name}")
+
+
+def _list_profile_permissions(name):
+    """The whole policy in one page; nextToken is ignored and never returned."""
+    profile, err = _active_profile_for_permissions(name, None)
+    if err:
+        return err
+    policy = profile.get("policy")
+    if policy is None:
+        return _no_policy(name)
+    return json_response({
+        "revisionId": policy["revisionId"],
+        "policySizeBytes": _policy_size(profile, policy["statements"]),
+        "permissions": [dict(p) for p in policy["statements"]],
+    })
+
+
+def _remove_profile_permission(name, sid, revision):
+    profile, err = _active_profile_for_permissions(name, "remove permission from")
+    if err:
+        return err
+    policy = profile.get("policy")
+    if policy is None:
+        return _no_policy(name)
+    if revision != policy["revisionId"]:
+        return _revision_mismatch(revision, policy)
+    remaining = [p for p in policy["statements"] if p["statementId"] != sid]
+    if len(remaining) == len(policy["statements"]):
+        return _coded_error(404, "ResourceNotFoundException", "PolicyNotFound",
+                            f"No policy named {sid} associated with {name} profile")
+    if remaining:
+        profile["policy"] = {"revisionId": str(uuid.uuid4()), "statements": remaining}
+        new_revision = profile["policy"]["revisionId"]
+    else:
+        # The last statement takes the policy with it: a listing is
+        # PolicyNotFound again and the next add needs no revisionId.
+        profile.pop("policy")
+        new_revision = str(uuid.uuid4())
+    return json_response({"revisionId": new_revision})
+
+
+def _cancel_signing_profile(name):
+    """Cancel a profile; its name stays taken and its permissions stay listable."""
+    name_err = _validate_profile_name(name)
+    if name_err:
+        return name_err
+    profile = _profiles.get(name)
+    if profile is None:
+        return _coded_error(404, "ResourceNotFoundException", "ProfileNotFound",
+                            f"Signing Profile with name {name} does not exist.")
+    if profile.get("status") == "Active" and profile.get("policy"):
+        profile["policy"] = dict(profile["policy"], revisionId=str(uuid.uuid4()))
+    profile["status"] = "Canceled"
+    return json_response({})
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +965,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if job_id and "/" not in job_id:
             return _describe_signing_job(job_id)
 
-    # PUT/GET /signing-profiles/{profileName} -- PutSigningProfile / GetSigningProfile
+    # PUT/GET/DELETE /signing-profiles/{profileName} -- PutSigningProfile /
+    # GetSigningProfile / CancelSigningProfile
     if path.startswith("/signing-profiles/"):
         name = urllib.parse.unquote(path[len("/signing-profiles/"):])
         if name and "/" not in name:
@@ -786,5 +974,19 @@ async def handle_request(method, path, headers, body_bytes, query_params):
                 return _put_signing_profile(name, body)
             if method == "GET":
                 return _get_signing_profile(name)
+            if method == "DELETE":
+                return _cancel_signing_profile(name)
+        # /signing-profiles/{profileName}/permissions[/{statementId}] --
+        # AddProfilePermission / ListProfilePermissions / RemoveProfilePermission
+        parts = path[len("/signing-profiles/"):].split("/")
+        if len(parts) in (2, 3) and parts[0] and parts[1] == "permissions":
+            name = urllib.parse.unquote(parts[0])
+            if len(parts) == 2 and method == "POST":
+                return _add_profile_permission(name, body)
+            if len(parts) == 2 and method == "GET":
+                return _list_profile_permissions(name)
+            if len(parts) == 3 and parts[2] and method == "DELETE":
+                return _remove_profile_permission(
+                    name, urllib.parse.unquote(parts[2]), query.get("revisionId"))
 
     return _error(400, "ValidationException", f"No route for {method} {path}")
