@@ -1656,6 +1656,17 @@ class TestResourceArn:
         assert extract_resource_arn("signer", "GET", "/signing-jobs", {}, b"", {"status": "Succeeded"}, "us-east-1", "123") == "*"
         assert extract_resource_arn("signer", "POST", "/signing-jobs", {}, b"not json", {}, "us-east-1", "123") == "*"
 
+    def test_signer_cancel_and_profile_permissions(self):
+        """CancelSigningProfile and the three profile-permission actions
+        are scoped to the signing profile."""
+        from ministack.core.iam_actions import extract_resource_arn
+        arn = "arn:aws:signer:us-east-1:123:/signing-profiles/fleet"
+        for method, path in (("DELETE", "/signing-profiles/fleet"),
+                             ("POST", "/signing-profiles/fleet/permissions"),
+                             ("GET", "/signing-profiles/fleet/permissions"),
+                             ("DELETE", "/signing-profiles/fleet/permissions/s1")):
+            assert extract_resource_arn("signer", method, path, {}, b"{}", {}, "us-east-1", "123") == arn
+
     def test_elb_passthrough_arn(self):
         from ministack.core.iam_actions import extract_resource_arn
         lb_arn = "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-lb/abc"
@@ -2590,6 +2601,176 @@ class TestBedrockAgentCoreAuthorization:
             region="eu-central-1",
         )
         assert evaluate(ctx, [stmts]).decision == decision
+
+
+class TestDynamoDBTransactionAuthorization:
+    """TransactWriteItems / TransactGetItems are authorised per item."""
+
+    _TABLE = "arn:aws:dynamodb:us-east-1:000000000000:table/repro"
+
+    @staticmethod
+    def _transact(monkeypatch, target, items_key, items, actions, resource="*", policy=None):
+        import asyncio
+
+        import ministack.app as app_mod
+        from ministack.core import iam_evaluator
+
+        statements = parse_policy_document(policy or {"Statement": [{
+            "Effect": "Allow", "Action": actions, "Resource": resource,
+        }]})
+        seen = []
+        handled = []
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
+            seen.append((iam_action, resource_arn))
+            ctx = _ctx(action=iam_action, resource=resource_arn)
+            ctx.service_context = {k.lower(): v for k, v in (service_context or {}).items()}
+            result = evaluate(ctx, [statements])
+            if result.decision == "Allow":
+                return None
+            result.principal_arn = "arn:aws:iam::000000000000:user/testuser"
+            return result
+
+        async def handler(method, request_path, headers, body, query):
+            handled.append(True)
+            return 200, {"Content-Type": "application/x-amz-json-1.0"}, b"{}"
+
+        monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        monkeypatch.setitem(app_mod.SERVICE_HANDLERS, "dynamodb", handler)
+        headers = {
+            **_sigv4_headers("dynamodb", "dynamodb.us-east-1.amazonaws.com"),
+            "host": "dynamodb.us-east-1.amazonaws.com",
+            "x-amz-target": f"DynamoDB_20120810.{target}",
+            "content-type": "application/x-amz-json-1.0",
+        }
+        headers["authorization"] = headers["authorization"].replace(
+            "20260101/eu-central-1/", "20260101/us-east-1/"
+        )
+        body = json.dumps({items_key: items}).encode()
+        response = asyncio.run(
+            app_mod._dispatch_service_request("POST", "/", headers, body, {}, "req-ddb-tx")
+        )
+        return response, seen, handled
+
+    _WRITE = [
+        {"ConditionCheck": {"TableName": "repro", "Key": {"pk": {"S": "guard"}},
+                            "ConditionExpression": "attribute_exists(pk)"}},
+        {"Put": {"TableName": "repro", "Item": {"pk": {"S": "written"}}}},
+    ]
+
+    def test_write_is_allowed_by_the_per_item_actions(self, monkeypatch):
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE,
+            ["dynamodb:ConditionCheckItem", "dynamodb:PutItem"],
+        )
+        assert response[0] == 200
+        assert handled
+        assert seen == [
+            ("dynamodb:ConditionCheckItem", self._TABLE),
+            ("dynamodb:PutItem", self._TABLE),
+        ]
+
+    def test_write_without_condition_check_permission_is_denied(self, monkeypatch):
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE,
+            ["dynamodb:TransactWriteItems", "dynamodb:PutItem"],
+        )
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert b"dynamodb:ConditionCheckItem" in response[2]
+        assert not handled
+
+    def test_update_and_delete_map_to_their_own_actions(self, monkeypatch):
+        items = [
+            {"Update": {"TableName": "repro", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :x"}},
+            {"Delete": {"TableName": "repro", "Key": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, _ = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items,
+            ["dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+        )
+        assert response[0] == 200
+        assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+
+    def test_item_naming_several_members_is_checked_for_each(self, monkeypatch):
+        # AWS rejects an item with two members; the handler does not, so the
+        # second member must not run unchecked behind an allowed first one.
+        items = [{
+            "Update": {"TableName": "repro", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :x"},
+            "Delete": {"TableName": "repro", "Key": {"pk": {"S": "a"}}},
+        }]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:UpdateItem"],
+        )
+        assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        assert response[0] == 403
+        assert b"dynamodb:DeleteItem" in response[2]
+        assert not handled
+
+    def test_denial_on_a_later_table_refuses_the_whole_transaction(self, monkeypatch):
+        items = [
+            {"Put": {"TableName": "repro", "Item": {"pk": {"S": "a"}}}},
+            {"Put": {"TableName": "other", "Item": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:PutItem"],
+            resource=self._TABLE,
+        )
+        assert [r for _, r in seen] == [self._TABLE, self._TABLE.replace("repro", "other")]
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert not handled
+
+    def test_get_is_authorised_per_item_on_its_own_table(self, monkeypatch):
+        items = [
+            {"Get": {"TableName": "repro", "Key": {"pk": {"S": "a"}}}},
+            {"Get": {"TableName": "other", "Key": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, _ = self._transact(
+            monkeypatch, "TransactGetItems", "TransactItems", items, ["dynamodb:GetItem"],
+        )
+        assert response[0] == 200
+        assert seen == [
+            ("dynamodb:GetItem", self._TABLE),
+            ("dynamodb:GetItem", self._TABLE.replace("repro", "other")),
+        ]
+
+    _ITEM_ACTIONS = ["dynamodb:ConditionCheckItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                     "dynamodb:DeleteItem", "dynamodb:GetItem"]
+    _ENCLOSING = {"ForAnyValue:StringEquals": {
+        "dynamodb:EnclosingOperation": ["TransactWriteItems", "TransactGetItems"]}}
+
+    def test_allow_only_transactional_operations(self, monkeypatch):
+        """Example 2 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [{"Effect": "Allow", "Action": self._ITEM_ACTIONS,
+                                 "Resource": "*", "Condition": self._ENCLOSING}]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 200 and handled
+
+    def test_deny_transactional_operations(self, monkeypatch):
+        """Example 3 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [
+            {"Effect": "Deny", "Action": self._ITEM_ACTIONS, "Resource": "*",
+             "Condition": self._ENCLOSING},
+            {"Effect": "Allow", "Action": self._ITEM_ACTIONS, "Resource": "*"},
+        ]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 403 and not handled
+
+    def test_get_with_only_the_whole_operation_action_is_denied(self, monkeypatch):
+        items = [{"Get": {"TableName": "repro", "Key": {"pk": {"S": "a"}}}}]
+        response, _, handled = self._transact(
+            monkeypatch, "TransactGetItems", "TransactItems", items,
+            ["dynamodb:TransactGetItems"],
+        )
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert b"dynamodb:GetItem" in response[2]
+        assert not handled
 
 
 class TestS3ActionMapping:

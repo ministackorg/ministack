@@ -3496,6 +3496,31 @@ def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
     assert [e["type"] for e in events].count("TaskScheduled") == 1
 
 
+def test_sfn_exhausted_retrier_does_not_fall_through_to_a_later_one(sfn, lam):
+    """The first matching retrier decides: MaxAttempts 0 never retries, even with States.ALL after it."""
+    fn = f"sfn-first-retrier-{time.time_ns()}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c): raise Exception('no')\n")},
+    )
+    sm = sfn.create_state_machine(
+        name=fn, roleArn="arn:aws:iam::000000000000:role/R",
+        definition=json.dumps({"StartAt": "Call", "States": {
+            "Call": {"Type": "Task", "Resource": lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"],
+                     "Retry": [{"ErrorEquals": ["States.TaskFailed"], "MaxAttempts": 0},
+                               {"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 2}],
+                     "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "Caught"}], "End": True},
+            "Caught": {"Type": "Pass", "End": True},
+        }}),
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    assert [e["type"] for e in events].count("TaskScheduled") == 1
+
+
 _SFN_FAIL_BRANCH = {"StartAt": "F", "States": {"F": {"Type": "Fail", "Error": "MyErr", "Cause": "c"}}}
 
 

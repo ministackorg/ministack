@@ -13575,13 +13575,16 @@ def test_idle_reaper_and_reset_release_provided_environments(isolated_runtime):
 
 
 def test_invoke_signature_keeps_trace_out_of_the_positional_contract(isolated_runtime):
-    """``trace_id`` is keyword-only, so no caller can pass it as the event."""
+    """``trace_id`` and ``invoked_function_arn`` are keyword-only, so no caller
+    can pass either as the event."""
     import inspect
 
     sig = inspect.signature(lambda_runtime.ProvidedWorker.invoke)
-    assert list(sig.parameters) == ["self", "event", "request_id", "trace_id"]
-    assert sig.parameters["trace_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert sig.parameters["trace_id"].default is None
+    assert list(sig.parameters) == [
+        "self", "event", "request_id", "trace_id", "invoked_function_arn"]
+    for name in ("trace_id", "invoked_function_arn"):
+        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters[name].default is None
 
 
 def test_json_only_bootstrap_output_is_not_parsed_as_protocol(worker_factory):
@@ -13724,7 +13727,10 @@ def test_provided_metadata_does_not_mutate_payload(monkeypatch, event):
     result = lambda_svc._execute_function_provided_warm(
         {"config": _provided_dispatch_config(), "code_zip": b"zip"}, event, "request-1",
     )
-    worker.invoke.assert_called_once_with(event, "request-1", trace_id="trace-1")
+    worker.invoke.assert_called_once_with(
+        event, "request-1", trace_id="trace-1",
+        invoked_function_arn=_provided_dispatch_config()["FunctionArn"],
+    )
     release.assert_called_once_with(worker)
     assert result == {"body": event, "log": "handler log"}
     if isinstance(event, dict):
@@ -14262,3 +14268,60 @@ def test_classify_function_error_bare_timeout_string_is_unhandled():
     assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
     # Only the exact runtime message counts; other handler strings stay successes.
     assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None
+
+
+def test_provided_invocation_arn_is_per_request(worker_factory):
+    worker = worker_factory(_bootstrap('''
+while True:
+    headers, event = next_invocation()
+    post_response(headers["Lambda-Runtime-Aws-Request-Id"],
+                  headers["Lambda-Runtime-Invoked-Function-Arn"])
+'''))
+    for qualifier in ("worker", "other", "1", "worker"):
+        arn = worker.config["FunctionArn"] + ":" + qualifier
+        result = worker.invoke({}, "request-" + qualifier, invoked_function_arn=arn)
+        assert result["status"] == "ok", result
+        assert result["result"] == arn
+
+
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invocation_retains_alias_without_mutating_version(monkeypatch, asynchronous, runtime):
+    """Invoke identity follows the caller's qualifier, not alias resolution."""
+    from copy import deepcopy
+
+    from ministack.core.lambda_runtime import invalidate_worker
+    from ministack.services import lambda_svc as svc
+
+    name = "identity-" + _uuid_mod.uuid4().hex
+    arn = svc._func_arn(name)
+    config = {"FunctionName": name, "FunctionArn": arn, "Runtime": runtime,
+              "Handler": "index.handler", "Timeout": 10, "Version": "$LATEST"}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", "def handler(event, context):\n"
+                         "    return [context.invoked_function_arn, context.function_version, event]\n")
+        archive.writestr("index.js", "exports.handler = async (event, context) => [context.invokedFunctionArn, context.functionVersion, event];")
+    version = {"config": {**config, "FunctionArn": arn + ":1", "Version": "1"},
+               "code_zip": buf.getvalue()}
+    function = {"config": config, "code_zip": buf.getvalue(), "versions": {"1": version},
+                "aliases": {"worker": {"FunctionVersion": "1"}, "other": {"FunctionVersion": "1"}}}
+    original = deepcopy(function)
+    monkeypatch.setitem(svc._functions, name, function)
+    monkeypatch.setattr(svc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(svc, "_execute_function_with_config_scope", svc._execute_function_warm)
+    captured = []
+    monkeypatch.setattr(svc, "invoke_async_with_retry", lambda f, e: captured.append(svc._execute_function_warm(f, e)))
+    try:
+        # Alternate aliases sharing one published version, including warm reuse.
+        for qualifier in ["worker", "other", "1", "worker", None, "$LATEST"]:
+            headers = {"x-amz-invocation-type": "Event"} if asynchronous else {}
+            status, response_headers, body = asyncio.run(svc._invoke(name, {"value": 1}, headers, qualifier))
+            expected_version = "1" if qualifier in ("worker", "other", "1") else "$LATEST"
+            assert response_headers["X-Amz-Executed-Version"] == expected_version
+            assert status == (202 if asynchronous else 200)
+            result = captured[-1]["body"] if asynchronous else json.loads(body)
+            assert result == [arn + (":" + qualifier if qualifier else ""), expected_version, {"value": 1}]
+            assert function == original
+    finally:
+        invalidate_worker(name)
