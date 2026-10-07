@@ -45,6 +45,7 @@ from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    get_account_id,
     get_region,
     new_uuid,
 )
@@ -531,6 +532,7 @@ def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
         mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                        subject, body_text, body_html, msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
     return msg_id
 
 
@@ -613,6 +615,7 @@ def _send_raw_email(params):
             _smtp_relay(actual_source, relay_addrs, raw_str)
         except Exception:
             logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
+    _send_notifications(msg_id, actual_source, relay_addrs)
     return _xml(200, "SendRawEmailResponse",
                 f"<SendRawEmailResult><MessageId>{msg_id}</MessageId></SendRawEmailResult>")
 
@@ -661,6 +664,7 @@ def _send_templated_email(params):
                                        rendered.get("Text", ""),
                                        rendered.get("Html", ""), msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
     return _xml(200, "SendTemplatedEmailResponse",
                 f"<SendTemplatedEmailResult><MessageId>{msg_id}</MessageId></SendTemplatedEmailResult>")
 
@@ -717,6 +721,7 @@ def _send_bulk_templated_email(params):
                                            rendered.get("Text", ""),
                                            rendered.get("Html", ""), msg_id)
             _smtp_relay(source, dest["To"], mime_str)
+        _send_notifications(msg_id, source, dest["To"])
         statuses.append(
             f"<member><Status>Success</Status>"
             f"<MessageId>{msg_id}</MessageId></member>")
@@ -1022,6 +1027,12 @@ def _production_access_enabled() -> bool:
     return (_account_details.get("account") or {}).get("ProductionAccessEnabled", True)
 
 
+def _domain_and_parents(domain: str):
+    """`a.b.com` -> `a.b.com`, `b.com` (the bare TLD is never an identity)."""
+    labels = domain.split(".")
+    return (".".join(labels[i:]) for i in range(len(labels) - 1))
+
+
 def _identity_verified(address: str, *, simulator: bool = False) -> bool:
     """A verified address identity (case-sensitive) or a verified domain identity
     for the address's domain or any parent domain (case-insensitive), in v1 or v2."""
@@ -1042,8 +1053,7 @@ def _identity_verified(address: str, *, simulator: bool = False) -> bool:
         return True
     v1 = {k.lower(): r for k, r in _identities.items() if "@" not in k}
     v2 = {k.lower(): r for k, r in ses_v2._identities.items() if "@" not in k}
-    labels = domain.split(".")
-    return any(ok(v1.get(d), v2.get(d)) for d in (".".join(labels[i:]) for i in range(len(labels) - 1)))
+    return any(ok(v1.get(d), v2.get(d)) for d in _domain_and_parents(domain))
 
 
 def _message_rejection(sender, recipients=()) -> str | None:
@@ -1056,6 +1066,93 @@ def _message_rejection(sender, recipients=()) -> str | None:
         return None
     return ("Email address is not verified. The following identities failed the check "
             f"in region {get_region().upper()}: {', '.join(failed)}")
+
+
+# Mailbox simulator: local part -> notification type. success@ and ooto@ are
+# delivered; bounce@ is a hard bounce; complaint@ is reported as spam.
+_SIMULATOR_OUTCOMES = {"bounce": "Bounce", "complaint": "Complaint"}
+
+
+def _notification_identity(source: str) -> dict | None:
+    """The identity whose notification topics apply to a sender: the address
+    identity if verified, else the nearest verified parent domain."""
+    addr = parseaddr(source or "")[1]
+    if not addr:
+        return None
+    if addr in _identities:
+        return _identities[addr]
+    domains = {k.lower(): r for k, r in _identities.items() if "@" not in k}
+    for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
+        rec = domains.get(d)
+        if rec is not None:
+            return rec
+    return None
+
+
+def _publish_notification(topic_arn: str, payload: dict) -> None:
+    from ministack.services import sns
+
+    try:
+        sns.publish_internal(topic_arn, json.dumps(payload),
+                             "Amazon SES Email Event Notification")
+    except Exception:
+        logger.warning("SES notification publish to %s failed", topic_arn, exc_info=True)
+
+
+def _notification_detail(kind: str, rcpt: str, ts: str) -> dict:
+    if kind == "Delivery":
+        return {"delivery": {
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "smtpResponse": "250 2.6.0 Message received",
+            "reportingMTA": "a0-0.smtp-out.amazonses.com"}}
+    if kind == "Bounce":
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "General",
+            "bouncedRecipients": [{
+                "emailAddress": rcpt, "action": "failed", "status": "5.1.1",
+                "diagnosticCode": "smtp; 550 5.1.1 user unknown"}],
+            "timestamp": ts, "feedbackId": new_uuid(),
+            "reportingMTA": "dsn; a0-0.smtp-out.amazonses.com"}}
+    return {"complaint": {
+        "complainedRecipients": [{"emailAddress": rcpt}],
+        "timestamp": ts, "feedbackId": new_uuid(),
+        "userAgent": "Amazon SES Mailbox Simulator",
+        "complaintFeedbackType": "abuse", "arrivalDate": ts}}
+
+
+def _send_notifications(msg_id, source, recipients):
+    """Publish the Delivery / Bounce / Complaint notification of each recipient
+    to the SNS topic set on the sender's identity (SetIdentityNotificationTopic)."""
+    identity = _notification_identity(source)
+    if not identity:
+        return
+    topics = identity.get("NotificationTopics", {})
+    if not any(topics.values()):
+        return
+    recipients = [a for a in (parseaddr(r)[1] for r in recipients) if a]
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    mail = {
+        "timestamp": ts,
+        "source": source,
+        "sendingAccountId": get_account_id(),
+        "messageId": msg_id,
+        "destination": recipients,
+    }
+    src_addr = parseaddr(source or "")[1]
+    if src_addr:
+        mail["sourceArn"] = (f"arn:aws:ses:{get_region()}:{get_account_id()}:"
+                             f"identity/{src_addr}")
+    for rcpt in recipients:
+        local, _, domain = rcpt.partition("@")
+        kind = "Delivery"
+        if domain.lower() == _SIMULATOR_DOMAIN:
+            kind = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], "Delivery")
+        topic = topics.get(kind)
+        if not topic:
+            continue
+        detail = _notification_detail(kind, rcpt, ts)
+        _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
 
 
 def _make_identity(identity, identity_type):

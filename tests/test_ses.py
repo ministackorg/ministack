@@ -1496,3 +1496,139 @@ def test_receipt_unsigned_sdk_lifecycle():
         client.set_active_receipt_rule_set(**({"RuleSetName": previous} if previous else {}))
         client.delete_receipt_rule_set(RuleSetName=name)
     assert name not in {item["Name"] for item in client.list_receipt_rule_sets()["RuleSets"]}
+@pytest.fixture
+def ses_notify_queue(ses, sns, sqs):
+    """An SNS topic subscribed by an SQS queue, plus a `drain(n)` collector of the
+    notifications received so far."""
+    from conftest import sqs_policy_allow_sns
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    topic_arn = sns.create_topic(Name=f"ses-notify-{suffix}")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=f"ses-notify-{suffix}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(QueueUrl=queue_url, Attributes={
+        "Policy": json.dumps(sqs_policy_allow_sns(queue_arn, topic_arn))})
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+    identities = []
+
+    def bind(identity):
+        identities.append(identity)
+        for kind in ("Delivery", "Bounce", "Complaint"):
+            ses.set_identity_notification_topic(
+                Identity=identity, NotificationType=kind, SnsTopic=topic_arn)
+
+    def drain(expected):
+        got = []
+        for _ in range(10):
+            for m in sqs.receive_message(
+                    QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", []):
+                env = json.loads(m["Body"])
+                assert env["Type"] == "Notification"
+                got.append(json.loads(env["Message"]))
+            if len(got) >= expected:
+                break
+        return got
+
+    yield suffix, bind, drain
+    for identity in identities:
+        ses.delete_identity(Identity=identity)
+    sqs.delete_queue(QueueUrl=queue_url)
+    sns.delete_topic(TopicArn=topic_arn)
+
+
+_NOTIFY_MSG = {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}}
+
+
+def test_ses_identity_notifications_published_to_sns_sqs(ses, ses_notify_queue):
+    suffix, bind, drain = ses_notify_queue
+    sender = f"notify-{suffix}@example.com"
+    ses.verify_email_identity(EmailAddress=sender)
+    bind(sender)
+
+    dest = ["ok@example.com", "bounce@simulator.amazonses.com",
+            "complaint@simulator.amazonses.com"]
+    msg_id = ses.send_email(
+        Source=sender, Destination={"ToAddresses": dest}, Message=_NOTIFY_MSG,
+    )["MessageId"]
+
+    got = {n["notificationType"]: n for n in drain(3)}
+    assert set(got) == {"Delivery", "Bounce", "Complaint"}
+    assert got["Delivery"]["mail"]["messageId"] == msg_id
+    assert got["Delivery"]["mail"]["source"] == sender
+    assert got["Delivery"]["mail"]["destination"] == dest
+    assert got["Delivery"]["delivery"]["recipients"] == ["ok@example.com"]
+    assert got["Bounce"]["bounce"]["bouncedRecipients"][0]["emailAddress"] == dest[1]
+    assert got["Complaint"]["complaint"]["complainedRecipients"][0]["emailAddress"] == dest[2]
+
+
+def test_ses_identity_notifications_fall_back_to_domain_identity(ses, ses_notify_queue):
+    suffix, bind, drain = ses_notify_queue
+    domain = f"notify-{suffix}.example.com"
+    ses.verify_domain_identity(Domain=domain)
+    bind(domain)
+
+    msg_id = ses.send_email(
+        Source=f"anyone@sub.{domain}", Destination={"ToAddresses": ["ok@example.com"]},
+        Message=_NOTIFY_MSG,
+    )["MessageId"]
+
+    got = drain(1)
+    assert [n["mail"]["messageId"] for n in got if n["notificationType"] == "Delivery"] == [msg_id]
+
+
+def test_ses_identity_notifications_simulator_subaddress(ses, ses_notify_queue):
+    suffix, bind, drain = ses_notify_queue
+    sender = f"notify-{suffix}@example.com"
+    ses.verify_email_identity(EmailAddress=sender)
+    bind(sender)
+
+    ses.send_email(
+        Source=sender, Destination={"ToAddresses": ["bounce+label@simulator.amazonses.com"]},
+        Message=_NOTIFY_MSG,
+    )
+
+    got = drain(1)
+    assert [n["notificationType"] for n in got] == ["Bounce"]
+
+
+def test_ses_identity_notifications_other_send_paths(ses, ses_notify_queue):
+    suffix, bind, drain = ses_notify_queue
+    sender = f"notify-{suffix}@example.com"
+    ses.verify_email_identity(EmailAddress=sender)
+    bind(sender)
+    tpl = f"notify-tpl-{suffix}"
+    ses.create_template(Template={"TemplateName": tpl, "SubjectPart": "s", "TextPart": "t"})
+    raw = f"From: {sender}\r\nTo: ok@example.com\r\nSubject: s\r\n\r\nb"
+    try:
+        ids = {
+            ses.send_raw_email(RawMessage={"Data": raw})["MessageId"],
+            ses.send_templated_email(
+                Source=sender, Destination={"ToAddresses": ["ok@example.com"]},
+                Template=tpl, TemplateData="{}")["MessageId"],
+        }
+        bulk = ses.send_bulk_templated_email(
+            Source=sender, Template=tpl, DefaultTemplateData="{}",
+            Destinations=[{"Destination": {"ToAddresses": ["ok@example.com"]}}],
+        )
+        ids.update(s["MessageId"] for s in bulk["Status"])
+
+        got = drain(len(ids))
+        assert {n["mail"]["messageId"] for n in got} == ids
+        assert {n["notificationType"] for n in got} == {"Delivery"}
+    finally:
+        ses.delete_template(TemplateName=tpl)
+
+
+def test_ses_identity_notifications_not_published_without_topic(ses, sns, ses_notify_queue):
+    suffix, bind, drain = ses_notify_queue
+    sender = f"notify-{suffix}@example.com"
+    ses.verify_email_identity(EmailAddress=sender)
+    bind(sender)
+    for kind in ("Delivery", "Bounce", "Complaint"):
+        ses.set_identity_notification_topic(Identity=sender, NotificationType=kind)
+
+    ses.send_email(
+        Source=sender, Destination={"ToAddresses": ["ok@example.com"]}, Message=_NOTIFY_MSG)
+
+    assert drain(1) == []
