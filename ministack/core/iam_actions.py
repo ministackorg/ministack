@@ -1246,12 +1246,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "signer":
-        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
+        # three profile-permission actions are scoped to the profile,
         # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
         # carry no resource (Service Authorization Reference). The ARNs put a
         # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
         parts = [p for p in path.split("/") if p]
-        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+        if (parts and parts[0] == "signing-profiles" and len(parts) > 1
+                and not (method == "PUT" and len(parts) == 2)):
             return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
         if parts and parts[0] == "signing-jobs":
             if len(parts) > 1:
@@ -1692,6 +1694,45 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
         for name in tables
         if isinstance(name, str) and name
     ]
+
+
+_DYNAMODB_TRANSACT_ITEM_ACTIONS = {
+    "ConditionCheck": "dynamodb:ConditionCheckItem",
+    "Put": "dynamodb:PutItem",
+    "Update": "dynamodb:UpdateItem",
+    "Delete": "dynamodb:DeleteItem",
+    "Get": "dynamodb:GetItem",
+}
+
+
+def dynamodb_transaction_checks(
+    iam_action: str, body: bytes, region: str, account_id: str
+) -> list[tuple[str, str]]:
+    """Per-item ``(action, table ARN)`` checks of a DynamoDB transaction.
+
+    ``TransactWriteItems`` and ``TransactGetItems`` are not IAM actions: each
+    item is authorized as the single-item action it performs, on its own table.
+    An item naming more than one member (AWS rejects it, the handler does not)
+    is checked for every member, so none can ride along unchecked.
+    Returns an empty list for any other action or a body with no usable item.
+    """
+    if iam_action not in ("dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"):
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    items = data.get("TransactItems") if isinstance(data, dict) else None
+    checks = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for member, action in _DYNAMODB_TRANSACT_ITEM_ACTIONS.items():
+            detail = item.get(member)
+            table = detail.get("TableName") if isinstance(detail, dict) else None
+            if isinstance(table, str) and table:
+                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
+    return checks
 
 
 def dynamodb_service_context(body: bytes) -> dict:

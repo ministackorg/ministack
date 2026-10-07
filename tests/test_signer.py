@@ -701,6 +701,268 @@ def test_signer_get_unknown_profile_404(signer):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_signer_get_profile_reports_the_default_validity_period(signer):
+    name = f"default_period_{_uid()}"
+    signer.put_signing_profile(profileName=name, platformId=_LAMBDA_PLATFORM)
+    got = signer.get_signing_profile(profileName=name)
+    assert got["signatureValidityPeriod"] == {"type": "MONTHS", "value": 135}
+
+
+def test_signer_put_profile_on_a_taken_name_is_refused(signer):
+    """A second put on the same name is refused, whether the profile is
+    Active or Canceled, and the first profile is left as it was."""
+    name = f"taken_{_uid()}"
+    first = signer.put_signing_profile(profileName=name, platformId=_LAMBDA_PLATFORM)
+    for _ in range(2):
+        with pytest.raises(ClientError) as exc:
+            signer.put_signing_profile(
+                profileName=name, platformId=_LAMBDA_PLATFORM,
+                signatureValidityPeriod={"type": "DAYS", "value": 5})
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert exc.value.response["code"] == "ProfileAlreadyExists"
+        assert exc.value.response["Error"]["Message"] == f"Profile with name {name} already exists"
+        got = signer.get_signing_profile(profileName=name)
+        assert got["profileVersion"] == first["profileVersion"]
+        assert got["signatureValidityPeriod"] == {"type": "MONTHS", "value": 135}
+        signer.cancel_signing_profile(profileName=name)
+
+
+def _signer_error(exc):
+    response = exc.value.response
+    return (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+            response.get("code"), response["Error"]["Message"])
+
+
+def _permissions_profile(signer):
+    name = f"perm_{_uid()}"
+    put = signer.put_signing_profile(profileName=name, platformId=_LAMBDA_PLATFORM)
+    account = put["arn"].split(":")[4]
+    return name, put, account
+
+
+def test_signer_profile_permissions_add_list_remove(signer):
+    """The statements list in the order they were added, policySizeBytes is
+    the compact JSON of the statements (account principals as
+    arn:aws:iam::<id>:root, profileVersion as a condition), and removing the
+    last statement removes the policy."""
+    name, put, account = _permissions_profile(signer)
+    with pytest.raises(ClientError) as exc:
+        signer.list_profile_permissions(profileName=name)
+    assert _signer_error(exc) == (404, "ResourceNotFoundException", "PolicyNotFound",
+                                  f"No policies associated with profile {name}")
+
+    first = signer.add_profile_permission(
+        profileName=name, action="signer:StartSigningJob", principal=account, statementId="s1")
+    second = signer.add_profile_permission(
+        profileName=name, action="signer:RevokeSignature", principal=account,
+        statementId="s3", profileVersion=put["profileVersion"], revisionId=first["revisionId"])
+    assert second["revisionId"] != first["revisionId"]
+
+    listed = signer.list_profile_permissions(profileName=name)
+    assert listed["revisionId"] == second["revisionId"]
+    assert "nextToken" not in listed
+    assert listed["permissions"] == [
+        {"action": "signer:StartSigningJob", "principal": account, "statementId": "s1"},
+        {"action": "signer:RevokeSignature", "principal": account, "statementId": "s3",
+         "profileVersion": put["profileVersion"]},
+    ]
+    statements = [
+        {"Sid": "s1", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
+         "Action": "signer:StartSigningJob", "Resource": put["arn"]},
+        {"Sid": "s3", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
+         "Action": "signer:RevokeSignature", "Resource": put["arn"],
+         "Condition": {"StringEquals": {"signer:ProfileVersion": put["profileVersion"]}}},
+    ]
+    assert listed["policySizeBytes"] == len(json.dumps(statements, separators=(",", ":")))
+    # A nextToken the service never issued is ignored.
+    again = signer.list_profile_permissions(profileName=name, nextToken="garbage")
+    assert again["permissions"] == listed["permissions"] and "nextToken" not in again
+
+    removed = signer.remove_profile_permission(
+        profileName=name, statementId="s1", revisionId=listed["revisionId"])
+    assert removed["revisionId"] != listed["revisionId"]
+    assert [p["statementId"] for p in
+            signer.list_profile_permissions(profileName=name)["permissions"]] == ["s3"]
+    signer.remove_profile_permission(
+        profileName=name, statementId="s3", revisionId=removed["revisionId"])
+    with pytest.raises(ClientError) as exc:
+        signer.list_profile_permissions(profileName=name)
+    assert _signer_error(exc)[2] == "PolicyNotFound"
+    # With the policy gone the next add needs no revisionId again.
+    signer.add_profile_permission(
+        profileName=name, action="signer:GetSigningProfile", principal=account, statementId="again")
+
+
+def test_signer_profile_permissions_revision_id_rules(signer):
+    name, _put, account = _permissions_profile(signer)
+
+    def add(**kw):
+        params = {"profileName": name, "action": "signer:StartSigningJob",
+                  "principal": account, "statementId": "s1"}
+        params.update(kw)
+        return signer.add_profile_permission(**params)
+
+    with pytest.raises(ClientError) as exc:
+        add(revisionId="whatever")
+    assert _signer_error(exc) == (
+        400, "ValidationException", "ValidationException",
+        "Resource Policy does not exist but revisionId was specified in the request")
+    first = add()["revisionId"]
+    with pytest.raises(ClientError) as exc:
+        add(statementId="s2")
+    assert _signer_error(exc) == (
+        400, "ValidationException", "ValidationException",
+        f"Resource Policy exists for Profile Name {name}. But no revisionId was provided "
+        "in the request")
+    second = add(statementId="s2", action="signer:GetSigningProfile", revisionId=first)["revisionId"]
+    with pytest.raises(ClientError) as exc:
+        add(statementId="s3", revisionId=first)
+    assert _signer_error(exc) == (
+        409, "ConflictException", "PolicyRevisionIdMismatch",
+        f"Specified revisionId ({first}) does not match the revisionId of the existing "
+        f"policy ({second})")
+    # Repeating a statement exactly answers the current revision, before
+    # any revisionId check.
+    assert add()["revisionId"] == second
+    assert add(revisionId="stale")["revisionId"] == second
+    with pytest.raises(ClientError) as exc:
+        add(action="signer:GetSigningProfile", revisionId=second)
+    assert _signer_error(exc) == (400, "ValidationException", "InvalidPermissionStatement",
+                                  "Statement with statementId s1 is already in the policy")
+    with pytest.raises(ClientError) as exc:
+        signer.remove_profile_permission(profileName=name, statementId="s1", revisionId=first)
+    assert _signer_error(exc)[:3] == (409, "ConflictException", "PolicyRevisionIdMismatch")
+    with pytest.raises(ClientError) as exc:
+        signer.remove_profile_permission(profileName=name, statementId="zz", revisionId=second)
+    assert _signer_error(exc) == (404, "ResourceNotFoundException", "PolicyNotFound",
+                                  f"No policy named zz associated with {name} profile")
+
+
+def test_signer_profile_permissions_refuse_malformed_statements(signer):
+    name, _put, account = _permissions_profile(signer)
+    base = {"profileName": name, "action": "signer:StartSigningJob",
+            "principal": account, "statementId": "s1"}
+    cases = [
+        ({"statementId": ""}, (400, "ValidationException", "ValidationException",
+                               "statementId cannot be empty.")),
+        ({"statementId": "a b"}, (400, "ValidationException", "InvalidPermissionStatement",
+                                  "Statement ID must contain only alphanumeric characters, "
+                                  "underscores, and dashes")),
+        ({"statementId": "y" * 101}, (400, "ValidationException", "InvalidPermissionStatement",
+                                      "Statement ID must be less than 64 characters length")),
+        ({"principal": "*"}, (400, "ValidationException", "InvalidPrincipal",
+                              "Principal is not a valid AWS account id or IAM Role Arn")),
+        ({"principal": f"arn:aws:iam::{account}:root"}, (
+            400, "ValidationException", "InvalidPrincipal",
+            "Principal is not a valid AWS account id or IAM Role Arn")),
+        ({"action": "signer:Foo"}, (
+            400, "ValidationException", "ValidationException",
+            f"Action signer:Foo not supported for platform {_LAMBDA_PLATFORM}. Action must be "
+            "one of [signer:StartSigningJob, signer:GetSigningProfile, signer:RevokeSignature]")),
+        ({"profileVersion": "ABCDEFGHIJ"}, (
+            404, "ResourceNotFoundException", "ProfileVersionNotFound",
+            f"Version ABCDEFGHIJ does not exist for SigningProfile {name}.")),
+    ]
+    for override, expected in cases:
+        with pytest.raises(ClientError) as exc:
+            signer.add_profile_permission(**{**base, **override})
+        assert _signer_error(exc) == expected, override
+    with pytest.raises(ClientError) as exc:
+        signer.list_profile_permissions(profileName=name)
+    assert _signer_error(exc)[2] == "PolicyNotFound"
+
+    # A 64-character id and an IAM role ARN are accepted.
+    signer.add_profile_permission(**{**base, "statementId": "x" * 64})
+    role = make_client("iam").create_role(
+        RoleName=f"signer-perm-{_uid()}",
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )["Role"]["Arn"]
+    signer.add_profile_permission(
+        **{**base, "statementId": "role", "principal": role},
+        revisionId=signer.list_profile_permissions(profileName=name)["revisionId"])
+
+    ghost = f"ghost_{_uid()}"
+    for call in (
+        lambda: signer.add_profile_permission(**{**base, "profileName": ghost}),
+        lambda: signer.list_profile_permissions(profileName=ghost),
+        lambda: signer.remove_profile_permission(profileName=ghost, statementId="s1",
+                                                 revisionId="x"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert _signer_error(exc) == (404, "ResourceNotFoundException", "ProfileNotFound",
+                                      f"SigningProfile with name {ghost} does not exist")
+
+
+def test_signer_profile_permissions_policy_size_limit(signer):
+    """The 2000-byte limit counts the compact statement list with the
+    principal as given: 2000 bytes are accepted, 2001 are refused."""
+    name, put, account = _permissions_profile(signer)
+
+    def size(sids):
+        return len(json.dumps([
+            {"Sid": sid, "Effect": "Allow", "Principal": {"AWS": account},
+             "Action": "signer:GetSigningProfile", "Resource": put["arn"]}
+            for sid in sids], separators=(",", ":")))
+
+    # N ids of 2 to 64 characters whose list is exactly 2000 bytes.
+    for count in range(1, 20):
+        need = 2000 - size([f"{i:02d}" for i in range(count)])
+        if 0 <= need <= 62 * count:
+            break
+    sids = []
+    for i in range(count):
+        pad = min(62, need)
+        need -= pad
+        sids.append(f"{i:02d}" + "a" * pad)
+    assert size(sids) == 2000 and len(sids[-1]) < 64
+    revision = None
+    for sid in sids:
+        revision = signer.add_profile_permission(
+            profileName=name, action="signer:GetSigningProfile", principal=account,
+            statementId=sid, **({"revisionId": revision} if revision else {}))["revisionId"]
+    revision = signer.remove_profile_permission(
+        profileName=name, statementId=sids[-1], revisionId=revision)["revisionId"]
+    with pytest.raises(ClientError) as exc:
+        signer.add_profile_permission(
+            profileName=name, action="signer:GetSigningProfile", principal=account,
+            statementId=sids[-1] + "c", revisionId=revision)
+    assert _signer_error(exc) == (402, "ServiceLimitExceededException", "ServiceLimitExceeded",
+                                  "Policy cannot exceed maximum size of 2000 bytes")
+
+
+def test_signer_cancel_profile_keeps_the_name_and_freezes_permissions(signer):
+    name, _put, account = _permissions_profile(signer)
+    revision = signer.add_profile_permission(
+        profileName=name, action="signer:StartSigningJob", principal=account,
+        statementId="s1")["revisionId"]
+    signer.cancel_signing_profile(profileName=name)
+    assert signer.get_signing_profile(profileName=name)["status"] == "Canceled"
+
+    listed = signer.list_profile_permissions(profileName=name)
+    assert [p["statementId"] for p in listed["permissions"]] == ["s1"]
+    assert listed["revisionId"] != revision
+    with pytest.raises(ClientError) as exc:
+        signer.add_profile_permission(
+            profileName=name, action="signer:StartSigningJob", principal=account,
+            statementId="late", revisionId=listed["revisionId"])
+    assert _signer_error(exc) == (400, "ValidationException", "ProfileNotActive",
+                                  "Cannot add permission to a profile in Canceled state")
+    with pytest.raises(ClientError) as exc:
+        signer.remove_profile_permission(
+            profileName=name, statementId="s1", revisionId=listed["revisionId"])
+    assert _signer_error(exc) == (400, "ValidationException", "ProfileNotActive",
+                                  "Cannot remove permission from a profile in Canceled state")
+
+    signer.cancel_signing_profile(profileName=name)
+    assert signer.get_signing_profile(profileName=name)["status"] == "Canceled"
+    ghost = f"ghost_{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        signer.cancel_signing_profile(profileName=ghost)
+    assert _signer_error(exc) == (404, "ResourceNotFoundException", "ProfileNotFound",
+                                  f"Signing Profile with name {ghost} does not exist.")
+
+
 @pytest.mark.parametrize("name", ["fw-profile", "p" * 65])
 def test_signer_profile_name_outside_documented_pattern_is_refused(
     signer, s3, buckets, name

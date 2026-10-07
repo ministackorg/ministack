@@ -923,6 +923,64 @@ def test_s3_origin_missing_key_returns_access_denied(cf_s3_stack):
     assert b"<Code>AccessDenied</Code>" in body
 
 
+def _s3_oac_origin(origin_id: str, bucket: str) -> dict:
+    return {"Id": origin_id, "DomainName": f"{bucket}.s3.amazonaws.com",
+            "S3OriginConfig": {"OriginAccessIdentity": ""}, "OriginAccessControlId": "test-oac-id"}
+
+
+def _custom_error_dist(cloudfront, suffix: str, origins: list, error_responses: list, behaviors: list | None = None):
+    return cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cf-dp-errors-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": len(origins), "Items": origins},
+        "DefaultCacheBehavior": {"TargetOriginId": origins[0]["Id"], "ViewerProtocolPolicy": "allow-all",
+                                 "CachePolicyId": _CACHING_DISABLED},
+        "CacheBehaviors": {"Quantity": len(behaviors or []), "Items": behaviors or []},
+        "CustomErrorResponses": {"Quantity": len(error_responses), "Items": error_responses},
+    })["Distribution"]
+
+
+def test_custom_error_response_serves_the_page_with_the_configured_status(cloudfront, s3):
+    """A single-page app: S3 answers 403 for a client route, CloudFront serves /index.html with 200."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket = f"cf-dp-spa-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="index.html", Body=b"<html>app</html>", ContentType="text/html")
+    dist = _custom_error_dist(cloudfront, suffix, [_s3_oac_origin("site", bucket)], [
+        {"ErrorCode": 403, "ResponsePagePath": "/index.html", "ResponseCode": "200", "ErrorCachingMinTTL": 10},
+    ])
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "cloudfront.amazonaws.com"},
+        "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*",
+        "Condition": {"StringEquals": {"AWS:SourceArn": dist["ARN"]}},
+    }]}))
+
+    status, headers, body = _get(dist["DomainName"], "/auth/callback")
+    assert status == 200
+    assert body == b"<html>app</html>"
+    assert headers.get("Content-Type") == "text/html"
+
+
+def test_unavailable_custom_error_page_answers_the_status_its_origin_returned(cloudfront, s3, cf_backend):
+    """The Developer Guide's example ("Generate custom error responses"): the custom origin answers 500 and the
+    page is missing from its S3 bucket, so the viewer gets S3's status, neither 500 nor the configured 200."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    pages = f"cf-dp-pages-{suffix}"
+    s3.create_bucket(Bucket=pages)
+    dist = _custom_error_dist(
+        cloudfront, suffix,
+        [{"Id": "api", "DomainName": cf_backend["origin_domain"], "CustomOriginConfig": {
+            "HTTPPort": int(GATEWAY_PORT), "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"}},
+         _s3_oac_origin("pages", pages)],
+        [{"ErrorCode": 500, "ResponsePagePath": "/errors/500.html", "ResponseCode": "200"}],
+        [{"PathPattern": "/errors/*", "TargetOriginId": "pages", "ViewerProtocolPolicy": "allow-all",
+          "CachePolicyId": _CACHING_DISABLED}],
+    )
+
+    status, _headers, body = _get(dist["DomainName"], "/status/500")
+    assert status == 403
+    assert b"<Code>AccessDenied</Code>" in body
+
+
 # ---------------------------------------------------------------------------
 # Percent-encoding fidelity (CloudFront Developer Guide, "Restrictions on all
 # edge functions" > "URI, query string, and headers encoding").

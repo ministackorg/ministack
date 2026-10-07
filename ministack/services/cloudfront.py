@@ -4665,11 +4665,23 @@ def parse_distribution_dataplane_config(dist: dict) -> dict:
             if _local_tag_name(it) == "CacheBehavior":
                 ordered_behaviors.append(_dataplane_behavior(it, _text(it, "PathPattern")))
 
+    custom_error_responses = {}
+    errors_el = _find(config_el, "CustomErrorResponses")
+    items_el = _find(errors_el, "Items") if errors_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            # AWS takes ResponsePagePath and ResponseCode only together; ErrorCachingMinTTL alone sets no page.
+            if _local_tag_name(it) == "CustomErrorResponse" and _text(it, "ResponsePagePath") and _text(it, "ResponseCode"):
+                custom_error_responses[int(_text(it, "ErrorCode"))] = {
+                    "page": _text(it, "ResponsePagePath"), "response_code": int(_text(it, "ResponseCode")),
+                }
+
     return {
         "default_root_object": _opt_text(config_el, "DefaultRootObject") or "",
         "origins": origins,
         "default_behavior": default_behavior,
         "ordered_behaviors": ordered_behaviors,
+        "custom_error_responses": custom_error_responses,
     }
 
 
