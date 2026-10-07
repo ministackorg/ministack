@@ -1394,6 +1394,17 @@ class TestResourceArn:
             "arn:aws:dynamodb:us-east-1:123:table/snapshots",
         ]
 
+    def test_dynamodb_table_name_may_be_the_table_arn(self):
+        from ministack.core.iam_actions import dynamodb_resource_arns, dynamodb_transaction_checks
+        arn = "arn:aws:dynamodb:us-east-1:123:table/users"
+        assert dynamodb_resource_arns(json.dumps({"TableName": arn, "IndexName": "by-email"}).encode(),
+                                      "us-east-1", "123") == [f"{arn}/index/by-email"]
+        assert dynamodb_resource_arns(json.dumps({"RequestItems": {arn: []}}).encode(),
+                                      "us-east-1", "123") == [arn]
+        body = json.dumps({"TransactItems": [{"Put": {"TableName": arn, "Item": {}}}]}).encode()
+        assert dynamodb_transaction_checks("dynamodb:TransactWriteItems", body, "us-east-1", "123") == [
+            ("dynamodb:PutItem", arn)]
+
     def test_eventbridge_put_events_returns_every_bus(self):
         from ministack.core.iam_actions import eventbridge_resource_arns
         body = json.dumps({"Entries": [
