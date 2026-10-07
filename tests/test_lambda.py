@@ -4892,7 +4892,7 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
-    key, user = "AKIALAYERCONSUMER001", "layer-consumer"
+    key, user = "test-layer-consumer-key", "layer-consumer"
     user_arn = f"arn:aws:iam::{_CALLER_ACCOUNT}:user/{user}"
     seeded = [
         (iam_svc._users, user, {"UserName": user, "Arn": user_arn, "UserId": "AIDALAYER", "AttachedPolicies": []}),
@@ -13724,7 +13724,10 @@ def test_provided_metadata_does_not_mutate_payload(monkeypatch, event):
     result = lambda_svc._execute_function_provided_warm(
         {"config": _provided_dispatch_config(), "code_zip": b"zip"}, event, "request-1",
     )
-    worker.invoke.assert_called_once_with(event, "request-1", trace_id="trace-1")
+    worker.invoke.assert_called_once_with(
+        event, "request-1", trace_id="trace-1",
+        invoked_function_arn=_provided_dispatch_config()["FunctionArn"],
+    )
     release.assert_called_once_with(worker)
     assert result == {"body": event, "log": "handler log"}
     if isinstance(event, dict):
@@ -14262,3 +14265,17 @@ def test_classify_function_error_bare_timeout_string_is_unhandled():
     assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
     # Only the exact runtime message counts; other handler strings stay successes.
     assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None
+
+
+def test_provided_invocation_arn_is_per_request(worker_factory):
+    worker = worker_factory(_bootstrap('''
+while True:
+    headers, event = next_invocation()
+    post_response(headers["Lambda-Runtime-Aws-Request-Id"],
+                  headers["Lambda-Runtime-Invoked-Function-Arn"])
+'''))
+    for qualifier in ("worker", "other", "1", "worker"):
+        arn = worker.config["FunctionArn"] + ":" + qualifier
+        result = worker.invoke({}, "request-" + qualifier, invoked_function_arn=arn)
+        assert result["status"] == "ok", result
+        assert result["result"] == arn

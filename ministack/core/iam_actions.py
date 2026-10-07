@@ -1246,12 +1246,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "signer":
-        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
+        # three profile-permission actions are scoped to the profile,
         # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
         # carry no resource (Service Authorization Reference). The ARNs put a
         # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
         parts = [p for p in path.split("/") if p]
-        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+        if (parts and parts[0] == "signing-profiles" and len(parts) > 1
+                and not (method == "PUT" and len(parts) == 2)):
             return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
         if parts and parts[0] == "signing-jobs":
             if len(parts) > 1:
@@ -1527,6 +1529,7 @@ def extract_resource_arn(service: str, method: str, path: str,
             "rules": "rule",
             "jobs": "job",
             "provisioning-templates": "provisioningtemplate",
+            "job-templates": "jobtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:

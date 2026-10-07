@@ -205,6 +205,81 @@ def test_cached_cert_is_reused_across_regions(tmp_path, monkeypatch):
     assert open(second, "rb").read() == first_bytes
 
 
+# ---------------------------------------------------------------------------
+# The IoT endpoint hosts: DescribeEndpoint answers a bare address that SDKs
+# dial as https://<address>, as on AWS, so the gateway certificate has to
+# name it for that handshake to verify.
+# ---------------------------------------------------------------------------
+
+
+def _checkhost(cert_path, host):
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-checkhost", host],
+        capture_output=True, text=True, check=False)
+    return "does match" in out.stdout
+
+
+def test_generated_cert_names_the_iot_endpoint_hosts(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_HOST", "localhost.localstack.cloud")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    assert _checkhost(cert_path, "f7b11509f4d675-ats.iot.eu-central-1.localhost.localstack.cloud")
+    assert _checkhost(cert_path, "f7b11509f4d675.credentials.iot.ap-southeast-2.localhost.localstack.cloud")
+    assert not _checkhost(cert_path, "f7b11509f4d675-ats.iot.eu-central-1.example.com")
+
+
+def test_cached_cert_for_another_ministack_host_is_regenerated(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    monkeypatch.setenv("MINISTACK_HOST", "first.test")
+    tls.resolve_tls_material()
+    monkeypatch.setenv("MINISTACK_HOST", "second.test")
+    cert, _ = tls.resolve_tls_material()
+    assert _checkhost(cert, "abc-ats.iot.us-east-1.second.test")
+    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(cert)
+
+
+def test_ip_ministack_host_adds_no_iot_names(monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("MINISTACK_HOST", "192.0.2.10")
+    assert tls.iot_endpoint_hosts() == []
+
+
+@pytest.mark.serial
+def test_iot_data_client_reaches_the_described_endpoint_over_https(tmp_path, monkeypatch):
+    """The AWS SDK pattern: endpoint_url=f"https://{endpointAddress}", verified."""
+    import boto3
+
+    port = _free_port()
+    proc = _spawn({"USE_SSL": "1", "TMPDIR": str(tmp_path), "MINISTACK_HOST": "localhost",
+                   "GATEWAY_PORT": str(port), "MINISTACK_SSL_CERT": "", "MINISTACK_SSL_KEY": ""}, port)
+    try:
+        _wait_health(f"https://127.0.0.1:{port}/_ministack/health", ctx=_ctx_no_verify())
+        cert = str(tmp_path / "ministack-tls" / "server.crt")
+        kw = {"region_name": "eu-central-1", "aws_access_key_id": "test",
+              "aws_secret_access_key": "test", "verify": cert}
+        address = boto3.client("iot", endpoint_url=f"https://localhost:{port}", **kw).describe_endpoint(
+            endpointType="iot:Data-ATS")["endpointAddress"]
+        host = address.rsplit(":", 1)[0]
+        assert host.endswith("-ats.iot.eu-central-1.localhost")
+        # *.localhost resolution varies by platform; the certificate check is what is under test.
+        real_getaddrinfo = socket.getaddrinfo
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda h, *a, **k: real_getaddrinfo("127.0.0.1" if h == host else h, *a, **k))
+        data = boto3.client("iot-data", endpoint_url=f"https://{address}", **kw)
+        assert data.publish(topic="ats/check", payload=b"{}")["ResponseMetadata"]["HTTPStatusCode"] == 200
+    finally:
+        _terminate(proc)
+
+
 def test_byo_certificate_is_never_regenerated(tmp_path, monkeypatch):
     """MINISTACK_SSL_CERT is the operator's, so the issuer host is their
     business and we must hand it back untouched."""
