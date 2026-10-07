@@ -64,6 +64,390 @@ def test_iot_describe_endpoint_unknown_type_rejected(iot_client):
 
 
 # ---------------------------------------------------------------------------
+# Domain configurations
+# ---------------------------------------------------------------------------
+
+_PROTOCOLS_DOC = "<https://docs.aws.amazon.com/iot/latest/developerguide/protocols.html>"
+
+
+def _dc_error(call, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        call(**kwargs)
+    return ei.value.response["Error"]["Code"], ei.value.response["Error"]["Message"]
+
+
+def _self_signed_pem(cn, server_auth):
+    """A self-signed certificate and key, with or without the serverAuth EKU."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+               .public_key(key.public_key()).serial_number(x509.random_serial_number())
+               .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1)))
+    if server_auth:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+    cert = builder.sign(key, hashes.SHA256())
+    return (cert.public_bytes(serialization.Encoding.PEM),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()))
+
+
+def test_iot_domain_configuration_iot_owned_entries(iot_client):
+    """A fresh account lists the iot:Data-ATS and iot:CredentialProvider
+    configurations, whose domainName is the DescribeEndpoint address."""
+    listed = {
+        d["domainConfigurationName"]: d["serviceType"]
+        for d in iot_client.list_domain_configurations()["domainConfigurations"]
+    }
+    assert listed["iot:Data-ATS"] == "DATA"
+    assert listed["iot:CredentialProvider"] == "CREDENTIAL_PROVIDER"
+    assert "iot:Jobs" not in listed
+
+    ats = iot_client.describe_domain_configuration(domainConfigurationName="iot:Data-ATS")
+    assert ats["domainName"] == iot_client.describe_endpoint(
+        endpointType="iot:Data-ATS")["endpointAddress"]
+    assert ats["domainConfigurationArn"].endswith(":domainconfiguration/iot:Data-ATS")
+    assert ats["domainType"] == "ENDPOINT"
+    assert ats["domainConfigurationStatus"] == "ENABLED"
+    assert ats["serverCertificates"] == []
+    assert ats["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+    assert (ats["authenticationType"], ats["applicationProtocol"]) == ("DEFAULT", "DEFAULT")
+
+    cp = iot_client.describe_domain_configuration(domainConfigurationName="iot:CredentialProvider")
+    assert cp["domainName"] == iot_client.describe_endpoint(
+        endpointType="iot:CredentialProvider")["endpointAddress"]
+    assert cp["domainType"] == "ENDPOINT"
+    assert not {"tlsConfig", "authenticationType", "applicationProtocol"} & cp.keys()
+
+    assert _dc_error(iot_client.describe_domain_configuration,
+                     domainConfigurationName="iot:Jobs") == (
+        "InvalidRequestException", "Invalid DomainConfiguration Name")
+
+
+def test_iot_domain_configuration_create_aws_managed(iot_client):
+    name = _unique("dc")
+    resp = iot_client.create_domain_configuration(domainConfigurationName=name)
+    assert resp["domainConfigurationName"] == name
+    assert re.fullmatch(
+        rf"arn:aws:iot:us-east-1:\d{{12}}:domainconfiguration/{name}/[a-z0-9]{{5}}",
+        resp["domainConfigurationArn"])
+
+    d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+    assert d["domainConfigurationArn"] == resp["domainConfigurationArn"]
+    assert re.match(r"d[a-z0-9]{20}-ats\.iot\.us-east-1\.", d["domainName"])
+    assert d["domainType"] == "AWS_MANAGED"
+    assert d["domainConfigurationStatus"] == "ENABLED"
+    assert d["serviceType"] == "DATA"
+    assert d["serverCertificates"] == []
+    assert d["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+    assert (d["authenticationType"], d["applicationProtocol"]) == ("DEFAULT", "DEFAULT")
+    assert "authorizerConfig" not in d
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_domain_configuration(
+            domainConfigurationName=name, tlsConfig={"securityPolicy": "Bogus"})
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert ei.value.response["Error"]["Message"] == "Domain configuration already exists"
+    assert ei.value.response["resourceId"] == resp["domainConfigurationArn"].split(":", 5)[5]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"domainConfigurationName": "bad:name"},
+         "1 validation error detected: Value at 'domainConfigurationName' failed to satisfy "
+         "constraint: Member must satisfy regular expression pattern: [\\w.-]+"),
+        ({"domainConfigurationName": "x" * 129},
+         "1 validation error detected: Value at 'domainConfigurationName' failed to satisfy "
+         "constraint: Member must have length less than or equal to 128"),
+        ({"serviceType": "CREDENTIAL_PROVIDER"},
+         "CreateDomainConfiguration only supports DATA Service Type"),
+        ({"serviceType": "JOBS"}, "Invalid Service Type"),
+        ({"serviceType": "BOGUS"},
+         "1 validation error detected: Value at 'serviceType' failed to satisfy constraint: "
+         "Member must satisfy enum value set: [DATA, JOBS, CREDENTIAL_PROVIDER]"),
+        ({"tlsConfig": {"securityPolicy": "Bogus"}}, "SecurityPolicy Bogus not recognized"),
+        ({"tlsConfig": {"securityPolicy": "IoTSecurityPolicy_TLS12_1_0_2016_01"}},
+         "SecurityPolicy IoTSecurityPolicy_TLS12_1_0_2016_01 is not supported in region us-east-1"),
+        ({"authenticationType": "AWS_X509"},
+         "The domain must configure a supported ApplicationProtocol when configuring an "
+         f"AuthenticationType. Please refer to {_PROTOCOLS_DOC} for supported combinations "
+         "and try again."),
+        ({"applicationProtocol": "HTTPS"},
+         "The domain must configure a supported AuthenticationType when configuring an "
+         f"ApplicationProtocol. Please refer to {_PROTOCOLS_DOC} for supported combinations "
+         "and try again."),
+        ({"authenticationType": "AWS_SIGV4", "applicationProtocol": "SECURE_MQTT"},
+         "Unsupported combination of AuthenticationType and ApplicationProtocol provided. "
+         "AuthenticationType: [AWS_SIGV4], ApplicationProtocol: [SECURE_MQTT]. Please refer "
+         f"to {_PROTOCOLS_DOC} for supported combinations and try again."),
+        ({"authenticationType": "CUSTOM_AUTH", "applicationProtocol": "HTTPS", "authorizerConfig": {}},
+         "The domain configuration must have a valid AuthorizerConfig configured when using "
+         f"CUSTOM_AUTH as the AuthenticationType. Please refer to {_PROTOCOLS_DOC} for "
+         "supported combinations and try again."),
+        ({"domainName": "iot.example.com"},
+         "Cannot provide a custom domain name for an AWS Managed Domain"),
+        ({"validationCertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/abc"},
+         "Cannot provide a Validation Certificate for AWS Managed Domain Configurations"),
+        ({"serverCertificateConfig": {"enableOCSPCheck": True}},
+         "Cannot create a server certificate config for an AWS Managed Domain"),
+        ({"serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/abc"]},
+         "Must provide a valid domain name to configure."),
+        ({"domainName": "iot.example.com",
+          "serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/abc"]},
+         "Certificate arn:aws:acm:us-east-1:000000000000:certificate/abc does not exist."),
+        ({"domainName": "iot.example.com",
+          "serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/a"] * 2},
+         "1 validation error detected: Value at 'serverCertificateArns' failed to satisfy "
+         "constraint: Member must have length less than or equal to 1"),
+    ],
+)
+def test_iot_domain_configuration_create_refusals(iot_client, kwargs, message):
+    kwargs = {"domainConfigurationName": _unique("dc-refused"), **kwargs}
+    assert _dc_error(iot_client.create_domain_configuration, **kwargs) == (
+        "InvalidRequestException", message)
+    listed = [d["domainConfigurationName"]
+              for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert kwargs["domainConfigurationName"] not in listed
+
+
+def test_iot_domain_configuration_customer_managed_certificates(iot_client, acm_client):
+    """An imported (self-signed) server certificate needs serverAuth and a
+    trusted validation certificate; an ACM-issued one makes the configuration
+    CUSTOMER_MANAGED on the caller's domain."""
+    pytest.importorskip("cryptography")
+    domain = f"{_unique('dc')}.example.com"
+    arns = {}
+    for tag, server_auth in (("noeku", False), ("eku", True), ("validation", True)):
+        pem, key = _self_signed_pem(domain, server_auth)
+        arns[tag] = acm_client.import_certificate(Certificate=pem, PrivateKey=key)["CertificateArn"]
+    create = iot_client.create_domain_configuration
+    name = _unique("dc-cm")
+    base = {"domainConfigurationName": name, "domainName": domain}
+
+    assert _dc_error(create, serverCertificateArns=[arns["noeku"]], **base) == (
+        "CertificateValidationException",
+        "The certificate is missing ServerAuth in extended key usage of certificate.")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]], **base) == (
+        "InvalidRequestException",
+        "Must provide validation certificate when using server certificates not signed by "
+        "trusted CA or not within")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]],
+                     validationCertificateArn=arns["eku"], **base) == (
+        "InvalidRequestException",
+        "Cannot provide a ServerCertificateArn that is the same as a ValidationCertificateArn")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]],
+                     validationCertificateArn=arns["validation"], **base) == (
+        "InvalidRequestException", "Validation certificate must be signed by trusted CA")
+
+    issued = acm_client.request_certificate(DomainName=domain)["CertificateArn"]
+    create(serverCertificateArns=[issued], **base)
+    d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+    assert d["domainType"] == "CUSTOMER_MANAGED"
+    assert d["domainName"] == domain
+    assert d["serverCertificates"] == [
+        {"serverCertificateArn": issued, "serverCertificateStatus": "VALID"}]
+    iot_client.update_domain_configuration(
+        domainConfigurationName=name, serverCertificateConfig={"enableOCSPCheck": False})
+    assert iot_client.describe_domain_configuration(domainConfigurationName=name)[
+        "serverCertificateConfig"] == {"enableOCSPCheck": False}
+
+
+def test_iot_domain_configuration_update(iot_client):
+    name = _unique("dc-upd")
+    iot_client.create_domain_configuration(domainConfigurationName=name)
+    update = iot_client.update_domain_configuration
+
+    def describe():
+        return iot_client.describe_domain_configuration(domainConfigurationName=name)
+
+    # The policy matches case-insensitively and is stored in AWS's spelling;
+    # an empty tlsConfig falls back to the default policy.
+    update(domainConfigurationName=name,
+           tlsConfig={"securityPolicy": "iotsecuritypolicy_tls12_1_2_2022_10"})
+    assert describe()["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"}
+    update(domainConfigurationName=name, tlsConfig={})
+    assert describe()["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=False) == (
+        "InvalidRequestException", "No arguments supplied to update")
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=True,
+                     authorizerConfig={"allowAuthorizerOverride": True}) == (
+        "InvalidRequestException",
+        "AuthorizerConfig supplied and removeAuthorizer is true, cannot set authorizer and remove it")
+    update(domainConfigurationName=name, authorizerConfig={"allowAuthorizerOverride": True})
+    update(domainConfigurationName=name, authorizerConfig={})
+    assert describe()["authorizerConfig"] == {"allowAuthorizerOverride": True}
+
+    # The combination is checked against the stored values for the half the
+    # request leaves out; a custom-auth type needs the authorizer to stay.
+    update(domainConfigurationName=name, authenticationType="CUSTOM_AUTH",
+           applicationProtocol="MQTT_WSS")
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=True) == (
+        "InvalidRequestException",
+        "The domain configuration must have a valid AuthorizerConfig configured when using "
+        f"CUSTOM_AUTH as the AuthenticationType. Please refer to {_PROTOCOLS_DOC} for "
+        "supported combinations and try again.")
+    assert _dc_error(update, domainConfigurationName=name, authenticationType="AWS_X509") == (
+        "InvalidRequestException",
+        "Unsupported combination of AuthenticationType and ApplicationProtocol provided. "
+        "AuthenticationType: [AWS_X509], ApplicationProtocol: [MQTT_WSS]. Please refer to "
+        f"{_PROTOCOLS_DOC} for supported combinations and try again.")
+    assert _dc_error(update, domainConfigurationName=name,
+                     authenticationType="CUSTOM_AUTH_WITH_X509")[1].startswith(
+        "The AuthenticationType provided in the request was not recognized.")
+    update(domainConfigurationName=name, authenticationType="DEFAULT",
+           applicationProtocol="DEFAULT", removeAuthorizerConfig=True)
+    assert "authorizerConfig" not in describe()
+
+    assert _dc_error(update, domainConfigurationName=name,
+                     serverCertificateConfig={"enableOCSPCheck": True}) == (
+        "InvalidRequestException",
+        "Cannot configure ServerCertificateConfig for non-customer-managed domains")
+    assert _dc_error(update, domainConfigurationName=name,
+                     domainConfigurationStatus="PAUSED")[1].endswith(
+        "Member must satisfy enum value set: [ENABLED, DISABLED]")
+
+    # lastStatusChangeDate only moves when the status does.
+    stamp = describe()["lastStatusChangeDate"]
+    update(domainConfigurationName=name, domainConfigurationStatus="ENABLED")
+    assert describe()["lastStatusChangeDate"] == stamp
+    time.sleep(0.01)
+    update(domainConfigurationName=name, domainConfigurationStatus="DISABLED")
+    assert describe()["domainConfigurationStatus"] == "DISABLED"
+    assert describe()["lastStatusChangeDate"] > stamp
+
+    # The policy is checked before the name is looked up.
+    missing = _unique("dc-missing")
+    assert _dc_error(update, domainConfigurationName=missing,
+                     tlsConfig={"securityPolicy": "Bogus"}) == (
+        "InvalidRequestException", "SecurityPolicy Bogus not recognized")
+    code, message = _dc_error(update, domainConfigurationName=missing,
+                              domainConfigurationStatus="DISABLED")
+    assert code == "ResourceNotFoundException"
+    assert message.endswith(f"DomainConfigurationName: {missing}")
+
+
+def test_iot_domain_configuration_update_iot_owned(iot_client):
+    """Of the configurations IoT owns only iot:Data-ATS's TLS policy changes."""
+    owned = "IoT owned domain configuration cannot be updated with the supplied arguments"
+    update = iot_client.update_domain_configuration
+    for name, kwargs in (
+        ("iot:Data-ATS", {"domainConfigurationStatus": "ENABLED"}),
+        ("iot:Data-ATS", {"removeAuthorizerConfig": True}),
+        ("iot:CredentialProvider", {"tlsConfig": {"securityPolicy": "Bogus"}}),
+        ("iot:Jobs", {"domainConfigurationStatus": "ENABLED"}),
+    ):
+        assert _dc_error(update, domainConfigurationName=name, **kwargs) == (
+            "InvalidRequestException", owned)
+    assert _dc_error(update, domainConfigurationName="iot:Data-ATS",
+                     tlsConfig={"securityPolicy": "Bogus"}) == (
+        "InvalidRequestException", "SecurityPolicy Bogus not recognized")
+    try:
+        update(domainConfigurationName="iot:Data-ATS",
+               tlsConfig={"securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"})
+        assert iot_client.describe_domain_configuration(
+            domainConfigurationName="iot:Data-ATS")["tlsConfig"] == {
+            "securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"}
+    finally:
+        update(domainConfigurationName="iot:Data-ATS", tlsConfig={})
+
+
+def test_iot_domain_configuration_delete(iot_client):
+    """Only a DISABLED configuration is deleted, and an AWS-managed one only
+    seven days after it was disabled."""
+    name = _unique("dc-del")
+    iot_client.create_domain_configuration(domainConfigurationName=name)
+    delete = iot_client.delete_domain_configuration
+    assert _dc_error(delete, domainConfigurationName=name) == (
+        "InvalidRequestException", "Cannot delete a domain configuration that is not disabled")
+    iot_client.update_domain_configuration(
+        domainConfigurationName=name, domainConfigurationStatus="DISABLED")
+    assert _dc_error(delete, domainConfigurationName=name) == (
+        "InvalidRequestException",
+        "AWS Managed Domain Configuration must be disabled for at least 7 days "
+        "before it can be deleted")
+    assert iot_client.describe_domain_configuration(
+        domainConfigurationName=name)["domainConfigurationStatus"] == "DISABLED"
+    # An unknown name is a no-op; the IoT-owned names fail the Delete pattern.
+    delete(domainConfigurationName=_unique("dc-never"))
+    assert _dc_error(delete, domainConfigurationName="iot:Data-ATS")[1].endswith(
+        "Member must satisfy regular expression pattern: [\\w.-]+")
+
+
+def test_iot_domain_configuration_list_paging(iot_client):
+    names = [_unique("dc-page") for _ in range(3)]
+    for name in names:
+        iot_client.create_domain_configuration(domainConfigurationName=name)
+    everything = [d["domainConfigurationName"]
+                  for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert set(names) <= set(everything)
+
+    walked, marker = [], None
+    while True:
+        page = iot_client.list_domain_configurations(
+            pageSize=2, **({"marker": marker} if marker else {}))
+        assert len(page["domainConfigurations"]) <= 2
+        walked += [d["domainConfigurationName"] for d in page["domainConfigurations"]]
+        marker = page.get("nextMarker")
+        if not marker:
+            break
+        assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", marker)
+    assert walked == everything
+
+    # serviceType does not filter on AWS: CREDENTIAL_PROVIDER still lists DATA.
+    cp = iot_client.list_domain_configurations(serviceType="CREDENTIAL_PROVIDER")
+    assert [d["domainConfigurationName"] for d in cp["domainConfigurations"]] == everything
+    assert _dc_error(iot_client.list_domain_configurations, serviceType="JOBS") == (
+        "InvalidRequestException", "Invalid Service Type")
+    assert _dc_error(iot_client.list_domain_configurations, marker="Zm9v") == (
+        "InvalidRequestException", "Invalid Token")
+    assert _dc_error(iot_client.list_domain_configurations, pageSize=251) == (
+        "InvalidRequestException",
+        "1 validation error detected: Value at 'pageSize' failed to satisfy constraint: "
+        "Member must have value less than or equal to 250")
+
+
+def test_iot_domain_configurations_are_region_scoped_persisted_and_reset():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("dc-scope")
+
+    async def _request(region, method):
+        set_request_account_id("123456789012")
+        set_request_region(region)
+        status, _headers, _body = await iot_module.handle_request(
+            method, f"/domainConfigurations/{name}", {}, b"{}" if method == "POST" else b"", {})
+        return status
+
+    async def _run():
+        assert await _request("eu-west-1", "POST") == 200
+        assert await _request("eu-west-1", "GET") == 200
+        assert await _request("eu-west-3", "GET") == 404
+        assert await _request("eu-west-3", "POST") == 200
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert await _request("eu-west-1", "GET") == 404
+        iot_module.load_persisted_state(saved)
+        assert await _request("eu-west-1", "GET") == 200
+        assert await _request("eu-west-3", "GET") == 200
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Thing CRUD
 # ---------------------------------------------------------------------------
 
@@ -491,6 +875,54 @@ def test_iot_create_keys_and_certificate_inactive(iot_client):
     iot_client.delete_certificate(certificateId=resp["certificateId"])
 
 
+def test_iot_create_certificate_from_csr(iot_client):
+    """CreateCertificateFromCsr signs the CSR with the local CA: the
+    certificate keeps the CSR's subject and key, is INACTIVE unless
+    setAsActive, and is in DEFAULT mode; a CSR that does not parse or verify,
+    or carries a key AWS refuses, is refused with AWS's message."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "csr-device"),
+                         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "csr-org")])
+    csr = (x509.CertificateSigningRequestBuilder().subject_name(subject)
+           .sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode())
+
+    inactive = iot_client.create_certificate_from_csr(certificateSigningRequest=csr)
+    active = iot_client.create_certificate_from_csr(certificateSigningRequest=csr, setAsActive=True)
+    assert inactive["certificateId"] != active["certificateId"]
+    assert inactive["certificateArn"].endswith(":cert/" + inactive["certificateId"])
+    issued = x509.load_pem_x509_certificate(inactive["certificatePem"].encode())
+    spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    assert issued.subject == subject
+    assert issued.public_key().public_bytes(*spki) == key.public_key().public_bytes(*spki)
+    assert not issued.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    desc = iot_client.describe_certificate(certificateId=inactive["certificateId"])["certificateDescription"]
+    assert (desc["status"], desc["certificateMode"], desc["certificatePem"]) == (
+        "INACTIVE", "DEFAULT", inactive["certificatePem"])
+    assert iot_client.describe_certificate(
+        certificateId=active["certificateId"])["certificateDescription"]["status"] == "ACTIVE"
+
+    tampered = csr.replace(csr.splitlines()[-2], csr.splitlines()[-2][:-6] + "AAAAAA")
+    weak = [rsa.generate_private_key(public_exponent=65537, key_size=1024),
+            ec.generate_private_key(ec.SECP224R1()), ec.generate_private_key(ec.SECP256K1())]
+    refused = [(x509.CertificateSigningRequestBuilder().subject_name(subject)
+                .sign(k, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode()) for k in weak]
+    for bad in ("not a csr", tampered, *refused):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_certificate_from_csr(certificateSigningRequest=bad)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == "CSR violates constraints"
+
+    iot_client.update_certificate(certificateId=active["certificateId"], newStatus="INACTIVE")
+    for resp in (inactive, active):
+        iot_client.delete_certificate(certificateId=resp["certificateId"])
+
+
 def test_iot_delete_active_certificate_rejected(iot_client):
     pytest.importorskip("cryptography")
     resp = iot_client.create_keys_and_certificate(setAsActive=True)
@@ -700,6 +1132,7 @@ def test_iot_register_certificate_without_ca_roundtrip(iot_client):
     desc = iot_client.describe_certificate(certificateId=cert_id)
     assert desc["certificateDescription"]["certificatePem"] == cert_pem
     assert desc["certificateDescription"]["status"] == "ACTIVE"
+    assert desc["certificateDescription"]["certificateMode"] == "SNI_ONLY"
 
     iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert_id)

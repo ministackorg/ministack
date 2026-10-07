@@ -16,6 +16,21 @@ from ministack.core.router import detect_service
 _HEADERS = {"host": "localhost:4566"}
 
 
+@pytest.mark.parametrize("action", [
+    "CreateReceiptRuleSet", "ListReceiptRuleSets", "DescribeReceiptRuleSet",
+    "DeleteReceiptRuleSet", "SetActiveReceiptRuleSet", "DescribeActiveReceiptRuleSet",
+    "CreateReceiptRule", "DescribeReceiptRule", "DeleteReceiptRule",
+])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_ses_receipt_actions_route_without_signature(action, method):
+    headers = dict(_HEADERS)
+    if method == "POST":
+        headers["content-type"] = "application/x-www-form-urlencoded"
+    # app.py passes parsed POST form parameters to the same router argument
+    # that holds GET query parameters.
+    assert detect_service(method, "/", headers, {"Action": [action], "Version": ["2010-12-01"]}) == "ses"
+
+
 @pytest.mark.parametrize("path", [
     # 2015-03-31 — Functions, ESM, Layers, Tags
     "/2015-03-31/functions/foo",

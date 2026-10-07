@@ -14,7 +14,11 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             DeleteConfigurationSet, DescribeConfigurationSet,
             ListConfigurationSets, CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
-            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled.
+            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled,
+            CreateReceiptRuleSet, ListReceiptRuleSets, DescribeReceiptRuleSet,
+            DeleteReceiptRuleSet, SetActiveReceiptRuleSet,
+            DescribeActiveReceiptRuleSet, CreateReceiptRule, DescribeReceiptRule,
+            DeleteReceiptRule.
 
 All emails stored in-memory for test inspection.
 Send statistics aggregated into 15-minute buckets per AWS spec.
@@ -26,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import smtplib
 import time
 from datetime import datetime, timezone
@@ -56,6 +61,8 @@ _templates = AccountRegionScopedDict()
 _configuration_sets = AccountRegionScopedDict()
 # SESv2 PutAccountDetails, under "account": ProductionAccessEnabled and the details.
 _account_details = AccountRegionScopedDict()
+_receipt_rule_sets = AccountRegionScopedDict()
+_active_receipt_rule_set = AccountRegionScopedDict()
 _SIMULATOR_DOMAIN = "simulator.amazonses.com"
 
 
@@ -77,6 +84,8 @@ def get_state() -> dict:
         "_templates": _templates,
         "_configuration_sets": _configuration_sets,
         "_account_details": _account_details,
+        "_receipt_rule_sets": _receipt_rule_sets,
+        "_active_receipt_rule_set": _active_receipt_rule_set,
     })
 
 
@@ -91,6 +100,10 @@ def _restore_state(data: dict):
         _configuration_sets, data.get("_configuration_sets", {})
     )
     _restore_regional_store(_account_details, data.get("_account_details", {}))
+    _restore_regional_store(_receipt_rule_sets, data.get("_receipt_rule_sets", {}))
+    _restore_regional_store(
+        _active_receipt_rule_set, data.get("_active_receipt_rule_set", {})
+    )
 
 
 def _restore_regional_store(store, restored):
@@ -124,13 +137,22 @@ async def handle_request(method, path, headers, body, query_params):
 
     params = dict(query_params)
     if method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 
     action = _p(params, "Action")
 
     handlers = {
+        "CreateReceiptRuleSet": _create_receipt_rule_set,
+        "ListReceiptRuleSets": _list_receipt_rule_sets,
+        "DescribeReceiptRuleSet": _describe_receipt_rule_set,
+        "DeleteReceiptRuleSet": _delete_receipt_rule_set,
+        "SetActiveReceiptRuleSet": _set_active_receipt_rule_set,
+        "DescribeActiveReceiptRuleSet": _describe_active_receipt_rule_set,
+        "CreateReceiptRule": _create_receipt_rule,
+        "DescribeReceiptRule": _describe_receipt_rule,
+        "DeleteReceiptRule": _delete_receipt_rule,
         "SendEmail": _send_email,
         "SendRawEmail": _send_raw_email,
         "SendTemplatedEmail": _send_templated_email,
@@ -163,6 +185,289 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return _error("InvalidAction", f"Unknown action: {action}", 400)
     return handler(params)
+
+
+# ---------------------------------------------------------------------------
+# v1 — Receipt-rule metadata (AddHeader/Stop only; no receiving execution)
+# ---------------------------------------------------------------------------
+
+_RECEIPT_ACTION_FIELDS = {
+    "S3Action": ("TopicArn", "BucketName", "ObjectKeyPrefix", "KmsKeyArn", "IamRoleArn"),
+    "BounceAction": ("TopicArn", "SmtpReplyCode", "StatusCode", "Message", "Sender"),
+    "WorkmailAction": ("TopicArn", "OrganizationArn"),
+    "LambdaAction": ("TopicArn", "FunctionArn", "InvocationType"),
+    "StopAction": ("Scope", "TopicArn"),
+    "AddHeaderAction": ("HeaderName", "HeaderValue"),
+    "SNSAction": ("TopicArn", "Encoding"),
+    "ConnectAction": ("InstanceARN", "IAMRoleARN"),
+}
+
+
+def _receipt_error(code, message):
+    return _error(code, message, 400, "Sender")
+
+
+def _receipt_result(action, data=None):
+    inner = _receipt_element(f"{action}Result", data or {})
+    # AWS stores headers containing NUL but returns InternalFailure when the
+    # metadata cannot be serialized as XML. Do not emit malformed success XML.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", inner):
+        return _error("InternalFailure", None, 500, "Receiver")
+    return _xml(200, f"{action}Response", inner)
+
+
+def _receipt_element(name, value):
+    if isinstance(value, dict):
+        inner = "".join(_receipt_element(k, v) for k, v in value.items())
+    elif isinstance(value, list):
+        inner = "".join(_receipt_element("member", v) for v in value)
+    elif isinstance(value, bool):
+        inner = str(value).lower()
+    else:
+        inner = _esc(str(value))
+    return f"<{name}>{inner}</{name}>"
+
+
+def _receipt_name_error(params, key, field, business_field=None):
+    if key not in params:
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must not be null"))
+    name = _p(params, key)
+    if not name:
+        return _receipt_error("ValidationError", (
+            f"2 validation errors detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1; "
+            f"Value at '{field}' failed to satisfy constraint: Member must satisfy "
+            "regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if business_field and (len(name) > 64 or not re.fullmatch(
+            r"[a-zA-Z0-9](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9])?", name)):
+        return _receipt_error("InvalidParameterValue", f"Not a valid {business_field}: {name}")
+    return None
+
+
+def _receipt_missing_set(name):
+    return _receipt_error("RuleSetDoesNotExist", f"Rule set does not exist: {name}")
+
+
+def _create_receipt_rule_set(params):
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name in _receipt_rule_sets:
+        return _receipt_error("AlreadyExists", f"Rule set already exists: {name}")
+    _receipt_rule_sets[name] = {
+        "Metadata": {"Name": name, "CreatedTimestamp": datetime.now(timezone.utc).isoformat()},
+        "Rules": [],
+    }
+    return _receipt_result("CreateReceiptRuleSet")
+
+
+def _list_receipt_rule_sets(params):
+    names = sorted(_receipt_rule_sets)
+    token = _p(params, "NextToken")
+    if token:
+        try:
+            last = base64.b64decode(token, validate=True).decode("utf-8")
+            start = names.index(last) + 1
+        except (ValueError, UnicodeError):
+            return _receipt_error("InvalidParameterValue", f"Invalid token: {token}")
+    else:
+        start = 0
+    page = names[start:start + 100]
+    result = {"RuleSets": [_receipt_rule_sets[n]["Metadata"] for n in page]}
+    if start + len(page) < len(names):
+        result["NextToken"] = base64.b64encode(page[-1].encode()).decode()
+    return _receipt_result("ListReceiptRuleSets", result)
+
+
+def _describe_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    return _receipt_result("DescribeReceiptRuleSet", _receipt_rule_sets[name])
+
+
+def _delete_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if _active_receipt_rule_set.get("name") == name:
+        return _receipt_error("CannotDelete", f"Cannot delete active rule set: {name}")
+    _receipt_rule_sets.pop(name, None)
+    return _receipt_result("DeleteReceiptRuleSet")
+
+
+def _set_active_receipt_rule_set(params):
+    if "RuleSetName" not in params:
+        _active_receipt_rule_set.pop("name", None)
+    else:
+        error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+        if error:
+            return error
+        name = _p(params, "RuleSetName")
+        if name not in _receipt_rule_sets:
+            return _receipt_missing_set(name)
+        _active_receipt_rule_set["name"] = name
+    return _receipt_result("SetActiveReceiptRuleSet")
+
+
+def _describe_active_receipt_rule_set(params):
+    name = _active_receipt_rule_set.get("name")
+    return _receipt_result("DescribeActiveReceiptRuleSet", _receipt_rule_sets.get(name, {}))
+
+
+def _receipt_rule_from_params(params):
+    rule = {
+        "Name": _p(params, "Rule.Name"),
+        "Enabled": _p(params, "Rule.Enabled").lower() == "true",
+        "TlsPolicy": _p(params, "Rule.TlsPolicy", "Optional"),
+        "Actions": [],
+        "ScanEnabled": _p(params, "Rule.ScanEnabled").lower() == "true",
+    }
+    if any(k == "Rule.Recipients" or k.startswith("Rule.Recipients.member.") for k in params):
+        recipients = []
+        i = 1
+        while f"Rule.Recipients.member.{i}" in params:
+            recipients.append(_p(params, f"Rule.Recipients.member.{i}"))
+            i += 1
+        rule["Recipients"] = recipients
+    indexes = sorted({int(k.split(".")[3]) for k in params
+                      if re.match(r"^Rule\.Actions\.member\.\d+\.", k)})
+    for i in indexes:
+        action = {}
+        for name, fields in _RECEIPT_ACTION_FIELDS.items():
+            prefix = f"Rule.Actions.member.{i}.{name}."
+            values = {f: _p(params, prefix + f) for f in fields if prefix + f in params}
+            if values:
+                action[name] = values
+        rule["Actions"].append(action)
+    return rule
+
+
+def _receipt_rule_error(rule):
+    tls = rule["TlsPolicy"]
+    if tls not in ("Optional", "Require"):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule.tlsPolicy' failed to satisfy "
+            "constraint: Member must satisfy enum value set: [Optional, Require]"))
+    for i, action in enumerate(rule["Actions"], 1):
+        if len(action) != 1:
+            return _receipt_error("InvalidParameterValue", (
+                "Exactly one action type must be specified for each ReceiptAction"))
+        action_type = next(iter(action))
+        if action_type not in ("AddHeaderAction", "StopAction"):
+            return _receipt_error("InvalidAction", (
+                f"Receipt action {action_type} is not implemented"))
+        if "StopAction" in action:
+            if "TopicArn" in action["StopAction"]:
+                return _receipt_error("InvalidAction", (
+                    "Receipt action StopAction with TopicArn is not implemented"))
+            if action["StopAction"].get("Scope") != "RuleSet":
+                return _receipt_error("ValidationError", (
+                    f"1 validation error detected: Value at 'rule.actions.{i}.member.stopAction.scope' "
+                    "failed to satisfy constraint: Member must satisfy enum value set: [RuleSet]"))
+            if i != len(rule["Actions"]):
+                return _receipt_error("InvalidParameterValue", (
+                    "Stop action, if any, must be placed at the end of the actions list"))
+        header = action.get("AddHeaderAction")
+        if header is not None:
+            for field in ("HeaderName", "HeaderValue"):
+                if field not in header:
+                    return _receipt_error("ValidationError", (
+                        f"1 validation error detected: Value at 'rule.actions.{i}.member."
+                        f"addHeaderAction.{field[0].lower() + field[1:]}' failed to satisfy "
+                        "constraint: Member must not be null"))
+            name, value = header["HeaderName"], header["HeaderValue"]
+            if not re.fullmatch(r"[a-zA-Z0-9-]{1,50}", name):
+                return _receipt_error("InvalidParameterValue", f"Invalid header name: {name}")
+            if len(value) > 2048 or "\n" in value or "\r" in value:
+                printable = value.replace("\n", "0x000a").replace("\r", "0x000d")
+                return _receipt_error("InvalidParameterValue", f"Invalid header value: {printable}")
+    recipients = rule.get("Recipients", [])
+    for i, recipient in enumerate(recipients):
+        parts = recipient.rsplit("@", 1)
+        domain = parts[-1]
+        if (len(parts) == 2 and not parts[0]) or not re.fullmatch(
+                r"\.?[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
+                r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+", domain) or (
+                    len(parts) == 2 and ("@" in parts[0] or re.search(r"\s", parts[0]))):
+            return _receipt_error("InvalidParameterValue", f"Invalid recipient: {recipient}")
+        recipients[i] = recipient.lower()
+    if "Recipients" in rule:
+        rule["Recipients"] = sorted(set(recipients))
+    return None
+
+
+def _create_receipt_rule(params):
+    if not any(key.startswith("Rule.") for key in params):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule' failed to satisfy "
+            "constraint: Member must not be null"))
+    error = _receipt_name_error(params, "Rule.Name", "rule.name", "ruleName")
+    if error:
+        return error
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if "After" in params:
+        error = _receipt_name_error(params, "After", "after")
+        if error:
+            return error
+    rule = _receipt_rule_from_params(params)
+    error = _receipt_rule_error(rule)
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    if any(r["Name"] == rule["Name"] for r in rules):
+        return _receipt_error("AlreadyExists", f"Rule already exists: {rule['Name']}")
+    after = _p(params, "After")
+    position = 0
+    if after:
+        position = next((i + 1 for i, r in enumerate(rules) if r["Name"] == after), None)
+        if position is None:
+            return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {after}")
+    rules.insert(position, rule)
+    return _receipt_result("CreateReceiptRule")
+
+
+def _describe_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rule = next((r for r in _receipt_rule_sets[name]["Rules"] if r["Name"] == rule_name), None)
+    if rule is None:
+        return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {rule_name}")
+    return _receipt_result("DescribeReceiptRule", {"Rule": rule})
+
+
+def _delete_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    rules[:] = [r for r in rules if r["Name"] != rule_name]
+    return _receipt_result("DeleteReceiptRule")
 
 
 # ---------------------------------------------------------------------------
@@ -944,10 +1249,12 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
-def _error(code, message, status):
+def _error(code, message, status, error_type=""):
+    type_xml = f"<Type>{error_type}</Type>" if error_type else ""
+    message_xml = f"<Message>{_esc(message)}</Message>" if message is not None else ""
     body = (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
-            f'<Error><Code>{code}</Code><Message>{_esc(message)}</Message></Error>'
+            f'<Error>{type_xml}<Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
@@ -959,3 +1266,5 @@ def reset():
     _templates.clear()
     _configuration_sets.clear()
     _account_details.clear()
+    _receipt_rule_sets.clear()
+    _active_receipt_rule_set.clear()

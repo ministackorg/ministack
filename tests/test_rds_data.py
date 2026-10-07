@@ -1480,12 +1480,12 @@ _MYSQL_ENGINES = ("mysql", "aurora-mysql", "mariadb")
 
 
 def _execute_with_cursor(monkeypatch, engine, rowcount, status=None, rows=None,
-                         sql="SELECT 1", with_status=True):
+                         sql="SELECT 1", with_status=True, lastrowid=0):
     """Run _execute_statement against a stubbed driver cursor."""
     from ministack.services import rds_data
 
     cursor = SimpleNamespace(
-        rowcount=rowcount,
+        rowcount=rowcount, lastrowid=lastrowid,
         description=([("value", 23, None, None, None, None, None)]
                      if rows is not None else None),
         execute=Mock(), fetchall=Mock(return_value=rows), close=Mock(),
@@ -1550,6 +1550,42 @@ def test_rds_data_pg_unrecognised_tag_preserves_the_count(monkeypatch, status):
 def test_rds_data_pg_missing_statusmessage_preserves_the_count(monkeypatch):
     assert _execute_with_cursor(
         monkeypatch, "postgres", 2, with_status=False)["numberOfRecordsUpdated"] == 2
+
+
+@pytest.mark.parametrize("engine", _MYSQL_ENGINES)
+def test_rds_data_mysql_insert_returns_its_auto_increment_id(monkeypatch, engine):
+    result = _execute_with_cursor(monkeypatch, engine, 1, sql="INSERT INTO t (name) VALUES ('a')", lastrowid=7)
+    assert result["generatedFields"] == [{"longValue": 7}]
+    assert _execute_with_cursor(monkeypatch, engine, 1, sql="UPDATE t SET name = 'b'")["generatedFields"] == []
+
+
+def test_rds_data_mysql_batch_insert_returns_each_auto_increment_id(monkeypatch):
+    from ministack.services import rds_data
+
+    ids = iter((7, 8))
+    cursor = SimpleNamespace(lastrowid=0, close=Mock())
+    cursor.execute = Mock(side_effect=lambda *_a: setattr(cursor, "lastrowid", next(ids)))
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(rds_data, "_resolve_target",
+                        lambda _arn: ({"DBInstanceIdentifier": "unit"}, "mysql", {}))
+    monkeypatch.setattr(rds_data, "_validate_http_endpoint_enabled", lambda *_a, **_k: None)
+    monkeypatch.setattr(rds_data, "_require_secret_credentials", lambda _arn: ("user", "password", None))
+    monkeypatch.setattr(rds_data, "_connect", lambda *_a, **_k: connection)
+
+    status_code, _headers, body = rds_data._batch_execute_statement({
+        "resourceArn": "resource", "secretArn": "secret", "sql": "INSERT INTO t (name) VALUES (:n)",
+        "parameterSets": [[{"name": "n", "value": {"stringValue": v}}] for v in ("a", "b")],
+    })
+    assert status_code == 200, body
+    assert json.loads(body)["updateResults"] == [{"generatedFields": [{"longValue": 7}]},
+                                                 {"generatedFields": [{"longValue": 8}]}]
+
+
+@pytest.mark.parametrize("engine", _PG_ENGINES)
+def test_rds_data_pg_returns_no_generated_fields(monkeypatch, engine):
+    # Aurora PostgreSQL does not support generatedFields (ExecuteStatement API reference); RETURNING gives them.
+    assert _execute_with_cursor(monkeypatch, engine, 1, "INSERT 0 1", lastrowid=7)["generatedFields"] == []
 
 
 @pytest.mark.parametrize("engine", _PG_ENGINES + ("mysql",))

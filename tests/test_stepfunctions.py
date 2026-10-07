@@ -353,6 +353,10 @@ def test_sfn_stop_execution_v2(sfn):
     sfn.stop_execution(executionArn=ex["executionArn"], error="UserAbort", cause="test stop")
     desc = sfn.describe_execution(executionArn=ex["executionArn"])
     assert desc["status"] == "ABORTED"
+    assert (desc["error"], desc["cause"]) == ("UserAbort", "test stop")
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    aborted = next(e for e in events if e["type"] == "ExecutionAborted")
+    assert aborted["executionAbortedEventDetails"] == {"error": "UserAbort", "cause": "test stop"}
 
 def test_sfn_get_execution_history_v2(sfn):
     definition = json.dumps(
@@ -3490,6 +3494,42 @@ def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
     assert json.loads(desc["output"]) == "timeout"
     events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
     assert [e["type"] for e in events].count("TaskScheduled") == 1
+
+
+def test_sfn_task_parameters_see_state_retry_count(sfn, lam):
+    """$$.State.RetryCount is 0 on a state's first attempt and counts its retries (a Task's or a Parallel's);
+    the next state starts at 0."""
+    fn = f"sfn-retry-count-{time.time_ns()}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip(
+            "def handler(e, c):\n"
+            "    if e['fail_until'] > e['retry_count']: raise Exception(str(e['retry_count']))\n"
+            "    return e['retry_count']\n")},
+    )
+    arn = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"]
+
+    retry = [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 2}]
+
+    def task(fail_until, result_path, nxt):
+        return {"Type": "Task", "Resource": arn, "ResultPath": result_path,
+                "Parameters": {"fail_until": fail_until, "retry_count.$": "$$.State.RetryCount"}, "Retry": retry, **nxt}
+
+    sm = sfn.create_state_machine(
+        name=fn, roleArn="arn:aws:iam::000000000000:role/R",
+        definition=json.dumps({"StartAt": "Retried", "States": {
+            "Retried": task(1, "$.retried", {"Next": "Parallel"}),
+            "Parallel": {"Type": "Parallel", "ResultPath": "$.parallel", "Retry": retry, "Next": "Next",
+                         "Parameters": {"fail_until": 1, "retry_count.$": "$$.State.RetryCount"},
+                         "Branches": [{"StartAt": "Call", "States": {"Call": {"Type": "Task", "Resource": arn, "End": True}}}]},
+            "Next": task(0, "$.next", {"End": True}),
+        }}),
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == {"retried": 1, "parallel": [1], "next": 0}
 
 
 _SFN_FAIL_BRANCH = {"StartAt": "F", "States": {"F": {"Type": "Fail", "Error": "MyErr", "Cause": "c"}}}

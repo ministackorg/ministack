@@ -590,7 +590,9 @@ def _describe_stack_events(params):
             f"<ResourceStatusReason>{_esc(e.get('ResourceStatusReason', ''))}</ResourceStatusReason>"
             f"<Timestamp>{e.get('Timestamp', '')}</Timestamp>"
             f"{token_xml}"
-            "</member>"
+            + (f"<DetailedStatus>{e['DetailedStatus']}</DetailedStatus>"
+               if e.get("DetailedStatus") else "")
+            + "</member>"
         )
 
     return _xml(200, "DescribeStackEventsResponse",
