@@ -744,6 +744,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             != new.get("TemplateType", "FLEET_PROVISIONING")
         ),
     },
+    "AWS::IoT::JobTemplate": {"name": "JobTemplateId"},
     "AWS::Lambda::Function": {"name": "FunctionName"},
     "AWS::SQS::Queue": {
         "name": "QueueName",
@@ -13134,6 +13135,51 @@ def _iot_provisioning_template_delete(physical_id, props):
     _iot._delete_provisioning_template(physical_id)
 
 
+# AWS::IoT::JobTemplate. Every property is create-only (a change is a
+# replacement, refused under the required, custom JobTemplateId), so the type
+# has no update handler. Two CloudFormation member names differ from the API's.
+_IOT_JOB_TEMPLATE_RENAMES = {
+    "exponentialRolloutRate": "exponentialRate",
+    "retryCriteriaList": "criteriaList",
+}
+
+
+def _iot_job_template_payload(props):
+    props = dict(props)
+    if isinstance(props.get("Document"), (dict, list)):
+        props["Document"] = json.dumps(props["Document"])
+    tags = props.pop("Tags", None)
+    props.pop("JobTemplateId", None)
+    payload = {
+        key: ({_IOT_JOB_TEMPLATE_RENAMES.get(k, k): v for k, v in value.items()}
+              if isinstance(value, dict) else value)
+        for key, value in _pascal_to_camel(props).items()
+        if value is not None
+    }
+    if tags:
+        payload["tags"] = tags
+    return payload
+
+
+def _iot_job_template_create(logical_id, props, stack_name):
+    template_id = str(props.get("JobTemplateId") or "")
+    # A stack never adopts an existing template: AWS fails its name-conflict
+    # validation before creating anything (measured eu-central-1, 2026-10-05).
+    if template_id in _iot._job_templates:
+        raise ValueError(
+            f"Resource of type 'AWS::IoT::JobTemplate' with identifier '{template_id}' already exists."
+        )
+    resp = (_iot._job_template_id_error(template_id)
+            or _iot._create_job_template(template_id, _iot_job_template_payload(props)))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::JobTemplate create failed: {resp[2]!r}")
+    return template_id, {"Arn": _iot._job_template_arn(template_id)}
+
+
+def _iot_job_template_delete(physical_id, props):
+    _iot._delete_job_template(physical_id)
+
+
 def _registration_config_payload(props):
     """CFN's RegistrationConfig (RoleArn/TemplateBody/TemplateName) in the
     API's camelCase, or None when the template declares none."""
@@ -13599,6 +13645,11 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
+    "AWS::IoT::JobTemplate": (
+        "JobTemplateId", "JobArn", "Description", "Document", "DocumentSource",
+        "TimeoutConfig", "JobExecutionsRolloutConfig", "AbortConfig", "PresignedUrlConfig",
+        "DestinationPackageVersions", "JobExecutionsRetryConfig", "MaintenanceWindows", "Tags",
+    ),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (
         "Name", "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
@@ -14504,6 +14555,10 @@ _RESOURCE_HANDLERS = {
         "update": _iot_provisioning_template_update,
         "update_with_logical_id": True,
         "delete": _iot_provisioning_template_delete,
+    },
+    "AWS::IoT::JobTemplate": {
+        "create": _iot_job_template_create,
+        "delete": _iot_job_template_delete,
     },
     "AWS::IoT::CACertificate": {
         "create": _iot_ca_certificate_create,

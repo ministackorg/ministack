@@ -40,6 +40,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
     ``CancelJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
+  - Job templates: ``CreateJobTemplate``, ``DescribeJobTemplate``,
+    ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
+    ``jobTemplateArn`` takes the template's document and configuration
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -126,6 +129,7 @@ _provisioning_templates: AccountRegionScopedDict = AccountRegionScopedDict()
 _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
+_job_templates: AccountRegionScopedDict = AccountRegionScopedDict()  # jobTemplateId -> record
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -250,6 +254,7 @@ def get_state() -> dict:
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
+        "job_templates": copy.deepcopy(_job_templates),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -286,6 +291,7 @@ def _restore_state(data: dict | None) -> None:
     _provisioning_templates.update(data.get("provisioning_templates", {}))
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
+    _job_templates.update(data.get("job_templates", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -327,6 +333,7 @@ def reset() -> None:
     _provisioning_templates.clear()
     _jobs.clear()
     _job_executions.clear()
+    _job_templates.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -621,6 +628,10 @@ async def _route_request(
         return _list_jobs(qp)
     if path.startswith("/jobs/"):
         return await _handle_job(method, path, body, qp)
+    if path == "/job-templates" and method == "GET":
+        return _list_job_templates(qp)
+    if path.startswith("/job-templates/"):
+        return _handle_job_template(method, path, body)
 
     # Topic rules
     if path == "/rules" and method == "GET":
@@ -4683,6 +4694,10 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
         )
+    if payload.get("jobTemplateArn") is not None:
+        payload, err = _job_payload_from_template(payload)
+        if err:
+            return err
     # Absent means SNAPSHOT (the AWS default); present means it has to be one
     # of the two modeled values — including the empty string, which would
     # otherwise default its way to a SNAPSHOT job the caller never asked for.
@@ -4948,6 +4963,286 @@ def _get_job_document(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     return json_response({"document": job.get("document") or "{}"})
+
+
+# ---------------------------------------------------------------------------
+# Job templates. A template has no update call; CreateJob copies what it needs
+# from one at create time, so deleting a template leaves its jobs as they are.
+# Messages and shapes below were measured on eu-central-1 2026-10-05.
+# ---------------------------------------------------------------------------
+
+# The configuration a template hands to a job created from it, and to a
+# template created from a job (jobArn). A member the request names wins whole.
+_JOB_TEMPLATE_CONFIG_MEMBERS = (
+    "presignedUrlConfig", "jobExecutionsRolloutConfig", "abortConfig",
+    "timeoutConfig", "jobExecutionsRetryConfig",
+)
+_JOB_TEMPLATE_PAGE_MAX = 250
+
+
+def _job_template_arn(template_id: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:jobtemplate/{template_id}"
+
+
+def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+    shown = "null" if value is None else f"'{value}'"
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value {shown} at '{member}' failed to "
+        f"satisfy constraint: {constraint}",
+        400,
+    )
+
+
+def _job_template_id_error(template_id: str) -> tuple | None:
+    if len(template_id) > 64:
+        return _job_template_validation_error(
+            template_id, "jobTemplateId",
+            "Member must have length less than or equal to 64",
+        )
+    if not _JOB_ID_RE.match(template_id):
+        return _job_template_validation_error(
+            template_id, "jobTemplateId",
+            "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+",
+        )
+    return None
+
+
+def _job_template_not_found(template_id: str) -> tuple:
+    return error_response_json(
+        "ResourceNotFoundException", f"Job Template {template_id} cannot be found.", 404
+    )
+
+
+def _handle_job_template(method: str, path: str, body: bytes) -> tuple:
+    template_id = path[len("/job-templates/"):]
+    if "/" in template_id:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    err = _job_template_id_error(template_id)
+    if err:
+        return err
+    if method == "PUT":
+        return _create_job_template(template_id, _parse_body(body))
+    if method == "GET":
+        return _describe_job_template(template_id)
+    if method == "DELETE":
+        return _delete_job_template(template_id)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _create_job_template(template_id: str, payload: dict) -> tuple:
+    if payload.get("description") is None:
+        return _job_template_validation_error(
+            None, "description", "Member must not be null"
+        )
+    document = payload.get("document")
+    if isinstance(document, str) and len(document) > 32768:
+        return _job_template_validation_error(
+            document, "document", "Member must have length less than or equal to 32768"
+        )
+    minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
+    if minutes is not None and not (isinstance(minutes, int) and 1 <= minutes <= 10080):
+        return error_response_json(
+            "InvalidRequestException",
+            "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
+            f"{minutes}.",
+            400,
+        )
+    source = payload.get("documentSource")
+    if document and source:
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document and job document source cannot be specified at the same time.",
+            400,
+        )
+    if not document and not source and not payload.get("jobArn"):
+        return error_response_json(
+            "InvalidRequestException",
+            "Neither job document nor job document source is specified.",
+            400,
+        )
+    if template_id in _job_templates:
+        return error_response_json(
+            "ConflictException", f"Job Template {template_id} already exists.", 409,
+            extra={"resourceId": None},
+        )
+    record = {
+        "jobTemplateArn": _job_template_arn(template_id),
+        "jobTemplateId": template_id,
+        "description": payload["description"],
+        "createdAt": _now_epoch(),
+    }
+    if payload.get("jobArn"):
+        job_id = str(payload["jobArn"]).rsplit("/", 1)[-1]
+        job = _jobs.get(job_id)
+        if job is None or job["jobArn"] != payload["jobArn"]:
+            return error_response_json(
+                "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+            )
+        record["document"] = job.get("document")
+        record["documentSource"] = job.get("documentSource")
+        for member in _JOB_TEMPLATE_CONFIG_MEMBERS:
+            record[member] = copy.deepcopy(job.get(member)) or None
+    if document or source:
+        record["document"] = document
+        record["documentSource"] = source
+    if source and not document:
+        # Same stand-in as CreateJob's: the S3 object is not fetched.
+        record["document"] = json.dumps({"documentSource": source})
+    for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
+        "maintenanceWindows", "destinationPackageVersions", "tags",
+    ):
+        if payload.get(member) is not None:
+            record[member] = copy.deepcopy(payload[member])
+    # The two `double` members read back as floats (25 comes back as 25.0).
+    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
+        if isinstance(criteria.get("thresholdPercentage"), int):
+            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
+    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
+    if isinstance(rate.get("incrementFactor"), int):
+        rate["incrementFactor"] = float(rate["incrementFactor"])
+    _job_templates[template_id] = record
+    return json_response({
+        "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
+    })
+
+
+def _describe_job_template(template_id: str) -> tuple:
+    t = _job_templates.get(template_id)
+    if t is None:
+        return _job_template_not_found(template_id)
+    # AWS writes every member, null when unset, and the three structures
+    # below as objects of nulls; botocore reads those as {}.
+    rollout = {"exponentialRate": None, "maximumPerMinute": None,
+               **(t.get("jobExecutionsRolloutConfig") or {})}
+    if rollout["exponentialRate"] is not None:
+        rate = dict(rollout["exponentialRate"])
+        rate["rateIncreaseCriteria"] = {
+            "numberOfNotifiedThings": None, "numberOfSucceededThings": None,
+            **(rate.get("rateIncreaseCriteria") or {}),
+        }
+        rollout["exponentialRate"] = rate
+    return json_response({
+        "jobTemplateArn": t["jobTemplateArn"],
+        "jobTemplateId": t["jobTemplateId"],
+        "description": t["description"],
+        "documentSource": t.get("documentSource"),
+        "document": t.get("document"),
+        "createdAt": t["createdAt"],
+        "presignedUrlConfig": {"expiresInSec": None, "roleArn": None,
+                               **(t.get("presignedUrlConfig") or {})},
+        "jobExecutionsRolloutConfig": rollout,
+        "abortConfig": t.get("abortConfig"),
+        "timeoutConfig": {"inProgressTimeoutInMinutes": None,
+                          **(t.get("timeoutConfig") or {})},
+        "jobExecutionsRetryConfig": t.get("jobExecutionsRetryConfig"),
+        "maintenanceWindows": t.get("maintenanceWindows"),
+        "destinationPackageVersions": t.get("destinationPackageVersions"),
+    })
+
+
+def _list_job_templates(qp: dict) -> tuple:
+    """``GET /job-templates``, newest first, paged by ``maxResults`` /
+    ``nextToken``; the token carries an offset into that order."""
+    raw = qp.get("maxResults")
+    try:
+        limit = _JOB_TEMPLATE_PAGE_MAX if raw in (None, "") else int(raw)
+    except (TypeError, ValueError):
+        limit = 0
+    if not 1 <= limit <= _JOB_TEMPLATE_PAGE_MAX:
+        bound = ("greater than or equal to 1" if limit < 1
+                 else f"less than or equal to {_JOB_TEMPLATE_PAGE_MAX}")
+        return _job_template_validation_error(
+            raw, "maxResults", f"Member must have value {bound}"
+        )
+    start = 0
+    token = qp.get("nextToken")
+    if token:
+        try:
+            raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+            prefix, _, offset = raw_token.partition(":")
+            start = int(offset) if prefix == "jobtemplates" else -1
+        except ValueError:  # binascii.Error and UnicodeDecodeError included
+            start = -1
+        if start < 0:
+            return error_response_json(
+                "InvalidRequestException", "Next token is invalid.", 400
+            )
+    ordered = sorted(_job_templates.values(), key=lambda t: t["createdAt"], reverse=True)
+    page = ordered[start:start + limit]
+    response = {"jobTemplates": [
+        {k: t[k] for k in ("jobTemplateArn", "jobTemplateId", "description", "createdAt")}
+        for t in page
+    ]}
+    if start + limit < len(ordered):
+        response["nextToken"] = base64.urlsafe_b64encode(
+            f"jobtemplates:{start + limit}".encode()
+        ).decode().rstrip("=")
+    return json_response(response)
+
+
+def _delete_job_template(template_id: str) -> tuple:
+    if _job_templates.get(template_id) is None:
+        return _job_template_not_found(template_id)
+    del _job_templates[template_id]
+    # AWS answers 200 with an empty body.
+    return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
+
+
+def _job_payload_from_template(payload: dict) -> tuple[dict | None, tuple | None]:
+    """CreateJob's request with its jobTemplateArn applied: the template's
+    document (unless the request names a document or a source), its
+    configuration and its maintenance windows; members of the request win.
+    Returns (payload, None) or (None, error)."""
+    arn = payload["jobTemplateArn"]
+    try:
+        parsed = parse_arn(arn)
+    except ArnParseError:
+        return None, error_response_json(
+            "InvalidRequestException", f"Invalid jobTemplateArn: {arn}", 400
+        )
+    resource_type, _, template_id = parsed.resource.partition("/")
+    if resource_type != "jobtemplate":
+        return None, error_response_json(
+            "InvalidRequestException",
+            "Resource type should be jobtemplate but found invalid resource type "
+            f"{resource_type}",
+            400,
+        )
+    template = _job_templates.get(template_id)
+    if template is None or template["jobTemplateArn"] != arn:
+        return None, _job_template_not_found(template_id)
+    merged = {
+        m: copy.deepcopy(template[m]) for m in _JOB_TEMPLATE_CONFIG_MEMBERS if template.get(m)
+    }
+    if not payload.get("document") and not payload.get("documentSource"):
+        merged["document"] = template.get("document")
+        merged["documentSource"] = template.get("documentSource")
+    merged.update({k: v for k, v in payload.items() if v is not None})
+    windows = template.get("maintenanceWindows")
+    if windows:
+        if merged.get("targetSelection", "SNAPSHOT") == "SNAPSHOT":
+            return None, error_response_json(
+                "InvalidRequestException",
+                "TargetSelection is invalid. MaintenanceWindow cannot be used with "
+                "SNAPSHOT job.",
+                400,
+            )
+        sched = dict(merged.get("schedulingConfig") or {})
+        if not sched.get("startTime"):
+            return None, error_response_json(
+                "InvalidRequestException",
+                "MaintenanceWindow cannot be used without StartTime of "
+                "SchedulingConfig.",
+                400,
+            )
+        sched.setdefault("maintenanceWindows", copy.deepcopy(windows))
+        merged["schedulingConfig"] = sched
+    return merged, None
 
 
 async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:

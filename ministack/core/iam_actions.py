@@ -1527,6 +1527,7 @@ def extract_resource_arn(service: str, method: str, path: str,
             "rules": "rule",
             "jobs": "job",
             "provisioning-templates": "provisioningtemplate",
+            "job-templates": "jobtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
