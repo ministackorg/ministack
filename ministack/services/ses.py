@@ -478,7 +478,18 @@ def _send_email(params):
     to_addrs = _collect_list(params, "Destination.ToAddresses.member")
     cc_addrs = _collect_list(params, "Destination.CcAddresses.member")
     bcc_addrs = _collect_list(params, "Destination.BccAddresses.member")
-    rejected = _message_rejection(source, to_addrs + cc_addrs + bcc_addrs)
+    recipients = to_addrs + cc_addrs + bcc_addrs
+    if not source or not _valid_email_address(source):
+        return _error("InvalidParameterValue", "The address specified is not valid.", 400)
+    if not recipients or any(not _valid_email_address(address) for address in recipients):
+        return _error("InvalidParameterValue", "The destination address is not valid.", 400)
+    if "Message.Subject.Data" not in params:
+        return _error("InvalidParameterValue", "The Subject field is required.", 400)
+    if "Message.Body.Text.Data" not in params and "Message.Body.Html.Data" not in params:
+        return _error("InvalidParameterValue", "The message body must contain Text or Html content.", 400)
+    if config_set and config_set not in _configuration_sets:
+        return _error("ConfigurationSetDoesNotExist", f"Configuration set {config_set} does not exist.", 400)
+    rejected = _message_rejection(source, recipients)
     if rejected:
         return _error("MessageRejected", rejected, 400)
 
@@ -495,6 +506,17 @@ def _send_email(params):
     )
     return _xml(200, "SendEmailResponse",
                 f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
+
+
+def _valid_email_address(value: str) -> bool:
+    if not value.isascii():
+        return False
+    address = parseaddr(value)[1]
+    if not address or len(address) > 320:
+        return False
+    local, separator, domain = address.rpartition("@")
+    return bool(separator and local and domain and "." in domain
+                and not any(character.isspace() for character in address))
 
 
 def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,

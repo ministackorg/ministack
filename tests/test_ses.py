@@ -61,6 +61,63 @@ def test_ses_send(ses):
     )
     assert "MessageId" in resp
 
+
+@pytest.mark.parametrize("subject", ["", "   "])
+def test_ses_send_email_accepts_present_empty_content(monkeypatch, subject):
+    from ministack.services import ses as ses_service
+
+    monkeypatch.setattr(ses_service, "_message_rejection", lambda *args: None)
+    monkeypatch.setattr(ses_service, "_record_send", lambda **kwargs: "empty-content")
+    params = {
+        "Source": ["sender@example.com"],
+        "Destination.ToAddresses.member.1": ["recipient@example.com"],
+        "Message.Subject.Data": [subject],
+        "Message.Body.Text.Data": [""],
+    }
+    assert ses_service._send_email(params)[0] == 200
+    del params["Message.Subject.Data"]
+    assert ses_service._send_email(params)[0] == 400
+    params["Message.Subject.Data"] = [subject]
+    del params["Message.Body.Text.Data"]
+    assert ses_service._send_email(params)[0] == 400
+
+
+def test_ses_email_address_requires_ascii():
+    from ministack.services.ses import _valid_email_address
+
+    assert not _valid_email_address("user\u00e9@example.com")
+    assert not _valid_email_address("user@\u00e9xample.com")
+    assert _valid_email_address("user@xn--xample-9ua.com")
+
+
+def test_ses_send_email_rejects_invalid_address(ses):
+    ses.verify_email_identity(EmailAddress="sender@example.com")
+    with pytest.raises(ClientError) as exc:
+        ses.send_email(
+            Source="sender@example.com",
+            Destination={"ToAddresses": ["not-an-email"]},
+            Message={
+                "Subject": {"Data": "Invalid address"},
+                "Body": {"Text": {"Data": "body"}},
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_ses_send_email_rejects_missing_configuration_set(ses):
+    ses.verify_email_identity(EmailAddress="sender@example.com")
+    with pytest.raises(ClientError) as exc:
+        ses.send_email(
+            Source="sender@example.com",
+            Destination={"ToAddresses": ["recipient@example.com"]},
+            Message={
+                "Subject": {"Data": "Configuration"},
+                "Body": {"Text": {"Data": "body"}},
+            },
+            ConfigurationSetName="missing-set",
+        )
+    assert exc.value.response["Error"]["Code"] == "ConfigurationSetDoesNotExist"
+
 def test_ses_list_identities(ses):
     ses.verify_email_identity(EmailAddress="another@example.com")
     resp = ses.list_identities()

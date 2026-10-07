@@ -14,6 +14,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SES**: validate source/recipient addresses, content-field presence and configuration sets while accepting present empty content and ASCII/Punycode addresses.
 - **Container reaping — one unreadable container no longer stops the sweep** — the boot sweep and the periodic reaper now list containers without inspecting each one, so a container whose inspect fails is skipped instead of leaving every leftover running. Reported by @iot-rocket.
 - **API Gateway — management IAM actions and resource paths** — with `AUTH=true`, REST and HTTP/WebSocket API management requests use `apigateway:GET`, `POST`, `PUT`, `PATCH` and `DELETE` instead of SDK operation names. Resource ARNs preserve stage names, nested resources and collection paths, and ignore trailing slashes as AWS does, so scoped grants and explicit stage denies apply to the requested resource.
 - **AppConfig — `GetLatestConfiguration` returns an empty body when nothing changed** — it returned the full configuration on every poll. It now also returns `Version-Label` and uses `RequiredMinimumPollIntervalInSeconds` as the poll interval, and `CreateHostedConfigurationVersion` stores `VersionLabel`. Contributed by @Jolley71717.
