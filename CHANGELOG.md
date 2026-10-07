@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Step Functions — the first matching retrier decides** — a retrier that had used its `MaxAttempts` (or had `MaxAttempts: 0`) was skipped, so a later matching retrier such as `States.ALL` retried the error anyway. The first retrier whose `ErrorEquals` matches now decides: once it has used its attempts the state fails (or goes to its `Catch`), as the Developer Guide's error-handling examples describe.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 

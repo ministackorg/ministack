@@ -3088,11 +3088,11 @@ def _error_matches(error_equals, error):
 
 
 def _find_matching_retrier(retriers, error, retry_counts):
+    """The first retrier matching the error decides; once it has used its MaxAttempts there is no retry."""
     for idx, retrier in enumerate(retriers):
-        max_attempts = retrier.get("MaxAttempts", 3)
-        if retry_counts.get(idx, 0) >= max_attempts:
-            continue
         if _error_matches(retrier.get("ErrorEquals", []), error):
+            if retry_counts.get(idx, 0) >= retrier.get("MaxAttempts", 3):
+                return None, -1
             return retrier, idx
     return None, -1
 
