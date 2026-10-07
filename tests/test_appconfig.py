@@ -596,12 +596,27 @@ def test_appconfig_stop_deployment(appconfig_client):
         ConfigurationProfileId=profile["Id"],
         ConfigurationVersion="1",
     )
+    assert deploy["State"] == "COMPLETE"
+    # StopDeployment "works only on deployments that have a status of
+    # DEPLOYING, unless an AllowRevert parameter is supplied" (botocore docs).
+    with pytest.raises(ClientError) as exc:
+        appconfig_client.stop_deployment(
+            ApplicationId=app["Id"],
+            EnvironmentId=env["Id"],
+            DeploymentNumber=deploy["DeploymentNumber"],
+        )
+    assert exc.value.response["Error"]["Code"] == "BadRequestException"
+
     resp = appconfig_client.stop_deployment(
         ApplicationId=app["Id"],
         EnvironmentId=env["Id"],
         DeploymentNumber=deploy["DeploymentNumber"],
+        AllowRevert=True,
     )
-    assert resp["State"] == "ROLLED_BACK"
+    assert resp["State"] == "REVERTED"
+    assert resp["EventLog"][0]["EventType"] == "REVERT_COMPLETED"
+    environment = appconfig_client.get_environment(ApplicationId=app["Id"], EnvironmentId=env["Id"])
+    assert environment["State"] == "REVERTED"
 
 
 def _deployment_target(appconfig_client, name):

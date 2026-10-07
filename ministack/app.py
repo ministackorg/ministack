@@ -1367,6 +1367,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._SFN_WAIT_SCALE",
         "translate._JOB_RUN_SECONDS",
         "transcribe._JOB_RUN_SECONDS",
+        "appconfig._DEPLOYMENT_MINUTE_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "alb.TARGET_CONNECT_TIMEOUT",
@@ -1392,6 +1393,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",
                 "transcribe._JOB_RUN_SECONDS",
+                "appconfig._DEPLOYMENT_MINUTE_SECONDS",
             ):
                 try:
                     float_value = float(value)

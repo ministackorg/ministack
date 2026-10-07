@@ -527,6 +527,40 @@ def test_ses_smtp_relay_send_raw_email(monkeypatch):
         assert 'dest@example.com' in call_args[0][1]
 
 
+def test_ses_smtp_relay_send_raw_email_replaces_existing_message_id(monkeypatch):
+    _verify_example_com(monkeypatch)
+    monkeypatch.setenv('SMTP_HOST', 'localhost:2525')
+    from ministack.services.ses import _send_raw_email
+    mock_smtp = MagicMock()
+    with patch('ministack.services.ses.smtplib.SMTP', return_value=mock_smtp):
+        mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
+        raw_msg = (
+            'From: raw@example.com\r\n'
+            'Message-ID:\r\n'
+            ' <folded-id@example.com>\r\n'
+            'To: dest@example.com\r\n'
+            'Subject: Raw Test\r\n'
+            '\r\n'
+            'Message-ID: <in-body@example.com>\r\n'
+        )
+        params = {
+            'Source': ['raw@example.com'],
+            'Destinations.member.1': ['dest@example.com'],
+            'RawMessage.Data': [raw_msg],
+        }
+        status, _, _ = _send_raw_email(params)
+        assert status == 200
+        sent = mock_smtp.sendmail.call_args[0][2]
+        header_part, body = sent.split('\r\n\r\n', 1)
+        ids = [l for l in header_part.split('\r\n') if l.lower().startswith('message-id:')]
+        assert len(ids) == 1
+        assert ids[0].endswith('@email.amazonses.com>')
+        assert 'folded-id' not in sent
+        assert 'To: dest@example.com' in header_part
+        assert 'in-body@example.com' in body
+
+
 # ---------------------------------------------------------------------------
 # SendTemplatedEmail with SMTP relay
 # ---------------------------------------------------------------------------

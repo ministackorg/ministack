@@ -28,6 +28,7 @@ Data Plane (appconfigdata):
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +42,15 @@ from ministack.core.responses import AccountRegionScopedDict, get_account_id, ge
 logger = logging.getLogger("appconfig")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+# APPCONFIG_DEPLOYMENT_MINUTE_SECONDS: real seconds that stand in for one minute of a
+# deployment strategy's DeploymentDurationInMinutes and FinalBakeTimeInMinutes. 0 (the
+# default) runs every deployment to COMPLETE as it starts; 60 keeps AWS's pace. Also
+# settable at runtime through /_ministack/config, so a test can pin the pace.
+_DEPLOYMENT_MINUTE_SECONDS = float(os.environ.get("APPCONFIG_DEPLOYMENT_MINUTE_SECONDS", "0"))
+
+# Next-Poll-Interval-In-Seconds for a session that set no RequiredMinimumPollIntervalInSeconds.
+_DEFAULT_POLL_INTERVAL_SECONDS = 30
 
 # ---------------------------------------------------------------------------
 # State
@@ -101,6 +111,10 @@ def _gen_id():
 
 def _now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch)) + f".{int(epoch * 1000) % 1000:03d}Z"
 
 
 def _app_arn(app_id):
@@ -384,7 +398,7 @@ def _next_hosted_version_number(app_id, profile_id):
     return number
 
 
-def _create_hosted_configuration_version(app_id, profile_id, body, content_type):
+def _create_hosted_configuration_version(app_id, profile_id, body, content_type, version_label=None):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
 
@@ -398,6 +412,8 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type)
         "Content": body,
         "Description": "",
     }
+    if version_label:
+        record["VersionLabel"] = version_label
     _hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = record
     logger.info("CreateHostedConfigurationVersion: %s/%s v%d", app_id, profile_id, version_number)
 
@@ -407,6 +423,8 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type)
         "Configuration-Profile-Id": profile_id,
         "Version-Number": str(version_number),
     }
+    if version_label:
+        resp_headers["VersionLabel"] = version_label
     return 201, resp_headers, body if isinstance(body, bytes) else body.encode("utf-8")
 
 
@@ -423,6 +441,8 @@ def _get_hosted_configuration_version(app_id, profile_id, version_number):
         "Configuration-Profile-Id": profile_id,
         "Version-Number": str(version_number),
     }
+    if record.get("VersionLabel"):
+        resp_headers["VersionLabel"] = record["VersionLabel"]
     return 200, resp_headers, content if isinstance(content, bytes) else content.encode("utf-8")
 
 
@@ -439,6 +459,7 @@ def _list_hosted_configuration_versions(app_id, profile_id, query):
                 "VersionNumber": v["VersionNumber"],
                 "ContentType": v["ContentType"],
                 "Description": v.get("Description", ""),
+                **({"VersionLabel": v["VersionLabel"]} if v.get("VersionLabel") else {}),
             })
     return _json(200, {"Items": items[:max_results]})
 
@@ -569,6 +590,146 @@ def _delete_deployment_strategy(strategy_id):
 # ---------------------------------------------------------------------------
 
 
+_IN_PROGRESS_STATES = ("DEPLOYING", "BAKING")
+_ENVIRONMENT_STATE_BY_DEPLOYMENT_STATE = {
+    "DEPLOYING": "DEPLOYING",
+    "BAKING": "DEPLOYING",
+    "COMPLETE": "READY_FOR_DEPLOYMENT",
+    "ROLLED_BACK": "ROLLED_BACK",
+    "REVERTED": "REVERTED",
+}
+# StopDeployment's docs: "AppConfig only allows a revert within 72 hours of
+# deployment completion."
+_REVERT_WINDOW_SECONDS = 72 * 3600
+
+
+def _rollout_steps(growth_type, growth_factor):
+    """The percentages a deployment passes through, ending at 100.
+
+    LINEAR adds GrowthFactor each step; EXPONENTIAL follows the G*(2^N) formula
+    from the CreateDeploymentStrategy docs.
+    """
+    # The model's floor for GrowthFactor; CreateDeploymentStrategy stores what it is given.
+    growth_factor = max(float(growth_factor or 100.0), 1.0)
+    steps = []
+    step = 1
+    while True:
+        if growth_type == "EXPONENTIAL":
+            pct = growth_factor * (2 ** (step - 1))
+        else:
+            pct = growth_factor * step
+        if pct >= 100.0:
+            break
+        steps.append(round(pct, 2))
+        step += 1
+    steps.append(100.0)
+    return steps
+
+
+def _add_deployment_event(record, event_type, triggered_by, description, at):
+    record.setdefault("_Events", []).append({
+        "EventType": event_type,
+        "TriggeredBy": triggered_by,
+        "Description": description,
+        "ActionInvocations": [],
+        "OccurredAt": _iso(at),
+    })
+
+
+def _first_monitor_alarm(app_id, env_id, start, end):
+    """The (alarm ARN, time) of the first environment monitor in ALARM in [start, end]."""
+    from ministack.services import cloudwatch
+
+    env = _environments.get(f"{app_id}/{env_id}") or {}
+    fired = []
+    for monitor in env.get("Monitors") or []:
+        alarm_arn = monitor.get("AlarmArn", "")
+        at = cloudwatch.first_alarm_time(alarm_arn, start, end)
+        if at is not None:
+            fired.append((at, alarm_arn))
+    if not fired:
+        return None
+    at, alarm_arn = min(fired)
+    return alarm_arn, at
+
+
+def _roll_back(record, triggered_by, initiator, at):
+    record["State"] = "ROLLED_BACK"
+    _add_deployment_event(record, "ROLLBACK_STARTED", triggered_by, f"Rollback initiated by {initiator}", at)
+    _add_deployment_event(record, "ROLLBACK_COMPLETED", triggered_by, "Rollback completed", at)
+
+
+def _advance_deployment(record, now):
+    """Bring an in-progress deployment up to ``now``.
+
+    Steps are spread evenly over DeploymentDurationInMinutes, the last one
+    reaching 100% when the duration ends; the deployment then bakes for
+    FinalBakeTimeInMinutes. A monitored alarm in ALARM at any point before the
+    bake ends rolls it back at that moment.
+    """
+    if record.get("State") not in _IN_PROGRESS_STATES or "_StartedEpoch" not in record:
+        return
+    minute = _DEPLOYMENT_MINUTE_SECONDS
+    started = record["_StartedEpoch"]
+    steps = _rollout_steps(record["GrowthType"], record["GrowthFactor"])
+    duration = float(record["DeploymentDurationInMinutes"]) * minute
+    step_gap = duration / len(steps)
+    bake = float(record["FinalBakeTimeInMinutes"]) * minute
+    complete_at = started + duration + bake
+
+    alarm = _first_monitor_alarm(record["ApplicationId"], record["EnvironmentId"],
+                                 started, min(now, complete_at))
+    horizon = alarm[1] if alarm else now
+
+    for index, pct in enumerate(steps, start=1):
+        at = started + index * step_gap
+        # A step due at the moment an alarm fires is not taken.
+        if at > horizon or (alarm and at >= horizon):
+            break
+        if pct > record["PercentageComplete"]:
+            record["PercentageComplete"] = pct
+            _add_deployment_event(record, "PERCENTAGE_UPDATED", "APPCONFIG",
+                                  f"Deployed to {pct:g}% of targets", at)
+    if record["State"] == "DEPLOYING" and record["PercentageComplete"] >= 100.0:
+        record["State"] = "BAKING"
+        if bake > 0:
+            _add_deployment_event(record, "BAKE_TIME_STARTED", "APPCONFIG", "Bake time started",
+                                  started + duration)
+
+    if alarm:
+        _roll_back(record, "CLOUDWATCH_ALARM", alarm[0], alarm[1])
+        return
+    if complete_at <= now:
+        record["State"] = "COMPLETE"
+        record["_CompletedEpoch"] = complete_at
+        record["CompletedAt"] = _iso(complete_at)
+        _add_deployment_event(record, "DEPLOYMENT_COMPLETED", "APPCONFIG", "Deployment completed", complete_at)
+
+
+def _environment_deployments(app_id, env_id):
+    prefix = f"{app_id}/{env_id}/"
+    return sorted((v for k, v in _deployments.items() if k.startswith(prefix)),
+                  key=lambda d: d["DeploymentNumber"])
+
+
+def _refresh_environment(app_id, env_id):
+    """Advance the environment's deployments to now and derive its State from the latest."""
+    deployments = _environment_deployments(app_id, env_id)
+    now = time.time()
+    for deployment in deployments:
+        _advance_deployment(deployment, now)
+    env = _environments.get(f"{app_id}/{env_id}")
+    if env is not None and deployments:
+        env["State"] = _ENVIRONMENT_STATE_BY_DEPLOYMENT_STATE.get(deployments[-1]["State"], env["State"])
+    return deployments
+
+
+def _deployment_view(record):
+    view = {k: v for k, v in record.items() if not k.startswith("_")}
+    view["EventLog"] = list(reversed(record.get("_Events", [])))  # most recent first
+    return view
+
+
 def _start_deployment(app_id, env_id, body):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
@@ -587,13 +748,21 @@ def _start_deployment(app_id, env_id, body):
         return _error(404, "ResourceNotFoundException",
                       f"DeploymentStrategy with Id {strategy_id} could not be found.")
 
-    existing = [
-        v for k, v in _deployments.items()
-        if k.startswith(f"{app_id}/{env_id}/")
-    ]
-    deploy_num = len(existing) + 1
+    existing = _refresh_environment(app_id, env_id)
+    latest_number = existing[-1]["DeploymentNumber"] if existing else 0
+    expected = body.get("LatestDeploymentNumber")
+    if expected is not None and expected != latest_number:
+        return _error(409, "ConflictException",
+                      f"LatestDeploymentNumber {expected} does not match the latest deployment "
+                      f"number {latest_number}.")
+    in_progress = [d for d in existing if d["State"] in _IN_PROGRESS_STATES]
+    if in_progress:
+        return _error(409, "ConflictException",
+                      f"Deployment {in_progress[-1]['DeploymentNumber']} is already in progress "
+                      f"in environment {env_id}.")
+    deploy_num = latest_number + 1
 
-    now = _now_iso()
+    now = time.time()
     record = {
         "ApplicationId": app_id,
         "EnvironmentId": env_id,
@@ -605,22 +774,28 @@ def _start_deployment(app_id, env_id, body):
         "ConfigurationVersion": version,
         "Description": body.get("Description", ""),
         **_deployment_params_from_strategy(strategy),
-        "State": "COMPLETE",
-        "PercentageComplete": 100.0,
-        "StartedAt": now,
-        "CompletedAt": now,
+        "State": "DEPLOYING",
+        "PercentageComplete": 0.0,
+        "StartedAt": _iso(now),
+        "_StartedEpoch": now,
     }
+    version_label = _hosted_versions.get(f"{app_id}/{profile_id}/{version}", {}).get("VersionLabel")
+    if version_label:
+        record["VersionLabel"] = version_label
+    _add_deployment_event(record, "DEPLOYMENT_STARTED", "USER", "Deployment started", now)
     _deployments[f"{app_id}/{env_id}/{deploy_num}"] = record
+    _refresh_environment(app_id, env_id)
     logger.info("StartDeployment: %s/%s #%d (profile=%s, version=%s)",
                 app_id, env_id, deploy_num, profile_id, version)
-    return _json(201, record)
+    return _json(201, _deployment_view(record))
 
 
 def _get_deployment(app_id, env_id, deploy_num):
+    _refresh_environment(app_id, env_id)
     record = _deployments.get(f"{app_id}/{env_id}/{deploy_num}")
     if not record:
         return _error(404, "ResourceNotFoundException", f"Deployment {deploy_num} not found")
-    return _json(200, record)
+    return _json(200, _deployment_view(record))
 
 
 def _list_deployments(app_id, env_id, query):
@@ -628,30 +803,48 @@ def _list_deployments(app_id, env_id, query):
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
     max_results = int(query.get("max_results", 50))
     items = []
-    for k, v in _deployments.items():
-        if k.startswith(f"{app_id}/{env_id}/"):
-            items.append({
-                "DeploymentNumber": v["DeploymentNumber"],
-                "ConfigurationName": v.get("ConfigurationName", ""),
-                "ConfigurationVersion": v.get("ConfigurationVersion", ""),
-                "DeploymentDurationInMinutes": v.get("DeploymentDurationInMinutes", 0),
-                "GrowthType": v.get("GrowthType", "LINEAR"),
-                "GrowthFactor": v.get("GrowthFactor", 100.0),
-                "FinalBakeTimeInMinutes": v.get("FinalBakeTimeInMinutes", 0),
-                "State": v.get("State", "COMPLETE"),
-                "PercentageComplete": v.get("PercentageComplete", 100.0),
-                "StartedAt": v.get("StartedAt", ""),
-                "CompletedAt": v.get("CompletedAt", ""),
-            })
+    for v in _refresh_environment(app_id, env_id):
+        item = {
+            "DeploymentNumber": v["DeploymentNumber"],
+            "ConfigurationName": v.get("ConfigurationName", ""),
+            "ConfigurationVersion": v.get("ConfigurationVersion", ""),
+            "DeploymentDurationInMinutes": v.get("DeploymentDurationInMinutes", 0),
+            "GrowthType": v.get("GrowthType", "LINEAR"),
+            "GrowthFactor": v.get("GrowthFactor", 100.0),
+            "FinalBakeTimeInMinutes": v.get("FinalBakeTimeInMinutes", 0),
+            "State": v.get("State", "COMPLETE"),
+            "PercentageComplete": v.get("PercentageComplete", 100.0),
+            "StartedAt": v.get("StartedAt", ""),
+        }
+        for optional in ("CompletedAt", "VersionLabel"):
+            if v.get(optional):
+                item[optional] = v[optional]
+        items.append(item)
     return _json(200, {"Items": items[:max_results]})
 
 
-def _stop_deployment(app_id, env_id, deploy_num):
+def _stop_deployment(app_id, env_id, deploy_num, allow_revert=False):
+    _refresh_environment(app_id, env_id)
     record = _deployments.get(f"{app_id}/{env_id}/{deploy_num}")
     if not record:
         return _error(404, "ResourceNotFoundException", f"Deployment {deploy_num} not found")
-    record["State"] = "ROLLED_BACK"
-    return _json(202, record)
+    now = time.time()
+    state = record["State"]
+    if state in _IN_PROGRESS_STATES:
+        _roll_back(record, "USER", get_account_id(), now)
+    elif state == "COMPLETE" and allow_revert:
+        completed = record.get("_CompletedEpoch")
+        if completed is not None and now - completed > _REVERT_WINDOW_SECONDS:
+            return _error(400, "BadRequestException",
+                          f"Deployment {deploy_num} completed more than 72 hours ago and can no longer be reverted.")
+        record["State"] = "REVERTED"
+        _add_deployment_event(record, "REVERT_COMPLETED", "USER", f"Revert initiated by {get_account_id()}", now)
+    else:
+        return _error(400, "BadRequestException",
+                      f"Deployment {deploy_num} is in state {state} and cannot be stopped."
+                      + ("" if state != "COMPLETE" else " Pass AllowRevert to revert a completed deployment."))
+    _refresh_environment(app_id, env_id)
+    return _json(202, _deployment_view(record))
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +971,11 @@ def _start_configuration_session(body):
                       "ApplicationIdentifier, EnvironmentIdentifier, and "
                       "ConfigurationProfileIdentifier are required")
 
+    poll_interval = body.get("RequiredMinimumPollIntervalInSeconds")
+    if poll_interval is not None and (not isinstance(poll_interval, int) or not 15 <= poll_interval <= 86400):
+        return _error(400, "BadRequestException",
+                      "RequiredMinimumPollIntervalInSeconds must be between 15 and 86400")
+
     app_id = _resolve_application_id(app_identifier)
     if not app_id:
         return _error(404, "ResourceNotFoundException", f"Application {app_identifier} not found")
@@ -795,9 +993,34 @@ def _start_configuration_session(body):
         "ApplicationIdentifier": app_id,
         "EnvironmentIdentifier": env_id,
         "ConfigurationProfileIdentifier": profile_id,
+        # Survives token rotation, so a client keeps its place in a gradual rollout.
+        "SessionId": token,
+        "PollIntervalInSeconds": poll_interval or _DEFAULT_POLL_INTERVAL_SECONDS,
+        "LastServedVersion": None,
     }
     logger.info("StartConfigurationSession: app=%s env=%s profile=%s", app_id, env_id, profile_id)
     return _json(201, {"InitialConfigurationToken": token})
+
+
+def _rollout_bucket(session_id):
+    """A stable 0-99 slot for a session; it receives a DEPLOYING version once
+    PercentageComplete passes its slot. AWS does not document how it picks
+    targets, so this is MiniStack's choice."""
+    return int(hashlib.sha256(session_id.encode("utf-8")).hexdigest(), 16) % 100
+
+
+def _served_deployment(app_id, env_id, profile_id, session_id):
+    """The deployment whose configuration this session receives: the newest
+    one that is COMPLETE or BAKING, or DEPLOYING far enough to reach the session."""
+    deployments = [d for d in _refresh_environment(app_id, env_id)
+                   if d.get("ConfigurationProfileId") == profile_id]
+    for deployment in reversed(deployments):
+        state = deployment.get("State")
+        if state in ("COMPLETE", "BAKING"):
+            return deployment
+        if state == "DEPLOYING" and _rollout_bucket(session_id) < deployment.get("PercentageComplete", 0.0):
+            return deployment
+    return None
 
 
 def _retrieval_time_content(app_id, profile_id, content: bytes) -> bytes:
@@ -820,42 +1043,43 @@ def _get_latest_configuration(token):
     if not session:
         return _error(400, "BadRequestException", "Invalid or expired configuration token")
 
-    # Remove the used token
+    # Each token is good for one call.
     del _sessions[token]
 
     app_id = session["ApplicationIdentifier"]
     env_id = session["EnvironmentIdentifier"]
     profile_id = session["ConfigurationProfileIdentifier"]
-
-    # Find the latest completed deployment for this app/env
-    latest_deploy = None
-    for k, v in _deployments.items():
-        if (k.startswith(f"{app_id}/{env_id}/")
-                and v.get("State") == "COMPLETE"
-                and v.get("ConfigurationProfileId") == profile_id):
-            if latest_deploy is None or v["DeploymentNumber"] > latest_deploy["DeploymentNumber"]:
-                latest_deploy = v
+    session_id = session.get("SessionId", token)
+    session = {**session, "SessionId": session_id}
 
     content = b""
     content_type = "application/octet-stream"
-    if latest_deploy:
-        cfg_version = latest_deploy.get("ConfigurationVersion", "")
-        version_key = f"{app_id}/{profile_id}/{cfg_version}"
-        version_record = _hosted_versions.get(version_key)
+    version_label = None
+    deployment = _served_deployment(app_id, env_id, profile_id, session_id)
+    if deployment:
+        cfg_version = deployment.get("ConfigurationVersion", "")
+        version_record = _hosted_versions.get(f"{app_id}/{profile_id}/{cfg_version}")
         if version_record:
-            raw = version_record["Content"]
-            content = raw if isinstance(raw, bytes) else raw.encode("utf-8")
             content_type = version_record.get("ContentType", "application/octet-stream")
-            content = _retrieval_time_content(app_id, profile_id, content)
+            version_label = version_record.get("VersionLabel")
+            # GetLatestConfiguration "may return empty configuration data if the
+            # client already has the latest version".
+            if session.get("LastServedVersion") != cfg_version:
+                raw = version_record["Content"]
+                content = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+                content = _retrieval_time_content(app_id, profile_id, content)
+                session["LastServedVersion"] = cfg_version
 
     next_token = uuid.uuid4().hex
-    _sessions[next_token] = session.copy()
+    _sessions[next_token] = session
 
     resp_headers = {
         "Content-Type": content_type,
         "Next-Poll-Configuration-Token": next_token,
-        "Next-Poll-Interval-In-Seconds": "30",
+        "Next-Poll-Interval-In-Seconds": str(session.get("PollIntervalInSeconds", _DEFAULT_POLL_INTERVAL_SECONDS)),
     }
+    if version_label:
+        resp_headers["Version-Label"] = version_label
     return 200, resp_headers, content
 
 
@@ -909,7 +1133,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m and method == "POST":
         app_id, profile_id = m.group(1), m.group(2)
         ct = content_type or "application/octet-stream"
-        return await _a(_create_hosted_configuration_version(app_id, profile_id, body_bytes, ct))
+        return await _a(_create_hosted_configuration_version(app_id, profile_id, body_bytes, ct,
+                                                             headers.get("versionlabel")))
 
     m = re.fullmatch(
         r"/applications/([^/]+)/configurationprofiles/([^/]+)/hostedconfigurationversions/(\d+)",
@@ -968,7 +1193,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "GET":
             return await _a(_get_deployment(app_id, env_id, deploy_num))
         if method == "DELETE":
-            return await _a(_stop_deployment(app_id, env_id, deploy_num))
+            allow_revert = str(headers.get("allow-revert", "")).lower() == "true"
+            return await _a(_stop_deployment(app_id, env_id, deploy_num, allow_revert))
 
     # --- Environments ---
     m = re.fullmatch(r"/applications/([^/]+)/environments", path)

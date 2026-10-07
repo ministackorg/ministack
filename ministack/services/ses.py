@@ -611,7 +611,8 @@ def _send_raw_email(params):
                 decoded = base64.b64decode(raw_bytes)
             except Exception:
                 decoded = raw_bytes
-            raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded.decode('utf-8', errors='replace')
+            raw_str = f'Message-ID: <{msg_id}>\r\n' + _strip_message_id_header(
+                decoded.decode('utf-8', errors='replace'))
             _smtp_relay(actual_source, relay_addrs, raw_str)
         except Exception:
             logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
@@ -1243,6 +1244,27 @@ def _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
 
 
 _SMTP_TIMEOUT_SECONDS = 10
+
+
+def _strip_message_id_header(raw_str):
+    """Drop client-supplied Message-ID headers (incl. folded lines); real SES replaces it."""
+    lines = raw_str.splitlines(keepends=True)
+    out = []
+    in_headers = True
+    skipping = False
+    for line in lines:
+        if in_headers:
+            if line in ('\r\n', '\n', '\r'):
+                in_headers = False
+            elif line[0] in ' \t':
+                if skipping:
+                    continue
+            else:
+                skipping = line.lower().startswith('message-id:')
+                if skipping:
+                    continue
+        out.append(line)
+    return ''.join(out)
 
 
 def _smtp_relay(source, to_addrs, message_str):
