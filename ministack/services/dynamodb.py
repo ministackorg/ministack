@@ -2225,6 +2225,11 @@ def _query(data):
             "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
+    index = _index_def(table, index_name) if index_name else None
+    hash_names, range_names = _index_key_lists(index) if index else ([pk_name], [sk_name] if sk_name else [])
+    multi_key = len(hash_names) > 1 or len(range_names) > 1
+    if multi_key:
+        pk_name, sk_name = hash_names[0], (range_names[0] if range_names else None)
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
@@ -2239,24 +2244,28 @@ def _query(data):
         if table.get("sk_name"):
             required.add(table["sk_name"])
         if index_name:
-            required.add(pk_name)
-            if sk_name:
-                required.add(sk_name)
+            required.update(hash_names + range_names)
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid", 400)
 
-    if key_conditions:
-        pk_val = _extract_pk_from_key_conditions(key_conditions, pk_name)
-    else:
-        pk_val = _extract_pk_from_condition(key_cond, eav, ean, pk_name)
-    if pk_val is None:
-        return error_response_json("ValidationException",
-            f"Query condition missed key schema element: {pk_name}", 400)
+    # Every partition-key attribute needs an equality condition; a
+    # multi-attribute partition is the tuple of their values.
+    pk_vals = []
+    for _hn in hash_names:
+        if key_conditions:
+            _hv = _extract_pk_from_key_conditions(key_conditions, _hn)
+        else:
+            _hv = _extract_pk_from_condition(key_cond, eav, ean, _hn)
+        if _hv is None:
+            return error_response_json("ValidationException",
+                f"Query condition missed key schema element: {_hn}", 400)
+        pk_vals.append(_hv)
+    pk_val = pk_vals[0] if len(pk_vals) == 1 else tuple(pk_vals)
     # A key-condition value whose type does not match the key's schema type is
     # rejected, as on real AWS ("Condition parameter type does not match schema
     # type") — MiniStack used to accept N for an S key and return the row.
-    for _kn in (pk_name, sk_name):
+    for _kn in hash_names + range_names:
         if not _kn:
             continue
         _av = _key_condition_av(key_cond, key_conditions, eav, ean, _kn)
@@ -2274,9 +2283,7 @@ def _query(data):
             kce_tokens = _tokenize(key_cond)
         except Exception:
             kce_tokens = []
-        allowed = {pk_name}
-        if sk_name:
-            allowed.add(sk_name)
+        allowed = set(hash_names + range_names)
         # A document path on a key attribute is rejected up front (AWS).
         if any(tok[0] == "DOT" for tok in kce_tokens):
             return error_response_json("ValidationException",
@@ -2296,6 +2303,11 @@ def _query(data):
                 if resolved and resolved not in allowed:
                     return error_response_json("ValidationException",
                         f"Query condition missed key schema element: {resolved}", 400)
+        # Multi-attribute sort keys are queried left to right without gaps,
+        # and only the last one queried may use a range condition.
+        if len(range_names) > 1 and not _multi_sort_condition_ok(kce_tokens, ean, range_names):
+            return error_response_json("ValidationException",
+                "Query key condition not supported", 400)
         # Key-condition operands are validated like key values themselves:
         # an empty string/binary operand is rejected with the same error AWS
         # raises for empty key attribute values.
@@ -2352,7 +2364,7 @@ def _query(data):
         # GSI/LSI: order by (INDEX_SORT, BASE_PK, BASE_SK). The base-table keys
         # tiebreak rows with equal INDEX_SORT (or hash-only GSIs), matching
         # real DynamoDB's hidden ordering and making pagination cursors stable.
-        sort_keys = _index_order_keys(table, sk_name)
+        sort_keys = _index_order_keys(table, range_names)
         candidates.sort(
             key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys),
             reverse=not scan_forward,
@@ -2370,7 +2382,8 @@ def _query(data):
             return error_response_json("ValidationException", str(exc), 400)
 
     if esk:
-        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
+        candidates = _apply_exclusive_start_key(
+            candidates, esk, pk_name, range_names if multi_key else sk_name, scan_forward, table=table)
 
     # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
     # limit — including when the results end exactly at the limit, since it
@@ -2413,9 +2426,9 @@ def _query(data):
     if has_more and candidates:
         lek = _build_key(candidates[-1], table["pk_name"], table["sk_name"])
         if index_name:
-            ik = _build_key(candidates[-1], pk_name, sk_name)
-            for k, v in ik.items():
-                lek.setdefault(k, v)
+            for k in hash_names + range_names:
+                if k in candidates[-1]:
+                    lek.setdefault(k, candidates[-1][k])
         result["LastEvaluatedKey"] = lek
 
     _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
@@ -2546,16 +2559,17 @@ def _scan(data):
 
     if index_name:
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
+        idx_hashes, idx_ranges = _index_key_lists(_index_def(table, index_name) or {})
         if is_gsi:
             # Sparse GSI semantics: items lacking ANY of the index's key
             # attributes (hash, or range on a composite GSI) don't appear.
-            all_items = [it for it in all_items if pk_name_idx in it and (not sk_name_idx or sk_name_idx in it)]
+            all_items = [it for it in all_items if all(n in it for n in idx_hashes + idx_ranges)]
         else:
             # LSI: items lacking the index's RANGE attribute don't appear.
             if sk_name_idx:
                 all_items = [it for it in all_items if sk_name_idx in it]
         # Sort by index key ordering so ESK/LEK pagination is consistent.
-        sort_keys = _index_order_keys(table, sk_name_idx)
+        sort_keys = _index_order_keys(table, idx_ranges or sk_name_idx)
         all_items.sort(key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys))
 
     # Parallel scan: partition items deterministically across segments by
@@ -2582,16 +2596,15 @@ def _scan(data):
         if table.get("sk_name"):
             required.add(table["sk_name"])
         if index_name:
-            required.add(pk_name_idx)
-            if sk_name_idx:
-                required.add(sk_name_idx)
+            required.update(idx_hashes + idx_ranges)
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid: The provided key element does not match the schema", 400)
         if index_name:
             # For index scans, use index-aware ordering (same as Query pagination).
             all_items = _apply_exclusive_start_key(
-                all_items, esk, pk_name_idx, sk_name_idx, scan_forward=True, table=table
+                all_items, esk, pk_name_idx, idx_ranges if len(idx_ranges) > 1 else sk_name_idx,
+                scan_forward=True, table=table
             )
         else:
             all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
@@ -2634,9 +2647,9 @@ def _scan(data):
     if has_more and all_items:
         lek = _build_key(all_items[-1], table["pk_name"], table["sk_name"])
         if index_name:
-            ik = _build_key(all_items[-1], pk_name_idx, sk_name_idx)
-            for k, v in ik.items():
-                lek.setdefault(k, v)
+            for k in idx_hashes + idx_ranges:
+                if k in all_items[-1]:
+                    lek.setdefault(k, all_items[-1][k])
         result["LastEvaluatedKey"] = lek
 
     _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
@@ -7223,6 +7236,30 @@ def _index_order_value(item, name, type_hint):
     return _sort_key_value(item.get(name), type_hint)
 
 
+def _multi_sort_condition_ok(tokens, ean, range_names):
+    """Sort-key attributes of a multi-attribute key must be queried left to
+    right without skipping any, with equality on all but the last."""
+    ops = {}
+    i = 0
+    while i < len(tokens):
+        kind, val = tokens[i]
+        if kind == "IDENT" and val.lower() == "begins_with" and i + 2 < len(tokens):
+            arg = tokens[i + 2]
+            name = ean.get(arg[1]) if arg[0] == "NAME_REF" else arg[1]
+            ops.setdefault(name, []).append("range")
+            i += 3
+            continue
+        name = ean.get(val) if kind == "NAME_REF" else (val if kind == "IDENT" else None)
+        if name in range_names and i + 1 < len(tokens):
+            eq = tokens[i + 1][0] == "EQ" or (i >= 2 and tokens[i - 1][0] == "EQ" and tokens[i - 2][0] == "VALUE_REF")
+            ops.setdefault(name, []).append("eq" if eq else "range")
+        i += 1
+    used = [n for n in range_names if n in ops]
+    if used != range_names[:len(used)] or any(len(ops[n]) != 1 for n in used):
+        return False
+    return all(ops[n] == ["eq"] for n in used[:-1])
+
+
 def _index_order_keys(table, sk_name):
     """Ordered list of (attr_name, attr_type) used to sort a GSI/LSI Query
     result deterministically: (INDEX_SORT, BASE_PK, BASE_SK). Real DynamoDB
@@ -7232,7 +7269,8 @@ def _index_order_keys(table, sk_name):
     hash-only)."""
     seen = set()
     keys = []
-    for n in (sk_name, table.get("pk_name"), table.get("sk_name")):
+    index_sorts = list(sk_name) if isinstance(sk_name, (list, tuple)) else [sk_name]
+    for n in (*index_sorts, table.get("pk_name"), table.get("sk_name")):
         if n and n not in seen:
             seen.add(n)
             keys.append((n, _get_attr_type(table, n)))
@@ -7576,21 +7614,35 @@ def _compact_projection(value):
 _INDEX_MEMBERS = "_index_members"
 
 
+def _index_key_lists(index):
+    """(HASH names, RANGE names) of an index KeySchema, in order; a GSI may
+    have up to four of each (multi-attribute keys)."""
+    schema = index.get("KeySchema", [])
+    return ([k.get("AttributeName") for k in schema if k.get("KeyType") == "HASH"],
+            [k.get("AttributeName") for k in schema if k.get("KeyType") == "RANGE"])
+
+
+def _index_def(table, index_name):
+    for index in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
+        if index.get("IndexName") == index_name:
+            return index
+    return None
+
+
 def _index_key_schemas(table):
     for index in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
-        hash_key = range_key = None
-        for key in index.get("KeySchema", []):
-            if key.get("KeyType") == "HASH":
-                hash_key = key.get("AttributeName")
-            elif key.get("KeyType") == "RANGE":
-                range_key = key.get("AttributeName")
-        yield index.get("IndexName"), hash_key, range_key
+        hashes, ranges = _index_key_lists(index)
+        yield index.get("IndexName"), hashes, ranges
 
 
-def _index_partition(item, hash_key, range_key):
-    if not hash_key or hash_key not in item or (range_key and range_key not in item):
+def _index_partition(item, hashes, ranges):
+    """The index partition of an item: its HASH value, or the tuple of them
+    for a multi-attribute key; None when any key attribute is missing."""
+    if not hashes or any(n not in item for n in hashes + ranges):
         return None
-    return _extract_key_val(item[hash_key])
+    if len(hashes) == 1:
+        return _extract_key_val(item[hashes[0]])
+    return tuple(_extract_key_val(item[n]) for n in hashes)
 
 
 def _index_members(table):

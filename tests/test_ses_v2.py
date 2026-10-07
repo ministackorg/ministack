@@ -1272,3 +1272,23 @@ def test_tenant_association_normalizes_foreign_partitions(sesv2):
         sesv2.tag_resource(ResourceArn=cn_arn, Tags=[{"Key": "ck", "Value": "v"}])
     sesv2.delete_tenant(TenantName=name)
     sesv2.delete_configuration_set(ConfigurationSetName=cs)
+
+
+def test_dedicated_ip_pool_lifecycle(sesv2):
+    name = f"pool-{uuid.uuid4().hex[:8]}"
+    sesv2.create_dedicated_ip_pool(PoolName=name, ScalingMode="MANAGED", Tags=[{"Key": "k", "Value": "v"}])
+    try:
+        assert sesv2.get_dedicated_ip_pool(PoolName=name)["DedicatedIpPool"] == {
+            "PoolName": name, "ScalingMode": "MANAGED"}
+        assert name in sesv2.list_dedicated_ip_pools()["DedicatedIpPools"]
+        arn = f"arn:aws:ses:us-east-1:000000000000:dedicated-ip-pool/{name}"
+        assert sesv2.list_tags_for_resource(ResourceArn=arn)["Tags"] == [{"Key": "k", "Value": "v"}]
+        with pytest.raises(ClientError) as exc:
+            sesv2.create_dedicated_ip_pool(PoolName=name)
+        assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+    finally:
+        sesv2.delete_dedicated_ip_pool(PoolName=name)
+    with pytest.raises(ClientError) as exc:
+        sesv2.get_dedicated_ip_pool(PoolName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404

@@ -7544,3 +7544,54 @@ def test_dynamodb_stream_skips_writes_that_change_nothing(ddb, ddb_streams):
         assert events == ["INSERT", "MODIFY"]
     finally:
         ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_gsi_multi_attribute_keys(ddb):
+    name = f"multi-key-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("pk", "a", "b", "s1", "s2")],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "Idx", "Projection": {"ProjectionType": "ALL"},
+            "KeySchema": [{"AttributeName": "a", "KeyType": "HASH"}, {"AttributeName": "b", "KeyType": "HASH"},
+                          {"AttributeName": "s1", "KeyType": "RANGE"}, {"AttributeName": "s2", "KeyType": "RANGE"}],
+        }])
+
+    def query(cond, **vals):
+        return ddb.query(TableName=name, IndexName="Idx", KeyConditionExpression=cond,
+                         ExpressionAttributeValues={f":{k}": {"S": v} for k, v in vals.items()})
+
+    try:
+        rows = [("1", "x", "y", "p", "2"), ("2", "x", "y", "p", "1"), ("3", "x", "y", "q", "1"),
+                ("4", "x", "z", "p", "1"), ("5", "x", "y", "p", None)]
+        for pk, a, b, s1, s2 in rows:
+            item = {"pk": {"S": pk}, "a": {"S": a}, "b": {"S": b}, "s1": {"S": s1}}
+            if s2:
+                item["s2"] = {"S": s2}
+            ddb.put_item(TableName=name, Item=item)
+
+        def pks(resp):
+            return [it["pk"]["S"] for it in resp["Items"]]
+
+        assert pks(query("a = :a AND b = :b", a="x", b="y")) == ["2", "1", "3"]
+        assert pks(query("a = :a AND b = :b AND s1 = :s1 AND s2 >= :s2", a="x", b="y", s1="p", s2="2")) == ["1"]
+        assert pks(query("a = :a AND b = :b AND begins_with(s1, :s1)", a="x", b="y", s1="q")) == ["3"]
+        page = ddb.query(TableName=name, IndexName="Idx", Limit=1, KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert set(page["LastEvaluatedKey"]) == {"pk", "a", "b", "s1", "s2"}
+        rest = ddb.query(TableName=name, IndexName="Idx", ExclusiveStartKey=page["LastEvaluatedKey"],
+                         KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert pks(rest) == ["1", "3"]
+
+        with pytest.raises(ClientError) as exc:
+            query("a = :a", a="x")
+        assert exc.value.response["Error"]["Message"] == "Query condition missed key schema element: b"
+        for cond, vals in (("a = :a AND b = :b AND s2 = :s2", {"s2": "1"}),
+                           ("a = :a AND b = :b AND s1 > :s1 AND s2 = :s2", {"s1": "a", "s2": "1"})):
+            with pytest.raises(ClientError) as exc:
+                query(cond, a="x", b="y", **vals)
+            assert exc.value.response["Error"]["Message"] == "Query key condition not supported"
+    finally:
+        ddb.delete_table(TableName=name)
