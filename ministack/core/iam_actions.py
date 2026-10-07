@@ -1696,6 +1696,45 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     ]
 
 
+_DYNAMODB_TRANSACT_ITEM_ACTIONS = {
+    "ConditionCheck": "dynamodb:ConditionCheckItem",
+    "Put": "dynamodb:PutItem",
+    "Update": "dynamodb:UpdateItem",
+    "Delete": "dynamodb:DeleteItem",
+    "Get": "dynamodb:GetItem",
+}
+
+
+def dynamodb_transaction_checks(
+    iam_action: str, body: bytes, region: str, account_id: str
+) -> list[tuple[str, str]]:
+    """Per-item ``(action, table ARN)`` checks of a DynamoDB transaction.
+
+    ``TransactWriteItems`` and ``TransactGetItems`` are not IAM actions: each
+    item is authorized as the single-item action it performs, on its own table.
+    An item naming more than one member (AWS rejects it, the handler does not)
+    is checked for every member, so none can ride along unchecked.
+    Returns an empty list for any other action or a body with no usable item.
+    """
+    if iam_action not in ("dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"):
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    items = data.get("TransactItems") if isinstance(data, dict) else None
+    checks = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for member, action in _DYNAMODB_TRANSACT_ITEM_ACTIONS.items():
+            detail = item.get(member)
+            table = detail.get("TableName") if isinstance(detail, dict) else None
+            if isinstance(table, str) and table:
+                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
+    return checks
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
