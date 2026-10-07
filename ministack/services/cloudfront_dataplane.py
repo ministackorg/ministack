@@ -2,7 +2,7 @@
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """CloudFront data plane: serves viewer requests to ``<label>.cloudfront.net`` / ``<label>.cloudfront.<MINISTACK_HOST>``.
 
-Not modelled: caching, WAF, logging, geo restrictions, custom error pages, signed URLs and cookies,
+Not modelled: caching, WAF, logging, geo restrictions, signed URLs and cookies,
 Lambda@Edge, CORS preflight, synthetic ``CloudFront-Viewer-*`` headers, origins at AWS hostnames (502).
 """
 
@@ -600,6 +600,21 @@ def _serve_s3_origin(origin: dict, method: str, uri: str, headers: dict, dist_ar
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: str, headers: dict, body: bytes,
+                             viewer_is_https: bool, client_ip: str, viewer_xff: str, dist_arn: str) -> tuple:
+    """(status, reason, headers, body) from an S3 or custom origin; raises OriginTimeout / OriginUnreachable."""
+    if origin.get("s3_bucket"):
+        status, header_pairs, data = await run_offloop(_serve_s3_origin, origin, method, uri, headers, dist_arn)
+        pairs = header_pairs.items() if isinstance(header_pairs, dict) else header_pairs
+        return status, http.client.responses.get(status, ""), _multidict_from_pairs(pairs), data
+    # The origin may be MiniStack's own gateway, so the call must be reentrant.
+    status, reason, header_pairs, data = await run_reentrant(
+        _forward_to_origin, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+        viewer_is_https, client_ip, viewer_xff,
+    )
+    return status, reason, _multidict_from_pairs(header_pairs), data
+
+
 def _multidict_from_pairs(pairs) -> dict:
     out: dict = {}
     for name, value in pairs:
@@ -797,28 +812,33 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
             quote_via=quote,
         )
 
-    if origin.get("s3_bucket"):
-        status, origin_headers_list, origin_body = await run_offloop(
-            _serve_s3_origin, origin, method, request_uri, fwd_headers, dist.get("ARN", ""),
+    try:
+        status, reason, origin_headers, origin_body = await _fetch_from_origin(
+            origin, method, request_uri, forward_qs, fwd_headers, body, viewer_is_https,
+            client_ip, request_headers.get("x-forwarded-for", ""), dist.get("ARN", ""),
         )
-        reason = http.client.responses.get(status, "")
-        origin_headers = _multidict_from_pairs(origin_headers_list.items() if isinstance(origin_headers_list, dict)
-                                                else origin_headers_list)
-    else:
-        full_uri = (origin.get("origin_path") or "") + request_uri
-        try:
-            # The origin may be MiniStack's own gateway, so the call must be reentrant.
-            status, reason, origin_headers_list, origin_body = await run_reentrant(
-                _forward_to_origin, origin, method, full_uri, forward_qs, fwd_headers, body, viewer_is_https,
-                client_ip, request_headers.get("x-forwarded-for", ""),
+        origin_status = status
+        error_response = parsed["custom_error_responses"].get(status)
+        if error_response:
+            # The page is requested through the cache behavior its path matches (Developer Guide,
+            # "Store objects and custom error pages in different locations").
+            origin = parsed["origins"].get(_match_behavior(parsed, error_response["page"])["target_origin_id"])
+            if origin is None:
+                return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
+            status, reason, origin_headers, origin_body = await _fetch_from_origin(
+                origin, "GET", error_response["page"], "", {"user-agent": "Amazon CloudFront"}, b"",
+                viewer_is_https, client_ip, "", dist.get("ARN", ""),
             )
-        except OriginTimeout:
-            logger.warning("Origin timed out for distribution=%s origin=%s", dist_id, origin["domain_name"])
-            return _cf_error_response(504, "The request could not be satisfied.", _ERROR_X_CACHE)
-        except OriginUnreachable:
-            logger.warning("Origin unreachable for distribution=%s origin=%s", dist_id, origin["domain_name"])
-            return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
-        origin_headers = _multidict_from_pairs(origin_headers_list)
+            # An unavailable page is answered with the status its origin returned (Developer Guide,
+            # "Generate custom error responses").
+            if status < 400:
+                status = error_response["response_code"]
+    except OriginTimeout:
+        logger.warning("Origin timed out for distribution=%s origin=%s", dist_id, origin["domain_name"])
+        return _cf_error_response(504, "The request could not be satisfied.", _ERROR_X_CACHE)
+    except OriginUnreachable:
+        logger.warning("Origin unreachable for distribution=%s origin=%s", dist_id, origin["domain_name"])
+        return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
 
     origin_headers = _strip_hop_by_hop_response_headers(origin_headers)
     policy_cfg = cloudfront.response_headers_policy_config(behavior.get("response_headers_policy_id"))
@@ -829,7 +849,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
 
     response_function_arn = behavior["functions"].get("viewer-response")
     # No viewer-response function runs when the origin answers 400 or above.
-    if response_function_arn and status < 400:
+    if response_function_arn and origin_status < 400:
         event = _build_function_event(
             "viewer-response", dist_id, dist_domain, request_id,
             method, request_uri, request_query, headers, client_ip,

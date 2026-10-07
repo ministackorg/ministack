@@ -1814,7 +1814,7 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         resp_code = int(result.get("statusCode", 200))
         out_headers = dict(result.get("headers") or {})
         for k, vals in (result.get("multiValueHeaders") or {}).items():
-            out_headers[k] = vals[-1]
+            out_headers[k] = vals[0] if len(vals) == 1 else vals
 
         out_body = result.get("body", "")
         if result.get("isBase64Encoded"):
@@ -1894,7 +1894,14 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
 
-    status, out_headers = resp.status, dict(resp.headers)
+    # Header names are case-insensitive; repeated fields must reach ASGI as
+    # separate values, especially Set-Cookie whose Expires can contain commas.
+    out_headers = {}
+    for name, value in resp.getheaders():
+        out_headers.setdefault(name.lower(), []).append(value)
+    out_headers = {name: values[0] if len(values) == 1 else values
+                   for name, values in out_headers.items()}
+    status = resp.status
 
     async def _stream(send, receive):
         disconnected = asyncio.create_task(_await_http_disconnect(receive))

@@ -1707,6 +1707,45 @@ def test_bedrock_list_foundation_model_agreement_offers():
     assert "offers" in resp
 
 
+def test_bedrock_agreement_offer_token_creates_an_agreement():
+    model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+    offers = _bedrock().list_foundation_model_agreement_offers(modelId=model_id)["offers"]
+    assert len(offers) == 1
+    assert set(offers[0]["termDetails"]) == {"usageBasedPricingTerm", "legalTerm", "supportTerm"}
+    resp = _bedrock().create_foundation_model_agreement(
+        offerToken=offers[0]["offerToken"], modelId=model_id,
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert resp["modelId"] == model_id
+
+
+def test_bedrock_agreement_lifecycle_drives_availability():
+    """The Terraform/OpenTofu agreement resource waits on agreementAvailability
+    reaching AVAILABLE after create and NOT_AVAILABLE after delete."""
+    model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+    client = _bedrock()
+    token = client.list_foundation_model_agreement_offers(modelId=model_id)["offers"][0]["offerToken"]
+    client.create_foundation_model_agreement(offerToken=token, modelId=model_id)
+    status = client.get_foundation_model_availability(modelId=model_id)["agreementAvailability"]["status"]
+    assert status == "AVAILABLE"
+    client.delete_foundation_model_agreement(modelId=model_id)
+    status = client.get_foundation_model_availability(modelId=model_id)["agreementAvailability"]["status"]
+    assert status == "NOT_AVAILABLE"
+    amazon = client.get_foundation_model_availability(modelId="amazon.titan-text-express-v1")
+    assert amazon["agreementAvailability"]["status"] == "AVAILABLE"
+
+
+def test_bedrock_amazon_models_have_no_agreement_offers():
+    resp = _bedrock().list_foundation_model_agreement_offers(modelId="amazon.titan-text-express-v1")
+    assert resp["offers"] == []
+
+
+def test_bedrock_create_foundation_model_agreement_unknown_model():
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        _bedrock().create_foundation_model_agreement(offerToken="t", modelId="nope.model-v1:0")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # Tagging
 # ---------------------------------------------------------------------------

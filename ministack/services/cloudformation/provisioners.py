@@ -37,6 +37,7 @@ import ministack.services.dynamodb as _dynamodb
 import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
+import ministack.services.efs as _efs
 import ministack.services.elasticache as _ec
 import ministack.services.eventbridge as _eb
 import ministack.services.firehose as _firehose
@@ -705,6 +706,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             for p in ("ThingTypeDescription", "SearchableAttributes")
         ),
     },
+    "AWS::IoT::DomainConfiguration": {"name": "DomainConfigurationName"},
     # BackupVaultName is required, so every vault is custom-named. Measured on
     # an account: adding EncryptionKeyArn fails with the refusal sentence.
     "AWS::Backup::BackupVault": {
@@ -744,6 +746,7 @@ _CUSTOM_NAME_REPLACEMENT = {
             != new.get("TemplateType", "FLEET_PROVISIONING")
         ),
     },
+    "AWS::IoT::JobTemplate": {"name": "JobTemplateId"},
     "AWS::Lambda::Function": {"name": "FunctionName"},
     "AWS::SQS::Queue": {
         "name": "QueueName",
@@ -753,6 +756,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TopicName",
         "exists": "Topic creation failed because the topic already exists",
     },
+    # A permission's identity is StatementId + ProfileName.
+    "AWS::Signer::SigningProfile": {"name": "ProfileName"},
+    "AWS::Signer::ProfilePermission": {"name": ("StatementId", "ProfileName")},
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
     # (aws-resource-elasticloadbalancingv2-loadbalancer), which is this rule
@@ -817,6 +823,8 @@ _CUSTOM_NAME_REPLACEMENT = {
         "requires_replacement": lambda old, new: any(
             old.get(p) != new.get(p) for p in _RDS_DB_INSTANCE_CREATE_ONLY + ("Engine",)),
     },
+    "AWS::RDS::DBParameterGroup": {"name": "DBParameterGroupName"},
+    "AWS::RDS::DBClusterParameterGroup": {"name": "DBClusterParameterGroupName"},
     # Type and WorkflowName are "Update requires: Replacement" in the
     # aws-resource-glue-trigger reference.
     "AWS::Glue::Trigger": {
@@ -851,9 +859,15 @@ def _custom_named_replacement_error(resource_type, old_props, new_props,
 
 
 def _kept_custom_name(resource_type, old_props, new_props):
-    """The explicit name an update keeps unchanged, else None."""
+    """The explicit name (or tuple of names) an update keeps unchanged, else None."""
     spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
-    name = old_props.get(spec["name"]) if spec else None
+    if not spec:
+        return None
+    if isinstance(spec["name"], tuple):
+        names = [old_props.get(p) for p in spec["name"]]
+        kept = all(names) and names == [new_props.get(p) for p in spec["name"]]
+        return "|".join(str(n) for n in names) if kept else None
+    name = old_props.get(spec["name"])
     return name if name and name == new_props.get(spec["name"]) else None
 
 
@@ -1053,12 +1067,14 @@ def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict,
 
 
 def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
-                        key: str = "Key", value: str = "Value") -> None:
+                        key: str = "Key", value: str = "Value",
+                        prop: str = "Tags") -> None:
     """The list-store twin of ``_reconcile_tag_map``: entries the template
     dropped are removed, the new ones set, entries from elsewhere kept. The
-    list is changed in place; ``key``/``value`` name the entry fields."""
-    old_tags = _tag_map(old_props.get("Tags"))
-    new_tags = _tag_map(new_props.get("Tags"))
+    list is changed in place; ``key``/``value`` name the entry fields and
+    ``prop`` the template property that carries the tags."""
+    old_tags = _tag_map(old_props.get(prop))
+    new_tags = _tag_map(new_props.get(prop))
     if old_tags == new_tags:
         return
     store[:] = [
@@ -1079,6 +1095,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
     "AWS::ApiGatewayV2::Api": ("Tags", "map"),
     "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::ApiGatewayV2::DomainName": ("Tags", "map"),
     "AWS::AppConfig::Application": ("Tags", "list"),
     "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
     "AWS::AppConfig::Deployment": ("Tags", "list"),
@@ -1105,6 +1122,8 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ECR::Repository": ("Tags", "list"),
     "AWS::ECS::Cluster": ("Tags", "list"),
     "AWS::ECS::Service": ("Tags", "list"),
+    "AWS::EFS::AccessPoint": ("AccessPointTags", "list"),
+    "AWS::EFS::FileSystem": ("FileSystemTags", "list"),
     "AWS::EKS::Cluster": ("Tags", "list"),
     "AWS::EKS::Nodegroup": ("Tags", "map"),
     "AWS::ElasticLoadBalancingV2::Listener": ("Tags", "list"),
@@ -1121,6 +1140,9 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::RDS::DBInstance": ("Tags", "list"),
     "AWS::DocDB::DBCluster": ("Tags", "list"),
     "AWS::DocDB::DBInstance": ("Tags", "list"),
+    "AWS::RDS::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::RDS::DBParameterGroup": ("Tags", "list"),
+    "AWS::RDS::DBSubnetGroup": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -1130,6 +1152,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ServiceDiscovery::PrivateDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::PublicDnsNamespace": ("Tags", "list"),
     "AWS::ServiceDiscovery::Service": ("Tags", "list"),
+    "AWS::Signer::SigningProfile": ("Tags", "list"),
     "AWS::StepFunctions::StateMachine": ("Tags", "list"),
 }
 
@@ -2753,7 +2776,10 @@ def _iam_ip_delete(physical_id, props):
 _SSM_CFN_PARAMETER_TYPES = ("String", "StringList")
 
 
-def _ssm_check_type(props):
+def _ssm_check_type(props, logical_id):
+    if isinstance(props.get("Value"), list):
+        raise ValueError(f"Properties validation failed for resource {logical_id} with message: "
+                         "[#/Value: expected type: String, found: JSONArray]")
     ptype = props.get("Type", "String")
     if ptype not in _SSM_CFN_PARAMETER_TYPES:
         raise ValueError(
@@ -2793,7 +2819,7 @@ def _ssm_create(logical_id, props, stack_name):
     # two doors into the same store behave alike: a create over an existing
     # parameter fails as real CloudFormation does (`ParameterAlreadyExists`), and
     # Version/history stay consistent with the API path.
-    _ssm_check_type(props)
+    _ssm_check_type(props, logical_id)
     name = props.get("Name") or f"/{stack_name}/{logical_id}"
     data = _ssm_put_data(name, props)
     status, _headers, body = _ssm._put_parameter(data)
@@ -2802,8 +2828,8 @@ def _ssm_create(logical_id, props, stack_name):
     return name, _ssm_attrs(name, data)
 
 
-def _ssm_update(physical_id, old_props, new_props, stack_name):
-    _ssm_check_type(new_props)
+def _ssm_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _ssm_check_type(new_props, logical_id or physical_id)
     new_name = new_props.get("Name")
     if new_name and new_name != physical_id:
         # Name is Update requires: Replacement — create the new parameter and
@@ -3145,6 +3171,9 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
             "AWS::AppConfig::Deployment requires ApplicationId, EnvironmentId, "
             "DeploymentStrategyId, and ConfigurationProfileId"
         )
+    strategy = _appconfig._find_deployment_strategy(strategy_id)
+    if not strategy:
+        raise ValueError(f"DeploymentStrategy with Id {strategy_id} could not be found.")
     existing = [
         v for k, v in _appconfig._deployments.items()
         if k.startswith(f"{app_id}/{env_id}/")
@@ -3163,6 +3192,7 @@ def _appconfig_deployment_create(logical_id, props, stack_name):
         "ConfigurationLocationUri": "hosted",
         "ConfigurationVersion": props.get("ConfigurationVersion", ""),
         "Description": props.get("Description", ""),
+        **_appconfig._deployment_params_from_strategy(strategy),
         "State": "COMPLETE",
         "PercentageComplete": 100.0,
         "StartedAt": now,
@@ -4208,6 +4238,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
+        if any(isinstance(v, list) for v in raw_param_props.values()):
+            # AWS fails a list here, for example a Ref to a CommaDelimitedList
+            raise ValueError("Value of property Parameters must be an object with String (or simple type) properties")
         provided_params = [
             {"Key": k, "Value": "" if v is None else str(v)}
             for k, v in raw_param_props.items()
@@ -9291,6 +9324,240 @@ def _sd_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# EFS (AWS::EFS::*) — through efs.py; create-only properties are replaced by the engine.
+# ---------------------------------------------------------------------------
+
+def _efs_result(response, what, missing_ok=False):
+    """The parsed body of an efs call; a 404 returns None when ``missing_ok``."""
+    status, _, body = response
+    if status == 404 and missing_ok:
+        return None
+    if status >= 400:
+        raise ValueError(f"{what} failed: {body!r}")
+    return json.loads(body) if body else {}
+
+
+def _efs_policy_json(policy):
+    return policy if isinstance(policy, str) else json.dumps(policy)
+
+
+def _efs_refresh_name(record):
+    """``Name`` follows the ``Name`` tag, as at create."""
+    record["Name"] = next(
+        (t["Value"] for t in record.get("Tags", []) if t.get("Key") == "Name"), "")
+
+
+def _efs_file_system_attrs(fs):
+    return {"Arn": fs["FileSystemArn"], "FileSystemId": fs["FileSystemId"]}
+
+
+def _efs_put_backup_policy(fs_id, policy):
+    _efs_result(_efs._put_backup_policy(fs_id, {"BackupPolicy": policy}),
+                "AWS::EFS::FileSystem BackupPolicy")
+
+
+def _efs_put_lifecycle_policies(fs_id, policies):
+    _efs_result(_efs._put_lifecycle_configuration(fs_id, {"LifecyclePolicies": policies}),
+                "AWS::EFS::FileSystem LifecyclePolicies")
+
+
+def _efs_put_file_system_policy(fs_id, props):
+    body = {"Policy": _efs_policy_json(props["FileSystemPolicy"])}
+    if "BypassPolicyLockoutSafetyCheck" in props:
+        body["BypassPolicyLockoutSafetyCheck"] = _cfn_bool(props["BypassPolicyLockoutSafetyCheck"])
+    _efs_result(_efs._put_file_system_policy(fs_id, body), "AWS::EFS::FileSystem FileSystemPolicy")
+
+
+def _efs_put_protection(fs_id, protection):
+    _efs_result(_efs._update_file_system_protection(fs_id, dict(protection or {})),
+                "AWS::EFS::FileSystem FileSystemProtection")
+
+
+def _efs_replication_destinations(configuration):
+    """The API Destinations, without the read-only Status and StatusMessage."""
+    return [
+        {k: v for k, v in destination.items() if k not in ("Status", "StatusMessage")}
+        for destination in (configuration or {}).get("Destinations") or []
+    ]
+
+
+def _efs_create_replication(fs_id, configuration):
+    _efs_result(
+        _efs._create_replication_configuration(
+            fs_id, {"Destinations": _efs_replication_destinations(configuration)}),
+        "AWS::EFS::FileSystem ReplicationConfiguration")
+
+
+def _efs_delete_replication(fs_id):
+    _efs_result(_efs._delete_replication_configuration(fs_id, {}),
+                "AWS::EFS::FileSystem ReplicationConfiguration delete", missing_ok=True)
+
+
+def _efs_file_system_create(logical_id, props, stack_name):
+    # No CreationToken: a repeated one would return the predecessor on a replacement.
+    body = {
+        key: props[key]
+        for key in ("PerformanceMode", "ThroughputMode", "KmsKeyId",
+                    "ProvisionedThroughputInMibps", "AvailabilityZoneName")
+        if key in props
+    }
+    if "Encrypted" in props:
+        body["Encrypted"] = _cfn_bool(props["Encrypted"])
+    if "FileSystemTags" in props:
+        body["Tags"] = props["FileSystemTags"]
+    fs = _efs_result(_efs._create_file_system(body), "AWS::EFS::FileSystem create")
+    fs_id = fs["FileSystemId"]
+    if props.get("LifecyclePolicies"):
+        _efs_put_lifecycle_policies(fs_id, props["LifecyclePolicies"])
+    if props.get("BackupPolicy"):
+        _efs_put_backup_policy(fs_id, props["BackupPolicy"])
+    if props.get("FileSystemPolicy"):
+        _efs_put_file_system_policy(fs_id, props)
+    if props.get("FileSystemProtection"):
+        _efs_put_protection(fs_id, props["FileSystemProtection"])
+    if props.get("ReplicationConfiguration"):
+        _efs_create_replication(fs_id, props["ReplicationConfiguration"])
+    return fs_id, _efs_file_system_attrs(fs)
+
+
+def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """The in-place properties; the create-only ones are replaced by the engine."""
+    fs = _efs._file_systems.get(physical_id)
+    if fs is None:
+        return _efs_file_system_create(logical_id or physical_id, new_props, stack_name)
+    throughput = {}
+    for key, default in (("ThroughputMode", "bursting"), ("ProvisionedThroughputInMibps", None)):
+        if new_props.get(key) != old_props.get(key):
+            if key in new_props:
+                throughput[key] = new_props[key]
+            elif default is not None:
+                throughput[key] = default
+    if throughput:
+        _efs_result(_efs._update_file_system(physical_id, throughput),
+                    "AWS::EFS::FileSystem update")
+    if new_props.get("LifecyclePolicies") != old_props.get("LifecyclePolicies"):
+        _efs_put_lifecycle_policies(physical_id, new_props.get("LifecyclePolicies") or [])
+    if new_props.get("BackupPolicy") != old_props.get("BackupPolicy"):
+        _efs_put_backup_policy(physical_id, new_props.get("BackupPolicy") or {"Status": "DISABLED"})
+    if new_props.get("FileSystemPolicy") != old_props.get("FileSystemPolicy"):
+        if new_props.get("FileSystemPolicy"):
+            _efs_put_file_system_policy(physical_id, new_props)
+        else:
+            _efs_result(_efs._delete_file_system_policy(physical_id),
+                        "AWS::EFS::FileSystem FileSystemPolicy")
+    if new_props.get("FileSystemProtection") != old_props.get("FileSystemProtection"):
+        _efs_put_protection(physical_id, new_props.get("FileSystemProtection")
+                            or {"ReplicationOverwriteProtection": "ENABLED"})
+    if new_props.get("ReplicationConfiguration") != old_props.get("ReplicationConfiguration"):
+        _efs_delete_replication(physical_id)
+        if new_props.get("ReplicationConfiguration"):
+            _efs_create_replication(physical_id, new_props["ReplicationConfiguration"])
+    _reconcile_tag_list(fs.setdefault("Tags", []), old_props, new_props, prop="FileSystemTags")
+    _efs_refresh_name(fs)
+    return physical_id, _efs_file_system_attrs(fs)
+
+
+def _efs_file_system_delete(physical_id, props):
+    # A replicating file system cannot be deleted; the destination stays, as on AWS.
+    _efs_delete_replication(physical_id)
+    _efs_result(_efs._delete_file_system(physical_id),
+                "AWS::EFS::FileSystem delete", missing_ok=True)
+
+
+def _efs_mount_target_attrs(mount_target):
+    # Id is the file system id (template reference); IPV6_ONLY has no IpAddress.
+    attrs = {"Id": mount_target["FileSystemId"]}
+    if "IpAddress" in mount_target:
+        attrs["IpAddress"] = mount_target["IpAddress"]
+    return attrs
+
+
+def _efs_mount_target_create(logical_id, props, stack_name):
+    body = {
+        "FileSystemId": _efs._fs_id_from(props.get("FileSystemId")),
+        "SubnetId": props.get("SubnetId", ""),
+        "SecurityGroups": list(props.get("SecurityGroups") or []),
+    }
+    for key in ("IpAddress", "Ipv6Address", "IpAddressType"):
+        if props.get(key):
+            body[key] = props[key]
+    mount_target = _efs_result(_efs._create_mount_target(body), "AWS::EFS::MountTarget create")
+    return mount_target["MountTargetId"], _efs_mount_target_attrs(mount_target)
+
+
+def _efs_mount_target_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """SecurityGroups change in place; the rest is replaced by the engine."""
+    mount_target = _efs._mount_targets.get(physical_id)
+    if mount_target is None:
+        return _efs_mount_target_create(logical_id or physical_id, new_props, stack_name)
+    if new_props.get("SecurityGroups") != old_props.get("SecurityGroups"):
+        _efs_result(_efs._modify_mount_target_security_groups(
+            physical_id, {"SecurityGroups": list(new_props.get("SecurityGroups") or [])}),
+            "AWS::EFS::MountTarget SecurityGroups")
+    return physical_id, _efs_mount_target_attrs(mount_target)
+
+
+def _efs_mount_target_delete(physical_id, props):
+    _efs_result(_efs._delete_mount_target(physical_id),
+                "AWS::EFS::MountTarget delete", missing_ok=True)
+
+
+def _efs_posix_user(user):
+    """The API types Uid, Gid and SecondaryGids as numbers; templates write strings."""
+    user = copy.deepcopy(user)
+    for key in ("Uid", "Gid"):
+        if key in user:
+            user[key] = int(user[key])
+    if "SecondaryGids" in user:
+        user["SecondaryGids"] = [int(gid) for gid in user["SecondaryGids"]]
+    return user
+
+
+def _efs_root_directory(root):
+    root = copy.deepcopy(root)
+    info = root.get("CreationInfo")
+    if info:
+        for key in ("OwnerUid", "OwnerGid"):
+            if key in info:
+                info[key] = int(info[key])
+    return root
+
+
+def _efs_access_point_attrs(access_point):
+    return {"AccessPointId": access_point["AccessPointId"], "Arn": access_point["AccessPointArn"]}
+
+
+def _efs_access_point_create(logical_id, props, stack_name):
+    body = {"FileSystemId": _efs._fs_id_from(props.get("FileSystemId"))}
+    if props.get("PosixUser"):
+        body["PosixUser"] = _efs_posix_user(props["PosixUser"])
+    if props.get("RootDirectory"):
+        body["RootDirectory"] = _efs_root_directory(props["RootDirectory"])
+    if props.get("ClientToken"):
+        body["ClientToken"] = props["ClientToken"]
+    if "AccessPointTags" in props:
+        body["Tags"] = props["AccessPointTags"]
+    access_point = _efs_result(_efs._create_access_point(body), "AWS::EFS::AccessPoint create")
+    return access_point["AccessPointId"], _efs_access_point_attrs(access_point)
+
+
+def _efs_access_point_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """AccessPointTags change in place; the rest is replaced by the engine."""
+    access_point = _efs._access_points.get(physical_id)
+    if access_point is None:
+        return _efs_access_point_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_list(access_point.setdefault("Tags", []), old_props, new_props,
+                        prop="AccessPointTags")
+    _efs_refresh_name(access_point)
+    return physical_id, _efs_access_point_attrs(access_point)
+
+
+def _efs_access_point_delete(physical_id, props):
+    _efs_result(_efs._delete_access_point(physical_id),
+                "AWS::EFS::AccessPoint delete", missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Route53 HostedZone
 # ---------------------------------------------------------------------------
 
@@ -9799,6 +10066,84 @@ def _apigw_v2_stage_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# ApiGatewayV2 DomainName and ApiMapping
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_result(resp, what, missing_ok=False):
+    if resp[0] == 404 and missing_ok:
+        return None
+    if resp[0] >= 400:
+        raise ValueError(f"{what} failed: {resp[2]!r}")
+    return json.loads(resp[2]) if resp[2] else {}
+
+
+def _apigw_v2_domain_body(props):
+    return {
+        "domainNameConfigurations": _pascal_to_camel(props.get("DomainNameConfigurations") or []),
+        "mutualTlsAuthentication": _pascal_to_camel(props.get("MutualTlsAuthentication") or {}),
+        "routingMode": props.get("RoutingMode", "API_MAPPING_ONLY"),
+    }
+
+
+def _apigw_v2_domain_attrs(view):
+    config = view["domainNameConfigurations"][0]
+    return {"DomainNameArn": view["domainNameArn"],
+            "RegionalDomainName": config["apiGatewayDomainName"],
+            "RegionalHostedZoneId": config["hostedZoneId"]}
+
+
+def _apigw_v2_domain_create(logical_id, props, stack_name):
+    body = {"domainName": props.get("DomainName", ""), "tags": dict(props.get("Tags") or {}),
+            **_apigw_v2_domain_body(props)}
+    view = _apigw_v2_result(_apigw_v2._create_domain_name(body), "AWS::ApiGatewayV2::DomainName create")
+    return view["domainName"], _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; the rest updates in place."""
+    import ministack.services.apigateway_v1 as _apigw_v1
+    view = _apigw_v2_result(_apigw_v2._update_domain_name(physical_id, _apigw_v2_domain_body(new_props)),
+                            "AWS::ApiGatewayV2::DomainName update", missing_ok=True)
+    if view is None:
+        return _apigw_v2_domain_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_map(_apigw_v1._v1_tags.setdefault(view["domainNameArn"], {}), old_props, new_props)
+    return physical_id, _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_domain_name(physical_id),
+                     "AWS::ApiGatewayV2::DomainName delete", missing_ok=True)
+
+
+def _apigw_v2_mapping_body(props):
+    return {"apiId": props.get("ApiId", ""), "stage": props.get("Stage", ""),
+            "apiMappingKey": props.get("ApiMappingKey", "")}
+
+
+def _apigw_v2_mapping_create(logical_id, props, stack_name):
+    mapping = _apigw_v2_result(
+        _apigw_v2._create_api_mapping(props.get("DomainName", ""), _apigw_v2_mapping_body(props)),
+        "AWS::ApiGatewayV2::ApiMapping create")
+    return mapping["apiMappingId"], {"ApiMappingId": mapping["apiMappingId"]}
+
+
+def _apigw_v2_mapping_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; ApiId, ApiMappingKey and Stage update in place."""
+    mapping = _apigw_v2_result(
+        _apigw_v2._update_api_mapping(new_props.get("DomainName", ""), physical_id,
+                                      _apigw_v2_mapping_body(new_props)),
+        "AWS::ApiGatewayV2::ApiMapping update", missing_ok=True)
+    if mapping is None:
+        return _apigw_v2_mapping_create(logical_id or physical_id, new_props, stack_name)
+    return physical_id, {"ApiMappingId": physical_id}
+
+
+def _apigw_v2_mapping_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_api_mapping(props.get("DomainName", ""), physical_id),
+                     "AWS::ApiGatewayV2::ApiMapping delete", missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration
 # ---------------------------------------------------------------------------
 
@@ -10152,6 +10497,128 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
     record = _ses._configuration_sets.get(config_set)
     if record is not None:
         record.get("EventDestinations", {}).pop(dest_name, None)
+
+
+# ---------------------------------------------------------------------------
+# Signer SigningProfile and ProfilePermission
+# ---------------------------------------------------------------------------
+
+# PlatformId's allowed values in the CloudFormation template reference.
+_SIGNER_CFN_PLATFORMS = ("AWSLambda-SHA384-ECDSA", "Notation-OCI-SHA384-ECDSA")
+
+# Property enums checked before a stack create provisions anything.
+_PROPERTY_ENUMS = {
+    "AWS::Signer::SigningProfile": {"PlatformId": _SIGNER_CFN_PLATFORMS},
+}
+
+
+def _property_enum_errors(resource_type, props):
+    """(property, reason) for each value outside its schema enum."""
+    return [
+        (prop, f"{props[prop]} is not a valid enum value. Supported values: "
+               f"[{', '.join(allowed)}]")
+        for prop, allowed in _PROPERTY_ENUMS.get(resource_type, {}).items()
+        if isinstance(props.get(prop), str) and props[prop] not in allowed
+    ]
+
+
+def _signer_raise_on_error(resp, resource_type):
+    if resp[0] >= 400:
+        try:
+            message = json.loads(resp[2]).get("message")
+        except (ValueError, AttributeError):
+            message = None
+        raise ValueError(message or f"{resource_type} failed: {resp[2]!r}")
+
+
+def _signer_profile_attrs(profile):
+    return {
+        "Arn": profile["arn"],
+        "ProfileName": profile["profileName"],
+        "ProfileVersion": profile["profileVersion"],
+        "ProfileVersionArn": profile["profileVersionArn"],
+    }
+
+
+def _signer_profile_name_from_arn(physical_id):
+    return str(physical_id).rsplit("/signing-profiles/", 1)[-1]
+
+
+def _signer_signing_profile_create(logical_id, props, stack_name):
+    """Ref is the profile ARN; a generated name is <LogicalId>_ + 12 random letters and digits."""
+    import ministack.services.signer as _signer
+    # The stack checks the enum before provisioning; a value that came from
+    # another resource is only known here.
+    for _prop, reason in _property_enum_errors("AWS::Signer::SigningProfile", props):
+        raise ValueError(reason)
+    platform = props.get("PlatformId")
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    # 51 + "_" + 12 keeps a long logical id inside the 64-character limit.
+    name = props.get("ProfileName") or f"{logical_id[:51]}_{suffix}"
+    body = {"platformId": platform}
+    period = props.get("SignatureValidityPeriod")
+    if isinstance(period, dict):
+        value = period.get("Value")
+        body["signatureValidityPeriod"] = {
+            k: v for k, v in (("type", period.get("Type")),
+                              ("value", int(value) if value is not None else None))
+            if v is not None
+        }
+    _signer_raise_on_error(_signer._put_signing_profile(name, body),
+                           "AWS::Signer::SigningProfile")
+    profile = _signer._profiles[name]
+    profile["tags"] = _tag_map(props.get("Tags"))
+    return profile["arn"], _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_update(physical_id, old_props, new_props, stack_name):
+    """Only Tags update in place; the profile keeps its version."""
+    import ministack.services.signer as _signer
+    profile = _signer._profiles.get(_signer_profile_name_from_arn(physical_id))
+    if profile is None:
+        raise ValueError(f"AWS::Signer::SigningProfile {physical_id} not found")
+    if not isinstance(profile.get("tags"), dict):
+        profile["tags"] = {}
+    _reconcile_tag_map(profile["tags"], old_props, new_props)
+    return physical_id, _signer_profile_attrs(profile)
+
+
+def _signer_signing_profile_delete(physical_id, props):
+    """A profile cannot be deleted: CloudFormation cancels it."""
+    import ministack.services.signer as _signer
+    _signer._cancel_signing_profile(_signer_profile_name_from_arn(physical_id))
+
+
+def _signer_current_revision(profile_name):
+    import ministack.services.signer as _signer
+    policy = (_signer._profiles.get(profile_name) or {}).get("policy")
+    return policy["revisionId"] if policy else None
+
+
+def _signer_profile_permission_create(logical_id, props, stack_name):
+    """Ref is <StatementId>|<ProfileName>; adds at the policy's current revision."""
+    import ministack.services.signer as _signer
+    name = props.get("ProfileName", "")
+    sid = props.get("StatementId", "")
+    body = {
+        "action": props.get("Action"),
+        "principal": str(props.get("Principal", "")),
+        "statementId": sid,
+        "profileVersion": props.get("ProfileVersion"),
+        "revisionId": _signer_current_revision(name),
+    }
+    _signer_raise_on_error(
+        _signer._add_profile_permission(name, {k: v for k, v in body.items() if v is not None}),
+        "AWS::Signer::ProfilePermission")
+    return f"{sid}|{name}", {}
+
+
+def _signer_profile_permission_delete(physical_id, props):
+    import ministack.services.signer as _signer
+    sid, _, name = str(physical_id).partition("|")
+    revision = _signer_current_revision(name)
+    if revision is not None:
+        _signer._remove_profile_permission(name, sid, revision)
 
 
 # ---------------------------------------------------------------------------
@@ -10884,6 +11351,254 @@ def _sm_secret_target_attachment_create(logical_id, props, stack_name):
 
 def _sm_secret_target_attachment_delete(physical_id, props):
     pass  # the link record is stateless; the secret and target delete separately
+# RDS DBSubnetGroup / DBParameterGroup / DBClusterParameterGroup
+# ---------------------------------------------------------------------------
+
+def _rds_raise(status, body, resource_type, action):
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    code = re.search(r"<Code>(.*?)</Code>", text)
+    message = re.search(r"<Message>(.*?)</Message>", text, re.S)
+    raise ValueError(
+        f"{resource_type} {action} failed: "
+        f"{code.group(1) if code else status}: {message.group(1) if message else text}")
+
+
+def _rds_call(fn, params, resource_type, action):
+    status, _headers, body = fn(params)
+    if status >= 400:
+        _rds_raise(status, body, resource_type, action)
+
+
+def _rds_sync_tags(arn, old_props, new_props, resource_type):
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
+        _rds_call(_rds._remove_tags, {"ResourceName": arn, **_ec_query({"TagKeys": removed})},
+                  resource_type, "untag")
+    changed = {k: v for k, v in new_tags.items() if old_tags.get(k) != v}
+    if changed:
+        _rds_call(_rds._add_tags, {"ResourceName": arn, **_ec_query({
+            "Tags": [{"Key": k, "Value": v} for k, v in changed.items()]})},
+            resource_type, "tag")
+
+
+def _rds_parameter_values(props):
+    return {str(k): str(v).lower() if isinstance(v, bool) else str(v)
+            for k, v in (props.get("Parameters") or {}).items()}
+
+
+def _rds_set_parameters(fn, name_key, name, values, resource_type, action):
+    # CloudFormation uses each parameter's default apply method: a static
+    # parameter refused as immediate goes pending-reboot.
+    for pname, pvalue in values.items():
+        for method in ("immediate", "pending-reboot"):
+            status, _headers, body = fn({
+                name_key: name,
+                "Parameters.member.1.ParameterName": pname,
+                "Parameters.member.1.ParameterValue": pvalue,
+                "Parameters.member.1.ApplyMethod": method,
+            })
+            if status < 400:
+                break
+            if method == "immediate" and b"InvalidParameterCombination" in body:
+                continue
+            _rds_raise(status, body, resource_type, action)
+
+
+def _rds_reset_parameters(fn, name_key, name, names, resource_type, action):
+    params = {name_key: name}
+    for i, pname in enumerate(names, 1):
+        params[f"Parameters.member.{i}.ParameterName"] = pname
+        params[f"Parameters.member.{i}.ApplyMethod"] = "immediate"
+    _rds_call(fn, params, resource_type, action)
+
+
+def _rds_update_parameters(modify_fn, reset_fn, name_key, name, old_props, new_props,
+                           resource_type):
+    old_values = _rds_parameter_values(old_props)
+    new_values = _rds_parameter_values(new_props)
+    changed = {k: v for k, v in new_values.items() if old_values.get(k) != v}
+    if changed:
+        _rds_set_parameters(modify_fn, name_key, name, changed, resource_type, "update")
+    dropped = sorted(old_values.keys() - new_values.keys())
+    if dropped:
+        _rds_reset_parameters(reset_fn, name_key, name, dropped, resource_type, "update")
+
+
+def _rds_subnet_group_create(logical_id, props, stack_name):
+    name = props.get("DBSubnetGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_subnet_group, {
+        "DBSubnetGroupName": name,
+        **_ec_query({"DBSubnetGroupDescription": props.get("DBSubnetGroupDescription", ""),
+                     "SubnetIds": props.get("SubnetIds") or []}),
+    }, "AWS::RDS::DBSubnetGroup", "create")
+    arn = _rds._subnet_groups[name]["DBSubnetGroupArn"]
+    _rds_sync_tags(arn, {}, props, "AWS::RDS::DBSubnetGroup")
+    return name, {"DBSubnetGroupArn": arn}
+
+
+def _rds_subnet_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if physical_id not in _rds._subnet_groups:
+        return _rds_subnet_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_call(_rds._modify_subnet_group, {
+        "DBSubnetGroupName": physical_id,
+        **_ec_query({"DBSubnetGroupDescription": new_props.get("DBSubnetGroupDescription", ""),
+                     "SubnetIds": new_props.get("SubnetIds") or []}),
+    }, "AWS::RDS::DBSubnetGroup", "update")
+    arn = _rds._subnet_groups[physical_id]["DBSubnetGroupArn"]
+    _rds_sync_tags(arn, old_props, new_props, "AWS::RDS::DBSubnetGroup")
+    return physical_id, {"DBSubnetGroupArn": arn}
+
+
+def _rds_subnet_group_delete(physical_id, props):
+    _rds._delete_subnet_group({"DBSubnetGroupName": physical_id})
+
+
+def _rds_param_group_attrs(name):
+    return {"DBParameterGroupName": name,
+            "DBParameterGroupArn": _rds._param_groups[name]["DBParameterGroupArn"]}
+
+
+def _rds_param_group_create(logical_id, props, stack_name):
+    name = props.get("DBParameterGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_param_group, {
+        "DBParameterGroupName": name,
+        "DBParameterGroupFamily": props.get("Family", ""),
+        "Description": props.get("Description", ""),
+    }, "AWS::RDS::DBParameterGroup", "create")
+    _rds_set_parameters(_rds._modify_param_group, "DBParameterGroupName", name,
+                        _rds_parameter_values(props), "AWS::RDS::DBParameterGroup", "create")
+    _rds_sync_tags(_rds._param_groups[name]["DBParameterGroupArn"], {}, props,
+                   "AWS::RDS::DBParameterGroup")
+    return name, _rds_param_group_attrs(name)
+
+
+def _rds_param_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if physical_id not in _rds._param_groups:
+        return _rds_param_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_update_parameters(_rds._modify_param_group, _rds._reset_param_group,
+                           "DBParameterGroupName", physical_id, old_props, new_props,
+                           "AWS::RDS::DBParameterGroup")
+    _rds_sync_tags(_rds._param_groups[physical_id]["DBParameterGroupArn"], old_props, new_props,
+                   "AWS::RDS::DBParameterGroup")
+    return physical_id, _rds_param_group_attrs(physical_id)
+
+
+def _rds_param_group_delete(physical_id, props):
+    _rds._delete_param_group({"DBParameterGroupName": physical_id})
+
+
+def _rds_cluster_param_group_create(logical_id, props, stack_name):
+    name = props.get("DBClusterParameterGroupName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=255)
+    _rds_call(_rds._create_db_cluster_param_group, {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": props.get("Family", ""),
+        "Description": props.get("Description", ""),
+    }, "AWS::RDS::DBClusterParameterGroup", "create")
+    _rds_set_parameters(_rds._modify_db_cluster_param_group, "DBClusterParameterGroupName", name,
+                        _rds_parameter_values(props), "AWS::RDS::DBClusterParameterGroup", "create")
+    _rds_sync_tags(_rds._db_cluster_param_groups[name]["DBClusterParameterGroupArn"], {}, props,
+                   "AWS::RDS::DBClusterParameterGroup")
+    return name, {}
+
+
+def _rds_cluster_param_group_update(physical_id, old_props, new_props, stack_name,
+                                    logical_id=None):
+    if physical_id not in _rds._db_cluster_param_groups:
+        return _rds_cluster_param_group_create(logical_id or physical_id, new_props, stack_name)
+    _rds_update_parameters(_rds._modify_db_cluster_param_group, _rds._reset_db_cluster_param_group,
+                           "DBClusterParameterGroupName", physical_id, old_props, new_props,
+                           "AWS::RDS::DBClusterParameterGroup")
+    _rds_sync_tags(_rds._db_cluster_param_groups[physical_id]["DBClusterParameterGroupArn"],
+                   old_props, new_props, "AWS::RDS::DBClusterParameterGroup")
+    return physical_id, {}
+
+
+def _rds_cluster_param_group_delete(physical_id, props):
+    _rds._delete_db_cluster_param_group({"DBClusterParameterGroupName": physical_id})
+
+
+# ---------------------------------------------------------------------------
+# SecretsManager SecretTargetAttachment
+# ---------------------------------------------------------------------------
+
+_SM_TARGET_KEYS = ("engine", "host", "port", "dbname")
+
+
+def _sm_target_connection(target_type, target_id):
+    """The connection keys the attachment writes into the secret JSON."""
+    if target_type == "AWS::RDS::DBInstance":
+        record = _rds._instances.get(target_id)
+        if record:
+            endpoint = record.get("Endpoint") or {}
+            host, port, dbname = endpoint.get("Address"), endpoint.get("Port"), record.get("DBName")
+    elif target_type == "AWS::RDS::DBCluster":
+        record = _rds._clusters.get(target_id)
+        if record:
+            host, port, dbname = record.get("Endpoint"), record.get("Port"), record.get("DatabaseName")
+    else:
+        raise ValueError(f"AWS::SecretsManager::SecretTargetAttachment: TargetType {target_type} "
+                         "is not supported")
+    if not record:
+        raise ValueError(f"AWS::SecretsManager::SecretTargetAttachment: {target_type} "
+                         f"{target_id} not found")
+    engine = record.get("Engine", "")
+    for prefix, name in (("aurora-postgresql", "postgres"), ("aurora", "mysql"),
+                         ("oracle", "oracle"), ("sqlserver", "sqlserver")):
+        if engine.startswith(prefix):
+            engine = name
+            break
+    info = {"engine": engine, "host": host, "port": int(port)}
+    if dbname:
+        info["dbname"] = dbname
+    return info
+
+
+def _sm_rewrite_secret(secret_id, info, resource_type, action):
+    _key, secret = _sm._resolve(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        if action == "delete":
+            return None
+        raise ValueError(f"{resource_type} {action} failed: "
+                         "Secrets Manager can't find the specified secret.")
+    current = next((v.get("SecretString") for v in secret["Versions"].values()
+                    if "AWSCURRENT" in v.get("Stages", [])), None)
+    try:
+        value = json.loads(current or "{}")
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        if action == "delete":
+            return None
+        raise ValueError(f"{resource_type} {action} failed: the secret value is not a JSON object")
+    value = {k: v for k, v in value.items() if k not in _SM_TARGET_KEYS}
+    value.update(info)
+    resp = _sm._put_secret_value({"SecretId": secret["ARN"], "SecretString": json.dumps(value)})
+    if resp[0] >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {resp[2]!r}")
+    return secret["ARN"]
+
+
+def _sm_target_attachment_create(logical_id, props, stack_name):
+    info = _sm_target_connection(props.get("TargetType"), props.get("TargetId"))
+    arn = _sm_rewrite_secret(props.get("SecretId"), info,
+                             "AWS::SecretsManager::SecretTargetAttachment", "create")
+    return arn, {}
+
+
+def _sm_target_attachment_update(physical_id, old_props, new_props, stack_name):
+    info = _sm_target_connection(new_props.get("TargetType"), new_props.get("TargetId"))
+    arn = _sm_rewrite_secret(physical_id, info,
+                             "AWS::SecretsManager::SecretTargetAttachment", "update")
+    return arn, {}
+
+
+def _sm_target_attachment_delete(physical_id, props):
+    _sm_rewrite_secret(physical_id, {}, "AWS::SecretsManager::SecretTargetAttachment", "delete")
 
 
 # ---------------------------------------------------------------------------
@@ -12248,6 +12963,193 @@ def _glue_trigger_delete(physical_id, props):
     _glue._delete_trigger({"Name": physical_id})
 
 
+# --- IoT Thing, Certificate and the principal attachments ---
+# Each calls the IoT control-plane handler the matching API call reaches. The
+# delete handlers follow the CloudFormation resource handlers: a certificate
+# is deactivated first, and a thing or certificate that still has an
+# attachment made outside the stack fails the delete with the service's
+# message instead of losing it.
+
+
+def _iot_thing_attrs(name):
+    rec = _iot._things.get(name) or {}
+    return {"Arn": rec.get("thingArn", _iot._thing_arn(name)), "Id": rec.get("thingId", "")}
+
+
+def _iot_thing_create(logical_id, props, stack_name):
+    name = props.get("ThingName") or _physical_name(stack_name, logical_id)
+    # CreateThing answers 200 for an identical existing thing, but a stack
+    # never adopts one: AWS fails its name-conflict validation first.
+    if name in _iot._things:
+        raise ValueError(f"Resource of type 'AWS::IoT::Thing' with identifier '{name}' already exists.")
+    payload = {}
+    if props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._create_thing(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing create failed: {resp[2]!r}")
+    return name, _iot_thing_attrs(name)
+
+
+def _iot_thing_update(physical_id, old_props, new_props, stack_name):
+    """Apply AttributePayload in place: the declared attributes replace the
+    stored ones, and a template that drops AttributePayload leaves them as
+    they are (measured on an account). A ThingName change is a replacement,
+    performed before this runs."""
+    payload = {}
+    if new_props.get("AttributePayload"):
+        payload["attributePayload"] = {
+            "attributes": new_props["AttributePayload"].get("Attributes") or {}}
+    resp = _iot._update_thing(physical_id, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Thing update failed: {resp[2]!r}")
+    return physical_id, _iot_thing_attrs(physical_id)
+
+
+def _iot_thing_import(identifier):
+    return identifier["ThingName"], _iot_thing_attrs(identifier["ThingName"])
+
+
+def _iot_thing_delete(physical_id, props):
+    thing = _iot._things.get(physical_id)
+    if thing is None:
+        return
+    if any(p.rsplit("/", 1)[-1] in _iot._certificates for p in thing.get("principals", [])):
+        raise ValueError(
+            f"Cannot delete. Thing {physical_id} is still attached to one or more principals")
+    _iot._delete_thing(physical_id)
+
+
+def _iot_certificate_attrs(cert_id):
+    return {"Arn": _iot._cert_arn(cert_id), "Id": cert_id}
+
+
+def _iot_certificate_status(cert_id, status):
+    resp = _iot._handle_certificate("PUT", f"/certificates/{cert_id}", b"", {"newStatus": status})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate status update failed: {resp[2]!r}")
+
+
+def _iot_certificate_call(path, payload):
+    """POST to the IoT control plane. Its register handlers are async, so the
+    type runs on a worker thread (``_runs_on_worker_thread``) and waits for
+    the request on the serving loop."""
+    from ministack import app
+
+    return app.call_service_handler_sync(
+        _iot.handle_request, "POST", path, {}, json.dumps(payload).encode(), {})
+
+
+def _iot_certificate_create(logical_id, props, stack_name):
+    """Create the certificate the way the declared properties select:
+    SNI_ONLY registers CertificatePem without a CA, DEFAULT either signs
+    CertificateSigningRequest or registers CertificatePem under
+    CACertificatePem. Any other combination is refused with AWS's message."""
+    status = props.get("Status")
+    if not status:
+        raise ValueError("AWS::IoT::Certificate requires Status")
+    csr = props.get("CertificateSigningRequest")
+    pem = props.get("CertificatePem")
+    ca_pem = props.get("CACertificatePem")
+    if props.get("CertificateMode") == "SNI_ONLY":
+        if csr or ca_pem or not pem:
+            raise ValueError(
+                "Invalid request provided: For certificate mode SNI_ONLY, the following "
+                "combination must be specified exactly: [CertificatePem]")
+        resp = _iot_certificate_call(
+            "/certificate/register-no-ca", {"certificatePem": pem, "status": status})
+    elif csr and not pem and not ca_pem:
+        resp = _iot_certificate_call("/certificates", {"certificateSigningRequest": csr})
+    elif pem and ca_pem and not csr:
+        resp = _iot_certificate_call(
+            "/certificate/register", {"certificatePem": pem, "caCertificatePem": ca_pem, "status": status})
+    else:
+        raise ValueError(
+            "Invalid request provided: For certificate mode Default, one of the following "
+            "combinations must be specified exactly: [CertificatePem and CACertificatePem] "
+            "OR [CertificateSigningRequest]")
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate create failed: {resp[2]!r}")
+    cert_id = json.loads(resp[2])["certificateId"]
+    if csr and status != "INACTIVE":
+        # CreateCertificateFromCsr only knows setAsActive.
+        _iot_certificate_status(cert_id, status)
+    return cert_id, _iot_certificate_attrs(cert_id)
+
+
+def _iot_certificate_update(physical_id, old_props, new_props, stack_name):
+    """Status is the one property that updates in place; the PEM, CSR and
+    mode properties are create-only and replace the certificate."""
+    _iot_certificate_status(physical_id, new_props.get("Status"))
+    return physical_id, _iot_certificate_attrs(physical_id)
+
+
+def _iot_certificate_import(identifier):
+    return identifier["Id"], _iot_certificate_attrs(identifier["Id"])
+
+
+def _iot_certificate_delete(physical_id, props):
+    cert = _iot._certificates.get(physical_id)
+    if cert is None:
+        return
+    if cert["status"] == "ACTIVE":
+        _iot_certificate_status(physical_id, "INACTIVE")
+    arn = cert["certificateArn"]
+    # The service refuses DeleteCertificate while things are attached, then
+    # while policies are, in that order.
+    if any(_iot._thing_name_from_arn(t) in _iot._things for t in cert.get("attachedThings", [])):
+        raise ValueError(f"Things must be detached before deletion (arn: {arn})")
+    if _iot._policies_attached_to(arn):
+        raise ValueError(f"Certificate policies must be detached before deletion (arn: {arn})")
+    resp = _iot._handle_certificate("DELETE", f"/certificates/{physical_id}", b"", {})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Certificate delete failed: {resp[2]!r}")
+
+
+def _iot_thing_principal_attachment_call(method, thing, principal, thing_principal_type=None):
+    qp = {"thingPrincipalType": thing_principal_type} if thing_principal_type else {}
+    return _iot._handle_thing_principals(
+        method, f"/things/{thing}/principals", {"x-amzn-principal": principal}, b"", qp)
+
+
+def _iot_thing_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{ThingName}|{Principal}``, the physical id AWS reports."""
+    thing, principal = props.get("ThingName"), props.get("Principal")
+    if not thing or not principal:
+        raise ValueError("AWS::IoT::ThingPrincipalAttachment requires ThingName and Principal")
+    resp = _iot_thing_principal_attachment_call(
+        "PUT", thing, principal, props.get("ThingPrincipalType"))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{thing}|{principal}", {}
+
+
+def _iot_thing_principal_attachment_delete(physical_id, props):
+    thing, _, principal = physical_id.partition("|")
+    resp = _iot_thing_principal_attachment_call("DELETE", thing, principal)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::ThingPrincipalAttachment delete failed: {resp[2]!r}")
+
+
+def _iot_policy_principal_attachment_create(logical_id, props, stack_name):
+    """Ref is ``{PolicyName}|{Principal}``, the physical id AWS reports."""
+    policy, principal = props.get("PolicyName"), props.get("Principal")
+    if not policy or not principal:
+        raise ValueError("AWS::IoT::PolicyPrincipalAttachment requires PolicyName and Principal")
+    resp = _iot._change_policy_target(policy, principal, attach=True)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment create failed: {resp[2]!r}")
+    return f"{policy}|{principal}", {}
+
+
+def _iot_policy_principal_attachment_delete(physical_id, props):
+    policy, _, principal = physical_id.partition("|")
+    resp = _iot._change_policy_target(policy, principal, attach=False)
+    if resp[0] >= 400 and resp[0] != 404:
+        raise ValueError(f"AWS::IoT::PolicyPrincipalAttachment delete failed: {resp[2]!r}")
+
+
 # --- IoT ThingType / Policy, Cognito IdentityPoolRoleAttachment,
 #     Lambda LayerVersionPermission (#1345, item 5) ---
 # Each maps onto the service's own control-plane create, so the resource is
@@ -12348,6 +13250,11 @@ def _iot_thing_group_properties(props):
 
 def _iot_thing_group_create(logical_id, props, stack_name):
     name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    # CreateThingGroup answers 200 for an identical existing group, but a stack
+    # never adopts one: AWS fails its name-conflict validation before creating
+    # anything, whatever the properties (measured eu-central-1, 2026-10-05).
+    if name in _iot._thing_groups:
+        raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
     payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]
@@ -12563,6 +13470,51 @@ def _iot_provisioning_template_delete(physical_id, props):
     _iot._delete_provisioning_template(physical_id)
 
 
+# AWS::IoT::JobTemplate. Every property is create-only (a change is a
+# replacement, refused under the required, custom JobTemplateId), so the type
+# has no update handler. Two CloudFormation member names differ from the API's.
+_IOT_JOB_TEMPLATE_RENAMES = {
+    "exponentialRolloutRate": "exponentialRate",
+    "retryCriteriaList": "criteriaList",
+}
+
+
+def _iot_job_template_payload(props):
+    props = dict(props)
+    if isinstance(props.get("Document"), (dict, list)):
+        props["Document"] = json.dumps(props["Document"])
+    tags = props.pop("Tags", None)
+    props.pop("JobTemplateId", None)
+    payload = {
+        key: ({_IOT_JOB_TEMPLATE_RENAMES.get(k, k): v for k, v in value.items()}
+              if isinstance(value, dict) else value)
+        for key, value in _pascal_to_camel(props).items()
+        if value is not None
+    }
+    if tags:
+        payload["tags"] = tags
+    return payload
+
+
+def _iot_job_template_create(logical_id, props, stack_name):
+    template_id = str(props.get("JobTemplateId") or "")
+    # A stack never adopts an existing template: AWS fails its name-conflict
+    # validation before creating anything (measured eu-central-1, 2026-10-05).
+    if template_id in _iot._job_templates:
+        raise ValueError(
+            f"Resource of type 'AWS::IoT::JobTemplate' with identifier '{template_id}' already exists."
+        )
+    resp = (_iot._job_template_id_error(template_id)
+            or _iot._create_job_template(template_id, _iot_job_template_payload(props)))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::JobTemplate create failed: {resp[2]!r}")
+    return template_id, {"Arn": _iot._job_template_arn(template_id)}
+
+
+def _iot_job_template_delete(physical_id, props):
+    _iot._delete_job_template(physical_id)
+
+
 def _registration_config_payload(props):
     """CFN's RegistrationConfig (RoleArn/TemplateBody/TemplateName) in the
     API's camelCase, or None when the template declares none."""
@@ -12686,6 +13638,79 @@ def _iot_ca_certificate_delete(physical_id, props):
             "PUT", f"/cacertificate/{physical_id}", b"", {"newStatus": "INACTIVE"}
         )
     _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
+
+
+# --- IoT DomainConfiguration ---
+# Measured on an account: an omitted DomainConfigurationName is
+# ``{LogicalId}-{suffix}`` (no stack name); a create that does not declare
+# DomainConfigurationStatus leaves the configuration DISABLED; an update sends
+# only the declared members, so a dropped one keeps its value; and the delete
+# disables an ENABLED configuration before deleting it.
+
+_IOT_DOMAIN_CONFIG_UPDATABLE = (
+    "AuthorizerConfig", "DomainConfigurationStatus", "TlsConfig",
+    "ServerCertificateConfig", "AuthenticationType", "ApplicationProtocol",
+    "ClientCertificateConfig",
+)
+
+
+def _iot_domain_configuration_attrs(name):
+    rec = _iot._domain_configurations.get(name) or {}
+    return {
+        "Arn": rec.get("domainConfigurationArn", ""),
+        "DomainType": rec.get("domainType", ""),
+        "ServerCertificates": [
+            {k[:1].upper() + k[1:]: v for k, v in cert.items()}
+            for cert in rec.get("serverCertificates", [])
+        ],
+    }
+
+
+def _iot_domain_configuration_set(name, payload, verb):
+    resp = _iot._update_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration {verb} failed: {resp[2]!r}")
+
+
+def _iot_domain_configuration_create(logical_id, props, stack_name):
+    name = props.get("DomainConfigurationName")
+    if not name:
+        suffix = _physical_name(stack_name, logical_id)[-12:]
+        name = f"{logical_id[:115]}-{suffix}"
+    payload = _pascal_to_camel({
+        k: v for k, v in props.items()
+        if k not in ("DomainConfigurationName", "DomainConfigurationStatus", "Tags")
+    })
+    resp = _iot._create_domain_configuration(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::DomainConfiguration create failed: {resp[2]!r}")
+    if props.get("DomainConfigurationStatus") != "ENABLED":
+        _iot_domain_configuration_set(name, {"domainConfigurationStatus": "DISABLED"}, "create")
+    return name, _iot_domain_configuration_attrs(name)
+
+
+def _iot_domain_configuration_update(physical_id, old_props, new_props, stack_name):
+    """Apply the declared updatable members in place; the create-only ones
+    (name, DomainName, ServiceType, the certificate ARNs) replace the
+    configuration before this runs."""
+    payload = _pascal_to_camel({
+        k: new_props[k] for k in _IOT_DOMAIN_CONFIG_UPDATABLE if k in new_props
+    })
+    if payload:
+        _iot_domain_configuration_set(physical_id, payload, "update")
+    return physical_id, _iot_domain_configuration_attrs(physical_id)
+
+
+def _iot_domain_configuration_delete(physical_id, props):
+    rec = _iot._domain_configurations.get(physical_id)
+    if rec is None:
+        return
+    if rec["domainConfigurationStatus"] == "ENABLED":
+        _iot_domain_configuration_set(
+            physical_id, {"domainConfigurationStatus": "DISABLED"}, "delete")
+    resp = _iot._delete_domain_configuration(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(f"Invalid request provided: {json.loads(resp[2])['message']}")
 
 
 def _cognito_identity_pool_role_attachment_apply(props):
@@ -13005,8 +14030,18 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
+    "AWS::IoT::Thing": ("ThingName",),
+    "AWS::IoT::Certificate": (
+        "CACertificatePem", "CertificateMode", "CertificatePem", "CertificateSigningRequest",
+    ),
+    "AWS::IoT::ThingPrincipalAttachment": ("Principal", "ThingName", "ThingPrincipalType"),
+    "AWS::IoT::PolicyPrincipalAttachment": ("PolicyName", "Principal"),
     "AWS::IoT::ThingGroup": ("ThingGroupName", "ParentGroupName"),
     "AWS::IoT::ThingType": ("ThingTypeName",),
+    "AWS::IoT::DomainConfiguration": (
+        "DomainConfigurationName", "DomainName", "ServiceType",
+        "ValidationCertificateArn", "ServerCertificateArns",
+    ),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
@@ -13022,6 +14057,11 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
+    "AWS::IoT::JobTemplate": (
+        "JobTemplateId", "JobArn", "Description", "Document", "DocumentSource",
+        "TimeoutConfig", "JobExecutionsRolloutConfig", "AbortConfig", "PresignedUrlConfig",
+        "DestinationPackageVersions", "JobExecutionsRetryConfig", "MaintenanceWindows", "Tags",
+    ),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (
         "Name", "Port", "Protocol", "ProtocolVersion", "TargetType", "VpcId",
@@ -13033,6 +14073,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::SSM::Parameter": ("Name",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
+    "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
+    "AWS::Signer::ProfilePermission": (
+        "ProfileName", "Action", "Principal", "StatementId", "ProfileVersion",
+    ),
     "AWS::Cognito::UserPool": (),
     "AWS::Lambda::Function": (
         "FunctionName", "PackageType", "TenancyConfig",
@@ -13043,6 +14087,10 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::SubnetGroup": ("CacheSubnetGroupName",),
     "AWS::ElastiCache::ParameterGroup": ("CacheParameterGroupFamily",),
+    "AWS::RDS::DBSubnetGroup": ("DBSubnetGroupName",),
+    "AWS::RDS::DBParameterGroup": ("DBParameterGroupName", "Description", "Family"),
+    "AWS::RDS::DBClusterParameterGroup": ("DBClusterParameterGroupName", "Description", "Family"),
+    "AWS::SecretsManager::SecretTargetAttachment": ("SecretId",),
     "AWS::ElastiCache::CacheCluster": (
         "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName", "ClusterName",
         "Engine", "NetworkType",
@@ -13062,6 +14110,13 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
     "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
+    "AWS::ApiGatewayV2::DomainName": ("DomainName",),
+    "AWS::ApiGatewayV2::ApiMapping": ("DomainName",),
+    "AWS::EFS::FileSystem": ("AvailabilityZoneName", "Encrypted", "KmsKeyId", "PerformanceMode"),
+    "AWS::EFS::MountTarget": (
+        "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
+    ),
+    "AWS::EFS::AccessPoint": ("ClientToken", "FileSystemId", "PosixUser", "RootDirectory"),
 }
 
 
@@ -13268,7 +14323,8 @@ _RESOURCE_HANDLERS = {
         "delete": _iam_ip_delete,
     },
     "AWS::SSM::Parameter": {
-        "create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete, "import": _ssm_import,
+        "create": _ssm_create, "update": _ssm_update, "update_with_logical_id": True,
+        "delete": _ssm_delete, "import": _ssm_import,
     },
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
@@ -13647,6 +14703,24 @@ _RESOURCE_HANDLERS = {
         "update": _ecs_service_update,
         "delete": _ecs_service_delete,
     },
+    "AWS::EFS::FileSystem": {
+        "create": _efs_file_system_create,
+        "update": _efs_file_system_update,
+        "update_with_logical_id": True,
+        "delete": _efs_file_system_delete,
+    },
+    "AWS::EFS::MountTarget": {
+        "create": _efs_mount_target_create,
+        "update": _efs_mount_target_update,
+        "update_with_logical_id": True,
+        "delete": _efs_mount_target_delete,
+    },
+    "AWS::EFS::AccessPoint": {
+        "create": _efs_access_point_create,
+        "update": _efs_access_point_update,
+        "update_with_logical_id": True,
+        "delete": _efs_access_point_delete,
+    },
     "AWS::EC2::LaunchTemplate": {
         "create": _ec2_launch_template_create,
         "update": _ec2_launch_template_update,
@@ -13738,6 +14812,18 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_v2_route_delete,
     },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::DomainName": {
+        "create": _apigw_v2_domain_create,
+        "update": _apigw_v2_domain_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_domain_delete,
+    },
+    "AWS::ApiGatewayV2::ApiMapping": {
+        "create": _apigw_v2_mapping_create,
+        "update": _apigw_v2_mapping_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_mapping_delete,
+    },
     "AWS::SES::EmailIdentity": {
         "create": _ses_email_identity_create,
         "update": _ses_email_identity_update,
@@ -13746,6 +14832,15 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
     "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::Signer::SigningProfile": {
+        "create": _signer_signing_profile_create,
+        "update": _signer_signing_profile_update,
+        "delete": _signer_signing_profile_delete,
+    },
+    "AWS::Signer::ProfilePermission": {
+        "create": _signer_profile_permission_create,
+        "delete": _signer_profile_permission_delete,
+    },
     "AWS::WAFv2::WebACL": {
         "create": _waf_web_acl_create,
         "update": _waf_web_acl_update,
@@ -13823,6 +14918,48 @@ _RESOURCE_HANDLERS = {
     "AWS::SecretsManager::SecretTargetAttachment": {
         "create": _sm_secret_target_attachment_create,
         "delete": _sm_secret_target_attachment_delete,
+    "AWS::RDS::DBSubnetGroup": {
+        "create": _rds_subnet_group_create,
+        "update": _rds_subnet_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_subnet_group_delete,
+    },
+    "AWS::RDS::DBParameterGroup": {
+        "create": _rds_param_group_create,
+        "update": _rds_param_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_param_group_delete,
+    },
+    "AWS::RDS::DBClusterParameterGroup": {
+        "create": _rds_cluster_param_group_create,
+        "update": _rds_cluster_param_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_cluster_param_group_delete,
+    },
+    "AWS::SecretsManager::SecretTargetAttachment": {
+        "create": _sm_target_attachment_create,
+        "update": _sm_target_attachment_update,
+        "delete": _sm_target_attachment_delete,
+    },
+    "AWS::IoT::Thing": {
+        "create": _iot_thing_create,
+        "update": _iot_thing_update,
+        "delete": _iot_thing_delete,
+        "import": _iot_thing_import,
+    },
+    "AWS::IoT::Certificate": {
+        "create": _iot_certificate_create,
+        "update": _iot_certificate_update,
+        "delete": _iot_certificate_delete,
+        "import": _iot_certificate_import,
+    },
+    "AWS::IoT::ThingPrincipalAttachment": {
+        "create": _iot_thing_principal_attachment_create,
+        "delete": _iot_thing_principal_attachment_delete,
+    },
+    "AWS::IoT::PolicyPrincipalAttachment": {
+        "create": _iot_policy_principal_attachment_create,
+        "delete": _iot_policy_principal_attachment_delete,
     },
     "AWS::IoT::TopicRule": {
         "create": _iot_topic_rule_create,
@@ -13856,11 +14993,20 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iot_provisioning_template_delete,
     },
+    "AWS::IoT::JobTemplate": {
+        "create": _iot_job_template_create,
+        "delete": _iot_job_template_delete,
+    },
     "AWS::IoT::CACertificate": {
         "create": _iot_ca_certificate_create,
         "update": _iot_ca_certificate_update,
         "delete": _iot_ca_certificate_delete,
         "import": _iot_ca_certificate_import,
+    },
+    "AWS::IoT::DomainConfiguration": {
+        "create": _iot_domain_configuration_create,
+        "update": _iot_domain_configuration_update,
+        "delete": _iot_domain_configuration_delete,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,

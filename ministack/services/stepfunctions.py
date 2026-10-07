@@ -38,6 +38,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
@@ -698,6 +699,11 @@ def _stop_execution(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    # A client may retry after the abort was applied but its response was lost.
+    # Return the original result without rewriting the cause or emitting a
+    # second ExecutionAborted event.
+    if execution["status"] == "ABORTED":
+        return json_response({"stopDate": execution["stopDate"]})
     if execution["status"] != "RUNNING":
         return error_response_json(
             "ValidationException", "Execution is not running", 400)
@@ -705,6 +711,8 @@ def _stop_execution(data):
     stop_date = now_iso()
     execution["status"] = "ABORTED"
     execution["stopDate"] = stop_date
+    execution["error"] = data.get("error")
+    execution["cause"] = data.get("cause")
     _add_event(execution, "ExecutionAborted", {
         "executionAbortedEventDetails": {
             "error": data.get("error", ""),
@@ -1521,7 +1529,7 @@ def _run_execution(exec_arn):
                     "States.Runtime",
                     f"State '{current_name}' not found in definition")
 
-            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
             _add_event(execution, f"{state_type}StateEntered", {
@@ -1676,17 +1684,16 @@ def _execute_task(state_def, raw_input, execution, ctx):
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
 
-    effective = None
-    if query_language != "JSONata":
-        effective = _apply_input_path(state_def, raw_input, ctx)
-        effective = _apply_parameters(state_def, effective, ctx)
-
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
     retry_counts: dict = {}
     last_error: _ExecutionError | None = None
 
     while True:
+        # Each attempt sees its own $$.State.RetryCount.
+        ctx["State"]["RetryCount"] = sum(retry_counts.values())
+        if query_language != "JSONata":
+            effective = _apply_parameters(state_def, _apply_input_path(state_def, raw_input, ctx), ctx)
         try:
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
@@ -1704,6 +1711,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if is_callback:
                 task_result = _invoke_with_callback(
                     resource, effective, ctx["Task"]["Token"], state_def)
+            # Skip activities: their timeout starts when a worker gets the task, not here
+            elif "TimeoutSeconds" in state_def and ":activity:" not in resource:
+                task_result = _invoke_resource_with_timeout(
+                    resource, effective, state_def["TimeoutSeconds"])
             else:
                 task_result = _invoke_resource(resource, effective)
 
@@ -1824,6 +1835,21 @@ def _invoke_resource(resource, input_data):
         )
 
     return input_data
+
+
+def _invoke_resource_with_timeout(resource, input_data, timeout):
+    """Run the task, and raise States.Timeout when it runs longer than TimeoutSeconds.
+
+    This function does not stop the task thread. The task continues to run, but the state ignores its result.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    # Workers do not inherit contextvars, so copy them to keep the account and region scope (#639).
+    future = pool.submit(contextvars.copy_context().run, _invoke_resource, resource, input_data)
+    pool.shutdown(wait=False)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise _ExecutionError("States.Timeout", f"Task timed out after {timeout} seconds") from None
 
 
 def _invoke_activity(resource, input_data):
@@ -2170,7 +2196,39 @@ def _sleep_until(iso_ts):
 # Parallel state
 # ---------------------------------------------------------------------------
 
+def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
+    """Run a Parallel or Map attempt under the state's Retry and Catch fields."""
+    state = ctx["State"]
+    retry_counts: dict = {}
+    while True:
+        # Branches share ctx and leave their own State in it; each attempt starts from this state's, counted.
+        ctx["State"] = {**state, "RetryCount": sum(retry_counts.values())}
+        try:
+            return attempt()
+        except _ExecutionError as err:
+            retrier, retrier_idx = _find_matching_retrier(
+                state_def.get("Retry", []), err.error, retry_counts)
+            if retrier is not None:
+                count = retry_counts.get(retrier_idx, 0)
+                interval = retrier.get("IntervalSeconds", 1)
+                _scaled_sleep(min(interval * (retrier.get("BackoffRate", 2.0) ** count), 60))
+                retry_counts[retrier_idx] = count + 1
+                continue
+            catcher = _find_matching_catcher(state_def.get("Catch", []), err.error)
+            if catcher is None:
+                raise
+            error_output = {"Error": err.error, "Cause": err.cause}
+            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            return output, catcher["Next"]
+
+
 def _execute_parallel(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_parallel_branches(state_def, raw_input, execution, ctx))
+
+
+def _run_parallel_branches(state_def, raw_input, execution, ctx):
     effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
@@ -2221,6 +2279,12 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # ---------------------------------------------------------------------------
 
 def _execute_map(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_map_items(state_def, raw_input, execution, ctx))
+
+
+def _run_map_items(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input, ctx)
@@ -2291,7 +2355,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"State '{current_name}' not found")
 
         state_type = state_def.get("Type")
-        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
         if state_type == "Succeed":
             return _apply_output_path(state_def,
@@ -3021,21 +3085,30 @@ def _resolve_ctx_path(path, ctx):
 # Retry / Catch helpers
 # ===================================================================
 
+def _error_matches(error_equals, error):
+    """Return True when a retrier's or catcher's ErrorEquals list matches this error name.
+
+    States.TaskFailed matches every error name except States.Timeout, as the
+    AWS Step Functions error handling guide describes.
+    """
+    if "States.ALL" in error_equals or error in error_equals:
+        return True
+    return "States.TaskFailed" in error_equals and error != "States.Timeout"
+
+
 def _find_matching_retrier(retriers, error, retry_counts):
+    """The first retrier matching the error decides; once it has used its MaxAttempts there is no retry."""
     for idx, retrier in enumerate(retriers):
-        equals = retrier.get("ErrorEquals", [])
-        max_attempts = retrier.get("MaxAttempts", 3)
-        if retry_counts.get(idx, 0) >= max_attempts:
-            continue
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(retrier.get("ErrorEquals", []), error):
+            if retry_counts.get(idx, 0) >= retrier.get("MaxAttempts", 3):
+                return None, -1
             return retrier, idx
     return None, -1
 
 
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
-        equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
 

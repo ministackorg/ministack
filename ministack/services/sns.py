@@ -35,6 +35,7 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid, request_scope
 from ministack.services import sqs as _sqs
 
@@ -432,13 +433,7 @@ def _create_topic(params):
             topic["dedup_cache"] = {}
             topic["fifo_seq"] = 0
 
-        # Store tags from CreateTopic
-        i = 1
-        while _p(params, f"Tag.member.{i}.Key"):
-            key = _p(params, f"Tag.member.{i}.Key")
-            val = _p(params, f"Tag.member.{i}.Value")
-            topic["tags"][key] = val
-            i += 1
+        topic["tags"].update(_param_tags(params))
 
         _topics[arn] = topic
         logger.info("SNS topic created: %s%s", name, " (FIFO)" if is_fifo else "")
@@ -1304,6 +1299,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         msg["dedup_id"] = message_dedup_id
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
+    esm_wake.set()
     logger.info("SNS fanout → SQS %s", queue_name)
 
 
@@ -1417,17 +1413,22 @@ def _list_tags_for_resource(params):
                 f"<ListTagsForResourceResult><Tags>{tags_xml}</Tags></ListTagsForResourceResult>")
 
 
+def _param_tags(params) -> dict:
+    """The Tags.member.N pairs of a CreateTopic or TagResource request."""
+    tags = {}
+    i = 1
+    while _p(params, f"Tags.member.{i}.Key"):
+        tags[_p(params, f"Tags.member.{i}.Key")] = _p(params, f"Tags.member.{i}.Value")
+        i += 1
+    return tags
+
+
 def _tag_resource(params):
     _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
                                               "sns:TagResource")
     if err:
         return err
-    i = 1
-    while _p(params, f"Tags.member.{i}.Key"):
-        key = _p(params, f"Tags.member.{i}.Key")
-        val = _p(params, f"Tags.member.{i}.Value")
-        topic["tags"][key] = val
-        i += 1
+    topic["tags"].update(_param_tags(params))
     return _xml(200, "TagResourceResponse", "<TagResourceResult/>")
 
 

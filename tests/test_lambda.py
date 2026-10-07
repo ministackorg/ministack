@@ -4099,7 +4099,7 @@ def test_lambda_provided_runtime_env_has_function_vars():
         },
         "code_zip": buf.getvalue(),
     }
-    result = lmod._execute_function_provided(func, {"ping": "pong"})
+    result = lmod._execute_function_provided(func, {"ping": "pong"}, request_id="request-1")
     assert not result.get("error"), result
     body = result["body"]
     assert body["memory"] == "512"
@@ -4150,7 +4150,7 @@ def test_lambda_provided_runtime_parallel_invocations():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(
-            lambda i: lmod._execute_function_provided(func, {"n": i}), range(8)))
+            lambda i: lmod._execute_function_provided(func, {"n": i}, request_id=f"request-{i}"), range(8)))
 
     for i, r in enumerate(results):
         assert not r.get("error"), f"invocation {i} failed: {r}"
@@ -5352,7 +5352,7 @@ def test_execute_function_uses_function_config_region_for_logs(monkeypatch):
     monkeypatch.setattr(
         lsvc,
         "_execute_function_warm",
-        lambda _func, _event: {"body": {"ok": True}, "log": "ran in target region"},
+        lambda _func, _event, request_id: {"body": {"ok": True}, "log": "ran in target region"},
     )
     cwl.reset()
     try:
@@ -6875,7 +6875,7 @@ def test_throttle_response_shape_matches_aws():
     body = r["body"]
     assert body["__type"] == "TooManyRequestsException"
     assert body["Reason"] == "ReservedFunctionConcurrentInvocationLimitExceeded"
-    assert "retryAfterSeconds" in body
+    assert body["retryAfterSeconds"] == "1"  # a string in the Lambda API model, not an int
     assert "message" in body
 
 
@@ -7011,7 +7011,7 @@ def test_warm_invocation_leaves_the_caller_event_untouched(monkeypatch):
     event = {"input": "hi"}
     token = lsvc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
     try:
-        result = lsvc._execute_function_warm({"config": config, "code_zip": b"zip"}, event)
+        result = lsvc._execute_function_warm({"config": config, "code_zip": b"zip"}, event, request_id="request-1")
     finally:
         lsvc._durable_ctx.reset(token)
 
@@ -7123,7 +7123,7 @@ def test_lambda_strict_hard_fails_when_docker_unavailable(monkeypatch):
         "Timeout": 3,
         "MemorySize": 128,
     }, "code_zip": b"\x00"}
-    result = lsvc._execute_function_docker(func, {"k": "v"})
+    result = lsvc._execute_function_docker(func, {"k": "v"}, request_id="request-1")
     assert result.get("error") is True
     assert result["body"]["errorType"] == "Runtime.DockerUnavailable"
 
@@ -7133,7 +7133,7 @@ def test_lambda_permissive_falls_back_to_warm_without_docker(monkeypatch):
     monkeypatch.setattr(lsvc, "LAMBDA_STRICT", False)
     monkeypatch.setattr(lsvc, "_docker_available", False)
     called = {"warm": False}
-    def _fake_warm(func, event):
+    def _fake_warm(func, event, request_id):
         called["warm"] = True
         return {"body": {"ok": True}}
     monkeypatch.setattr(lsvc, "_execute_function_warm", _fake_warm)
@@ -7145,7 +7145,7 @@ def test_lambda_permissive_falls_back_to_warm_without_docker(monkeypatch):
         "Timeout": 3,
         "MemorySize": 128,
     }, "code_zip": b"\x00"}
-    lsvc._execute_function_docker(func, {})
+    lsvc._execute_function_docker(func, {}, request_id="request-1")
     assert called["warm"] is True
 
 
@@ -10584,7 +10584,7 @@ def test_invoke_rie_rewrites_custom_resource_response_url():
         "ResourceProperties": {},
     }
     with patch("urllib.request.urlopen", _fake_urlopen):
-        _invoke_rie(_FakeContainer(), event, timeout=5)
+        _invoke_rie(_FakeContainer(), event, timeout=5, request_id="request-1")
 
     assert captured["body"]["ResponseURL"] == \
         "http://host.docker.internal:4566/_ministack/cfn-response/tok"
@@ -10666,7 +10666,7 @@ def test_invoke_rie_reports_an_init_error_instead_of_retrying_it():
     started = time.time()
     with patch("urllib.request.urlopen", _fake_urlopen):
         # Timeout=900 is legal on AWS, and used to buy 9020 retries at 0.1s.
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900, request_id="request-1")
     elapsed = time.time() - started
 
     assert len(calls) == 1
@@ -10696,7 +10696,7 @@ def test_invoke_rie_still_retries_a_container_that_is_still_starting():
         return _FakeResp()
 
     with patch("urllib.request.urlopen", _fake_urlopen):
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=5)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=5, request_id="request-1")
 
     assert len(calls) == 3
     assert result["body"] == {"ok": True}
@@ -10714,7 +10714,7 @@ def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
         raise TimeoutError("timed out")
 
     with patch("urllib.request.urlopen", _fake_urlopen):
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3, request_id="request-1")
 
     assert len(calls) == 1
     assert result["error"] is True
@@ -10722,7 +10722,7 @@ def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
     # The message and type the local and catch-all docker paths already emit.
     assert result["body"] == {
         "errorMessage": "Task timed out after 3.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     # Internal signal to _execute_function_docker: do not pool this container.
     assert result["timeout"] is True
@@ -10745,7 +10745,7 @@ def test_invoke_rie_reports_a_non_json_502_body():
         )
 
     with patch("urllib.request.urlopen", _fake_urlopen):
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3, request_id="request-1")
 
     assert result["error"] is True
     assert result["function_error"] == "Unhandled"
@@ -10766,7 +10766,7 @@ def test_invoke_rie_non_json_502_without_an_error_type_header():
         )
 
     with patch("urllib.request.urlopen", _fake_urlopen):
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3, request_id="request-1")
 
     assert result["body"] == {
         "errorMessage": "Lambda RIE returned HTTP 502: not json",
@@ -10812,17 +10812,17 @@ def test_lambda_docker_timeout_recycles_the_container(monkeypatch):
     try:
         with patch("urllib.request.urlopen", _fake_urlopen):
             first = lsvc._execute_function_docker(
-                {"config": config, "code_zip": b"zip"}, {}
+                {"config": config, "code_zip": b"zip"}, {}, "request-1",
             )
             second = lsvc._execute_function_docker(
-                {"config": config, "code_zip": b"zip"}, {}
+                {"config": config, "code_zip": b"zip"}, {}, "request-1",
             )
     finally:
         lsvc._pool_kill_function("000000000000", name)
 
     for result in (first, second):
         assert result["error"] is True
-        assert result["body"]["errorType"] == "Runtime.ExitError"
+        assert result["body"]["errorType"] == "Sandbox.Timedout"
         assert result["body"]["errorMessage"] == "Task timed out after 3.00 seconds"
         # The recycle signal is internal and must not reach the caller.
         assert "timeout" not in result
@@ -10848,7 +10848,7 @@ def test_invoke_rie_gives_up_on_an_unreachable_container(monkeypatch):
 
     started = time.time()
     with patch("urllib.request.urlopen", _fake_urlopen):
-        result = lsvc._invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+        result = lsvc._invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900, request_id="request-1")
     elapsed = time.time() - started
 
     assert elapsed < 5
@@ -10970,6 +10970,23 @@ def test_lambda_docker_timeout_update_changes_rie_deadline(lam, old_timeout, new
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
 @pytest.mark.data_plane
+def test_lambda_handler_error_mentioning_timed_out_is_not_a_timeout(lam):
+    fname = f"lam-read-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    code = "def handler(event, context):\n    raise Exception('Read timed out. (read timeout=5)')\n"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=10,
+    )
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        payload = json.loads(resp["Payload"].read())
+        assert resp.get("FunctionError") == "Unhandled"
+        assert payload["errorMessage"] == "Read timed out. (read timeout=5)"
+        assert payload["errorType"] != "Sandbox.Timedout"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -10997,7 +11014,7 @@ def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
         elapsed = time.time() - started
         assert resp.get("FunctionError") == "Unhandled"
         assert payload["errorMessage"] == "Task timed out after 3.00 seconds"
-        assert payload["errorType"] == "Runtime.ExitError"
+        assert payload["errorType"] == "Sandbox.Timedout"
         # One timeout, not a retry storm (broken code took 4x+ the Timeout and
         # surfaced a raw "Lambda RIE failed" instead).
         assert elapsed < 9, f"timeout took {elapsed:.1f}s — retry storm?"
@@ -13558,13 +13575,16 @@ def test_idle_reaper_and_reset_release_provided_environments(isolated_runtime):
 
 
 def test_invoke_signature_keeps_trace_out_of_the_positional_contract(isolated_runtime):
-    """``trace_id`` is keyword-only, so no caller can pass it as the event."""
+    """``trace_id`` and ``invoked_function_arn`` are keyword-only, so no caller
+    can pass either as the event."""
     import inspect
 
     sig = inspect.signature(lambda_runtime.ProvidedWorker.invoke)
-    assert list(sig.parameters) == ["self", "event", "request_id", "trace_id"]
-    assert sig.parameters["trace_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert sig.parameters["trace_id"].default is None
+    assert list(sig.parameters) == [
+        "self", "event", "request_id", "trace_id", "invoked_function_arn"]
+    for name in ("trace_id", "invoked_function_arn"):
+        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters[name].default is None
 
 
 def test_json_only_bootstrap_output_is_not_parsed_as_protocol(worker_factory):
@@ -13707,7 +13727,10 @@ def test_provided_metadata_does_not_mutate_payload(monkeypatch, event):
     result = lambda_svc._execute_function_provided_warm(
         {"config": _provided_dispatch_config(), "code_zip": b"zip"}, event, "request-1",
     )
-    worker.invoke.assert_called_once_with(event, "request-1", trace_id="trace-1")
+    worker.invoke.assert_called_once_with(
+        event, "request-1", trace_id="trace-1",
+        invoked_function_arn=_provided_dispatch_config()["FunctionArn"],
+    )
     release.assert_called_once_with(worker)
     assert result == {"body": event, "log": "handler log"}
     if isinstance(event, dict):
@@ -13733,7 +13756,7 @@ def test_provided_failure_is_scoped_and_not_retried(monkeypatch, isolated_pool):
         unrelated.append(worker)
     fallback = Mock()
     monkeypatch.setattr(lambda_svc, "_execute_function_provided", fallback)
-    result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {})
+    result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {}, request_id="request-1")
     assert result["error"] is True
     assert result["body"]["errorMessage"] == "bootstrap crashed"
     assert fail.call_count == 1
@@ -13841,11 +13864,11 @@ def test_docker_unavailable_fallback_carries_the_durable_context(monkeypatch, un
     func = {"config": config, "code_zip": b"zip"}
     token = lambda_svc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
     try:
-        assert lambda_svc._execute_function_docker(func, {}) == {"body": "warm"}
+        assert lambda_svc._execute_function_docker(func, {}, request_id="request-1") == {"body": "warm"}
         overlay = lambda_svc._durable_env_overlay()
     finally:
         lambda_svc._durable_ctx.reset(token)
-    warm.assert_called_once_with(func, {})
+    warm.assert_called_once_with(func, {}, "request-1")
     one_shot.assert_not_called()
     assert overlay == {
         "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "exec-arn",
@@ -14228,13 +14251,13 @@ def test_invoke_rie_reports_a_bare_string_timeout_as_a_function_error():
             return b"Task timed out after 300.00 seconds"
 
     with patch("urllib.request.urlopen", lambda req, timeout=None: _FakeResp()):
-        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900, request_id="request-1")
 
     assert result["error"] is True
     assert result["function_error"] == "Unhandled"
     assert result["body"] == {
         "errorMessage": "Task timed out after 300.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     assert result["timeout"] is True
 
@@ -14245,3 +14268,110 @@ def test_classify_function_error_bare_timeout_string_is_unhandled():
     assert lsvc._classify_function_error("Task timed out after 300.00 seconds", "") == "Unhandled"
     # Only the exact runtime message counts; other handler strings stay successes.
     assert lsvc._classify_function_error("the Task timed out after 3.00 seconds today", "") is None
+
+
+def test_provided_invocation_arn_is_per_request(worker_factory):
+    worker = worker_factory(_bootstrap('''
+while True:
+    headers, event = next_invocation()
+    post_response(headers["Lambda-Runtime-Aws-Request-Id"],
+                  headers["Lambda-Runtime-Invoked-Function-Arn"])
+'''))
+    for qualifier in ("worker", "other", "1", "worker"):
+        arn = worker.config["FunctionArn"] + ":" + qualifier
+        result = worker.invoke({}, "request-" + qualifier, invoked_function_arn=arn)
+        assert result["status"] == "ok", result
+        assert result["result"] == arn
+
+
+@pytest.mark.parametrize("source", ["sqs", "sqs-visibility", "dynamodb", "kinesis"])
+def test_new_event_source_work_wakes_poll_loop(esm_poll_state, source):
+    """New work for an event source is picked up at once, not on the poller's idle tick."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+    if source == "sqs":
+        _sqs._queues[_sqs._queue_url("wake-q")] = {"name": "wake-q", "messages": [], "attributes": {}, "is_fifo": False,
+                                                  "dedup_cache": {}, "fifo_seq": 0}
+        produce = lambda: _sqs._act_send_message({"MessageBody": "x"}, _sqs._queue_url("wake-q"))  # noqa: E731
+    elif source == "sqs-visibility":
+        url = _sqs_esm_fixture(_lsvc, _sqs, "wake-v")
+        _sqs._queues[url]["messages"][0]["receipt_handle"] = "rh"
+        produce = lambda: _sqs._act_change_visibility({"ReceiptHandle": "rh", "VisibilityTimeout": "0"}, url)  # noqa: E731
+    elif source == "dynamodb":
+        _ddb._create_table({"TableName": "wake-t", "BillingMode": "PAY_PER_REQUEST",
+                            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                            "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"}})
+        produce = lambda: _ddb._put_item({"TableName": "wake-t", "Item": {"pk": {"S": "1"}}})  # noqa: E731
+    else:
+        _kin._create_stream({"StreamName": "wake-s", "ShardCount": 1})
+        _kin._streams["wake-s"]["StreamStatus"] = "ACTIVE"
+        produce = lambda: _kin._put_record({"StreamName": "wake-s", "PartitionKey": "k", "Data": "eA=="})  # noqa: E731
+    _lsvc._esm_wake.clear()
+    produce()
+    assert _lsvc._esm_wake.is_set()
+
+
+def test_poll_loop_paces_wakes_that_find_nothing(esm_poll_state, monkeypatch):
+    """Traffic the poller has no mapping for must not keep it scanning back to back."""
+    waits, sleeps = [], []
+
+    def fake_wait(secs):
+        waits.append(secs)
+        if len(waits) > 2:
+            raise _StopPollLoop()
+        return True
+
+    monkeypatch.setattr(lsvc, "_poll_sqs", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_kinesis", lambda: False)
+    monkeypatch.setattr(lsvc, "_poll_dynamodb_streams", lambda: False)
+    monkeypatch.setattr(lsvc._esm_wake, "wait", fake_wait)
+    monkeypatch.setattr(lsvc.time, "sleep", sleeps.append)
+    with pytest.raises(_StopPollLoop):
+        lsvc._poll_loop()
+    assert sleeps == [lsvc._ESM_IDLE_WAKE_GAP_SECONDS] * 2
+
+
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invocation_retains_alias_without_mutating_version(monkeypatch, asynchronous, runtime):
+    """Invoke identity follows the caller's qualifier, not alias resolution."""
+    from copy import deepcopy
+
+    from ministack.core.lambda_runtime import invalidate_worker
+    from ministack.services import lambda_svc as svc
+
+    name = "identity-" + _uuid_mod.uuid4().hex
+    arn = svc._func_arn(name)
+    config = {"FunctionName": name, "FunctionArn": arn, "Runtime": runtime,
+              "Handler": "index.handler", "Timeout": 10, "Version": "$LATEST"}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", "def handler(event, context):\n"
+                         "    return [context.invoked_function_arn, context.function_version, event]\n")
+        archive.writestr("index.js", "exports.handler = async (event, context) => [context.invokedFunctionArn, context.functionVersion, event];")
+    version = {"config": {**config, "FunctionArn": arn + ":1", "Version": "1"},
+               "code_zip": buf.getvalue()}
+    function = {"config": config, "code_zip": buf.getvalue(), "versions": {"1": version},
+                "aliases": {"worker": {"FunctionVersion": "1"}, "other": {"FunctionVersion": "1"}}}
+    original = deepcopy(function)
+    monkeypatch.setitem(svc._functions, name, function)
+    monkeypatch.setattr(svc, "_emit_lambda_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(svc, "LAMBDA_EXECUTOR", "local")
+    monkeypatch.setattr(svc, "LAMBDA_STRICT", False)
+    monkeypatch.setattr(svc, "_proxy_url_for", lambda config: None)
+    monkeypatch.setattr(svc, "_emit_lambda_logs", lambda *args, **kwargs: None)
+    captured = []
+    monkeypatch.setattr(svc, "invoke_async_with_retry", lambda f, e: captured.append(svc._execute_function_with_config_scope(f, e)))
+    try:
+        # Alternate aliases sharing one published version, including warm reuse.
+        for qualifier in ["worker", "other", "1", "worker", None, "$LATEST"]:
+            headers = {"x-amz-invocation-type": "Event"} if asynchronous else {}
+            status, response_headers, body = asyncio.run(svc._invoke(name, {"value": 1}, headers, qualifier))
+            expected_version = "1" if qualifier in ("worker", "other", "1") else "$LATEST"
+            assert response_headers["X-Amz-Executed-Version"] == expected_version
+            assert status == (202 if asynchronous else 200)
+            result = captured[-1]["body"] if asynchronous else json.loads(body)
+            assert result == [arn + (":" + qualifier if qualifier else ""), expected_version, {"value": 1}]
+            assert function == original
+    finally:
+        invalidate_worker(name)

@@ -430,6 +430,7 @@ def _k3s_run_kwargs(
     ms_network: str | None = None,
     oidc_args: list[str] | None = None,
     node_labels: list[str] | None = None,
+    account_id: str | None = None,
 ) -> dict:
     """Build the docker run kwargs for a k3s server container.
 
@@ -451,6 +452,7 @@ def _k3s_run_kwargs(
         command.extend(oidc_args)
     if node_labels:
         command.extend(node_labels)
+    account_id = account_id or get_account_id()
 
     run_kwargs = dict(
         image=apply_image_prefix(EKS_K3S_IMAGE),
@@ -468,8 +470,8 @@ def _k3s_run_kwargs(
         security_opt=["seccomp=unconfined", "apparmor=unconfined"],
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
-        name=f"ministack-eks-{region}-{name}",
-        labels=container_reaper.own_labels("eks", cluster_name=name, region=region),
+        name=f"ministack-eks-{account_id}-{region}-{name}",
+        labels=container_reaper.own_labels("eks", cluster_name=name, region=region, account_id=account_id),
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
@@ -755,6 +757,7 @@ def _create_cluster(body, creator_arn=None):
                 ms_network=ms_network,
                 oidc_args=oidc_args,
                 node_labels=node_labels,
+                account_id=account_id,
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
@@ -1804,6 +1807,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
+            cluster_spec = parse_arn(cluster.get("arn", ""))
             run_kwargs = _k3s_run_kwargs(
                 name=cluster_name,
                 region=region,
@@ -1811,10 +1815,10 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 ms_network=ms_network,
                 oidc_args=oidc_args,
                 node_labels=node_labels,
+                account_id=cluster_spec.account_id,
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
-            cluster_spec = parse_arn(cluster.get("arn", ""))
             # A restart reuses the cluster's token; one minted here would not
             # match the URL k3s was given, and the restored record carries it.
             cluster.setdefault("_auth_token", secrets.token_urlsafe(32))

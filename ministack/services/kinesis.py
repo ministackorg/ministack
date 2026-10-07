@@ -25,6 +25,7 @@ import time
 import zlib
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -337,6 +338,7 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
         "Data": base64.b64encode(data).decode("ascii"),
         "PartitionKey": partition_key,
     })
+    esm_wake.set()
     return True
 
 
@@ -635,6 +637,7 @@ def _put_record(data):
         "Data": record_data,
         "PartitionKey": partition_key,
     })
+    esm_wake.set()
 
     # Fan out to any Firehose delivery stream configured with this Kinesis
     # stream as its source. Best-effort, must not break this PutRecord.
@@ -714,6 +717,7 @@ def _put_records(data):
         except Exception:
             raw = rd.encode() if isinstance(rd, str) else rd
         fanout_pairs.append((pk, raw))
+    esm_wake.set()
 
     # Fan out the whole batch to any Firehose delivery stream configured with
     # this Kinesis stream as its source. Best-effort, must not break PutRecords.
@@ -1187,6 +1191,13 @@ def _subscribe_to_shard(data, is_cbor):
         return error_response_json("InvalidArgumentException",
                                    f"Invalid StartingPosition.Type: {it_type}", 400)
 
+    # Capture the selected boundary before the runner starts. Retention can
+    # replace the record list and shift its indices while the response is open.
+    shard = stream["shards"][shard_id]
+    records = shard["records"]
+    boundary = records[position - 1]["SequenceNumber"] if position else None
+    initial_continuation = boundary if boundary is not None else shard["starting_sequence_number"]
+
     # A second call within 5 seconds is refused; later, it takes the subscription over.
     key = (consumer_arn, shard_id)
     now = time.time()
@@ -1233,10 +1244,8 @@ def _subscribe_to_shard(data, is_cbor):
             while (await receive()).get("type") != "http.disconnect":
                 pass
 
-        pos = position
-        records = stream["shards"][shard_id]["records"]
-        continuation = (records[pos - 1]["SequenceNumber"] if 0 < pos <= len(records)
-                        else stream["shards"][shard_id]["starting_sequence_number"])
+        after_sequence = boundary
+        continuation = initial_continuation
         deadline = now + SUBSCRIPTION_SECONDS
         last_sent = 0.0
         watcher = asyncio.create_task(disconnected())
@@ -1266,12 +1275,12 @@ def _subscribe_to_shard(data, is_cbor):
                         "MillisBehindLatest": 0, "ChildShards": children}))
                     return
                 records = shard["records"]
-                batch = records[min(pos, len(records)):]
+                batch = [r for r in records
+                         if after_sequence is None or r["SequenceNumber"] > after_sequence]
                 if batch or not last_sent or time.time() - last_sent >= _SUBSCRIPTION_IDLE_SECONDS:
                     encryption = stream.get("EncryptionType", "NONE")
                     if batch:
-                        pos += len(batch)
-                        continuation = batch[-1]["SequenceNumber"]
+                        after_sequence = continuation = batch[-1]["SequenceNumber"]
                     await chunk(event("SubscribeToShardEvent", {
                         "Records": [record_out(r, encryption) for r in batch],
                         "ContinuationSequenceNumber": continuation,

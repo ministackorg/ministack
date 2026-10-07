@@ -64,6 +64,390 @@ def test_iot_describe_endpoint_unknown_type_rejected(iot_client):
 
 
 # ---------------------------------------------------------------------------
+# Domain configurations
+# ---------------------------------------------------------------------------
+
+_PROTOCOLS_DOC = "<https://docs.aws.amazon.com/iot/latest/developerguide/protocols.html>"
+
+
+def _dc_error(call, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        call(**kwargs)
+    return ei.value.response["Error"]["Code"], ei.value.response["Error"]["Message"]
+
+
+def _self_signed_pem(cn, server_auth):
+    """A self-signed certificate and key, with or without the serverAuth EKU."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+               .public_key(key.public_key()).serial_number(x509.random_serial_number())
+               .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1)))
+    if server_auth:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+    cert = builder.sign(key, hashes.SHA256())
+    return (cert.public_bytes(serialization.Encoding.PEM),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()))
+
+
+def test_iot_domain_configuration_iot_owned_entries(iot_client):
+    """A fresh account lists the iot:Data-ATS and iot:CredentialProvider
+    configurations, whose domainName is the DescribeEndpoint address."""
+    listed = {
+        d["domainConfigurationName"]: d["serviceType"]
+        for d in iot_client.list_domain_configurations()["domainConfigurations"]
+    }
+    assert listed["iot:Data-ATS"] == "DATA"
+    assert listed["iot:CredentialProvider"] == "CREDENTIAL_PROVIDER"
+    assert "iot:Jobs" not in listed
+
+    ats = iot_client.describe_domain_configuration(domainConfigurationName="iot:Data-ATS")
+    assert ats["domainName"] == iot_client.describe_endpoint(
+        endpointType="iot:Data-ATS")["endpointAddress"]
+    assert ats["domainConfigurationArn"].endswith(":domainconfiguration/iot:Data-ATS")
+    assert ats["domainType"] == "ENDPOINT"
+    assert ats["domainConfigurationStatus"] == "ENABLED"
+    assert ats["serverCertificates"] == []
+    assert ats["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+    assert (ats["authenticationType"], ats["applicationProtocol"]) == ("DEFAULT", "DEFAULT")
+
+    cp = iot_client.describe_domain_configuration(domainConfigurationName="iot:CredentialProvider")
+    assert cp["domainName"] == iot_client.describe_endpoint(
+        endpointType="iot:CredentialProvider")["endpointAddress"]
+    assert cp["domainType"] == "ENDPOINT"
+    assert not {"tlsConfig", "authenticationType", "applicationProtocol"} & cp.keys()
+
+    assert _dc_error(iot_client.describe_domain_configuration,
+                     domainConfigurationName="iot:Jobs") == (
+        "InvalidRequestException", "Invalid DomainConfiguration Name")
+
+
+def test_iot_domain_configuration_create_aws_managed(iot_client):
+    name = _unique("dc")
+    resp = iot_client.create_domain_configuration(domainConfigurationName=name)
+    assert resp["domainConfigurationName"] == name
+    assert re.fullmatch(
+        rf"arn:aws:iot:us-east-1:\d{{12}}:domainconfiguration/{name}/[a-z0-9]{{5}}",
+        resp["domainConfigurationArn"])
+
+    d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+    assert d["domainConfigurationArn"] == resp["domainConfigurationArn"]
+    assert re.match(r"d[a-z0-9]{20}-ats\.iot\.us-east-1\.", d["domainName"])
+    assert d["domainType"] == "AWS_MANAGED"
+    assert d["domainConfigurationStatus"] == "ENABLED"
+    assert d["serviceType"] == "DATA"
+    assert d["serverCertificates"] == []
+    assert d["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+    assert (d["authenticationType"], d["applicationProtocol"]) == ("DEFAULT", "DEFAULT")
+    assert "authorizerConfig" not in d
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_domain_configuration(
+            domainConfigurationName=name, tlsConfig={"securityPolicy": "Bogus"})
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert ei.value.response["Error"]["Message"] == "Domain configuration already exists"
+    assert ei.value.response["resourceId"] == resp["domainConfigurationArn"].split(":", 5)[5]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"domainConfigurationName": "bad:name"},
+         "1 validation error detected: Value at 'domainConfigurationName' failed to satisfy "
+         "constraint: Member must satisfy regular expression pattern: [\\w.-]+"),
+        ({"domainConfigurationName": "x" * 129},
+         "1 validation error detected: Value at 'domainConfigurationName' failed to satisfy "
+         "constraint: Member must have length less than or equal to 128"),
+        ({"serviceType": "CREDENTIAL_PROVIDER"},
+         "CreateDomainConfiguration only supports DATA Service Type"),
+        ({"serviceType": "JOBS"}, "Invalid Service Type"),
+        ({"serviceType": "BOGUS"},
+         "1 validation error detected: Value at 'serviceType' failed to satisfy constraint: "
+         "Member must satisfy enum value set: [DATA, JOBS, CREDENTIAL_PROVIDER]"),
+        ({"tlsConfig": {"securityPolicy": "Bogus"}}, "SecurityPolicy Bogus not recognized"),
+        ({"tlsConfig": {"securityPolicy": "IoTSecurityPolicy_TLS12_1_0_2016_01"}},
+         "SecurityPolicy IoTSecurityPolicy_TLS12_1_0_2016_01 is not supported in region us-east-1"),
+        ({"authenticationType": "AWS_X509"},
+         "The domain must configure a supported ApplicationProtocol when configuring an "
+         f"AuthenticationType. Please refer to {_PROTOCOLS_DOC} for supported combinations "
+         "and try again."),
+        ({"applicationProtocol": "HTTPS"},
+         "The domain must configure a supported AuthenticationType when configuring an "
+         f"ApplicationProtocol. Please refer to {_PROTOCOLS_DOC} for supported combinations "
+         "and try again."),
+        ({"authenticationType": "AWS_SIGV4", "applicationProtocol": "SECURE_MQTT"},
+         "Unsupported combination of AuthenticationType and ApplicationProtocol provided. "
+         "AuthenticationType: [AWS_SIGV4], ApplicationProtocol: [SECURE_MQTT]. Please refer "
+         f"to {_PROTOCOLS_DOC} for supported combinations and try again."),
+        ({"authenticationType": "CUSTOM_AUTH", "applicationProtocol": "HTTPS", "authorizerConfig": {}},
+         "The domain configuration must have a valid AuthorizerConfig configured when using "
+         f"CUSTOM_AUTH as the AuthenticationType. Please refer to {_PROTOCOLS_DOC} for "
+         "supported combinations and try again."),
+        ({"domainName": "iot.example.com"},
+         "Cannot provide a custom domain name for an AWS Managed Domain"),
+        ({"validationCertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/abc"},
+         "Cannot provide a Validation Certificate for AWS Managed Domain Configurations"),
+        ({"serverCertificateConfig": {"enableOCSPCheck": True}},
+         "Cannot create a server certificate config for an AWS Managed Domain"),
+        ({"serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/abc"]},
+         "Must provide a valid domain name to configure."),
+        ({"domainName": "iot.example.com",
+          "serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/abc"]},
+         "Certificate arn:aws:acm:us-east-1:000000000000:certificate/abc does not exist."),
+        ({"domainName": "iot.example.com",
+          "serverCertificateArns": ["arn:aws:acm:us-east-1:000000000000:certificate/a"] * 2},
+         "1 validation error detected: Value at 'serverCertificateArns' failed to satisfy "
+         "constraint: Member must have length less than or equal to 1"),
+    ],
+)
+def test_iot_domain_configuration_create_refusals(iot_client, kwargs, message):
+    kwargs = {"domainConfigurationName": _unique("dc-refused"), **kwargs}
+    assert _dc_error(iot_client.create_domain_configuration, **kwargs) == (
+        "InvalidRequestException", message)
+    listed = [d["domainConfigurationName"]
+              for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert kwargs["domainConfigurationName"] not in listed
+
+
+def test_iot_domain_configuration_customer_managed_certificates(iot_client, acm_client):
+    """An imported (self-signed) server certificate needs serverAuth and a
+    trusted validation certificate; an ACM-issued one makes the configuration
+    CUSTOMER_MANAGED on the caller's domain."""
+    pytest.importorskip("cryptography")
+    domain = f"{_unique('dc')}.example.com"
+    arns = {}
+    for tag, server_auth in (("noeku", False), ("eku", True), ("validation", True)):
+        pem, key = _self_signed_pem(domain, server_auth)
+        arns[tag] = acm_client.import_certificate(Certificate=pem, PrivateKey=key)["CertificateArn"]
+    create = iot_client.create_domain_configuration
+    name = _unique("dc-cm")
+    base = {"domainConfigurationName": name, "domainName": domain}
+
+    assert _dc_error(create, serverCertificateArns=[arns["noeku"]], **base) == (
+        "CertificateValidationException",
+        "The certificate is missing ServerAuth in extended key usage of certificate.")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]], **base) == (
+        "InvalidRequestException",
+        "Must provide validation certificate when using server certificates not signed by "
+        "trusted CA or not within")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]],
+                     validationCertificateArn=arns["eku"], **base) == (
+        "InvalidRequestException",
+        "Cannot provide a ServerCertificateArn that is the same as a ValidationCertificateArn")
+    assert _dc_error(create, serverCertificateArns=[arns["eku"]],
+                     validationCertificateArn=arns["validation"], **base) == (
+        "InvalidRequestException", "Validation certificate must be signed by trusted CA")
+
+    issued = acm_client.request_certificate(DomainName=domain)["CertificateArn"]
+    create(serverCertificateArns=[issued], **base)
+    d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+    assert d["domainType"] == "CUSTOMER_MANAGED"
+    assert d["domainName"] == domain
+    assert d["serverCertificates"] == [
+        {"serverCertificateArn": issued, "serverCertificateStatus": "VALID"}]
+    iot_client.update_domain_configuration(
+        domainConfigurationName=name, serverCertificateConfig={"enableOCSPCheck": False})
+    assert iot_client.describe_domain_configuration(domainConfigurationName=name)[
+        "serverCertificateConfig"] == {"enableOCSPCheck": False}
+
+
+def test_iot_domain_configuration_update(iot_client):
+    name = _unique("dc-upd")
+    iot_client.create_domain_configuration(domainConfigurationName=name)
+    update = iot_client.update_domain_configuration
+
+    def describe():
+        return iot_client.describe_domain_configuration(domainConfigurationName=name)
+
+    # The policy matches case-insensitively and is stored in AWS's spelling;
+    # an empty tlsConfig falls back to the default policy.
+    update(domainConfigurationName=name,
+           tlsConfig={"securityPolicy": "iotsecuritypolicy_tls12_1_2_2022_10"})
+    assert describe()["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"}
+    update(domainConfigurationName=name, tlsConfig={})
+    assert describe()["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10"}
+
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=False) == (
+        "InvalidRequestException", "No arguments supplied to update")
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=True,
+                     authorizerConfig={"allowAuthorizerOverride": True}) == (
+        "InvalidRequestException",
+        "AuthorizerConfig supplied and removeAuthorizer is true, cannot set authorizer and remove it")
+    update(domainConfigurationName=name, authorizerConfig={"allowAuthorizerOverride": True})
+    update(domainConfigurationName=name, authorizerConfig={})
+    assert describe()["authorizerConfig"] == {"allowAuthorizerOverride": True}
+
+    # The combination is checked against the stored values for the half the
+    # request leaves out; a custom-auth type needs the authorizer to stay.
+    update(domainConfigurationName=name, authenticationType="CUSTOM_AUTH",
+           applicationProtocol="MQTT_WSS")
+    assert _dc_error(update, domainConfigurationName=name, removeAuthorizerConfig=True) == (
+        "InvalidRequestException",
+        "The domain configuration must have a valid AuthorizerConfig configured when using "
+        f"CUSTOM_AUTH as the AuthenticationType. Please refer to {_PROTOCOLS_DOC} for "
+        "supported combinations and try again.")
+    assert _dc_error(update, domainConfigurationName=name, authenticationType="AWS_X509") == (
+        "InvalidRequestException",
+        "Unsupported combination of AuthenticationType and ApplicationProtocol provided. "
+        "AuthenticationType: [AWS_X509], ApplicationProtocol: [MQTT_WSS]. Please refer to "
+        f"{_PROTOCOLS_DOC} for supported combinations and try again.")
+    assert _dc_error(update, domainConfigurationName=name,
+                     authenticationType="CUSTOM_AUTH_WITH_X509")[1].startswith(
+        "The AuthenticationType provided in the request was not recognized.")
+    update(domainConfigurationName=name, authenticationType="DEFAULT",
+           applicationProtocol="DEFAULT", removeAuthorizerConfig=True)
+    assert "authorizerConfig" not in describe()
+
+    assert _dc_error(update, domainConfigurationName=name,
+                     serverCertificateConfig={"enableOCSPCheck": True}) == (
+        "InvalidRequestException",
+        "Cannot configure ServerCertificateConfig for non-customer-managed domains")
+    assert _dc_error(update, domainConfigurationName=name,
+                     domainConfigurationStatus="PAUSED")[1].endswith(
+        "Member must satisfy enum value set: [ENABLED, DISABLED]")
+
+    # lastStatusChangeDate only moves when the status does.
+    stamp = describe()["lastStatusChangeDate"]
+    update(domainConfigurationName=name, domainConfigurationStatus="ENABLED")
+    assert describe()["lastStatusChangeDate"] == stamp
+    time.sleep(0.01)
+    update(domainConfigurationName=name, domainConfigurationStatus="DISABLED")
+    assert describe()["domainConfigurationStatus"] == "DISABLED"
+    assert describe()["lastStatusChangeDate"] > stamp
+
+    # The policy is checked before the name is looked up.
+    missing = _unique("dc-missing")
+    assert _dc_error(update, domainConfigurationName=missing,
+                     tlsConfig={"securityPolicy": "Bogus"}) == (
+        "InvalidRequestException", "SecurityPolicy Bogus not recognized")
+    code, message = _dc_error(update, domainConfigurationName=missing,
+                              domainConfigurationStatus="DISABLED")
+    assert code == "ResourceNotFoundException"
+    assert message.endswith(f"DomainConfigurationName: {missing}")
+
+
+def test_iot_domain_configuration_update_iot_owned(iot_client):
+    """Of the configurations IoT owns only iot:Data-ATS's TLS policy changes."""
+    owned = "IoT owned domain configuration cannot be updated with the supplied arguments"
+    update = iot_client.update_domain_configuration
+    for name, kwargs in (
+        ("iot:Data-ATS", {"domainConfigurationStatus": "ENABLED"}),
+        ("iot:Data-ATS", {"removeAuthorizerConfig": True}),
+        ("iot:CredentialProvider", {"tlsConfig": {"securityPolicy": "Bogus"}}),
+        ("iot:Jobs", {"domainConfigurationStatus": "ENABLED"}),
+    ):
+        assert _dc_error(update, domainConfigurationName=name, **kwargs) == (
+            "InvalidRequestException", owned)
+    assert _dc_error(update, domainConfigurationName="iot:Data-ATS",
+                     tlsConfig={"securityPolicy": "Bogus"}) == (
+        "InvalidRequestException", "SecurityPolicy Bogus not recognized")
+    try:
+        update(domainConfigurationName="iot:Data-ATS",
+               tlsConfig={"securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"})
+        assert iot_client.describe_domain_configuration(
+            domainConfigurationName="iot:Data-ATS")["tlsConfig"] == {
+            "securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"}
+    finally:
+        update(domainConfigurationName="iot:Data-ATS", tlsConfig={})
+
+
+def test_iot_domain_configuration_delete(iot_client):
+    """Only a DISABLED configuration is deleted, and an AWS-managed one only
+    seven days after it was disabled."""
+    name = _unique("dc-del")
+    iot_client.create_domain_configuration(domainConfigurationName=name)
+    delete = iot_client.delete_domain_configuration
+    assert _dc_error(delete, domainConfigurationName=name) == (
+        "InvalidRequestException", "Cannot delete a domain configuration that is not disabled")
+    iot_client.update_domain_configuration(
+        domainConfigurationName=name, domainConfigurationStatus="DISABLED")
+    assert _dc_error(delete, domainConfigurationName=name) == (
+        "InvalidRequestException",
+        "AWS Managed Domain Configuration must be disabled for at least 7 days "
+        "before it can be deleted")
+    assert iot_client.describe_domain_configuration(
+        domainConfigurationName=name)["domainConfigurationStatus"] == "DISABLED"
+    # An unknown name is a no-op; the IoT-owned names fail the Delete pattern.
+    delete(domainConfigurationName=_unique("dc-never"))
+    assert _dc_error(delete, domainConfigurationName="iot:Data-ATS")[1].endswith(
+        "Member must satisfy regular expression pattern: [\\w.-]+")
+
+
+def test_iot_domain_configuration_list_paging(iot_client):
+    names = [_unique("dc-page") for _ in range(3)]
+    for name in names:
+        iot_client.create_domain_configuration(domainConfigurationName=name)
+    everything = [d["domainConfigurationName"]
+                  for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert set(names) <= set(everything)
+
+    walked, marker = [], None
+    while True:
+        page = iot_client.list_domain_configurations(
+            pageSize=2, **({"marker": marker} if marker else {}))
+        assert len(page["domainConfigurations"]) <= 2
+        walked += [d["domainConfigurationName"] for d in page["domainConfigurations"]]
+        marker = page.get("nextMarker")
+        if not marker:
+            break
+        assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", marker)
+    assert walked == everything
+
+    # serviceType does not filter on AWS: CREDENTIAL_PROVIDER still lists DATA.
+    cp = iot_client.list_domain_configurations(serviceType="CREDENTIAL_PROVIDER")
+    assert [d["domainConfigurationName"] for d in cp["domainConfigurations"]] == everything
+    assert _dc_error(iot_client.list_domain_configurations, serviceType="JOBS") == (
+        "InvalidRequestException", "Invalid Service Type")
+    assert _dc_error(iot_client.list_domain_configurations, marker="Zm9v") == (
+        "InvalidRequestException", "Invalid Token")
+    assert _dc_error(iot_client.list_domain_configurations, pageSize=251) == (
+        "InvalidRequestException",
+        "1 validation error detected: Value at 'pageSize' failed to satisfy constraint: "
+        "Member must have value less than or equal to 250")
+
+
+def test_iot_domain_configurations_are_region_scoped_persisted_and_reset():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("dc-scope")
+
+    async def _request(region, method):
+        set_request_account_id("123456789012")
+        set_request_region(region)
+        status, _headers, _body = await iot_module.handle_request(
+            method, f"/domainConfigurations/{name}", {}, b"{}" if method == "POST" else b"", {})
+        return status
+
+    async def _run():
+        assert await _request("eu-west-1", "POST") == 200
+        assert await _request("eu-west-1", "GET") == 200
+        assert await _request("eu-west-3", "GET") == 404
+        assert await _request("eu-west-3", "POST") == 200
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert await _request("eu-west-1", "GET") == 404
+        iot_module.load_persisted_state(saved)
+        assert await _request("eu-west-1", "GET") == 200
+        assert await _request("eu-west-3", "GET") == 200
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Thing CRUD
 # ---------------------------------------------------------------------------
 
@@ -305,6 +689,95 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
 # ---------------------------------------------------------------------------
 
 
+def test_iot_create_thing_group_repeat_returns_the_existing_group(iot_client):
+    parent, other, name = _unique("parent"), _unique("parent"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=parent)
+    iot_client.create_thing_group(thingGroupName=other)
+    props = {
+        "thingGroupDescription": "first",
+        "attributePayload": {"attributes": {"a": "1", "b": "2"}},
+    }
+    first = iot_client.create_thing_group(
+        thingGroupName=name, parentGroupName=parent, thingGroupProperties=props,
+    )
+
+    # Attribute order and the merge flag do not count (AWS, 2026-10-05).
+    for repeat in (
+        props,
+        {**props, "attributePayload": {"attributes": {"b": "2", "a": "1"}}},
+        {**props, "attributePayload": {"attributes": {"a": "1", "b": "2"}, "merge": True}},
+    ):
+        again = iot_client.create_thing_group(
+            thingGroupName=name, parentGroupName=parent, thingGroupProperties=repeat,
+        )
+        assert (again["thingGroupName"], again["thingGroupArn"], again["thingGroupId"]) == (
+            name, first["thingGroupArn"], first["thingGroupId"])
+
+    for differs in (
+        {"thingGroupProperties": {**props, "thingGroupDescription": "second"}},
+        {"thingGroupProperties": {"thingGroupDescription": "first"}},
+        {"thingGroupProperties": {**props, "attributePayload": {
+            "attributes": {"a": "1"}, "merge": True}}},
+        {},
+    ):
+        kwargs = {"parentGroupName": parent, **differs}
+        for params in (kwargs, {**kwargs, "parentGroupName": other}):
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_thing_group(thingGroupName=name, **params)
+            assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+            assert ei.value.response["Error"]["Message"] == (
+                f"Thing Group {name} already exists in current account with different properties")
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(thingGroupName=name, thingGroupProperties=props)
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+
+    described = iot_client.describe_thing_group(thingGroupName=name)
+    assert described["version"] == 1
+    assert described["thingGroupProperties"]["thingGroupDescription"] == "first"
+    assert described["thingGroupMetadata"]["parentGroupName"] == parent
+    iot_client.delete_thing_group(thingGroupName=name)
+    iot_client.delete_thing_group(thingGroupName=parent)
+    iot_client.delete_thing_group(thingGroupName=other)
+
+
+def test_iot_create_thing_group_repeat_compares_tags(iot_client):
+    bare, tagged = _unique("group"), _unique("group")
+    iot_client.create_thing_group(thingGroupName=bare)
+    first = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+
+    # No properties equals empty properties, empty attributes and no tags.
+    for repeat in (
+        {},
+        {"thingGroupProperties": {}},
+        {"thingGroupProperties": {"attributePayload": {"attributes": {}}}},
+        {"tags": []},
+    ):
+        iot_client.create_thing_group(thingGroupName=bare, **repeat)
+    again = iot_client.create_thing_group(
+        thingGroupName=tagged, tags=[{"Key": "k", "Value": "v"}])
+    assert again["thingGroupId"] == first["thingGroupId"]
+
+    for name, tags in (
+        (bare, [{"Key": "k", "Value": "v"}]),
+        (tagged, []),
+        (tagged, [{"Key": "k", "Value": "w"}]),
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_thing_group(thingGroupName=name, tags=tags)
+        arn = iot_client.describe_thing_group(thingGroupName=name)["thingGroupArn"]
+        assert ei.value.response["Error"]["Message"] == (
+            f"Resource {arn} already exists in current account with different properties")
+    # A property difference is reported before a tag difference.
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(
+            thingGroupName=tagged, thingGroupProperties={"thingGroupDescription": "x"})
+    assert ei.value.response["Error"]["Message"] == (
+        f"Thing Group {tagged} already exists in current account with different properties")
+    iot_client.delete_thing_group(thingGroupName=bare)
+    iot_client.delete_thing_group(thingGroupName=tagged)
+
+
 def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     parent, child = _unique("parent"), _unique("child")
     iot_client.create_thing_group(thingGroupName=parent)
@@ -400,6 +873,54 @@ def test_iot_create_keys_and_certificate_inactive(iot_client):
     desc = iot_client.describe_certificate(certificateId=resp["certificateId"])
     assert desc["certificateDescription"]["status"] == "INACTIVE"
     iot_client.delete_certificate(certificateId=resp["certificateId"])
+
+
+def test_iot_create_certificate_from_csr(iot_client):
+    """CreateCertificateFromCsr signs the CSR with the local CA: the
+    certificate keeps the CSR's subject and key, is INACTIVE unless
+    setAsActive, and is in DEFAULT mode; a CSR that does not parse or verify,
+    or carries a key AWS refuses, is refused with AWS's message."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "csr-device"),
+                         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "csr-org")])
+    csr = (x509.CertificateSigningRequestBuilder().subject_name(subject)
+           .sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode())
+
+    inactive = iot_client.create_certificate_from_csr(certificateSigningRequest=csr)
+    active = iot_client.create_certificate_from_csr(certificateSigningRequest=csr, setAsActive=True)
+    assert inactive["certificateId"] != active["certificateId"]
+    assert inactive["certificateArn"].endswith(":cert/" + inactive["certificateId"])
+    issued = x509.load_pem_x509_certificate(inactive["certificatePem"].encode())
+    spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    assert issued.subject == subject
+    assert issued.public_key().public_bytes(*spki) == key.public_key().public_bytes(*spki)
+    assert not issued.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    desc = iot_client.describe_certificate(certificateId=inactive["certificateId"])["certificateDescription"]
+    assert (desc["status"], desc["certificateMode"], desc["certificatePem"]) == (
+        "INACTIVE", "DEFAULT", inactive["certificatePem"])
+    assert iot_client.describe_certificate(
+        certificateId=active["certificateId"])["certificateDescription"]["status"] == "ACTIVE"
+
+    tampered = csr.replace(csr.splitlines()[-2], csr.splitlines()[-2][:-6] + "AAAAAA")
+    weak = [rsa.generate_private_key(public_exponent=65537, key_size=1024),
+            ec.generate_private_key(ec.SECP224R1()), ec.generate_private_key(ec.SECP256K1())]
+    refused = [(x509.CertificateSigningRequestBuilder().subject_name(subject)
+                .sign(k, hashes.SHA256()).public_bytes(serialization.Encoding.PEM).decode()) for k in weak]
+    for bad in ("not a csr", tampered, *refused):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_certificate_from_csr(certificateSigningRequest=bad)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == "CSR violates constraints"
+
+    iot_client.update_certificate(certificateId=active["certificateId"], newStatus="INACTIVE")
+    for resp in (inactive, active):
+        iot_client.delete_certificate(certificateId=resp["certificateId"])
 
 
 def test_iot_delete_active_certificate_rejected(iot_client):
@@ -611,6 +1132,7 @@ def test_iot_register_certificate_without_ca_roundtrip(iot_client):
     desc = iot_client.describe_certificate(certificateId=cert_id)
     assert desc["certificateDescription"]["certificatePem"] == cert_pem
     assert desc["certificateDescription"]["status"] == "ACTIVE"
+    assert desc["certificateDescription"]["certificateMode"] == "SNI_ONLY"
 
     iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert_id)
@@ -2084,6 +2606,115 @@ def test_iot_broker_region_wildcards_cannot_bypass_isolation(
 
     asyncio.run(_run())
     reset()
+
+
+def test_iot_broker_wildcard_region_does_not_widen_its_own_filters():
+    """A ``#`` region in the scope prefix must not turn a filter into ``#``."""
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        received = []
+
+        async def callback(topic, payload, qos):
+            received.append(topic)
+
+        await broker_subscribe(account_id, "#", "sensors/temp", callback)
+        await broker_publish(account_id, "#", "other/topic", b"x")
+        await broker_publish(account_id, "#", "sensors/temp", b"x")
+        assert received == ["sensors/temp"]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_iot_broker_leading_wildcard_does_not_match_aws_events():
+    """``#`` and ``+/...`` get ``$aws/things`` but not ``$aws/events``, live and queued."""
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        offline = _WSSession(send, "123456789012")
+        await offline.handle_packet(
+            PKT_CONNECT, 0, _build_connect_body("offline-hash", clean_session=False)
+        )
+        await offline.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("#", 1)])
+        )
+        await offline.cleanup()
+
+        received = {}
+        for topic_filter in ("#", "+/#", "$aws/events/#"):
+            async def callback(topic, payload, qos, key=topic_filter):
+                received.setdefault(key, []).append(topic)
+
+            await subscribe("123456789012", topic_filter, callback)
+
+        await publish("123456789012", "$aws/events/presence/connected/dev", b"{}", qos=1)
+        await publish("123456789012", "$aws/things/dev/shadow/get/rejected", b"{}", qos=1)
+
+        assert received == {
+            "#": ["$aws/things/dev/shadow/get/rejected"],
+            "+/#": ["$aws/things/dev/shadow/get/rejected"],
+            "$aws/events/#": ["$aws/events/presence/connected/dev"],
+        }
+        queued = _persistent_sessions[("123456789012", _TEST_REGION, "offline-hash")]
+        assert [m[0] for m in queued.queued_messages] == [
+            "$aws/things/dev/shadow/get/rejected"
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_iot_topic_rule_leading_wildcard_does_not_match_aws_events(monkeypatch):
+    """A ``#`` rule fires on ``$aws/things`` but, as on AWS, not on ``$aws/events``."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    filters = (
+        "#",
+        "+/events/presence/#",
+        "$aws/events/presence/connected/+",
+        "$aws/things/+/shadow/update/accepted",
+    )
+    for i, topic_filter in enumerate(filters):
+        iot_module._topic_rules.set_scoped(account_id, _TEST_REGION, f"r{i}", {
+            "ruleName": f"r{i}",
+            "sql": f"SELECT * FROM '{topic_filter}'",
+            "ruleDisabled": False,
+            "actions": [],
+        })
+    fired = []
+
+    async def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
+    ):
+        fired.append((rule["ruleName"], topic))
+
+    monkeypatch.setattr(iot_module, "_run_rule_actions", _capture_rule_action)
+
+    async def _run():
+        for topic in (
+            "sensors/temp",
+            "$aws/events/presence/connected/dev",
+            "$aws/things/dev/shadow/update/accepted",
+        ):
+            await broker_publish(account_id, _TEST_REGION, topic, b"{}")
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+    assert sorted(fired) == [
+        ("r0", "$aws/things/dev/shadow/update/accepted"),
+        ("r0", "sensors/temp"),
+        ("r2", "$aws/events/presence/connected/dev"),
+        ("r3", "$aws/things/dev/shadow/update/accepted"),
+    ]
 
 
 def test_iot_broker_persistent_sessions_are_region_isolated():
@@ -5235,6 +5866,175 @@ def test_connectivity_reconnect_clears_the_previous_disconnect_reason():
     reset()
 
 
+async def _watch_lifecycle_events():
+    """Subscribe to ``$aws/events/#`` and return the list the events land in."""
+    events = []
+
+    async def callback(topic, payload, qos):
+        events.append((topic, json.loads(payload)))
+
+    await subscribe(_ACCT, "$aws/events/#", callback)
+    return events
+
+
+def test_lifecycle_events_for_connect_subscribe_unsubscribe_disconnect():
+    """Payload keys and topics as AWS publishes them for one session."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+        send, _sent = _mock_send()
+        session = _IoTWSSession(send, _ACCT, _TEST_REGION, principal="c0ffee")
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-life"))
+        await session.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("a", 0), ("b/#", 1)])
+        )
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(2, ["a", "never"])
+        )
+        await session.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session.cleanup()
+
+        assert [topic for topic, _event in events] == [
+            "$aws/events/presence/connected/dev-life",
+            "$aws/events/subscriptions/subscribed/dev-life",
+            "$aws/events/subscriptions/unsubscribed/dev-life",
+            "$aws/events/presence/disconnected/dev-life",
+        ]
+        connected, subscribed, unsubscribed, disconnected = [e for _t, e in events]
+        common = {
+            "clientId": "dev-life",
+            "principalIdentifier": "c0ffee",
+            "sessionIdentifier": connected["sessionIdentifier"],
+        }
+        for event in (connected, subscribed, unsubscribed, disconnected):
+            assert isinstance(event.pop("timestamp"), int)
+        assert connected == {
+            **common, "eventType": "connected", "ipAddress": "127.0.0.1",
+            "versionNumber": 0,
+        }
+        assert subscribed == {**common, "eventType": "subscribed", "topics": ["a", "b/#"]}
+        assert unsubscribed == {
+            **common, "eventType": "unsubscribed", "topics": ["a", "never"],
+        }
+        assert disconnected == {
+            **common, "eventType": "disconnected", "clientInitiatedDisconnect": True,
+            "disconnectReason": "CLIENT_INITIATED_DISCONNECT", "versionNumber": 0,
+        }
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_events_skip_client_ids_with_wildcards():
+    """AWS documents that client ids containing # or + receive no lifecycle events."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+        for client_id in ("dev#hash", "dev+plus", "dev-plain"):
+            send, _sent = _mock_send()
+            session = _IoTWSSession(send, _ACCT, _TEST_REGION, principal="c0ffee")
+            await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
+            await session.handle_packet(
+                PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("a", 0)])
+            )
+            await session.handle_packet(PKT_DISCONNECT, 0, b"")
+            await session.cleanup()
+
+        assert [topic for topic, _event in events] == [
+            "$aws/events/presence/connected/dev-plain",
+            "$aws/events/subscriptions/subscribed/dev-plain",
+            "$aws/events/presence/disconnected/dev-plain",
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_version_numbers_and_disconnect_reasons():
+    """Connects and disconnects each advance versionNumber; a takeover allocates first."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+
+        async def connect():
+            send, _sent = _mock_send()
+            session = _WSSession(send, _ACCT)
+            await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-ver"))
+            return session
+
+        first = await connect()
+        await first.handle_packet(PKT_DISCONNECT, 0, b"")
+        await first.cleanup()
+        dropped = await connect()
+        await dropped.cleanup()
+        evicted = await connect()
+        taker = await connect()
+        await evicted.cleanup()
+        await taker.handle_packet(PKT_DISCONNECT, 0, b"")
+        await taker.cleanup()
+
+        assert [
+            (
+                e["eventType"], e["versionNumber"], e.get("disconnectReason"),
+                e.get("clientInitiatedDisconnect"), e["principalIdentifier"],
+            )
+            for _t, e in events
+        ] == [
+            ("connected", 0, None, None, _ACCT),
+            ("disconnected", 0, "CLIENT_INITIATED_DISCONNECT", True, _ACCT),
+            ("connected", 2, None, None, _ACCT),
+            ("disconnected", 2, "CONNECTION_LOST", False, _ACCT),
+            ("connected", 4, None, None, _ACCT),
+            ("disconnected", 4, "DUPLICATE_CLIENTID", False, _ACCT),
+            ("connected", 5, None, None, _ACCT),
+            ("disconnected", 5, "CLIENT_INITIATED_DISCONNECT", True, _ACCT),
+        ]
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_lifecycle_resumed_session_keeps_its_session_identifier():
+    """A resumed persistent session reuses sessionIdentifier and raises no subscribed event."""
+    reset()
+
+    async def _run():
+        events = await _watch_lifecycle_events()
+
+        async def connect(clean_session):
+            send, _sent = _mock_send()
+            session = _WSSession(send, _ACCT)
+            await session.handle_packet(
+                PKT_CONNECT, 0,
+                _build_connect_body("dev-resume", clean_session=clean_session),
+            )
+            return session
+
+        first = await connect(False)
+        await first.handle_packet(PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("p", 1)]))
+        await first.handle_packet(PKT_DISCONNECT, 0, b"")
+        await first.cleanup()
+        resumed = await connect(False)
+        await resumed.handle_packet(PKT_DISCONNECT, 0, b"")
+        await resumed.cleanup()
+        fresh = await connect(True)
+        await fresh.cleanup()
+
+        kinds = [(e["eventType"], e["sessionIdentifier"]) for _t, e in events]
+        original = kinds[0][1]
+        assert [k for k, _s in kinds] == [
+            "connected", "subscribed", "disconnected",
+            "connected", "disconnected", "connected", "disconnected",
+        ]
+        assert [s == original for _k, s in kinds] == [True] * 5 + [False] * 2
+
+    asyncio.run(_run())
+    reset()
+
+
 def test_connectivity_is_not_persisted_and_cannot_restore_as_connected():
     """A snapshot must not be able to claim a thing is online after a restart.
 
@@ -5514,13 +6314,18 @@ def _jitr_registration_code(iot_module) -> str:
 async def _jitr_scope_with_ca(
     iot_module, ca_pem: str, verification_pem: str, received: list, allow_auto=True
 ) -> str:
-    """Pin the JITR test scope, register ``ca_pem`` ACTIVE and collect every
-    registered event into ``received``. Returns the CA id."""
+    """Pin the JITR test scope, register ``ca_pem`` ACTIVE (in SNI_ONLY mode
+    when ``verification_pem`` is None) and collect every registered event into
+    ``received``. Returns the CA id."""
     _jitr_registration_code(iot_module)
     qp = {"setAsActive": "true"}
     if allow_auto:
         qp["allowAutoRegistration"] = "true"
-    body = {"caCertificate": ca_pem, "verificationCertificate": verification_pem}
+    body = {"caCertificate": ca_pem}
+    if verification_pem is None:
+        body["certificateMode"] = "SNI_ONLY"
+    else:
+        body["verificationCertificate"] = verification_pem
     status, _, body = await iot_module.handle_request(
         "POST", "/cacertificate", {}, json.dumps(body).encode(), qp
     )
@@ -5645,6 +6450,105 @@ def test_iot_jitr_auto_registration_on_connect(monkeypatch):
         "sourceIp": "192.0.2.10",
     }
     assert second["certificateRegistrationTimestamp"] == str(int(record["creationDate"] * 1000))
+
+
+def test_iot_jitr_under_an_sni_only_ca_needs_sni():
+    """A CA in SNI_ONLY mode auto-registers only on a connect that sent SNI:
+    the account's endpoint prefix counts in any region, no server name or
+    another account's prefix creates nothing. A certificate already
+    PENDING_ACTIVATION gets a repeat event only with SNI. A DEFAULT CA
+    auto-registers for a non-endpoint name."""
+    import ssl
+
+    from ministack.services import iot as iot_module
+
+    code = _jitr_registration_code(iot_module)
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf(code)
+    def_ca_pem, def_verification_pem, def_leaf_pem = _generate_ca_and_leaf(code)
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    prefix = iot_module._endpoint_prefix(_JITR_ACCOUNT)
+    other_prefix = iot_module._endpoint_prefix("111111111111")
+    received: list = []
+
+    async def _run():
+        ca_id = await _jitr_scope_with_ca(iot_module, ca_pem, None, received)
+        await _jitr_scope_with_ca(iot_module, def_ca_pem, def_verification_pem, [])
+        for server_name in (
+            None,
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.amazonaws.com",
+            f"{other_prefix}-ats.iot.{_TEST_REGION}.localhost",
+            f"{other_prefix}.credentials.iot.{_TEST_REGION}.localhost",
+        ):
+            assert not await iot_module._mtls_auto_register(der, peer, server_name)
+            assert cert_id not in iot_module._certificates
+        def_der = ssl.PEM_cert_to_DER_cert(def_leaf_pem)
+        assert await iot_module._mtls_auto_register(def_der, peer, "mqtt.example.com")
+
+        other_region = f"{prefix.upper()}-ats.iot.us-east-1.amazonaws.com"
+        assert await iot_module._mtls_auto_register(der, peer, other_region)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+        assert not await iot_module._mtls_auto_register(der, peer)
+        assert await iot_module._mtls_auto_register(der, peer, "localhost")
+        return ca_id
+
+    try:
+        ca_id = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+    topic = f"$aws/events/certificates/registered/{ca_id}"
+    events = [event for t, event in received if t == topic]
+    assert [event["certificateId"] for event in events] == [cert_id] * 2
+    assert events[0]["certificateRegistrationTimestamp"] is None
+    assert isinstance(events[1]["certificateRegistrationTimestamp"], str)
+
+
+def test_iot_jitr_sni_only_ca_in_two_accounts_registers_where_the_name_points():
+    """The same SNI_ONLY CA registered in two accounts: an endpoint name picks
+    the account it names, while a name both accounts are served under
+    (``localhost``) is ambiguous and registers nothing."""
+    import ssl
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    ca_pem, _verification_pem, leaf_pem = _generate_ca_and_leaf("unused")
+    cert_id = iot_module.get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    accounts = ("111111111111", "222222222222")
+
+    async def _run():
+        for account in accounts:
+            set_request_account_id(account)
+            set_request_region(_TEST_REGION)
+            status, _, _body = await iot_module.handle_request(
+                "POST", "/cacertificate", {},
+                json.dumps({"caCertificate": ca_pem, "certificateMode": "SNI_ONLY"}).encode(),
+                {"setAsActive": "true", "allowAutoRegistration": "true"},
+            )
+            assert status == 200
+        assert not await iot_module._mtls_auto_register(der, peer, "localhost")
+        prefix = iot_module._endpoint_prefix(accounts[1])
+        name = f"{prefix}-ats.iot.{_TEST_REGION}.localhost"
+        assert await iot_module._mtls_auto_register(der, peer, name)
+        return [
+            iot_module._certificates.get_scoped(account, _TEST_REGION, cert_id)
+            for account in accounts
+        ]
+
+    try:
+        first, second = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+    assert first is None
+    assert second["status"] == "PENDING_ACTIVATION"
 
 
 # ----------------------------------------------------------------------
@@ -6091,6 +6995,41 @@ def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
         iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client):
+    """Without ``caCertificatePem``, AWS links the certificate to the
+    registered ACTIVE CA that signed it: DescribeCertificate names that CA and
+    ListCertificatesByCA lists it. Two CAs share a subject here, so only the
+    signature tells them apart."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    subject = _unique("twin-ca")
+    twins = [generate_ca(common_name=subject) for _ in range(2)]
+    ca_ids, cert_ids = [], []
+    try:
+        for ca_pem, _key in twins:
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, certificateMode="SNI_ONLY", setAsActive=True,
+            )["certificateId"])
+        for ca_pem, ca_key in reversed(twins):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=_unique("twin-device")
+            )[0]
+            cert_ids.insert(0, iot_client.register_certificate(
+                certificatePem=leaf_pem, status="ACTIVE"
+            )["certificateId"])
+
+        for ca_id, cert_id in zip(ca_ids, cert_ids):
+            desc = iot_client.describe_certificate(certificateId=cert_id)[
+                "certificateDescription"
+            ]
+            assert desc["caCertificateId"] == ca_id
+            listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+            assert [c["certificateId"] for c in listing["certificates"]] == [cert_id]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
+
+
 def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
     """``caCertificatePem`` naming a CA that was never registered is a
     ``CertificateValidationException``, and nothing is stored — otherwise the
@@ -6153,6 +7092,167 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
         for ca_id in (ca_x_id, ca_y_id):
             iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
             iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def _delete_certificates_and_cas(iot_client, cert_ids, ca_ids):
+    for cert_id in cert_ids:
+        iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+        iot_client.delete_certificate(certificateId=cert_id)
+    for ca_id in ca_ids:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_list_certificates_by_ca_lists_what_was_registered_under_the_ca(iot_client):
+    """As measured on AWS: every certificate registered with the CA's
+    ``caCertificatePem`` is listed whatever its status, newest first unless
+    ``isAscendingOrder=true``, with the four ``ListCertificates`` members. A
+    leaf the CA issued but registered through RegisterCertificateWithoutCA is
+    not listed, nor is a leaf of another CA."""
+    code = _registration_code(iot_client)
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(code, count=4)
+    other_ca_pem, other_verification_pem, other_leaf = _generate_ca_and_leaf(code)
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    other_ca_id = iot_client.register_ca_certificate(
+        caCertificate=other_ca_pem, verificationCertificate=other_verification_pem,
+        setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        for leaf_pem, status in zip(leaves[:3], ("ACTIVE", "INACTIVE", "REVOKED")):
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status=status,
+            )["certificateId"])
+        under_ca = list(created)
+        created.append(iot_client.register_certificate_without_ca(
+            certificatePem=leaves[3], status="ACTIVE",
+        )["certificateId"])
+        other = iot_client.register_certificate(
+            certificatePem=other_leaf, caCertificatePem=other_ca_pem, status="ACTIVE",
+        )["certificateId"]
+        created.append(other)
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
+        assert "nextMarker" not in listing
+        certificates = listing["certificates"]
+        assert [c["certificateId"] for c in certificates] == under_ca[::-1]
+        assert [c["status"] for c in certificates] == ["REVOKED", "INACTIVE", "ACTIVE"]
+        for c in certificates:
+            assert set(c) == {"certificateArn", "certificateId", "status", "creationDate"}
+            assert c["certificateArn"].endswith(":cert/" + c["certificateId"])
+
+        ascending = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, ascendingOrder=True
+        )["certificates"]
+        assert [c["certificateId"] for c in ascending] == under_ca
+
+        other_listing = iot_client.list_certificates_by_ca(caCertificateId=other_ca_id)
+        assert [c["certificateId"] for c in other_listing["certificates"]] == [other]
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id, other_ca_id))
+
+
+def test_iot_list_certificates_by_ca_pages_from_the_last_certificate(iot_client):
+    """``pageSize`` pages carry a ``nextMarker`` until the last one. The marker
+    names a position, the way AWS's does: continuing a descending page with
+    ``isAscendingOrder=true`` yields the certificates newer than that page's
+    last one. A CA without certificates, an id that names no CA and the
+    upper-case form of a CA id all answer an empty list."""
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+        _registration_code(iot_client), count=3
+    )
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    created = []
+    try:
+        assert iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"] == []
+        for leaf_pem in leaves:
+            created.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        seen, marker = [], None
+        for _ in range(len(created)):
+            kwargs = {"marker": marker} if marker else {}
+            page = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=1, **kwargs)
+            assert len(page["certificates"]) == 1
+            seen.append(page["certificates"][0]["certificateId"])
+            marker = page.get("nextMarker")
+            if marker:
+                assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", marker)
+        assert marker is None
+        assert seen == created[::-1]
+
+        paginator = iot_client.get_paginator("list_certificates_by_ca")
+        pages = paginator.paginate(
+            caCertificateId=ca_id, ascendingOrder=True, PaginationConfig={"PageSize": 2}
+        )
+        assert [c["certificateId"] for p in pages for c in p["certificates"]] == created
+
+        first = iot_client.list_certificates_by_ca(caCertificateId=ca_id, pageSize=2)
+        flipped = iot_client.list_certificates_by_ca(
+            caCertificateId=ca_id, pageSize=2, marker=first["nextMarker"], ascendingOrder=True
+        )
+        assert [c["certificateId"] for c in flipped["certificates"]] == [created[2]]
+
+        for unknown in ("0" * 64, ca_id.upper()):
+            assert iot_client.list_certificates_by_ca(caCertificateId=unknown)["certificates"] == []
+    finally:
+        _delete_certificates_and_cas(iot_client, created, (ca_id,))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"pageSize": 0},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value greater than or equal to 1",
+        ),
+        (
+            {"pageSize": 251},
+            "1 validation error detected: Value at 'pageSize' failed to satisfy "
+            "constraint: Member must have value less than or equal to 250",
+        ),
+        (
+            {"caCertificateId": "not-a-ca-id"},
+            "2 validation errors detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            "(0x)?[a-fA-F0-9]+; Value at 'caCertificateId' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"caCertificateId": "a" * 63},
+            "1 validation error detected: Value at 'caCertificateId' failed to "
+            "satisfy constraint: Member must have length greater than or equal to 64",
+        ),
+        (
+            {"marker": "not-a-marker!"},
+            "1 validation error detected: Value at 'marker' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            "[A-Za-z0-9+/]+={0,2}",
+        ),
+        (
+            {"marker": "bm90LWEtbWFya2Vy"},
+            "Invalid/Malformed marker passed for listCertificateByCA",
+        ),
+    ],
+    ids=["page-size-0", "page-size-251", "malformed-id", "short-id", "marker-pattern", "unissued-marker"],
+)
+def test_iot_list_certificates_by_ca_rejects_what_aws_rejects(kwargs, message):
+    """The messages AWS answers once the SDK's own validation is out of the
+    way; the base64 marker is well formed but was never issued."""
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    with pytest.raises(ClientError) as ei:
+        raw.list_certificates_by_ca(**{"caCertificateId": "0" * 64, **kwargs})
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):

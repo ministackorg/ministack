@@ -662,15 +662,18 @@ def test_eks_k3s_run_kwargs_network_optional():
     assert with_net["network"] == "ministack-net"
 
 
-def test_eks_k3s_run_kwargs_container_name_and_labels_are_region_scoped():
-    """Same-name clusters in different regions need distinct containers."""
+def test_eks_k3s_run_kwargs_container_name_and_labels_are_account_and_region_scoped():
+    """Same-name clusters in different accounts or regions need distinct containers."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    east = _k3s_run_kwargs(name="my-cluster", region="us-east-1", port=16443)
-    west = _k3s_run_kwargs(name="my-cluster", region="us-west-2", port=16444)
+    east = _k3s_run_kwargs(name="my-cluster", region="us-east-1", port=16443, account_id="111111111111")
+    west = _k3s_run_kwargs(name="my-cluster", region="us-west-2", port=16444, account_id="111111111111")
+    other = _k3s_run_kwargs(name="my-cluster", region="us-east-1", port=16445, account_id="222222222222")
 
-    assert east["name"] == "ministack-eks-us-east-1-my-cluster"
-    assert west["name"] == "ministack-eks-us-west-2-my-cluster"
+    assert east["name"] == "ministack-eks-111111111111-us-east-1-my-cluster"
+    assert west["name"] == "ministack-eks-111111111111-us-west-2-my-cluster"
+    assert other["name"] == "ministack-eks-222222222222-us-east-1-my-cluster"
+    assert other["labels"]["account_id"] == "222222222222"
     # Subset, not equality: containers also carry the ownership labels
     # (`ministack.instance` / `ministack.boot`) that scope reaping to this
     # MiniStack. This test is about region scoping, so it asserts only that.

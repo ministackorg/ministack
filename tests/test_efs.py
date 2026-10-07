@@ -1,3 +1,5 @@
+import ipaddress
+import json
 import os
 import uuid as _uuid_mod
 
@@ -339,6 +341,71 @@ def test_efs_backup_policy(efs):
     resp = efs.describe_backup_policy(FileSystemId=fs_id)
     assert resp["BackupPolicy"]["Status"] == "ENABLED"
 
+def test_efs_file_system_policy(efs):
+    policy = (
+        '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},'
+        '"Action":"elasticfilesystem:ClientMount"}]}'
+    )
+    fs_id = efs.create_file_system()["FileSystemId"]
+    with pytest.raises(ClientError) as exc:
+        efs.describe_file_system_policy(FileSystemId=fs_id)
+    assert exc.value.response["Error"]["Code"] == "PolicyNotFound"
+
+    put = efs.put_file_system_policy(FileSystemId=fs_id, Policy=policy)
+    assert put["FileSystemId"] == fs_id
+    # Id, Sid and Resource are filled in as the API reference examples show.
+    stored = json.loads(put["Policy"])
+    arn = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]["FileSystemArn"]
+    assert stored["Id"] == "1"
+    assert stored["Statement"][0]["Sid"].startswith("efs-statement-")
+    assert stored["Statement"][0]["Resource"] == arn
+    assert stored["Statement"][0]["Action"] == "elasticfilesystem:ClientMount"
+    assert efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"] == put["Policy"]
+    assert "FileSystemPolicy" not in efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+
+    efs.delete_file_system_policy(FileSystemId=fs_id)
+    with pytest.raises(ClientError) as exc:
+        efs.describe_file_system_policy(FileSystemId=fs_id)
+    assert exc.value.response["Error"]["Code"] == "PolicyNotFound"
+
+    missing = "fs-00000000000000000"
+    for call, kwargs in (
+        (efs.put_file_system_policy, {"FileSystemId": missing, "Policy": policy}),
+        (efs.describe_file_system_policy, {"FileSystemId": missing}),
+        (efs.delete_file_system_policy, {"FileSystemId": missing}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "FileSystemNotFound"
+    efs.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_availability_zone_name(efs):
+    fs = efs.create_file_system(AvailabilityZoneName="us-east-1a")
+    assert fs["AvailabilityZoneName"] == "us-east-1a"
+    desc = efs.describe_file_systems(FileSystemId=fs["FileSystemId"])["FileSystems"][0]
+    assert desc["AvailabilityZoneName"] == "us-east-1a"
+    efs.delete_file_system(FileSystemId=fs["FileSystemId"])
+
+
+def test_efs_delete_clears_lifecycle_and_backup_state():
+    from ministack.services import efs as service
+
+    service.reset()
+    try:
+        fs_id = json.loads(service._create_file_system({})[2])["FileSystemId"]
+        service._put_lifecycle_configuration(fs_id, {"LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]})
+        service._put_backup_policy(fs_id, {"BackupPolicy": {"Status": "ENABLED"}})
+        assert fs_id in service._lifecycle_configs
+        assert fs_id in service._backup_policies
+
+        assert service._delete_file_system(fs_id)[0] == 204
+        assert fs_id not in service._lifecycle_configs
+        assert fs_id not in service._backup_policies
+    finally:
+        service.reset()
+
+
 def _uid():
     return _uuid_mod.uuid4().hex[:8]
 
@@ -365,39 +432,53 @@ def test_efs_update_file_system(efs):
 
     efs.delete_file_system(FileSystemId=fs_id)
 
-def test_efs_describe_mount_target_security_groups(efs):
+def _default_vpc_security_groups(ec2, count):
+    return [
+        ec2.create_security_group(
+            GroupName=f"efs-{_uid()}", Description="efs test", VpcId="vpc-00000001")["GroupId"]
+        for _ in range(count)
+    ]
+
+
+def test_efs_describe_mount_target_security_groups(efs, ec2):
     fs = efs.create_file_system(CreationToken=f"sg-desc-{_uid()}")
     fs_id = fs["FileSystemId"]
+    groups = _default_vpc_security_groups(ec2, 2)
     mt = efs.create_mount_target(
         FileSystemId=fs_id,
         SubnetId="subnet-00000001",
-        SecurityGroups=["sg-aaa111aaa", "sg-bbb222bbb"],
+        SecurityGroups=groups,
     )
     mt_id = mt["MountTargetId"]
 
     resp = efs.describe_mount_target_security_groups(MountTargetId=mt_id)
-    assert set(resp["SecurityGroups"]) == {"sg-aaa111aaa", "sg-bbb222bbb"}
+    assert set(resp["SecurityGroups"]) == set(groups)
 
     efs.delete_mount_target(MountTargetId=mt_id)
     efs.delete_file_system(FileSystemId=fs_id)
 
-def test_efs_modify_mount_target_security_groups(efs):
+def test_efs_modify_mount_target_security_groups(efs, ec2):
     fs = efs.create_file_system(CreationToken=f"sg-mod-{_uid()}")
     fs_id = fs["FileSystemId"]
+    old, new1, new2 = _default_vpc_security_groups(ec2, 3)
     mt = efs.create_mount_target(
         FileSystemId=fs_id,
         SubnetId="subnet-00000001",
-        SecurityGroups=["sg-old111old"],
+        SecurityGroups=[old],
     )
     mt_id = mt["MountTargetId"]
 
     efs.modify_mount_target_security_groups(
         MountTargetId=mt_id,
-        SecurityGroups=["sg-new111new", "sg-new222new"],
+        SecurityGroups=[new1, new2],
     )
 
     resp = efs.describe_mount_target_security_groups(MountTargetId=mt_id)
-    assert set(resp["SecurityGroups"]) == {"sg-new111new", "sg-new222new"}
+    assert set(resp["SecurityGroups"]) == {new1, new2}
+
+    with pytest.raises(ClientError) as exc:
+        efs.modify_mount_target_security_groups(MountTargetId=mt_id, SecurityGroups=["sg-0123abcd"])
+    assert exc.value.response["Error"]["Code"] == "SecurityGroupNotFound"
 
     efs.delete_mount_target(MountTargetId=mt_id)
     efs.delete_file_system(FileSystemId=fs_id)
@@ -415,3 +496,244 @@ def test_efs_put_account_preferences(efs):
     assert pref["ResourceIdType"] == "LONG_ID"
     assert "FILE_SYSTEM" in pref["Resources"]
     assert "MOUNT_TARGET" in pref["Resources"]
+
+
+# ---------------------------------------------------------------------------
+# File system policy, protection, replication and mount target validation
+# ---------------------------------------------------------------------------
+
+_LOCKOUT_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Deny",
+        "Principal": {"AWS": "*"},
+        "Action": "elasticfilesystem:PutFileSystemPolicy",
+        "Resource": "*",
+    }],
+})
+
+
+def _error_code(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"]
+
+
+def test_efs_file_system_policy_validation_and_lockout_check(efs):
+    fs_id = efs.create_file_system()["FileSystemId"]
+    assert _error_code(efs.put_file_system_policy, FileSystemId=fs_id, Policy="not json") == "InvalidPolicyException"
+    assert _error_code(efs.put_file_system_policy, FileSystemId=fs_id, Policy="{}") == "InvalidPolicyException"
+    assert _error_code(
+        efs.put_file_system_policy, FileSystemId=fs_id, Policy=_LOCKOUT_POLICY) == "InvalidPolicyException"
+    assert _error_code(efs.describe_file_system_policy, FileSystemId=fs_id) == "PolicyNotFound"
+
+    efs.put_file_system_policy(
+        FileSystemId=fs_id, Policy=_LOCKOUT_POLICY, BypassPolicyLockoutSafetyCheck=True)
+    assert json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])["Statement"][0]["Effect"] == "Deny"
+
+    # A Deny with a condition cannot be evaluated here and is not treated as a lockout.
+    conditional = json.loads(_LOCKOUT_POLICY)
+    conditional["Statement"][0]["Condition"] = {"Bool": {"aws:SecureTransport": "false"}}
+    efs.put_file_system_policy(FileSystemId=fs_id, Policy=json.dumps(conditional))
+    efs.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_file_system_protection_defaults_and_updates(efs):
+    fs = efs.create_file_system()
+    fs_id = fs["FileSystemId"]
+    assert fs["FileSystemProtection"] == {"ReplicationOverwriteProtection": "ENABLED"}
+    described = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+    assert described["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
+
+    resp = efs.update_file_system_protection(FileSystemId=fs_id, ReplicationOverwriteProtection="DISABLED")
+    assert resp["ReplicationOverwriteProtection"] == "DISABLED"
+    described = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+    assert described["FileSystemProtection"]["ReplicationOverwriteProtection"] == "DISABLED"
+
+    assert _error_code(
+        efs.update_file_system_protection, FileSystemId=fs_id,
+        ReplicationOverwriteProtection="REPLICATING") == "BadRequest"
+    assert _error_code(
+        efs.update_file_system_protection, FileSystemId="fs-00000000000000000",
+        ReplicationOverwriteProtection="ENABLED") == "FileSystemNotFound"
+    efs.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_replication_lifecycle_in_one_region(efs):
+    source = efs.create_file_system(Encrypted=True)
+    source_id = source["FileSystemId"]
+    assert _error_code(efs.describe_replication_configurations, FileSystemId=source_id) == "ReplicationNotFound"
+    assert _error_code(efs.describe_replication_configurations, FileSystemId="fs-00000000000000000") == "FileSystemNotFound"
+    assert _error_code(efs.delete_replication_configuration, SourceFileSystemId=source_id) == "ReplicationNotFound"
+
+    config = efs.create_replication_configuration(SourceFileSystemId=source_id, Destinations=[{}])
+    destination = config["Destinations"][0]
+    destination_id = destination["FileSystemId"]
+    assert config["SourceFileSystemId"] == source_id
+    assert config["SourceFileSystemArn"] == source["FileSystemArn"]
+    assert destination["Status"] == "ENABLED"
+    assert destination["Region"] == efs.meta.region_name
+
+    target = efs.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert target["FileSystemProtection"]["ReplicationOverwriteProtection"] == "REPLICATING"
+    assert target["Encrypted"] is True
+
+    by_source = efs.describe_replication_configurations(FileSystemId=source_id)["Replications"]
+    by_destination = efs.describe_replication_configurations(FileSystemId=destination_id)["Replications"]
+    assert by_source == by_destination and by_source[0]["SourceFileSystemId"] == source_id
+    assert source_id in {r["SourceFileSystemId"] for r in efs.describe_replication_configurations()["Replications"]}
+
+    # One configuration per file system, as source or destination; both are undeletable meanwhile.
+    assert _error_code(
+        efs.create_replication_configuration, SourceFileSystemId=source_id, Destinations=[{}]) == "BadRequest"
+    assert _error_code(
+        efs.create_replication_configuration, SourceFileSystemId=destination_id, Destinations=[{}]) == "BadRequest"
+    assert _error_code(efs.delete_file_system, FileSystemId=source_id) == "FileSystemInUse"
+    assert _error_code(efs.delete_file_system, FileSystemId=destination_id) == "FileSystemInUse"
+    assert _error_code(
+        efs.update_file_system_protection, FileSystemId=destination_id,
+        ReplicationOverwriteProtection="ENABLED") == "ReplicationAlreadyExists"
+    assert _error_code(
+        efs.delete_replication_configuration, SourceFileSystemId=source_id,
+        DeletionMode="LOCAL_CONFIGURATION_ONLY") == "BadRequest"
+
+    efs.delete_replication_configuration(SourceFileSystemId=source_id)
+    assert _error_code(efs.describe_replication_configurations, FileSystemId=source_id) == "ReplicationNotFound"
+    target = efs.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert target["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
+    efs.delete_file_system(FileSystemId=source_id)
+    efs.delete_file_system(FileSystemId=destination_id)
+
+
+def test_efs_replication_to_another_region_and_existing_destination():
+    east = _efs_client("us-east-1")
+    west = _efs_client("us-west-2")
+    source_id = east.create_file_system()["FileSystemId"]
+    config = east.create_replication_configuration(
+        SourceFileSystemId=source_id, Destinations=[{"Region": "us-west-2"}])
+    destination_id = config["Destinations"][0]["FileSystemId"]
+    try:
+        assert config["SourceFileSystemRegion"] == "us-east-1"
+        assert config["Destinations"][0]["Region"] == "us-west-2"
+        # The destination lives in its own region and sees the configuration from there.
+        assert west.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0][
+            "FileSystemProtection"]["ReplicationOverwriteProtection"] == "REPLICATING"
+        assert west.describe_replication_configurations(
+            FileSystemId=destination_id)["Replications"][0]["SourceFileSystemId"] == source_id
+    finally:
+        east.delete_replication_configuration(SourceFileSystemId=source_id)
+
+    # An existing destination needs overwrite protection DISABLED, and may not be less encrypted.
+    other_id = east.create_file_system()["FileSystemId"]
+    assert _error_code(
+        east.create_replication_configuration, SourceFileSystemId=other_id,
+        Destinations=[{"FileSystemId": destination_id, "Region": "us-west-2"}]) == "BadRequest"
+    west.update_file_system_protection(FileSystemId=destination_id, ReplicationOverwriteProtection="DISABLED")
+    encrypted_id = east.create_file_system(Encrypted=True)["FileSystemId"]
+    assert _error_code(
+        east.create_replication_configuration, SourceFileSystemId=encrypted_id,
+        Destinations=[{"FileSystemId": destination_id, "Region": "us-west-2"}]) == "ConflictException"
+    east.create_replication_configuration(
+        SourceFileSystemId=other_id, Destinations=[{"FileSystemId": destination_id, "Region": "us-west-2"}])
+    east.delete_replication_configuration(SourceFileSystemId=other_id)
+
+    for client, fs_id in ((east, source_id), (east, other_id), (east, encrypted_id), (west, destination_id)):
+        client.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_mount_target_validates_subnet_security_groups_and_zone(efs, ec2):
+    fs_id = efs.create_file_system()["FileSystemId"]
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-0123abcd") == "SubnetNotFound"
+    assert _error_code(
+        efs.create_mount_target, FileSystemId="fs-00000000000000000",
+        SubnetId="subnet-00000001") == "FileSystemNotFound"
+
+    other_vpc = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]["VpcId"]
+    foreign_group = ec2.create_security_group(
+        GroupName=f"efs-{_uid()}", Description="other vpc", VpcId=other_vpc)["GroupId"]
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-00000001",
+        SecurityGroups=[foreign_group]) == "SecurityGroupNotFound"
+
+    # No security group given: the subnet's VPC default group.
+    mt = efs.create_mount_target(FileSystemId=fs_id, SubnetId="subnet-00000001")
+    assert efs.describe_mount_target_security_groups(MountTargetId=mt["MountTargetId"])["SecurityGroups"] == [
+        "sg-00000001"]
+    assert mt["VpcId"] == "vpc-00000001"
+    assert mt["AvailabilityZoneName"].endswith("a")
+    assert mt["AvailabilityZoneId"]
+    assert mt["NetworkInterfaceId"].startswith("eni-") and "[" not in mt["NetworkInterfaceId"]
+    assert ipaddress.ip_address(mt["IpAddress"]) in ipaddress.ip_network("172.31.0.0/20")
+    assert "Ipv6Address" not in mt
+
+    # One mount target per Availability Zone; a second subnet in another zone is fine.
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-00000001") == "MountTargetConflict"
+    second = efs.create_mount_target(FileSystemId=fs_id, SubnetId="subnet-00000002")
+    assert second["AvailabilityZoneName"].endswith("b")
+
+    # A One Zone file system takes only its own zone.
+    one_zone = efs.create_file_system(AvailabilityZoneName=mt["AvailabilityZoneName"])
+    assert one_zone["AvailabilityZoneName"] == mt["AvailabilityZoneName"]
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=one_zone["FileSystemId"],
+        SubnetId="subnet-00000002") == "AvailabilityZonesMismatch"
+
+    for mount_target in (mt, second):
+        efs.delete_mount_target(MountTargetId=mount_target["MountTargetId"])
+    for file_system in (fs_id, one_zone["FileSystemId"]):
+        efs.delete_file_system(FileSystemId=file_system)
+
+
+def test_efs_mount_target_ip_addresses(efs, ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.1.0/29")["Subnet"]["SubnetId"]
+    file_systems = [efs.create_file_system()["FileSystemId"] for _ in range(4)]
+    created = []
+    try:
+        # The first four addresses and the last are reserved, so a /29 holds three mount targets.
+        for fs_id in file_systems[:3]:
+            created.append(efs.create_mount_target(FileSystemId=fs_id, SubnetId=subnet_id))
+        assert [mt["IpAddress"] for mt in created] == ["10.78.1.4", "10.78.1.5", "10.78.1.6"]
+        assert _error_code(
+            efs.create_mount_target, FileSystemId=file_systems[3],
+            SubnetId=subnet_id) == "NoFreeAddressesInSubnet"
+        assert _error_code(
+            efs.create_mount_target, FileSystemId=file_systems[3], SubnetId=subnet_id,
+            IpAddress="10.78.1.5") == "IpAddressInUse"
+        assert _error_code(
+            efs.create_mount_target, FileSystemId=file_systems[3], SubnetId=subnet_id,
+            IpAddress="10.99.1.5") == "BadRequest"
+    finally:
+        for mt in created:
+            efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
+        for fs_id in file_systems:
+            efs.delete_file_system(FileSystemId=fs_id)
+
+    # An address in range is taken as given.
+    fs_id = efs.create_file_system()["FileSystemId"]
+    mt = efs.create_mount_target(FileSystemId=fs_id, SubnetId="subnet-00000003", IpAddress="172.31.32.200")
+    assert mt["IpAddress"] == "172.31.32.200"
+    efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
+    efs.delete_file_system(FileSystemId=fs_id)
+
+
+def test_efs_mount_target_ip_address_type_must_match_the_subnet(efs):
+    fs_id = efs.create_file_system()["FileSystemId"]
+    # The default subnets have no IPv6 CIDR block, so the IPv6 types do not match them.
+    for address_type in ("IPV6_ONLY", "DUAL_STACK"):
+        assert _error_code(
+            efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-00000001",
+            IpAddressType=address_type) == "BadRequest"
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-00000001",
+        IpAddressType="IPV4_ONLY", Ipv6Address="2001:db8::10") == "BadRequest"
+    assert _error_code(
+        efs.create_mount_target, FileSystemId=fs_id, SubnetId="subnet-00000001",
+        IpAddressType="IPV6_ONLY", IpAddress="172.31.0.9") == "BadRequest"
+    mt = efs.create_mount_target(
+        FileSystemId=fs_id, SubnetId="subnet-00000001", IpAddressType="IPV4_ONLY")
+    assert "Ipv6Address" not in mt
+    efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
+    efs.delete_file_system(FileSystemId=fs_id)

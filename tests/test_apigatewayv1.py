@@ -2309,6 +2309,17 @@ def test_apigwv1_update_api_key(apigw_v1):
     assert isinstance(resp["lastUpdatedDate"], datetime.datetime)
     apigw_v1.delete_api_key(apiKey=key_id)
 
+def test_apigwv1_get_api_keys_filters_by_name_query(apigw_v1):
+    """GetApiKeys with nameQuery returns only the keys whose names start with it."""
+    key_ids = [
+        apigw_v1.create_api_key(name=name)["id"]
+        for name in ("v1-namequery-other", "v1-namequery-target", "v1-namequery-target-2")
+    ]
+    resp = apigw_v1.get_api_keys(nameQuery="v1-namequery-target")
+    assert sorted(item["name"] for item in resp["items"]) == ["v1-namequery-target", "v1-namequery-target-2"]
+    for key_id in key_ids:
+        apigw_v1.delete_api_key(apiKey=key_id)
+
 def test_apigwv1_update_usage_plan(apigw_v1):
     """UpdateUsagePlan updates name via patchOperations."""
     plan_id = apigw_v1.create_usage_plan(name="v1-plan-update-before")["id"]
@@ -5320,3 +5331,186 @@ def test_apigwv1_request_validator_crud(apigw_v1):
         assert exc.value.response["Error"]["Code"] == "NotFoundException"
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _sqs_api(apigw_v1, queue_name, *, path_part="send", account="000000000000",
+             region="us-east-1", request_templates=None,
+             integration_responses=None, passthrough=None):
+    """REST API with POST /<path_part> backed by a non-proxy AWS integration
+    pointing at ``sqs:path/{account}/{queue_name}`` (#2045)."""
+    api_id, root = _gw_api(apigw_v1, f"gwsqs-{_uuid_mod.uuid4().hex[:8]}")
+    resource = apigw_v1.create_resource(
+        restApiId=api_id, parentId=root, pathPart=path_part)["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource,
+                        httpMethod="POST", authorizationType="NONE")
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=resource,
+                                 httpMethod="POST", statusCode="200")
+    kwargs = {}
+    if passthrough:
+        kwargs["passthroughBehavior"] = passthrough
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource, httpMethod="POST", type="AWS",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:{region}:sqs:path/{account}/{queue_name}",
+        credentials=f"arn:aws:iam::{account}:role/apigw-sqs",
+        requestParameters={
+            "integration.request.header.Content-Type":
+                "'application/x-www-form-urlencoded'"},
+        requestTemplates=request_templates or {},
+        **kwargs)
+    for status_code, extra in (integration_responses or {}).items():
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=resource, httpMethod="POST",
+            statusCode=status_code, **extra)
+    apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+    return api_id
+
+
+def test_apigwv1_execute_sqs_integration_delivers_message(apigw_v1, sqs):
+    """#2045 repro: AWS -> sqs:path renders the request template, sends the
+    message, and flows the reply through the integration response."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={
+            "application/json":
+                "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={"200": {
+            "responseTemplates": {"application/json": '{"message":"accepted"}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"hello":"world"}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        assert json.loads(text) == {"message": "accepted"}
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ['{"hello":"world"}']
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_vtl_subset(apigw_v1, sqs):
+    """$input.json / $input.params render inside the request template."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={
+            "application/json":
+                "Action=SendMessage"
+                "&MessageBody=$util.urlEncode($input.json('$.msg'))"
+                "-$input.params('tenant')"},
+        integration_responses={"200": {}})
+    try:
+        status, _ = _stage_call(
+            api_id, "/send?tenant=blue", method="POST",
+            body='{"msg":"hi there"}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ["hi there-blue"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_passthrough(apigw_v1, sqs):
+    """No matching request template: the body passes through as the Query
+    call itself (WHEN_NO_MATCH default)."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=x"},
+        integration_responses={"200": {}})
+    try:
+        status, _ = _stage_call(
+            api_id, "/send", method="POST",
+            body="Action=SendMessage&MessageBody=raw-form-body",
+            headers=[("Content-Type", "application/x-www-form-urlencoded")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ["raw-form-body"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_backend_errors_map(apigw_v1, sqs):
+    """selectionPattern matches the backend status code; unmatched statuses
+    land on the default (patternless) response."""
+    missing = f"missing-q-{_uuid_mod.uuid4().hex[:8]}"
+    api_id = _sqs_api(
+        apigw_v1, missing,
+        request_templates={
+            "application/json":
+                "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={
+            "200": {"responseTemplates": {"application/json": '{"ok":true}'}},
+            "502": {"selectionPattern": "400",
+                    "responseTemplates": {"application/json": '{"ok":false}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"x":1}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 502
+        assert json.loads(text) == {"ok": False}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+    # No pattern matches the MissingAction 400: the default response absorbs it.
+    api_id = _sqs_api(
+        apigw_v1, missing,
+        request_templates={"application/json": "Action=&MessageBody=x"},
+        integration_responses={
+            "200": {"responseTemplates": {"application/json": '{"ok":true}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"x":1}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        assert json.loads(text) == {"ok": True}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_execute_sqs_integration_send_message_reply_is_json(apigw_v1, sqs):
+    """The SendMessage reply reaches the response template as SQS's JSON envelope."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={"200": {"responseTemplates": {
+            "application/json": "$input.path('$.SendMessageResponse.SendMessageResult.MessageId')"}}})
+    try:
+        status, text = _stage_call(api_id, "/send", method="POST", body='{"a":1}',
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1)["Messages"]
+        assert text == msgs[0]["MessageId"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_without_integration_responses_is_500(apigw_v1, sqs):
+    """No integration response to map the reply: AWS answers 500 Internal server error."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=x"})
+    try:
+        status, text = _stage_call(api_id, "/send", method="POST", body="{}",
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 500
+        assert json.loads(text) == {"message": "Internal server error"}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)

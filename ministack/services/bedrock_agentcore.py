@@ -11,7 +11,21 @@ Covers the two AgentCore services, which both sign as ``bedrock-agentcore``:
     ListAgentRuntimeEndpoints, UpdateAgentRuntimeEndpoint,
     DeleteAgentRuntimeEndpoint, PutResourcePolicy, GetResourcePolicy,
     DeleteResourcePolicy.
-  * ``bedrock-agentcore`` (rest-json) — data plane: InvokeAgentRuntime.
+  * ``bedrock-agentcore`` (rest-json) — data plane: InvokeAgentRuntime and
+    the short-term/long-term Memory data plane: CreateEvent, GetEvent,
+    ListEvents, DeleteEvent, ListActors, ListSessions,
+    BatchCreateMemoryRecords, BatchUpdateMemoryRecords,
+    BatchDeleteMemoryRecords, GetMemoryRecord, ListMemoryRecords,
+    DeleteMemoryRecord, RetrieveMemoryRecords, StartMemoryExtractionJob,
+    ListMemoryExtractionJobs.
+
+Memory notes: events are recorded verbatim per (actor, session) with branch
+and metadata filtering; extraction behind memory strategies does not run (the
+control plane records strategies only), so long-term records exist only where
+BatchCreateMemoryRecords puts them. RetrieveMemoryRecords has no embeddings
+here: it scores records by the fraction of the search query's lowercase word
+tokens present in the record text, drops zero-overlap records, and orders by
+score.
 
 Deterministic and stateful: resources provision instantly (``READY``) and
 InvokeAgentRuntime returns a deterministic echo response, so teams can test
@@ -59,6 +73,9 @@ logger = logging.getLogger("bedrock_agentcore")
 _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
 _resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
+_memories = AccountRegionScopedDict()    # memoryId -> memory record
+_memory_events = AccountRegionScopedDict()   # memoryId -> {actorId -> {sessionId -> session}}
+_memory_records = AccountRegionScopedDict()  # memoryId -> {memoryRecordId -> record}
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
 
@@ -72,6 +89,9 @@ def get_state():
         "runtimes": _runtimes,
         "endpoints": _endpoints,
         "resourcePolicies": _resource_policies,
+        "memories": _memories,
+        "memoryEvents": _memory_events,
+        "memoryRecords": _memory_records,
     })
 
 
@@ -85,9 +105,15 @@ def _restore_state(data):
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
+    _memory_events.clear()
+    _memory_records.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
+    _memories.update(data.get("memories", {}))
+    _memory_events.update(data.get("memoryEvents", {}))
+    _memory_records.update(data.get("memoryRecords", {}))
     _migrate_legacy_arns()
     # Backfill one snapshot for state written before version history existed.
     for runtime in _runtimes._data.values():
@@ -127,6 +153,9 @@ def reset():
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
+    _memory_events.clear()
+    _memory_records.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +369,919 @@ def _paginate_agentcore_results(items, query_params):
             str(offset + limit).encode()
         ).decode().rstrip("=")
     return page, None
+
+
+def _memory_arn(memory_id):
+    return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
+            f"memory/{memory_id}")
+
+
+def _memory_public_record(record):
+    return {key: copy.deepcopy(value) for key, value in record.items()
+            if not key.startswith("_")}
+
+
+_MEMORY_ID_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}")
+
+# MemoryStrategyInput union member -> MemoryStrategyType.
+_MEMORY_STRATEGY_TYPES = {
+    "semanticMemoryStrategy": "SEMANTIC",
+    "summaryMemoryStrategy": "SUMMARIZATION",
+    "userPreferenceMemoryStrategy": "USER_PREFERENCE",
+    "customMemoryStrategy": "CUSTOM",
+    "episodicMemoryStrategy": "EPISODIC",
+}
+
+
+def _memory_strategies(inputs, now):
+    """MemoryStrategy records for a MemoryStrategyInputList, or an error response."""
+    if not isinstance(inputs, list):
+        return None, _validation("memoryStrategies must be a list")
+    strategies = []
+    for item in inputs:
+        members = [key for key in item if key in _MEMORY_STRATEGY_TYPES] if isinstance(item, dict) else []
+        if len(members) != 1 or len(item) != 1:
+            return None, _validation("Each memory strategy must set exactly one strategy type")
+        spec = item[members[0]]
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+            return None, _validation("Memory strategy name is invalid")
+        strategy = {
+            "strategyId": _resource_id(name),
+            "name": name,
+            "type": _MEMORY_STRATEGY_TYPES[members[0]],
+            "namespaces": copy.deepcopy(spec.get("namespaces", [])),
+            "namespaceTemplates": copy.deepcopy(spec.get("namespaceTemplates", [])),
+            "status": "ACTIVE",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        for field in ("description", "memoryRecordSchema"):
+            if field in spec:
+                strategy[field] = copy.deepcopy(spec[field])
+        strategies.append(strategy)
+    return strategies, None
+
+
+def _modify_memory_strategies(record, changes, now):
+    """Apply ModifyMemoryStrategies to a copy of the record's strategies."""
+    if not isinstance(changes, dict):
+        return None, _validation("memoryStrategies must be an object")
+    strategies = copy.deepcopy(record.get("strategies", []))
+    by_id = {strategy["strategyId"]: strategy for strategy in strategies}
+    for item in changes.get("deleteMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        strategies.remove(by_id.pop(strategy_id))
+    for item in changes.get("modifyMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        for field in ("description", "namespaces", "namespaceTemplates", "memoryRecordSchema"):
+            if field in item:
+                by_id[strategy_id][field] = copy.deepcopy(item[field])
+        by_id[strategy_id]["updatedAt"] = now
+    added, error = _memory_strategies(changes.get("addMemoryStrategies") or [], now)
+    if error:
+        return None, error
+    return strategies + added, None
+
+
+def _memory_page(items, data, default=20):
+    query = {"maxResults": data.get("maxResults", default)}
+    if "nextToken" in data:
+        query["nextToken"] = data["nextToken"]
+    return _paginate_agentcore_results(items, query)
+
+
+def _create_memory(body):
+    data = _parse_body(body)
+    name = data.get("name")
+    duration = data.get("eventExpiryDuration")
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        return _validation("name must start with a letter and contain only letters, digits, and underscores")
+    if any(memory.get("name") == name for memory in _memories.values()):
+        return _conflict(f"A memory with name '{name}' already exists")
+    if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+        return _validation("eventExpiryDuration must be an integer from 3 to 365")
+    tags = data.get("tags") or {}
+    if not isinstance(tags, dict) or len(tags) > 50:
+        return _validation("tags must be a map of at most 50 entries")
+    now = int(time.time())
+    # Strategies are recorded; no extraction runs behind them.
+    strategies, error = _memory_strategies(data.get("memoryStrategies") or [], now)
+    if error:
+        return error
+
+    memory_id = _resource_id(name)
+    record = {
+        "id": memory_id,
+        "arn": _memory_arn(memory_id),
+        "name": name,
+        "eventExpiryDuration": duration,
+        "status": "ACTIVE",
+        "createdAt": now,
+        "updatedAt": now,
+        "strategies": strategies,
+        "_tags": copy.deepcopy(tags),
+    }
+    for field in ("description", "encryptionKeyArn", "memoryExecutionRoleArn",
+                  "indexedKeys", "namespaceKeys", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    _memories[memory_id] = record
+
+    response = _memory_public_record(record)
+    response["status"] = "CREATING"
+    return json_response({"memory": response}, 202)
+
+
+def _get_memory(memory_id, query_params):
+    record = _memories.get(memory_id)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    view = _agentcore_query_value(query_params, "view", "full")
+    if view not in ("full", "without_decryption"):
+        return _validation("view must be 'full' or 'without_decryption'")
+    return json_response({"memory": _memory_public_record(record)})
+
+
+def _list_memories(body):
+    data = _parse_body(body)
+    items = [{key: record[key] for key in (
+        "arn", "createdAt", "id", "status", "updatedAt"
+    ) if key in record} for record in _memories.values()]
+    page, error = _memory_page(items, data, default=10)
+    if error:
+        return error
+    return json_response({
+        "memories": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _update_memory(memory_id, body):
+    record = _memories.get(memory_id)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    data = _parse_body(body)
+    now = int(time.time())
+    if "eventExpiryDuration" in data:
+        duration = data["eventExpiryDuration"]
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+            return _validation("eventExpiryDuration must be an integer from 3 to 365")
+    if "memoryStrategies" in data:
+        strategies, error = _modify_memory_strategies(record, data["memoryStrategies"], now)
+        if error:
+            return error
+        record["strategies"] = strategies
+    if "eventExpiryDuration" in data:
+        record["eventExpiryDuration"] = data["eventExpiryDuration"]
+    if "description" in data:
+        record["description"] = data["description"]
+    for field in ("memoryExecutionRoleArn", "namespaceKeys", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    if data.get("addIndexedKeys"):
+        existing = {item.get("key") for item in record.get("indexedKeys", [])}
+        record.setdefault("indexedKeys", []).extend(
+            copy.deepcopy(item) for item in data["addIndexedKeys"]
+            if item.get("key") not in existing
+        )
+    record["updatedAt"] = now
+    response = _memory_public_record(record)
+    response["status"] = "UPDATING"
+    return json_response({"memory": response}, 202)
+
+
+def _delete_memory(memory_id):
+    record = _memories.pop(memory_id, None)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    _memory_events.pop(memory_id, None)
+    _memory_records.pop(memory_id, None)
+    return json_response({"memoryId": memory_id, "status": "DELETING"}, 202)
+
+
+# ---------------------------------------------------------------------------
+# Memory data plane (bedrock-agentcore)
+# ---------------------------------------------------------------------------
+
+_ACTOR_ID_RE = re.compile(
+    r"[a-zA-Z0-9][a-zA-Z0-9-_/]*(?::[a-zA-Z0-9-_/]+)*[a-zA-Z0-9-_/]*")
+_SESSION_ID_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9-_]*")
+_EVENT_ID_RE = re.compile(r"[0-9]+#[a-fA-F0-9]+")
+_NAMESPACE_RE = re.compile(
+    r"[a-zA-Z0-9/*][a-zA-Z0-9-_/*]*(?::[a-zA-Z0-9-_/*]+)*[a-zA-Z0-9-_/*]*")
+_RECORD_ID_RE = re.compile(r"mem-[a-zA-Z0-9-_]*")
+_REQUEST_ID_RE = re.compile(r"[a-zA-Z0-9_-]+")
+
+_PAYLOAD_UNION_KEYS = ("conversational", "blob", "json")
+
+
+def _mem_get(store, key, scope, default=None):
+    return store.get_scoped(*scope, key, default) if scope else store.get(key, default)
+
+
+def _mem_set(store, key, scope, value):
+    if scope:
+        store.set_scoped(*scope, key, value)
+    else:
+        store[key] = value
+
+
+def _resolve_memory(raw_id):
+    """(memory_id, owner_scope, error) for a path ``memoryId``.
+
+    The path label accepts the bare id or the full resource ARN; with an ARN
+    the memory and its data live under the ARN owner's account and region."""
+    memory_id = unquote(raw_id)
+    scope = None
+    if ":memory/" in memory_id:
+        scope = _arn_owner(memory_id)
+        from ministack.app import AUTH
+        if AUTH and scope and scope[0] != get_account_id():
+            # Memory takes no resource policy, so no other account is granted.
+            return None, None, error_response_json(
+                "AccessDeniedException",
+                f"User is not authorized to access memory {memory_id}", 403)
+        memory_id = memory_id.rsplit(":memory/", 1)[1]
+    if not _MEMORY_ID_RE.fullmatch(memory_id):
+        return None, None, _validation(
+            f"1 validation error detected: Value '{memory_id}' at 'memoryId' "
+            f"failed to satisfy constraint: Member must satisfy regular "
+            f"expression pattern: {_MEMORY_ID_RE.pattern}")
+    record = (_memories.get_scoped(*scope, memory_id) if scope
+              else _memories.get(memory_id))
+    if record is None:
+        return None, None, _not_found(f"Memory '{memory_id}' not found")
+    return memory_id, scope, None
+
+
+def _public_event(event):
+    return {key: copy.deepcopy(value) for key, value in event.items()
+            if not key.startswith("_")}
+
+
+def _events_bucket(memory_id, scope):
+    return _mem_get(_memory_events, memory_id, scope, {})
+
+
+def _create_event(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    actor_id = data.get("actorId")
+    if not isinstance(actor_id, str) or not _ACTOR_ID_RE.fullmatch(actor_id):
+        return _validation(
+            f"1 validation error detected: Value '{actor_id}' at 'actorId' "
+            f"failed to satisfy constraint: Member must satisfy regular "
+            f"expression pattern: {_ACTOR_ID_RE.pattern}")
+    session_id = data.get("sessionId")
+    if session_id is None:
+        session_id = f"session-{_rand_suffix()}"
+    if (not isinstance(session_id, str)
+            or not _SESSION_ID_RE.fullmatch(session_id)):
+        return _validation(
+            f"1 validation error detected: Value '{session_id}' at "
+            f"'sessionId' failed to satisfy constraint: Member must satisfy "
+            f"regular expression pattern: {_SESSION_ID_RE.pattern}")
+    if "eventTimestamp" not in data:
+        return _validation("eventTimestamp is required")
+    payload = data.get("payload")
+    if not isinstance(payload, list) or not payload:
+        return _validation("payload must be a non-empty list")
+    for item in payload:
+        if (not isinstance(item, dict) or len(item) != 1
+                or next(iter(item)) not in _PAYLOAD_UNION_KEYS):
+            return _validation(
+                "payload entries must set exactly one of conversational, "
+                "blob, or json")
+
+    bucket = _events_bucket(memory_id, scope)
+    token = data.get("clientToken")
+    if isinstance(token, str) and token:
+        for sessions in bucket.values():
+            for session in sessions.values():
+                for existing in session["events"]:
+                    if existing.get("_clientToken") == token:
+                        return json_response({"event": _public_event(existing)}, 201)
+
+    session = bucket.setdefault(actor_id, {}).get(session_id)
+    if session is None:
+        session = {"createdAt": int(time.time()), "nextSeq": 0, "events": []}
+        bucket[actor_id][session_id] = session
+    session["nextSeq"] += 1
+    event = {
+        "memoryId": memory_id,
+        "actorId": actor_id,
+        "sessionId": session_id,
+        "eventId": f"{session['nextSeq']}#{secrets.token_hex(8)}",
+        "eventTimestamp": data["eventTimestamp"],
+        "payload": copy.deepcopy(payload),
+        "_createdAt": time.time(),
+        "_seq": session["nextSeq"],
+    }
+    for field in ("branch", "metadata"):
+        if field in data:
+            event[field] = copy.deepcopy(data[field])
+    if isinstance(token, str) and token:
+        event["_clientToken"] = token
+    session["events"].append(event)
+    _mem_set(_memory_events, memory_id, scope, bucket)
+    return json_response({"event": _public_event(event)}, 201)
+
+
+def _find_event(memory_id, scope, actor_id, session_id, event_id):
+    bucket = _events_bucket(memory_id, scope)
+    session = bucket.get(actor_id, {}).get(session_id)
+    if session is None:
+        return None
+    for event in session["events"]:
+        if event["eventId"] == event_id:
+            return event
+    return None
+
+
+def _get_event(raw_memory_id, actor_id, session_id, event_id):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    event = _find_event(memory_id, scope, unquote(actor_id),
+                        unquote(session_id), unquote(event_id))
+    if event is None:
+        return _not_found(f"Event '{unquote(event_id)}' not found")
+    return json_response({"event": _public_event(event)})
+
+
+def _delete_event(raw_memory_id, actor_id, session_id, event_id):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    actor_id, session_id, event_id = (
+        unquote(actor_id), unquote(session_id), unquote(event_id))
+    bucket = _events_bucket(memory_id, scope)
+    session = bucket.get(actor_id, {}).get(session_id)
+    events = [] if session is None else session["events"]
+    remaining = [event for event in events if event["eventId"] != event_id]
+    if len(remaining) == len(events):
+        return _not_found(f"Event '{event_id}' not found")
+    session["events"] = remaining
+    _mem_set(_memory_events, memory_id, scope, bucket)
+    return json_response({"eventId": event_id})
+
+
+def _event_metadata_matches(metadata, expressions):
+    for expression in expressions:
+        key = (expression.get("left") or {}).get("metadataKey")
+        operator = expression.get("operator")
+        present = key in metadata
+        if operator == "EXISTS":
+            if not present:
+                return False
+        elif operator == "NOT_EXISTS":
+            if present:
+                return False
+        elif operator == "EQUALS_TO":
+            right = ((expression.get("right") or {}).get("metadataValue")
+                     or {}).get("stringValue")
+            if not present or (metadata[key] or {}).get("stringValue") != right:
+                return False
+        else:
+            return False
+    return True
+
+
+def _list_events(raw_memory_id, actor_id, session_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    bucket = _events_bucket(memory_id, scope)
+    session = bucket.get(unquote(actor_id), {}).get(unquote(session_id))
+    events = list(session["events"]) if session else []
+
+    branch = (data.get("filter") or {}).get("branch")
+    if branch and branch.get("name"):
+        name = branch["name"]
+        if branch.get("includeParentBranches"):
+            by_id = {event["eventId"]: event for event in events}
+            keep = set()
+            for event in events:
+                if (event.get("branch") or {}).get("name") != name:
+                    continue
+                keep.add(event["eventId"])
+                root = (event.get("branch") or {}).get("rootEventId")
+                while root in by_id and root not in keep:
+                    keep.add(root)
+                    root = (by_id[root].get("branch") or {}).get("rootEventId")
+            events = [event for event in events if event["eventId"] in keep]
+        else:
+            events = [event for event in events
+                      if (event.get("branch") or {}).get("name") == name]
+    expressions = (data.get("filter") or {}).get("eventMetadata") or []
+    if expressions:
+        events = [event for event in events
+                  if _event_metadata_matches(event.get("metadata") or {},
+                                             expressions)]
+
+    include_payloads = data.get("includePayloads") is not False
+    items = []
+    for event in events:
+        public = _public_event(event)
+        if not include_payloads:
+            public.pop("payload", None)
+        items.append(public)
+    page, error = _memory_page(items, data)
+    if error:
+        return error
+    return json_response({
+        "events": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _list_actors(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    items = [{"actorId": actor_id}
+             for actor_id in _events_bucket(memory_id, scope)]
+    page, error = _memory_page(items, data)
+    if error:
+        return error
+    return json_response({
+        "actorSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _list_sessions(raw_memory_id, actor_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    actor_id = unquote(actor_id)
+    sessions = _events_bucket(memory_id, scope).get(actor_id, {})
+    only_with_events = (
+        (data.get("filter") or {}).get("eventFilter") == "HAS_EVENTS")
+    items = [
+        {"sessionId": session_id, "actorId": actor_id,
+         "createdAt": session["createdAt"]}
+        for session_id, session in sessions.items()
+        if session["events"] or not only_with_events
+    ]
+    page, error = _memory_page(items, data)
+    if error:
+        return error
+    return json_response({
+        "sessionSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+# --- long-term memory records ----------------------------------------------
+
+def _record_id():
+    return "mem-" + "".join(
+        secrets.choice(string.ascii_letters + string.digits + "-_")
+        for _ in range(40))
+
+
+def _records_bucket(memory_id, scope):
+    return _mem_get(_memory_records, memory_id, scope, {})
+
+
+def _record_summary(record, score=None):
+    summary = {key: copy.deepcopy(value) for key, value in record.items()
+               if not key.startswith("_")}
+    if score is not None:
+        summary["score"] = score
+    return summary
+
+
+def _namespace_matches(pattern, namespaces):
+    if not pattern:
+        return True
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
+    return any(re.match(regex, namespace or "")
+               for namespace in namespaces)
+
+
+def _ts_value(value):
+    """Comparable epoch float for a metadata timestamp, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _meta_scalar(value):
+    """A MemoryRecordMetadataValue union member reduced to a python value."""
+    if not isinstance(value, dict):
+        return None
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "stringListValue" in value:
+        return value["stringListValue"]
+    if "numberValue" in value:
+        return value["numberValue"]
+    if "dateTimeValue" in value:
+        return _ts_value(value["dateTimeValue"])
+    return None
+
+
+def _compare_meta(left, right, operator):
+    if left is None or right is None:
+        return False
+    if operator == "EQUALS_TO":
+        if isinstance(left, list):
+            return right in left or left == right
+        return left == right
+    if operator == "CONTAINS":
+        if isinstance(left, str) and isinstance(right, str):
+            return right in left
+        if isinstance(left, list):
+            return right in left
+        return False
+    left_ts, right_ts = _ts_value(left), _ts_value(right)
+    if isinstance(left, (int, float)) and not isinstance(left, bool) \
+            and isinstance(right, (int, float)) and not isinstance(right, bool):
+        left_ts, right_ts = float(left), float(right)
+    if left_ts is None or right_ts is None:
+        return False
+    if operator == "BEFORE":
+        return left_ts < right_ts
+    if operator == "AFTER":
+        return left_ts > right_ts
+    if operator == "GREATER_THAN":
+        return left_ts > right_ts
+    if operator == "GREATER_THAN_OR_EQUALS":
+        return left_ts >= right_ts
+    if operator == "LESS_THAN":
+        return left_ts < right_ts
+    if operator == "LESS_THAN_OR_EQUALS":
+        return left_ts <= right_ts
+    return False
+
+
+def _metadata_filters_match(metadata, expressions):
+    for expression in expressions:
+        if not isinstance(expression, dict):
+            return False
+        key = (expression.get("left") or {}).get("metadataKey")
+        operator = expression.get("operator")
+        present = key in metadata
+        if operator == "EXISTS":
+            if not present:
+                return False
+            continue
+        if operator == "NOT_EXISTS":
+            if present:
+                return False
+            continue
+        right = _meta_scalar(
+            (expression.get("right") or {}).get("metadataValue"))
+        if not present or not _compare_meta(
+                _meta_scalar(metadata.get(key)), right, operator):
+            return False
+    return True
+
+
+def _valid_namespaces(namespaces):
+    return (isinstance(namespaces, list) and len(namespaces) <= 1
+            and all(isinstance(ns, str) and _NAMESPACE_RE.fullmatch(ns)
+                    for ns in namespaces))
+
+
+def _batch_result(record_id, status, request_id=None, error=None):
+    result = {"memoryRecordId": record_id, "status": status}
+    if request_id is not None:
+        result["requestIdentifier"] = request_id
+    if error:
+        result["errorCode"] = 400
+        result["errorMessage"] = error
+    return result
+
+
+def _batch_create_memory_records(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    entries = data.get("records")
+    if not isinstance(entries, list) or not entries:
+        return _validation("records must be a non-empty list")
+    bucket = dict(_records_bucket(memory_id, scope))
+    succeeded, failed = [], []
+    for entry in entries:
+        request_id = entry.get("requestIdentifier") if isinstance(entry, dict) else None
+        record_id = _record_id()
+        problem = None
+        if not isinstance(entry, dict):
+            problem = "record must be an object"
+        elif not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
+            problem = "requestIdentifier must match pattern [a-zA-Z0-9_-]+"
+        elif not _valid_namespaces(entry.get("namespaces")):
+            problem = "namespaces must be a list of at most one valid namespace"
+        elif not isinstance(entry.get("content"), dict) \
+                or not isinstance(entry["content"].get("text"), str) \
+                or not 1 <= len(entry["content"]["text"]) <= 16000:
+            problem = "content must be an object with a 'text' string of 1 to 16000 characters"
+        elif "timestamp" not in entry:
+            problem = "timestamp is required"
+        elif "memoryStrategyId" in entry and (
+                not isinstance(entry["memoryStrategyId"], str)
+                or not 1 <= len(entry["memoryStrategyId"]) <= 100):
+            problem = "memoryStrategyId must be a string of 1 to 100 characters"
+        if problem:
+            failed.append(_batch_result(
+                record_id, "FAILED", request_id, problem))
+            continue
+        record = {
+            "memoryRecordId": record_id,
+            "content": copy.deepcopy(entry["content"]),
+            "memoryStrategyId": entry.get("memoryStrategyId", ""),
+            "namespaces": copy.deepcopy(entry["namespaces"]),
+            "createdAt": entry["timestamp"],
+        }
+        if "metadata" in entry:
+            record["metadata"] = copy.deepcopy(entry["metadata"])
+        bucket[record_id] = record
+        succeeded.append(_batch_result(record_id, "SUCCEEDED", request_id))
+    _mem_set(_memory_records, memory_id, scope, bucket)
+    return json_response(
+        {"successfulRecords": succeeded, "failedRecords": failed}, 201)
+
+
+def _batch_update_memory_records(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    entries = data.get("records")
+    if not isinstance(entries, list) or not entries:
+        return _validation("records must be a non-empty list")
+    bucket = dict(_records_bucket(memory_id, scope))
+    succeeded, failed = [], []
+    for entry in entries:
+        record_id = entry.get("memoryRecordId") if isinstance(entry, dict) else None
+        problem = None
+        if not isinstance(entry, dict):
+            problem = "record must be an object"
+        elif not isinstance(record_id, str) or not record_id:
+            problem = "memoryRecordId is required"
+        elif "timestamp" not in entry:
+            problem = "timestamp is required"
+        elif record_id not in bucket:
+            problem = f"Memory record '{record_id}' not found"
+        elif "namespaces" in entry and not _valid_namespaces(entry["namespaces"]):
+            problem = "namespaces must be a list of at most one valid namespace"
+        if problem:
+            failed.append(_batch_result(
+                record_id or "", "FAILED",
+                entry.get("requestIdentifier") if isinstance(entry, dict) else None,
+                problem))
+            continue
+        record = dict(bucket[record_id])
+        for field in ("content", "namespaces", "memoryStrategyId", "metadata"):
+            if field in entry:
+                record[field] = copy.deepcopy(entry[field])
+        record["_updatedAt"] = entry["timestamp"]
+        bucket[record_id] = record
+        succeeded.append(_batch_result(
+            record_id, "SUCCEEDED", entry.get("requestIdentifier")))
+    _mem_set(_memory_records, memory_id, scope, bucket)
+    return json_response(
+        {"successfulRecords": succeeded, "failedRecords": failed})
+
+
+def _batch_delete_memory_records(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    entries = data.get("records")
+    if not isinstance(entries, list) or not entries:
+        return _validation("records must be a non-empty list")
+    bucket = dict(_records_bucket(memory_id, scope))
+    succeeded, failed = [], []
+    for entry in entries:
+        record_id = entry.get("memoryRecordId") if isinstance(entry, dict) else None
+        if not isinstance(record_id, str) or not record_id:
+            failed.append(_batch_result("", "FAILED", None,
+                                        "memoryRecordId is required"))
+        elif record_id not in bucket:
+            failed.append(_batch_result(
+                record_id, "FAILED", entry.get("requestIdentifier"),
+                f"Memory record '{record_id}' not found"))
+        else:
+            del bucket[record_id]
+            succeeded.append(_batch_result(
+                record_id, "SUCCEEDED", entry.get("requestIdentifier")))
+    _mem_set(_memory_records, memory_id, scope, bucket)
+    return json_response(
+        {"successfulRecords": succeeded, "failedRecords": failed})
+
+
+def _get_memory_record(raw_memory_id, record_id):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    record_id = unquote(record_id)
+    record = _records_bucket(memory_id, scope).get(record_id)
+    if record is None:
+        return _not_found(f"Memory record '{record_id}' not found")
+    return json_response({"memoryRecord": _record_summary(record)})
+
+
+def _delete_memory_record(raw_memory_id, record_id):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    record_id = unquote(record_id)
+    record = _records_bucket(memory_id, scope).get(record_id)
+    if record is None:
+        return _not_found(f"Memory record '{record_id}' not found")
+    bucket = dict(_records_bucket(memory_id, scope))
+    del bucket[record_id]
+    _mem_set(_memory_records, memory_id, scope, bucket)
+    return json_response({"memoryRecordId": record_id})
+
+
+def _list_memory_records(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    namespace = data.get("namespace") or data.get("namespacePath")
+    items = []
+    for record in _records_bucket(memory_id, scope).values():
+        if data.get("memoryStrategyId") and \
+                record.get("memoryStrategyId") != data["memoryStrategyId"]:
+            continue
+        if not _namespace_matches(namespace, record.get("namespaces") or []):
+            continue
+        if data.get("metadataFilters") and not _metadata_filters_match(
+                record.get("metadata") or {}, data["metadataFilters"]):
+            continue
+        items.append(_record_summary(record))
+    page, error = _memory_page(items, data)
+    if error:
+        return error
+    return json_response({
+        "memoryRecordSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _retrieve_memory_records(raw_memory_id, body):
+    memory_id, scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    data = _parse_body(body)
+    criteria = data.get("searchCriteria")
+    if not isinstance(criteria, dict) \
+            or not isinstance(criteria.get("searchQuery"), str) \
+            or not criteria["searchQuery"]:
+        return _validation("searchCriteria.searchQuery is required")
+    namespace = data.get("namespace") or data.get("namespacePath")
+    terms = set(re.findall(r"[a-z0-9]+", criteria["searchQuery"].lower()))
+    scored = []
+    for record in _records_bucket(memory_id, scope).values():
+        if criteria.get("memoryStrategyId") and \
+                record.get("memoryStrategyId") != criteria["memoryStrategyId"]:
+            continue
+        if not _namespace_matches(namespace, record.get("namespaces") or []):
+            continue
+        if criteria.get("metadataFilters") and not _metadata_filters_match(
+                record.get("metadata") or {}, criteria["metadataFilters"]):
+            continue
+        text = (record.get("content") or {}).get("text") or ""
+        if not isinstance(text, str):
+            text = str(text)
+        hits = terms & set(re.findall(r"[a-z0-9]+", text.lower()))
+        score = len(hits) / len(terms) if terms else 0.0
+        if score <= 0:
+            continue
+        scored.append(_record_summary(record, score))
+    scored.sort(key=lambda item: -item["score"])
+    top_k = criteria.get("topK")
+    if isinstance(top_k, int) and not isinstance(top_k, bool) and top_k >= 1:
+        scored = scored[:top_k]
+    page, error = _memory_page(scored, data)
+    if error:
+        return error
+    return json_response({
+        "memoryRecordSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+# --- extraction jobs: extraction never runs, so no job is ever eligible ------
+
+def _start_extraction_job(raw_memory_id, body):
+    _memory_id, _scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    job = _parse_body(body).get("extractionJob")
+    job_id = job.get("jobId") if isinstance(job, dict) else None
+    if not isinstance(job_id, str) or not job_id:
+        return _validation("extractionJob.jobId is required")
+    return _not_found(f"Extraction job '{job_id}' not found")
+
+
+def _list_extraction_jobs(raw_memory_id, body):
+    _memory_id, _scope, error = _resolve_memory(raw_memory_id)
+    if error:
+        return error
+    page, error = _memory_page([], _parse_body(body))
+    if error:
+        return error
+    return json_response({"jobs": page["items"]})
+
+
+def _memory_data_plane(method, rest, body):
+    """Dispatch ``/memories/...`` data-plane paths; None when not a match.
+
+    ``memoryId`` and ``actorId`` may carry literal ``/`` (an ARN and the
+    ActorId pattern allow it), so every split anchors on a fixed suffix."""
+    if "/actor/" in rest:
+        memory_id, _, actor_rest = rest.partition("/actor/")
+        if actor_rest.endswith("/sessions"):
+            if method == "POST":
+                return _list_sessions(
+                    memory_id, actor_rest[:-len("/sessions")], body)
+            return None
+        actor_id, sep, tail = actor_rest.rpartition("/sessions/")
+        if sep:
+            if "/events/" in tail:
+                session_id, _, event_id = tail.partition("/events/")
+                if "/" in event_id:
+                    return None
+                if method == "GET":
+                    return _get_event(memory_id, actor_id, session_id, event_id)
+                if method == "DELETE":
+                    return _delete_event(
+                        memory_id, actor_id, session_id, event_id)
+                return None
+            if "/" not in tail and method == "POST":
+                return _list_events(memory_id, actor_id, tail, body)
+        return None
+    if rest.endswith("/extractionJobs/start"):
+        if method == "POST":
+            return _start_extraction_job(
+                rest[:-len("/extractionJobs/start")], body)
+        return None
+    if rest.endswith("/extractionJobs"):
+        if method == "POST":
+            return _list_extraction_jobs(rest[:-len("/extractionJobs")], body)
+        return None
+    if rest.endswith("/events"):
+        if method == "POST":
+            return _create_event(rest[:-len("/events")], body)
+        return None
+    if rest.endswith("/actors"):
+        if method == "POST":
+            return _list_actors(rest[:-len("/actors")], body)
+        return None
+    if rest.endswith("/retrieve"):
+        if method == "POST":
+            return _retrieve_memory_records(rest[:-len("/retrieve")], body)
+        return None
+    for suffix, handler in (
+            ("/memoryRecords/batchCreate", _batch_create_memory_records),
+            ("/memoryRecords/batchUpdate", _batch_update_memory_records),
+            ("/memoryRecords/batchDelete", _batch_delete_memory_records)):
+        if rest.endswith(suffix):
+            if method == "POST":
+                return handler(rest[:-len(suffix)], body)
+            return None
+    if rest.endswith("/memoryRecords"):
+        if method == "POST":
+            return _list_memory_records(rest[:-len("/memoryRecords")], body)
+        return None
+    if "/memoryRecord/" in rest:
+        memory_id, _, record_id = rest.partition("/memoryRecord/")
+        if "/" not in record_id and method == "GET":
+            return _get_memory_record(memory_id, record_id)
+        return None
+    if "/memoryRecords/" in rest:
+        memory_id, _, record_id = rest.partition("/memoryRecords/")
+        if "/" not in record_id and method == "DELETE":
+            return _delete_memory_record(memory_id, record_id)
+        return None
+    return None
 
 
 def _version_snapshot(runtime):
@@ -1067,6 +2009,26 @@ def _invoke_container(url, body, headers, content_type, session_id):
 
 async def handle_request(method, path, headers, body, query_params):
     inner = path.strip("/")
+    if inner == "memories" and method == "POST":
+        return _list_memories(body)
+    if inner == "memories/create" and method == "POST":
+        return _create_memory(body)
+    if inner.startswith("memories/"):
+        rest = inner[len("memories/"):]
+        response = _memory_data_plane(method, rest, body)
+        if response is not None:
+            return response
+        memory_id, _, op = unquote(rest).rpartition("/")
+        handler = {("GET", "details"): lambda: _get_memory(memory_id, query_params),
+                   ("PUT", "update"): lambda: _update_memory(memory_id, body),
+                   ("DELETE", "delete"): lambda: _delete_memory(memory_id)}.get((method, op))
+        if handler:
+            if not _MEMORY_ID_RE.fullmatch(memory_id):
+                return _validation(
+                    f"1 validation error detected: Value '{memory_id}' at 'memoryId' failed to "
+                    f"satisfy constraint: Member must satisfy regular expression pattern: "
+                    f"{_MEMORY_ID_RE.pattern}")
+            return handler()
     if inner.startswith("resourcepolicy/"):
         resource_arn = unquote(inner[len("resourcepolicy/"):])
         if method == "PUT":

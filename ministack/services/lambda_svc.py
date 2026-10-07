@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant, spawn_background
+from ministack.core.concurrency import esm_wake, run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
@@ -807,9 +807,9 @@ class LambdaContext:
     function_name        = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
     memory_limit_in_mb   = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128"))
     invoked_function_arn = os.environ.get("_LAMBDA_FUNCTION_ARN", "")
-    aws_request_id       = os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", "")
+    aws_request_id       = os.environ["_LAMBDA_REQUEST_ID"]
     log_group_name       = "/aws/lambda/" + function_name
-    log_stream_name      = aws_request_id
+    log_stream_name      = os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", "")
 
     @staticmethod
     def get_remaining_time_in_millis():
@@ -904,7 +904,7 @@ const context = {
   functionName:       process.env.AWS_LAMBDA_FUNCTION_NAME || '',
   memoryLimitInMB:    process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE || '128',
   invokedFunctionArn: process.env._LAMBDA_FUNCTION_ARN || '',
-  awsRequestId:       process.env.AWS_LAMBDA_LOG_STREAM_NAME || '',
+  awsRequestId:       process.env._LAMBDA_REQUEST_ID || '',
   logGroupName:       '/aws/lambda/' + (process.env.AWS_LAMBDA_FUNCTION_NAME || ''),
   logStreamName:      process.env.AWS_LAMBDA_LOG_STREAM_NAME || '',
   getRemainingTimeInMillis: () => parseFloat(process.env._LAMBDA_TIMEOUT || '3') * 1000,
@@ -2989,6 +2989,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             409,
         )
 
+    # Keep caller identity separate from the resolved version's stored config.
+    exec_record = dict(exec_record)
+    exec_record["config"] = dict(exec_record.get("config") or exec_record)
+    exec_record["config"]["FunctionArn"] = _func_arn(name) + (f":{qualifier}" if qualifier else "")
+
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
 
@@ -3767,6 +3772,7 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                     "group_id": None, "dedup_id": None,
                     "dedup_cache_key": None, "seq": None,
                 })
+                esm_wake.set()
                 return
         elif spec.service == "sns":
             import ministack.services.sns as _sns
@@ -3802,7 +3808,7 @@ def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict
             "__type": "TooManyRequestsException",
             "message": msg,
             "Reason": reason_code,
-            "retryAfterSeconds": retry_after,
+            "retryAfterSeconds": str(retry_after),
         },
         "error": True,
         "log": "",
@@ -3958,7 +3964,7 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
     # agrees on one shape.
     body = {
         "errorMessage": f"Task timed out after {timeout}.00 seconds",
-        "errorType": "Runtime.ExitError",
+        "errorType": "Sandbox.Timedout",
     }
     return {
         "body": body, "error": True, "function_error": "Unhandled",
@@ -3966,7 +3972,7 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
     }
 
 
-def _invoke_rie(container, event: dict, timeout: int) -> dict:
+def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
     # A CloudFormation custom-resource ResponseURL points at ministack on the
@@ -4009,7 +4015,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             invoke_time = time.time()
             req = urllib.request.Request(
                 rie_url, data=json.dumps(event).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "X-Amzn-RequestId": request_id},
             )
             resp = urllib.request.urlopen(req, timeout=timeout)
             body = resp.read().decode("utf-8", errors="replace")
@@ -4020,14 +4026,16 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
-            result = {"body": parsed, "log": logs}
+            # RIE owns the platform lines, including handler errors returned as HTTP 200.
+            # Carry provenance separately so user output never controls log wrapping.
+            result = {"body": parsed, "log": logs, "log_source": "rie"}
             function_error = _classify_function_error(parsed, err_header)
             if function_error is not None:
                 result["error"] = True
                 result["function_error"] = function_error
                 if isinstance(parsed, str) and _RIE_TIMEOUT_TEXT_RE.fullmatch(parsed):
                     # A bare timeout string: same shape as _rie_terminal_result.
-                    result["body"] = {"errorMessage": parsed, "errorType": "Runtime.ExitError"}
+                    result["body"] = {"errorMessage": parsed, "errorType": "Sandbox.Timedout"}
                     result["timeout"] = True
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
@@ -4035,7 +4043,9 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 logs = container.logs(
                     stdout=True, stderr=True, since=attempt_start
                 ).decode("utf-8", errors="replace").strip()
-                return _rie_terminal_result(exc, timeout, logs)
+                result = _rie_terminal_result(exc, timeout, logs)
+                result["log_source"] = "rie"
+                return result
             time.sleep(0.1)
             continue
     # Never became reachable
@@ -4687,7 +4697,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     return container, tmpdir
 
 
-def _execute_function_docker(func: dict, event: dict) -> dict:
+def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
     """Execute a Lambda function inside a Docker container using AWS RIE.
 
     Unifies Zip and Image PackageType through a single warm container pool.
@@ -4709,9 +4719,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                              "errorType": "Runtime.DockerUnavailable"}, "error": True}
         if runtime.startswith(("python", "nodejs")):
             logger.warning("docker SDK unavailable - falling back to warm executor")
-            return _execute_function_warm(func, event)
+            return _execute_function_warm(func, event, request_id)
         logger.warning("docker SDK unavailable - falling back to local subprocess")
-        return _execute_function_local(func, event)
+        return _execute_function_local(func, event, request_id)
 
     if _get_docker_client() is None:
         if package_type == "Image" or LAMBDA_STRICT:
@@ -4719,8 +4729,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                              "errorType": "Runtime.DockerError"}, "error": True}
         logger.warning("Docker daemon unreachable – falling back")
         if runtime.startswith(("python", "nodejs")):
-            return _execute_function_warm(func, event)
-        return _execute_function_local(func, event)
+            return _execute_function_warm(func, event, request_id)
+        return _execute_function_local(func, event, request_id)
 
     # Zip needs code (Image brings it in the image)
     code_zip = func.get("code_zip")
@@ -4781,7 +4791,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
         time.sleep(0.05)
 
     try:
-        result = _invoke_rie(entry["container"], event, timeout)
+        result = _invoke_rie(entry["container"], event, timeout, request_id)
         # `timeout` is _invoke_rie's internal signal to this function; pop it so
         # only the caller-facing keys survive into the invoke response.
         if result.pop("timeout", False):
@@ -4805,7 +4815,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
         msg = str(exc).lower()
         if "timed out" in msg or "read timed out" in msg:
             err_body = {"errorMessage": f"Task timed out after {timeout}.00 seconds",
-                        "errorType": "Runtime.ExitError"}
+                        "errorType": "Sandbox.Timedout"}
         else:
             err_body = {"errorMessage": str(exc), "errorType": type(exc).__name__}
         logger.error("Lambda %s invocation error: %s", fn_name, exc)
@@ -4867,12 +4877,13 @@ def _probe_peak_memory_mb(func: dict) -> int:
 
 
 def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
-                      error: bool, duration_ms: int) -> None:
+                      error: bool, duration_ms: int, *, log_source: str | None = None) -> None:
     """Write handler output to CloudWatch Logs under /aws/lambda/{name}, matching AWS.
 
     - Log group `/aws/lambda/{FunctionName}` is auto-created on first write.
     - Stream name follows AWS's format: `{yyyy}/{mm}/{dd}/[{qualifier}]{uuid}`.
-    - Each invocation emits START / body / END / REPORT lines like real Lambda.
+    - RIE output already contains platform lines; other executors get a wrapper.
+    - Empty RIE output falls back to the synthetic wrapper so logs remain visible.
     Best-effort: a failure to write logs must never break the invocation.
     """
     try:
@@ -4910,16 +4921,19 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
             }
         stream = group["streams"][stream_name]
 
-        lines: list[str] = [f"START RequestId: {request_id} Version: {qualifier}"]
-        if log_text:
-            lines.extend(log_text.splitlines())
-        lines.append(f"END RequestId: {request_id}")
-        peak_mb = _probe_peak_memory_mb(func)
-        lines.append(
-            f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
-            f"Billed Duration: {duration_ms} ms\tMemory Size: "
-            f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {peak_mb} MB"
-        )
+        if log_source == "rie" and log_text:
+            lines = log_text.splitlines()
+        else:
+            lines = [f"START RequestId: {request_id} Version: {qualifier}"]
+            if log_text:
+                lines.extend(log_text.splitlines())
+            lines.append(f"END RequestId: {request_id}")
+            peak_mb = _probe_peak_memory_mb(func)
+            lines.append(
+                f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
+                f"Billed Duration: {duration_ms} ms\tMemory Size: "
+                f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {peak_mb} MB"
+            )
         for line in lines:
             stream["events"].append({"timestamp": now_ms, "message": line, "ingestionTime": now_ms})
         if stream["firstEventTimestamp"] is None:
@@ -5034,6 +5048,7 @@ def _execute_function(func: dict, event: dict) -> dict:
         # the slot for a single invocation.
         return _run_with_function_config_scope(config, _execute_function, func, event)
 
+    # One invocation identity for the context, Runtime API and platform logs.
     request_id = new_uuid()
     started = time.time()
 
@@ -5075,11 +5090,11 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     if proxy_url:
         result = _execute_function_proxy(func, event, proxy_url, request_id)
     elif LAMBDA_STRICT:
-        result = _execute_function_docker(func, event)
+        result = _execute_function_docker(func, event, request_id)
     elif config.get("PackageType") == "Image" and config.get("ImageUri"):
-        result = _execute_function_docker(func, event)
+        result = _execute_function_docker(func, event, request_id)
     elif LAMBDA_EXECUTOR == "docker":
-        result = _execute_function_docker(func, event)
+        result = _execute_function_docker(func, event, request_id)
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
@@ -5089,17 +5104,17 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
             # invocations keep the one-shot executor. python and nodejs carry
             # that context in the event instead, which is why they can be pooled.
             if _durable_ctx.get():
-                result = _execute_function_provided(func, event)
+                result = _execute_function_provided(func, event, request_id)
             else:
                 result = _execute_function_provided_warm(func, event, request_id)
         elif runtime.startswith(("python", "nodejs")):
             # Durable invocations included: their per-call context rides in
             # the event, so the pooled worker can serve them.
-            result = _execute_function_warm(func, event)
+            result = _execute_function_warm(func, event, request_id)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
-            result = _execute_function_docker(func, event)
+            result = _execute_function_docker(func, event, request_id)
 
     duration_ms = int((time.time() - started) * 1000)
     _emit_lambda_logs(
@@ -5107,6 +5122,7 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
         result.get("log", "") if isinstance(result, dict) else "",
         bool(result.get("error")) if isinstance(result, dict) else False,
         duration_ms,
+        log_source=result.get("log_source") if isinstance(result, dict) else None,
     )
     return result
 
@@ -5232,7 +5248,7 @@ def _execute_function_proxy(func: dict, event: dict, url: str, request_id: str) 
         return {"body": text}
 
 
-def _execute_function_warm(func: dict, event: dict) -> dict:
+def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
     """Execute a Lambda function using the warm worker pool (Python + Node.js)."""
     config = func.get("config") or func
     code_zip = func.get("code_zip")
@@ -5268,8 +5284,9 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # the values ride the envelope and the bootstrap applies them per call.
         result = worker.invoke(
             event,
-            new_uuid(),
+            request_id,
             trace_id=_xray_trace_id_for_invocation(config),
+            invoked_function_arn=config.get("FunctionArn", ""),
             depth=_invoke_depth.get(),
             durable=_durable_env_overlay(),
         )
@@ -5278,8 +5295,8 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         else:
             error_msg = result.get("error", "Unknown error")
             error_type = "Runtime.HandlerError"
-            if "timed out" in error_msg.lower():
-                error_type = "Runtime.ExitError"
+            if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg):
+                error_type = "Sandbox.Timedout"
             return {
                 "body": {
                     "errorMessage": error_msg,
@@ -5341,7 +5358,7 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
 
 
 def _execute_function_provided_warm(func: dict, event: dict,
-                                    request_id: str | None = None) -> dict:
+                                    request_id: str) -> dict:
     """Execute a ``provided.*`` Lambda on a pooled, reused environment."""
     config = func.get("config") or func
     code_zip = func.get("code_zip")
@@ -5361,8 +5378,9 @@ def _execute_function_provided_warm(func: dict, event: dict,
         # Invocation metadata belongs in Runtime API headers, not in the user
         # payload (which need not be a dict and may contain similarly named keys).
         result = worker.invoke(
-            event, request_id or new_uuid(),
+            event, request_id,
             trace_id=_xray_trace_id_for_invocation(config),
+            invoked_function_arn=config.get("FunctionArn", ""),
         )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
@@ -5370,7 +5388,7 @@ def _execute_function_provided_warm(func: dict, event: dict,
         if isinstance(payload, dict):
             return {"body": payload, "error": True, "log": result.get("log", "")}
         error_msg = result.get("error", "Unknown error")
-        error_type = ("Runtime.ExitError" if "timed out" in error_msg.lower()
+        error_type = ("Sandbox.Timedout" if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg)
                       else "Runtime.HandlerError")
         return {
             "body": {"errorMessage": error_msg, "errorType": error_type},
@@ -5397,7 +5415,7 @@ def _execute_function_provided_warm(func: dict, event: dict,
         release_worker(worker)
 
 
-def _execute_function_provided(func: dict, event: dict) -> dict:
+def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict:
     """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
     config = func.get("config") or func
     code_zip = func.get("code_zip")
@@ -5417,7 +5435,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         # Shared state for the Runtime API
         result_holder = {"response": None, "error": None}
         event_json = json.dumps(event)
-        request_id = new_uuid()
         event_served = threading.Event()
         response_received = threading.Event()
         server_ready = threading.Event()
@@ -5548,7 +5565,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
                 proc.kill()
                 stdout, stderr = proc.communicate(timeout=5)
                 logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
-                return {"body": {"errorMessage": f"Lambda timed out after {timeout}s: {logs[:500]}", "errorType": "Runtime.ExitError"}, "error": True}
+                return {"body": {"errorMessage": f"Task timed out after {timeout}.00 seconds", "errorType": "Sandbox.Timedout"}, "error": True, "log": logs}
         finally:
             server.shutdown()
 
@@ -5557,7 +5574,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         return {"body": {"errorMessage": str(e), "errorType": type(e).__name__}, "error": True}
 
 
-def _execute_function_local(func: dict, event: dict) -> dict:
+def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
     """Execute a Lambda function in a one-shot subprocess (fallback for unsupported runtimes)."""
     config = func.get("config") or func
     code_zip = func.get("code_zip")
@@ -5677,6 +5694,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if _xray_trace_id:
                 env["_X_AMZN_TRACE_ID"] = _xray_trace_id
             env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
+            env["_LAMBDA_REQUEST_ID"] = request_id
 
             cmd = ["node", wrapper_path] if is_node else ["python3", wrapper_path]
             proc = subprocess.run(
@@ -5686,6 +5704,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 text=True,
                 timeout=timeout,
                 env=env,
+                cwd=code_dir,
             )
 
             log_tail = proc.stderr.strip()
@@ -5729,7 +5748,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
         return {
             "body": {
                 "errorMessage": f"Task timed out after {timeout}.00 seconds",
-                "errorType": "Runtime.ExitError",
+                "errorType": "Sandbox.Timedout",
             },
             "error": True,
             "log": _log,
@@ -7190,8 +7209,8 @@ _ESM_SQS_DEFAULT_CONCURRENCY = 5
 # esm_uuid -> dispatched batches not yet finished.
 _esm_inflight: dict[str, int] = {}
 _esm_inflight_lock = threading.Lock()
-# Set when a dispatched batch finishes, so _poll_loop refills the slot at once.
-_esm_wake = threading.Event()
+# Set when a dispatched batch finishes or a source gains work, so _poll_loop acts at once.
+_esm_wake = esm_wake
 
 
 def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | None = None) -> int:
@@ -7258,8 +7277,13 @@ def _ensure_poller():
             _poller_started = True
 
 
+# A wake that found nothing (another tenant's traffic, an unmapped source) delays the next wake by this much.
+_ESM_IDLE_WAKE_GAP_SECONDS = 0.05
+
+
 def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
+    idle_wake = False
     while True:
         processed = False
         _esm_wake.clear()
@@ -7279,7 +7303,11 @@ def _poll_loop():
         # immediately rather than waiting out the idle cadence below, so
         # throughput isn't throttled to batch_size-per-tick.
         if not processed:
-            _esm_wake.wait(1 if _esms.has_any() else 5)
+            if idle_wake:
+                time.sleep(_ESM_IDLE_WAKE_GAP_SECONDS)
+            idle_wake = bool(_esm_wake.wait(1 if _esms.has_any() else 5))
+        else:
+            idle_wake = False
 
 
 def _iter_all_esms():
@@ -7676,6 +7704,7 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
                     "sys": {"SenderId": get_account_id(), "SentTimestamp": str(int(now * 1000))},
                     "group_id": None, "dedup_id": None, "dedup_cache_key": None, "seq": None,
                 })
+                esm_wake.set()
         elif spec.service == "sns":
             import ministack.services.sns as _sns
             if dest in _sns._topics:

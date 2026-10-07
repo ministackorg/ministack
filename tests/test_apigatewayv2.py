@@ -1940,6 +1940,69 @@ def test_apigw_request_authorizer_iam_policy_response_enforced_in_data_plane(api
         lam.delete_function(FunctionName=int_fn)
 
 
+def test_apigw_jwt_claims_delivered_to_lambda_as_strings(apigw, lam, cognito_idp):
+    """Every JWT claim value reaches the Lambda event as a string, as on AWS."""
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"jwt-claims-str-{suffix}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    claims = event['requestContext']['authorizer']['jwt']['claims']\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(claims)}\n"
+    )
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-str-{suffix}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+    api_id = apigw.create_api(Name=f"jwt-str-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        integ_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="JWT",
+            Name="jwt-str-auth",
+            IdentitySource=["$request.header.Authorization"],
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
+        )["AuthorizerId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /secure",
+            Target=f"integrations/{integ_id}",
+            AuthorizationType="JWT",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        now = int(time.time())
+        token = _make_signed_token(
+            {"sub": "u1", "iss": issuer, "aud": "ms-client", "iat": now, "exp": now + 3600,
+             "email_verified": True, "cognito:groups": ["admin", "dev"]}
+        )
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/secure"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", f"Bearer {token}")
+        claims = json.loads(_urlreq.urlopen(req).read())
+        assert claims["iat"] == str(now)
+        assert claims["exp"] == str(now + 3600)
+        assert claims["email_verified"] == "true"
+        assert claims["cognito:groups"] == "[admin dev]"
+        assert all(isinstance(v, str) for v in claims.values())
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+        lam.delete_function(FunctionName=fn)
+
+
 def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
     import urllib.request as _urlreq
 
@@ -3182,6 +3245,21 @@ def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
         "principalId": "alice", "user": "alice", "n": "7", "ok": "true", "type": "REQUEST", "eventType": "CONNECT",
         "methodArn": f"arn:aws:execute-api:us-east-1:000000000000:{api_id}/prod/$connect",
     }
+
+
+def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
+    """An AWS_IAM $connect refuses an unsigned handshake with 403 and accepts a SigV4-signed one."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"iam-{uuid.uuid4().hex[:6]}", connect_code=_ECHO_CODE)
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="AWS_IAM")
+
+    status, body = _ws_handshake(api_id, "/prod")
+    assert (status, body["message"]) == (403, "Missing Authentication Token")
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/execute-api/aws4_request, "
+                               "SignedHeaders=host;x-amz-date, Signature=0"}
+    assert _ws_handshake(api_id, "/prod", signed)[0] == 101
+    presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
+    assert _ws_handshake(api_id, presigned)[0] == 101
 
 
 @pytest.mark.parametrize("resource, message", [
@@ -4755,7 +4833,7 @@ def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_t
         (f"arn:aws:execute-api:us-east-1::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-west-2::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1:000000000000:/apis/{api_id}", "BadRequestException"),
-        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "BadRequestException"),
+        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "NotFoundException"),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes/{route['routeId']}", "BadRequestException"),
         (
@@ -4792,3 +4870,182 @@ def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_t
     assert status == 404
     assert body["__type"] == "NotFoundException"
     assert _apigw._api_tags.get(stage_arn) is None
+
+
+# ---------------------------------------------------------------------------
+# Custom domain names and API mappings
+# ---------------------------------------------------------------------------
+
+_CERT_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"
+
+
+def _domain(apigw, name, **kwargs):
+    return apigw.create_domain_name(
+        DomainName=name,
+        DomainNameConfigurations=[{"CertificateArn": _CERT_ARN, "EndpointType": "REGIONAL",
+                                   "SecurityPolicy": "TLS_1_2"}],
+        **kwargs,
+    )
+
+
+def test_apigwv2_domain_name_crud_shared_with_v1(apigw, apigw_v1):
+    name = f"api-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    created = _domain(apigw, name, Tags={"team": "a"})
+    try:
+        assert created["DomainName"] == name
+        assert created["DomainNameArn"] == f"arn:aws:apigateway:us-east-1::/domainnames/{name}"
+        assert created["ApiMappingSelectionExpression"] == "$request.basepath"
+        assert created["RoutingMode"] == "API_MAPPING_ONLY"
+        assert created["Tags"] == {"team": "a"}
+        [config] = created["DomainNameConfigurations"]
+        assert config["CertificateArn"] == _CERT_ARN
+        assert config["EndpointType"] == "REGIONAL"
+        assert config["DomainNameStatus"] == "AVAILABLE"
+        assert config["ApiGatewayDomainName"].startswith("d-")
+
+        assert apigw.get_domain_name(DomainName=name)["DomainNameConfigurations"] == [config]
+        assert name in [d["DomainName"] for d in apigw.get_domain_names()["Items"]]
+        # One resource with API Gateway v1, as on AWS.
+        v1 = apigw_v1.get_domain_name(domainName=name)
+        assert v1["regionalCertificateArn"] == _CERT_ARN
+        assert v1["regionalDomainName"] == config["ApiGatewayDomainName"]
+
+        updated = apigw.update_domain_name(
+            DomainName=name,
+            DomainNameConfigurations=[{"CertificateArn": _CERT_ARN.replace("1111", "9999"),
+                                       "EndpointType": "REGIONAL"}],
+        )
+        assert updated["DomainNameConfigurations"][0]["CertificateArn"].endswith("99999999-2222-3333-4444-555555555555")
+
+        with pytest.raises(ClientError) as exc:
+            _domain(apigw, name)
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_domain_name(DomainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_domain_name(domainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_apigwv2_domain_name_tags(apigw):
+    name = f"tags-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    arn = _domain(apigw, name)["DomainNameArn"]
+    try:
+        apigw.tag_resource(ResourceArn=arn, Tags={"env": "dev"})
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {"env": "dev"}
+        assert apigw.get_domain_name(DomainName=name)["Tags"] == {"env": "dev"}
+        apigw.untag_resource(ResourceArn=arn, TagKeys=["env"])
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {}
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+
+
+def test_apigwv2_api_mapping_crud(apigw, apigw_v1):
+    name = f"map-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"map-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    _domain(apigw, name)
+    try:
+        mapping = apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        mapping_id = mapping["ApiMappingId"]
+        assert (mapping["ApiId"], mapping["Stage"], mapping["ApiMappingKey"]) == (api_id, "prod", "orders")
+        assert apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)["ApiMappingKey"] == "orders"
+        assert [m["ApiMappingId"] for m in apigw.get_api_mappings(DomainName=name)["Items"]] == [mapping_id]
+        # The v1 view of the same mapping, without the v2 id.
+        v1 = apigw_v1.get_base_path_mapping(domainName=name, basePath="orders")
+        assert {k: v for k, v in v1.items() if k != "ResponseMetadata"} == {
+            "basePath": "orders", "restApiId": api_id, "stage": "prod"}
+
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == "ApiMapping key already exists for this domain name"
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId="nope123", Stage="prod")
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+        updated = apigw.update_api_mapping(DomainName=name, ApiMappingId=mapping_id, ApiId=api_id,
+                                           ApiMappingKey="v2/orders")
+        assert updated["ApiMappingKey"] == "v2/orders"
+        assert updated["ApiMappingId"] == mapping_id
+
+        apigw.delete_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert apigw.get_api_mappings(DomainName=name)["Items"] == []
+        with pytest.raises(ClientError) as exc:
+            apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_custom_domain_routes_to_http_api(apigw):
+    server, _thread, captured = _start_echo_server()
+    port = server.server_address[1]
+    name = f"route-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"route-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    integration_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+        IntegrationUri=f"http://127.0.0.1:{port}/backend", PayloadFormatVersion="1.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integration_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+    _domain(apigw, name)
+    try:
+        apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="$default", ApiMappingKey="v1")
+        req = urllib.request.Request(f"http://localhost:{_EXECUTE_PORT}/v1/hello", method="GET")
+        req.add_header("Host", name)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+        # The mapping key is stripped; the API sees /hello.
+        assert captured["path"].endswith("/hello") and "/v1" not in captured["path"]
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+        server.shutdown()
+
+
+def test_apigwv2_api_mapping_requires_an_existing_stage(apigw):
+    name = f"stage-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"stage-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    _domain(apigw, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="missing")
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == "Invalid stage identifier specified"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_domain_names_and_api_mappings_paginate(apigw):
+    names = [f"page{i}-{_uuid_mod.uuid4().hex[:8]}.example.com" for i in range(3)]
+    api_id = apigw.create_api(Name=f"page-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    for name in names:
+        _domain(apigw, name)
+    try:
+        seen, token = [], None
+        while True:
+            page = apigw.get_domain_names(MaxResults="1", **({"NextToken": token} if token else {}))
+            assert len(page["Items"]) <= 1
+            seen += [d["DomainName"] for d in page["Items"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(seen)
+
+        for key in ("a", "b"):
+            apigw.create_api_mapping(DomainName=names[0], ApiId=api_id, Stage="prod", ApiMappingKey=key)
+        first = apigw.get_api_mappings(DomainName=names[0], MaxResults="1")
+        second = apigw.get_api_mappings(DomainName=names[0], MaxResults="1", NextToken=first["NextToken"])
+        assert [m["ApiMappingKey"] for m in first["Items"] + second["Items"]] == ["a", "b"]
+        assert "NextToken" not in second
+    finally:
+        for name in names:
+            apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)

@@ -344,13 +344,13 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
         container_env[f"AIRFLOW__{env_key}"] = value
 
     try:
-        container_name = f"ministack-mwaa-{region}-{env_name}"
-        legacy_container_name = f"ministack-mwaa-{env_name}"
+        container_name = f"ministack-mwaa-{account_id}-{region}-{env_name}"
+        legacy_container_names = (f"ministack-mwaa-{region}-{env_name}", f"ministack-mwaa-{env_name}")
 
-        # Remove stale current and pre-regional containers before binding the
-        # environment's host port. A container left by the previous naming
-        # scheme can otherwise survive an upgrade and block the regional one.
-        for stale_name in (container_name, legacy_container_name):
+        # Remove stale current and earlier-scheme containers before binding the
+        # environment's host port. A container left by a previous naming
+        # scheme can otherwise survive an upgrade and block the current one.
+        for stale_name in (container_name, *legacy_container_names):
             try:
                 existing = docker_client.containers.get(stale_name)
                 existing.remove(force=True, v=True)
@@ -364,7 +364,7 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
             name=container_name,
-            labels=container_reaper.own_labels("mwaa", region=region, env_name=env_name),
+            labels=container_reaper.own_labels("mwaa", region=region, env_name=env_name, account_id=account_id),
         )
 
         if ms_network:

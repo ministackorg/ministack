@@ -576,6 +576,64 @@ def test_cfn_nested_stack_stays_in_parent_region():
             pass
 
 
+def test_cfn_ref_to_list_parameter_gives_a_list(cfn, ddb):
+    """A Ref to a CommaDelimitedList gives a list of its members, without the spaces after the commas."""
+    name = f"cfn-list-ref-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Parameters": {"Projected": {"Type": "CommaDelimitedList", "Default": "attr_a, attr_b"}},
+        "Resources": {"Table": {"Type": "AWS::DynamoDB::Table", "Properties": {
+            "TableName": name,
+            "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                     {"AttributeName": "gpk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": {"Ref": "Projected"}},
+            }],
+        }}},
+        "Outputs": {"Joined": {"Value": {"Fn::Join": ["|", {"Ref": "Projected"}]}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert _output(stack, "Joined") == "attr_a|attr_b"
+        projection = ddb.describe_table(TableName=name)["Table"]["GlobalSecondaryIndexes"][0]["Projection"]
+        # AWS does not keep the order of NonKeyAttributes
+        assert sorted(projection["NonKeyAttributes"]) == ["attr_a", "attr_b"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_nested_stack_fails_a_list_parameter(cfn, s3):
+    """A list in nested-stack Parameters fails the stack resource. A template must pass a string, for example with
+    Fn::Join."""
+    name = f"cfn-nested-list-{_uuid_mod.uuid4().hex[:8]}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    child = {"Parameters": {"Names": {"Type": "String"}}, "Resources": {}}
+    parent = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Resources": {"Child": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+            "TemplateURL": f"{endpoint}/{name}/child.json",
+            "Parameters": {"Names": {"Ref": "Names"}},
+        }}},
+    }
+    s3.create_bucket(Bucket=name)
+    s3.put_object(Bucket=name, Key="child.json", Body=json.dumps(child))
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(parent))
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        failed = [e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Child" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed == ["Value of property Parameters must be an object with String (or simple type) properties"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        s3.delete_object(Bucket=name, Key="child.json")
+        s3.delete_bucket(Bucket=name)
+
+
 _E2E_STACK = "e2e-test"
 
 _E2E_TEMPLATE = """
@@ -856,6 +914,327 @@ def test_cfn_cognito_identity_pool_principal_tag(cfn, cognito_identity):
     _wait_stack(cfn, "cfn-cog-tag")
 
 
+def _cfn_iot_outputs(stack):
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def _cfn_iot_failure(cfn, stack, logical_id, status):
+    events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+    return next(e["ResourceStatusReason"] for e in events
+                if e["LogicalResourceId"] == logical_id and e["ResourceStatus"] == status)
+
+
+def _cfn_iot_csr(common_name):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)]))
+           .sign(key, hashes.SHA256()))
+    return csr.public_bytes(serialization.Encoding.PEM).decode(), key
+
+
+def test_cfn_iot_thing_lifecycle(cfn, iot_client):
+    """AWS::IoT::Thing: Ref is the name, Arn and Id come from the registry, an
+    AttributePayload change applies in place (a dropped key is removed, a
+    dropped AttributePayload keeps the attributes), a ThingName change
+    replaces the thing, and the stack delete removes it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, first, second = f"cfn-thing-{uid}", f"cfn-thing-a-{uid}", f"cfn-thing-b-{uid}"
+
+    def template(name, attributes):
+        props = {"ThingName": name}
+        if attributes is not None:
+            props["AttributePayload"] = {"Attributes": attributes}
+        return json.dumps({
+            "Resources": {"Named": {"Type": "AWS::IoT::Thing", "Properties": props},
+                          "Unnamed": {"Type": "AWS::IoT::Thing"}},
+            "Outputs": {f"{lid}{key}": {"Value": {"Ref": lid} if key == "Ref" else {"Fn::GetAtt": [lid, key]}}
+                        for lid in ("Named", "Unnamed") for key in ("Ref", "Arn", "Id")},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template(first, {"color": "red", "size": "m"}))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        thing = iot_client.describe_thing(thingName=first)
+        assert (out["NamedRef"], out["NamedArn"], out["NamedId"]) == (first, thing["thingArn"], thing["thingId"])
+        assert thing["attributes"] == {"color": "red", "size": "m"}
+        assert out["UnnamedRef"].startswith(f"{stack}-Unnamed-")
+        unnamed = iot_client.describe_thing(thingName=out["UnnamedRef"])
+        assert (out["UnnamedArn"], out["UnnamedId"]) == (unnamed["thingArn"], unnamed["thingId"])
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(first, {"color": "blue"}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        updated = iot_client.describe_thing(thingName=first)
+        assert (updated["thingId"], updated["attributes"]) == (thing["thingId"], {"color": "blue"})
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(first, None))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        assert iot_client.describe_thing(thingName=first)["attributes"] == {"color": "blue"}
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(second, {"color": "green"}))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        renamed = iot_client.describe_thing(thingName=second)
+        assert (out["NamedRef"], out["NamedId"]) == (second, renamed["thingId"]) != (first, thing["thingId"])
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_thing(thingName=first)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+    for name in (second, out["UnnamedRef"]):
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_thing(thingName=name)
+
+
+def test_cfn_iot_certificate_lifecycle(cfn, iot_client):
+    """AWS::IoT::Certificate from a CSR (signed by the local CA), from a PEM
+    under a registered CA, and SNI_ONLY without a CA: Ref is the id, Status
+    updates in place, a new CSR replaces the certificate, and the stack
+    delete removes the certificates although they are ACTIVE."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-cert-{uid}"
+    ca_pem, ca_key, verification_pem = iot_test_ca(
+        iot_client.get_registration_code()["registrationCode"], f"cfn-cert-ca-{uid}")
+    leaf_pem = sign_leaf_certificate(ca_pem, ca_key, common_name=f"cfn-cert-leaf-{uid}")[0]
+    other_pem, other_key = generate_ca(common_name=f"cfn-cert-other-{uid}")
+    sni_pem = sign_leaf_certificate(other_pem, other_key, common_name=f"cfn-cert-sni-{uid}")[0]
+    csr_one, key_one = _cfn_iot_csr(f"cfn-cert-csr-{uid}")
+    csr_two, _key = _cfn_iot_csr(f"cfn-cert-csr2-{uid}")
+
+    def template(csr, csr_status, sni_status):
+        return json.dumps({
+            "Resources": {
+                "Ca": {"Type": "AWS::IoT::CACertificate", "Properties": {
+                    "CACertificatePem": ca_pem, "VerificationCertificatePem": verification_pem,
+                    "Status": "ACTIVE"}},
+                "CsrCert": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateSigningRequest": csr, "Status": csr_status}},
+                "CaCert": {"Type": "AWS::IoT::Certificate", "DependsOn": "Ca", "Properties": {
+                    "CertificatePem": leaf_pem, "CACertificatePem": ca_pem,
+                    "CertificateMode": "DEFAULT", "Status": "ACTIVE"}},
+                "SniCert": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificatePem": sni_pem, "CertificateMode": "SNI_ONLY", "Status": sni_status}},
+            },
+            "Outputs": {"CaId": {"Value": {"Ref": "Ca"}}} | {
+                f"{lid}{key}": {"Value": {"Ref": lid} if key == "Ref" else {"Fn::GetAtt": [lid, key]}}
+                for lid in ("CsrCert", "CaCert", "SniCert") for key in ("Ref", "Arn", "Id")},
+        })
+
+    def describe(cert_id):
+        return iot_client.describe_certificate(certificateId=cert_id)["certificateDescription"]
+
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template(csr_one, "ACTIVE", "INACTIVE"))
+        first = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        for lid in ("CsrCert", "CaCert", "SniCert"):
+            assert first[f"{lid}Ref"] == first[f"{lid}Id"]
+            assert first[f"{lid}Arn"].endswith(":cert/" + first[f"{lid}Id"])
+        shapes = {lid: (d["status"], d.get("caCertificateId"), d["certificateMode"])
+                  for lid in ("CsrCert", "CaCert", "SniCert") for d in [describe(first[f"{lid}Id"])]}
+        assert shapes == {"CsrCert": ("ACTIVE", None, "DEFAULT"),
+                          "CaCert": ("ACTIVE", first["CaId"], "DEFAULT"),
+                          "SniCert": ("INACTIVE", None, "SNI_ONLY")}
+        issued = x509.load_pem_x509_certificate(describe(first["CsrCertId"])["certificatePem"].encode())
+        spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        assert issued.public_key().public_bytes(*spki) == key_one.public_key().public_bytes(*spki)
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(csr_one, "INACTIVE", "ACTIVE"))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        assert out == first
+        assert (describe(out["CsrCertId"])["status"], describe(out["SniCertId"])["status"]) == (
+            "INACTIVE", "ACTIVE")
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(csr_two, "ACTIVE", "ACTIVE"))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        assert out["CsrCertId"] != first["CsrCertId"]
+        assert describe(out["CsrCertId"])["status"] == "ACTIVE"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            describe(first["CsrCertId"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+    for key in ("CsrCertId", "CaCertId", "SniCertId"):
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            describe(out[key])
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_ca_certificate(certificateId=out["CaId"])
+
+
+def test_cfn_iot_thing_existing_name_fails_the_stack(cfn, iot_client):
+    """A stack never adopts a thing created outside it, even with the same
+    properties: the resource fails with AWS's name-conflict message and the
+    thing is left as it was."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, name = f"cfn-thing-exists-{uid}", f"cfn-thing-exists-{uid}"
+    iot_client.create_thing(thingName=name, attributePayload={"attributes": {"k": "v"}})
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"Thing": {
+            "Type": "AWS::IoT::Thing",
+            "Properties": {"ThingName": name, "AttributePayload": {"Attributes": {"k": "v"}}}}}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack, "Thing", "CREATE_FAILED") == (
+            f"Resource of type 'AWS::IoT::Thing' with identifier '{name}' already exists.")
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+    thing = iot_client.describe_thing(thingName=name)
+    assert (thing["attributes"], thing["version"]) == ({"k": "v"}, 1)
+    iot_client.delete_thing(thingName=name)
+
+
+_CFN_IOT_DEFAULT_COMBINATIONS = (
+    "Invalid request provided: For certificate mode Default, one of the following combinations must be "
+    "specified exactly: [CertificatePem and CACertificatePem] OR [CertificateSigningRequest]")
+_CFN_IOT_SNI_COMBINATION = (
+    "Invalid request provided: For certificate mode SNI_ONLY, the following combination must be "
+    "specified exactly: [CertificatePem]")
+
+
+@pytest.mark.parametrize("props, reason", [
+    ({"CertificatePem": "leaf"}, _CFN_IOT_DEFAULT_COMBINATIONS),
+    ({"CertificatePem": "leaf", "CertificateSigningRequest": "csr"}, _CFN_IOT_DEFAULT_COMBINATIONS),
+    ({}, _CFN_IOT_DEFAULT_COMBINATIONS),
+    ({"CertificateSigningRequest": "csr", "CertificateMode": "SNI_ONLY"}, _CFN_IOT_SNI_COMBINATION),
+    ({"CertificatePem": "leaf", "CACertificatePem": "ca", "CertificateMode": "SNI_ONLY"},
+     _CFN_IOT_SNI_COMBINATION),
+], ids=["pem-only", "csr-and-pem", "nothing", "sni-csr", "sni-with-ca"])
+def test_cfn_iot_certificate_refuses_property_combinations(cfn, iot_client, props, reason):
+    """Each certificate mode takes one exact set of sources; anything else
+    fails the resource with AWS's message and creates no certificate."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-cert-bad-{uid}"
+    ca_pem, ca_key = generate_ca(common_name=f"cfn-cert-bad-{uid}")
+    values = {"leaf": sign_leaf_certificate(ca_pem, ca_key, common_name=uid)[0], "ca": ca_pem,
+              "csr": _cfn_iot_csr(uid)[0]}
+    props = {k: values.get(v, v) for k, v in props.items()}
+    before = {c["certificateId"] for c in iot_client.list_certificates()["certificates"]}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"Cert": {
+            "Type": "AWS::IoT::Certificate", "Properties": {**props, "Status": "ACTIVE"}}}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack, "Cert", "CREATE_FAILED") == reason
+        assert {c["certificateId"] for c in iot_client.list_certificates()["certificates"]} == before
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
+def test_cfn_iot_principal_attachments(cfn, iot_client):
+    """ThingPrincipalAttachment and PolicyPrincipalAttachment attach the
+    certificate, Ref is ``{name}|{principal}``, a ThingName or PolicyName
+    change replaces the attachment (the old one is detached), and the stack
+    delete detaches before it deletes the certificate."""
+    pytest.importorskip("cryptography")
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-att-{uid}"
+    thing1, thing2, pol1, pol2 = (f"cfn-att-{s}-{uid}" for s in ("t1", "t2", "p1", "p2"))
+    csr = _cfn_iot_csr(uid)[0]
+    document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}
+
+    def template(tpa_thing, ppa_policy):
+        return json.dumps({
+            "Resources": {
+                "Thing1": {"Type": "AWS::IoT::Thing", "Properties": {"ThingName": thing1}},
+                "Thing2": {"Type": "AWS::IoT::Thing", "Properties": {"ThingName": thing2}},
+                "Cert": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateSigningRequest": csr, "Status": "ACTIVE"}},
+                "Pol1": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": pol1, "PolicyDocument": document}},
+                "Pol2": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": pol2, "PolicyDocument": document}},
+                "Tpa": {"Type": "AWS::IoT::ThingPrincipalAttachment", "Properties": {
+                    "ThingName": {"Ref": tpa_thing}, "Principal": {"Fn::GetAtt": ["Cert", "Arn"]}}},
+                "Ppa": {"Type": "AWS::IoT::PolicyPrincipalAttachment", "Properties": {
+                    "PolicyName": {"Ref": ppa_policy}, "Principal": {"Fn::GetAtt": ["Cert", "Arn"]}}},
+            },
+            "Outputs": {"Tpa": {"Value": {"Ref": "Tpa"}}, "Ppa": {"Value": {"Ref": "Ppa"}},
+                        "CertArn": {"Value": {"Fn::GetAtt": ["Cert", "Arn"]}},
+                        "CertId": {"Value": {"Ref": "Cert"}}},
+        })
+
+    def principals(thing):
+        return iot_client.list_thing_principals(thingName=thing)["principals"]
+
+    def policies(arn):
+        return [p["policyName"] for p in iot_client.list_attached_policies(target=arn)["policies"]]
+
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template("Thing1", "Pol1"))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        arn = out["CertArn"]
+        assert (out["Tpa"], out["Ppa"]) == (f"{thing1}|{arn}", f"{pol1}|{arn}")
+        assert (principals(thing1), principals(thing2), policies(arn)) == ([arn], [], [pol1])
+
+        cfn.update_stack(StackName=stack, TemplateBody=template("Thing2", "Pol2"))
+        out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+        assert (out["Tpa"], out["Ppa"]) == (f"{thing2}|{arn}", f"{pol2}|{arn}")
+        assert (principals(thing1), principals(thing2), policies(arn)) == ([], [arn], [pol2])
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_certificate(certificateId=out["CertId"])
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=thing2)
+
+
+def test_cfn_iot_delete_keeps_what_is_attached_outside_the_stack(cfn, iot_client):
+    """A certificate with a policy or a thing attached outside the stack is
+    deactivated and then fails its delete, as is a thing with an outside
+    certificate; the stack lands in DELETE_FAILED, and once detached a
+    second delete completes."""
+    pytest.importorskip("cryptography")
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, thing, policy = f"cfn-iot-keep-{uid}", f"cfn-iot-keep-{uid}", f"cfn-iot-keep-{uid}"
+    iot_client.create_policy(policyName=policy, policyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}))
+    outside = iot_client.create_keys_and_certificate(setAsActive=False)
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({
+        "Resources": {"Cert": {"Type": "AWS::IoT::Certificate", "Properties": {
+                          "CertificateSigningRequest": _cfn_iot_csr(uid)[0], "Status": "ACTIVE"}},
+                      "Thing": {"Type": "AWS::IoT::Thing", "Properties": {"ThingName": thing}}},
+        "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Cert", "Arn"]}}, "Id": {"Value": {"Ref": "Cert"}}},
+    }))
+    out = _cfn_iot_outputs(_wait_stack(cfn, stack))
+    arn, cert_id = out["Arn"], out["Id"]
+    try:
+        iot_client.attach_policy(policyName=policy, target=arn)
+        iot_client.attach_thing_principal(thingName=thing, principal=outside["certificateArn"])
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_FAILED"
+        assert _cfn_iot_failure(cfn, stack, "Cert", "DELETE_FAILED") == (
+            f"Certificate policies must be detached before deletion (arn: {arn})")
+        assert _cfn_iot_failure(cfn, stack, "Thing", "DELETE_FAILED") == (
+            f"Cannot delete. Thing {thing} is still attached to one or more principals")
+        assert iot_client.describe_certificate(certificateId=cert_id)["certificateDescription"]["status"] == "INACTIVE"
+        assert iot_client.describe_thing(thingName=thing)["thingName"] == thing
+
+        # The things check comes first.
+        iot_client.detach_thing_principal(thingName=thing, principal=outside["certificateArn"])
+        iot_client.attach_thing_principal(thingName=thing, principal=arn)
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_FAILED"
+        assert _cfn_iot_failure(cfn, stack, "Cert", "DELETE_FAILED") == (
+            f"Things must be detached before deletion (arn: {arn})")
+
+        iot_client.detach_thing_principal(thingName=thing, principal=arn)
+        iot_client.detach_policy(policyName=policy, target=arn)
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_certificate(certificateId=cert_id)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        iot_client.delete_certificate(certificateId=outside["certificateId"])
+        iot_client.delete_policy(policyName=policy)
+
+
 def test_cfn_iot_policy_document_update_applies_in_place(cfn, iot_client):
     """A changed PolicyDocument updates the policy instead of rolling the stack
     back: IoT stores a new default version and Ref keeps the same name."""
@@ -1103,6 +1482,132 @@ def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
         iot_client.describe_provisioning_template(templateName=name)
 
 
+def _cfn_job_template(template_id, **overrides):
+    props = {
+        "JobTemplateId": template_id,
+        "Description": "from cloudformation",
+        "Document": json.dumps({"operation": "cfn"}),
+        "TimeoutConfig": {"InProgressTimeoutInMinutes": 20},
+        "JobExecutionsRetryConfig": {
+            "RetryCriteriaList": [{"FailureType": "FAILED", "NumberOfRetries": 1}]},
+        "JobExecutionsRolloutConfig": {
+            "MaximumPerMinute": 40,
+            "ExponentialRolloutRate": {
+                "BaseRatePerMinute": 4, "IncrementFactor": 1.5,
+                "RateIncreaseCriteria": {"NumberOfSucceededThings": 3}}},
+        "AbortConfig": {"CriteriaList": [{
+            "Action": "CANCEL", "FailureType": "ALL",
+            "MinNumberOfExecutedThings": 2, "ThresholdPercentage": 25}]},
+        "PresignedUrlConfig": {
+            "RoleArn": "arn:aws:iam::000000000000:role/presign", "ExpiresInSec": 900},
+        "MaintenanceWindows": [
+            {"StartTime": "cron(0 3 ? * SUN *)", "DurationInMinutes": 90}],
+        "Tags": [{"Key": "k", "Value": "v"}],
+        **overrides,
+    }
+    return json.dumps({
+        "Resources": {"T": {"Type": "AWS::IoT::JobTemplate", "Properties": props}},
+        "Outputs": {"Ref": {"Value": {"Ref": "T"}},
+                    "Arn": {"Value": {"Fn::GetAtt": ["T", "Arn"]}}},
+    })
+
+
+def test_cfn_iot_job_template(cfn, iot_client):
+    """AWS::IoT::JobTemplate creates the template through the IoT API with the
+    two renamed members mapped (ExponentialRolloutRate, RetryCriteriaList), and
+    every property is create-only: an update under the same JobTemplateId
+    fails and rolls back, a new JobTemplateId replaces the template (measured
+    on AWS, eu-central-1, 2026-10-05)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, old_id, new_id = f"cfn-iot-jobtmpl-{uid}", f"cfn-jt-{uid}", f"cfn-jt2-{uid}"
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(old_id))
+        result = _wait_stack(cfn, stack)
+        assert result["StackStatus"] == "CREATE_COMPLETE"
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in result["Outputs"]}
+        assert outputs["Ref"] == old_id
+        assert outputs["Arn"] == f"arn:aws:iot:us-east-1:000000000000:jobtemplate/{old_id}"
+
+        desc = iot_client.describe_job_template(jobTemplateId=old_id)
+        assert desc["description"] == "from cloudformation"
+        assert desc["document"] == json.dumps({"operation": "cfn"})
+        assert desc["timeoutConfig"] == {"inProgressTimeoutInMinutes": 20}
+        assert desc["jobExecutionsRetryConfig"] == {
+            "criteriaList": [{"failureType": "FAILED", "numberOfRetries": 1}]}
+        assert desc["jobExecutionsRolloutConfig"] == {
+            "maximumPerMinute": 40,
+            "exponentialRate": {"baseRatePerMinute": 4, "incrementFactor": 1.5,
+                                "rateIncreaseCriteria": {"numberOfSucceededThings": 3}}}
+        assert desc["abortConfig"] == {"criteriaList": [{
+            "action": "CANCEL", "failureType": "ALL",
+            "minNumberOfExecutedThings": 2, "thresholdPercentage": 25.0}]}
+        assert desc["presignedUrlConfig"] == {
+            "roleArn": "arn:aws:iam::000000000000:role/presign", "expiresInSec": 900}
+        assert desc["maintenanceWindows"] == [
+            {"startTime": "cron(0 3 ? * SUN *)", "durationInMinutes": 90}]
+
+        for change in ({"Description": "changed"}, {"Tags": [{"Key": "k", "Value": "w"}]}):
+            cfn.update_stack(StackName=stack,
+                             TemplateBody=_cfn_job_template(old_id, **change))
+            assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in
+                       cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                       if e["ResourceStatus"] == "UPDATE_FAILED"]
+            assert (
+                "CloudFormation cannot update a stack when a custom-named resource "
+                f"requires replacing. Rename {old_id} and update the stack again."
+            ) in reasons, change
+        assert iot_client.describe_job_template(
+            jobTemplateId=old_id)["description"] == "from cloudformation"
+
+        cfn.update_stack(StackName=stack, TemplateBody=_cfn_job_template(
+            new_id, Description="renamed"))
+        result = _wait_stack(cfn, stack)
+        assert result["StackStatus"] == "UPDATE_COMPLETE"
+        assert {o["OutputKey"]: o["OutputValue"] for o in result["Outputs"]}["Ref"] == new_id
+        assert iot_client.describe_job_template(
+            jobTemplateId=new_id)["description"] == "renamed"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_job_template(jobTemplateId=old_id)
+
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack)
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_job_template(jobTemplateId=new_id)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        for template_id in (old_id, new_id):
+            try:
+                iot_client.delete_job_template(jobTemplateId=template_id)
+            except ClientError:
+                pass
+
+
+def test_cfn_iot_job_template_existing_id_fails_the_stack(cfn, iot_client):
+    """A JobTemplateId that already exists fails the create with AWS's
+    name-conflict text and rolls the stack back, leaving the existing
+    template alone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, template_id = f"cfn-iot-jobtmpl-dup-{uid}", f"cfn-jt-dup-{uid}"
+    iot_client.create_job_template(jobTemplateId=template_id, description="mine",
+                                   document="{}")
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(template_id))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert (
+            f"Resource of type 'AWS::IoT::JobTemplate' with identifier '{template_id}' "
+            "already exists."
+        ) in reasons
+        assert iot_client.describe_job_template(
+            jobTemplateId=template_id)["description"] == "mine"
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        iot_client.delete_job_template(jobTemplateId=template_id)
+
+
 def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     """AWS::IoT::CACertificate provisions onto the real CA registry instead of
     rolling the stack back: create registers the PEM (readable back through
@@ -1168,6 +1673,46 @@ def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.describe_ca_certificate(certificateId=ca_id)
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_iot_ca_certificate_lists_certificates_registered_under_it(cfn, iot_client):
+    """A CA the stack registered is the same registry entry the API uses:
+    device certificates registered under it by RegisterCertificate come back
+    from ListCertificatesByCA for the stack's CA id, newest first."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-iot-ca-by-ca-{suffix}"
+    ca_pem, ca_key = generate_ca(common_name=f"cfn-by-ca-{suffix}")
+    template = json.dumps({
+        "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem, "Status": "ACTIVE", "CertificateMode": "SNI_ONLY",
+        }}},
+        "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+    })
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    cert_ids = []
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        ca_id = stack["Outputs"][0]["OutputValue"]
+        for i in range(2):
+            leaf_pem = sign_leaf_certificate(
+                ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=f"cfn-by-ca-device-{i}"
+            )[0]
+            cert_ids.append(iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_pem, status="ACTIVE",
+            )["certificateId"])
+
+        listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)["certificates"]
+        assert [c["certificateId"] for c in listing] == cert_ids[::-1]
+    finally:
+        for cert_id in cert_ids:
+            iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+            iot_client.delete_certificate(certificateId=cert_id)
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
 
 
 def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_client):
@@ -1300,6 +1845,46 @@ def test_cfn_iot_ca_certificate_registration_config_and_mode_immutability(cfn, i
     _wait_stack(cfn, "cfn-iot-ca-regcfg")
 
 
+def test_cfn_iot_sni_only_ca_certificate_auto_registers_with_sni():
+    """A CACertificate declared with CertificateMode SNI_ONLY and
+    AutoRegistrationStatus ENABLE (how a CDK app declares a JITR CA without a
+    verification certificate) is stored as RegisterCACertificate stores it, and
+    just-in-time registration under it runs for a device that sent a server
+    name (SNI) and not for one that did not. In-process, so no MQTT listener is needed."""
+    pytest.importorskip("cryptography")
+    import asyncio
+    import ssl
+
+    from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
+    from ministack.services import iot as iot_module
+
+    ca_pem, ca_key = generate_ca(common_name="cfn-jitr-sni-ca")
+    leaf_pem = sign_leaf_certificate(ca_pem, ca_key, common_name="cfn-jitr-sni-device")[0]
+    cert_id = get_certificate_id(leaf_pem)
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    peer = ("192.0.2.10", 50000)
+    handler = _RESOURCE_HANDLERS["AWS::IoT::CACertificate"]
+    props = {"CACertificatePem": ca_pem, "Status": "ACTIVE",
+             "AutoRegistrationStatus": "ENABLE", "CertificateMode": "SNI_ONLY"}
+    ca_id, _attrs = handler["create"]("CA", props, "cfn-jitr-sni")
+
+    async def _connects():
+        return (await iot_module._mtls_auto_register(der, peer),
+                await iot_module._mtls_auto_register(der, peer, "localhost"))
+
+    try:
+        ca = iot_module._ca_certificates[ca_id]
+        assert (ca["status"], ca["autoRegistrationStatus"], ca["certificateMode"]) == (
+            "ACTIVE", "ENABLE", "SNI_ONLY")
+        assert asyncio.run(_connects()) == (False, True)
+        record = iot_module._certificates[cert_id]
+        assert record["status"] == "PENDING_ACTIVATION"
+        assert record["caCertificateId"] == ca_id
+    finally:
+        iot_module._certificates.pop(cert_id, None)
+        handler["delete"](ca_id, props)
+
+
 def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
     """CACertificatePem is the physical identity — the certificate id derives
     from it — so an update that changes the PEM fails loudly and rolls back
@@ -1337,6 +1922,124 @@ def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
 
     cfn.delete_stack(StackName="cfn-iot-ca-pem")
     _wait_stack(cfn, "cfn-iot-ca-pem")
+
+
+def _iot_domain_configuration_template(resources):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            logical_id: {"Type": "AWS::IoT::DomainConfiguration", "Properties": props}
+            for logical_id, props in resources.items()
+        },
+        "Outputs": {
+            f"{logical_id}{attr}": {"Value": {"Fn::GetAtt": [logical_id, attr]}}
+            for logical_id in resources for attr in ("Arn", "DomainType")
+        } | {f"{logical_id}Ref": {"Value": {"Ref": logical_id}} for logical_id in resources},
+    })
+
+
+def test_cfn_iot_domain_configuration_lifecycle(cfn, iot_client):
+    """Ref is the name (``{LogicalId}-{suffix}`` when generated); a create that
+    does not declare DomainConfigurationStatus leaves the configuration
+    DISABLED; an update applies the declared members in place and keeps the
+    dropped ones; the delete disables an ENABLED configuration, then fails on
+    AWS's seven-day hold for an AWS-managed one (DELETE_FAILED)."""
+    stack_name = f"cfn-iot-dc-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn-dc-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {
+            "DomainConfigurationName": named,
+            "DomainConfigurationStatus": "ENABLED",
+            "TlsConfig": {"SecurityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"},
+            "AuthenticationType": "AWS_X509",
+            "ApplicationProtocol": "SECURE_MQTT",
+        },
+        "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    assert _output(stack, "NamedRef") == named
+    unnamed = _output(stack, "UnnamedRef")
+    assert re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", unnamed)
+    for logical_id, name in (("Named", named), ("Unnamed", unnamed)):
+        d = iot_client.describe_domain_configuration(domainConfigurationName=name)
+        assert _output(stack, f"{logical_id}Arn") == d["domainConfigurationArn"]
+        assert _output(stack, f"{logical_id}DomainType") == "AWS_MANAGED"
+    named_desc = iot_client.describe_domain_configuration(domainConfigurationName=named)
+    assert named_desc["domainConfigurationStatus"] == "ENABLED"
+    assert named_desc["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS12_1_2_2022_10"}
+    assert (named_desc["authenticationType"], named_desc["applicationProtocol"]) == (
+        "AWS_X509", "SECURE_MQTT")
+    assert iot_client.describe_domain_configuration(domainConfigurationName=unnamed)[
+        "domainConfigurationStatus"] == "DISABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {
+            "DomainConfigurationName": named,
+            "TlsConfig": {"SecurityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"},
+        },
+        "Unnamed": {"DomainConfigurationStatus": "ENABLED"},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    assert _output(stack, "UnnamedRef") == unnamed
+    after = iot_client.describe_domain_configuration(domainConfigurationName=named)
+    assert after["domainConfigurationArn"] == named_desc["domainConfigurationArn"]
+    assert after["tlsConfig"] == {"securityPolicy": "IoTSecurityPolicy_TLS13_1_3_2022_10"}
+    assert after["domainConfigurationStatus"] == "ENABLED"
+    assert (after["authenticationType"], after["applicationProtocol"]) == ("AWS_X509", "SECURE_MQTT")
+    assert iot_client.describe_domain_configuration(domainConfigurationName=unnamed)[
+        "domainConfigurationStatus"] == "ENABLED"
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_FAILED"
+    assert "must be disabled for at least 7 days" in _stack_event_reasons(cfn, stack_name)
+    for name in (named, unnamed):
+        assert iot_client.describe_domain_configuration(
+            domainConfigurationName=name)["domainConfigurationStatus"] == "DISABLED"
+    cfn.delete_stack(StackName=stack_name, RetainResources=["Named", "Unnamed"])
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_iot_domain_configuration_create_only_properties(cfn, iot_client):
+    """ServiceType and the other create-only properties replace the
+    configuration: refused under a custom name, a new generated name
+    otherwise, with the predecessor kept by AWS's seven-day hold on deleting
+    an AWS-managed configuration."""
+    stack_name = f"cfn-iot-dc-replace-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn-dc-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named}, "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    first = _output(stack, "UnnamedRef")
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named, "ServiceType": "DATA"}, "Unnamed": {},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=_iot_domain_configuration_template({
+        "Named": {"DomainConfigurationName": named}, "Unnamed": {"ServiceType": "DATA"},
+    }))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+    second = _output(stack, "UnnamedRef")
+    assert second != first and second.startswith("Unnamed-")
+    listed = [d["domainConfigurationName"]
+              for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert second in listed and first in listed
+    assert iot_client.describe_domain_configuration(
+        domainConfigurationName=first)["domainConfigurationStatus"] == "DISABLED"
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_FAILED"
+    cfn.delete_stack(StackName=stack_name, RetainResources=["Named", "Unnamed"])
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
 
 
 def test_cfn_deleted_stack_name_is_reusable(cfn):
@@ -2159,6 +2862,63 @@ def test_cfn_conditions(cfn, s3):
 
     with pytest.raises(ClientError):
         s3.head_bucket(Bucket="cfn-t04-cond")
+
+
+def test_cfn_condition_selects_from_comma_delimited_list(cfn):
+    """Fn::Select in a condition gives one member of a CommaDelimitedList. An empty member makes the condition false,
+    so the stack does not make the resource."""
+    name = f"cfn-cond-select-{_uuid_mod.uuid4().hex[:8]}"
+
+    def parameter(condition):
+        return {"Type": "AWS::SSM::Parameter", "Condition": condition,
+                "Properties": {"Name": f"/{name}/{condition}", "Type": "String", "Value": "x"}}
+
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "gsi,,S"}},
+        "Conditions": {
+            "FirstSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [0, {"Ref": "Spec"}]}, ""]}]},
+            "SecondSet": {"Fn::Not": [{"Fn::Equals": [{"Fn::Select": [1, {"Ref": "Spec"}]}, ""]}]},
+        },
+        "Resources": {"First": parameter("FirstSet"), "Second": parameter("SecondSet")},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        resources = cfn.describe_stack_resources(StackName=name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in resources] == ["First"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_condition_select_out_of_range_is_a_template_error(cfn):
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Conditions": {"C": {"Fn::Equals": [{"Fn::Select": [5, {"Ref": "Spec"}]}, ""]}},
+        "Resources": {"T": {"Type": "AWS::SNS::Topic", "Condition": "C"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=f"cfn-sel-oob-{_uuid_mod.uuid4().hex[:8]}",
+                         TemplateBody=json.dumps(template))
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert exc.value.response["Error"]["Message"] == (
+        "Template error: Fn::Select cannot select nonexistent value at index 5")
+
+
+def test_cfn_ssm_parameter_rejects_a_list_value(cfn):
+    name = f"cfn-ssm-list-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter",
+                            "Properties": {"Type": "String", "Value": {"Ref": "Names"}}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert ("Properties validation failed for resource P with message: "
+                "[#/Value: expected type: String, found: JSONArray]") in _stack_event_reasons(cfn, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
 
 def test_cfn_outputs_exports(cfn):
     template = {
@@ -6679,6 +7439,402 @@ def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+# ---------------------------------------------------------------------------
+# AWS::EFS::*
+# ---------------------------------------------------------------------------
+
+_efs_physical_ids = _sd_physical_ids
+
+
+def _efs_client_for_region(region):
+    return boto3.client(
+        "efs",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+_EFS_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"AWS": "*"},
+        "Action": ["elasticfilesystem:ClientMount"],
+    }],
+}
+
+
+def _efs_stack_template(performance_mode="generalPurpose", throughput_mode="bursting",
+                        provisioned=None, lifecycle=None, backup="ENABLED", policy=None,
+                        fs_tags=None, security_groups=("Sg",), ap_tags=None):
+    """A file system, one mount target per subnet and an access point."""
+    fs_props = {
+        "Encrypted": True,
+        "PerformanceMode": performance_mode,
+        "ThroughputMode": throughput_mode,
+        "LifecyclePolicies": lifecycle if lifecycle is not None else [{"TransitionToIA": "AFTER_30_DAYS"}],
+        "BackupPolicy": {"Status": backup},
+        "FileSystemPolicy": policy or _EFS_POLICY,
+        "FileSystemTags": fs_tags if fs_tags is not None else [
+            {"Key": "Name", "Value": "efs-test"}, {"Key": "team", "Value": "a"}],
+    }
+    if provisioned is not None:
+        fs_props["ProvisionedThroughputInMibps"] = provisioned
+    mount_target = lambda subnet: {  # noqa: E731
+        "Type": "AWS::EFS::MountTarget",
+        "Properties": {
+            "FileSystemId": {"Ref": "Fs"},
+            "SubnetId": {"Ref": subnet},
+            "SecurityGroups": [{"Ref": sg} for sg in security_groups],
+        },
+    }
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.0.0.0/16"}},
+            "Subnet1": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.0.1.0/24", "AvailabilityZone": "us-east-1a"}},
+            "Subnet2": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.0.2.0/24", "AvailabilityZone": "us-east-1b"}},
+            "Sg": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "efs", "VpcId": {"Ref": "Vpc"}}},
+            "Sg2": {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+                "GroupDescription": "efs2", "VpcId": {"Ref": "Vpc"}}},
+            "Fs": {"Type": "AWS::EFS::FileSystem", "Properties": fs_props},
+            "Mt1": mount_target("Subnet1"),
+            "Mt2": mount_target("Subnet2"),
+            "Ap": {
+                "Type": "AWS::EFS::AccessPoint",
+                "Properties": {
+                    "FileSystemId": {"Ref": "Fs"},
+                    "PosixUser": {"Uid": "13234", "Gid": "1322", "SecondaryGids": ["1344", "1452"]},
+                    "RootDirectory": {
+                        "Path": "/app",
+                        "CreationInfo": {"OwnerUid": "7987", "OwnerGid": "708", "Permissions": "0755"},
+                    },
+                    "AccessPointTags": ap_tags if ap_tags is not None else [
+                        {"Key": "Name", "Value": "ap-test"}],
+                },
+            },
+        },
+    }
+
+
+def _efs_error_code(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"]
+
+
+def test_cfn_efs_validate_template(cfn):
+    response = cfn.validate_template(TemplateBody=json.dumps(_efs_stack_template()))
+    assert "Parameters" in response
+
+
+def test_cfn_efs_create(cfn, efs):
+    stack_name = f"cfn-efs-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_stack_template()
+    template["Outputs"] = {
+        "FsRef": {"Value": {"Ref": "Fs"}},
+        "FsArn": {"Value": {"Fn::GetAtt": ["Fs", "Arn"]}},
+        "FsId": {"Value": {"Fn::GetAtt": ["Fs", "FileSystemId"]}},
+        "MtRef": {"Value": {"Ref": "Mt1"}},
+        "MtIp": {"Value": {"Fn::GetAtt": ["Mt1", "IpAddress"]}},
+        "MtId": {"Value": {"Fn::GetAtt": ["Mt1", "Id"]}},
+        "ApRef": {"Value": {"Ref": "Ap"}},
+        "ApId": {"Value": {"Fn::GetAtt": ["Ap", "AccessPointId"]}},
+        "ApArn": {"Value": {"Fn::GetAtt": ["Ap", "Arn"]}},
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template),
+                     Tags=[{"Key": "env", "Value": "test"}])
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    fs_id = out["FsRef"]
+    assert fs_id.startswith("fs-") and out["FsId"] == fs_id
+    fs = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+    assert fs["FileSystemArn"] == out["FsArn"]
+    assert fs["Encrypted"] is True
+    assert fs["PerformanceMode"] == "generalPurpose"
+    assert fs["Name"] == "efs-test"
+    assert fs["NumberOfMountTargets"] == 2
+    tags = {t["Key"]: t["Value"] for t in efs.list_tags_for_resource(ResourceId=fs_id)["Tags"]}
+    assert tags["team"] == "a" and tags["env"] == "test"
+    assert tags["aws:cloudformation:stack-name"] == stack_name
+    assert efs.describe_lifecycle_configuration(FileSystemId=fs_id)["LifecyclePolicies"] == [
+        {"TransitionToIA": "AFTER_30_DAYS"}]
+    assert efs.describe_backup_policy(FileSystemId=fs_id)["BackupPolicy"]["Status"] == "ENABLED"
+    stored_policy = json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])
+    assert stored_policy["Statement"][0]["Action"] == _EFS_POLICY["Statement"][0]["Action"]
+    assert stored_policy["Statement"][0]["Resource"] == out["FsArn"]
+    assert fs["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
+
+    mt = efs.describe_mount_targets(MountTargetId=out["MtRef"])["MountTargets"][0]
+    assert mt["FileSystemId"] == fs_id
+    assert mt["IpAddress"] == out["MtIp"]
+    assert out["MtId"] == fs_id
+    assert len(efs.describe_mount_targets(FileSystemId=fs_id)["MountTargets"]) == 2
+
+    assert out["ApRef"] == out["ApId"] and out["ApRef"].startswith("fsap-")
+    ap = efs.describe_access_points(AccessPointId=out["ApRef"])["AccessPoints"][0]
+    assert ap["AccessPointArn"] == out["ApArn"]
+    assert ap["PosixUser"] == {"Uid": 13234, "Gid": 1322, "SecondaryGids": [1344, 1452]}
+    assert ap["RootDirectory"]["CreationInfo"] == {
+        "OwnerUid": 7987, "OwnerGid": 708, "Permissions": "0755"}
+    assert ap["Name"] == "ap-test"
+    ap_tags = {t["Key"] for t in efs.list_tags_for_resource(ResourceId=out["ApRef"])["Tags"]}
+    assert {"Name", "aws:cloudformation:stack-name"} <= ap_tags
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_efs_update_in_place(cfn, efs):
+    stack_name = f"cfn-efs-upd-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_efs_stack_template()))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    before = _efs_physical_ids(cfn, stack_name)
+
+    new_policy = {**_EFS_POLICY, "Id": "updated"}
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_efs_stack_template(
+        throughput_mode="provisioned", provisioned=5,
+        lifecycle=[{"TransitionToIA": "AFTER_60_DAYS"}], backup="DISABLED", policy=new_policy,
+        fs_tags=[{"Key": "Name", "Value": "efs-renamed"}, {"Key": "owner", "Value": "b"}],
+        security_groups=("Sg2",), ap_tags=[{"Key": "Name", "Value": "ap-renamed"}],
+    )))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    after = _efs_physical_ids(cfn, stack_name)
+    for logical_id in ("Fs", "Mt1", "Mt2", "Ap"):
+        assert after[logical_id] == before[logical_id]
+
+    fs_id = before["Fs"]
+    fs = efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0]
+    assert fs["ThroughputMode"] == "provisioned"
+    assert fs["ProvisionedThroughputInMibps"] == 5
+    assert fs["Name"] == "efs-renamed"
+    tags = {t["Key"]: t["Value"] for t in efs.list_tags_for_resource(ResourceId=fs_id)["Tags"]}
+    assert tags["owner"] == "b" and "team" not in tags
+    assert efs.describe_lifecycle_configuration(FileSystemId=fs_id)["LifecyclePolicies"] == [
+        {"TransitionToIA": "AFTER_60_DAYS"}]
+    assert efs.describe_backup_policy(FileSystemId=fs_id)["BackupPolicy"]["Status"] == "DISABLED"
+    assert json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])["Id"] == "updated"
+
+    sg2 = before["Sg2"]
+    for mt_logical_id in ("Mt1", "Mt2"):
+        groups = efs.describe_mount_target_security_groups(
+            MountTargetId=before[mt_logical_id])["SecurityGroups"]
+        assert groups == [sg2]
+
+    ap = efs.describe_access_points(AccessPointId=before["Ap"])["AccessPoints"][0]
+    assert ap["Name"] == "ap-renamed"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_efs_update_replacement(cfn, efs):
+    stack_name = f"cfn-efs-repl-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_efs_stack_template()))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    before = _efs_physical_ids(cfn, stack_name)
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_stack_template(performance_mode="maxIO")))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    after = _efs_physical_ids(cfn, stack_name)
+
+    # The mount targets and access point follow the replaced file system.
+    for logical_id in ("Fs", "Mt1", "Mt2", "Ap"):
+        assert after[logical_id] != before[logical_id]
+    assert efs.describe_file_systems(FileSystemId=after["Fs"])["FileSystems"][0]["PerformanceMode"] == "maxIO"
+
+    assert _efs_error_code(efs.describe_file_systems, FileSystemId=before["Fs"]) == "FileSystemNotFound"
+    for logical_id in ("Mt1", "Mt2"):
+        assert _efs_error_code(efs.describe_mount_targets, MountTargetId=before[logical_id]) == "MountTargetNotFound"
+    assert efs.describe_access_points(AccessPointId=before["Ap"])["AccessPoints"] == []
+    assert len(efs.describe_mount_targets(FileSystemId=after["Fs"])["MountTargets"]) == 2
+
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    assert any(
+        e["LogicalResourceId"] == "Fs" and "creation of a new physical resource" in e.get("ResourceStatusReason", "")
+        for e in events
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_efs_delete_stack(cfn, efs):
+    stack_name = f"cfn-efs-del-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_efs_stack_template()))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    ids = _efs_physical_ids(cfn, stack_name)
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    assert _efs_error_code(efs.describe_file_systems, FileSystemId=ids["Fs"]) == "FileSystemNotFound"
+    for logical_id in ("Mt1", "Mt2"):
+        assert _efs_error_code(efs.describe_mount_targets, MountTargetId=ids[logical_id]) == "MountTargetNotFound"
+    assert efs.describe_access_points(AccessPointId=ids["Ap"])["AccessPoints"] == []
+
+
+def test_cfn_efs_cdk_shape(cfn, efs):
+    """The shape the CDK ``efs.FileSystem`` emits (taken from the construct
+    library, not a synthesized app): a retained, encrypted file system, one
+    mount target per subnet and an access point from ``addAccessPoint``."""
+    stack_name = f"cfn-efs-cdk-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_stack_template()
+    template["Resources"]["Fs"].update({"DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain"})
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    ids = _efs_physical_ids(cfn, stack_name)
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    # The retained file system outlives the stack; its dependents do not.
+    assert efs.describe_file_systems(FileSystemId=ids["Fs"])["FileSystems"][0]["FileSystemId"] == ids["Fs"]
+    for logical_id in ("Mt1", "Mt2"):
+        assert _efs_error_code(efs.describe_mount_targets, MountTargetId=ids[logical_id]) == "MountTargetNotFound"
+    assert efs.describe_access_points(AccessPointId=ids["Ap"])["AccessPoints"] == []
+    efs.delete_file_system(FileSystemId=ids["Fs"])
+
+
+def _efs_single_file_system_template(**properties):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Fs": {"Type": "AWS::EFS::FileSystem", "Properties": properties}},
+    }
+
+
+def test_cfn_efs_file_system_protection(cfn, efs):
+    stack_name = f"cfn-efs-prot-{_uuid_mod.uuid4().hex[:8]}"
+    protection = lambda value: {"ReplicationOverwriteProtection": value}  # noqa: E731
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("DISABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, stack_name)["Fs"]
+
+    def current():
+        return efs.describe_file_systems(FileSystemId=fs_id)["FileSystems"][0][
+            "FileSystemProtection"]["ReplicationOverwriteProtection"]
+
+    assert current() == "DISABLED"
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("ENABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _efs_physical_ids(cfn, stack_name)["Fs"] == fs_id and current() == "ENABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemProtection=protection("DISABLED"))))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(ThroughputMode="bursting")))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert current() == "ENABLED"  # the dropped property reverts to the default
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_efs_replication_configuration(cfn, efs):
+    west = _efs_client_for_region("us-west-2")
+    stack_name = f"cfn-efs-repl-cfg-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_single_file_system_template(
+        Encrypted=True,
+        ReplicationConfiguration={"Destinations": [{"Region": "us-west-2"}]},
+    )
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, stack_name)["Fs"]
+
+    config = efs.describe_replication_configurations(FileSystemId=fs_id)["Replications"][0]
+    destination_id = config["Destinations"][0]["FileSystemId"]
+    assert config["Destinations"][0]["Region"] == "us-west-2"
+    destination = west.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert destination["Encrypted"] is True
+    assert destination["FileSystemProtection"]["ReplicationOverwriteProtection"] == "REPLICATING"
+
+    # Dropping the property ends the replication; the destination stays, writeable again.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+        _efs_single_file_system_template(Encrypted=True)))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    assert _efs_physical_ids(cfn, stack_name)["Fs"] == fs_id
+    assert _efs_error_code(efs.describe_replication_configurations, FileSystemId=fs_id) == "ReplicationNotFound"
+    destination = west.describe_file_systems(FileSystemId=destination_id)["FileSystems"][0]
+    assert destination["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    second = efs.describe_replication_configurations(FileSystemId=fs_id)["Replications"][0]
+    second_destination = second["Destinations"][0]["FileSystemId"]
+
+    # Stack delete ends the replication first, which a file system in one cannot do without.
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    assert _efs_error_code(efs.describe_file_systems, FileSystemId=fs_id) == "FileSystemNotFound"
+    for leftover in (destination_id, second_destination):
+        west.delete_file_system(FileSystemId=leftover)
+
+
+def test_cfn_efs_policy_lockout_check_and_bypass(cfn, efs):
+    lockout = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": "*"},
+            "Action": "elasticfilesystem:PutFileSystemPolicy", "Resource": "*",
+        }],
+    }
+    refused = f"cfn-efs-lock-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=refused, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemPolicy=lockout)), OnFailure="DO_NOTHING")
+    assert _wait_stack(cfn, refused)["StackStatus"] == "CREATE_FAILED"
+    events = cfn.describe_stack_events(StackName=refused)["StackEvents"]
+    assert any("InvalidPolicyException" in e.get("ResourceStatusReason", "") for e in events)
+    cfn.delete_stack(StackName=refused)
+    _wait_stack(cfn, refused)
+
+    allowed = f"cfn-efs-bypass-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=allowed, TemplateBody=json.dumps(
+        _efs_single_file_system_template(FileSystemPolicy=lockout, BypassPolicyLockoutSafetyCheck=True)))
+    assert _wait_stack(cfn, allowed)["StackStatus"] == "CREATE_COMPLETE"
+    fs_id = _efs_physical_ids(cfn, allowed)["Fs"]
+    assert json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])["Statement"][0]["Effect"] == "Deny"
+    cfn.delete_stack(StackName=allowed)
+    _wait_stack(cfn, allowed)
+
+
+def test_cfn_efs_mount_target_ip_properties(cfn, efs):
+    stack_name = f"cfn-efs-ip-{_uuid_mod.uuid4().hex[:8]}"
+    template = _efs_stack_template()
+    template["Resources"]["Mt1"]["Properties"].update({"IpAddress": "10.0.1.50", "IpAddressType": "IPV4_ONLY"})
+    template["Outputs"] = {"MtIp": {"Value": {"Fn::GetAtt": ["Mt1", "IpAddress"]}}}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["MtIp"] == "10.0.1.50"
+    ids = _efs_physical_ids(cfn, stack_name)
+    mt = efs.describe_mount_targets(MountTargetId=ids["Mt1"])["MountTargets"][0]
+    assert mt["IpAddress"] == "10.0.1.50" and mt["SubnetId"] == ids["Subnet1"] and mt["VpcId"] == ids["Vpc"]
+    # Mt2 takes the first free address of its own subnet.
+    assert efs.describe_mount_targets(MountTargetId=ids["Mt2"])["MountTargets"][0]["IpAddress"] == "10.0.2.4"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    # The subnets here have no IPv6 CIDR block, so an IPv6 address type fails the stack.
+    failing = _efs_stack_template()
+    failing["Resources"]["Mt1"]["Properties"]["IpAddressType"] = "DUAL_STACK"
+    failed_name = f"cfn-efs-ipv6-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=failed_name, TemplateBody=json.dumps(failing), OnFailure="DO_NOTHING")
+    assert _wait_stack(cfn, failed_name)["StackStatus"] == "CREATE_FAILED"
+    cfn.delete_stack(StackName=failed_name)
+    _wait_stack(cfn, failed_name)
 
 
 # ---------------------------------------------------------------------------
@@ -17667,6 +18823,183 @@ def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
         ses.describe_configuration_set(ConfigurationSetName=cs_name)
 
 
+def _signer_template(named, validity=30, tags=None, named_validity=None,
+                     action="signer:StartSigningJob"):
+    named_props = {"ProfileName": named, "PlatformId": "AWSLambda-SHA384-ECDSA"}
+    if named_validity:
+        named_props["SignatureValidityPeriod"] = {"Type": "DAYS", "Value": named_validity}
+    return json.dumps({
+        "Resources": {
+            "Prof": {"Type": "AWS::Signer::SigningProfile", "Properties": {
+                "PlatformId": "AWSLambda-SHA384-ECDSA",
+                "SignatureValidityPeriod": {"Type": "DAYS", "Value": validity},
+                "Tags": tags or [{"Key": "team", "Value": "a"}]}},
+            "Named": {"Type": "AWS::Signer::SigningProfile", "Properties": named_props},
+            "Perm": {"Type": "AWS::Signer::ProfilePermission", "Properties": {
+                "ProfileName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+                "Action": action,
+                "Principal": {"Ref": "AWS::AccountId"}, "StatementId": "p1"}},
+            "Perm2": {"Type": "AWS::Signer::ProfilePermission", "DependsOn": "Perm",
+                      "Properties": {
+                          "ProfileName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+                          "ProfileVersion": {"Fn::GetAtt": ["Prof", "ProfileVersion"]},
+                          "Action": "signer:GetSigningProfile",
+                          "Principal": {"Ref": "AWS::AccountId"}, "StatementId": "p2"}},
+        },
+        "Outputs": {k: {"Value": v} for k, v in {
+            "ProfRef": {"Ref": "Prof"}, "ProfArn": {"Fn::GetAtt": ["Prof", "Arn"]},
+            "ProfName": {"Fn::GetAtt": ["Prof", "ProfileName"]},
+            "ProfVersion": {"Fn::GetAtt": ["Prof", "ProfileVersion"]},
+            "ProfVersionArn": {"Fn::GetAtt": ["Prof", "ProfileVersionArn"]},
+            "NamedRef": {"Ref": "Named"}, "PermRef": {"Ref": "Perm"},
+        }.items()},
+    })
+
+
+def _signer_permission_ids(signer, name):
+    try:
+        listed = signer.list_profile_permissions(profileName=name)["permissions"]
+    except ClientError as exc:
+        return exc.response["code"]
+    return [p["statementId"] for p in listed]
+
+
+def test_cfn_signer_signing_profile_and_profile_permission(cfn, signer):
+    """Ref is the profile ARN (the permission's is ``StatementId|ProfileName``),
+    a generated ProfileName is ``<LogicalId>_`` plus 12 letters and digits,
+    the profile carries the template, stack and ``aws:cloudformation:`` tags,
+    a Tags change keeps the profile, a SignatureValidityPeriod change replaces
+    it and its permissions, and a delete cancels it: profiles are never
+    deleted on AWS."""
+    stack_name = f"cfn-signer-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn_named_{_uuid_mod.uuid4().hex[:8]}"
+    stack_tags = [{"Key": "stacktag", "Value": "x"}]
+    cfn.create_stack(StackName=stack_name, TemplateBody=_signer_template(named), Tags=stack_tags)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    gen = out["ProfName"]
+    assert re.fullmatch(r"Prof_[A-Za-z0-9]{12}", gen)
+    assert out["ProfRef"] == out["ProfArn"]
+    assert out["ProfArn"].endswith(f":/signing-profiles/{gen}")
+    assert out["ProfVersionArn"] == f"{out['ProfArn']}/{out['ProfVersion']}"
+    assert out["NamedRef"].endswith(f":/signing-profiles/{named}")
+    assert out["PermRef"] == f"p1|{gen}"
+
+    profile = signer.get_signing_profile(profileName=gen)
+    assert profile["signatureValidityPeriod"] == {"type": "DAYS", "value": 30}
+    assert profile["tags"] == {
+        "team": "a", "stacktag": "x",
+        "aws:cloudformation:stack-name": stack_name,
+        "aws:cloudformation:stack-id": stack["StackId"],
+        "aws:cloudformation:logical-id": "Prof",
+    }
+    listed = signer.list_profile_permissions(profileName=gen)["permissions"]
+    assert listed[1] == {"action": "signer:GetSigningProfile", "principal": listed[0]["principal"],
+                         "statementId": "p2", "profileVersion": out["ProfVersion"]}
+    assert _signer_permission_ids(signer, named) == "PolicyNotFound"
+
+    cfn.update_stack(StackName=stack_name, Tags=stack_tags, TemplateBody=_signer_template(
+        named, tags=[{"Key": "team", "Value": "b"}, {"Key": "k2", "Value": "v2"}]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    tagged = signer.get_signing_profile(profileName=gen)
+    assert tagged["profileVersion"] == out["ProfVersion"]
+    assert tagged["tags"]["team"] == "b" and tagged["tags"]["k2"] == "v2"
+
+    cfn.update_stack(StackName=stack_name, Tags=stack_tags, TemplateBody=_signer_template(
+        named, validity=31, tags=[{"Key": "team", "Value": "b"}, {"Key": "k2", "Value": "v2"}]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    gen2 = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ProfName"]
+    assert gen2 != gen
+    assert signer.get_signing_profile(profileName=gen)["status"] == "Canceled"
+    assert _signer_permission_ids(signer, gen) == "PolicyNotFound"
+    assert signer.get_signing_profile(profileName=gen2)["signatureValidityPeriod"]["value"] == 31
+    assert _signer_permission_ids(signer, gen2) == ["p1", "p2"]
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    for name in (gen2, named):
+        assert signer.get_signing_profile(profileName=name)["status"] == "Canceled"
+        assert _signer_permission_ids(signer, name) == "PolicyNotFound"
+    # The canceled name stays taken.
+    with pytest.raises(ClientError) as exc:
+        signer.put_signing_profile(profileName=named, platformId="AWSLambda-SHA384-ECDSA")
+    assert exc.value.response["code"] == "ProfileAlreadyExists"
+
+
+def test_cfn_signer_custom_named_replacement_is_refused(cfn, signer):
+    """A create-only change under a kept ProfileName, or under a kept
+    StatementId and ProfileName, fails with the custom-named refusal that
+    names the physical id; the stack rolls back."""
+    stack_name = f"cfn-signer-rn-{_uuid_mod.uuid4().hex[:8]}"
+    named = f"cfn_named_{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_signer_template(named))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    try:
+        for template, physical_id in (
+            (_signer_template(named, named_validity=7), out["NamedRef"]),
+            (_signer_template(named, action="signer:RevokeSignature"), out["PermRef"]),
+        ):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template)
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            reasons = [e.get("ResourceStatusReason", "") for e in
+                       cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
+            assert ("CloudFormation cannot update a stack when a custom-named resource "
+                    f"requires replacing. Rename {physical_id} and update the stack again."
+                    ) in reasons
+        assert signer.get_signing_profile(profileName=named)["status"] == "Active"
+        assert signer.list_profile_permissions(profileName=out["ProfName"])["permissions"][0][
+            "action"] == "signer:StartSigningJob"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def test_cfn_signer_signing_profile_platform_outside_the_schema_enum(cfn, signer):
+    """The resource schema's PlatformId enum has two values. A value outside
+    it, literal or from a parameter, fails the create before anything is
+    provisioned: one stack-level CREATE_FAILED counting every error, then the
+    rollback, with no resource event and no profile created, not even for the
+    valid resource."""
+    iot = "AWSIoTDeviceManagement-SHA256-ECDSA"
+    stack_name = f"cfn-signer-iot-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Parameters": {"Platform": {"Type": "String", "Default": iot}},
+        "Resources": {
+            "Iot": {"Type": "AWS::Signer::SigningProfile",
+                    "Properties": {"PlatformId": {"Ref": "Platform"}}},
+            "Bogus": {"Type": "AWS::Signer::SigningProfile",
+                      "Properties": {"PlatformId": "Bogus"}},
+            "Ok": {"Type": "AWS::Signer::SigningProfile",
+                   "Properties": {"ProfileName": stack_name.replace("-", "_"),
+                                  "PlatformId": "AWSLambda-SHA384-ECDSA"}},
+        }}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        events = list(reversed(cfn.describe_stack_events(StackName=stack_name)["StackEvents"]))
+        assert {e["LogicalResourceId"] for e in events} == {stack_name}
+        assert [(e["ResourceStatus"], e.get("ResourceStatusReason"), e.get("DetailedStatus"))
+                for e in events[1:]] == [
+            ("CREATE_FAILED", "Validation failed with 2 error(s). Call DescribeEvents to retrieve "
+             "the full list of issues with resource and property details, resolve each error, "
+             "then retry the operation.", "VALIDATION_FAILED"),
+            ("ROLLBACK_IN_PROGRESS",
+             "Validation failure detected. See the operation's FAILED event for details.", None),
+            ("ROLLBACK_COMPLETE", "", None),
+        ]
+        assert cfn.describe_stack_resources(StackName=stack_name)["StackResources"] == []
+        with pytest.raises(ClientError):
+            signer.get_signing_profile(profileName=stack_name.replace("-", "_"))
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # Loud deletes — DELETE_FAILED / ROLLBACK_FAILED stack states, and the
 # delete handlers for the types that used to leak silently
@@ -25135,6 +26468,39 @@ def test_cfn_iot_thing_group_delete_with_child_group_fails(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_group_existing_name_fails_even_with_identical_properties(cfn, iot_client):
+    """CreateThingGroup returns an identical existing group, but a stack does not
+    adopt it: with the same or other properties the stack rolls back with the
+    name-conflict message, the group stays as it was and survives the stack's
+    delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-tg-taken-{uid}"
+    original = iot_client.create_thing_group(thingGroupName=name, thingGroupProperties={
+        "thingGroupDescription": "first", "attributePayload": {"attributes": {"a": "1"}}})
+    try:
+        for description in ("first", "second"):
+            stack_name = f"cfn-tg-taken-{description}-{uid}"
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+                "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+                    "ThingGroupName": name,
+                    "ThingGroupProperties": {
+                        "ThingGroupDescription": description,
+                        "AttributePayload": {"Attributes": {"a": "1"}}}}}}}))
+            try:
+                stack = _wait_stack(cfn, stack_name)
+                assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+                assert (f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists."
+                        in _stack_event_reasons(cfn, stack_name))
+            finally:
+                _delete_cfn_test_stack(cfn, stack_name)
+            group = iot_client.describe_thing_group(thingGroupName=name)
+            assert group["thingGroupId"] == original["thingGroupId"]
+            assert group["version"] == 1
+            assert group["thingGroupProperties"]["thingGroupDescription"] == "first"
+    finally:
+        iot_client.delete_thing_group(thingGroupName=name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
@@ -27854,6 +29220,61 @@ def test_cfn_appconfig_deployment_replacement_keeps_the_old_deployment(cfn, appc
         with pytest.raises(ClientError) as exc:
             call()
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def _cfn_appconfig_deployment_template(name, strategy_id):
+    """An application, environment, profile, hosted version and a deployment with `strategy_id`."""
+    return json.dumps({
+        "Resources": {
+            "App": {"Type": "AWS::AppConfig::Application", "Properties": {"Name": name}},
+            "Env": {"Type": "AWS::AppConfig::Environment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name}},
+            "Profile": {"Type": "AWS::AppConfig::ConfigurationProfile", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "Name": name, "LocationUri": "hosted"}},
+            "HCV": {"Type": "AWS::AppConfig::HostedConfigurationVersion", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "ConfigurationProfileId": {"Ref": "Profile"},
+                "ContentType": "application/json", "Content": "{}"}},
+            "Deployment": {"Type": "AWS::AppConfig::Deployment", "Properties": {
+                "ApplicationId": {"Ref": "App"}, "EnvironmentId": {"Ref": "Env"},
+                "ConfigurationProfileId": {"Ref": "Profile"},
+                "DeploymentStrategyId": strategy_id,
+                "ConfigurationVersion": {"Ref": "HCV"}}},
+        },
+        "Outputs": {"AppId": {"Value": {"Ref": "App"}},
+                    "EnvId": {"Value": {"Ref": "Env"}},
+                    "Number": {"Value": {"Fn::GetAtt": ["Deployment", "DeploymentNumber"]}}},
+    })
+
+
+def test_cfn_appconfig_deployment_with_a_predefined_strategy(cfn, appconfig_client):
+    """The deployment records the parameters of the predefined strategy it names."""
+    stack_name = f"cfn-ac-predef-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "AppConfig.AllAtOnce"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        deployment = appconfig_client.get_deployment(
+            ApplicationId=_cfn_output(cfn, stack_name, "AppId"),
+            EnvironmentId=_cfn_output(cfn, stack_name, "EnvId"),
+            DeploymentNumber=int(_cfn_output(cfn, stack_name, "Number")))
+        assert deployment["DeploymentStrategyId"] == "AppConfig.AllAtOnce"
+        assert (deployment["DeploymentDurationInMinutes"], deployment["GrowthType"],
+                deployment["GrowthFactor"], deployment["FinalBakeTimeInMinutes"]) == (0, "LINEAR", 100.0, 10)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_appconfig_deployment_with_a_missing_strategy_rolls_back(cfn):
+    """A deployment naming a strategy that does not exist fails and rolls the stack back."""
+    stack_name = f"cfn-ac-nostrat-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appconfig_deployment_template(stack_name, "abcdefg"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "DeploymentStrategy with Id abcdefg could not be found." in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
@@ -30726,6 +32147,8 @@ def test_cfn_import_adopts_each_supported_type(cfn, sqs, ssm, s3, ddb, iam, logs
         zf.writestr("index.py", "def handler(e, c):\n    return e\n")
     fn_arn = lam.create_function(FunctionName=name, Runtime="python3.12", Role=role["Arn"],
                                  Handler="index.handler", Code={"ZipFile": buf.getvalue()})["FunctionArn"]
+    thing = iot_client.create_thing(thingName=name)
+    cert = iot_client.create_keys_and_certificate(setAsActive=True)
     policy_arn = iot_client.create_policy(policyName=name, policyDocument=json.dumps(document))["policyArn"]
     ca = iot_client.register_ca_certificate(caCertificate=ca_pem, certificateMode="SNI_ONLY",
                                             setAsActive=True)
@@ -30749,6 +32172,11 @@ def test_cfn_import_adopts_each_supported_type(cfn, sqs, ssm, s3, ddb, iam, logs
         "F": ("AWS::Lambda::Function", {"FunctionName": name}, {
             "FunctionName": name, "Runtime": "python3.12", "Handler": "index.handler", "Role": role["Arn"],
             "Code": {"ZipFile": "def handler(e, c):\n    return e\n"}}, {"Arn": fn_arn}),
+        "IT": ("AWS::IoT::Thing", {"ThingName": name}, {"ThingName": name},
+               {"Arn": thing["thingArn"], "Id": thing["thingId"]}),
+        "IC": ("AWS::IoT::Certificate", {"Id": cert["certificateId"]}, {
+            "CertificatePem": cert["certificatePem"], "Status": "ACTIVE"},
+            {"Arn": cert["certificateArn"], "Id": cert["certificateId"]}),
         "IP": ("AWS::IoT::Policy", {"Id": name}, {"PolicyName": name, "PolicyDocument": document},
                {"Arn": policy_arn, "Id": name}),
         "CA": ("AWS::IoT::CACertificate", {"Id": ca["certificateId"]}, {
@@ -30790,6 +32218,9 @@ def test_cfn_import_adopts_each_supported_type(cfn, sqs, ssm, s3, ddb, iam, logs
         lam.delete_function(FunctionName=name)
         iam.delete_role(RoleName=name)
         logs.delete_log_group(logGroupName=name)
+        iot_client.delete_thing(thingName=name)
+        iot_client.update_certificate(certificateId=cert["certificateId"], newStatus="INACTIVE")
+        iot_client.delete_certificate(certificateId=cert["certificateId"])
         iot_client.delete_policy(policyName=name)
         iot_client.update_ca_certificate(certificateId=ca["certificateId"], newStatus="INACTIVE")
         iot_client.delete_ca_certificate(certificateId=ca["certificateId"])
@@ -30810,6 +32241,10 @@ _CFN_IMPORT_MISSING = {
         "FunctionName",
         r"Function not found: arn:aws:lambda:[a-z0-9-]+:\d{{12}}:function:{v} \(Service: Lambda, "
         r"Status Code: 404, Request ID: [0-9a-f-]+\) \(SDK Attempt Count: 1\)"),
+    "AWS::IoT::Thing": (
+        "ThingName", r"Resource of type 'AWS::IoT::Thing' with identifier '{v}' was not found\."),
+    "AWS::IoT::Certificate": (
+        "Id", r"Resource of type 'AWS::IoT::Certificate' with identifier '{v}' was not found\."),
     "AWS::IoT::Policy": (
         "Id", r"Resource of type 'AWS::IoT::Policy' with identifier '{v}' was not found\."),
     "AWS::IoT::CACertificate": (
@@ -32821,3 +34256,177 @@ def test_cfn_elasticache_lambda_reaches_replication_group(cfn, lam):
         assert result.get("reply") == "+PONG", result
     finally:
         _delete_cfn_test_stack(cfn, stack)
+
+
+def _cfn_apigwv2_domain_template(domain, key):
+    return json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"Name": "dom-api", "ProtocolType": "HTTP"}},
+            "Stage": {"Type": "AWS::ApiGatewayV2::Stage",
+                      "Properties": {"ApiId": {"Ref": "Api"}, "StageName": "prod"}},
+            "Domain": {"Type": "AWS::ApiGatewayV2::DomainName", "Properties": {
+                "DomainName": domain, "Tags": {"team": "a"},
+                "DomainNameConfigurations": [{"EndpointType": "REGIONAL", "CertificateArn":
+                    "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"}]}},
+            "Mapping": {"Type": "AWS::ApiGatewayV2::ApiMapping", "DependsOn": ["Stage"], "Properties": {
+                "DomainName": {"Ref": "Domain"}, "ApiId": {"Ref": "Api"}, "Stage": "prod", "ApiMappingKey": key}},
+        },
+        "Outputs": {
+            "Domain": {"Value": {"Ref": "Domain"}},
+            "Regional": {"Value": {"Fn::GetAtt": ["Domain", "RegionalDomainName"]}},
+            "Arn": {"Value": {"Fn::GetAtt": ["Domain", "DomainNameArn"]}},
+            "Mapping": {"Value": {"Ref": "Mapping"}},
+            "MappingId": {"Value": {"Fn::GetAtt": ["Mapping", "ApiMappingId"]}},
+        },
+    })
+
+
+def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
+    stack_name = f"cfn-apigw-dom-{_uuid_mod.uuid4().hex[:8]}"
+    domain = f"{stack_name}.example.com"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Domain") == domain
+        assert _output(stack, "Arn") == f"arn:aws:apigateway:us-east-1::/domainnames/{domain}"
+        got = apigw.get_domain_name(DomainName=domain)
+        assert _output(stack, "Regional") == got["DomainNameConfigurations"][0]["ApiGatewayDomainName"]
+        assert got["Tags"]["team"] == "a"
+        assert got["Tags"]["aws:cloudformation:logical-id"] == "Domain"
+        mapping_id = _output(stack, "Mapping")
+        assert _output(stack, "MappingId") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v1"
+
+        # ApiMappingKey updates in place.
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Mapping") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        apigw.get_domain_name(DomainName=domain)
+
+
+
+def _rds_groups_template(uid, *, params, subnet_desc="db subnets", attach=True):
+    resources = {
+        "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.42.0.0/16"}},
+        "SubnetA": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.1.0/24", "AvailabilityZone": "us-east-1a"}},
+        "SubnetB": {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.42.2.0/24", "AvailabilityZone": "us-east-1b"}},
+        "Subnets": {"Type": "AWS::RDS::DBSubnetGroup", "Properties": {
+            "DBSubnetGroupDescription": subnet_desc,
+            "SubnetIds": [{"Ref": "SubnetA"}, {"Ref": "SubnetB"}],
+            "Tags": [{"Key": "team", "Value": "db"}]}},
+        "Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "Description": "instance params", "Family": "mysql8.0", "Parameters": params}},
+        "ClusterParams": {"Type": "AWS::RDS::DBClusterParameterGroup", "Properties": {
+            "DBClusterParameterGroupName": f"cpg-{uid}", "Description": "cluster params",
+            "Family": "aurora-mysql8.0", "Parameters": {"time_zone": "UTC"}}},
+        "Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+            "GenerateSecretString": {"SecretStringTemplate": '{"username":"admin"}',
+                                     "GenerateStringKey": "password",
+                                     "ExcludeCharacters": "\"@/\\\\"}}},
+        "Db": {"Type": "AWS::RDS::DBInstance", "DeletionPolicy": "Delete", "Properties": {
+            "DBInstanceIdentifier": f"cfn-groups-{uid}", "Engine": "mysql",
+            "DBInstanceClass": "db.t3.micro", "AllocatedStorage": "20", "DBName": "app",
+            "MasterUsername": "admin", "MasterUserPassword": "password123",
+            "DBSubnetGroupName": {"Ref": "Subnets"}, "DBParameterGroupName": {"Ref": "Params"}}},
+    }
+    if attach:
+        resources["Attach"] = {"Type": "AWS::SecretsManager::SecretTargetAttachment", "Properties": {
+            "SecretId": {"Ref": "Secret"}, "TargetId": {"Ref": "Db"},
+            "TargetType": "AWS::RDS::DBInstance"}}
+    outputs = {
+        "SubnetGroup": {"Value": {"Ref": "Subnets"}},
+        "SubnetGroupArn": {"Value": {"Fn::GetAtt": ["Subnets", "DBSubnetGroupArn"]}},
+        "ParamGroup": {"Value": {"Ref": "Params"}},
+        "ParamGroupName": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupName"]}},
+        "ParamGroupArn": {"Value": {"Fn::GetAtt": ["Params", "DBParameterGroupArn"]}},
+        "ClusterParamGroup": {"Value": {"Ref": "ClusterParams"}},
+        "SecretArn": {"Value": {"Ref": "Secret"}},
+    }
+    if attach:
+        outputs["Attachment"] = {"Value": {"Ref": "Attach"}}
+    return json.dumps({"Resources": resources, "Outputs": outputs})
+
+
+def test_cfn_rds_groups_and_secret_target_attachment(cfn, rds, sm):
+    """The resources rds.DatabaseInstance emits: a DBSubnetGroup, parameter
+    groups and a SecretTargetAttachment that writes the connection keys."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-groups-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+        uid, params={"max_connections": 100, "sql_mode": "STRICT_ALL_TABLES"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupArn"] == out["SubnetGroupArn"]
+        assert len(group["Subnets"]) == 2
+        tags = rds.list_tags_for_resource(ResourceName=out["SubnetGroupArn"])["TagList"]
+        assert {"Key": "team", "Value": "db"} in tags
+        assert out["ParamGroup"] == out["ParamGroupName"]
+        assert out["ParamGroupArn"].endswith(f":pg:{out['ParamGroup']}")
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "100", "sql_mode": "STRICT_ALL_TABLES"}
+        assert out["ClusterParamGroup"] == f"cpg-{uid}"
+        db = rds.describe_db_instances(DBInstanceIdentifier=f"cfn-groups-{uid}")["DBInstances"][0]
+        assert db["DBSubnetGroup"]["DBSubnetGroupName"] == out["SubnetGroup"]
+
+        assert out["Attachment"] == sm.describe_secret(SecretId=out["SecretArn"])["ARN"]
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert value["username"] == "admin" and value["password"]
+        assert value["engine"] == "mysql"
+        assert value["host"] == db["Endpoint"]["Address"]
+        assert value["port"] == db["Endpoint"]["Port"]
+        assert value["dbname"] == "app"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_rds_groups_template(
+            uid, params={"max_connections": 200}, subnet_desc="changed", attach=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])["DBSubnetGroups"][0]
+        assert group["DBSubnetGroupDescription"] == "changed"
+        user = {p["ParameterName"]: p["ParameterValue"] for p in rds.describe_db_parameters(
+            DBParameterGroupName=out["ParamGroup"], Source="user")["Parameters"]}
+        assert user == {"max_connections": "200"}
+        value = json.loads(sm.get_secret_value(SecretId=out["SecretArn"])["SecretString"])
+        assert set(value) == {"username", "password"}
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError):
+            rds.describe_db_subnet_groups(DBSubnetGroupName=out["SubnetGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_parameters(DBParameterGroupName=out["ParamGroup"])
+        with pytest.raises(ClientError):
+            rds.describe_db_cluster_parameters(DBClusterParameterGroupName=f"cpg-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_rds_custom_named_parameter_group_cannot_be_replaced(cfn):
+    """Family is Update requires: Replacement, so a custom-named group refuses it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rds-pg-repl-{uid}"
+
+    def template(family):
+        return json.dumps({"Resources": {"Params": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {
+            "DBParameterGroupName": f"pg-{uid}", "Description": "d", "Family": family}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("mysql8.0"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("mysql5.7"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

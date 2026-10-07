@@ -330,6 +330,44 @@ def _record_history(alarm_name, old_state, new_state, reason):
     )
 
 
+def first_alarm_time(alarm_arn: str, start: float, end: float) -> float | None:
+    """The earliest moment in ``[start, end]`` at which the alarm named by
+    ``alarm_arn`` was in ``ALARM``, or None if it never was (or the ARN names no
+    alarm of the current account and region).
+
+    Internal entry point for AppConfig's environment monitors. The alarm's state
+    over time is rebuilt from its StateUpdate history, so an alarm that fired
+    and recovered inside the window still counts. History timestamps carry
+    whole seconds.
+    """
+    name = _alarm_name_from_local_arn(alarm_arn)
+    alarm = (_alarms.get(name) or _composite_alarms.get(name)) if name else None
+    if not alarm:
+        return None
+    transitions = []
+    for entry in _history_entries():
+        if entry.get("AlarmName") != name or entry.get("HistoryItemType") != "StateUpdate":
+            continue
+        try:
+            data = json.loads(entry["HistoryData"])
+            at = datetime.strptime(entry["Timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            transitions.append((at, data["oldState"]["stateValue"], data["newState"]["stateValue"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    transitions.sort(key=lambda t: t[0])
+    state_at_start = transitions[0][1] if transitions else alarm["StateValue"]
+    for at, _old, new in transitions:
+        if at > start:
+            break
+        state_at_start = new
+    if state_at_start == "ALARM":
+        return start
+    for at, _old, new in transitions:
+        if start < at <= end and new == "ALARM":
+            return at
+    return None
+
+
 def record_metric(namespace: str, metric_name: str, value: float,
                   unit: str = "None", dimensions: dict | None = None) -> None:
     """Internal entry point for other services to publish CloudWatch metrics
