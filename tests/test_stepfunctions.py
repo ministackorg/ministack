@@ -4616,6 +4616,35 @@ def test_sfn_stop_execution(sfn):
     desc = sfn.describe_execution(executionArn=exec_arn)
     assert desc["status"] == "ABORTED"
 
+def test_sfn_stop_execution_retry_preserves_abort(sfn):
+    """A retry after a lost StopExecution response must not rewrite the abort."""
+    name = f"stop-retry-{_uuid_mod.uuid4().hex[:12]}"
+    machine = sfn.create_state_machine(
+        name=name,
+        definition=json.dumps({"StartAt": "Wait", "States": {
+            "Wait": {"Type": "Wait", "Seconds": 3600, "End": True},
+        }}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=machine)["executionArn"]
+        first = sfn.stop_execution(executionArn=execution, error="FirstError", cause="first cause")
+        before = sfn.describe_execution(executionArn=execution)
+        before.pop("ResponseMetadata")
+        history = sfn.get_execution_history(executionArn=execution)["events"]
+        retry = sfn.stop_execution(executionArn=execution, error="RetryError", cause="retry cause")
+        assert retry["stopDate"] == first["stopDate"]
+        after = sfn.describe_execution(executionArn=execution)
+        after.pop("ResponseMetadata")
+        assert after == before
+        assert sfn.get_execution_history(executionArn=execution)["events"] == history
+        assert before["status"] == "ABORTED"
+        assert before["error"] == "FirstError"
+        assert before["cause"] == "first cause"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=machine)
+
+
 def test_sfn_list_executions_filter(sfn):
     """ListExecutions with statusFilter returns only matching executions."""
     definition = json.dumps(
