@@ -8,8 +8,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateThing``, ``DeleteThing``
   - ThingType: ``CreateThingType`` and friends
   - ThingGroup: ``CreateThingGroup`` and friends
-  - Certificates: ``CreateKeysAndCertificate``, ``RegisterCertificate``,
-    ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
+  - Certificates: ``CreateKeysAndCertificate``, ``CreateCertificateFromCsr``,
+    ``RegisterCertificate``, ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
     ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
@@ -44,6 +44,11 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
     ``jobTemplateArn`` takes the template's document and configuration
   - ``DescribeEndpoint`` returning a per-account hostname
+  - Domain configurations: ``CreateDomainConfiguration``,
+    ``DescribeDomainConfiguration``, ``ListDomainConfigurations``,
+    ``UpdateDomainConfiguration``, ``DeleteDomainConfiguration``, including
+    the ``iot:Data-ATS`` / ``iot:CredentialProvider`` configurations IoT owns
+    (control plane only: the broker does not serve a configured domain)
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
 dependency. The data plane (``iot_data.py``) is
@@ -92,6 +97,7 @@ from ministack.core.x509_utils import (
     certificate_is_signed_by,
     generate_ca,
     get_certificate_id,
+    sign_certificate_request,
     sign_leaf_certificate,
 )
 
@@ -119,6 +125,8 @@ _shadows: AccountRegionScopedDict = AccountRegionScopedDict()
 _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
 # Registry event configuration (UpdateEventConfigurations), one entry per account+region.
 _event_config: AccountRegionScopedDict = AccountRegionScopedDict()
+# Domain configurations (CreateDomainConfiguration & friends): name -> record
+_domain_configurations: AccountRegionScopedDict = AccountRegionScopedDict()
 # CA-certificate registry (RegisterCACertificate & friends): caCertificateId -> record
 _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 # JITR registration code — a single "code" key per account/region
@@ -248,6 +256,7 @@ def get_state() -> dict:
         "shadows": copy.deepcopy(_shadows),
         "indexing_config": copy.deepcopy(_indexing_config),
         "event_config": copy.deepcopy(_event_config),
+        "domain_configurations": copy.deepcopy(_domain_configurations),
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
@@ -285,6 +294,7 @@ def _restore_state(data: dict | None) -> None:
     _shadows.update(data.get("shadows", {}))
     _indexing_config.update(data.get("indexing_config", {}))
     _event_config.update(data.get("event_config", {}))
+    _domain_configurations.update(data.get("domain_configurations", {}))
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
@@ -327,6 +337,7 @@ def reset() -> None:
     _warned_sql_funcs.clear()
     _indexing_config.clear()
     _event_config.clear()
+    _domain_configurations.clear()
     _ca_certificates.clear()
     _registration_codes.clear()
     _provisioning_templates.clear()
@@ -505,6 +516,10 @@ async def _route_request(
     # Endpoint
     if path == "/endpoint" and method == "GET":
         return _describe_endpoint(qp)
+    if path == "/domainConfigurations" and method == "GET":
+        return _list_domain_configurations(qp)
+    if path.startswith("/domainConfigurations/"):
+        return _handle_domain_configuration(method, path, body)
 
     # Things — list/describe/update/delete
     if path == "/things" and method == "GET":
@@ -557,10 +572,12 @@ async def _route_request(
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
         return _create_keys_and_certificate(qp)
+    if path == "/certificates" and method == "POST":
+        return _create_certificate_from_csr(_parse_body(body), qp)
     if path == "/certificate/register" and method == "POST":
         return await _register_certificate(_parse_body(body), qp)
     if path == "/certificate/register-no-ca" and method == "POST":
-        return await _register_certificate(_parse_body(body), qp, without_ca=True)
+        return await _register_certificate_without_ca(_parse_body(body), qp)
 
     # CA certificates + JITR registration code
     if path == "/registrationcode" and method in ("GET", "DELETE"):
@@ -700,6 +717,510 @@ def _describe_endpoint(qp: dict) -> tuple:
             400,
         )
     return json_response({"endpointAddress": host})
+
+
+# ---------------------------------------------------------------------------
+# Domain configurations
+# ---------------------------------------------------------------------------
+
+# Names: Create and Delete take ``[\w.-]+``; Describe and Update also accept
+# ``:`` so they reach the configurations IoT owns (``iot:Data-ATS``).
+_DOMAIN_CONFIG_NAME_RE = re.compile(r"[\w.-]+", re.ASCII)
+_RESERVED_DOMAIN_CONFIG_NAME_RE = re.compile(r"[\w.:-]+", re.ASCII)
+_AUTHORIZER_NAME_RE = re.compile(r"[\w=,@-]+", re.ASCII)
+# The configurations IoT owns. ListDomainConfigurations shows the first two on
+# an account that never created one; ``iot:Jobs`` is retired with its endpoint.
+_IOT_OWNED_DOMAIN_CONFIGS = {
+    "iot:Data-ATS": "DATA",
+    "iot:CredentialProvider": "CREDENTIAL_PROVIDER",
+}
+_RETIRED_DOMAIN_CONFIG_NAMES = frozenset({"iot:Jobs"})
+_DEFAULT_SECURITY_POLICY = "IoTSecurityPolicy_TLS13_1_2_2022_10"
+# Matched case-insensitively and stored in this spelling, as AWS does.
+_SECURITY_POLICIES = {
+    p.lower(): p
+    for p in (
+        "IoTSecurityPolicy_TLS13_1_3_2022_10",
+        "IoTSecurityPolicy_TLS13_1_2_2022_10",
+        "IoTSecurityPolicy_TLS12_1_2_2022_10",
+        "IoTSecurityPolicy_TLS12_1_0_2016_01",
+        "IoTSecurityPolicy_TLS12_1_0_2015_01",
+    )
+}
+# Regions that answer "not supported in region" for the 2016 policy (measured
+# 2026-10-05; the other ten commercial regions probed accept it).
+_TLS12_2016_UNSUPPORTED_REGIONS = frozenset({
+    "us-east-1", "us-west-2", "eu-west-1", "eu-central-1",
+    "ap-southeast-1", "ap-northeast-1",
+})
+# authenticationType -> the applicationProtocols it combines with.
+_AUTH_PROTOCOLS = {
+    "DEFAULT": ("DEFAULT",),
+    "AWS_X509": ("SECURE_MQTT", "HTTPS"),
+    "AWS_SIGV4": ("MQTT_WSS", "HTTPS"),
+    "CUSTOM_AUTH_X509": ("SECURE_MQTT", "HTTPS"),
+    "CUSTOM_AUTH": ("SECURE_MQTT", "MQTT_WSS", "HTTPS"),
+}
+_DOMAIN_CONFIG_ENUMS = (
+    ("serviceType", ("DATA", "JOBS", "CREDENTIAL_PROVIDER")),
+    ("authenticationType", (
+        "DEFAULT", "AWS_X509", "AWS_SIGV4", "CUSTOM_AUTH_X509", "CUSTOM_AUTH",
+        "CUSTOM_AUTH_WITH_X509",
+    )),
+    ("applicationProtocol", ("DEFAULT", "HTTPS", "SECURE_MQTT", "MQTT_WSS")),
+    ("domainConfigurationStatus", ("ENABLED", "DISABLED")),
+)
+_DOMAIN_CONFIG_UPDATE_MEMBERS = (
+    "authorizerConfig", "domainConfigurationStatus", "tlsConfig",
+    "serverCertificateConfig", "authenticationType", "applicationProtocol",
+    "clientCertificateConfig",
+)
+_DOMAIN_CONFIG_LIST_LIMIT = 250
+_PROTOCOLS_DOC = "<https://docs.aws.amazon.com/iot/latest/developerguide/protocols.html>"
+
+
+def _domain_config_invalid(message: str) -> tuple:
+    return error_response_json("InvalidRequestException", message, 400)
+
+
+def _domain_config_constraint(field: str, constraint: str) -> tuple:
+    return _domain_config_invalid(
+        f"1 validation error detected: Value at '{field}' failed to satisfy "
+        f"constraint: Member must {constraint}"
+    )
+
+
+def _domain_config_name_error(name: str, pattern: re.Pattern) -> tuple | None:
+    if len(name) > 128:
+        return _domain_config_constraint(
+            "domainConfigurationName", "have length less than or equal to 128")
+    if not pattern.fullmatch(name):
+        return _domain_config_constraint(
+            "domainConfigurationName",
+            f"satisfy regular expression pattern: {pattern.pattern}")
+    return None
+
+
+def _domain_config_model_error(payload: dict) -> tuple | None:
+    """The request-model checks AWS runs before anything else."""
+    for field, allowed in _DOMAIN_CONFIG_ENUMS:
+        value = payload.get(field)
+        if value is not None and value not in allowed:
+            return _domain_config_constraint(
+                field, f"satisfy enum value set: [{', '.join(allowed)}]")
+    authorizer = payload.get("authorizerConfig")
+    authorizer_name = (authorizer or {}).get("defaultAuthorizerName")
+    if authorizer_name is not None:
+        if not 1 <= len(authorizer_name) <= 128:
+            return _domain_config_constraint(
+                "authorizerConfig.defaultAuthorizerName",
+                "have length less than or equal to 128")
+        if not _AUTHORIZER_NAME_RE.fullmatch(authorizer_name):
+            return _domain_config_constraint(
+                "authorizerConfig.defaultAuthorizerName",
+                f"satisfy regular expression pattern: {_AUTHORIZER_NAME_RE.pattern}")
+    if len(payload.get("serverCertificateArns") or ()) > 1:
+        return _domain_config_constraint(
+            "serverCertificateArns", "have length less than or equal to 1")
+    return None
+
+
+def _domain_config_security_policy(tls_config: dict | None) -> tuple[str | None, tuple | None]:
+    """The stored spelling of ``tlsConfig.securityPolicy`` (the default when
+    absent), or the error AWS answers for a policy it does not offer here."""
+    policy = (tls_config or {}).get("securityPolicy")
+    if policy is None:
+        return _DEFAULT_SECURITY_POLICY, None
+    canonical = _SECURITY_POLICIES.get(str(policy).lower())
+    if canonical is None:
+        return None, _domain_config_invalid(f"SecurityPolicy {policy} not recognized")
+    region = get_region()
+    if canonical.endswith("_2016_01") and region in _TLS12_2016_UNSUPPORTED_REGIONS:
+        return None, _domain_config_invalid(
+            f"SecurityPolicy {policy} is not supported in region {region}")
+    return canonical, None
+
+
+def _domain_config_auth_error(auth: str, protocol: str, authorizer: dict | None) -> tuple | None:
+    if auth not in _AUTH_PROTOCOLS:
+        return _domain_config_invalid(
+            "The AuthenticationType provided in the request was not recognized. "
+            f"Please refer to {_PROTOCOLS_DOC} for supported Authentication Type "
+            "values and try again.")
+    if protocol not in _AUTH_PROTOCOLS[auth]:
+        return _domain_config_invalid(
+            "Unsupported combination of AuthenticationType and ApplicationProtocol "
+            f"provided. AuthenticationType: [{auth}], ApplicationProtocol: "
+            f"[{protocol}]. Please refer to {_PROTOCOLS_DOC} for supported "
+            "combinations and try again.")
+    if auth.startswith("CUSTOM_AUTH") and not authorizer:
+        return _domain_config_invalid(
+            "The domain configuration must have a valid AuthorizerConfig configured "
+            f"when using {auth} as the AuthenticationType. Please refer to "
+            f"{_PROTOCOLS_DOC} for supported combinations and try again.")
+    return None
+
+
+def _domain_config_arn(name: str, suffix: str | None) -> str:
+    resource = f"domainconfiguration/{name}" + (f"/{suffix}" if suffix else "")
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:{resource}"
+
+
+def _endpoint_address(endpoint_type: str) -> str:
+    """The host DescribeEndpoint answers for ``iot:Data-ATS`` or
+    ``iot:CredentialProvider``, which AWS's configurations of the same name
+    carry as their ``domainName``. Same host as ``_describe_endpoint``."""
+    prefix = _endpoint_prefix(get_account_id())
+    region = get_region()
+    if endpoint_type == "iot:CredentialProvider":
+        return f"{prefix}.credentials.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    return f"{prefix}-ats.iot.{region}.{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+
+
+def _ensure_owned_domain_configurations() -> None:
+    """Materialise the configurations IoT owns, the way AWS does on the
+    first domain-configuration call of an account and region. A stored one
+    follows the current DescribeEndpoint address (the host or port may differ
+    after a restart with persisted state)."""
+    for name, service_type in _IOT_OWNED_DOMAIN_CONFIGS.items():
+        existing = _domain_configurations.get(name)
+        if existing is not None:
+            existing["domainName"] = _endpoint_address(name)
+            continue
+        record = {
+            "domainConfigurationName": name,
+            "domainConfigurationArn": _domain_config_arn(name, None),
+            "domainName": _endpoint_address(name),
+            "serverCertificates": [],
+            "domainConfigurationStatus": "ENABLED",
+            "serviceType": service_type,
+            "domainType": "ENDPOINT",
+            "lastStatusChangeDate": _now_epoch(),
+        }
+        if service_type == "DATA":
+            record["tlsConfig"] = {"securityPolicy": _DEFAULT_SECURITY_POLICY}
+            record["authenticationType"] = "DEFAULT"
+            record["applicationProtocol"] = "DEFAULT"
+        _domain_configurations[name] = record
+
+
+def _domain_config_not_found(name: str) -> tuple:
+    return error_response_json(
+        "ResourceNotFoundException",
+        "Could not find domain configuration for given account ID and domain "
+        f"configuration name, AccountId: {get_account_id()}, "
+        f"DomainConfigurationName: {name}",
+        404,
+    )
+
+
+def _acm_certificate(arn: str) -> dict | None:
+    from ministack.services import acm as _acm
+
+    return _acm._get_local_certificate(arn)
+
+
+def _certificate_lacks_server_auth(cert: dict) -> bool:
+    """True for an imported certificate whose extended key usage does not
+    include TLS server authentication (no EKU extension at all counts)."""
+    pem = cert.get("_pem_body")
+    if cert.get("Type") != "IMPORTED" or not pem:
+        return False
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        parsed = x509.load_pem_x509_certificate(pem.encode() if isinstance(pem, str) else pem)
+    except Exception:
+        return False
+    try:
+        usages = parsed.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        return True
+    return ExtendedKeyUsageOID.SERVER_AUTH not in usages
+
+
+def _customer_managed_certificate_error(payload: dict) -> tuple | None:
+    server_arn = payload["serverCertificateArns"][0]
+    validation_arn = payload.get("validationCertificateArn")
+    if not payload.get("domainName"):
+        return _domain_config_invalid("Must provide a valid domain name to configure.")
+    if validation_arn is not None and validation_arn == server_arn:
+        return _domain_config_invalid(
+            "Cannot provide a ServerCertificateArn that is the same as a "
+            "ValidationCertificateArn")
+    for arn in (server_arn, validation_arn):
+        if arn is not None and _acm_certificate(arn) is None:
+            return _domain_config_invalid(f"Certificate {arn} does not exist.")
+    server_cert = _acm_certificate(server_arn)
+    if _certificate_lacks_server_auth(server_cert):
+        return error_response_json(
+            "CertificateValidationException",
+            "The certificate is missing ServerAuth in extended key usage of certificate.",
+            400,
+        )
+    # Only an ACM-issued certificate counts as signed by a trusted CA here; an
+    # imported one has to be vouched for by a trusted validation certificate.
+    if validation_arn is None and server_cert.get("Type") == "IMPORTED":
+        return _domain_config_invalid(
+            "Must provide validation certificate when using server certificates not "
+            "signed by trusted CA or not within")
+    if validation_arn is not None and _acm_certificate(validation_arn).get("Type") == "IMPORTED":
+        return _domain_config_invalid("Validation certificate must be signed by trusted CA")
+    return None
+
+
+def _create_domain_configuration(name: str, payload: dict) -> tuple:
+    """``POST /domainConfigurations/{name}``. Without a server certificate
+    the configuration is AWS_MANAGED and gets a generated ``-ats`` host; with
+    one it is CUSTOMER_MANAGED on the caller's ``domainName``."""
+    err = (_domain_config_name_error(name, _DOMAIN_CONFIG_NAME_RE)
+           or _domain_config_model_error(payload))
+    if err:
+        return err
+    service_type = payload.get("serviceType") or "DATA"
+    if service_type == "JOBS":
+        return _domain_config_invalid("Invalid Service Type")
+    if service_type != "DATA":
+        return _domain_config_invalid(
+            "CreateDomainConfiguration only supports DATA Service Type")
+    existing = _domain_configurations.get(name)
+    if existing is not None:
+        return error_response_json(
+            "ResourceAlreadyExistsException",
+            "Domain configuration already exists",
+            409,
+            extra={"resourceId": existing["domainConfigurationArn"].split(":", 5)[5]},
+        )
+    policy, err = _domain_config_security_policy(payload.get("tlsConfig"))
+    if err:
+        return err
+    auth = payload.get("authenticationType")
+    protocol = payload.get("applicationProtocol")
+    authorizer = payload.get("authorizerConfig")
+    if auth is not None and protocol is None:
+        return _domain_config_invalid(
+            "The domain must configure a supported ApplicationProtocol when "
+            f"configuring an AuthenticationType. Please refer to {_PROTOCOLS_DOC} "
+            "for supported combinations and try again.")
+    if protocol is not None and auth is None:
+        return _domain_config_invalid(
+            "The domain must configure a supported AuthenticationType when "
+            f"configuring an ApplicationProtocol. Please refer to {_PROTOCOLS_DOC} "
+            "for supported combinations and try again.")
+    auth = auth or "DEFAULT"
+    protocol = protocol or "DEFAULT"
+    err = _domain_config_auth_error(auth, protocol, authorizer)
+    if err:
+        return err
+    if payload.get("serverCertificateArns"):
+        err = _customer_managed_certificate_error(payload)
+        if err:
+            return err
+        domain_type = "CUSTOMER_MANAGED"
+        domain_name = payload["domainName"]
+        server_certificates = [{
+            "serverCertificateArn": payload["serverCertificateArns"][0],
+            "serverCertificateStatus": "VALID",
+        }]
+    else:
+        if payload.get("domainName"):
+            return _domain_config_invalid(
+                "Cannot provide a custom domain name for an AWS Managed Domain")
+        if payload.get("validationCertificateArn"):
+            return _domain_config_invalid(
+                "Cannot provide a Validation Certificate for AWS Managed Domain Configurations")
+        if payload.get("serverCertificateConfig") is not None:
+            return _domain_config_invalid(
+                "Cannot create a server certificate config for an AWS Managed Domain")
+        domain_type = "AWS_MANAGED"
+        domain_name = (f"d{uuid.uuid4().hex[:20]}-ats.iot.{get_region()}."
+                       f"{_MINISTACK_HOST}:{_GATEWAY_PORT}")
+        server_certificates = []
+    record = {
+        "domainConfigurationName": name,
+        "domainConfigurationArn": _domain_config_arn(name, uuid.uuid4().hex[:5]),
+        "domainName": domain_name,
+        "serverCertificates": server_certificates,
+        "domainConfigurationStatus": "ENABLED",
+        "serviceType": service_type,
+        "domainType": domain_type,
+        "lastStatusChangeDate": _now_epoch(),
+        "tlsConfig": {"securityPolicy": policy},
+        "authenticationType": auth,
+        "applicationProtocol": protocol,
+    }
+    for member in ("authorizerConfig", "serverCertificateConfig", "clientCertificateConfig"):
+        if payload.get(member):
+            record[member] = payload[member]
+    _domain_configurations[name] = record
+    return json_response({
+        "domainConfigurationName": name,
+        "domainConfigurationArn": record["domainConfigurationArn"],
+    })
+
+
+def _describe_domain_configuration(name: str) -> tuple:
+    err = _domain_config_name_error(name, _RESERVED_DOMAIN_CONFIG_NAME_RE)
+    if err:
+        return err
+    if name in _RETIRED_DOMAIN_CONFIG_NAMES:
+        return _domain_config_invalid("Invalid DomainConfiguration Name")
+    _ensure_owned_domain_configurations()
+    record = _domain_configurations.get(name)
+    if record is None:
+        return _domain_config_not_found(name)
+    return json_response(record)
+
+
+def _list_domain_configurations(qp: dict) -> tuple:
+    """``GET /domainConfigurations``. AWS pages with ``pageSize`` (1..250) and
+    an opaque ``marker``; its ``serviceType`` filter answers every
+    configuration for DATA and CREDENTIAL_PROVIDER alike and refuses JOBS."""
+    raw_size = qp.get("pageSize")
+    try:
+        page_size = int(raw_size) if raw_size not in (None, "") else None
+    except (TypeError, ValueError):
+        return _domain_config_invalid("The request is not valid.")
+    if page_size is not None and page_size > _DOMAIN_CONFIG_LIST_LIMIT:
+        return _domain_config_constraint(
+            "pageSize", f"have value less than or equal to {_DOMAIN_CONFIG_LIST_LIMIT}")
+    if page_size is not None and page_size < 1:
+        return _domain_config_constraint("pageSize", "have value greater than or equal to 1")
+    err = _domain_config_model_error({"serviceType": qp.get("serviceType")})
+    if err:
+        return err
+    if qp.get("serviceType") == "JOBS":
+        return _domain_config_invalid("Invalid Service Type")
+    offset = 0
+    marker = qp.get("marker")
+    if marker:
+        try:
+            prefix, _, value = base64.b64decode(marker, validate=True).decode().partition(":")
+            offset = int(value) if prefix == "domainConfigurations" else -1
+        except Exception:
+            offset = -1
+        if offset < 0:
+            return _domain_config_invalid("Invalid Token")
+    _ensure_owned_domain_configurations()
+    records = list(_domain_configurations.values())
+    end = len(records) if page_size is None else offset + page_size
+    body = {
+        "domainConfigurations": [
+            {k: r[k] for k in ("domainConfigurationName", "domainConfigurationArn", "serviceType")}
+            for r in records[offset:end]
+        ]
+    }
+    if end < len(records):
+        body["nextMarker"] = base64.b64encode(f"domainConfigurations:{end}".encode()).decode()
+    return json_response(body)
+
+
+def _update_domain_configuration(name: str, payload: dict) -> tuple:
+    """``PUT /domainConfigurations/{name}``. Unset members keep their value;
+    ``tlsConfig`` is replaced whole (no policy means the default one), and
+    ``lastStatusChangeDate`` only moves when the status does."""
+    err = (_domain_config_name_error(name, _RESERVED_DOMAIN_CONFIG_NAME_RE)
+           or _domain_config_model_error(payload))
+    if err:
+        return err
+    remove_authorizer = payload.get("removeAuthorizerConfig") is True
+    supplied = {m for m in _DOMAIN_CONFIG_UPDATE_MEMBERS if payload.get(m) is not None}
+    if not supplied and not remove_authorizer:
+        return _domain_config_invalid("No arguments supplied to update")
+    if name in _IOT_OWNED_DOMAIN_CONFIGS or name in _RETIRED_DOMAIN_CONFIG_NAMES:
+        # Of an owned configuration only iot:Data-ATS's TLS policy is settable.
+        if name != "iot:Data-ATS" or supplied != {"tlsConfig"} or remove_authorizer:
+            return _domain_config_invalid(
+                "IoT owned domain configuration cannot be updated with the supplied arguments")
+    if "authorizerConfig" in supplied and remove_authorizer:
+        return _domain_config_invalid(
+            "AuthorizerConfig supplied and removeAuthorizer is true, cannot set "
+            "authorizer and remove it")
+    policy = None
+    if "tlsConfig" in supplied:
+        policy, err = _domain_config_security_policy(payload["tlsConfig"])
+        if err:
+            return err
+    _ensure_owned_domain_configurations()
+    record = _domain_configurations.get(name)
+    if record is None:
+        return _domain_config_not_found(name)
+    if "serverCertificateConfig" in supplied and record["domainType"] != "CUSTOMER_MANAGED":
+        return _domain_config_invalid(
+            "Cannot configure ServerCertificateConfig for non-customer-managed domains")
+    authorizer = record.get("authorizerConfig")
+    if remove_authorizer:
+        authorizer = None
+    elif "authorizerConfig" in supplied:
+        authorizer = {**(authorizer or {}), **payload["authorizerConfig"]}
+    if record["domainType"] != "ENDPOINT":
+        err = _domain_config_auth_error(
+            payload.get("authenticationType", record["authenticationType"]),
+            payload.get("applicationProtocol", record["applicationProtocol"]),
+            authorizer,
+        )
+        if err:
+            return err
+    if authorizer:
+        record["authorizerConfig"] = authorizer
+    else:
+        record.pop("authorizerConfig", None)
+    if policy is not None:
+        record["tlsConfig"] = {"securityPolicy": policy}
+    status = payload.get("domainConfigurationStatus")
+    if status is not None and status != record["domainConfigurationStatus"]:
+        record["domainConfigurationStatus"] = status
+        record["lastStatusChangeDate"] = _now_epoch()
+    for member in ("authenticationType", "applicationProtocol",
+                   "serverCertificateConfig", "clientCertificateConfig"):
+        if member in supplied:
+            record[member] = payload[member]
+    _domain_configurations[name] = record
+    return json_response({
+        "domainConfigurationName": name,
+        "domainConfigurationArn": record["domainConfigurationArn"],
+    })
+
+
+def _delete_domain_configuration(name: str) -> tuple:
+    """Only a DISABLED configuration goes (an AWS-managed one after seven days); an unknown name is 200."""
+    err = _domain_config_name_error(name, _DOMAIN_CONFIG_NAME_RE)
+    if err:
+        return err
+    record = _domain_configurations.get(name)
+    if record is None:
+        return json_response({})
+    if record["domainConfigurationStatus"] != "DISABLED":
+        return _domain_config_invalid(
+            "Cannot delete a domain configuration that is not disabled")
+    if (record.get("domainType") == "AWS_MANAGED"
+            and _now_epoch() - float(record.get("lastStatusChangeDate") or 0) < 7 * 86400):
+        return _domain_config_invalid(
+            "AWS Managed Domain Configuration must be disabled for at least 7 days "
+            "before it can be deleted")
+    del _domain_configurations[name]
+    return json_response({})
+
+
+def _handle_domain_configuration(method: str, path: str, body: bytes) -> tuple:
+    """Dispatch ``/domainConfigurations/{domainConfigurationName}``."""
+    name = path[len("/domainConfigurations/"):]
+    if not name or "/" in name:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    if method == "POST":
+        return _create_domain_configuration(name, _parse_body(body))
+    if method == "GET":
+        return _describe_domain_configuration(name)
+    if method == "PUT":
+        return _update_domain_configuration(name, _parse_body(body))
+    if method == "DELETE":
+        return _delete_domain_configuration(name)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1562,6 +2083,42 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
     })
 
 
+def _create_certificate_from_csr(payload: dict, qp: dict) -> tuple:
+    """``POST /certificates``: sign the caller's CSR with the Local CA.
+
+    The certificate keeps the CSR's subject and key and is INACTIVE unless
+    ``setAsActive``; a CSR that does not parse or verify, or whose key AWS
+    does not accept, is refused with the message AWS uses for all of these.
+    """
+    try:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        cert_pem = sign_certificate_request(
+            ca_cert_pem, ca_key_pem, payload.get("certificateSigningRequest") or "")
+    except ValueError:
+        return error_response_json("InvalidRequestException", "CSR violates constraints", 400)
+    except RuntimeError as e:
+        return error_response_json("InternalFailureException", str(e), 503)
+    cert_id = get_certificate_id(cert_pem)
+    record = _certificate_record(
+        cert_id, cert_pem, "ACTIVE" if _qp_bool(qp, "setAsActive") else "INACTIVE")
+    _certificates[cert_id] = record
+    return json_response({
+        "certificateArn": record["certificateArn"],
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+    })
+
+
+async def _register_certificate_without_ca(payload: dict, qp: dict) -> tuple:
+    """``RegisterCertificateWithoutCA``: a certificate registered without a
+    CA is in ``SNI_ONLY`` mode, which DescribeCertificate reports."""
+    response = await _register_certificate(payload, qp, without_ca=True)
+    if response[0] == 200:
+        cert_id = json.loads(response[2])["certificateId"]
+        _certificates[cert_id] = {**_certificates[cert_id], "certificateMode": "SNI_ONLY"}
+    return response
+
+
 def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     """409 for a duplicate PEM, carrying ``resourceId``/``resourceArn`` the way
     real AWS's ``ResourceAlreadyExistsException`` does — all register variants
@@ -1836,6 +2393,7 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
             "certificatePem": record["certificatePem"],
             "ownedBy": record["ownedBy"],
             "creationDate": record.get("creationDate"),
+            "certificateMode": record.get("certificateMode", "DEFAULT"),
         }
         # Present only for CA-signed registrations, so JITR consumers can
         # resolve the signing CA (per the CertificateDescription model).

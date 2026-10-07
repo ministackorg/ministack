@@ -43,6 +43,7 @@ import struct
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
 from urllib.parse import quote_plus as _url_quote_plus
@@ -3830,9 +3831,10 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
         if obj.get("_replica"):
-            dest_name, replica_version = obj["_replica"]
-            _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
-            _persist_version_state(dest_name, key, _buckets[dest_name])
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
@@ -4070,8 +4072,10 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
         if obj.get("_replica"):
-            _object_tags[(obj["_replica"][0], key, obj["_replica"][1])] = dict(pending_tags)
-            _persist_version_state(obj["_replica"][0], key, _buckets[obj["_replica"][0]])
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
 
@@ -4587,21 +4591,95 @@ def _preserve_null_version(bucket_name: str, key: str, versions: list, prior_obj
     versions.append(_version_entry_from_record(prior_obj, "null", _read_body(bucket_name, key, prior_obj)))
 
 
-def _replication_rule_for(bucket_name: str, key: str) -> dict | None:
-    """The first Enabled rule whose Prefix covers `key`, or None.
+def _replication_rule_for(bucket_name: str, key: str) -> tuple[dict | None, str]:
+    """The first Enabled rule whose filter covers `key`, plus the config Role.
 
-    Replication runs only while the source bucket's versioning is Enabled,
-    as on AWS (a Suspended bucket stops replicating; the stored config stays).
+    A rule matches when the key falls under its prefix — legacy V1 rules carry
+    ``Prefix`` directly, V2 rules carry it inside ``Filter``. Replication runs
+    only while the source bucket's versioning is Enabled, as on AWS (a
+    Suspended bucket stops replicating; the stored config stays).
     """
     config = _bucket_replication.get(bucket_name)
     if not config or _bucket_versioning.get(bucket_name) != "Enabled":
-        return None
+        return None, ""
     for rule in config.get("Rules", []):
         if rule.get("Status") != "Enabled":
             continue
-        if key.startswith(rule.get("Prefix") or ""):
-            return rule
-    return None
+        prefix = rule.get("Prefix")
+        if prefix is None:
+            rule_filter = rule.get("Filter") or {}
+            prefix = rule_filter.get("Prefix") or (rule_filter.get("And") or {}).get("Prefix") or ""
+        if key.startswith(prefix):
+            return rule, config.get("Role", "")
+    return None, ""
+
+
+@contextmanager
+def _in_account(account_id: str):
+    """Run the wrapped block inside *account_id*'s tenancy, then restore.
+
+    A cross-account replica lands in a bucket another account owns; pinning
+    the request account keeps every account-scoped store (objects, versions,
+    tags, annotations, on-disk files) inside the destination tenant.
+    """
+    previous = get_account_id()
+    if account_id == previous:
+        yield
+        return
+    set_request_account_id(account_id)
+    try:
+        yield
+    finally:
+        set_request_account_id(previous)
+
+
+def _bucket_owner_enforced(bucket: dict) -> bool:
+    stored = bucket.get("_ownership_controls")
+    if stored:
+        return "BucketOwnerEnforced" in stored
+    return not bucket.get("_ownership_controls_deleted")
+
+
+def _replication_destination_allows(dest_account: str, dest_name: str, key: str,
+                                    role: str, dest: dict, dest_bucket: dict) -> bool:
+    """Whether the destination bucket policy grants the replication role.
+
+    Cross-account replication requires the destination owner to allow the
+    source's replication role ``s3:ReplicateObject`` on the destination
+    objects, plus ``s3:ObjectOwnerOverrideToBucketOwner`` when the rule
+    carries ``AccessControlTranslation`` and the destination is not
+    ``BucketOwnerEnforced``. A missing or denying policy stamps
+    the source FAILED, as AWS reports a replica it could not write.
+    """
+    policy = _bucket_policies.get_scoped(dest_account, None, dest_name)
+    if not policy:
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    role_parts = role.split(":")
+    role_account = role_parts[4] if role.startswith("arn:") and len(role_parts) > 4 else ""
+    resource = f"arn:aws:s3:::{dest_name}/{key}"
+    ctx = EvalContext(
+        principal_arn=role,
+        principal_type="AssumedRole",
+        principal_account=role_account,
+        action="s3:ReplicateObject",
+        resource_arn=resource,
+        region=get_region(),
+    )
+    if evaluate_resource_policy(policy, ctx).decision != "Allow":
+        return False
+    if dest.get("AccessControlTranslation") and not _bucket_owner_enforced(dest_bucket):
+        ctx = EvalContext(
+            principal_arn=role,
+            principal_type="AssumedRole",
+            principal_account=role_account,
+            action="s3:ObjectOwnerOverrideToBucketOwner",
+            resource_arn=resource,
+            region=get_region(),
+        )
+        return evaluate_resource_policy(policy, ctx).decision == "Allow"
+    return True
 
 
 def _maybe_replicate(bucket_name: str, key: str, obj: dict, data) -> None:
@@ -4615,32 +4693,45 @@ def _maybe_replicate(bucket_name: str, key: str, obj: dict, data) -> None:
     entry is recorded, so a version-addressed read carries the status too.
     A destination that no longer exists or is no longer versioned stamps the
     source FAILED, which is how AWS reports a replica it could not write.
+    A destination owned by another account also requires the destination's
+    bucket policy to grant the replication role; otherwise AWS fails the
+    replica the same way.
     """
-    rule = _replication_rule_for(bucket_name, key)
+    rule, role = _replication_rule_for(bucket_name, key)
     if rule is None:
         return
-    dest_ref = (rule.get("Destination") or {}).get("Bucket") or ""
+    dest = rule.get("Destination") or {}
+    dest_ref = dest.get("Bucket") or ""
     dest_name = dest_ref.split(":::")[-1] if ":::" in dest_ref else dest_ref
-    dest_bucket = _buckets.get(dest_name)
+    source_account = get_account_id()
+    # The name identifies the bucket; Destination.Account only names the owner for AccessControlTranslation.
+    dest_account = _bucket_owner_account(dest_name)
+    dest_bucket = _buckets.get_scoped(dest_account, None, dest_name) if dest_account else None
     if (dest_bucket is None or dest_name == bucket_name
-            or _bucket_versioning.get(dest_name) != "Enabled"):
+            or _bucket_versioning.get_scoped(dest_account, None, dest_name) != "Enabled"):
+        obj["replication_status"] = "FAILED"
+        return
+    if (dest_account != source_account and not _replication_destination_allows(
+            dest_account, dest_name, key, role, dest, dest_bucket)):
         obj["replication_status"] = "FAILED"
         return
 
     replica = copy.deepcopy(obj)
     replica["replication_status"] = "REPLICA"
     replica.pop("version_id", None)
-    if rule.get("Destination", {}).get("StorageClass"):
-        replica["storage_class"] = rule["Destination"]["StorageClass"]
+    replica.pop("_replica", None)
+    if dest.get("StorageClass"):
+        replica["storage_class"] = dest["StorageClass"]
     prior = dest_bucket["objects"].get(key)
     dest_bucket["objects"][key] = replica
-    replica_version = _record_object_version(dest_name, key, prior, replica, data)
+    with _in_account(dest_account):
+        replica_version = _record_object_version(dest_name, key, prior, replica, data)
+        if S3_PERSIST:
+            _persist_object(dest_name, key, replica)
     # The write paths store the source's tags after the version is cut; the
     # pointer lets them mirror the tags onto the replica, as AWS replicates
     # them. Internal bookkeeping only — never serialized onto a response.
-    obj["_replica"] = (dest_name, replica_version)
-    if S3_PERSIST:
-        _persist_object(dest_name, key, replica)
+    obj["_replica"] = (dest_name, replica_version, dest_account)
     obj["replication_status"] = "COMPLETED"
 
 
@@ -5212,10 +5303,11 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     if pending_dest_annotations:
         _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
         if dest_obj.get("_replica"):
-            replica_bucket, replica_version = dest_obj["_replica"]
-            _object_annotations[(replica_bucket, dest_key, replica_version)] = {
-                name: dict(entry, replication_status="REPLICA") for name, entry in pending_dest_annotations.items()
-            }
+            replica_bucket, replica_version, replica_account = dest_obj["_replica"]
+            with _in_account(replica_account):
+                _object_annotations[(replica_bucket, dest_key, replica_version)] = {
+                    name: dict(entry, replication_status="REPLICA") for name, entry in pending_dest_annotations.items()
+                }
             for entry in pending_dest_annotations.values():
                 entry["replication_status"] = "COMPLETED"
     else:
@@ -5223,8 +5315,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     if pending_dest_tags is not None:
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
         if dest_obj.get("_replica"):
-            _object_tags[(dest_obj["_replica"][0], dest_key, dest_obj["_replica"][1])] = dict(pending_dest_tags)
-            _persist_version_state(dest_obj["_replica"][0], dest_key, _buckets[dest_obj["_replica"][0]])
+            replica_bucket, replica_version, replica_account = dest_obj["_replica"]
+            with _in_account(replica_account):
+                _object_tags[(replica_bucket, dest_key, replica_version)] = dict(pending_dest_tags)
+                _persist_version_state(replica_bucket, dest_key, _buckets[replica_bucket])
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
 
@@ -5648,12 +5742,13 @@ def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dic
     # Annotations replicate onto the version's replica.
     current = bucket["objects"].get(key)
     if current is not None and current.get("version_id") == version_key and current.get("_replica"):
-        replica_bucket, replica_version = current["_replica"]
-        replica_key = (replica_bucket, key, replica_version)
-        replica_annotations = dict(_object_annotations.get(replica_key) or {})
-        replica_annotations[name] = dict(entry, replication_status="REPLICA")
-        _object_annotations[replica_key] = replica_annotations
-        _persist_version_state(replica_bucket, key, _buckets[replica_bucket])
+        replica_bucket, replica_version, replica_account = current["_replica"]
+        with _in_account(replica_account):
+            replica_key = (replica_bucket, key, replica_version)
+            replica_annotations = dict(_object_annotations.get(replica_key) or {})
+            replica_annotations[name] = dict(entry, replication_status="REPLICA")
+            _object_annotations[replica_key] = replica_annotations
+            _persist_version_state(replica_bucket, key, _buckets[replica_bucket])
         entry["replication_status"] = "COMPLETED"
     annotations[name] = entry
     _object_annotations[store_key] = annotations
@@ -6220,6 +6315,52 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
 # ---------------------------------------------------------------------------
 
 
+def _replication_tag(tag_el) -> dict:
+    key_el, value_el = _find_xml_tag(tag_el, "Key"), _find_xml_tag(tag_el, "Value")
+    return {"Key": key_el.text if key_el is not None and key_el.text else "",
+            "Value": value_el.text if value_el is not None and value_el.text else ""}
+
+
+def _parse_replication_filter(filter_el) -> dict:
+    """A ReplicationRuleFilter: Prefix, Tag, or And (Prefix and Tags)."""
+    out: dict = {}
+    prefix_el = _find_xml_tag(filter_el, "Prefix")
+    if prefix_el is not None:
+        out["Prefix"] = prefix_el.text or ""
+    tag_el = _find_xml_tag(filter_el, "Tag")
+    if tag_el is not None:
+        out["Tag"] = _replication_tag(tag_el)
+    and_el = _find_xml_tag(filter_el, "And")
+    if and_el is not None:
+        and_op: dict = {}
+        and_prefix = _find_xml_tag(and_el, "Prefix")
+        if and_prefix is not None:
+            and_op["Prefix"] = and_prefix.text or ""
+        tags = [_replication_tag(t) for t in and_el if t.tag.split("}")[-1] == "Tag"]
+        if tags:
+            and_op["Tags"] = tags
+        out["And"] = and_op
+    return out
+
+
+def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
+    def _tag(parent, tag):
+        tag_el = SubElement(parent, "Tag")
+        SubElement(tag_el, "Key").text = tag.get("Key", "")
+        SubElement(tag_el, "Value").text = tag.get("Value", "")
+
+    if "Prefix" in rule_filter:
+        SubElement(filter_el, "Prefix").text = rule_filter["Prefix"]
+    if "Tag" in rule_filter:
+        _tag(filter_el, rule_filter["Tag"])
+    if "And" in rule_filter:
+        and_el = SubElement(filter_el, "And")
+        if "Prefix" in rule_filter["And"]:
+            SubElement(and_el, "Prefix").text = rule_filter["And"]["Prefix"]
+        for tag in rule_filter["And"].get("Tags", []):
+            _tag(and_el, tag)
+
+
 def _put_bucket_replication(bucket_name: str, body: bytes):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -6252,23 +6393,44 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
         prefix_el = _find_xml_tag(rule_el, "Prefix")
         if prefix_el is not None and prefix_el.text is not None:
             rule["Prefix"] = prefix_el.text
+        filter_el = _find_xml_tag(rule_el, "Filter")
+        if filter_el is not None:
+            rule["Filter"] = _parse_replication_filter(filter_el)
+        priority_el = _find_xml_tag(rule_el, "Priority")
+        if priority_el is not None and priority_el.text and priority_el.text.isdigit():
+            rule["Priority"] = int(priority_el.text)
+        dmr_el = _find_xml_tag(rule_el, "DeleteMarkerReplication")
+        if dmr_el is not None:
+            dmr_status = _find_xml_tag(dmr_el, "Status")
+            rule["DeleteMarkerReplication"] = {
+                "Status": dmr_status.text if dmr_status is not None and dmr_status.text else "Disabled"
+            }
         dest_el = _find_xml_tag(rule_el, "Destination")
         if dest_el is not None:
             dest: dict = {}
             bucket_el = _find_xml_tag(dest_el, "Bucket")
             if bucket_el is not None and bucket_el.text:
                 dest["Bucket"] = bucket_el.text
-                # Validate destination bucket
+                # Validate destination bucket — the name identifies one bucket
+                # whoever owns it, so the check spans accounts, as on AWS.
                 dest_name = bucket_el.text.split(":::")[-1] if ":::" in bucket_el.text else bucket_el.text
-                dest_bucket = _ensure_bucket(dest_name)
-                if dest_bucket is not None:
-                    dest_versioning = _bucket_versioning.get(dest_name, "")
+                dest_owner = _bucket_owner_account(dest_name)
+                if dest_owner is not None:
+                    dest_versioning = _bucket_versioning.get_scoped(dest_owner, None, dest_name, "")
                     if dest_versioning != "Enabled":
                         return _error(
                             "InvalidRequest",
                             "Destination bucket must have versioning enabled.",
                             400,
                         )
+            account_el = _find_xml_tag(dest_el, "Account")
+            if account_el is not None and account_el.text:
+                dest["Account"] = account_el.text
+            act_el = _find_xml_tag(dest_el, "AccessControlTranslation")
+            if act_el is not None:
+                owner_el = _find_xml_tag(act_el, "Owner")
+                if owner_el is not None and owner_el.text:
+                    dest["AccessControlTranslation"] = {"Owner": owner_el.text}
             sc_el = _find_xml_tag(dest_el, "StorageClass")
             if sc_el is not None and sc_el.text:
                 dest["StorageClass"] = sc_el.text
@@ -6302,11 +6464,25 @@ def _get_bucket_replication(bucket_name: str):
         rule_el = SubElement(root, "Rule")
         SubElement(rule_el, "ID").text = rule.get("ID", "")
         SubElement(rule_el, "Status").text = rule.get("Status", "Enabled")
+        if "Priority" in rule:
+            SubElement(rule_el, "Priority").text = str(rule["Priority"])
         if "Prefix" in rule:
             SubElement(rule_el, "Prefix").text = rule["Prefix"]
+        if "Filter" in rule:
+            _replication_filter_xml(SubElement(rule_el, "Filter"), rule["Filter"] or {})
+        if "DeleteMarkerReplication" in rule:
+            dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
+            SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
+                "Status", "Disabled")
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
+            if "Account" in dest:
+                SubElement(dest_el, "Account").text = dest["Account"]
+            if "AccessControlTranslation" in dest:
+                act_el = SubElement(dest_el, "AccessControlTranslation")
+                SubElement(act_el, "Owner").text = (dest["AccessControlTranslation"] or {}).get(
+                    "Owner", "")
             if "Bucket" in dest:
                 SubElement(dest_el, "Bucket").text = dest["Bucket"]
             if "StorageClass" in dest:
