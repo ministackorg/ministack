@@ -1043,6 +1043,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "logs":
+        action = headers.get("x-amz-target", "").rsplit(".", 1)[-1]
+        if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+            return _safe_json_field(body, "resourceArn") or "*"
         name = _safe_json_field(body, "logGroupName")
         if name:
             return f"arn:aws:logs:{region}:{account_id}:log-group:{name}"
@@ -1696,6 +1699,51 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     ]
 
 
+def logs_service_context(action: str, body: bytes, resource_arn: str,
+                         region: str, account_id: str) -> dict:
+    """Tag conditions from the Logs payload and the existing scoped resource.
+
+    Read stored tags before dispatch: incoming tags must not replace ownership
+    context, and an untag request must still see the tags it proposes removing.
+    """
+    from ministack.services import cloudwatch_logs as logs
+
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    context = {}
+
+    def add_tags(prefix, tags):
+        if not isinstance(tags, dict):
+            return
+        for name, value in tags.items():
+            key = f"{prefix}/{name}".lower()
+            if key not in context:
+                context[key] = value
+            else:
+                previous = context[key]
+                context[key] = (previous if isinstance(previous, list) else [previous]) + [value]
+
+    if action in {"CreateLogGroup", "TagLogGroup", "TagResource"}:
+        tags = data.get("tags", {})
+        if isinstance(tags, dict):
+            add_tags("aws:RequestTag", tags)
+            context["aws:TagKeys"] = list(tags)
+    elif action in {"UntagLogGroup", "UntagResource"}:
+        keys = data.get("tags" if action == "UntagLogGroup" else "tagKeys", [])
+        if isinstance(keys, list):
+            context["aws:TagKeys"] = keys
+
+    if action == "CreateLogGroup":
+        return context
+    record = logs.resolve_tag_resource(resource_arn, account_id=account_id, region=region)
+    if record is not None:
+        add_tags("aws:ResourceTag", record.get("tags", {}))
+    return context
 _DYNAMODB_TRANSACT_ITEM_ACTIONS = {
     "ConditionCheck": "dynamodb:ConditionCheckItem",
     "Put": "dynamodb:PutItem",
@@ -1793,9 +1841,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service == "ssm" and not error_code:
-        # SSM authorization denials are HTTP 400, JSON 1.1, with a capitalized
-        # Message naming the resource.
+    if service in {"ssm", "logs"} and not error_code:
+        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
+        # capitalized Message naming the resource, as observed on live AWS.
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"

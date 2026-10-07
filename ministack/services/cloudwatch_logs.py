@@ -348,6 +348,10 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidOperationException", f"Unknown action: {action}", 400)
+    if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+        invalid = validate_tag_resource_arn(data.get("resourceArn", ""))
+        if invalid is not None:
+            return invalid
     return handler(data)
 
 
@@ -1468,24 +1472,55 @@ def _list_tags_log_group(data):
 # Tags – modern ARN-based APIs
 # ---------------------------------------------------------------------------
 
-def _resolve_tag_record_by_arn(arn: str):
-    """Resolve a logs ARN to the mutable dict holding its ``tags``. The
-    ARN-based tag operations accept log groups AND the vended-delivery trio
-    (delivery sources, delivery destinations, deliveries) — the AWS provider
-    reads tags back on every one of them after create."""
-    group = _resolve_group_by_arn(arn)
-    if group:
-        return _log_groups[group].setdefault("tags", {})
-    for marker, store in (
-        (":delivery-source:", _delivery_sources),
-        (":delivery-destination:", _delivery_destinations),
-        (":delivery:", _deliveries),
-    ):
-        if marker in arn:
-            record = store.get(arn.rsplit(":", 1)[-1])
-            if record is not None:
-                return record.setdefault("tags", {})
+def _tag_resource_identity(arn: str, account_id: str, region: str):
+    parsed = parse_arn(arn)
+    resource_type, _, name = parsed.resource.partition(":")
+    stores = {
+        "log-group": _log_groups,
+        "delivery-source": _delivery_sources,
+        "delivery-destination": _delivery_destinations,
+        "delivery": _deliveries,
+    }
+    pattern = r"[\w./#-]+" if resource_type == "log-group" else r"[\w.-]+"
+    if (parsed.partition != "aws" or parsed.service != "logs"
+            or parsed.account_id != account_id or parsed.region != region
+            or resource_type not in stores or not re.fullmatch(pattern, name, flags=re.ASCII)):
+        raise ArnParseError("Invalid resourceArn")
+    return stores[resource_type], resource_type, name
+
+
+def validate_tag_resource_arn(arn: str, *, account_id: str | None = None,
+                              region: str | None = None):
+    """Modern tag APIs validate scope and ARN shape before IAM policy checks."""
+    try:
+        _tag_resource_identity(arn, account_id or get_account_id(), region or get_region())
+    except ArnParseError:
+        # Observed on live Logs: lowercase message, JSON 1.1, no error header.
+        return json_response({"__type": "ValidationException", "message": "Invalid resourceArn"},
+                             400, content_type="application/x-amz-json-1.1")
     return None
+
+
+def resolve_tag_resource(arn: str, *, account_id: str | None = None,
+                         region: str | None = None):
+    """Use the same validated, scoped resource for IAM context and tag dispatch."""
+    account_id, region = account_id or get_account_id(), region or get_region()
+    try:
+        store, resource_type, name = _tag_resource_identity(arn, account_id, region)
+    except ArnParseError:
+        return None
+    record = store.get_scoped(account_id, region, name)
+    if record is None:
+        return None
+    stored_arn = record.get("arn", "")
+    if resource_type == "log-group":
+        stored_arn = stored_arn.removesuffix(":*")
+    return record if stored_arn == arn else None
+
+
+def _resolve_tag_record_by_arn(arn: str):
+    record = resolve_tag_resource(arn)
+    return record.setdefault("tags", {}) if record is not None else None
 
 
 def _tag_resource(data):

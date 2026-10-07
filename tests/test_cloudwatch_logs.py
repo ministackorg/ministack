@@ -1102,7 +1102,7 @@ def test_logs_tag_resource(logs):
     logs.create_log_group(logGroupName=group)
 
     groups = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
-    arn = groups[0]["arn"]
+    arn = groups[0]["arn"].removesuffix(":*")
 
     logs.tag_resource(resourceArn=arn, tags={"team": "platform", "env": "staging"})
 
@@ -1121,7 +1121,7 @@ def test_logs_untag_resource(logs):
     logs.create_log_group(logGroupName=group, tags={"keep": "yes", "remove": "me"})
 
     groups = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
-    arn = groups[0]["arn"]
+    arn = groups[0]["arn"].removesuffix(":*")
 
     logs.untag_resource(resourceArn=arn, tagKeys=["remove"])
 
