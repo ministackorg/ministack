@@ -3023,13 +3023,11 @@ def _render_request_template_v1(template: str, body_str: str,
     return "".join(out)
 
 
-def _select_service_integration_response(integration, backend_status: int,
-                                         backend_text: str):
+def _select_service_integration_response(integration, backend_status: int):
     """Pick the integration response for a non-proxy service call.
 
-    ``selectionPattern`` entries match on the backend HTTP status
-    (``fullmatch`` on the numeric code) or on the backend body (``search``);
-    the entry with no pattern is the default and takes whatever remains.
+    For AWS back ends other than Lambda, ``selectionPattern`` matches the HTTP
+    status code; the entry with no pattern is the default.
     """
     responses = integration.get("integrationResponses") or {}
     for resp in responses.values():
@@ -3037,8 +3035,7 @@ def _select_service_integration_response(integration, backend_status: int,
         if not pattern:
             continue
         try:
-            if (re.fullmatch(pattern, str(backend_status))
-                    or re.search(pattern, backend_text)):
+            if re.fullmatch(pattern, str(backend_status)):
                 return resp
         except re.error:
             continue
@@ -3049,15 +3046,11 @@ def _select_service_integration_response(integration, backend_status: int,
 
 
 def _service_integration_response(integration, backend_status: int,
-                                  backend_ct: str, backend_text: str,
-                                  accept: str):
+                                  backend_text: str, accept: str,
+                                  request_params: dict):
     """Map a backend service result through the integration responses."""
-    responses = integration.get("integrationResponses") or {}
-    if not responses:
-        # No integration responses configured: pass the backend reply through.
-        return backend_status, {"Content-Type": backend_ct}, backend_text.encode()
-    selected = _select_service_integration_response(
-        integration, backend_status, backend_text)
+    # No match and no default answers 500, configured responses or not.
+    selected = _select_service_integration_response(integration, backend_status)
     if selected is None:
         return (500, {"Content-Type": "application/json"},
                 json.dumps({"message": "Internal server error"}).encode())
@@ -3079,9 +3072,7 @@ def _service_integration_response(integration, backend_status: int,
     if template is None and templates:
         template = next(iter(templates.values()))
     if template is not None:
-        body_out = _render_request_template_v1(
-            template, backend_text,
-            {k: v for k, v in resp_headers.items()})
+        body_out = _render_request_template_v1(template, backend_text, request_params)
         return status, resp_headers, body_out.encode()
     return status, resp_headers, backend_text.encode()
 
@@ -3163,8 +3154,7 @@ async def _invoke_sqs_v1(
             "MissingAction", "Missing Action parameter", 400)
         backend_text = xbody.decode("utf-8", errors="replace")
         return _service_integration_response(
-            integration, backend_status, "application/xml", backend_text,
-            accept)
+            integration, backend_status, backend_text, accept, params_map)
 
     qurl = (_sqs_svc._queue_name_to_url.get_scoped(account, region, queue_name)
             or _sqs_svc._queue_url_for_account(account, queue_name))
@@ -3173,18 +3163,31 @@ async def _invoke_sqs_v1(
     try:
         with request_scope(account, region):
             result = await _sqs_svc._dispatch(action, data, qurl)
-        backend_status, _h, xbody = _sqs_svc._to_xml(action, result)
-        backend_ct = "application/xml"
+        if action == "SendMessage":
+            # API Gateway receives SQS's Query reply as JSON.
+            backend_status = 200
+            backend_text = json.dumps({"SendMessageResponse": {
+                "ResponseMetadata": {"RequestId": new_uuid()},
+                "SendMessageResult": {
+                    "MD5OfMessageAttributes": result.get("MD5OfMessageAttributes"),
+                    "MD5OfMessageBody": result.get("MD5OfMessageBody"),
+                    "MD5OfMessageSystemAttributes": result.get("MD5OfMessageSystemAttributes"),
+                    "MessageId": result.get("MessageId"),
+                    "SequenceNumber": result.get("SequenceNumber"),
+                },
+            }})
+        else:
+            backend_status, _h, xbody = _sqs_svc._to_xml(action, result)
+            backend_text = xbody.decode("utf-8", errors="replace")
     except _sqs_svc._Err as e:
         backend_status, _h, xbody = _sqs_svc._xml_err_resp(
             e.code, e.message, e.status)
-        backend_ct = "application/xml"
+        backend_text = xbody.decode("utf-8", errors="replace")
     except Exception:
         return (504, {"Content-Type": "application/json"},
                 json.dumps({"message": "Internal server error"}).encode())
     return _service_integration_response(
-        integration, backend_status, backend_ct,
-        xbody.decode("utf-8", errors="replace"), accept)
+        integration, backend_status, backend_text, accept, params_map)
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):

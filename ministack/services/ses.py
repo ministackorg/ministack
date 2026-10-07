@@ -364,14 +364,7 @@ def _receipt_rule_error(rule):
         if len(action) != 1:
             return _receipt_error("InvalidParameterValue", (
                 "Exactly one action type must be specified for each ReceiptAction"))
-        action_type = next(iter(action))
-        if action_type not in ("AddHeaderAction", "StopAction"):
-            return _receipt_error("InvalidAction", (
-                f"Receipt action {action_type} is not implemented"))
         if "StopAction" in action:
-            if "TopicArn" in action["StopAction"]:
-                return _receipt_error("InvalidAction", (
-                    "Receipt action StopAction with TopicArn is not implemented"))
             if action["StopAction"].get("Scope") != "RuleSet":
                 return _receipt_error("ValidationError", (
                     f"1 validation error detected: Value at 'rule.actions.{i}.member.stopAction.scope' "
