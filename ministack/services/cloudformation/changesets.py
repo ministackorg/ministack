@@ -179,6 +179,18 @@ def _function_import_problem(name):
     return None
 
 
+def _thing_import_problem(name):
+    if name not in _iot._things:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::Thing", value=name)
+    return None
+
+
+def _certificate_import_problem(cert_id):
+    if cert_id not in _iot._certificates:
+        return _IMPORT_NOT_FOUND.format(type="AWS::IoT::Certificate", value=cert_id)
+    return None
+
+
 def _iot_policy_import_problem(name):
     if name not in _iot._policies:
         return _IMPORT_NOT_FOUND.format(type="AWS::IoT::Policy", value=name)
@@ -275,6 +287,8 @@ _IMPORT_LOOKUPS = {
     "AWS::IAM::Role": (("RoleName",), _role_import_problem),
     "AWS::Logs::LogGroup": (("LogGroupName",), _log_group_import_problem),
     "AWS::Lambda::Function": (("FunctionName",), _function_import_problem),
+    "AWS::IoT::Thing": (("ThingName",), _thing_import_problem),
+    "AWS::IoT::Certificate": (("Id",), _certificate_import_problem),
     "AWS::IoT::Policy": (("Id",), _iot_policy_import_problem),
     "AWS::IoT::CACertificate": (("Id",), _ca_certificate_import_problem),
     "AWS::Cognito::UserPool": (("UserPoolId",), _user_pool_import_problem),
