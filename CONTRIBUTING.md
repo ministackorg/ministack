@@ -228,11 +228,9 @@ pytest tests/ -v -k "cognito"
 
 High-value contributions right now:
 
-- **CloudFront** — distribution CRUD, invalidations, origin configuration
-- **CodeBuild / CodePipeline** — CI/CD pipeline stubs
-- **AppSync** — GraphQL API CRUD
-- **SQS FIFO** — message group / deduplication support
-- **More Cognito flows** — hosted UI, federated identity providers, custom auth triggers
+- **CodePipeline** — pipelines whose build stages run on the existing CodeBuild support. This is a new service, so open a scoped issue first (see above).
+
+For everything else, browse the [open issues](https://github.com/ministackorg/ministack/issues). Before proposing a service or operation, check the supported-services table in the [README](README.md) — it may already be implemented.
 
 ---
 
