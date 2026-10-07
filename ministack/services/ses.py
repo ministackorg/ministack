@@ -1069,24 +1069,28 @@ def _message_rejection(sender, recipients=()) -> str | None:
             f"in region {get_region().upper()}: {', '.join(failed)}")
 
 
-# Mailbox simulator: local part -> notification type. success@ and ooto@ are
-# delivered; bounce@ is a hard bounce; complaint@ is reported as spam.
-_SIMULATOR_OUTCOMES = {"bounce": "Bounce", "complaint": "Complaint"}
+# Mailbox simulator local part -> (notificationType, bounceSubType) it produces;
+# any other address (success@, ooto@) is delivered.
+_SIMULATOR_OUTCOMES = {
+    "bounce": (("Bounce", "General"),),
+    "suppressionlist": (("Bounce", "Suppressed"),),
+    # Accepted and delivered, then marked as spam.
+    "complaint": (("Delivery", None), ("Complaint", None)),
+}
 
 
-def _notification_identity(source: str) -> dict | None:
-    """The identity whose notification topics apply to a sender: the address
-    identity if verified, else the nearest verified parent domain."""
+def _notification_identity(source: str) -> tuple[str, dict] | None:
+    """The (name, record) of the identity whose notification topics apply to a
+    sender: the address identity if verified, else the nearest verified parent domain."""
     addr = parseaddr(source or "")[1]
     if not addr:
         return None
     if addr in _identities:
-        return _identities[addr]
-    domains = {k.lower(): r for k, r in _identities.items() if "@" not in k}
+        return addr, _identities[addr]
+    domains = {k.lower(): (k, r) for k, r in _identities.items() if "@" not in k}
     for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
-        rec = domains.get(d)
-        if rec is not None:
-            return rec
+        if d in domains:
+            return domains[d]
     return None
 
 
@@ -1100,12 +1104,18 @@ def _publish_notification(topic_arn: str, payload: dict) -> None:
         logger.warning("SES notification publish to %s failed", topic_arn, exc_info=True)
 
 
-def _notification_detail(kind: str, rcpt: str, ts: str) -> dict:
+def _notification_detail(kind: str, rcpt: str, ts: str, bounce_subtype: str | None = None) -> dict:
     if kind == "Delivery":
         return {"delivery": {
             "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
             "smtpResponse": "250 2.6.0 Message received",
             "reportingMTA": "a0-0.smtp-out.amazonses.com"}}
+    if kind == "Bounce" and bounce_subtype == "Suppressed":
+        # SES suppressed the send, so no remote MTA returned a DSN.
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "Suppressed",
+            "bouncedRecipients": [{"emailAddress": rcpt}],
+            "timestamp": ts, "feedbackId": new_uuid()}}
     if kind == "Bounce":
         return {"bounce": {
             "bounceType": "Permanent", "bounceSubType": "General",
@@ -1124,9 +1134,10 @@ def _notification_detail(kind: str, rcpt: str, ts: str) -> dict:
 def _send_notifications(msg_id, source, recipients):
     """Publish the Delivery / Bounce / Complaint notification of each recipient
     to the SNS topic set on the sender's identity (SetIdentityNotificationTopic)."""
-    identity = _notification_identity(source)
-    if not identity:
+    found = _notification_identity(source)
+    if not found:
         return
+    identity_name, identity = found
     topics = identity.get("NotificationTopics", {})
     if not any(topics.values()):
         return
@@ -1135,25 +1146,24 @@ def _send_notifications(msg_id, source, recipients):
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
     mail = {
         "timestamp": ts,
-        "source": source,
+        # The envelope MAIL FROM address and the identity used to send.
+        "source": parseaddr(source)[1],
+        "sourceArn": f"arn:aws:ses:{get_region()}:{get_account_id()}:identity/{identity_name}",
         "sendingAccountId": get_account_id(),
         "messageId": msg_id,
         "destination": recipients,
     }
-    src_addr = parseaddr(source or "")[1]
-    if src_addr:
-        mail["sourceArn"] = (f"arn:aws:ses:{get_region()}:{get_account_id()}:"
-                             f"identity/{src_addr}")
     for rcpt in recipients:
         local, _, domain = rcpt.partition("@")
-        kind = "Delivery"
+        outcomes = (("Delivery", None),)
         if domain.lower() == _SIMULATOR_DOMAIN:
-            kind = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], "Delivery")
-        topic = topics.get(kind)
-        if not topic:
-            continue
-        detail = _notification_detail(kind, rcpt, ts)
-        _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
+            outcomes = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], outcomes)
+        for kind, bounce_subtype in outcomes:
+            topic = topics.get(kind)
+            if not topic:
+                continue
+            detail = _notification_detail(kind, rcpt, ts, bounce_subtype)
+            _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
 
 
 def _make_identity(identity, identity_type):

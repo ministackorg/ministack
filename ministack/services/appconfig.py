@@ -43,11 +43,8 @@ logger = logging.getLogger("appconfig")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-# APPCONFIG_DEPLOYMENT_MINUTE_SECONDS: real seconds that stand in for one minute of a
-# deployment strategy's DeploymentDurationInMinutes and FinalBakeTimeInMinutes. 0 (the
-# default) runs every deployment to COMPLETE as it starts; 60 keeps AWS's pace. Also
-# settable at runtime through /_ministack/config, so a test can pin the pace.
-_DEPLOYMENT_MINUTE_SECONDS = float(os.environ.get("APPCONFIG_DEPLOYMENT_MINUTE_SECONDS", "0"))
+# A strategy minute is a real minute, as on AWS.
+_DEPLOYMENT_MINUTE_SECONDS = 60.0
 
 # Next-Poll-Interval-In-Seconds for a session that set no RequiredMinimumPollIntervalInSeconds.
 _DEFAULT_POLL_INTERVAL_SECONDS = 30
@@ -830,7 +827,8 @@ def _stop_deployment(app_id, env_id, deploy_num, allow_revert=False):
         return _error(404, "ResourceNotFoundException", f"Deployment {deploy_num} not found")
     now = time.time()
     state = record["State"]
-    if state in _IN_PROGRESS_STATES:
+    # Only DEPLOYING stops without AllowRevert; with it, BAKING rolls back too.
+    if state == "DEPLOYING" or (state == "BAKING" and allow_revert):
         _roll_back(record, "USER", get_account_id(), now)
     elif state == "COMPLETE" and allow_revert:
         completed = record.get("_CompletedEpoch")

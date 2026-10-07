@@ -1581,19 +1581,26 @@ def test_ses_identity_notifications_published_to_sns_sqs(ses, ses_notify_queue):
     bind(sender)
 
     dest = ["ok@example.com", "bounce@simulator.amazonses.com",
-            "complaint@simulator.amazonses.com"]
+            "complaint@simulator.amazonses.com", "suppressionlist@simulator.amazonses.com"]
     msg_id = ses.send_email(
-        Source=sender, Destination={"ToAddresses": dest}, Message=_NOTIFY_MSG,
+        Source=f'"Notify" <{sender}>', Destination={"ToAddresses": dest}, Message=_NOTIFY_MSG,
     )["MessageId"]
 
-    got = {n["notificationType"]: n for n in drain(3)}
-    assert set(got) == {"Delivery", "Bounce", "Complaint"}
-    assert got["Delivery"]["mail"]["messageId"] == msg_id
-    assert got["Delivery"]["mail"]["source"] == sender
-    assert got["Delivery"]["mail"]["destination"] == dest
-    assert got["Delivery"]["delivery"]["recipients"] == ["ok@example.com"]
-    assert got["Bounce"]["bounce"]["bouncedRecipients"][0]["emailAddress"] == dest[1]
-    assert got["Complaint"]["complaint"]["complainedRecipients"][0]["emailAddress"] == dest[2]
+    got = drain(5)
+    by_kind = {}
+    for n in got:
+        by_kind.setdefault(n["notificationType"], []).append(n)
+    # complaint@ is delivered before it is marked as spam; suppressionlist@ is a suppressed hard bounce.
+    assert sorted(r for n in by_kind["Delivery"] for r in n["delivery"]["recipients"]) == [dest[2], dest[0]]
+    bounces = {n["bounce"]["bouncedRecipients"][0]["emailAddress"]: n["bounce"] for n in by_kind["Bounce"]}
+    assert (bounces[dest[1]]["bounceType"], bounces[dest[1]]["bounceSubType"]) == ("Permanent", "General")
+    assert (bounces[dest[3]]["bounceType"], bounces[dest[3]]["bounceSubType"]) == ("Permanent", "Suppressed")
+    assert [n["complaint"]["complainedRecipients"][0]["emailAddress"] for n in by_kind["Complaint"]] == [dest[2]]
+    mail = got[0]["mail"]
+    assert mail["messageId"] == msg_id
+    assert mail["source"] == sender
+    assert mail["sourceArn"].endswith(f":identity/{sender}")
+    assert mail["destination"] == dest
 
 
 def test_ses_identity_notifications_fall_back_to_domain_identity(ses, ses_notify_queue):
@@ -1609,6 +1616,7 @@ def test_ses_identity_notifications_fall_back_to_domain_identity(ses, ses_notify
 
     got = drain(1)
     assert [n["mail"]["messageId"] for n in got if n["notificationType"] == "Delivery"] == [msg_id]
+    assert got[0]["mail"]["sourceArn"].endswith(f":identity/{domain}")
 
 
 def test_ses_identity_notifications_simulator_subaddress(ses, ses_notify_queue):
