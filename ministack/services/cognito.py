@@ -3808,9 +3808,6 @@ def _initiate_user_srp_auth(pool: dict, pid: str, cid: str, auth_params: dict):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
-        if user.get("UserStatus") == "RESET_REQUIRED":
-            return error_response_json("PasswordResetRequiredException",
-                                       "Password reset required for the user", 400)
         user_id = user["Username"]
     token, session = _create_challenge_session(pid, cid, user_id)
     session["auth_flow"] = "USER_SRP_AUTH"
@@ -3850,6 +3847,8 @@ def _respond_to_password_verifier(data: dict, cid: str):
     refused = _password_signin_refused(user)
     if refused:
         return refused
+    if user.get("UserStatus") == "RESET_REQUIRED":
+        return _password_reset_required()
     client_metadata = data.get("ClientMetadata", {})
     if not custom:
         return _password_auth_result(pool, session["pool_id"], cid, user, user["Username"],
@@ -3892,14 +3891,14 @@ def _admin_initiate_auth(data):
         # user is refused as disabled first (measured).
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
-        if user.get("UserStatus") == "RESET_REQUIRED":
-            return error_response_json("PasswordResetRequiredException",
-                                       "Password reset required for the user", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+        # Only a correct password learns that a reset is required.
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return _password_reset_required()
         return _password_auth_result(pool, pid, cid, user, username)
 
     if auth_flow == "USER_SRP_AUTH":
@@ -4200,14 +4199,14 @@ def _initiate_auth(data):
         # user is refused as disabled first (measured).
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
-        if user.get("UserStatus") == "RESET_REQUIRED":
-            return error_response_json("PasswordResetRequiredException",
-                                       "Password reset required for the user", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+        # Only a correct password learns that a reset is required.
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return _password_reset_required()
         return _password_auth_result(pool, pid, cid, user, username)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
@@ -5205,6 +5204,10 @@ def _admin_link_provider_for_user(data):
                 source["ProviderName"], source["ProviderAttributeValue"],
                 destination_username, pid)
     return json_response({})
+
+
+def _password_reset_required():
+    return error_response_json("PasswordResetRequiredException", "Password reset required for the user", 400)
 
 
 def _password_signin_refused(user):
