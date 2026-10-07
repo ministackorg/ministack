@@ -568,6 +568,8 @@ def _get_reset_lock() -> asyncio.Lock:
 class _IncompleteRequestBody(Exception):
     """The request body ended before its declared framing was complete."""
 
+    body = b""
+
 
 class _RequestBodyDisconnected(Exception):
     """The client disconnected before the request body was complete."""
@@ -722,19 +724,25 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
     if content_length is not None:
         content_length = content_length.strip()
         if not re.fullmatch(r"[0-9]+", content_length) or len(body) != int(content_length):
-            raise _IncompleteRequestBody("Content-Length does not match request body")
-    return _decode_aws_chunked_body(body, headers)
+            exc = _IncompleteRequestBody("Content-Length does not match request body")
+            exc.body = body
+            raise exc
+    try:
+        return _decode_aws_chunked_body(body, headers)
+    except _IncompleteRequestBody as exc:
+        exc.body = body
+        raise
 
 
 def _incomplete_request_body_response(method: str, path: str, headers: dict, query_params: dict):
-    """Use the routed protocol's existing error envelope for an incomplete body."""
-    message = "You did not provide the number of bytes specified by the Content-Length HTTP header"
-    service = detect_service(method, path, headers, query_params)
-    if service == "s3":
-        return _get_module("s3")._error("IncompleteBody", message, 400)
-    from ministack.core.responses import error_response_json
-
-    return error_response_json("IncompleteBody", message, 400)
+    """S3's IncompleteBody; None for other services, which have no such error."""
+    if detect_service(method, path, headers, query_params) != "s3":
+        return None
+    return _get_module("s3")._error(
+        "IncompleteBody",
+        "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+        400,
+    )
 
 
 def _encode_header_value(v: str) -> bytes:
@@ -1146,8 +1154,6 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
             msgs = queue.get("messages") or []
             rendered = []
             for m in msgs:
-                if m is None:
-                    continue
                 rendered.append(
                     {
                         "MessageId": m.get("id"),
@@ -2883,10 +2889,12 @@ async def app(scope, receive, send):
         body = await _read_request_body(receive, method, headers)
     except _RequestBodyDisconnected:
         return
-    except _IncompleteRequestBody:
+    except _IncompleteRequestBody as exc:
         response = _incomplete_request_body_response(method, path, headers, query_params)
-        await _send_if_handled(send, response, receive)
-        return
+        if response is not None:
+            await _send_if_handled(send, response, receive)
+            return
+        body = exc.body
 
     if await _send_if_handled(
         send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id), receive
