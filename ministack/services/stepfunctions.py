@@ -1522,7 +1522,7 @@ def _run_execution(exec_arn):
                     "States.Runtime",
                     f"State '{current_name}' not found in definition")
 
-            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
             _add_event(execution, f"{state_type}StateEntered", {
@@ -1677,17 +1677,16 @@ def _execute_task(state_def, raw_input, execution, ctx):
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
 
-    effective = None
-    if query_language != "JSONata":
-        effective = _apply_input_path(state_def, raw_input, ctx)
-        effective = _apply_parameters(state_def, effective, ctx)
-
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
     retry_counts: dict = {}
     last_error: _ExecutionError | None = None
 
     while True:
+        # Each attempt sees its own $$.State.RetryCount.
+        ctx["State"]["RetryCount"] = sum(retry_counts.values())
+        if query_language != "JSONata":
+            effective = _apply_parameters(state_def, _apply_input_path(state_def, raw_input, ctx), ctx)
         try:
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
@@ -2192,8 +2191,11 @@ def _sleep_until(iso_ts):
 
 def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
     """Run a Parallel or Map attempt under the state's Retry and Catch fields."""
+    state = ctx["State"]
     retry_counts: dict = {}
     while True:
+        # Branches share ctx and leave their own State in it; each attempt starts from this state's, counted.
+        ctx["State"] = {**state, "RetryCount": sum(retry_counts.values())}
         try:
             return attempt()
         except _ExecutionError as err:
@@ -2346,7 +2348,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"State '{current_name}' not found")
 
         state_type = state_def.get("Type")
-        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
         if state_type == "Succeed":
             return _apply_output_path(state_def,
