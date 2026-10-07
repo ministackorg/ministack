@@ -2519,10 +2519,12 @@ async def _dispatch_service_request(
             )
             if transaction_checks:
                 denied = None
+                item_context = {**(service_context or {}),
+                                "dynamodb:EnclosingOperation": [iam_action.split(":", 1)[1]]}
                 for item_action, item_arn in transaction_checks:
                     denied = enforce(
                         access_key, item_action, service, region,
-                        resource_arn=item_arn, service_context=service_context,
+                        resource_arn=item_arn, service_context=item_context,
                     )
                     if denied:
                         iam_action = item_action  # named in the AccessDenied message

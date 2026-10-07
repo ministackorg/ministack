@@ -13575,13 +13575,16 @@ def test_idle_reaper_and_reset_release_provided_environments(isolated_runtime):
 
 
 def test_invoke_signature_keeps_trace_out_of_the_positional_contract(isolated_runtime):
-    """``trace_id`` is keyword-only, so no caller can pass it as the event."""
+    """``trace_id`` and ``invoked_function_arn`` are keyword-only, so no caller
+    can pass either as the event."""
     import inspect
 
     sig = inspect.signature(lambda_runtime.ProvidedWorker.invoke)
-    assert list(sig.parameters) == ["self", "event", "request_id", "trace_id"]
-    assert sig.parameters["trace_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert sig.parameters["trace_id"].default is None
+    assert list(sig.parameters) == [
+        "self", "event", "request_id", "trace_id", "invoked_function_arn"]
+    for name in ("trace_id", "invoked_function_arn"):
+        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters[name].default is None
 
 
 def test_json_only_bootstrap_output_is_not_parsed_as_protocol(worker_factory):

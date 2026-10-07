@@ -2609,13 +2609,13 @@ class TestDynamoDBTransactionAuthorization:
     _TABLE = "arn:aws:dynamodb:us-east-1:000000000000:table/repro"
 
     @staticmethod
-    def _transact(monkeypatch, target, items_key, items, actions, resource="*"):
+    def _transact(monkeypatch, target, items_key, items, actions, resource="*", policy=None):
         import asyncio
 
         import ministack.app as app_mod
         from ministack.core import iam_evaluator
 
-        statements = parse_policy_document({"Statement": [{
+        statements = parse_policy_document(policy or {"Statement": [{
             "Effect": "Allow", "Action": actions, "Resource": resource,
         }]})
         seen = []
@@ -2624,7 +2624,9 @@ class TestDynamoDBTransactionAuthorization:
         def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
                          service_context=None):
             seen.append((iam_action, resource_arn))
-            result = evaluate(_ctx(action=iam_action, resource=resource_arn), [statements])
+            ctx = _ctx(action=iam_action, resource=resource_arn)
+            ctx.service_context = {k.lower(): v for k, v in (service_context or {}).items()}
+            result = evaluate(ctx, [statements])
             if result.decision == "Allow":
                 return None
             result.principal_arn = "arn:aws:iam::000000000000:user/testuser"
@@ -2734,6 +2736,30 @@ class TestDynamoDBTransactionAuthorization:
             ("dynamodb:GetItem", self._TABLE),
             ("dynamodb:GetItem", self._TABLE.replace("repro", "other")),
         ]
+
+    _ITEM_ACTIONS = ["dynamodb:ConditionCheckItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                     "dynamodb:DeleteItem", "dynamodb:GetItem"]
+    _ENCLOSING = {"ForAnyValue:StringEquals": {
+        "dynamodb:EnclosingOperation": ["TransactWriteItems", "TransactGetItems"]}}
+
+    def test_allow_only_transactional_operations(self, monkeypatch):
+        """Example 2 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [{"Effect": "Allow", "Action": self._ITEM_ACTIONS,
+                                 "Resource": "*", "Condition": self._ENCLOSING}]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 200 and handled
+
+    def test_deny_transactional_operations(self, monkeypatch):
+        """Example 3 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [
+            {"Effect": "Deny", "Action": self._ITEM_ACTIONS, "Resource": "*",
+             "Condition": self._ENCLOSING},
+            {"Effect": "Allow", "Action": self._ITEM_ACTIONS, "Resource": "*"},
+        ]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 403 and not handled
 
     def test_get_with_only_the_whole_operation_action_is_denied(self, monkeypatch):
         items = [{"Get": {"TableName": "repro", "Key": {"pk": {"S": "a"}}}}]
