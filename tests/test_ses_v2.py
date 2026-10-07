@@ -260,7 +260,6 @@ def test_ses_v2_configuration_set_tag_resource_uses_parser_backed_resource_arn(s
     [
         "not-an-arn",
         f"arn:aws:ses:{REGION}:{ACCOUNT_ID}",
-        _arn("identity", "parser.example.com", partition="aws-cn"),
         _arn("identity", "parser.example.com", service="sesv2"),
         _arn("identity", "parser.example.com", region="us-west-2"),
         _arn("identity", "parser.example.com", account="111111111111"),
@@ -301,6 +300,22 @@ def test_ses_v2_tag_apis_reject_invalid_resource_arns_before_touching_tags(ses_v
     status, body = _call(ses_v2, "GET", query={"ResourceArn": [valid_arn]})
     assert status == 200
     assert body["Tags"] == [{"Key": "keep", "Value": "yes"}]
+
+
+def test_ses_v2_tag_apis_accept_foreign_partitions_on_one_store(ses_v2):
+    identity = "partition.example.com"
+    aws_arn = _arn("identity", identity)
+    cn_arn = _arn("identity", identity, partition="aws-cn")
+    _call(ses_v2, "POST", "/v2/email/identities", body={"EmailIdentity": identity})
+
+    status, _ = _call(
+        ses_v2, "POST", body={"ResourceArn": cn_arn, "Tags": [{"Key": "team", "Value": "email"}]}
+    )
+    assert status == 200
+    for arn in (aws_arn, cn_arn):
+        status, body = _call(ses_v2, "GET", query={"ResourceArn": [arn]})
+        assert status == 200
+        assert body["Tags"] == [{"Key": "team", "Value": "email"}]
 
 
 @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])

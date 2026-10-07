@@ -805,8 +805,25 @@ def _get_identity_verification_attributes(params):
                 f"</GetIdentityVerificationAttributesResult>")
 
 
+def _tenant_delete_block(kind, name):
+    """Refuse v1 deletes of resources with SESv2 tenant associations, as AWS does."""
+    from ministack.services import ses_v2
+
+    arn = f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+    if any(arn in resources for resources in ses_v2._tenant_resources.values()):
+        return _error(
+            "InvalidParameterValue",
+            f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
+            400,
+        )
+    return None
+
+
 def _delete_identity(params):
     identity = _p(params, "Identity")
+    blocked = _tenant_delete_block("identity", identity)
+    if blocked:
+        return blocked
     _identities.pop(identity, None)
     return _xml(200, "DeleteIdentityResponse", "<DeleteIdentityResult/>")
 
@@ -916,6 +933,9 @@ def _create_configuration_set(params):
 
 def _delete_configuration_set(params):
     name = _p(params, "ConfigurationSetName")
+    blocked = _tenant_delete_block("configuration-set", name)
+    if blocked:
+        return blocked
     if name not in _configuration_sets:
         return _error("ConfigurationSetDoesNotExist",
                        f"Configuration set {name} does not exist", 400)
@@ -985,6 +1005,9 @@ def _get_template(params):
 
 def _delete_template(params):
     name = _p(params, "TemplateName")
+    blocked = _tenant_delete_block("template", name)
+    if blocked:
+        return blocked
     _templates.pop(name, None)
     return _xml(200, "DeleteTemplateResponse", "<DeleteTemplateResult/>")
 
