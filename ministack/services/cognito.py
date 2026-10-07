@@ -3808,6 +3808,9 @@ def _initiate_user_srp_auth(pool: dict, pid: str, cid: str, auth_params: dict):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return error_response_json("PasswordResetRequiredException",
+                                       "Password reset required for the user", 400)
         user_id = user["Username"]
     token, session = _create_challenge_session(pid, cid, user_id)
     session["auth_flow"] = "USER_SRP_AUTH"
@@ -3889,6 +3892,9 @@ def _admin_initiate_auth(data):
         # user is refused as disabled first (measured).
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return error_response_json("PasswordResetRequiredException",
+                                       "Password reset required for the user", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused
@@ -4194,6 +4200,9 @@ def _initiate_auth(data):
         # user is refused as disabled first (measured).
         if user.get("UserStatus") == "UNCONFIRMED":
             return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return error_response_json("PasswordResetRequiredException",
+                                       "Password reset required for the user", 400)
         refused = _password_signin_refused(user)
         if refused:
             return refused

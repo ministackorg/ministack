@@ -18,6 +18,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request. Contributed by @jayjanssen.
+- **Cognito — `RESET_REQUIRED` users cannot sign in with a password** — after `AdminResetUserPassword`, `InitiateAuth` `USER_PASSWORD_AUTH`, `AdminInitiateAuth` `ADMIN_USER_PASSWORD_AUTH` / `ADMIN_NO_SRP_AUTH` and `USER_SRP_AUTH` still accepted the old password. They now return `PasswordResetRequiredException`, checked next to `UserNotConfirmedException`. Contributed by @prandogabriel.
 - **IoT — `DescribeCertificate` reports `certificateMode`** — the field was missing from the description. It is now `SNI_ONLY` for a certificate registered with `RegisterCertificateWithoutCA` and `DEFAULT` for the others, as AWS reports it. Contributed by @iot-rocket.
 ### Fixed
 
