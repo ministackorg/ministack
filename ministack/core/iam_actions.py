@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
 
@@ -681,6 +681,12 @@ def extract_iam_action(service: str, method: str, path: str,
         logger.debug("AUTH: no IAM namespace for service %s — allowing", service)
         return None
 
+    # API Gateway management authorizes HTTP verbs, not SDK operation names.
+    # Handle it before Query/JSON extraction: those protocols cannot override
+    # the action of a REST management request (v1 and v2 share this namespace).
+    if service == "apigateway":
+        return f"apigateway:{method}" if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else None
+
     # Tier 1: Action query param (query-protocol services)
     action_name = _action_from_query(query_params, body,
                                      headers.get("content-type", ""))
@@ -1043,6 +1049,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "logs":
+        action = headers.get("x-amz-target", "").rsplit(".", 1)[-1]
+        if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+            return _safe_json_field(body, "resourceArn") or "*"
         name = _safe_json_field(body, "logGroupName")
         if name:
             return f"arn:aws:logs:{region}:{account_id}:log-group:{name}"
@@ -1541,22 +1550,16 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- API Gateway (REST path-based) ---
 
     if service == "apigateway":
-        parts = [p for p in path.split("/") if p]
-        # v2: /v2/apis/{apiId}
-        if "apis" in parts:
-            ai = parts.index("apis")
-            if ai + 1 < len(parts):
-                api_id = parts[ai + 1]
-                return f"arn:aws:apigateway:{region}::/apis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/apis/*"
-        # v1: /restapis/{restApiId}
-        if "restapis" in parts:
-            ri = parts.index("restapis")
-            if ri + 1 < len(parts):
-                api_id = parts[ri + 1]
-                return f"arn:aws:apigateway:{region}::/restapis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/restapis/*"
-        return "*"
+        # Management ARNs retain the complete resource/collection path and
+        # have an empty account component. The v2 endpoint prefix is not part
+        # of the ARN. Decode URI labels, including the HTTP API $default stage.
+        # AWS ignores trailing slashes when authorizing management resources,
+        # as our control-plane handlers do when resolving the target resource.
+        resource_path = unquote(path[3:] if path.startswith("/v2/") else path).rstrip("/")
+        if resource_path.startswith("/tags/"):
+            # Tags: ::/tags/{url-encoded-resource-arn} (API Gateway ARN reference).
+            resource_path = "/tags/" + quote(resource_path[len("/tags/"):], safe="")
+        return f"arn:aws:apigateway:{region}::{resource_path}"
 
     # --- Bedrock (REST path-based, multiple sub-services) ---
 
@@ -1673,6 +1676,13 @@ def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list
     return arns
 
 
+def _dynamodb_table_arn(table: str, region: str, account_id: str) -> str:
+    """TableName also accepts the table's ARN."""
+    if table.startswith("arn:"):
+        return table
+    return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+
+
 def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
     """Return every table ARN addressed by a DynamoDB JSON request."""
     try:
@@ -1683,19 +1693,62 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""
-        return [
-            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
-        ]
+        return [_dynamodb_table_arn(table, region, account_id) + suffix]
     else:
         request_items = data.get("RequestItems") if isinstance(data, dict) else None
         tables = list(request_items) if isinstance(request_items, dict) else []
     return [
-        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        _dynamodb_table_arn(name, region, account_id)
         for name in tables
         if isinstance(name, str) and name
     ]
 
 
+def logs_service_context(action: str, body: bytes, resource_arn: str,
+                         region: str, account_id: str) -> dict:
+    """Tag conditions from the Logs payload and the existing scoped resource.
+
+    Read stored tags before dispatch: incoming tags must not replace ownership
+    context, and an untag request must still see the tags it proposes removing.
+    """
+    from ministack.services import cloudwatch_logs as logs
+
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    context = {}
+
+    def add_tags(prefix, tags):
+        if not isinstance(tags, dict):
+            return
+        for name, value in tags.items():
+            key = f"{prefix}/{name}".lower()
+            if key not in context:
+                context[key] = value
+            else:
+                previous = context[key]
+                context[key] = (previous if isinstance(previous, list) else [previous]) + [value]
+
+    if action in {"CreateLogGroup", "TagLogGroup", "TagResource"}:
+        tags = data.get("tags", {})
+        if isinstance(tags, dict):
+            add_tags("aws:RequestTag", tags)
+            context["aws:TagKeys"] = list(tags)
+    elif action in {"UntagLogGroup", "UntagResource"}:
+        keys = data.get("tags" if action == "UntagLogGroup" else "tagKeys", [])
+        if isinstance(keys, list):
+            context["aws:TagKeys"] = keys
+
+    if action == "CreateLogGroup":
+        return context
+    record = logs.resolve_tag_resource(resource_arn, account_id=account_id, region=region)
+    if record is not None:
+        add_tags("aws:ResourceTag", record.get("tags", {}))
+    return context
 _DYNAMODB_TRANSACT_ITEM_ACTIONS = {
     "ConditionCheck": "dynamodb:ConditionCheckItem",
     "Put": "dynamodb:PutItem",
@@ -1731,7 +1784,7 @@ def dynamodb_transaction_checks(
             detail = item.get(member)
             table = detail.get("TableName") if isinstance(detail, dict) else None
             if isinstance(table, str) and table:
-                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
+                checks.append((action, _dynamodb_table_arn(table, region, account_id)))
     return checks
 
 
@@ -1793,9 +1846,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service == "ssm" and not error_code:
-        # SSM authorization denials are HTTP 400, JSON 1.1, with a capitalized
-        # Message naming the resource.
+    if service in {"ssm", "logs"} and not error_code:
+        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
+        # capitalized Message naming the resource, as observed on live AWS.
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"

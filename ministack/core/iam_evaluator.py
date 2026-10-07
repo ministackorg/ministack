@@ -206,8 +206,10 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     if k == "aws:sourceip":
         return ctx.source_ip
     if k == "aws:tagkeys":
-        return ctx.tag_keys
+        return ctx.service_context.get(k, ctx.tag_keys)
     if k.startswith("aws:requesttag/"):
+        if k in ctx.service_context:
+            return ctx.service_context[k]
         tag_key = key[len("aws:RequestTag/"):]
         values = [value for name, value in ctx.request_tags.items() if name.lower() == tag_key.lower()]
         if len(values) == 1:

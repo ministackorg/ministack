@@ -119,15 +119,19 @@ def java_truststore_path(cert_path: str) -> "str | None":
 
 
 def _cert_names(cert_path: str, names: "list[str]") -> bool:
-    """Whether the certificate at `cert_path` carries every name in `names` as a SAN."""
+    """Whether the certificate at `cert_path` carries every name in `names` as a SAN and is no CA.
+
+    webpki (rustls) refuses a CA certificate served as the leaf (CaUsedAsEndEntity).
+    """
     try:
         out = subprocess.run(
-            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
+            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName,basicConstraints"],
             capture_output=True, text=True, check=False,
         )
     except OSError:
         return True  # No openssl to check with; leave the cached cert alone.
-    return all(f"DNS:{name}" in (out.stdout or "") for name in names)
+    text = out.stdout or ""
+    return all(f"DNS:{name}" in text for name in names) and "CA:TRUE" not in text
 
 
 def trust_gateway_cert(env: dict) -> None:
@@ -180,6 +184,9 @@ def resolve_tls_material() -> "tuple[str, str]":
             "-keyout", key_path, "-out", cert_path,
             "-days", "825",
             "-subj", "/CN=ministack-local/O=MiniStack",
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
             "-addext",
             "subjectAltName=DNS:localhost,DNS:ministack,"
             + "".join(f"DNS:{host}," for host in _generated_cert_names())

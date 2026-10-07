@@ -807,6 +807,47 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
 
 
+@pytest.mark.serial
+def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
+    """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-1")
+    for name in ("left-1", "left-2", "left-3"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+    full_list = fake_docker.containers.list
+
+    def listing(all=False, filters=None, sparse=False):
+        if not sparse:
+            raise RuntimeError("inspect of left-2 failed")
+        return full_list(all=all, filters=filters, sparse=sparse)
+
+    monkeypatch.setattr(fake_docker.containers, "list", listing)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
+    assert container_reaper.reap_all(fake_docker, include_unlabelled=True) == 3
+    assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+def test_periodic_reaper_skips_only_the_container_it_cannot_inspect(fake_docker, monkeypatch):
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for name in ("gone-1", "broken", "gone-2"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+
+    def failing_reload():
+        raise RuntimeError("inspect failed")
+
+    monkeypatch.setattr(fake_docker.containers.get("broken"), "reload", failing_reload)
+    container_reaper.register_live_ids("rds", lambda: [])
+    assert container_reaper.reap_abandoned(fake_docker) == 2
+    assert fake_docker.live() == ["broken"]
+
+
 def test_persistence_keeps_state_when_a_module_fails_to_load():
     """A service that could not import must not overwrite its persisted state.
 
