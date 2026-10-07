@@ -565,6 +565,14 @@ def _get_reset_lock() -> asyncio.Lock:
 # ---------------------------------------------------------------------------
 
 
+class _IncompleteRequestBody(Exception):
+    """The request body ended before its declared framing was complete."""
+
+
+class _RequestBodyDisconnected(Exception):
+    """The client disconnected before the request body was complete."""
+
+
 def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     """Decode AWS chunked request bodies and normalize content-encoding headers."""
     sha256_header = headers.get("x-amz-content-sha256", "")
@@ -583,40 +591,75 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     # sends for a large streaming PutObject.
     chunks = []
     pos = 0
-    trailer = b""
+    trailer = None
     while pos < len(body):
         crlf = body.find(b"\r\n", pos)
         if crlf == -1:
-            break
-        chunk_header = body[pos:crlf].decode("ascii", errors="replace")
-        size_hex = chunk_header.split(";")[0].strip()
+            raise _IncompleteRequestBody("Truncated aws-chunked frame header")
         try:
-            chunk_size = int(size_hex, 16)
-        except ValueError:
-            break
+            chunk_header = body[pos:crlf].decode("ascii")
+        except UnicodeDecodeError as e:
+            raise _IncompleteRequestBody("Invalid aws-chunked frame header") from e
+        size_hex = chunk_header.split(";")[0].strip()
+        if not re.fullmatch(r"[0-9A-Fa-f]+", size_hex):
+            raise _IncompleteRequestBody("Invalid aws-chunked frame size")
+        chunk_size = int(size_hex, 16)
         if chunk_size == 0:
             # Whatever follows the final chunk is the trailing header
             # section the request announced in x-amz-trailer.
             trailer = body[crlf + 2 :]
             break
         data_start = crlf + 2
-        chunks.append(body[data_start : data_start + chunk_size])
-        pos = data_start + chunk_size + 2  # skip trailing \r\n
+        data_end = data_start + chunk_size
+        if data_end + 2 > len(body) or body[data_end : data_end + 2] != b"\r\n":
+            raise _IncompleteRequestBody("Truncated aws-chunked frame data")
+        chunks.append(body[data_start:data_end])
+        pos = data_end + 2  # skip trailing \r\n
+    if trailer is None:
+        raise _IncompleteRequestBody("Missing aws-chunked terminating frame")
+
+    trailer_values = {}
+    if trailer == b"\r\n":
+        trailer_lines = []
+    elif trailer.endswith(b"\r\n\r\n"):
+        trailer_lines = trailer[:-4].split(b"\r\n")
+    else:
+        raise _IncompleteRequestBody("Incomplete aws-chunked trailer section")
+    for line in trailer_lines:
+        name, sep, value = line.partition(b":")
+        if not sep or not name:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer")
+        try:
+            name = name.decode("ascii").strip().lower()
+        except UnicodeDecodeError as e:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer name") from e
+        if not name:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer name")
+        trailer_values.setdefault(name, value.decode("utf-8", errors="replace").strip())
+
+    announced_trailers = {
+        name.strip().lower()
+        for name in headers.get("x-amz-trailer", "").split(",")
+        if name.strip()
+    }
+    if not announced_trailers.issubset(trailer_values):
+        raise _IncompleteRequestBody("Missing announced aws-chunked trailer")
+
     decoded = b"".join(chunks)
+    decoded_length = headers.get("x-amz-decoded-content-length")
+    if decoded_length is not None:
+        if not re.fullmatch(r"[0-9]+", decoded_length.strip()):
+            raise _IncompleteRequestBody("Invalid X-Amz-Decoded-Content-Length")
+        if len(decoded) != int(decoded_length):
+            raise _IncompleteRequestBody("Decoded aws-chunked length mismatch")
 
     # A checksum computed while the body streamed arrives here rather than
     # among the request headers, and the rest of the request has no way to
     # tell the two apart -- so lift it into the headers, where every
     # checksum reader already looks.  An explicit header wins: the trailer
     # is the late copy of the same field, not an override.
-    for line in trailer.split(b"\r\n"):
-        name, sep, value = line.partition(b":")
-        if not sep:
-            continue
-        name = name.decode("ascii", errors="replace").strip().lower()
-        if name:
-            headers.setdefault(
-                name, value.decode("utf-8", errors="replace").strip())
+    for name, value in trailer_values.items():
+        headers.setdefault(name, value)
 
     body = decoded
     if "aws-chunked" in content_encoding:
@@ -665,13 +708,33 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
         chunks = []
         while True:
             message = await receive()
+            if message.get("type") == "http.disconnect":
+                raise _RequestBodyDisconnected
+            if message.get("type") != "http.request":
+                raise _IncompleteRequestBody("Unexpected ASGI message while reading request body")
             chunk = message.get("body", b"")
             if chunk:
                 chunks.append(chunk)
             if not message.get("more_body", False):
                 break
         body = b"".join(chunks)
+    content_length = headers.get("content-length")
+    if content_length is not None:
+        content_length = content_length.strip()
+        if not re.fullmatch(r"[0-9]+", content_length) or len(body) != int(content_length):
+            raise _IncompleteRequestBody("Content-Length does not match request body")
     return _decode_aws_chunked_body(body, headers)
+
+
+def _incomplete_request_body_response(method: str, path: str, headers: dict, query_params: dict):
+    """Use the routed protocol's existing error envelope for an incomplete body."""
+    message = "You did not provide the number of bytes specified by the Content-Length HTTP header"
+    service = detect_service(method, path, headers, query_params)
+    if service == "s3":
+        return _get_module("s3")._error("IncompleteBody", message, 400)
+    from ministack.core.responses import error_response_json
+
+    return error_response_json("IncompleteBody", message, 400)
 
 
 def _encode_header_value(v: str) -> bytes:
@@ -1048,6 +1111,10 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     try:
         mod = _get_module("sqs")
         now = time.time()
+        queue_name_filter = None
+        queue_account_filter = None
+        if queue_url_filter is not None:
+            queue_account_filter, queue_name_filter = mod._queue_ref_from_urlish(queue_url_filter)
 
         # Legacy AccountScopedDict state is keyed by (account_id, queue_url);
         # AccountRegionScopedDict state is keyed by (account_id, region, queue_url).
@@ -1069,13 +1136,18 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                 continue
             if region_filter is not None and region != region_filter:
                 continue
-            if queue_url_filter is not None and qurl != queue_url_filter:
-                continue
             if not isinstance(queue, dict):
                 continue
+            if queue_url_filter is not None:
+                if queue.get("name") != queue_name_filter:
+                    continue
+                if queue_account_filter and acct != queue_account_filter:
+                    continue
             msgs = queue.get("messages") or []
             rendered = []
             for m in msgs:
+                if m is None:
+                    continue
                 rendered.append(
                     {
                         "MessageId": m.get("id"),
@@ -1094,7 +1166,8 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                         "SequenceNumber": m.get("seq"),
                     }
                 )
-            per_account.setdefault(acct, {}).setdefault(region, {})[qurl] = rendered
+            display_qurl = queue_url_filter if queue_url_filter is not None else qurl
+            per_account.setdefault(acct, {}).setdefault(region, {})[display_qurl] = rendered
 
         response = {"messages": per_account}
     except Exception as e:
@@ -2806,7 +2879,14 @@ async def app(scope, receive, send):
     ):
         return
 
-    body = await _read_request_body(receive, method, headers)
+    try:
+        body = await _read_request_body(receive, method, headers)
+    except _RequestBodyDisconnected:
+        return
+    except _IncompleteRequestBody:
+        response = _incomplete_request_body_response(method, path, headers, query_params)
+        await _send_if_handled(send, response, receive)
+        return
 
     if await _send_if_handled(
         send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id), receive
