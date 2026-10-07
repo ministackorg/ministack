@@ -699,6 +699,11 @@ def _stop_execution(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    # A client may retry after the abort was applied but its response was lost.
+    # Return the original result without rewriting the cause or emitting a
+    # second ExecutionAborted event.
+    if execution["status"] == "ABORTED":
+        return json_response({"stopDate": execution["stopDate"]})
     if execution["status"] != "RUNNING":
         return error_response_json(
             "ValidationException", "Execution is not running", 400)

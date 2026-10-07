@@ -920,6 +920,60 @@ def test_rds_global_cluster_lifecycle(rds):
         rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
+@pytest.mark.parametrize("engine", ["aurora-postgresql", "aurora-mysql"])
+def test_rds_global_cluster_tags_lifecycle(rds, engine):
+    global_id = f"global-tags-{uuid.uuid4().hex[:8]}"
+    tags = [{"Key": "operator", "Value": "example&owner"},
+            {"Key": "environment", "Value": "test"}]
+    west = _regional_rds("us-west-2")
+    gc = rds.create_global_cluster(
+        GlobalClusterIdentifier=global_id, Engine=engine, Tags=tags,
+    )["GlobalCluster"]
+    arn = gc["GlobalClusterArn"]
+    try:
+        assert gc["TagList"] == tags
+        assert west.list_tags_for_resource(ResourceName=arn)["TagList"] == tags
+        assert west.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]["TagList"] == tags
+
+        with pytest.raises(ClientError):
+            rds.create_global_cluster(
+                GlobalClusterIdentifier=global_id, Engine=engine,
+                Tags=[{"Key": "operator", "Value": "rejected"}],
+            )
+        assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == tags
+
+        west.add_tags_to_resource(
+            ResourceName=arn, Tags=[{"Key": "operator", "Value": "updated"}],
+        )
+        rds.remove_tags_from_resource(ResourceName=arn, TagKeys=["environment"])
+        expected = [{"Key": "operator", "Value": "updated"}]
+        assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == expected
+        assert rds.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]["TagList"] == expected
+
+        renamed = global_id + "-renamed"
+        gc = rds.modify_global_cluster(
+            GlobalClusterIdentifier=global_id, NewGlobalClusterIdentifier=renamed,
+        )["GlobalCluster"]
+        global_id = renamed
+        arn = gc["GlobalClusterArn"]
+        assert gc["TagList"] == expected
+        assert west.list_tags_for_resource(ResourceName=arn)["TagList"] == expected
+        assert rds.delete_global_cluster(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalCluster"]["TagList"] == expected
+        gc = rds.create_global_cluster(
+            GlobalClusterIdentifier=global_id, Engine=engine,
+        )["GlobalCluster"]
+        assert gc["TagList"] == []
+        assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == []
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+
+
 def test_rds_describe_global_clusters_member_element(rds):
     """Each cluster in DescribeGlobalClusters is a <GlobalClusterMember> element.
 
@@ -953,20 +1007,27 @@ def test_rds_describe_global_clusters_member_element(rds):
 
 def test_rds_global_cluster_with_source(rds):
     """CreateGlobalCluster with SourceDBClusterIdentifier picks up engine from source."""
-    rds.create_db_cluster(
+    source_tags = [{"Key": "source-only", "Value": "regional"}]
+    global_tags = [{"Key": "operator", "Value": "global"}]
+    source = rds.create_db_cluster(
         DBClusterIdentifier="gc-source-cluster",
         Engine="aurora-postgresql",
         MasterUsername="admin",
         MasterUserPassword="password123",
-    )
+        Tags=source_tags,
+    )["DBCluster"]
     try:
         rds.create_global_cluster(
             GlobalClusterIdentifier="test-global-src",
             SourceDBClusterIdentifier="gc-source-cluster",
+            Tags=global_tags,
         )
         resp = rds.describe_global_clusters(GlobalClusterIdentifier="test-global-src")
         gc = resp["GlobalClusters"][0]
         assert gc["Engine"] == "aurora-postgresql"
+        assert gc["TagList"] == global_tags
+        assert rds.list_tags_for_resource(ResourceName=gc["GlobalClusterArn"])["TagList"] == global_tags
+        assert rds.list_tags_for_resource(ResourceName=source["DBClusterArn"])["TagList"] == source_tags
         members = gc["GlobalClusterMembers"]
         assert len(members) == 1
         assert members[0]["IsWriter"] is True

@@ -7845,6 +7845,10 @@ def _sync_tag_list_to_resource(arn):
         if cl.get("DBClusterArn") == arn:
             cl["TagList"] = list(tag_list)
             return
+    for gc in _global_clusters.values():
+        if gc.get("GlobalClusterArn") == arn:
+            gc["TagList"] = list(tag_list)
+            return
     for snap in _snapshots.values():
         if snap.get("DBSnapshotArn") == arn:
             snap["TagList"] = list(tag_list)
@@ -7941,10 +7945,12 @@ def _create_global_cluster(p):
         "DeletionProtection": deletion_protection,
         "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
+        "TagList": _parse_tags(p),
     }
     if source_cluster:
         _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
+    _tags[arn] = list(gc["TagList"])
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
 
@@ -7999,6 +8005,7 @@ def _delete_global_cluster(p):
 
     gc["Status"] = "deleting"
     del _global_clusters[gc["GlobalClusterIdentifier"]]
+    _tags.pop(gc["GlobalClusterArn"], None)
     return _xml(200, "DeleteGlobalClusterResponse",
         f"<DeleteGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></DeleteGlobalClusterResult>")
 
@@ -8102,9 +8109,11 @@ def _modify_global_cluster_impl(p):
             return _error("GlobalClusterAlreadyExistsFault",
                 f"Global cluster {new_id} already exists.", 400)
         old_id = gc["GlobalClusterIdentifier"]
+        old_arn = gc["GlobalClusterArn"]
         gc["GlobalClusterIdentifier"] = new_id
         gc["GlobalClusterArn"] = f"arn:aws:rds::{get_account_id()}:global-cluster:{new_id}"
         _global_clusters[new_id] = gc
+        _tags[gc["GlobalClusterArn"]] = _tags.pop(old_arn, [])
         del _global_clusters[old_id]
         for member in gc.get("GlobalClusterMembers", []):
             cluster = _resolve_cluster(member["DBClusterArn"])
@@ -9160,6 +9169,10 @@ def _disable_http_endpoint(p):
 
 def _global_cluster_xml(gc):
     _refresh_global_cluster_readers(gc)
+    tag_xml = "".join(
+        f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+        for t in gc.get("TagList", [])
+    )
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
         readers_xml = "".join(f"<member>{_esc(reader)}</member>" for reader in m.get("Readers", []))
@@ -9189,7 +9202,8 @@ def _global_cluster_xml(gc):
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
         {failover_state_xml}
-        <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>"""
+        <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>
+        <TagList>{tag_xml}</TagList>"""
 
 
 # ---------------------------------------------------------------------------
