@@ -7570,7 +7570,7 @@ def _compact_projection(value):
 # ---------------------------------------------------------------------------
 
 # Derived per table, never persisted: {index_name: {index hash value:
-# {(base_pk, base_sk), ...}}}, so a GSI/LSI Query reads its own partition
+# {(base_pk, base_sk): None}}} (insertion-ordered), so a GSI/LSI Query reads its own partition
 # instead of every item. Built on first use; dropped whenever items are
 # replaced wholesale or the index set changes.
 _INDEX_MEMBERS = "_index_members"
@@ -7603,7 +7603,7 @@ def _index_members(table):
                 for base_sk, item in sk_map.items():
                     partition = _index_partition(item, hash_key, range_key)
                     if partition is not None:
-                        partitions.setdefault(partition, set()).add((base_pk, base_sk))
+                        partitions.setdefault(partition, {})[(base_pk, base_sk)] = None
         table[_INDEX_MEMBERS] = members
     return members
 
@@ -7621,9 +7621,9 @@ def _index_item(table, base_pk, base_sk, item, add):
             continue
         partitions = members[name]
         if add:
-            partitions.setdefault(partition, set()).add((base_pk, base_sk))
+            partitions.setdefault(partition, {})[(base_pk, base_sk)] = None
         elif partition in partitions:
-            partitions[partition].discard((base_pk, base_sk))
+            partitions[partition].pop((base_pk, base_sk), None)
             if not partitions[partition]:
                 del partitions[partition]
 

@@ -7481,10 +7481,10 @@ def test_dynamodb_index_membership_not_persisted():
              "GlobalSecondaryIndexes": [{"IndexName": "byG",
                                          "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}]}]}
     _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "x"}})
-    assert _d._index_members(table) == {"byG": {"x": {("a", "__no_sort__")}}}
+    assert _d._index_members(table) == {"byG": {"x": {("a", "__no_sort__"): None}}}
     _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "y"}})
     _d._set_item(table, "b", "__no_sort__", {"pk": {"S": "b"}})
-    assert _d._index_members(table) == {"byG": {"y": {("a", "__no_sort__")}}}
+    assert _d._index_members(table) == {"byG": {"y": {("a", "__no_sort__"): None}}}
     assert table["ItemCount"] == 2
     _d._remove_item(table, "a", "__no_sort__")
     assert _d._index_members(table) == {"byG": {}} and table["ItemCount"] == 1
