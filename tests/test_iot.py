@@ -5480,13 +5480,15 @@ def test_rule_action_failure_does_not_kill_the_loop(monkeypatch):
         reset()
 
 
-def test_rule_sns_action_writes_a_full_sns_message_record():
-    """The dispatcher publishes through SNS's own internal path, so the stored
-    record carries every field an HTTP `Publish` writes — a hand-rolled append
-    here would quietly drop the ones a subscription filter policy reads."""
+def test_rule_sns_action_writes_a_full_sns_message_record(monkeypatch):
+    """The dispatcher publishes through SNS's own internal path, so the fan-out
+    receives every field an HTTP `Publish` passes, including the ones a
+    subscription filter policy reads."""
     from ministack.services import iot as iot_module
     from ministack.services import sns as sns_module
 
+    fanned_out = []
+    monkeypatch.setattr(sns_module, "_fanout", lambda *args, **kwargs: fanned_out.append(args))
     reset()
     iot_module._topic_rules.clear()
     account_id = "123456789012"
@@ -5495,7 +5497,7 @@ def test_rule_sns_action_writes_a_full_sns_message_record():
         account_id,
         _TEST_REGION,
         topic_arn,
-        {"arn": topic_arn, "messages": [], "subscriptions": [], "attributes": {}},
+        {"arn": topic_arn, "subscriptions": [], "attributes": {}},
     )
     _put_rule(
         account_id,
@@ -5509,18 +5511,12 @@ def test_rule_sns_action_writes_a_full_sns_message_record():
 
     try:
         asyncio.run(_run())
-        stored = sns_module._topics.get_scoped(account_id, _TEST_REGION, topic_arn)
-        assert len(stored["messages"]) == 1
-        record = stored["messages"][0]
-        assert json.loads(record["message"]) == {"temp": 22}
-        assert set(record) == {
-            "id",
-            "message",
-            "subject",
-            "message_structure",
-            "message_attributes",
-            "timestamp",
-        }
+        assert len(fanned_out) == 1
+        arn, msg_id, message, _subject, message_structure, message_attributes = fanned_out[0][:6]
+        assert arn == topic_arn and msg_id
+        assert json.loads(message) == {"temp": 22}
+        assert message_structure == "" and message_attributes == {}
+        assert "messages" not in sns_module._topics.get_scoped(account_id, _TEST_REGION, topic_arn)
     finally:
         sns_module._topics.clear()
         iot_module._topic_rules.clear()
