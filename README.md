@@ -1605,10 +1605,56 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 ---
 
+## Testing failure paths
+
+MiniStack answers *correctly* — that's its job. To test how your app
+behaves when AWS *fails*, pair it with
+[**microburst**](https://github.com/pingedbrain/microburst), an
+AWS-protocol-aware fault-injection proxy:
+
+```
+your app → microburst (:9999) → MiniStack (:4566)
+```
+
+```bash
+microburst --upstream http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:9999
+```
+
+What microburst injects — **every fault validated against real AWS wire
+captures**, so the SDK retries and classifies exactly like it would
+against AWS itself:
+
+- **Modeled errors** — `ProvisionedThroughputExceededException`,
+  `SlowDown`, `ExpiredTokenException`… with the correct envelope,
+  `__type` namespacing, and HTTP status per protocol.
+- **Network degradation** — latency, timeouts, connection resets,
+  bandwidth caps — on *any* HTTP upstream, AWS-shaped or not.
+- **Stream surgery** — mid-frame cuts and terminal error events on
+  event-stream responses (S3 Select, Kinesis, Lambda streaming).
+- **Live rule control** — inject/clear faults via HTTP API or YAML, and
+  audit exactly what fired via `/_microburst/fired`.
+
+Runnable scenarios live in
+[`examples/`](https://github.com/pingedbrain/microburst/tree/main/examples):
+throttled writers, timeout-vs-retry-budget, poison queues, and more.
+
+**Scope:** microburst proxies HTTP — MiniStack's real database endpoints
+(RDS MySQL, ElastiCache Redis, Aurora DSQL) speak native TCP wire
+protocols, which don't pass through an HTTP proxy. Faults apply to the
+AWS HTTP APIs; for TCP-level degradation use a TCP proxy (e.g.
+toxiproxy) alongside it.
+
+Maintainers of AWS-compatible tools can also diff their wire output
+against microburst's committed real-AWS captures —
+`microburst fidelity conform` produces a conformance report with zero
+AWS credentials required.
+
 ## Community Integrations
 
 | Project | Description |
 |---------|-------------|
+| [**microburst**](https://github.com/pingedbrain/microburst) | **Chaos proxy** — injects AWS-faithful errors, latency, resets, and stream cuts between your app and MiniStack. Available on [PyPI](https://pypi.org/project/microburst/) and [GHCR](https://github.com/pingedbrain/microburst/pkgs/container/microburst). |
 | [**OpenArchFlow**](https://github.com/dmux/OpenArchFlow) | Open-source Progressive Web App for generating interactive AWS architecture diagrams from natural language descriptions using AI, LLMs, AI Agents, and AWS MCP. |
 | [**StackPort**](https://github.com/DaviReisVieira/stackport) | **Web UI** — visual dashboard to browse and inspect AWS resources in MiniStack. Available on [PyPI](https://pypi.org/project/stackport/) and [Docker Hub](https://hub.docker.com/r/davireis/stackport). |
 | [**McDoit.Aspire.Hosting.Ministack**](https://github.com/McDoit/aspire-hosting-ministack) | .NET Aspire hosting integration for MiniStack. |
