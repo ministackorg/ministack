@@ -1996,7 +1996,7 @@ def _call_lambda(func_ref, event):
 
     body = result.get("body")
     if body is None:
-        return {}
+        return None
     if isinstance(body, (dict, list)):
         return body
     try:

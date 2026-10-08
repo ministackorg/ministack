@@ -7,9 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
+## [1.5.24] — 2026-10-08
 
-- **Lambda — local Node.js console logs** — the one-shot local executor mixed `console.log()`, `console.info()` and other stdout output into the Invoke response, and omitted them from invocation logs. It now sends handler stdout/stderr output, including `fs.writeSync(1, ...)` and `fs.write(1, ...)`, to the log channel and reserves stdout for the JSON return value, including logs written during module initialization.
+### Added
+- **API Gateway v1 — richer SQS request templates** — templates now support `#set`, `##` and `#* *#` comments, quiet `$!` references, double-quoted strings with interpolation and `""` escapes, and `$context.authorizer` values including Cognito claims. Reported by @teruyukisuda.
+
+### Fixed
+- **API Gateway — `CreateApiKey` keeps `value` and `customerId`** — the key always got a generated value. A value under 20 characters returns `BadRequestException` "API Key value should be at least 20 characters". Reported by @mjuen.
+- **CloudWatch — CBOR timestamps** — timestamps from clients using the CBOR protocol are now read as UTC. Reported by @DimQ1.
+- **Container reaping — failed removals are logged** — containers the reaper could not remove are logged at `WARNING` with their ids. Reported by @iot-rocket.
+- **DynamoDB Streams — iterator expiry and `GetRecords` limits** — shard iterators expire after 15 minutes with `ExpiredIteratorException`, a page stops at 1 MB, a position behind the trim horizon returns `TrimmedDataAccessException`, and an unknown shard returns `ResourceNotFoundException`. Reported by @DimQ1.
+- **Lambda — a returned string is JSON-encoded** — `Invoke` returned `hello` instead of `"hello"`. Reported by @edu-shippo.
+- **Lambda — local Node.js console logs** — the one-shot local executor mixed stdout into the `Invoke` response. Logs now go to the invocation log and stdout carries only the return value. Contributed by @gakuto-cw21.
+- **Pipes — SNS FIFO targets are refused** — `CreatePipe` and `UpdatePipe` now return "SNS FIFO topics are not supported as a pipe target.". Reported by @DimQ1.
+- **S3 Tables — Iceberg REST catalogs and commits** — every catalog read the first catalog's warehouse; each is now scoped to its table bucket ARN. Commits now check update requirements (`CommitFailedException`, 409) and keep snapshot sequence numbers consistent.
+- **SES — non-ASCII addresses** — an address with non-ASCII characters returns `InvalidParameterValue` "Missing final '@domain'". Reported by @DimQ1.
+- **SNS — filter policies** — `FilterPolicyScope` `MessageBody` was ignored and `suffix` and `equals-ignore-case` never matched. Both scopes now apply, with `wildcard`, `cidr` and `"exists": false` too. Reported by @DimQ1.
+- **SQS — retention and dead-letter moves** — messages now expire after `MessageRetentionPeriod`. A message moved to a dead-letter queue keeps its enqueue time on standard queues and carries `DeadLetterQueueSourceArn`. Reported by @DimQ1.
+- **Step Functions — a Lambda that returns `null` outputs `null`** — the Task output was `{}`. Reported by @edu-shippo.
 
 ## [1.5.23] — 2026-10-07
 

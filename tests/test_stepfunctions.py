@@ -3915,6 +3915,41 @@ def test_sfn_integration_lambda_invoke_failure_cause_is_json(sfn, lam):
     assert cause["errorMessage"] == "widget exploded", cause
 
 
+def test_sfn_lambda_task_returning_none_outputs_null(sfn, lam):
+    """A function that returns None yields the JSON text null, which is the
+    Task result: [null, null, null] out of a Map, and Payload null through the
+    optimized lambda:invoke integration."""
+    import uuid as _uuid
+
+    fn = f"sfn-returns-none-{_uuid.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler",
+                        Code={"ZipFile": _make_zip("def handler(event, context):\n    return None\n")})
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    definitions = {
+        "map": ({"StartAt": "Fanout", "States": {"Fanout": {
+            "Type": "Map", "ItemsPath": "$.items", "End": True,
+            "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "Call",
+                              "States": {"Call": {"Type": "Task", "Resource": func_arn, "End": True}}}}}},
+                [None, None, None]),
+        "invoke": ({"StartAt": "Call", "States": {"Call": {
+            "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {"FunctionName": func_arn, "Payload": {}},
+            "OutputPath": "$.Payload", "End": True}}},
+                   None),
+    }
+    for label, (definition, expected) in definitions.items():
+        sm = sfn.create_state_machine(name=f"sfn-null-{label}-{_uuid.uuid4().hex[:8]}",
+                                      definition=json.dumps(definition), roleArn=_LAMBDA_ROLE)
+        ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"],
+                                 input=json.dumps({"items": [1, 2, 3]}))
+        desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+        assert desc["status"] == "SUCCEEDED", (label, desc)
+        assert json.loads(desc["output"]) == expected, label
+        sfn.delete_state_machine(stateMachineArn=sm["stateMachineArn"])
+    lam.delete_function(FunctionName=fn)
+
+
 def test_sfn_integration_ecs_run_task(sfn, ecs):
     """Task state triggers ecs:runTask (fire-and-forget, no Docker needed)."""
     ecs.create_cluster(clusterName="sfn-ecs-test")

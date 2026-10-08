@@ -3156,9 +3156,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     payload = result.get("body")
     if payload is None:
         return 200, resp_headers, b"null"
-    if isinstance(payload, (str, bytes)):
-        raw = payload.encode("utf-8") if isinstance(payload, str) else payload
-        return 200, resp_headers, raw
+    if isinstance(payload, bytes):
+        return 200, resp_headers, payload
+    if isinstance(payload, str) and (result.get("raw_payload") or result.get("error")):
+        return 200, resp_headers, payload.encode("utf-8")
+    # A returned string is serialized like any other value: "hello" -> "\"hello\"".
     return 200, resp_headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
@@ -4029,16 +4031,19 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
             )
             resp = urllib.request.urlopen(req, timeout=timeout)
             body = resp.read().decode("utf-8", errors="replace")
+            raw_payload = False
             try:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
-                parsed = body
+                parsed, raw_payload = body, True
             logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             # RIE owns the platform lines, including handler errors returned as HTTP 200.
             # Carry provenance separately so user output never controls log wrapping.
             result = {"body": parsed, "log": logs, "log_source": "rie"}
+            if raw_payload:
+                result["raw_payload"] = True
             function_error = _classify_function_error(parsed, err_header)
             if function_error is not None:
                 result["error"] = True
@@ -5261,7 +5266,7 @@ def _execute_function_proxy(func: dict, event: dict, url: str, request_id: str) 
     try:
         return {"body": json.loads(text)}
     except json.JSONDecodeError:
-        return {"body": text}
+        return {"body": text, "raw_payload": True}
 
 
 def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
@@ -5498,6 +5503,7 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                         result_holder["response"] = json.loads(body)
                     except json.JSONDecodeError:
                         result_holder["response"] = body.decode("utf-8", errors="replace")
+                        result_holder["raw_payload"] = True
                     self.send_response(202)
                     self.end_headers()
                     response_received.set()
@@ -5576,7 +5582,8 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                     if isinstance(err, dict):
                         return {"body": err, "error": True}
                     return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True}
-                return {"body": result_holder["response"]}
+                return {"body": result_holder["response"],
+                        "raw_payload": result_holder.get("raw_payload", False)}
             else:
                 proc.kill()
                 stdout, stderr = proc.communicate(timeout=5)
@@ -5732,7 +5739,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
                 try:
                     return {"body": json.loads(stdout), "log": log_tail}
                 except json.JSONDecodeError:
-                    return {"body": stdout, "log": log_tail}
+                    return {"body": stdout, "log": log_tail, "raw_payload": True}
             else:
                 return {
                     "body": {
