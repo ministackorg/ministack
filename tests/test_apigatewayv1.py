@@ -4937,6 +4937,47 @@ def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_apigwv1_create_api_key_keeps_the_given_value(apigw_v1):
+    wanted = f"own-key-value-{_uuid_mod.uuid4().hex[:12]}"
+    api_id, root = _gw_api(apigw_v1, f"gwkey-{_uuid_mod.uuid4().hex[:8]}")
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True,
+                                  value=wanted, customerId="customer-1")
+    try:
+        assert key["value"] == wanted
+        assert key["customerId"] == "customer-1"
+        stored = apigw_v1.get_api_key(apiKey=key["id"], includeValue=True)
+        assert stored["value"] == wanted
+        assert stored["customerId"] == "customer-1"
+
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", wanted)]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        apigw_v1.delete_api_key(apiKey=key["id"])
+
+
+def test_apigwv1_create_api_key_refuses_a_value_under_20_characters(apigw_v1):
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                value="x" * 19)
+    err = exc.value.response
+    assert err["Error"]["Code"] == "BadRequestException"
+    assert err["Error"]["Message"] == "API Key value should be at least 20 characters"
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", value="x" * 20)
+    assert key["value"] == "x" * 20
+    apigw_v1.delete_api_key(apiKey=key["id"])
+
+
 def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
     """Quota 1 serves one request, then 429 QUOTA_EXCEEDED."""
     api_id, root = _gw_api(apigw_v1, f"gwquota-{_uuid_mod.uuid4().hex[:8]}")
@@ -5416,6 +5457,117 @@ def test_apigwv1_execute_sqs_integration_vtl_subset(apigw_v1, sqs):
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_cognito_claims_template(apigw_v1, sqs, cognito_idp):
+    """#set, interpolated "" strings and $context.authorizer.claims, as in the
+    template CDK users pass through an AwsIntegration to SQS."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    queue_name = f"apigw-q-{suffix}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    pool_id = cognito_idp.create_user_pool(PoolName=f"sqs-claims-{suffix}")["UserPool"]["Id"]
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="c",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pool_id, Username="test-user", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "user@example.com"}])
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="test-user", Password="Passw0rd!", Permanent=True)
+    token = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "test-user", "PASSWORD": "Passw0rd!"},
+    )["AuthenticationResult"]["IdToken"]
+
+    template = (
+        "#set($body = $input.json('$'))\n"
+        "#set($id = $input.params('id'))\n"
+        "Action=SendMessage&MessageBody=$util.urlEncode(\"{\"\"body\"\":$body,"
+        "\"\"pathParameters\"\":{\"\"id\"\":\"\"$id\"\"},\"\"requestContext\"\":"
+        "{\"\"authorizer\"\":{\"\"claims\"\":{\"\"cognito:username\"\":"
+        "\"\"$!context.authorizer.claims.get('cognito:username')\"\",\"\"email\"\":"
+        "\"\"$!context.authorizer.claims.get('email')\"\"}}}}\")")
+    api_id, root = _gw_api(apigw_v1, f"gwsqs-{suffix}")
+    items = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="items")["id"]
+    resource = apigw_v1.create_resource(restApiId=api_id, parentId=items, pathPart="{id}")["id"]
+    authorizer = apigw_v1.create_authorizer(
+        restApiId=api_id, name="cog", type="COGNITO_USER_POOLS",
+        providerARNs=[f"arn:aws:cognito-idp:us-east-1:000000000000:userpool/{pool_id}"],
+        identitySource="method.request.header.Authorization")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource, httpMethod="PUT",
+                        authorizationType="COGNITO_USER_POOLS", authorizerId=authorizer)
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", type="AWS",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:sqs:path/000000000000/{queue_name}",
+        credentials="arn:aws:iam::000000000000:role/apigw-sqs",
+        requestParameters={"integration.request.header.Content-Type":
+                           "'application/x-www-form-urlencoded'"},
+        requestTemplates={"application/json": template})
+    for code in ("200", "400"):
+        apigw_v1.put_method_response(restApiId=api_id, resourceId=resource,
+                                     httpMethod="PUT", statusCode=code)
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", statusCode="200",
+        responseTemplates={"application/json": '{"message": "Request accepted"}'})
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", statusCode="400",
+        selectionPattern=r"4\d{2}",
+        responseTemplates={"application/json": '{"message": "Bad Request"}'})
+    apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+    try:
+        status, text = _stage_call(
+            api_id, "/items/item-1", method="PUT", body='{"name":"example"}',
+            headers=[("Content-Type", "application/json"), ("Authorization", token)])
+        assert (status, json.loads(text)) == (200, {"message": "Request accepted"})
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get("Messages", [])
+        assert [m["Body"] for m in msgs] == [
+            '{"body":{"name":"example"},"pathParameters":{"id":"item-1"},'
+            '"requestContext":{"authorizer":{"claims":{"cognito:username":"test-user",'
+            '"email":"user@example.com"}}}}']
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def _render_v1(template, body="", params=None, context=None):
+    return apigateway_v1._render_request_template_v1(template, body, params or {}, context)
+
+
+def test_apigwv1_template_set_lines_render_nothing():
+    assert _render_v1("#set($a = 'x')\n  #set ($b = \"$a/y\")\r\nA=$a&B=$b") == "A=x&B=x/y"
+
+
+def test_apigwv1_template_comments_strip_through_end_of_line():
+    assert _render_v1("Action=SendMessage##\n&MessageBody=x## tail\n#* block\n*#&k=v") == (
+        "Action=SendMessage&MessageBody=x&k=v")
+
+
+def test_apigwv1_template_string_literals():
+    template = "#set($v = \"in\")$util.urlEncode(\"a \"\"$v\"\" b\")|$util.urlEncode('$v ''q''')"
+    assert _render_v1(template) == "a+%22in%22+b|%24v+%27q%27"
+
+
+def test_apigwv1_template_set_null_keeps_the_previous_value():
+    ctx = {"authorizer": {"claims": {}}}
+    assert _render_v1("#set($a = 'kept')#set($a = $context.authorizer.claims.get('nope'))$a",
+                      context=ctx) == "kept"
+
+
+def test_apigwv1_template_undefined_references():
+    assert _render_v1("$undefined|$!undefined|$!{undefined}|$10") == "$undefined|||$10"
+
+
+def test_apigwv1_template_context_authorizer_values():
+    claims_ctx = {"authorizer": {"claims": {"email": "a@b.c", "cognito:username": "u"}}}
+    assert _render_v1(
+        "$context.authorizer.claims.email|$context.authorizer.claims.get('cognito:username')"
+        "|$!context.authorizer.claims.missing|$!context.authorizer.claims",
+        context=claims_ctx) == "a@b.c|u||"
+    lambda_ctx = {"authorizer": {"principalId": "p1", "numKey": "1"}}
+    assert _render_v1("$context.authorizer.principalId-$context.authorizer.numKey",
+                      context=lambda_ctx) == "p1-1"
 
 
 def test_apigwv1_execute_sqs_integration_passthrough(apigw_v1, sqs):

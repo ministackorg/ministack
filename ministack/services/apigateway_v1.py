@@ -2920,15 +2920,23 @@ def _parse_service_integration_uri(uri: str):
     return region, service, verb, rest
 
 
-# ── Minimal request-template (VTL) subset ────────────────────────────────
+# ── Request-template (VTL) subset ────────────────────────────────────────
 #
 # Non-proxy AWS service integrations shape the backend call through a
-# `requestTemplates` mapping template. Only the subset real SQS templates use
-# is modeled: `$input.body`, `$input.json('<json-path>')` / `$input.path(...)`,
-# `$input.params('name')` (merged header < querystring < path params, the
-# precedence AWS documents), and `$util.urlEncode(...)` — e.g.
-# `Action=SendMessage&MessageBody=$util.urlEncode($input.body)`.
-# Anything the subset does not cover renders as an empty string.
+# `requestTemplates` mapping template. Modeled: `$input.body`,
+# `$input.json('<json-path>')` / `$input.path(...)`, `$input.params('name')`
+# (path > querystring > header, the precedence AWS documents),
+# `$util.urlEncode(...)`, `$context.authorizer.*` (Cognito claims included),
+# `#set` with Velocity 1.x newline gobbling, `##` / `#* *#` comments, quiet
+# `$!` references, and string literals ("..." interpolated with `""` escapes,
+# '...' as-is with `''` escapes). An unmodeled `$input` / `$util` / `$context`
+# reference renders as an empty string; any other `$` text passes through.
+
+_VTL_ROOTS = ("input", "util", "context")
+_VTL_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_VTL_SET = re.compile(r"#\{?set\}?[ \t]*\(")
+_VTL_SET_LHS = re.compile(r"\s*\$!?\{?([A-Za-z][A-Za-z0-9_]*)\}?\s*=(.*)", re.DOTALL)
+
 
 def _vtl_json_path(body_str: str, path: str):
     """Evaluate the small ``$input.json('<path>')`` subset: ``$``, ``$.a.b``,
@@ -2954,73 +2962,256 @@ def _vtl_json_path(body_str: str, path: str):
     return node
 
 
-def _vtl_eval(expr: str, body_str: str, params_map: dict):
-    """Evaluate one template reference; unrecognised references render ""."""
-    expr = expr.strip()
-    if expr.startswith("$util.urlEncode(") and expr.endswith(")"):
-        inner = _vtl_eval(expr[len("$util.urlEncode("):-1], body_str, params_map)
-        return urllib.parse.quote(str(inner), safe="")
-    if expr == "$input.body":
-        return body_str
-    m = re.fullmatch(r"\$input\.(?:json|path)\(\s*(['\"])(.*?)\1\s*\)",
-                     expr, re.DOTALL)
-    if m:
-        value = _vtl_json_path(body_str, m.group(2))
-        if isinstance(value, (dict, list)):
-            return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-        return "" if value is None else str(value)
-    m = re.fullmatch(r"\$input\.params\(\s*(['\"])(.*?)\1\s*\)",
-                     expr, re.DOTALL)
-    if m:
-        return str(params_map.get(m.group(2), ""))
-    if len(expr) >= 2 and expr[0] == expr[-1] and expr[0] in ("'", '"'):
-        return expr[1:-1]
-    return ""
-
-
-def _vtl_expr_end(template: str, start: int) -> int:
-    """Index just past the ``$...`` expression at ``start`` in ``template``.
-
-    Bare references end at the first non-identifier/dot character; parenthesised
-    calls end at the closing paren, skipping over quoted strings.
-    """
-    i = start + 1
+def _vtl_close_paren(text: str, start: int):
+    """Index of the ``)`` matching the ``(`` at ``start``, skipping quoted
+    strings (a doubled quote pairs off as two adjacent strings); None if open."""
     depth = 0
-    while i < len(template):
-        ch = template[i]
+    i = start
+    while i < len(text):
+        ch = text[i]
         if ch in ("'", '"'):
+            close = text.find(ch, i + 1)
+            if close < 0:
+                return None
+            i = close + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _vtl_split_args(src: str) -> list:
+    args, depth, quote, current = [], 0, None, []
+    for ch in src:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
             quote = ch
-            i += 1
-            while i < len(template) and template[i] != quote:
-                i += 1
         elif ch == "(":
             depth += 1
         elif ch == ")":
-            if depth == 0:
-                return i
             depth -= 1
-            if depth == 0:
-                return i + 1
-        elif depth == 0 and not (ch.isalnum() or ch in "._"):
-            return i
+        elif ch == "," and depth == 0:
+            args.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        args.append("".join(current))
+    return args
+
+
+def _vtl_parse_ref(text: str, i: int):
+    """Parse the reference starting at ``text[i] == "$"``.
+
+    Returns ``(end, quiet, root, steps)`` where each step is ``(name, args)``
+    and ``args`` is the raw argument source of a call or None for a property;
+    None when no identifier follows the ``$``.
+    """
+    j = i + 1
+    quiet = text.startswith("!", j)
+    if quiet:
+        j += 1
+    braced = text.startswith("{", j)
+    if braced:
+        j += 1
+    m = _VTL_IDENT.match(text, j)
+    if not m:
+        return None
+    root, j = m.group(0), m.end()
+    steps = []
+    while text.startswith(".", j):
+        m = _VTL_IDENT.match(text, j + 1)
+        if not m:
+            break
+        name, k = m.group(0), m.end()
+        if text.startswith("(", k):
+            close = _vtl_close_paren(text, k)
+            if close is None:
+                break
+            steps.append((name, text[k + 1:close]))
+            j = close + 1
+        else:
+            steps.append((name, None))
+            j = k
+    if braced:
+        if not text.startswith("}", j):
+            return None
+        j += 1
+    return j, quiet, root, steps
+
+
+def _vtl_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+
+def _vtl_value(expr: str, st: dict):
+    """Evaluate an argument or ``#set`` right-hand side."""
+    expr = expr.strip()
+    if len(expr) >= 2 and expr[0] == expr[-1] == '"':
+        gobbled = st["gobbled"]
+        value = _vtl_render(expr[1:-1].replace('""', '"'), st)
+        st["gobbled"] = gobbled
+        return value
+    if len(expr) >= 2 and expr[0] == expr[-1] == "'":
+        return expr[1:-1].replace("''", "'")
+    if re.fullmatch(r"-?\d+", expr):
+        return int(expr)
+    if expr in ("true", "false"):
+        return expr == "true"
+    if expr.startswith("$"):
+        ref = _vtl_parse_ref(expr, 0)
+        if ref is not None and ref[0] == len(expr):
+            return _vtl_resolve(ref, st)
+    return None
+
+
+def _vtl_walk(node, steps, st):
+    for name, args in steps:
+        if not isinstance(node, dict):
+            return None
+        if args is None:
+            node = node.get(name)
+        elif name == "get":
+            arg = _vtl_split_args(args)
+            key = _vtl_value(arg[0], st) if arg else None
+            node = node.get(key) if isinstance(key, str) else None
+        else:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+def _vtl_input(steps, st):
+    if not steps:
+        return None
+    (name, args), rest = steps[0], steps[1:]
+    if name == "body" and args is None:
+        value = st["body"]
+    elif name in ("json", "path") and args is not None:
+        arg = _vtl_split_args(args)
+        node = _vtl_json_path(st["body"], str(_vtl_value(arg[0], st)) if arg else "$")
+        if name == "path":
+            value = node
+        elif isinstance(node, (dict, list)):
+            value = json.dumps(node, separators=(",", ":"), ensure_ascii=False)
+        else:
+            value = "" if node is None else str(node)
+    elif name == "params":
+        arg = _vtl_split_args(args) if args is not None else []
+        if not arg:
+            value = dict(st["params"])
+        else:
+            value = str(st["params"].get(_vtl_str(_vtl_value(arg[0], st)), ""))
+    else:
+        return None
+    return _vtl_walk(value, rest, st) if rest else value
+
+
+def _vtl_util(steps, st):
+    if not steps:
+        return None
+    name, args = steps[0]
+    if name == "urlEncode" and args is not None:
+        arg = _vtl_split_args(args)
+        text = _vtl_str(_vtl_value(arg[0], st)) if arg else ""
+        # java.net.URLEncoder: application/x-www-form-urlencoded, as AWS documents.
+        return urllib.parse.quote_plus(text, safe="*").replace("~", "%7E")
+    return None
+
+
+def _vtl_resolve(ref, st):
+    _end, _quiet, root, steps = ref
+    if root == "input":
+        return _vtl_input(steps, st)
+    if root == "util":
+        return _vtl_util(steps, st)
+    if root == "context":
+        value = _vtl_walk(st["context"], steps, st)
+        # AWS: "Calling $context.authorizer.claims returns null."
+        return None if isinstance(value, dict) else value
+    if root in st["vars"]:
+        return _vtl_walk(st["vars"][root], steps, st) if steps else st["vars"][root]
+    return None
+
+
+def _vtl_set(inner: str, st: dict) -> None:
+    m = _VTL_SET_LHS.fullmatch(inner)
+    if not m:
+        return
+    value = _vtl_value(m.group(2), st)
+    if value is not None:  # Velocity leaves the variable as it was on null
+        st["vars"][m.group(1)] = value
+
+
+def _vtl_render(text: str, st: dict) -> str:
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "#":
+            if text.startswith("##", i):
+                newline = text.find("\n", i)
+                i = len(text) if newline < 0 else newline + 1
+                continue
+            if text.startswith("#*", i):
+                close = text.find("*#", i + 2)
+                i = len(text) if close < 0 else close + 2
+                continue
+            m = _VTL_SET.match(text, i)
+            close = _vtl_close_paren(text, m.end() - 1) if m else None
+            if close is not None:
+                if st["gobbled"]:
+                    while out and out[-1] in (" ", "\t"):
+                        out.pop()
+                _vtl_set(text[m.end():close], st)
+                i = close + 1
+                k = i
+                while k < len(text) and text[k] in " \t":
+                    k += 1
+                if text.startswith("\r\n", k):
+                    i, st["gobbled"] = k + 2, True
+                elif text.startswith("\n", k):
+                    i, st["gobbled"] = k + 1, True
+                continue
+        elif ch == "$":
+            ref = _vtl_parse_ref(text, i)
+            if ref is not None and (ref[2] in _VTL_ROOTS or ref[2] in st["vars"]):
+                value = _vtl_str(_vtl_resolve(ref, st))
+                out.append(value)
+                if value:
+                    st["gobbled"] = False
+                i = ref[0]
+                continue
+            if ref is not None and ref[1]:
+                i = ref[0]
+                continue
+        out.append(ch)
+        if ch not in (" ", "\t"):
+            st["gobbled"] = False
         i += 1
-    return i
+    return "".join(out)
 
 
 def _render_request_template_v1(template: str, body_str: str,
-                                params_map: dict) -> str:
+                                params_map: dict, context=None) -> str:
     """Render the VTL subset; bare text passes through unchanged."""
-    out = []
-    i = 0
-    while i < len(template):
-        if template[i] != "$" or not template[i + 1:].startswith(("input", "util")):
-            out.append(template[i])
-            i += 1
-            continue
-        end = _vtl_expr_end(template, i)
-        out.append(str(_vtl_eval(template[i:end], body_str, params_map)))
-        i = end
-    return "".join(out)
+    st = {"vars": {}, "context": context or {}, "body": body_str,
+          "params": params_map, "gobbled": False}
+    return _vtl_render(template, st)
 
 
 def _select_service_integration_response(integration, backend_status: int):
@@ -3047,7 +3238,7 @@ def _select_service_integration_response(integration, backend_status: int):
 
 def _service_integration_response(integration, backend_status: int,
                                   backend_text: str, accept: str,
-                                  request_params: dict):
+                                  request_params: dict, context=None):
     """Map a backend service result through the integration responses."""
     # No match and no default answers 500, configured responses or not.
     selected = _select_service_integration_response(integration, backend_status)
@@ -3072,7 +3263,8 @@ def _service_integration_response(integration, backend_status: int,
     if template is None and templates:
         template = next(iter(templates.values()))
     if template is not None:
-        body_out = _render_request_template_v1(template, backend_text, request_params)
+        body_out = _render_request_template_v1(
+            template, backend_text, request_params, context)
         return status, resp_headers, body_out.encode()
     return status, resp_headers, backend_text.encode()
 
@@ -3141,7 +3333,8 @@ async def _invoke_sqs_v1(
         if key.split(";", 1)[0].strip().lower() == content_type:
             template = value
             break
-    rendered = (_render_request_template_v1(template, body_str, params_map)
+    vtl_context = {"authorizer": authorizer_context} if authorizer_context else {}
+    rendered = (_render_request_template_v1(template, body_str, params_map, vtl_context)
                 if template is not None else body_str)
     form = dict(urllib.parse.parse_qsl(rendered, keep_blank_values=True))
     action = form.get("Action", "")
@@ -3154,7 +3347,8 @@ async def _invoke_sqs_v1(
             "MissingAction", "Missing Action parameter", 400)
         backend_text = xbody.decode("utf-8", errors="replace")
         return _service_integration_response(
-            integration, backend_status, backend_text, accept, params_map)
+            integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
 
     qurl = (_sqs_svc._queue_name_to_url.get_scoped(account, region, queue_name)
             or _sqs_svc._queue_url_for_account(account, queue_name))
@@ -3187,7 +3381,8 @@ async def _invoke_sqs_v1(
         return (504, {"Content-Type": "application/json"},
                 json.dumps({"message": "Internal server error"}).encode())
     return _service_integration_response(
-        integration, backend_status, backend_text, accept, params_map)
+        integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
@@ -4666,8 +4861,13 @@ def _delete_gateway_response(api_id, response_type):
 # ---- Control plane: API Keys ----
 
 def _create_api_key(data):
+    key_value = data.get("value")
+    if key_value is None:
+        key_value = new_uuid().replace("-", "")
+    elif len(str(key_value)) < 20:
+        return _v1_error("BadRequestException",
+                         "API Key value should be at least 20 characters", 400)
     key_id = _new_id()[:8]
-    key_value = new_uuid().replace("-", "")
     api_key = {
         "id": key_id,
         "name": data.get("name", ""),
@@ -4679,6 +4879,8 @@ def _create_api_key(data):
         "stageKeys": data.get("stageKeys", []),
         "tags": data.get("tags", {}),
     }
+    if data.get("customerId"):
+        api_key["customerId"] = data["customerId"]
     _api_keys[key_id] = api_key
     return _v1_response(api_key, 201)
 

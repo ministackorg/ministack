@@ -5153,9 +5153,7 @@ def _apigw_api_key_create(logical_id, props, stack_name):
     """Provision an ``AWS::ApiGateway::ApiKey``.
 
     Ref returns the generated key id; ``Fn::GetAtt APIKeyId`` returns the same
-    id, matching the AWS CloudFormation resource contract. The runtime create
-    always mints a fresh value, so an explicit ``Value`` is applied afterwards
-    to honor a caller-pinned key.
+    id, matching the AWS CloudFormation resource contract.
     """
     data = {
         "name": props.get("Name") or _physical_name(stack_name, logical_id),
@@ -5166,22 +5164,13 @@ def _apigw_api_key_create(logical_id, props, stack_name):
             for sk in props.get("StageKeys", [])
         ],
         "tags": _tag_map(props.get("Tags")),
+        "value": props.get("Value"),
+        "customerId": props.get("CustomerId"),
     }
     status, _headers, body = _apigw_v1._create_api_key(data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::ApiKey create failed: {body!r}")
-    api_key = json.loads(body)
-    key_id = api_key.get("id", "")
-    value = props.get("Value")
-    if value:
-        stored = _apigw_v1._api_keys.get(key_id)
-        if stored is not None:
-            stored["value"] = value
-    customer_id = props.get("CustomerId")
-    if customer_id:
-        stored = _apigw_v1._api_keys.get(key_id)
-        if stored is not None:
-            stored["customerId"] = customer_id
+    key_id = json.loads(body).get("id", "")
     return key_id, {"APIKeyId": key_id}
 
 

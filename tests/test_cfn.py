@@ -15835,6 +15835,21 @@ def test_cfn_apigateway_api_key_lifecycle(cfn, apigw_v1):
                 pass
 
 
+def test_cfn_apigateway_api_key_short_value_fails_the_stack(cfn):
+    stack = f"cfn-api-key-short-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"Key": {
+            "Type": "AWS::ApiGateway::ApiKey", "Properties": {"Value": "x" * 19}}}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Key" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert len(reasons) == 1
+        assert "API Key value should be at least 20 characters" in reasons[0]
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def test_cfn_apigateway_usage_plan_and_key_lifecycle(cfn, apigw_v1):
     """UsagePlan and UsagePlanKey provision, expose ids, associate a key, and delete.
 
