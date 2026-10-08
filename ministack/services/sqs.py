@@ -612,6 +612,14 @@ def _act_get_queue_url(data: dict, _u: str) -> dict:
     return {"QueueUrl": url}
 
 
+def queue_delay(q: dict) -> int:
+    """The queue's DelaySeconds; internal producers' messages wait it too."""
+    try:
+        return int(q["attributes"].get("DelaySeconds", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ── SendMessage ─────────────────────────────────────────────
 
 def _act_send_message(data: dict, qurl: str) -> dict:
@@ -642,8 +650,16 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
         )
 
-    delay = int(data.get("DelaySeconds")
-                or q["attributes"].get("DelaySeconds", "0"))
+    # A per-message DelaySeconds overrides the queue's; FIFO queues accept
+    # only 0 and keep the queue-level delay (real AWS, ap-south-1).
+    _delay = data.get("DelaySeconds")
+    if q["is_fifo"] and _delay is not None and int(_delay) != 0:
+        raise _Err("InvalidParameterValue",
+                   f"Value {int(_delay)} for parameter DelaySeconds is invalid. "
+                   "Reason: The request include parameter that is not valid for this queue type.")
+    if _delay is None or q["is_fifo"]:
+        _delay = q["attributes"].get("DelaySeconds", "0")
+    delay = int(_delay)
     msg_attrs = data.get("MessageAttributes") or {}
     sys_attrs = data.get("MessageSystemAttributes") or {}
     group_id = data.get("MessageGroupId")
@@ -682,7 +698,6 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             return r
         q["fifo_seq"] += 1
         seq = str(q["fifo_seq"]).zfill(20)
-        delay = 0
 
     now = time.time()
     mid = new_uuid()
@@ -729,7 +744,11 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:ReceiveMessage")
 
-    max_n = min(int(data.get("MaxNumberOfMessages", 1)), 10)
+    max_n = int(data.get("MaxNumberOfMessages", 1))
+    if not 1 <= max_n <= 10:
+        raise _Err("InvalidParameterValue",
+                   f"Value {max_n} for parameter MaxNumberOfMessages is invalid. "
+                   "Reason: Must be between 1 and 10, if provided.")
     # An explicit request value wins even when it is 0 — a supplied
     # VisibilityTimeout=0 / WaitTimeSeconds=0 must NOT fall back to the queue
     # attribute (0 is falsy in Python; keying on presence is required).
@@ -746,6 +765,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     msgs: list = []
 
     while True:
+        _expire_retained(q)
         _dlq_sweep(q)
         msgs = _collect_msgs(q, max_n, vis)
         if msgs or time.time() >= deadline:
@@ -1234,8 +1254,27 @@ def _ensure_msg_fields(m: dict) -> None:
     m.setdefault("seq", None)
 
 
+def _expire_retained(q: dict) -> None:
+    """Drop messages older than MessageRetentionPeriod ("The length of time,
+    in seconds, for which Amazon SQS retains a message"), measured from the
+    enqueue time: the send, or a FIFO dead-letter move."""
+    try:
+        retention = int(q["attributes"].get("MessageRetentionPeriod", "345600"))
+    except (TypeError, ValueError):
+        return
+    now = time.time()
+    cutoff = now - retention
+
+    def enqueued(m):
+        return m.get("enqueued_at", m.get("sent_at", now))
+
+    if any(enqueued(m) <= cutoff for m in q["messages"]):
+        q["messages"] = [m for m in q["messages"] if enqueued(m) > cutoff]
+
+
 def _refresh_counts(q: dict) -> None:
     """Recompute approximate message counters."""
+    _expire_retained(q)
     now = time.time()
     visible = delayed = inflight = 0
     for m in q["messages"]:
@@ -1339,6 +1378,12 @@ def _dlq_sweep(q: dict) -> None:
             moved = dict(m)
             moved["receipt_handle"] = None
             moved["visible_at"] = now
+            # Standard keeps the original enqueue timestamp; "For FIFO queues,
+            # the enqueue timestamp resets when the message is moved".
+            if dlq.get("is_fifo"):
+                moved["enqueued_at"] = now
+            moved["sys"] = {**m.get("sys", {})}
+            moved["sys"].setdefault("DeadLetterQueueSourceArn", q["attributes"].get("QueueArn", ""))
             dlq["messages"].append(moved)
             esm_wake.set()
         else:
@@ -1405,6 +1450,9 @@ def _build_sys_attrs(msg: dict, names: list) -> dict:
     trace = msg["sys"].get("AWSTraceHeader")
     if trace and (want_all or "AWSTraceHeader" in names):
         r["AWSTraceHeader"] = trace
+    source = msg["sys"].get("DeadLetterQueueSourceArn")
+    if source and (want_all or "DeadLetterQueueSourceArn" in names):
+        r["DeadLetterQueueSourceArn"] = source
     return r
 
 
@@ -1943,6 +1991,7 @@ def _receive_messages_for_esm(queue_url: str, max_number: int) -> list[dict]:
         q = _get_q(queue_url)
         max_n = min(int(max_number or 1), 10)
         vis = int(q["attributes"].get("VisibilityTimeout", "30"))
+        _expire_retained(q)
         _dlq_sweep(q)
         return _collect_msgs(q, max_n, vis)
 

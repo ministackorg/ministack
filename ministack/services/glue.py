@@ -691,7 +691,10 @@ def _iceberg_rest_commit_table(namespace, table_name, body):
     meta_loc = table["Parameters"]["metadata_location"]
     metadata = _iceberg_fetch_metadata(meta_loc) or {}
     try:
+        _s3t._check_iceberg_requirements(metadata, body.get("requirements", []))
         _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    except _s3t.IcebergCommitFailed as exc:
+        return _iceberg_error(str(exc), "CommitFailedException", 409)
     except ValueError as exc:
         # A refused update (an illegal format-version change) commits
         # nothing: the stored metadata_location is only advanced below.

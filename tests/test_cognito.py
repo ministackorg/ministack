@@ -403,6 +403,10 @@ def test_cognito_password_auth_reset_required_user_is_refused_until_reset(cognit
                                                    AuthParameters=params)
         return cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)
 
+    # A wrong password is refused as wrong; only the right one learns a reset is required.
+    with pytest.raises(ClientError) as exc:
+        sign_in("Wrong1!")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
     with pytest.raises(ClientError) as exc:
         sign_in("IvyPass1!")
     assert exc.value.response["Error"]["Code"] == "PasswordResetRequiredException"
@@ -9007,9 +9011,7 @@ def test_cognito_srp_empty_challenge_responses(cognito_idp):
     ("sub as username", "UserNotFoundException", "User does not exist."),
     ("disabled", "NotAuthorizedException", "User is disabled."),
     ("unconfirmed", "UserNotConfirmedException", "User is not confirmed."),
-    ("reset required", "PasswordResetRequiredException", "Password reset required for the user"),
-], ids=["missing-srp-a", "non-hex-srp-a", "client-without-srp", "unknown-user", "sub-as-username", "disabled", "unconfirmed",
-        "reset-required"])
+], ids=["missing-srp-a", "non-hex-srp-a", "client-without-srp", "unknown-user", "sub-as-username", "disabled", "unconfirmed"])
 def test_cognito_srp_initiate_refusals(cognito_idp, case, code, message):
     flows = ["ALLOW_USER_PASSWORD_AUTH"] if case == "client without SRP" else ["ALLOW_USER_SRP_AUTH"]
     pid, cid = _srp_pool(cognito_idp, flows)
@@ -9028,13 +9030,24 @@ def test_cognito_srp_initiate_refusals(cognito_idp, case, code, message):
     elif case == "unconfirmed":
         username = "srp-unconfirmed"
         cognito_idp.sign_up(ClientId=cid, Username=username, Password="Correct1!")
-    elif case == "reset required":
-        cognito_idp.admin_reset_user_password(UserPoolId=pid, Username=username)
     auth_params = {"USERNAME": username, **({"SRP_A": srp_a} if srp_a else {})}
     with pytest.raises(ClientError) as exc:
         cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters=auth_params)
     assert exc.value.response["Error"]["Code"] == code
     assert exc.value.response["Error"]["Message"] == message
+
+
+@pytest.mark.parametrize("admin", [False, True])
+def test_cognito_srp_reset_required_is_answered_after_the_proof(cognito_idp, admin):
+    pid, cid = _srp_pool(cognito_idp)
+    cognito_idp.admin_reset_user_password(UserPoolId=pid, Username="srp-user")
+    with pytest.raises(ClientError) as exc:
+        _srp_sign_in(cognito_idp, pid, cid, "srp-user", "Wrong1!", admin=admin)
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    with pytest.raises(ClientError) as exc:
+        _srp_sign_in(cognito_idp, pid, cid, "srp-user", "Correct1!", admin=admin)
+    assert exc.value.response["Error"]["Code"] == "PasswordResetRequiredException"
+    assert exc.value.response["Error"]["Message"] == "Password reset required for the user"
 
 
 def test_cognito_srp_challenge_answers_repeated_proofs(cognito_idp):

@@ -747,3 +747,21 @@ def test_list_tags_unknown_arn_not_found(handler_env):
     status, _hdrs, b = _req("GET", f"/tags/{enc}")
     assert status == 404
     assert _body((status, _hdrs, b))["__type"] == "NotFoundException"
+
+
+def test_pipe_refuses_sns_fifo_target():
+    import uuid
+
+    import boto3
+    from botocore.exceptions import ClientError
+    from conftest import ENDPOINT
+    kw = dict(endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+    pipes, sqs = boto3.client("pipes", **kw), boto3.client("sqs", **kw)
+    name = f"fifo-target-{uuid.uuid4().hex[:8]}"
+    qarn = sqs.get_queue_attributes(QueueUrl=sqs.create_queue(QueueName=name)["QueueUrl"],
+                                    AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    with pytest.raises(ClientError) as exc:
+        pipes.create_pipe(Name=name, Source=qarn, RoleArn="arn:aws:iam::000000000000:role/r",
+                          Target=f"arn:aws:sns:us-east-1:000000000000:{name}.fifo")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == "SNS FIFO topics are not supported as a pipe target."

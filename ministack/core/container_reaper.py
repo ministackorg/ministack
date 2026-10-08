@@ -288,10 +288,16 @@ def drop_containers(containers, stop_timeout: int = 2, force: bool = False) -> i
             c.stop(timeout=stop_timeout)
             c.remove(v=True, force=force)   # v=True: reclaim the anonymous volume too
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug("container_reaper: could not remove %s: %s", getattr(c, "id", "?"), e)
             return False
 
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(16, len(targets)), thread_name_prefix="ministack-reap") as pool:
-        return sum(1 for ok in pool.map(_drop, targets) if ok)
+        results = list(pool.map(_drop, targets))
+    left = [getattr(c, "id", "?")[:12] for c, ok in zip(targets, results) if not ok]
+    if left:
+        logger.warning("container_reaper: %d container(s) could not be removed: %s",
+                       len(left), ", ".join(left))
+    return len(targets) - len(left)
 

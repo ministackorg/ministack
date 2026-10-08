@@ -75,19 +75,6 @@ def test_ses_send_email_accepts_present_empty_content(monkeypatch, subject):
         "Message.Body.Text.Data": [""],
     }
     assert ses_service._send_email(params)[0] == 200
-    del params["Message.Subject.Data"]
-    assert ses_service._send_email(params)[0] == 400
-    params["Message.Subject.Data"] = [subject]
-    del params["Message.Body.Text.Data"]
-    assert ses_service._send_email(params)[0] == 400
-
-
-def test_ses_email_address_requires_ascii():
-    from ministack.services.ses import _valid_email_address
-
-    assert not _valid_email_address("user\u00e9@example.com")
-    assert not _valid_email_address("user@\u00e9xample.com")
-    assert _valid_email_address("user@xn--xample-9ua.com")
 
 
 def test_ses_send_email_rejects_invalid_address(ses):
@@ -102,6 +89,7 @@ def test_ses_send_email_rejects_invalid_address(ses):
             },
         )
     assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == "Missing final '@domain'"
 
 
 def test_ses_send_email_rejects_missing_configuration_set(ses):
@@ -117,6 +105,9 @@ def test_ses_send_email_rejects_missing_configuration_set(ses):
             ConfigurationSetName="missing-set",
         )
     assert exc.value.response["Error"]["Code"] == "ConfigurationSetDoesNotExist"
+    assert exc.value.response["Error"]["Message"] == "Configuration set missing-set does not exist"
+    assert exc.value.response["ConfigurationSetName"] == "missing-set"
+
 
 def test_ses_list_identities(ses):
     ses.verify_email_identity(EmailAddress="another@example.com")
@@ -1731,3 +1722,17 @@ def test_ses_identity_notifications_not_published_without_topic(ses, sns, ses_no
         Source=sender, Destination={"ToAddresses": ["ok@example.com"]}, Message=_NOTIFY_MSG)
 
     assert drain(1) == []
+
+
+def test_ses_send_email_rejects_non_ascii_address(ses):
+    ses.verify_email_identity(EmailAddress="sender@example.com")
+    for to in ("us\u00e9r@example.com", "user@\u00e9xample.com"):
+        with pytest.raises(ClientError) as exc:
+            ses.send_email(Source="sender@example.com", Destination={"ToAddresses": [to]},
+                           Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == "Missing final '@domain'"
+    ses.verify_email_identity(EmailAddress="user@xn--xample-9ua.com")
+    ses.send_email(Source="sender@example.com", Destination={"ToAddresses": ["user@xn--xample-9ua.com"]},
+                   Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+

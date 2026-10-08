@@ -35,15 +35,22 @@ RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
 # Plugin artifacts are release-stable; release builds pin this donor by digest.
 FROM ${PLUGIN_DONOR_IMAGE} AS plugin-donor
 
-FROM python:3.13-alpine
-
-LABEL maintainer="MiniStack" \
-      description="Local AWS Service Emulator — drop-in LocalStack replacement"
+FROM python:3.13-alpine AS runtime
 
 # Upgrade base packages to pick up latest security patches.
 RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
-    && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
-              /usr/local/bin/pip*
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/bin/pip* \
+              /usr/local/lib/python3.13/ensurepip /usr/local/lib/python3.13/idlelib \
+              /usr/local/lib/python3.13/pydoc_data /usr/local/lib/python3.13/tkinter \
+              /usr/local/lib/python3.13/turtledemo
+
+# Flatten so upgraded and deleted base files do not also ship in a lower layer.
+FROM scratch
+COPY --from=runtime / /
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LABEL maintainer="MiniStack" \
+      description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 WORKDIR /opt/ministack
 

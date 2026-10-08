@@ -7960,3 +7960,22 @@ def test_delete_objects_in_an_unversioned_bucket(s3, sqs, notified):
     s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": "u.txt"}, {"Key": "never-there.txt"}]})
     [record] = _event_records(sqs, url, 1)
     assert (record["s3"]["object"]["key"], record["eventName"]) == ("u.txt", "ObjectRemoved:Delete")
+
+
+def test_s3_create_owned_bucket_again(s3):
+    east = f"owned-east-{_uuid_mod.uuid4().hex[:8]}"
+    west = f"owned-west-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=east, ACL="public-read")
+    s3.create_bucket(Bucket=west, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    try:
+        s3.create_bucket(Bucket=east)
+        grants = s3.get_bucket_acl(Bucket=east)["Grants"]
+        assert [g["Permission"] for g in grants] == ["FULL_CONTROL"]
+        with pytest.raises(ClientError) as exc:
+            s3.create_bucket(Bucket=west, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+        assert exc.value.response["Error"]["Code"] == "BucketAlreadyOwnedByYou"
+        assert exc.value.response["Error"]["Message"] == "The bucket you tried to create already exists, and you own it."
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    finally:
+        s3.delete_bucket(Bucket=east)
+        s3.delete_bucket(Bucket=west)

@@ -7420,3 +7420,207 @@ def test_dynamodb_global_table_replica_update_errors():
         for client in (other, home):
             with contextlib.suppress(ClientError):
                 client.delete_table(TableName=name)
+
+
+def test_dynamodb_gsi_query_tracks_every_write_path(ddb):
+    name = f"gsi-track-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "g", "AttributeType": "S"},
+                              {"AttributeName": "r", "AttributeType": "N"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{"IndexName": "byG",
+                                 "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"},
+                                               {"AttributeName": "r", "KeyType": "RANGE"}],
+                                 "Projection": {"ProjectionType": "ALL"}}])
+
+    def gsi(g):
+        resp = ddb.query(TableName=name, IndexName="byG", KeyConditionExpression="g = :g",
+                         ExpressionAttributeValues={":g": {"S": g}})
+        return [it["pk"]["S"] for it in resp["Items"]]
+
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "g": {"S": "x"}, "r": {"N": "2"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "g": {"S": "x"}, "r": {"N": "1"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "sparse"}, "g": {"S": "x"}})
+        assert gsi("x") == ["b", "a"]
+
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET g = :y",
+                        ExpressionAttributeValues={":y": {"S": "y"}})
+        assert gsi("x") == ["b"] and gsi("y") == ["a"]
+
+        ddb.batch_write_item(RequestItems={name: [
+            {"PutRequest": {"Item": {"pk": {"S": "c"}, "g": {"S": "y"}, "r": {"N": "0"}}}},
+            {"DeleteRequest": {"Key": {"pk": {"S": "b"}}}}]})
+        assert gsi("x") == [] and gsi("y") == ["c", "a"]
+
+        ddb.transact_write_items(TransactItems=[
+            {"Update": {"TableName": name, "Key": {"pk": {"S": "c"}}, "UpdateExpression": "SET g = :z",
+                        "ExpressionAttributeValues": {":z": {"S": "z"}}}},
+            {"Delete": {"TableName": name, "Key": {"pk": {"S": "a"}}}}])
+        assert gsi("y") == [] and gsi("z") == ["c"]
+
+        ddb.execute_statement(Statement=f"UPDATE \"{name}\" SET g = 'w' WHERE pk = 'c'")
+        assert gsi("z") == [] and gsi("w") == ["c"]
+        ddb.execute_statement(Statement=f"INSERT INTO \"{name}\" VALUE {{'pk': 'd', 'g': 'w', 'r': 9}}")
+        assert gsi("w") == ["c", "d"]
+        ddb.execute_statement(Statement=f"DELETE FROM \"{name}\" WHERE pk = 'c'")
+        assert gsi("w") == ["d"]
+
+        ddb.delete_item(TableName=name, Key={"pk": {"S": "d"}})
+        assert gsi("w") == []
+        assert ddb.describe_table(TableName=name)["Table"]["ItemCount"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_index_membership_not_persisted():
+    from ministack.services import dynamodb as _d
+    table = {"pk_name": "pk", "sk_name": None, "items": _d.defaultdict(dict),
+             "GlobalSecondaryIndexes": [{"IndexName": "byG",
+                                         "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}]}]}
+    _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "x"}})
+    assert _d._index_members(table) == {"byG": {"x": {("a", "__no_sort__"): None}}}
+    _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "y"}})
+    _d._set_item(table, "b", "__no_sort__", {"pk": {"S": "b"}})
+    assert _d._index_members(table) == {"byG": {"y": {("a", "__no_sort__"): None}}}
+    assert table["ItemCount"] == 2
+    _d._remove_item(table, "a", "__no_sort__")
+    assert _d._index_members(table) == {"byG": {}} and table["ItemCount"] == 1
+    assert "a" not in table["items"]
+    _d._tables.set_scoped("000000000000", "us-east-1", "persist-probe", table)
+    try:
+        state = _d.get_state()["tables"].get_scoped("000000000000", "us-east-1", "persist-probe")
+        assert _d._INDEX_MEMBERS not in state and _d._INDEX_MEMBERS in table
+    finally:
+        _d._tables.pop_scoped("000000000000", "us-east-1", "persist-probe", None)
+
+
+def test_dynamodb_client_request_token_expires_after_ten_minutes(monkeypatch):
+    from ministack.services import dynamodb as _d
+    now = [1_000_000.0]
+    monkeypatch.setattr(_d.time, "time", lambda: now[0])
+    monkeypatch.setattr(_d, "_txn_token_sweep_at", 0.0)
+    token, stale = f"crt-{_uuid_mod.uuid4().hex}", f"crt-{_uuid_mod.uuid4().hex}"
+    try:
+        _d._txn_token_store(stale, {"signature": {}, "response": {}})
+        now[0] += 300
+        _d._txn_token_store(token, {"signature": {}, "response": {}})
+        now[0] += 299
+        assert _d._txn_token_lookup(stale) is not None
+        now[0] += 1
+        assert _d._txn_token_lookup(stale) is None
+        assert _d._txn_token_lookup(token) is not None
+        now[0] += 300
+        assert _d._txn_token_lookup(token) is None
+        _d._txn_token_store(f"crt-{_uuid_mod.uuid4().hex}", {"signature": {}, "response": {}})
+        assert all(t not in (token, stale) for _, _, t in (k for k, _ in _d._txn_idempotency.all_items()))
+    finally:
+        _d._txn_idempotency.pop(token, None)
+        _d._txn_idempotency.pop(stale, None)
+
+
+def test_dynamodb_stream_skips_writes_that_change_nothing(ddb, ddb_streams):
+    name = f"noop-stream-{_uuid_mod.uuid4().hex[:8]}"
+    arn = ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )["TableDescription"]["LatestStreamArn"]
+    try:
+        item = {"pk": {"S": "a"}, "v": {"N": "1"}}
+        ddb.put_item(TableName=name, Item=item)
+        ddb.put_item(TableName=name, Item=item)
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"N": "1"}})
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"N": "2"}})
+        shard = ddb_streams.describe_stream(StreamArn=arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        it = ddb_streams.get_shard_iterator(StreamArn=arn, ShardId=shard,
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        events = [r["eventName"] for r in ddb_streams.get_records(ShardIterator=it)["Records"]]
+        assert events == ["INSERT", "MODIFY"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_gsi_multi_attribute_keys(ddb):
+    name = f"multi-key-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("pk", "a", "b", "s1", "s2")],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "Idx", "Projection": {"ProjectionType": "ALL"},
+            "KeySchema": [{"AttributeName": "a", "KeyType": "HASH"}, {"AttributeName": "b", "KeyType": "HASH"},
+                          {"AttributeName": "s1", "KeyType": "RANGE"}, {"AttributeName": "s2", "KeyType": "RANGE"}],
+        }])
+
+    def query(cond, **vals):
+        return ddb.query(TableName=name, IndexName="Idx", KeyConditionExpression=cond,
+                         ExpressionAttributeValues={f":{k}": {"S": v} for k, v in vals.items()})
+
+    try:
+        rows = [("1", "x", "y", "p", "2"), ("2", "x", "y", "p", "1"), ("3", "x", "y", "q", "1"),
+                ("4", "x", "z", "p", "1"), ("5", "x", "y", "p", None)]
+        for pk, a, b, s1, s2 in rows:
+            item = {"pk": {"S": pk}, "a": {"S": a}, "b": {"S": b}, "s1": {"S": s1}}
+            if s2:
+                item["s2"] = {"S": s2}
+            ddb.put_item(TableName=name, Item=item)
+
+        def pks(resp):
+            return [it["pk"]["S"] for it in resp["Items"]]
+
+        assert pks(query("a = :a AND b = :b", a="x", b="y")) == ["2", "1", "3"]
+        assert pks(query("a = :a AND b = :b AND s1 = :s1 AND s2 >= :s2", a="x", b="y", s1="p", s2="2")) == ["1"]
+        assert pks(query("a = :a AND b = :b AND begins_with(s1, :s1)", a="x", b="y", s1="q")) == ["3"]
+        page = ddb.query(TableName=name, IndexName="Idx", Limit=1, KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert set(page["LastEvaluatedKey"]) == {"pk", "a", "b", "s1", "s2"}
+        rest = ddb.query(TableName=name, IndexName="Idx", ExclusiveStartKey=page["LastEvaluatedKey"],
+                         KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert pks(rest) == ["1", "3"]
+
+        with pytest.raises(ClientError) as exc:
+            query("a = :a", a="x")
+        assert exc.value.response["Error"]["Message"] == "Query condition missed key schema element: b"
+        for cond, vals in (("a = :a AND b = :b AND s2 = :s2", {"s2": "1"}),
+                           ("a = :a AND b = :b AND s1 > :s1 AND s2 = :s2", {"s1": "a", "s2": "1"})):
+            with pytest.raises(ClientError) as exc:
+                query(cond, a="x", b="y", **vals)
+            assert exc.value.response["Error"]["Message"] == "Query key condition not supported"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_and_scan_pages_stop_at_1mb(ddb):
+    name = f"page-1mb-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "sk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}])
+    try:
+        for i in range(30):
+            ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": f"{i:03}"}, "b": {"S": "x" * 100_000}})
+        for op, kwargs in (("query", {"KeyConditionExpression": "pk = :p",
+                                      "ExpressionAttributeValues": {":p": {"S": "p"}}}),
+                           ("scan", {})):
+            pages, start = [], None
+            while True:
+                extra = {"ExclusiveStartKey": start} if start else {}
+                resp = getattr(ddb, op)(TableName=name, **kwargs, **extra)
+                pages.append(resp["Count"])
+                start = resp.get("LastEvaluatedKey")
+                if not start:
+                    break
+            assert pages == [10, 10, 10], (op, pages)
+        filtered = ddb.scan(TableName=name, FilterExpression="sk = :none",
+                            ExpressionAttributeValues={":none": {"S": "none"}})
+        assert filtered["Count"] == 0 and filtered["ScannedCount"] == 10 and "LastEvaluatedKey" in filtered
+    finally:
+        ddb.delete_table(TableName=name)

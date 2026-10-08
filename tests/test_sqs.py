@@ -777,14 +777,6 @@ def test_sqs_change_message_visibility_invalid_receipt_handle(sqs):
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
-def test_sqs_receive_max_10(sqs):
-    """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
-    url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
-    for i in range(15):
-        sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}")
-    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
-    assert len(msgs.get("Messages", [])) <= 10
-
 def test_sqs_visibility_timeout_zero_makes_visible(sqs):
     """ChangeMessageVisibility to 0 makes message immediately visible again."""
     url = sqs.create_queue(QueueName="qa-sqs-vis0")["QueueUrl"]
@@ -1938,8 +1930,6 @@ class TestCrossAccountSns:
             arn, ACCT_B, "sns:Publish"))
         assert _resp_code(_as(ACCT_B, sns_svc._publish, {
             "TopicArn": arn, "Message": "granted"})) == (200, "")
-        topic = sns_svc._topic_by_arn_any_scope(arn)
-        assert [m["message"] for m in topic["messages"]] == ["granted"]
 
     def test_explicit_deny_blocks_same_account(self, auth):
         name = _uniq("xpol-t")
@@ -2290,3 +2280,118 @@ def test_queue_url_scheme_http_without_tls(monkeypatch):
     name = _uniq("plain-scheme")
     created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
     assert created.startswith("http://"), created
+
+
+def test_sqs_fifo_queue_delay_and_per_message_delay(sqs):
+    name = f"delay-{_uuid_mod.uuid4().hex[:8]}"
+    fifo = sqs.create_queue(QueueName=f"{name}.fifo", Attributes={
+        "FifoQueue": "true", "ContentBasedDeduplication": "true", "DelaySeconds": "2"})["QueueUrl"]
+    std = sqs.create_queue(QueueName=name, Attributes={"DelaySeconds": "2"})["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=fifo, MessageBody="n", MessageGroupId="g", DelaySeconds=1)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            "Value 1 for parameter DelaySeconds is invalid. "
+            "Reason: The request include parameter that is not valid for this queue type.")
+        sqs.send_message(QueueUrl=fifo, MessageBody="m", MessageGroupId="g", DelaySeconds=0)
+        sqs.send_message(QueueUrl=std, MessageBody="now", DelaySeconds=0)
+        assert "Messages" not in sqs.receive_message(QueueUrl=fifo)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=std)["Messages"]] == ["now"]
+        time.sleep(2.2)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=fifo)["Messages"]] == ["m"]
+    finally:
+        sqs.delete_queue(QueueUrl=fifo)
+        sqs.delete_queue(QueueUrl=std)
+
+
+@pytest.mark.parametrize("value", [0, 11])
+def test_sqs_receive_max_number_of_messages_out_of_range(sqs, value):
+    url = sqs.create_queue(QueueName=f"maxn-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=value)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            f"Value {value} for parameter MaxNumberOfMessages is invalid. "
+            "Reason: Must be between 1 and 10, if provided.")
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+class _SqsClock:
+    def __init__(self, start):
+        self.now = start
+
+    def time(self):
+        return self.now
+
+
+def _sqs_inproc(monkeypatch):
+    import asyncio
+    import time as _time
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    clock = _SqsClock(_time.time())
+    monkeypatch.setattr(sqs_svc.time, "time", clock.time)
+
+    def create(name, **attrs):
+        return sqs_svc._act_create_queue(
+            {"QueueName": name, "Attributes": {k: str(v) for k, v in attrs.items()}}, "")["QueueUrl"]
+
+    def counts(url):
+        a = sqs_svc._act_get_queue_attributes({"QueueUrl": url, "AttributeNames": ["All"]}, url)["Attributes"]
+        return int(a["ApproximateNumberOfMessages"]), int(a["ApproximateNumberOfMessagesNotVisible"])
+
+    def receive(url, **kw):
+        return asyncio.run(sqs_svc._act_receive_message({"QueueUrl": url, "WaitTimeSeconds": 0, **kw}, url))
+
+    return clock, create, counts, receive
+
+
+def test_sqs_retention_expires_messages(monkeypatch):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    url = create(f"ret-{_uuid_mod.uuid4().hex[:8]}", MessageRetentionPeriod=60, VisibilityTimeout=120)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "a"}, url)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "b"}, url)
+    receive(url, MaxNumberOfMessages=1)          # one message in flight
+    clock.now += 59
+    assert counts(url) == (1, 1)
+    clock.now += 1
+    assert counts(url) == (0, 0)
+    # Lowering the period expires messages already in the queue.
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "c"}, url)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "120"}}, url)
+    clock.now += 70
+    assert counts(url) == (1, 0)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "60"}}, url)
+    assert counts(url) == (0, 0)
+
+
+@pytest.mark.parametrize("fifo", [False, True])
+def test_sqs_dlq_move_enqueue_time_and_source_arn(monkeypatch, fifo):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    sfx = ".fifo" if fifo else ""
+    extra = {"FifoQueue": "true", "ContentBasedDeduplication": "true"} if fifo else {}
+    dlq = create(f"dlq-{_uuid_mod.uuid4().hex[:8]}{sfx}", MessageRetentionPeriod=120, **extra)
+    dlq_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dlq, "AttributeNames": ["QueueArn"]}, dlq)["Attributes"]["QueueArn"]
+    src = create(f"src-{_uuid_mod.uuid4().hex[:8]}{sfx}", VisibilityTimeout=30, **extra,
+                 RedrivePolicy=json.dumps({"maxReceiveCount": 1, "deadLetterTargetArn": dlq_arn}))
+    src_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": src, "AttributeNames": ["QueueArn"]}, src)["Attributes"]["QueueArn"]
+    send = {"QueueUrl": src, "MessageBody": "x"}
+    if fifo:
+        send["MessageGroupId"] = "g"
+    sent = sqs_svc._act_send_message(send, src)
+    sent_at = clock.now
+    receive(src)                                  # receive count 1
+    clock.now += 31                               # visibility timeout over
+    assert receive(src).get("Messages", []) == []  # the sweep moves it to the DLQ
+    got = receive(dlq, AttributeNames=["All"])["Messages"][0]
+    assert got["MessageId"] == sent["MessageId"]
+    assert got["Attributes"]["DeadLetterQueueSourceArn"] == src_arn
+    clock.now = sent_at + 120                     # 120 s after the original send
+    remaining = sum(counts(dlq))
+    # Standard keeps the original enqueue time (expired); FIFO reset it on the move (still there).
+    assert remaining == (1 if fifo else 0)

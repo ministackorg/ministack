@@ -1666,7 +1666,6 @@ def _sns_create(logical_id, props, stack_name):
             }),
         },
         "subscriptions": [],
-        "messages": [],
         "tags": _tag_map(props.get("Tags")),
     }
 
@@ -1939,8 +1938,7 @@ def _ddb_create(logical_id, props, stack_name):
 
 
 def _ddb_delete(physical_id, props):
-    _dynamodb._tables.pop(physical_id, None)
-    _dynamodb.drop_stream_records(physical_id)
+    _dynamodb.drop_stream_records(physical_id, _dynamodb._tables.pop(physical_id, None))
 
 
 def _ddb_update_call(data):
