@@ -252,7 +252,12 @@ def _create_table_bucket(data):
         "name": name,
         "ownerAccountId": get_account_id(),
         "createdAt": now_iso(),
+        "tableBucketId": new_uuid(),
+        "type": "customer",
         "tableCount": 0,
+        "_encryption": data.get("encryptionConfiguration"),
+        "_storageClass": data.get("storageClassConfiguration"),
+        "_tags": dict(data.get("tags") or {}),
     }
     # Provision the backing S3 bucket so data-plane writes (Parquet, manifests)
     # have somewhere to land — mirrors real AWS where S3 Tables manages its own
@@ -264,15 +269,22 @@ def _create_table_bucket(data):
     return json_response({"arn": arn})
 
 
+_BUCKET_FIELDS = ("arn", "name", "ownerAccountId", "createdAt", "tableBucketId", "type")
+
+
+def _bucket_view(bucket):
+    return {k: bucket[k] for k in _BUCKET_FIELDS if k in bucket}
+
+
 def _list_table_buckets():
-    return json_response({"tableBuckets": list(_table_buckets.values())})
+    return json_response({"tableBuckets": [_bucket_view(b) for b in _table_buckets.values()]})
 
 
 def _get_table_bucket(arn):
     bucket = _find_bucket_by_arn(arn)
     if not bucket:
         return _bucket_not_found(arn)
-    return json_response(bucket)
+    return json_response(_bucket_view(bucket))
 
 
 def _delete_table_bucket(arn):
@@ -406,17 +418,26 @@ def _create_table(bucket_arn, namespace, data):
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
 
+    bucket_record = _find_bucket_by_arn(bucket_arn) or {}
     _tables[key] = {
         "name": table_name,
+        "type": "customer",
         "tableARN": arn,
         "namespace": [namespace],
         "tableBucketARN": bucket_arn,
+        "tableBucketId": bucket_record.get("tableBucketId"),
+        "versionToken": new_uuid()[:8],
         "format": fmt,
         "createdAt": now_iso(),
+        "createdBy": get_account_id(),
         "modifiedAt": now_iso(),
+        "modifiedBy": get_account_id(),
         "ownerAccountId": get_account_id(),
         "metadataLocation": metadata_location,
         "warehouseLocation": location,
+        "_encryption": data.get("encryptionConfiguration"),
+        "_storageClass": data.get("storageClassConfiguration"),
+        "_tags": dict(data.get("tags") or {}),
         "_iceberg_metadata": iceberg_metadata,
         "_metadata_version": 0,
         "_schema_fields": schema_fields,
@@ -428,7 +449,7 @@ def _create_table(bucket_arn, namespace, data):
             break
 
     logger.info("S3Tables: created table %s/%s", namespace, table_name)
-    return json_response({"tableARN": arn, "versionToken": new_uuid()[:8]})
+    return json_response({"tableARN": arn, "versionToken": _tables[key]["versionToken"]})
 
 
 def _list_tables(bucket_arn, namespace=None):
@@ -446,13 +467,22 @@ def _list_tables(bucket_arn, namespace=None):
         result.append(
             {
                 "name": table["name"],
+                "type": table.get("type", "customer"),
                 "tableARN": table["tableARN"],
                 "namespace": table["namespace"],
-                "format": table["format"],
                 "createdAt": table["createdAt"],
+                "modifiedAt": table.get("modifiedAt", table["createdAt"]),
+                "tableBucketId": table.get("tableBucketId"),
             }
         )
     return json_response({"tables": result})
+
+
+_TABLE_FIELDS = (
+    "name", "type", "tableARN", "namespace", "namespaceId", "versionToken", "metadataLocation",
+    "warehouseLocation", "createdAt", "createdBy", "managedByService", "modifiedAt", "modifiedBy",
+    "ownerAccountId", "format", "tableBucketId",
+)
 
 
 def _get_table(bucket_arn, namespace, table_name):
@@ -464,7 +494,7 @@ def _get_table(bucket_arn, namespace, table_name):
     table = _tables.get(key)
     if not table:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
-    return json_response({k: v for k, v in table.items() if not k.startswith("_")})
+    return json_response({k: table[k] for k in _TABLE_FIELDS if table.get(k) is not None})
 
 
 def _delete_table(bucket_arn, namespace, table_name):
@@ -523,7 +553,7 @@ def _iceberg_config(query_params=None, headers=None):
     defaults = {
         "client.region": get_region(),
         "s3.endpoint": s3_endpoint,
-        "s3.access-key-id": "test",
+        "s3.access-key-id": _vended_access_key(),
         "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
     }
@@ -562,6 +592,13 @@ def _resolve_container_ip():
         pass
     _resolve_container_ip._cached = None
     return None
+
+
+def _vended_access_key():
+    """The caller's account as the vended access key, so a client's data reads and
+    writes stay in that account; the default account keeps ``test``."""
+    account = get_account_id()
+    return "test" if account == os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000") else account
 
 
 def _reachable_s3_endpoint():
@@ -788,7 +825,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                 "metadata": metadata,
                 "config": {
                     "s3.endpoint": _reachable_s3_endpoint(),
-                    "s3.access-key-id": "test",
+                    "s3.access-key-id": _vended_access_key(),
                     "s3.secret-access-key": "test",
                     "s3.path-style-access": "true",
                     "s3.region": get_region(),
@@ -1137,9 +1174,9 @@ async def handle_request(method, path, headers, body, query_params):
         arn = "/".join(parts[1:])
         if not arn.startswith("arn:"):
             arn = f"arn:aws:s3tables:{get_region()}:{get_account_id()}:bucket/{arn}"
-        # Check for sub-resource paths
-        if parts[-1] in ("encryption", "maintenance", "metrics", "policy", "storage-class"):
-            return json_response({})  # stub
+        bucket_arn, sub = _split_arn_and_suffix("/".join(parts[1:]), "bucket")
+        if sub:
+            return _bucket_subresource(method, bucket_arn, sub.split("/"), data)
         if method == "GET":
             return _get_table_bucket(arn)
         if method == "DELETE":
@@ -1198,6 +1235,12 @@ async def handle_request(method, path, headers, body, query_params):
                 return _get_table_metadata_location(arn, suffix_parts[0], suffix_parts[1])
             if method == "PUT":
                 return _update_table_metadata_location(arn, suffix_parts[0], suffix_parts[1], data)
+        elif len(suffix_parts) >= 3:
+            return _table_subresource(method, arn, suffix_parts[0], suffix_parts[1], suffix_parts[2:], data)
+
+    # POST|GET|DELETE /tag/{resourceArn} -> TagResource|ListTagsForResource|UntagResource
+    if len(parts) >= 2 and parts[0] == "tag":
+        return _tags_request(method, "/".join(parts[1:]), data, query_params)
 
     # GET /get-table?tableBucketARN=&namespace=&name= -> GetTable
     if parts == ["get-table"] and method == "GET":
@@ -1213,6 +1256,201 @@ async def handle_request(method, path, headers, body, query_params):
         return _get_table(_qp("tableBucketARN"), _qp("namespace"), _qp("name"))
 
     return error_response_json("UnknownOperationException", f"Unknown S3Tables operation: {method} {path}", 400)
+
+
+# ── Bucket and table sub-resources ──────────────────────────
+# Defaults are the documented ones: SSE-S3, STANDARD storage, unreferenced file
+# removal 3/10 days, compaction at 512 MB with the auto strategy, and snapshot
+# management keeping 1 snapshot for up to 120 hours, all enabled.
+
+_DEFAULT_ENCRYPTION = {"sseAlgorithm": "AES256"}
+_DEFAULT_STORAGE_CLASS = {"storageClass": "STANDARD"}
+_BUCKET_MAINTENANCE_DEFAULTS = {
+    "icebergUnreferencedFileRemoval": {
+        "status": "enabled",
+        "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 3, "nonCurrentDays": 10}},
+    },
+}
+_TABLE_MAINTENANCE_DEFAULTS = {
+    "icebergCompaction": {
+        "status": "enabled",
+        "settings": {"icebergCompaction": {"targetFileSizeMB": 512, "strategy": "auto"}},
+    },
+    "icebergSnapshotManagement": {
+        "status": "enabled",
+        "settings": {"icebergSnapshotManagement": {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120}},
+    },
+}
+
+
+def _no_content():
+    return 204, {}, b""
+
+
+def _maintenance_view(defaults, stored):
+    view = copy.deepcopy(defaults)
+    for kind, value in (stored or {}).items():
+        merged = copy.deepcopy(view.get(kind, {}))
+        if "status" in value:
+            merged["status"] = value["status"]
+        for setting, fields in (value.get("settings") or {}).items():
+            merged.setdefault("settings", {}).setdefault(setting, {}).update(fields or {})
+        view[kind] = merged
+    return view
+
+
+def _bucket_subresource(method, bucket_arn, sub, data):
+    bucket = _find_bucket_by_arn(bucket_arn)
+    if not bucket:
+        return _bucket_not_found(bucket_arn)
+    kind = sub[0]
+    if kind == "encryption":
+        if method == "GET":
+            return json_response({"encryptionConfiguration": bucket.get("_encryption") or _DEFAULT_ENCRYPTION})
+        if method == "PUT":
+            bucket["_encryption"] = data.get("encryptionConfiguration")
+            return json_response({})
+        if method == "DELETE":
+            bucket["_encryption"] = None
+            return _no_content()
+    if kind == "maintenance":
+        if method == "GET":
+            return json_response({
+                "tableBucketARN": bucket["arn"],
+                "configuration": _maintenance_view(_BUCKET_MAINTENANCE_DEFAULTS, bucket.get("_maintenance")),
+            })
+        if method == "PUT" and len(sub) == 2:
+            bucket.setdefault("_maintenance", {})[sub[1]] = data.get("value") or {}
+            return _no_content()
+    if kind == "policy":
+        if method == "GET":
+            if not bucket.get("_policy"):
+                return error_response_json("NotFoundException", "The specified bucket policy does not exist", 404)
+            return json_response({"resourcePolicy": bucket["_policy"]})
+        if method == "PUT":
+            bucket["_policy"] = data.get("resourcePolicy")
+            return json_response({})
+        if method == "DELETE":
+            bucket.pop("_policy", None)
+            return _no_content()
+    if kind == "storage-class":
+        if method == "GET":
+            return json_response({"storageClassConfiguration": bucket.get("_storageClass") or _DEFAULT_STORAGE_CLASS})
+        if method == "PUT":
+            bucket["_storageClass"] = data.get("storageClassConfiguration")
+            return json_response({})
+    if kind == "metrics":
+        if method == "GET":
+            if not bucket.get("_metricsId"):
+                return error_response_json("NotFoundException", "The specified metrics configuration does not exist", 404)
+            return json_response({"tableBucketARN": bucket["arn"], "id": bucket["_metricsId"]})
+        if method == "PUT":
+            bucket.setdefault("_metricsId", new_uuid())
+            return _no_content()
+        if method == "DELETE":
+            bucket.pop("_metricsId", None)
+            return _no_content()
+    return error_response_json("UnknownOperationException", f"Unknown S3Tables operation: {method} {kind}", 400)
+
+
+def _table_record(bucket_arn, namespace, name):
+    existing = _existing_bucket_arn(bucket_arn)
+    if not existing:
+        return None, _bucket_not_found(bucket_arn)
+    table = _tables.get(_table_key(existing, namespace, name))
+    if not table:
+        return None, error_response_json("NotFoundException", f"Table {name} not found", 404)
+    return table, None
+
+
+def _table_subresource(method, bucket_arn, namespace, name, sub, data):
+    table, error = _table_record(bucket_arn, namespace, name)
+    if error:
+        return error
+    bucket = _find_bucket_by_arn(table["tableBucketARN"]) or {}
+    kind = sub[0]
+    if kind == "encryption" and method == "GET":
+        return json_response({"encryptionConfiguration": table.get("_encryption")
+                              or bucket.get("_encryption") or _DEFAULT_ENCRYPTION})
+    if kind == "storage-class" and method == "GET":
+        return json_response({"storageClassConfiguration": table.get("_storageClass")
+                              or bucket.get("_storageClass") or _DEFAULT_STORAGE_CLASS})
+    if kind == "maintenance":
+        if method == "GET":
+            return json_response({
+                "tableARN": table["tableARN"],
+                "configuration": _maintenance_view(_TABLE_MAINTENANCE_DEFAULTS, table.get("_maintenance")),
+            })
+        if method == "PUT" and len(sub) == 2:
+            table.setdefault("_maintenance", {})[sub[1]] = data.get("value") or {}
+            return _no_content()
+    if kind == "maintenance-job-status" and method == "GET":
+        return json_response({"tableARN": table["tableARN"], "status": {
+            job: {"status": "Not_Yet_Run"}
+            for job in ("icebergCompaction", "icebergSnapshotManagement", "icebergUnreferencedFileRemoval")
+        }})
+    if kind == "policy":
+        if method == "GET":
+            if not table.get("_policy"):
+                return error_response_json("NotFoundException", "The specified table policy does not exist", 404)
+            return json_response({"resourcePolicy": table["_policy"]})
+        if method == "PUT":
+            table["_policy"] = data.get("resourcePolicy")
+            return json_response({})
+        if method == "DELETE":
+            table.pop("_policy", None)
+            return _no_content()
+    if kind == "rename" and method == "PUT":
+        return _rename_table(table, namespace, name, data)
+    return error_response_json("UnknownOperationException", f"Unknown S3Tables operation: {method} {kind}", 400)
+
+
+def _rename_table(table, namespace, name, data):
+    bucket_arn = table["tableBucketARN"]
+    new_namespace = data.get("newNamespaceName") or namespace
+    new_name = data.get("newName") or name
+    if not _namespaces.get(_ns_key(bucket_arn, new_namespace)):
+        return error_response_json("NotFoundException", f"Namespace {new_namespace} not found", 404)
+    new_key = _table_key(bucket_arn, new_namespace, new_name)
+    if new_key in _tables:
+        return error_response_json("ConflictException", f"Table {new_name} already exists", 409)
+    token = data.get("versionToken")
+    if token and token != table.get("versionToken"):
+        return error_response_json("ConflictException", "The version token does not match the current version", 409)
+    del _tables[_table_key(bucket_arn, namespace, name)]
+    table["name"], table["namespace"] = new_name, [new_namespace]
+    table["modifiedAt"], table["modifiedBy"] = now_iso(), get_account_id()
+    table["versionToken"] = new_uuid()[:8]
+    _tables[new_key] = table
+    return _no_content()
+
+
+def _tagged_record(resource_arn):
+    bucket = _find_bucket_by_arn(resource_arn)
+    if bucket and bucket["arn"] == resource_arn:
+        return bucket
+    for table in _tables.values():
+        if table.get("tableARN") == resource_arn:
+            return table
+    return None
+
+
+def _tags_request(method, resource_arn, data, query_params):
+    record = _tagged_record(unquote(resource_arn))
+    if record is None:
+        return error_response_json("NotFoundException", f"Resource not found: {resource_arn}", 404)
+    tags = record.setdefault("_tags", {})
+    if method == "GET":
+        return json_response({"tags": tags})
+    if method == "POST":
+        tags.update(data.get("tags") or {})
+        return json_response({})
+    if method == "DELETE":
+        keys = query_params.get("tagKeys") or []
+        for key in keys if isinstance(keys, list) else [keys]:
+            tags.pop(key, None)
+        return _no_content()
+    return error_response_json("UnknownOperationException", f"Unknown S3Tables operation: {method} tag", 400)
 
 
 def _split_arn_and_suffix(path_str, resource_type):

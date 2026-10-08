@@ -429,15 +429,17 @@ def _iceberg_s3_overrides():
     MiniStack must return them or the client tries real S3 for the data
     files referenced by the catalog and fails.
 
-    Credentials are the fixed `test`/`test` pair (same as the s3tables
-    Iceberg surface) — MiniStack's S3 doesn't verify signatures, and
-    echoing ambient AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP
-    response would leak real credentials from the host environment."""
+    The access key names the caller's account (same as the s3tables Iceberg
+    surface) — MiniStack's S3 doesn't verify signatures, and echoing ambient
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP response would leak
+    real credentials from the host environment."""
+    from ministack.services.s3tables import _vended_access_key
+
     host = os.environ.get("MINISTACK_HOST", "localhost")
     port = os.environ.get("GATEWAY_PORT", "4566")
     return {
         "s3.endpoint": f"http://{host}:{port}",
-        "s3.access-key-id": "test",
+        "s3.access-key-id": _vended_access_key(),
         "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
         "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
