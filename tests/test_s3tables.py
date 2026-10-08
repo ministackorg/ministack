@@ -10,9 +10,11 @@ Operations covered:
 Shapes verified against `botocore.data.s3tables.2024-12-01.service-2`.
 """
 
+import contextlib
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid as _uuid_mod
 
@@ -1160,3 +1162,89 @@ def test_iceberg_unknown_path_answers_404_envelope():
         assert e.code == 404
         doc = json.loads(e.read())
         assert doc["error"]["type"] == "NotFoundException"
+
+
+def _iceberg_call(path, method="GET", payload=None):
+    try:
+        return 200, _iceberg_json(path, method, payload)
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
+def _arn_prefix(arn):
+    return urllib.parse.quote(arn, safe="")
+
+
+def test_s3tables_iceberg_rest_scopes_each_catalog_to_its_warehouse_arn(s3tables):
+    """Two catalogs, each with its table-bucket ARN as warehouse; the REST
+    {prefix} "is always your url-encoded table bucket ARN"."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    arns = [s3tables.create_table_bucket(name=f"wh-{n}-{suffix}")["arn"] for n in ("std", "qual")]
+    try:
+        for arn in arns:
+            p = _arn_prefix(arn)
+            assert _iceberg_call(f"/iceberg/v1/{p}/namespaces", "POST", {"namespace": ["ns"]})[0] == 200
+            status, created = _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables", "POST", {
+                "name": "t", "schema": {"type": "struct", "schema-id": 0,
+                                        "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}})
+            assert status == 200, created
+        for arn in arns:
+            p = _arn_prefix(arn)
+            bucket = arn.rsplit("/", 1)[-1]
+            status, loaded = _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables/t")
+            assert status == 200
+            assert loaded["metadata-location"].startswith(f"s3://{bucket}/")
+            assert _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables")[1]["identifiers"] == [
+                {"namespace": ["ns"], "name": "t"}]
+    finally:
+        for arn in arns:
+            with contextlib.suppress(Exception):
+                s3tables.delete_table(tableBucketARN=arn, namespace="ns", name="t")
+                s3tables.delete_namespace(tableBucketARN=arn, namespace="ns")
+                s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_s3tables_iceberg_rest_sequence_numbers_and_requirements(s3tables):
+    arn = s3tables.create_table_bucket(name=f"seq-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    p = _arn_prefix(arn)
+    table = f"/iceberg/v1/{p}/namespaces/ns/tables/t"
+    try:
+        _iceberg_call(f"/iceberg/v1/{p}/namespaces", "POST", {"namespace": ["ns"]})
+        _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables", "POST", {
+            "name": "t", "format-version": 2, "schema": {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "type": "long", "required": False}]}})
+
+        def append(seq, snap_id, parent, expected_ref):
+            snapshot = {"snapshot-id": snap_id, "sequence-number": seq, "timestamp-ms": 1_700_000_000_000 + seq,
+                        "manifest-list": f"s3://x/{snap_id}.avro", "summary": {"operation": "append"}}
+            if parent is not None:
+                snapshot["parent-snapshot-id"] = parent
+            return _iceberg_call(table, "POST", {
+                "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": expected_ref}],
+                "updates": [{"action": "add-snapshot", "snapshot": snapshot},
+                            {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch",
+                             "snapshot-id": snap_id}]})
+
+        for seq in (1, 2, 3):                      # sequential Spark appends
+            status, body = append(seq, 100 + seq, (99 + seq) if seq > 1 else None, (99 + seq) if seq > 1 else None)
+            assert status == 200, body
+            assert body["metadata"]["last-sequence-number"] == seq
+        assert _iceberg_call(table)[1]["metadata"]["last-sequence-number"] == 3
+
+        # A writer that loaded the table before the last commit is refused.
+        status, body = append(3, 200, 102, 102)
+        assert status == 409
+        assert body["error"]["type"] == "CommitFailedException"
+        assert body["error"]["message"] == "Requirement failed: branch main has changed: expected id 102 != 103"
+
+        # A snapshot not newer than the table's last sequence number is refused.
+        status, body = _iceberg_call(table, "POST", {"updates": [{"action": "add-snapshot", "snapshot": {
+            "snapshot-id": 300, "sequence-number": 3, "parent-snapshot-id": 103, "timestamp-ms": 1_800_000_000_000,
+            "manifest-list": "s3://x/300.avro", "summary": {"operation": "append"}}}]})
+        assert status == 400
+        assert body["error"]["message"] == "Cannot add snapshot with sequence number 3 older than last sequence number 3"
+    finally:
+        with contextlib.suppress(Exception):
+            s3tables.delete_table(tableBucketARN=arn, namespace="ns", name="t")
+            s3tables.delete_namespace(tableBucketARN=arn, namespace="ns")
+            s3tables.delete_table_bucket(tableBucketARN=arn)

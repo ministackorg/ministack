@@ -2505,13 +2505,14 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
 def _dispatch_to_sns(arn, payload):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(arn)
-    if not topic:
+    try:
+        result = _sns.publish_internal(arn, payload, "EventBridge Notification")
+    except _sns.SnsPublishError as exc:
+        logger.warning("EventBridge → SNS %s refused: %s", arn, exc)
+        return
+    if result is None:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
-
-    msg_id = new_uuid()
-    _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
 
 

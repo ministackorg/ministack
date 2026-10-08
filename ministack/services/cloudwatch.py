@@ -142,6 +142,9 @@ def _parse_ts(value):
     """Parse ISO-8601 string, epoch float, or None into a Unix timestamp."""
     if value is None:
         return None
+    if isinstance(value, datetime):
+        # rpc-v2-cbor timestamps (tag 1) decode to datetime; naive means UTC.
+        return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):

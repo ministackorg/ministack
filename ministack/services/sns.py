@@ -1173,12 +1173,11 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         protocol = sub.get("protocol", "")
         endpoint = sub.get("endpoint", "")
 
-        if not _matches_filter_policy(sub, message_attributes or {}):
-            continue
-
         effective_message = _resolve_message_for_protocol(
             message, message_structure, protocol
         )
+        if not _matches_filter_policy(sub, message_attributes or {}, effective_message):
+            continue
 
         raw = sub.get("attributes", {}).get("RawMessageDelivery", "false") == "true"
         envelope = _build_envelope(
@@ -1801,7 +1800,7 @@ def _resolve_message_for_protocol(message: str, message_structure: str,
     return parsed.get(protocol, parsed.get("default", message))
 
 
-def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
+def _matches_filter_policy(sub: dict, message_attributes: dict, message: str = "") -> bool:
     policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
     if not policy_json:
         return True
@@ -1813,16 +1812,20 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
         return True
 
     scope = sub.get("attributes", {}).get("FilterPolicyScope", "MessageAttributes")
-
     if scope == "MessageBody":
-        return True
-
-    return _policy_matches(policy, message_attributes)
+        # "Filter policies for the message body assume that the message payload
+        # is a well-formed JSON object"; anything else is filtered out.
+        try:
+            body = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(body, dict) and _policy_matches(policy, _body_lookup(body), nested=True)
+    return _policy_matches(policy, _attribute_lookup(message_attributes))
 
 
 _OR_RESERVED_MEMBER_KEYS = frozenset({
     "anything-but", "prefix", "suffix", "equals-ignore-case",
-    "numeric", "exists", "cidr",
+    "numeric", "exists", "cidr", "wildcard",
 })
 
 
@@ -1841,27 +1844,62 @@ def _is_or_operator(value) -> bool:
     return True
 
 
-def _policy_matches(policy: dict, message_attributes: dict) -> bool:
-    """Match one filter-policy object against the message attributes. Sibling
-    keys are AND-ed; a recognized ``$or`` matches when any of its member
-    policies matches (evaluated recursively, so nested ``$or`` works)."""
-    for key, allowed_values in policy.items():
-        if key == "$or" and _is_or_operator(allowed_values):
-            if not any(_policy_matches(member, message_attributes)
-                       for member in allowed_values):
-                return False
-            continue
+def _attribute_lookup(message_attributes: dict):
+    """Lookup over message attributes: key -> (present, values, nonempty)."""
+    def lookup(key):
         attr = message_attributes.get(key)
         if attr is None:
-            return False
-        if not isinstance(allowed_values, list):
-            allowed_values = [allowed_values]
-        # A String.Array attribute carries a JSON array of values; AWS evaluates
-        # each element separately and the attribute matches if any element does.
-        candidates = _attr_candidate_values(attr)
-        if not any(_attr_matches_any(value, allowed_values) for value in candidates):
+            return False, [], bool(message_attributes)
+        return True, _attr_candidate_values(attr), True
+    lookup.child = None
+    return lookup
+
+
+def _body_lookup(body: dict):
+    """Lookup over a JSON body; an array value matches if any element does."""
+    def lookup(key):
+        if key not in body or body[key] is None:
+            return False, [], bool(body)
+        value = body[key]
+        return True, (value if isinstance(value, list) else [value]), True
+    lookup.child = lambda key: _body_lookup(body[key]) if isinstance(body.get(key), dict) else None
+    return lookup
+
+
+def _policy_matches(policy: dict, lookup, nested: bool = False) -> bool:
+    """Match one filter-policy object. Sibling keys are AND-ed; a recognized
+    ``$or`` matches when any member policy matches; on a message body a nested
+    policy object matches the nested property."""
+    for key, rules in policy.items():
+        if key == "$or" and _is_or_operator(rules):
+            if not any(_policy_matches(member, lookup, nested) for member in rules):
+                return False
+            continue
+        if nested and isinstance(rules, dict):
+            child = lookup.child(key)
+            if child is None or not _policy_matches(rules, child, nested):
+                return False
+            continue
+        if not isinstance(rules, list):
+            rules = [rules]
+        present, values, nonempty = lookup(key)
+        if not _key_matches(rules, present, values, nonempty):
             return False
     return True
+
+
+def _key_matches(rules: list, present: bool, values: list, nonempty: bool) -> bool:
+    for rule in rules:
+        if isinstance(rule, dict) and "exists" in rule:
+            # "exists": false "only matches if at least one attribute is present".
+            if rule["exists"] is True and present and any(v not in ("", None) for v in values):
+                return True
+            if rule["exists"] is False and not present and nonempty:
+                return True
+            continue
+        if present and any(_value_matches(value, rule) for value in values):
+            return True
+    return False
 
 
 def _attr_candidate_values(attr: dict) -> list:
@@ -1888,40 +1926,67 @@ def _attr_candidate_values(attr: dict) -> list:
     return values or [raw]
 
 
-def _attr_matches_any(attr_value: str, rules: list) -> bool:
-    for rule in rules:
-        if isinstance(rule, str):
-            if attr_value == rule:
-                return True
-        elif isinstance(rule, (int, float)):
-            try:
-                if float(attr_value) == float(rule):
-                    return True
-            except (ValueError, TypeError):
-                pass
-        elif isinstance(rule, dict):
-            if "exists" in rule:
-                if rule["exists"] is True:
-                    return True
-                continue
-            if "prefix" in rule:
-                if attr_value.startswith(rule["prefix"]):
-                    return True
-            if "anything-but" in rule:
-                excluded = rule["anything-but"]
-                if isinstance(excluded, list):
-                    if attr_value not in excluded:
-                        return True
-                elif attr_value != str(excluded):
-                    return True
-            if "numeric" in rule:
-                try:
-                    num = float(attr_value)
-                    conditions = rule["numeric"]
-                    if _check_numeric(num, conditions):
-                        return True
-                except (ValueError, TypeError):
-                    pass
+def _as_number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wildcard_matches(value: str, pattern: str) -> bool:
+    """`*` matches any run of characters; everything else is literal."""
+    return _re.fullmatch(".*".join(_re.escape(part) for part in pattern.split("*")), value, _re.S) is not None
+
+
+def _cidr_matches(value: str, cidr: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address(value) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+
+def _string_rule_matches(value, rule: dict) -> bool:
+    if not isinstance(value, str):
+        return False
+    if "wildcard" in rule:
+        return isinstance(rule["wildcard"], str) and _wildcard_matches(value, rule["wildcard"])
+    if "cidr" in rule:
+        return isinstance(rule["cidr"], str) and _cidr_matches(value, rule["cidr"])
+    if "prefix" in rule:
+        return isinstance(rule["prefix"], str) and value.startswith(rule["prefix"])
+    if "suffix" in rule:
+        return isinstance(rule["suffix"], str) and value.endswith(rule["suffix"])
+    if "equals-ignore-case" in rule:
+        return isinstance(rule["equals-ignore-case"], str) and value.lower() == rule["equals-ignore-case"].lower()
+    return False
+
+
+def _value_matches(value, rule) -> bool:
+    if isinstance(rule, bool) or rule is None:
+        return value is rule or (isinstance(value, str) and value == json.dumps(rule))
+    if isinstance(rule, str):
+        return isinstance(value, str) and value == rule
+    if isinstance(rule, (int, float)):
+        num = _as_number(value)
+        return num is not None and num == float(rule)
+    if not isinstance(rule, dict):
+        return False
+    if any(k in rule for k in ("prefix", "suffix", "equals-ignore-case", "wildcard", "cidr")):
+        return _string_rule_matches(value, rule)
+    if "anything-but" in rule:
+        excluded = rule["anything-but"]
+        if isinstance(excluded, dict):
+            return isinstance(value, str) and not _string_rule_matches(value, excluded)
+        excluded = excluded if isinstance(excluded, list) else [excluded]
+        return not any(_value_matches(value, e) for e in excluded)
+    if "numeric" in rule:
+        num = _as_number(value)
+        return num is not None and _check_numeric(num, rule["numeric"])
     return False
 
 

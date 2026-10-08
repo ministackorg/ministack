@@ -765,6 +765,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     msgs: list = []
 
     while True:
+        _expire_retained(q)
         _dlq_sweep(q)
         msgs = _collect_msgs(q, max_n, vis)
         if msgs or time.time() >= deadline:
@@ -1253,8 +1254,27 @@ def _ensure_msg_fields(m: dict) -> None:
     m.setdefault("seq", None)
 
 
+def _expire_retained(q: dict) -> None:
+    """Drop messages older than MessageRetentionPeriod ("The length of time,
+    in seconds, for which Amazon SQS retains a message"), measured from the
+    enqueue time: the send, or a FIFO dead-letter move."""
+    try:
+        retention = int(q["attributes"].get("MessageRetentionPeriod", "345600"))
+    except (TypeError, ValueError):
+        return
+    now = time.time()
+    cutoff = now - retention
+
+    def enqueued(m):
+        return m.get("enqueued_at", m.get("sent_at", now))
+
+    if any(enqueued(m) <= cutoff for m in q["messages"]):
+        q["messages"] = [m for m in q["messages"] if enqueued(m) > cutoff]
+
+
 def _refresh_counts(q: dict) -> None:
     """Recompute approximate message counters."""
+    _expire_retained(q)
     now = time.time()
     visible = delayed = inflight = 0
     for m in q["messages"]:
@@ -1358,6 +1378,12 @@ def _dlq_sweep(q: dict) -> None:
             moved = dict(m)
             moved["receipt_handle"] = None
             moved["visible_at"] = now
+            # Standard keeps the original enqueue timestamp; "For FIFO queues,
+            # the enqueue timestamp resets when the message is moved".
+            if dlq.get("is_fifo"):
+                moved["enqueued_at"] = now
+            moved["sys"] = {**m.get("sys", {})}
+            moved["sys"].setdefault("DeadLetterQueueSourceArn", q["attributes"].get("QueueArn", ""))
             dlq["messages"].append(moved)
             esm_wake.set()
         else:
@@ -1424,6 +1450,9 @@ def _build_sys_attrs(msg: dict, names: list) -> dict:
     trace = msg["sys"].get("AWSTraceHeader")
     if trace and (want_all or "AWSTraceHeader" in names):
         r["AWSTraceHeader"] = trace
+    source = msg["sys"].get("DeadLetterQueueSourceArn")
+    if source and (want_all or "DeadLetterQueueSourceArn" in names):
+        r["DeadLetterQueueSourceArn"] = source
     return r
 
 
@@ -1962,6 +1991,7 @@ def _receive_messages_for_esm(queue_url: str, max_number: int) -> list[dict]:
         q = _get_q(queue_url)
         max_n = min(int(max_number or 1), 10)
         vis = int(q["attributes"].get("VisibilityTimeout", "30"))
+        _expire_retained(q)
         _dlq_sweep(q)
         return _collect_msgs(q, max_n, vis)
 

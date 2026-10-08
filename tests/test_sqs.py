@@ -2317,3 +2317,81 @@ def test_sqs_receive_max_number_of_messages_out_of_range(sqs, value):
             "Reason: Must be between 1 and 10, if provided.")
     finally:
         sqs.delete_queue(QueueUrl=url)
+
+
+class _SqsClock:
+    def __init__(self, start):
+        self.now = start
+
+    def time(self):
+        return self.now
+
+
+def _sqs_inproc(monkeypatch):
+    import asyncio
+    import time as _time
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    clock = _SqsClock(_time.time())
+    monkeypatch.setattr(sqs_svc.time, "time", clock.time)
+
+    def create(name, **attrs):
+        return sqs_svc._act_create_queue(
+            {"QueueName": name, "Attributes": {k: str(v) for k, v in attrs.items()}}, "")["QueueUrl"]
+
+    def counts(url):
+        a = sqs_svc._act_get_queue_attributes({"QueueUrl": url, "AttributeNames": ["All"]}, url)["Attributes"]
+        return int(a["ApproximateNumberOfMessages"]), int(a["ApproximateNumberOfMessagesNotVisible"])
+
+    def receive(url, **kw):
+        return asyncio.run(sqs_svc._act_receive_message({"QueueUrl": url, "WaitTimeSeconds": 0, **kw}, url))
+
+    return clock, create, counts, receive
+
+
+def test_sqs_retention_expires_messages(monkeypatch):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    url = create(f"ret-{_uuid_mod.uuid4().hex[:8]}", MessageRetentionPeriod=60, VisibilityTimeout=120)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "a"}, url)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "b"}, url)
+    receive(url, MaxNumberOfMessages=1)          # one message in flight
+    clock.now += 59
+    assert counts(url) == (1, 1)
+    clock.now += 1
+    assert counts(url) == (0, 0)
+    # Lowering the period expires messages already in the queue.
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "c"}, url)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "120"}}, url)
+    clock.now += 70
+    assert counts(url) == (1, 0)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "60"}}, url)
+    assert counts(url) == (0, 0)
+
+
+@pytest.mark.parametrize("fifo", [False, True])
+def test_sqs_dlq_move_enqueue_time_and_source_arn(monkeypatch, fifo):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    sfx = ".fifo" if fifo else ""
+    extra = {"FifoQueue": "true", "ContentBasedDeduplication": "true"} if fifo else {}
+    dlq = create(f"dlq-{_uuid_mod.uuid4().hex[:8]}{sfx}", MessageRetentionPeriod=120, **extra)
+    dlq_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dlq, "AttributeNames": ["QueueArn"]}, dlq)["Attributes"]["QueueArn"]
+    src = create(f"src-{_uuid_mod.uuid4().hex[:8]}{sfx}", VisibilityTimeout=30, **extra,
+                 RedrivePolicy=json.dumps({"maxReceiveCount": 1, "deadLetterTargetArn": dlq_arn}))
+    src_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": src, "AttributeNames": ["QueueArn"]}, src)["Attributes"]["QueueArn"]
+    send = {"QueueUrl": src, "MessageBody": "x"}
+    if fifo:
+        send["MessageGroupId"] = "g"
+    sent = sqs_svc._act_send_message(send, src)
+    sent_at = clock.now
+    receive(src)                                  # receive count 1
+    clock.now += 31                               # visibility timeout over
+    assert receive(src).get("Messages", []) == []  # the sweep moves it to the DLQ
+    got = receive(dlq, AttributeNames=["All"])["Messages"][0]
+    assert got["MessageId"] == sent["MessageId"]
+    assert got["Attributes"]["DeadLetterQueueSourceArn"] == src_arn
+    clock.now = sent_at + 120                     # 120 s after the original send
+    remaining = sum(counts(dlq))
+    # Standard keeps the original enqueue time (expired); FIFO reset it on the move (still there).
+    assert remaining == (1 if fifo else 0)

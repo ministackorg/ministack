@@ -1061,3 +1061,13 @@ def test_cloudwatch_query_protocol_put_metric_data_values_and_statistic_values()
         dp = cw.get_metric_statistics(Namespace=ns, MetricName=name, StartTime=ts - 60, EndTime=ts + 3000,
                                       Period=3600, Statistics=["SampleCount", "Sum"])["Datapoints"][0]
         assert (dp["SampleCount"], dp["Sum"]) == expected
+
+
+def test_cloudwatch_parse_ts_accepts_cbor_datetime():
+    from datetime import datetime, timezone
+
+    from ministack.services.cloudwatch import _parse_ts
+    ts = datetime(2026, 10, 6, 12, 30, tzinfo=timezone.utc)
+    assert _parse_ts(ts) == ts.timestamp()
+    assert _parse_ts(ts.replace(tzinfo=None)) == ts.timestamp()
+

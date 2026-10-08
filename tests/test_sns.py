@@ -2329,3 +2329,59 @@ def test_sns_to_sqs_delivery_waits_for_queue_delay(sns, sqs):
     finally:
         sns.delete_topic(TopicArn=topic)
         sqs.delete_queue(QueueUrl=url)
+
+
+def _filter_queue(sns, sqs, name, policy, scope=None):
+    topic = sns.create_topic(Name=name)["TopicArn"]
+    url = sqs.create_queue(QueueName=name)["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(QueueUrl=url, Attributes={"Policy": json.dumps(sqs_policy_allow_sns(qarn, topic))})
+    attrs = {"RawMessageDelivery": "true", "FilterPolicy": json.dumps(policy)}
+    if scope:
+        attrs["FilterPolicyScope"] = scope
+    sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=qarn, Attributes=attrs)
+    return topic, url
+
+
+def _bodies(sqs, url):
+    return sorted(m["Body"] for m in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10).get("Messages", []))
+
+
+def test_sns_filter_suffix_and_equals_ignore_case(sns, sqs):
+    for op, policy, match, other in (("suffix", {"f": [{"suffix": ".png"}]}, "a.png", "a.jpg"),
+                                     ("eqic", {"f": [{"equals-ignore-case": "RED"}]}, "red", "blue")):
+        name = f"op-{op}-{_uuid_mod.uuid4().hex[:8]}"
+        topic, url = _filter_queue(sns, sqs, name, policy)
+        for v in (match, other):
+            sns.publish(TopicArn=topic, Message=v, MessageAttributes={"f": {"DataType": "String", "StringValue": v}})
+        assert _bodies(sqs, url) == [match]
+
+
+def test_sns_filter_policy_scope_message_body(sns, sqs):
+    name = f"body-filter-{_uuid_mod.uuid4().hex[:8]}"
+    policy = {"kind": ["wanted"], "detail": {"size": [{"numeric": [">", 10]}]}, "tags": [{"suffix": "-x"}]}
+    topic, url = _filter_queue(sns, sqs, name, policy, scope="MessageBody")
+    good = json.dumps({"kind": "wanted", "detail": {"size": 11}, "tags": ["a", "b-x"]})
+    for body in (good, json.dumps({"kind": "other", "detail": {"size": 11}, "tags": ["b-x"]}),
+                 json.dumps({"kind": "wanted", "detail": {"size": 5}, "tags": ["b-x"]}), "not json"):
+        sns.publish(TopicArn=topic, Message=body)
+    assert _bodies(sqs, url) == [good]
+
+
+def test_sns_filter_exists_false(sns, sqs):
+    name = f"exists-false-{_uuid_mod.uuid4().hex[:8]}"
+    topic, url = _filter_queue(sns, sqs, name, {"store": [{"exists": False}]})
+    sns.publish(TopicArn=topic, Message="no-store", MessageAttributes={"other": {"DataType": "String", "StringValue": "x"}})
+    sns.publish(TopicArn=topic, Message="has-store", MessageAttributes={"store": {"DataType": "String", "StringValue": "fans"}})
+    sns.publish(TopicArn=topic, Message="no-attributes")
+    assert _bodies(sqs, url) == ["no-store"]
+
+
+def test_sns_filter_wildcard_and_cidr(sns, sqs):
+    for op, policy, match, other in (("wild", {"f": [{"wildcard": "*ball"}]}, "baseball", "rugby"),
+                                     ("cidr", {"f": [{"cidr": "10.0.0.0/24"}]}, "10.0.0.255", "10.1.1.0")):
+        name = f"op-{op}-{_uuid_mod.uuid4().hex[:8]}"
+        topic, url = _filter_queue(sns, sqs, name, policy)
+        for v in (match, other):
+            sns.publish(TopicArn=topic, Message=v, MessageAttributes={"f": {"DataType": "String", "StringValue": v}})
+        assert _bodies(sqs, url) == [match]

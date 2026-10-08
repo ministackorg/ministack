@@ -472,13 +472,13 @@ def test_get_records_iterator_position_survives_record_expiry(streams_state):
     for record in ddb_service._stream_records[name][:2]:
         record["dynamodb"]["ApproximateCreationDateTime"] = int(expired)
 
-    second = _json(streams_service._get_records({"ShardIterator": first["NextShardIterator"]}))
-    assert _seqs(second) == ["2"]
+    # The held iterator now points at a trimmed record: TrimmedDataAccessException.
+    trimmed = _json(streams_service._get_records({"ShardIterator": first["NextShardIterator"]}))
+    assert trimmed["__type"].endswith("TrimmedDataAccessException")
     assert ddb_service.stream_start_position(name) == 2
-    # And the iterator it hands back is past the end, not back inside the list.
-    assert _seqs(_json(streams_service._get_records({
-        "ShardIterator": second["NextShardIterator"],
-    }))) == []
+    # A fresh TRIM_HORIZON iterator resumes at the surviving record.
+    second = _json(streams_service._get_records({"ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON")}))
+    assert _seqs(second) == ["2"]
 
 
 def test_shard_iterators_are_absolute_after_a_trim(streams_state):
@@ -584,3 +584,30 @@ def test_closed_stream_stays_readable_and_new_stream_starts_empty(ddb, ddb_strea
     finally:
         with contextlib.suppress(ClientError):
             ddb.delete_table(TableName=name)
+
+
+def test_shard_iterator_expires_after_15_minutes(streams_state, monkeypatch):
+    ddb_service, streams_service, time = streams_state
+    name = "streams-iterator-ttl"
+    arn = _streamed_table(ddb_service, name)
+    ddb_service._stream_records[name] = [_record(0, time.time())]
+    iterator = _iterator(streams_service, arn, "TRIM_HORIZON")
+    issued = time.time()
+    monkeypatch.setattr(streams_service.time, "time", lambda: issued + 15 * 60 - 1)
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": iterator}))) == ["0"]
+    monkeypatch.setattr(streams_service.time, "time", lambda: issued + 15 * 60)
+    assert _json(streams_service._get_records({"ShardIterator": iterator}))["__type"].endswith(
+        "ExpiredIteratorException")
+
+
+def test_unknown_shard_is_resource_not_found(ddb, ddb_streams):
+    name = f"unknown-shard-{uuid.uuid4().hex[:8]}"
+    _make_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb_streams.get_shard_iterator(StreamArn=_stream_arn(ddb, name), ShardId="shardId-00000000000000000000-ffffffff",
+                                           ShardIteratorType="TRIM_HORIZON")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert exc.value.response["Error"]["Message"] == "Requested resource not found: Shard does not exist"
+    finally:
+        ddb.delete_table(TableName=name)

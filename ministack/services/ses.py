@@ -503,6 +503,10 @@ def _send_email(params):
 
 
 def _missing_domain(value: str) -> bool:
+    """SES answers "Missing final '@domain'" for an address without a domain
+    and for one with non-ASCII characters ("must be 7-bit ASCII")."""
+    if not value.isascii():
+        return True
     _, separator, domain = parseaddr(value)[1].rpartition("@")
     return not separator or not domain
 

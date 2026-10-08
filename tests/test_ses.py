@@ -1722,3 +1722,17 @@ def test_ses_identity_notifications_not_published_without_topic(ses, sns, ses_no
         Source=sender, Destination={"ToAddresses": ["ok@example.com"]}, Message=_NOTIFY_MSG)
 
     assert drain(1) == []
+
+
+def test_ses_send_email_rejects_non_ascii_address(ses):
+    ses.verify_email_identity(EmailAddress="sender@example.com")
+    for to in ("us\u00e9r@example.com", "user@\u00e9xample.com"):
+        with pytest.raises(ClientError) as exc:
+            ses.send_email(Source="sender@example.com", Destination={"ToAddresses": [to]},
+                           Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == "Missing final '@domain'"
+    ses.verify_email_identity(EmailAddress="user@xn--xample-9ua.com")
+    ses.send_email(Source="sender@example.com", Destination={"ToAddresses": ["user@xn--xample-9ua.com"]},
+                   Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
+

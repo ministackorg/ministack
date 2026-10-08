@@ -1027,3 +1027,25 @@ def test_incomplete_non_s3_body_is_dispatched_without_s3_error(monkeypatch):
     asyncio.run(app_module.app(scope, receive, send))
     assert all(b"IncompleteBody" not in m.get("body", b"") for m in sent)
     assert len(dispatched) == 1 and dispatched[0][3] == b"Action=ListQueues"
+
+
+def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
+    import logging
+
+    from ministack.core import container_reaper
+
+    class _C:
+        def __init__(self, cid, fail):
+            self.id, self.fail = cid, fail
+
+        def stop(self, timeout=None):
+            if self.fail:
+                raise RuntimeError("gone")
+
+        def remove(self, v=False, force=False):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="container_reaper"):
+        removed = container_reaper.drop_containers([_C("a" * 64, False), _C("b" * 64, True)])
+    assert removed == 1
+    assert "bbbbbbbbbbbb" in caplog.text and "aaaaaaaaaaaa" not in caplog.text
