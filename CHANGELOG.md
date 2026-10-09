@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **CloudFormation — `AWS::Logs::MetricFilter`** — templates with a metric filter failed with `Unrecognized resource types`; the filter now provisions, updates in place and is replaced on a `FilterName` or `LogGroupName` change. Contributed by @iot-rocket.
+- **DynamoDB — vector search** — `CreateTable` accepts `VectorIndexes`, `UpdateTable` takes `VectorIndexUpdates` (resource allocation, then backfilling, then `ACTIVE`), and `DescribeTable` reports them. `SearchVectors` scores with `COSINE`, `EUCLIDEAN` or `DOT_PRODUCT` at 32-bit float precision and filters on the `SearchSchema`. Writes are checked against each vector index, `INDEXES` capacity reports `VectorWriteRequestBytes`, and a PartiQL `SELECT` or `Scan` on a vector index returns "Scan operation not supported on this index type".
 
 ### Fixed
 - **CloudWatch Logs — `DescribeMetricFilters` by metric** — `metricName` and `metricNamespace` now select the filters that publish that metric, `filterNamePrefix` applies only with `logGroupName`, and `DeleteLogGroup` removes the group's filters. Contributed by @iot-rocket.
@@ -26,9 +27,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EC2 `DescribeInstances` validates ID format before existence** — a malformed `InstanceId` (e.g. `i-0000000000000000x`) now returns `InvalidInstanceID.Malformed`, matching the AWS capture; a well-formed unknown id still returns `InvalidInstanceID.NotFound`.
 - **ELBv2 `DescribeLoadBalancers` validates name length before existence** — a `Names` entry over 32 characters returns `ValidationError`, matching the AWS capture.
 - **WAFv2 `GetWebACL` validates the `Id` shape before existence** — a non-UUID or >36-char `Id` returns `ValidationException` listing the failed constraints, matching the AWS capture; a well-formed unknown id still returns `WAFNonexistentItemException`.
-- **Step Functions — optimized DynamoDB error names** — conditional failures and other service errors now use the `DynamoDB.` prefix so exact `Catch` and `Retry` handlers match AWS.
-- **Step Functions — Lambda `GetFunction` SDK integration** — workflows can read function configuration, code metadata and tags through `aws-sdk:lambda:getFunction`, including qualified reads.
+- **Step Functions — optimized DynamoDB error names** — conditional failures and other service errors now use the `DynamoDB.` prefix so exact `Catch` and `Retry` handlers match AWS. Contributed by @jayjanssen.
+- **Step Functions — Lambda `GetFunction` SDK integration** — workflows can read function configuration, code metadata and tags through `aws-sdk:lambda:getFunction`, including qualified reads. Contributed by @jayjanssen.
 - **Secrets Manager — force delete of a secret scheduled for deletion** — `DeleteSecret` with `ForceDeleteWithoutRecovery` returned `InvalidRequestException` for a secret already scheduled for deletion. It now deletes the secret permanently. Reported by @fabio-andre-rodrigues.
+- **DynamoDB — item size limits per operation** — numbers are sized as base-100 digit pairs, so the 400 KB limit is exact to the byte. `UpdateItem` counts only the attributes it writes plus a cost per clause and answers "Item size to update has exceeded the maximum allowed size". PartiQL `INSERT` and `UPDATE` now enforce the limit, and an oversized transacted `Update` cancels the transaction.
+- **DynamoDB — nesting depth and key length** — values nested beyond 32 levels return "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit", including in `UpdateItem` and `TransactWriteItems` expression values. Over-long keys are refused on reads too.
+- **DynamoDB — validation messages** — overlapping `ProjectionExpression` paths are refused on `GetItem`, `Query`, `Scan` and `BatchGetItem`. Empty `RequestItems`, `Select`, `Limit`, `Segment`, `ExclusiveStartKey`, `CreateTable`, PartiQL and transaction errors use AWS's wording, and `UpdateItem` reports only the first invalid enum.
 
 ## [1.5.24] — 2026-10-08
 

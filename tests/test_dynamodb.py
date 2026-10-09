@@ -6112,7 +6112,7 @@ def test_dynamodb_deleteitem_multi_enum_errors_accumulated():
     assert "2 validation errors detected" in msg
 
 
-def test_dynamodb_updateitem_multi_enum_errors_accumulated():
+def test_dynamodb_updateitem_reports_the_first_enum_error():
     code, body = _raw_ddb("UpdateItem", {
         "TableName": "intg-multi-upd",
         "Key": {"pk": {"S": "x"}},
@@ -6121,7 +6121,8 @@ def test_dynamodb_updateitem_multi_enum_errors_accumulated():
     })
     assert code == 400
     msg = body.get("message", "")
-    assert "2 validation errors detected" in msg
+    assert msg.startswith("1 validation error detected: Value 'BOGUS' at 'returnValues'")
+    assert "returnConsumedCapacity" not in msg
 
 
 def test_dynamodb_query_invalid_table_pattern():
