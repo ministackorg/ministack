@@ -8,6 +8,7 @@ JSON responses (DynamoDB, Lambda, SecretsManager, CloudWatch Logs).
 
 import contextlib
 import contextvars
+import functools
 import hashlib
 import json
 import os
@@ -528,6 +529,120 @@ class StreamingResponse:
 
     def __init__(self, runner):
         self.runner = runner
+
+
+# ---------------------------------------------------------------------------
+# Error-envelope Content-Type normalization
+#
+# Real AWS picks an error's Content-Type from the *service's protocol*, not
+# from a generic default — and services disagree: DynamoDB answers
+# ``application/x-amz-json-1.0`` while Kinesis answers
+# ``application/x-amz-json-1.1``; query-protocol services answer
+# ``text/xml`` while EC2 answers ``text/xml;charset=UTF-8``. The botocore
+# service model carries everything needed to reproduce this: ``protocol``
+# and ``jsonVersion``. A small override table covers wire quirks the model
+# does not declare.
+#
+# Evidence: real AWS wire captures diffed per service (us-east-1) — the
+# model values below matched the captured Content-Type on every probed
+# service.
+# ---------------------------------------------------------------------------
+
+# Ministack registry/service names that differ from the botocore client name.
+_BOTOCORE_NAME = {
+    "states": "stepfunctions",
+    "monitoring": "cloudwatch",
+    "elasticloadbalancing": "elbv2",
+    "airflow": "mwaa",
+    "elasticmapreduce": "emr",
+    "tagging": "resourcegroupstaggingapi",
+}
+
+# Wire-observed Content-Types that contradict what the model implies.
+#   sesv2 — rest-json service, but AWS emits application/x-amz-json-1.1 on
+#           errors (capture: get_email_identity 404).
+#   s3    — rest-xml, but S3 answers application/xml where the other
+#           rest-xml services (route53) answer text/xml.
+_WIRE_CT_OVERRIDE = {
+    "sesv2": "application/x-amz-json-1.1",
+    "s3": "application/xml",
+}
+
+_JSON_FAMILY = {
+    "application/json",
+    "application/x-amz-json-1.0",
+    "application/x-amz-json-1.1",
+}
+_XML_FAMILY = {"application/xml", "text/xml"}
+
+
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    """The botocore service model for a ministack service name, or None."""
+    try:
+        import botocore.session
+    except ImportError:
+        return None
+    name = _BOTOCORE_NAME.get(service, service)
+    try:
+        return botocore.session.get_session().get_service_model(name)
+    except Exception:
+        return None
+
+
+def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's error envelope.
+
+    ``emitted_ct`` decides which family to correct within: a service that
+    answered an XML envelope gets the XML value for its protocol, a JSON
+    envelope gets the JSON value. Returns None when there is nothing
+    evidence-backed to enforce (unknown service, non-envelope type, or a
+    protocol ministack does not wire-map, e.g. declared-cbor services it
+    serves as query-compatible JSON).
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    families = _JSON_FAMILY | _XML_FAMILY
+    if base in families and service in _WIRE_CT_OVERRIDE:
+        return _WIRE_CT_OVERRIDE[service]
+
+    model = _service_model(service)
+    if model is None:
+        return None
+    protocol = model.metadata.get("protocol")
+
+    if base in _JSON_FAMILY:
+        if protocol == "json":
+            version = model.metadata.get("jsonVersion") or "1.0"
+            return f"application/x-amz-json-{version}"
+        if protocol == "rest-json":
+            return "application/json"
+        return None
+    if base in _XML_FAMILY:
+        if protocol == "query":
+            return "text/xml"
+        if protocol == "ec2":
+            return "text/xml;charset=UTF-8"
+        if protocol == "rest-xml":
+            return "text/xml"  # s3's application/xml is the override above
+    return None
+
+
+def fix_error_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when an error envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to error responses: the captures that drive this table are
+    error probes, and success payloads (e.g. an S3 object that happens to
+    be JSON) must never be rewritten.
+    """
+    if status < 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_error_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
 
 
 def now_iso() -> str:

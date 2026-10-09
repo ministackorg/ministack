@@ -127,7 +127,10 @@ def _legacy_resource_arn_for_region(resource_arn, account_id, region):
 
 def _json_err(code, message, status=400):
     body = json.dumps({"message": message, "name": code}).encode("utf-8")
-    headers = {"Content-Type": "application/json", "x-amzn-errortype": code}
+    # Evidence: real AWS wire capture — SESv2 answers errors with
+    # application/x-amz-json-1.1, not application/json like most rest-json
+    # services.
+    headers = {"Content-Type": "application/x-amz-json-1.1", "x-amzn-errortype": code}
     return status, headers, body
 
 

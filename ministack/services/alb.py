@@ -597,6 +597,16 @@ def _describe_lbs(params):
         if not results:
             return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)
     if name_filter:
+        # AWS validates the name before checking existence — evidence: real
+        # AWS wire capture answered ValidationError for a name over 32
+        # chars.
+        for name in name_filter:
+            if len(name) > 32:
+                return _error(
+                    "ValidationError",
+                    f"The load balancer name '{name}' cannot be longer than '32' characters",
+                    400,
+                )
         results = [lb for lb in results if lb["LoadBalancerName"] in name_filter]
         if not results:
             return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)

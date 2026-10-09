@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Error envelope Content-Types now match AWS per protocol** — real AWS picks an error's `Content-Type` from the service's protocol, and services disagree: `application/x-amz-json-1.1` for jsonVersion-1.1 services (Kinesis, KMS, Secrets Manager, Athena, Cognito, EventBridge, WAFv2, CloudWatch Logs) vs `1.0` (DynamoDB, Step Functions, SQS); `text/xml` for query services (IAM, SNS, RDS, CloudFormation) and `text/xml;charset=UTF-8` for EC2; `application/json` for rest-json (Lambda, AppSync, API Gateway) vs `application/x-amz-json-1.1` for SESv2; `text/xml` for rest-xml except S3's `application/xml`. Errors are now normalized at dispatch using the botocore service model plus wire-captured quirks. Evidence: real AWS wire captures diffed per probe (7/28 → 23/28 probes conforming).
+- **Unimplemented services no longer answered by S3** — a request whose SigV4 credential scope names a real AWS service MiniStack does not implement (e.g. Glacier, Pinpoint, Route53 Resolver) used to fall through to the S3 path catch-all and return `NoSuchBucket`. It now surfaces as `Unsupported service: <name>`. Evidence: same conformance run — `describe_vault`/`get_app` previously returned an S3 error body.
+- **CloudFormation error namespace** — `ErrorResponse` xmlns was `doc/2010-05-08/`; AWS emits `doc/2010-05-15/` (matches the botocore apiVersion).
+- **SESv2 error Content-Type** — errors now answer `application/x-amz-json-1.1`, matching the AWS capture (most rest-json services answer `application/json`; SESv2 does not).
+- **EC2 `DescribeInstances` validates ID format before existence** — a malformed `InstanceId` (e.g. `i-0000000000000000x`) now returns `InvalidInstanceID.Malformed`, matching the AWS capture; a well-formed unknown id still returns `InvalidInstanceID.NotFound`.
+- **ELBv2 `DescribeLoadBalancers` validates name length before existence** — a `Names` entry over 32 characters returns `ValidationError`, matching the AWS capture.
+- **WAFv2 `GetWebACL` validates the `Id` shape before existence** — a non-UUID or >36-char `Id` returns `ValidationException` listing the failed constraints, matching the AWS capture; a well-formed unknown id still returns `WAFNonexistentItemException`.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added

@@ -1884,3 +1884,15 @@ def test_abandoned_login_attempts_are_pruned_after_the_15_minute_bound():
     assert status == 302
     assert "stale-1" not in alb._oidc_pending, "abandoned attempt survived the prune"
     assert "fresh-1" in alb._oidc_pending, "a live attempt must not be pruned"
+
+
+def test_alb_describe_lbs_validates_name_length_before_existence(elbv2):
+    """AWS validates the Names filter before lookup — evidence: real AWS
+    wire capture answered ValidationError for a name over 32 chars."""
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=["x" * 33])
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=["definitely-not-there"])
+    assert exc.value.response["Error"]["Code"] == "LoadBalancerNotFound"

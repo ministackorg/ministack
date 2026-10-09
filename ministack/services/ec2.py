@@ -92,6 +92,10 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # for a systemd guest). Parsed by _parse_ec2_docker_flags; --init is refused.
 EC2_DOCKER_FLAGS = os.environ.get("EC2_DOCKER_FLAGS", "")
 
+# AWS instance IDs are i- + 8 or 17 lowercase hex chars — malformed IDs are
+# rejected before any existence check.
+_INSTANCE_ID_RE = re.compile(r"^i-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
+
 # Docker client, created on first use. Only registered images reach for it, so
 # an emulator nobody registered an AMI with never imports docker-py at all.
 _docker = None
@@ -940,6 +944,11 @@ def _describe_instances(p):
 
     if filter_ids:
         for iid in filter_ids:
+            # AWS validates the ID format before checking existence —
+            # evidence: real AWS wire capture answered
+            # InvalidInstanceID.Malformed for a non-hex id.
+            if not _INSTANCE_ID_RE.match(iid):
+                return _error("InvalidInstanceID.Malformed", f'Invalid id: "{iid}"', 400)
             if iid not in _instances:
                 return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
 

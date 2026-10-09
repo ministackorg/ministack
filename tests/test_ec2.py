@@ -4742,3 +4742,15 @@ def test_ec2_cross_account_ami_sharing():
     assert f"Not authorized for image:{ami}" in exc.value.response["Error"]["Message"]
 
     owner.deregister_image(ImageId=ami)
+
+
+def test_ec2_describe_instances_validates_id_format_before_existence(ec2):
+    """AWS rejects a malformed instance ID before checking existence —
+    evidence: real AWS wire capture answered InvalidInstanceID.Malformed."""
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-0000000000000000x"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.Malformed"
+
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-00000000000000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
