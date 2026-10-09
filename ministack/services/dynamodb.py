@@ -24,8 +24,10 @@ import gzip
 import io
 import json
 import logging
+import math
 import os
 import re
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -341,6 +343,23 @@ def _ddb_canonicalize_number(s: str) -> str | None:
     return sign_str + text
 
 
+_NESTING_MSG = ("Nesting Levels have exceeded supported limits: "
+                "Attributes in the item have nested levels beyond supported limit")
+
+
+def _nesting_exceeded(value, depth: int = 1) -> bool:
+    if depth > _DDB_MAX_NESTING_DEPTH:
+        return True
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    (vtype, vval), = value.items()
+    if vtype == "M" and isinstance(vval, dict):
+        return any(_nesting_exceeded(v, depth + 1) for v in vval.values())
+    if vtype == "L" and isinstance(vval, list):
+        return any(_nesting_exceeded(v, depth + 1) for v in vval)
+    return False
+
+
 def _validate_attribute_value(attr_name: str, value: dict, _depth: int = 1) -> tuple | None:
     """Recursively validate a single attribute value. Returns an error response
     tuple if invalid, or None if OK. May mutate `value` to canonicalize numbers.
@@ -348,8 +367,7 @@ def _validate_attribute_value(attr_name: str, value: dict, _depth: int = 1) -> t
     recursing. AWS enforces a maximum nesting depth of 32 levels.
     """
     if _depth > _DDB_MAX_NESTING_DEPTH:
-        return error_response_json("ValidationException",
-            "One or more parameter values were invalid: document path length exceeded limit", 400)
+        return error_response_json("ValidationException", _NESTING_MSG, 400)
     if not isinstance(value, dict) or not value:
         return error_response_json("ValidationException",
             "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes", 400)
@@ -426,7 +444,7 @@ def _validate_attribute_value(attr_name: str, value: dict, _depth: int = 1) -> t
                     "One or more parameter values were invalid: Binary set element must be binary type", 400)
             if key in seen:
                 return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
+                    f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}]of type BS contains duplicates.", 400)
             seen.add(key)
     elif vtype == "L":
         if not isinstance(vval, list):
@@ -467,9 +485,7 @@ def _attribute_value_size(value: dict) -> int:
     if vtype == "S":
         return len(vval.encode("utf-8")) if isinstance(vval, str) else 0
     if vtype == "N":
-        # Strip sign, decimal, leading zeros for digit count.
-        s = (vval or "").lstrip("-").replace(".", "").lstrip("0") or "0"
-        return 1 + (len(s) + 1) // 2
+        return _number_size_bytes(vval)
     if vtype == "B":
         if isinstance(vval, bytes):
             return len(vval)
@@ -483,11 +499,7 @@ def _attribute_value_size(value: dict) -> int:
     if vtype == "SS":
         return sum(len(s.encode("utf-8")) for s in vval if isinstance(s, str))
     if vtype == "NS":
-        total = 0
-        for n in vval:
-            s = (n or "").lstrip("-").replace(".", "").lstrip("0") or "0"
-            total += 1 + (len(s) + 1) // 2
-        return total
+        return sum(_number_size_bytes(n) for n in vval)
     if vtype == "BS":
         total = 0
         for b in vval:
@@ -532,6 +544,28 @@ def _paginate_evaluated_items(items, limit, table, index_name=None):
     return page, False
 
 
+def _number_size_bytes(text) -> int:
+    """Base-100 digit pairs aligned on the decimal point, plus 1, plus 1 if negative."""
+    s = str(text).strip()
+    negative = s.startswith("-")
+    s = s.lstrip("+-")
+    mantissa, _, exp_text = s.lower().partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = whole + fraction
+    if not digits.isdigit() or (exp_text and not exp_text.lstrip("+-").isdigit()):
+        return 1
+    exponent = (int(exp_text) if exp_text else 0) - len(fraction)
+    stripped = digits.lstrip("0").rstrip("0")
+    if not stripped:
+        return 1
+    exponent += len(digits.lstrip("0")) - len(stripped)
+    if exponent % 2:
+        stripped += "0"
+    if len(stripped) % 2:
+        stripped = "0" + stripped
+    return 1 + len(stripped) // 2 + (1 if negative else 0)
+
+
 def _item_size_bytes(item: dict) -> int:
     total = 0
     if not isinstance(item, dict):
@@ -542,21 +576,34 @@ def _item_size_bytes(item: dict) -> int:
     return total
 
 
-def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None = None) -> tuple | None:
-    """Validate a full item: each attribute, then total size cap. Mutates
-    Number values to canonical form."""
-    if not isinstance(item, dict):
-        return error_response_json("ValidationException",
-            "Item must be a structure", 400)
-    for name, value in item.items():
-        # Empty string/binary not allowed for hash/sort key attributes
-        if name in (pk_name, sk_name):
-            err = _empty_key_value_error(name, value)
-            if err:
-                return err
-        err = _validate_attribute_value(name, value)
-        if err:
-            return err
+_ITEM_SIZE_MSG = "Item size has exceeded the maximum allowed size"
+_UPDATE_SIZE_MSG = "Item size to update has exceeded the maximum allowed size"
+
+
+def _update_statement_size(item: dict, expr: str, attr_names: dict) -> int:
+    """UpdateItem's size: the top-level attributes it writes plus 3, 19 per SET/ADD
+    action (20 through a list index) and 2 per REMOVE/DELETE action."""
+    clauses = []
+    for tok in _tokenize(expr):
+        if tok[0] == "IDENT" and tok[1].upper() in ("SET", "REMOVE", "ADD", "DELETE"):
+            clauses.append((tok[1].upper(), []))
+        elif tok[0] != "EOF" and clauses:
+            clauses[-1][1].append(tok)
+    size = 3
+    written = set()
+    for clause, tokens in clauses:
+        for action in _split_by_comma(tokens):
+            path = _parse_path_from_tokens(action, attr_names or {})
+            if not path:
+                continue
+            size += 19 if clause in ("SET", "ADD") else 2
+            if clause == "SET" and any(isinstance(p, int) for p in path):
+                size += 1
+            written.add(path[0])
+    return size + sum(len(n.encode("utf-8")) + _attribute_value_size(item[n]) for n in written if n in item)
+
+
+def _key_length_error(item: dict, pk_name: str | None, sk_name: str | None) -> tuple | None:
     # Key attribute value length limits: partition key max 2048 bytes, sort key max 1024 bytes.
     for key_name, max_bytes in ((pk_name, _DDB_KEY_MAX_BYTES), (sk_name, _DDB_SORT_KEY_MAX_BYTES)):
         if not key_name or key_name not in item:
@@ -577,10 +624,30 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
             return error_response_json("ValidationException",
                 "One or more parameter values were invalid: Aggregated size of all range keys has exceeded the size limit of 1024 bytes" if key_name == sk_name else
                 "One or more parameter values were invalid: Aggregated size of all hash keys has exceeded the size limit of 2048 bytes", 400)
-    size = _item_size_bytes(item)
-    if size > _DDB_ITEM_MAX_BYTES:
+    return None
+
+
+def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None = None,
+                   size_msg: str = _ITEM_SIZE_MSG) -> tuple | None:
+    """Validate a full item: each attribute, then total size cap. Mutates
+    Number values to canonical form."""
+    if not isinstance(item, dict):
         return error_response_json("ValidationException",
-            "Item size has exceeded the maximum allowed size", 400)
+            "Item must be a structure", 400)
+    for name, value in item.items():
+        # Empty string/binary not allowed for hash/sort key attributes
+        if name in (pk_name, sk_name):
+            err = _empty_key_value_error(name, value)
+            if err:
+                return err
+        err = _validate_attribute_value(name, value)
+        if err:
+            return err
+    err = _key_length_error(item, pk_name, sk_name)
+    if err:
+        return err
+    if _item_size_bytes(item) > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException", size_msg, 400)
     return None
 
 # DynamoDB Streams: table_name -> list of stream records
@@ -944,6 +1011,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "RestoreTableFromBackup": _restore_table_from_backup,
         "RestoreTableToPointInTime": _restore_table_to_point_in_time,
         "DescribeLimits": _describe_limits,
+        "SearchVectors": _search_vectors,
     }
 
     handler = handlers.get(action)
@@ -1040,7 +1108,7 @@ def _multi_validation_error(failures: list[tuple]) -> tuple | None:
         f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
 
 
-def _check_per_op_param_enums(data: dict, rv_allowed: set | None) -> tuple | None:
+def _check_per_op_param_enums(data: dict, rv_allowed: set | None, first_only: bool = False) -> tuple | None:
     """Collect every enum-style validation error in one envelope so the
     'reports X and Y together' conformance tests match AWS exactly."""
     failures: list[tuple] = []
@@ -1053,7 +1121,7 @@ def _check_per_op_param_enums(data: dict, rv_allowed: set | None) -> tuple | Non
     ricm = data.get("ReturnItemCollectionMetrics")
     if ricm is not None and ricm not in _RETURN_ITEM_COLLECTION_METRICS:
         failures.append((ricm, "returnItemCollectionMetrics", "Member must satisfy enum value set: [NONE, SIZE]"))
-    return _multi_validation_error(failures)
+    return _multi_validation_error(failures[:1] if first_only else failures)
 
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
@@ -1151,6 +1219,11 @@ def _create_table(data):
     err = _validate_table_name(name)
     if err:
         return err
+    vector_indexes = data.get("VectorIndexes") or []
+    for position, vix in enumerate(vector_indexes, start=1):
+        err = _vector_index_request_error(vix, f"vectorIndexes.{position}.member")
+        if err:
+            return err
     if name in _tables:
         return error_response_json("ResourceInUseException", f"Table already exists: {name}", 400)
 
@@ -1202,7 +1275,7 @@ def _create_table(data):
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must be greater than zero", 400)
     elif pt is not None:
         return error_response_json("ValidationException",
-            "One or more parameter values were invalid: ProvisionedThroughput should not be specified when BillingMode is PAY_PER_REQUEST", 400)
+            "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST", 400)
 
     gsis = copy.deepcopy(data.get("GlobalSecondaryIndexes", []))
     lsis = copy.deepcopy(data.get("LocalSecondaryIndexes", []))
@@ -1223,7 +1296,7 @@ def _create_table(data):
 
     # Duplicate-index-name detection across LSI + GSI.
     seen_index_names = set()
-    for idx in lsis + gsis:
+    for idx in lsis + gsis + vector_indexes:
         iname = idx.get("IndexName")
         if iname and iname in seen_index_names:
             return error_response_json("ValidationException",
@@ -1241,7 +1314,7 @@ def _create_table(data):
                 f"One or more parameter values were invalid: Unknown ProjectionType: {ptype}", 400)
         if ptype == "INCLUDE" and not proj.get("NonKeyAttributes"):
             return error_response_json("ValidationException",
-                "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
+                "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified", 400)
         if ptype == "KEYS_ONLY" and proj.get("NonKeyAttributes"):
             return error_response_json("ValidationException",
                 "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
@@ -1250,7 +1323,7 @@ def _create_table(data):
     stream_spec = data.get("StreamSpecification")
     if stream_spec and stream_spec.get("StreamEnabled") is False and stream_spec.get("StreamViewType"):
         return error_response_json("ValidationException",
-            "One or more parameter values were invalid: StreamViewType can only be specified when StreamEnabled is true", 400)
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified", 400)
 
     # Every attribute referenced in any index KeySchema must be in AttributeDefinitions.
     referenced_attrs = set()
@@ -1260,6 +1333,11 @@ def _create_table(data):
         for idx in idx_group:
             for k in idx.get("KeySchema") or []:
                 referenced_attrs.add(k.get("AttributeName"))
+    err = _vector_indexes_error(vector_indexes, [], billing_mode, seen_attr_names)
+    if err:
+        return err
+    for vix in vector_indexes:
+        referenced_attrs |= _vector_search_attrs(vix)
     for ad_name in referenced_attrs:
         if ad_name not in seen_attr_names:
             return error_response_json("ValidationException",
@@ -1309,6 +1387,8 @@ def _create_table(data):
         "SSEDescription": _sse_description_from_spec(data.get("SSESpecification")),
         "DeletionProtectionEnabled": data.get("DeletionProtectionEnabled", False),
     }
+    if vector_indexes:
+        _tables[name]["VectorIndexes"] = [_vector_index_record(name, v, online=False) for v in vector_indexes]
     # TableClass round-trip — DescribeTable echoes the configured class via
     # TableClassSummary (real AWS shape).
     if table_class:
@@ -1340,6 +1420,10 @@ def _delete_table(data):
     if _tables[name].get("DeletionProtectionEnabled"):
         return error_response_json("ValidationException",
             "Table is protected against deletion. To delete the table, disable deletion protection.", 400)
+    if any(_vector_phase(v) != "active" for v in _tables[name].get("VectorIndexes") or []):
+        return error_response_json("ResourceInUseException",
+            "Attempt to change a resource which is still in use: Cannot delete table while indexes are being "
+            "created, updated, or deleted.", 400)
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
     remaining = [r for r in _replica_group(_tables[name]) if r != get_region()]
@@ -1492,7 +1576,7 @@ def _update_table(data):
     _ACTIONABLE_UPDATE_PARAMS = (
         "ProvisionedThroughput", "BillingMode", "GlobalSecondaryIndexUpdates",
         "StreamSpecification", "SSESpecification", "ReplicaUpdates", "TableClass",
-        "OnDemandThroughput", "DeletionProtectionEnabled", "WarmThroughput",
+        "OnDemandThroughput", "DeletionProtectionEnabled", "WarmThroughput", "VectorIndexUpdates",
     )
     if not any(k in data for k in _ACTIONABLE_UPDATE_PARAMS):
         return error_response_json("ValidationException",
@@ -1502,6 +1586,9 @@ def _update_table(data):
 
     current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
     new_billing = data.get("BillingMode")
+    err = _apply_vector_index_updates(name, table, data, new_billing or current_billing)
+    if err:
+        return err
     # ProvisionedThroughput validation when supplied.
     pt = data.get("ProvisionedThroughput")
     if pt is not None:
@@ -1632,6 +1719,8 @@ def _update_table(data):
     for idx in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
         for ks in idx.get("KeySchema", []):
             referenced.add(ks.get("AttributeName"))
+    for vix in table.get("VectorIndexes") or []:
+        referenced |= _vector_search_attrs(vix)
     table["AttributeDefinitions"] = [
         ad for ad in table.get("AttributeDefinitions", [])
         if ad["AttributeName"] in referenced
@@ -1665,6 +1754,10 @@ def _table_description(name):
         desc["GlobalSecondaryIndexes"] = t["GlobalSecondaryIndexes"]
     if t.get("LocalSecondaryIndexes"):
         desc["LocalSecondaryIndexes"] = t["LocalSecondaryIndexes"]
+    if t.get("VectorIndexes"):
+        desc["VectorIndexes"] = [_vector_index_description(v) for v in t["VectorIndexes"]]
+        if desc["TableStatus"] == "ACTIVE" and any(_vector_phase(v) == "allocating" for v in t["VectorIndexes"]):
+            desc["TableStatus"] = "UPDATING"
     if t.get("StreamSpecification"):
         desc["StreamSpecification"] = t["StreamSpecification"]
         desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
@@ -1735,17 +1828,48 @@ def _validate_projection_expression_syntax(expr: str) -> str | None:
     return None
 
 
+def _projection_overlap_error(expr: str, attr_names: dict) -> str | None:
+    """AWS rejects a ProjectionExpression whose paths overlap (equal, or one a
+    prefix of another), on the paths after alias resolution, naming the first
+    overlapping pair in request order."""
+    paths = [_parse_projection_path(p, attr_names or {}) for p in expr.split(",") if p.strip()]
+    for j, later in enumerate(paths):
+        for earlier in paths[:j]:
+            n = min(len(earlier), len(later))
+            if earlier[:n] == later[:n]:
+                def show(path):
+                    return "[" + ", ".join(f"[{v}]" if kind == "index" else str(v) for kind, v in path) + "]"
+                return ("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                        f"must remove or rewrite one of these paths; path one: {show(earlier)}, path two: {show(later)}")
+    return None
+
+
+def _projection_overlap_response(data) -> tuple | None:
+    expr = (data.get("ProjectionExpression") or "").strip()
+    message = _projection_overlap_error(expr, data.get("ExpressionAttributeNames")) if expr else None
+    return error_response_json("ValidationException", message, 400) if message else None
+
+
+def _expression_size_error(data, expression_fields: tuple) -> tuple | None:
+    """Each expression is capped at 4096 bytes of its raw text."""
+    for fname in expression_fields:
+        body = data.get(fname) or ""
+        size = len(body.encode("utf-8")) if isinstance(body, str) else 0
+        if size > _DDB_EXPR_MAX_BYTES:
+            return error_response_json("ValidationException",
+                f"Invalid {fname}: Expression size has exceeded the maximum allowed size; expression size: {size}", 400)
+    return None
+
+
 def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
     """AWS rejects ExpressionAttributeValues / ExpressionAttributeNames when
     no expression field references them at all, AND when any defined alias
     isn't used by any of the expressions, AND when any `:foo` or `#bar`
     referenced by an expression isn't defined."""
     # Expression string length limit: 4096 bytes each.
-    for fname in expression_fields:
-        body = data.get(fname) or ""
-        if body and len(body.encode("utf-8")) > _DDB_EXPR_MAX_BYTES:
-            return error_response_json("ValidationException",
-                f"Invalid {fname}: expression size exceeds maximum allowed size of {_DDB_EXPR_MAX_BYTES} bytes", 400)
+    err = _expression_size_error(data, expression_fields)
+    if err:
+        return err
     has_any_expr = any(data.get(f) for f in expression_fields)
     eav = data.get("ExpressionAttributeValues")
     ean = data.get("ExpressionAttributeNames")
@@ -1923,7 +2047,7 @@ def _get_item(data):
         _pe_err = _validate_projection_expression_syntax(_pe)
         if _pe_err:
             return error_response_json("ValidationException", _pe_err, 400)
-    err = _validate_expression_attrs(data, ("ProjectionExpression",))
+    err = _validate_expression_attrs(data, ("ProjectionExpression",)) or _projection_overlap_response(data)
     if err:
         return err
 
@@ -2007,7 +2131,8 @@ def _update_item(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
-    err = _check_per_op_param_enums(data, _UPDATE_RV_VALUES)
+    # UpdateItem stops at the first invalid enum, unlike the other writes.
+    err = _check_per_op_param_enums(data, _UPDATE_RV_VALUES, first_only=True)
     if err:
         return err
     table = _tables.get(name)
@@ -2028,6 +2153,8 @@ def _update_item(data):
     err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
     if err:
         return err
+    if any(_nesting_exceeded(v) for v in (data.get("ExpressionAttributeValues") or {}).values()):
+        return error_response_json("ValidationException", f"1 validation error detected: {_NESTING_MSG}", 400)
 
     key = data.get("Key", {})
     pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -2106,9 +2233,11 @@ def _update_item(data):
                     f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
 
     # AWS rejects updates with invalid values
-    err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+    err = _validate_item(item, table.get("pk_name"), table.get("sk_name"), _UPDATE_SIZE_MSG)
     if err:
         return err
+    if update_expr and _update_statement_size(item, update_expr, ean) > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
     # Validate GSI/LSI key attribute types and values after the update is applied.
     err = _validate_index_key_values(table, item, update_expr=bool(data.get("UpdateExpression")))
     if err:
@@ -2179,7 +2308,8 @@ def _query(data):
                     return error_response_json("ValidationException", _err, 400)
             except Exception:
                 pass
-    err = _validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
+    err = (_validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
+           or _projection_overlap_response(data))
     if err:
         return err
 
@@ -2244,7 +2374,7 @@ def _query(data):
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
-            "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
+            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
     index = _index_def(table, index_name) if index_name else None
@@ -2471,6 +2601,9 @@ def _scan(data):
     if idx_req:
         known = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])} | \
                 {l["IndexName"] for l in table.get("LocalSecondaryIndexes", [])}
+        if idx_req in {v["IndexName"] for v in table.get("VectorIndexes") or []}:
+            return error_response_json("ValidationException",
+                "Scan operation not supported on this index type", 400)
         if idx_req not in known:
             return error_response_json("ValidationException",
                 f"The table does not have the specified index: {idx_req}", 400)
@@ -2495,7 +2628,7 @@ def _scan(data):
             if _t and _t not in ("S", "B"):
                 return error_response_json("ValidationException",
                     f"Invalid FilterExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {_t}", 400)
-    err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression"))
+    err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression")) or _projection_overlap_response(data)
     if err:
         return err
 
@@ -2515,7 +2648,7 @@ def _scan(data):
     # Limit must be > 0 when provided (AWS rejects Limit=0).
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{int(limit)}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -2541,10 +2674,10 @@ def _scan(data):
         # equal to 0" floor — distinct from the segment>=totalSegments error.
         if seg < 0:
             return error_response_json("ValidationException",
-                f"1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0", 400)
+                "1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0", 400)
         if seg >= ts:
             return error_response_json("ValidationException",
-                f"The Segment parameter is zero-based and must be less than parameter TotalSegments: Segment: {seg} is not less than TotalSegments: {ts}", 400)
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments", 400)
     # Select validation per AWS (messages measured against real DynamoDB by
     # paritysuite — Scan reuses the Query-worded IndexName message verbatim).
     if "Select" in data and data.get("ProjectionExpression"):
@@ -2562,7 +2695,7 @@ def _scan(data):
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
-            "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
+            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES", 400)
     # ConsistentRead on a GSI is invalid.
     if index_name and data.get("ConsistentRead"):
         _, _, is_gsi_scan = _resolve_index_keys(table, index_name)
@@ -2618,7 +2751,7 @@ def _scan(data):
             required.update(idx_hashes + idx_ranges)
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
-                "The provided starting key is invalid: The provided key element does not match the schema", 400)
+                "The provided starting key is invalid", 400)
         if index_name:
             # For index scans, use index-aware ordering (same as Query pagination).
             all_items = _apply_exclusive_start_key(
@@ -2734,14 +2867,17 @@ def _partiql_select_index(table, parsed, data):
     gsis = {i.get("IndexName"): (i, True) for i in table.get("GlobalSecondaryIndexes", []) or []}
     lsis = {i.get("IndexName"): (i, False) for i in table.get("LocalSecondaryIndexes", []) or []}
     idx, is_gsi = (gsis.get(index_name) or lsis.get(index_name) or (None, None))
+    if idx is None and index_name in {v["IndexName"] for v in table.get("VectorIndexes") or []}:
+        return error_response_json("ValidationException",
+            "Scan operation not supported on this index type", 400)
     if idx is None:
         return error_response_json("ValidationException",
-            f"The table does not have the specified index: {index_name}", 400)
+            "The table does not have the specified index", 400)
 
     consistent = bool(data.get("ConsistentRead"))
     if consistent and is_gsi:
         return error_response_json("ValidationException",
-            "Consistent reads are not supported on global secondary indexes", 400)
+            "Strongly consistent read is not supported on Global Secondary Indexes", 400)
     rate = 1.0 if consistent else 0.5
 
     key_names = [ks.get("AttributeName") for ks in idx.get("KeySchema", []) or []]
@@ -2757,10 +2893,11 @@ def _partiql_select_index(table, parsed, data):
     conditions = parsed.get("conditions") or []
     keyed = any(attr in key_names for attr, _op, _v in conditions)
     if keyed and view_attrs is not None:
-        for attr, _op, _v in conditions:
-            if attr not in view_attrs:
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Filter expression can only contain non-primary key attributes projected into the index: {attr}", 400)
+        unprojected_filters = list(dict.fromkeys(a for a, _op, _v in conditions if a not in view_attrs))
+        if unprojected_filters:
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: Secondary index {index_name} does not project "
+                f"one or more filter attributes: [{', '.join(unprojected_filters)}]", 400)
 
     projections = parsed.get("projections")
     reach_back = False
@@ -2769,7 +2906,7 @@ def _partiql_select_index(table, parsed, data):
         if unprojected:
             if is_gsi:
                 return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Global secondary index {index_name} does not project {unprojected}", 400)
+                    f"One or more parameter values were invalid: Global secondary index {index_name} does not project [{', '.join(unprojected)}]", 400)
             reach_back = True
 
     def _index_view(item):
@@ -2905,6 +3042,8 @@ def _partiql_insert(table, parsed):
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
         return error_response_json("DuplicateItemException",
                                    "Duplicate primary key exists in table", 400)
+    if _item_size_bytes(item) > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException", _ITEM_SIZE_MSG, 400)
     _set_item(table, pk_val, sk_val, item)
     return json_response({})
 
@@ -3204,6 +3343,8 @@ def _partiql_update(table, parsed):
             return error_response_json("ValidationException", str(exc), 400)
         _partiql_remove_path(work, parts)
         applied_paths.append(parts)
+    if _item_size_bytes(work) > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
     # Nothing failed — commit the working copy.
     _set_item(table, pk_key, sk_key, work)
     item_after = work
@@ -3232,7 +3373,7 @@ def _partiql_delete(table, parsed):
         r = returning.upper().strip()
         if r not in ("ALL OLD *",):
             return error_response_json("ValidationException",
-                "Only RETURNING ALL OLD * is allowed in DELETE statements", 400)
+                f"Invalid returning clause: RETURNING {returning.strip()}. Only RETURNING ALL OLD * is allowed in DELETE statements.", 400)
 
     pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
     if err:
@@ -3410,21 +3551,21 @@ def _execute_transaction(data):
     # Parse every statement and detect duplicate-INSERT pre-emptively so the
     # whole transaction is rejected (matches AWS semantics — all-or-nothing).
     parsed_list = []
-    for stmt in statements:
+    for stmt_index, stmt in enumerate(statements):
         statement = stmt.get("Statement", "")
         parameters = stmt.get("Parameters", [])
         # RETURNING clause is not allowed in transaction statements.
         import re as _re2
         if _re2.search(r'\s+RETURNING\s+', statement, _re2.IGNORECASE):
             return error_response_json("ValidationException",
-                "RETURNING clause is not supported in ExecuteTransaction", 400)
+                f"Validation failed in TransactStatements[{stmt_index}]: RETURNING clause is not supported in ExecuteTransaction.", 400)
         try:
             parsed = _parse_partiql(statement, parameters)
         except ValueError as e:
             return error_response_json("ValidationException", str(e), 400)
         if parsed.get("op") == "SELECT" and parsed.get("index"):
             return error_response_json("ValidationException",
-                "Reads on indices are not supported within transactions", 400)
+                f"Validation failed in TransactStatements[{stmt_index}]: Reads on indices are not supported within transactions.", 400)
         table = _tables.get(parsed["table"])
         if not table:
             return error_response_json("ResourceNotFoundException",
@@ -3534,8 +3675,25 @@ def _parse_partiql(statement, parameters):
         raise ValueError(f"Unsupported PartiQL statement: {s[:20]}")
 
 
+def _partiql_from_path_error(s):
+    """AWS checks the FROM path before resolving it: no empty component, at most two."""
+    import re
+    m = re.search(r'\bFROM\s+((?:"[^"]*"|[A-Za-z0-9_\-]+)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z0-9_\-]+))*)', s, re.IGNORECASE)
+    if not m:
+        return None
+    components = re.findall(r'"[^"]*"|[A-Za-z0-9_\-]+', m.group(1))
+    if any(c == '""' for c in components):
+        return "Path component cannot be an empty string"
+    if len(components) > 2:
+        return "A path may contain at most 2 components in the FROM clause"
+    return None
+
+
 def _parse_partiql_select(s, parameters):
     import re
+    path_error = _partiql_from_path_error(s)
+    if path_error:
+        raise ValueError(path_error)
     # SELECT <projections> FROM <table> [WHERE <condition>]
     m = re.match(
         r'SELECT\s+(.*?)\s+FROM\s+("?[A-Za-z0-9_.\-]+"?(?:\s*\.\s*"[A-Za-z0-9_.\-]+")?)(?:\s+WHERE\s+(.+))?$',
@@ -4035,6 +4193,9 @@ def _accumulate_write_capacity(cap, table, old_item, new_item):
             u = _index_write_units(table, idx, old_item, new_item)
             if u:
                 cap[key][idx["IndexName"]] = cap[key].get(idx["IndexName"], 0.0) + u
+    for index_name, size in _vector_write_bytes(table, old_item, new_item).items():
+        vector = cap.setdefault("vector", {})
+        vector[index_name] = vector.get(index_name, 0.0) + size
 
 
 def _batch_write_item(data):
@@ -4042,7 +4203,7 @@ def _batch_write_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
         return error_response_json("ValidationException",
-            "The requestItems parameter is required for BatchWriteItem", 400)
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     # Total request count cap (25 per BatchWriteItem call).
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
@@ -4144,6 +4305,8 @@ def _batch_write_item(data):
                     entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["gsi"].items()}
                 if cap["lsi"]:
                     entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["lsi"].items()}
+                if cap.get("vector"):
+                    entry["VectorIndexes"] = {n: {"VectorWriteRequestBytes": b} for n, b in cap["vector"].items()}
             consumed.append(entry)
         result["ConsumedCapacity"] = consumed
     return json_response(result)
@@ -4153,7 +4316,7 @@ def _batch_get_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
         return error_response_json("ValidationException",
-            "The requestItems parameter is required for BatchGetItem", 400)
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     # Per-table key cap (100 per BatchGetItem call, per-table path in the error).
     for _bg_table_name, _bg_cfg in request_items.items():
         _bg_keys = _bg_cfg.get("Keys", [])
@@ -4178,6 +4341,16 @@ def _batch_get_item(data):
                 return error_response_json("ValidationException",
                     "Provided list of item keys contains duplicates", 400)
             seen.add(key_repr)
+    # One bad entry rejects the whole batch, and expression and non-expression
+    # projections cannot be mixed even across tables.
+    configs = [c for c in request_items.values() if isinstance(c, dict)]
+    if any(c.get("ProjectionExpression") for c in configs) and any(c.get("AttributesToGet") for c in configs):
+        return error_response_json("ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
+    for config in configs:
+        err = _projection_overlap_response(config)
+        if err:
+            return err
     responses = {}
     unprocessed = {}
     for table_name, config in request_items.items():
@@ -4188,9 +4361,6 @@ def _batch_get_item(data):
         responses[table_name] = []
         proj = config.get("ProjectionExpression")
         atg = config.get("AttributesToGet")
-        if proj and atg:
-            return error_response_json("ValidationException",
-                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
         config_ean = config.get("ExpressionAttributeNames", {})
         for key in config.get("Keys", []):
             pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -4222,6 +4392,17 @@ def _transact_write_items(data):
     if len(items_list) > _DDB_TXN_WRITE_MAX_ITEMS:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '[{', '.join(repr(i) for i in items_list)}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_WRITE_MAX_ITEMS}", 400)
+    # An oversized expression in any member rejects the whole request up front.
+    for _member in items_list:
+        for _op in (_member.values() if isinstance(_member, dict) else []):
+            if isinstance(_op, dict):
+                err = _expression_size_error(_op, ("ConditionExpression", "UpdateExpression"))
+                if err:
+                    return err
+                values = list((_op.get("ExpressionAttributeValues") or {}).values())
+                values += list((_op.get("Item") or {}).values()) if isinstance(_op.get("Item"), dict) else []
+                if any(_nesting_exceeded(v) for v in values):
+                    return error_response_json("ValidationException", _NESTING_MSG, 400)
     # 4MB total payload cap.
     try:
         if len(json.dumps(data).encode("utf-8")) > _DDB_TXN_MAX_BYTES:
@@ -4291,7 +4472,7 @@ def _transact_write_items(data):
             # Empty-string/binary secondary-index key -> top-level
             # ValidationException; wrong-typed index keys instead cancel in
             # Phase 1 (measured against real DynamoDB by paritysuite).
-            msg = _index_key_empty_reason(tbl, key_src)
+            msg = _index_key_empty_reason(tbl, key_src) or _vector_write_reason(tbl, key_src)
             if msg:
                 return error_response_json("ValidationException", msg, 400)
         elif op_type == "Update" and op.get("UpdateExpression"):
@@ -4330,7 +4511,9 @@ def _transact_write_items(data):
         key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
         type_msg = _key_type_mismatch_reason(tbl, key_src)
         if type_msg:
-            val_reasons[idx] = type_msg
+            # A Put names the mismatch; a Key-addressed member reports a schema mismatch.
+            val_reasons[idx] = (type_msg if op_type == "Put"
+                                else "The provided key element does not match the schema")
             continue
         if op_type == "Put":
             imsg = _index_key_type_reason(tbl, key_src)
@@ -4352,6 +4535,8 @@ def _transact_write_items(data):
                     imsg = _index_key_type_reason(tbl, probe)
                     if imsg:
                         val_reasons[idx] = imsg
+                    elif _item_size_bytes(probe) > _DDB_ITEM_MAX_BYTES:
+                        val_reasons[idx] = _UPDATE_SIZE_MSG
     if val_reasons:
         return _transact_validation_cancel_response(len(items_list), val_reasons)
 
@@ -4442,6 +4627,7 @@ def _transact_write_items(data):
         write_units = 0.0
         gsi_units: dict = {}
         lsi_units: dict = {}
+        vector_bytes: dict = {}
         for old_it, new_it in effects:
             sz = max(_item_size_bytes(old_it) if old_it else 0,
                      _item_size_bytes(new_it) if new_it else 0)
@@ -4452,6 +4638,8 @@ def _transact_write_items(data):
                     u = _index_write_units(tbl, idx, old_it, new_it)
                     if u:
                         acc[idx["IndexName"]] = acc.get(idx["IndexName"], 0.0) + u
+            for index_name, size in _vector_write_bytes(tbl, old_it, new_it).items():
+                vector_bytes[index_name] = vector_bytes.get(index_name, 0.0) + size
         txn_sizes[tname] = sizes
         if rc != "NONE":
             total = write_units + sum(gsi_units.values()) + sum(lsi_units.values())
@@ -4461,6 +4649,8 @@ def _transact_write_items(data):
                     entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in gsi_units.items()}
                 if lsi_units:
                     entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in lsi_units.items()}
+                if vector_bytes:
+                    entry["VectorIndexes"] = {n: {"VectorWriteRequestBytes": b} for n, b in vector_bytes.items()}
             consumed.append(entry)
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
@@ -5845,7 +6035,10 @@ def _create_backup(data):
         },
         # Stash a deep snapshot of the items so Restore can rebuild the table.
         "_items_snapshot": copy.deepcopy(dict(table.get("items", {}))),
+        "_attribute_definitions": copy.deepcopy(table.get("AttributeDefinitions", [])),
     }
+    if table.get("VectorIndexes"):
+        desc["SourceTableFeatureDetails"]["VectorIndexes"] = [_vector_index_info(v) for v in table["VectorIndexes"]]
     _backups[arn] = desc
     return json_response({"BackupDetails": details})
 
@@ -5926,22 +6119,12 @@ def _restore_table_from_backup(data):
             f"Target table {target} already exists", 400)
     src = desc.get("SourceTableDetails", {})
     feat = desc.get("SourceTableFeatureDetails", {})
-    create_req = {
-        "TableName": target,
-        "KeySchema": src.get("KeySchema", []),
-        "AttributeDefinitions": _tables.get(src.get("TableName"), {}).get("AttributeDefinitions", []),
-        "BillingMode": data.get("BillingModeOverride") or src.get("BillingMode", "PROVISIONED"),
-    }
-    if create_req["BillingMode"] == "PROVISIONED":
-        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
-    if data.get("GlobalSecondaryIndexOverride") is not None:
-        create_req["GlobalSecondaryIndexes"] = data["GlobalSecondaryIndexOverride"]
-    elif feat.get("GlobalSecondaryIndexes"):
-        create_req["GlobalSecondaryIndexes"] = feat["GlobalSecondaryIndexes"]
-    if data.get("LocalSecondaryIndexOverride") is not None:
-        create_req["LocalSecondaryIndexes"] = data["LocalSecondaryIndexOverride"]
-    elif feat.get("LocalSecondaryIndexes"):
-        create_req["LocalSecondaryIndexes"] = feat["LocalSecondaryIndexes"]
+    attr_defs = desc.get("_attribute_definitions") or _tables.get(src.get("TableName"), {}).get("AttributeDefinitions", [])
+    create_req = _restore_create_request(
+        target, src.get("KeySchema", []), attr_defs,
+        data.get("BillingModeOverride") or src.get("BillingMode", "PROVISIONED"),
+        src.get("ProvisionedThroughput"), data,
+        feat.get("GlobalSecondaryIndexes"), feat.get("LocalSecondaryIndexes"), feat.get("VectorIndexes"))
     status, _, body = _create_table(create_req)
     if status != 200:
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
@@ -5975,14 +6158,12 @@ def _restore_table_to_point_in_time(data):
         return error_response_json("TableAlreadyExistsException",
             f"Target table {target} already exists", 400)
     src = _tables[src_name]
-    create_req = {
-        "TableName": target,
-        "KeySchema": src.get("KeySchema", []),
-        "AttributeDefinitions": src.get("AttributeDefinitions", []),
-        "BillingMode": data.get("BillingModeOverride") or src.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
-    }
-    if create_req["BillingMode"] == "PROVISIONED":
-        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    create_req = _restore_create_request(
+        target, src.get("KeySchema", []), src.get("AttributeDefinitions", []),
+        data.get("BillingModeOverride") or src.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+        src.get("ProvisionedThroughput"), data,
+        src.get("GlobalSecondaryIndexes"), src.get("LocalSecondaryIndexes"),
+        [_vector_index_info(v) for v in src.get("VectorIndexes") or []])
     status, _, body = _create_table(create_req)
     if status != 200:
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
@@ -6983,6 +7164,9 @@ def _resolve_table_key_values(table, attrs, allow_extra):
         err = _empty_key_value_error(key_name, raw_value)
         if err:
             return "", "", err
+    err = None if allow_extra else _key_length_error(attrs, table["pk_name"], table["sk_name"])
+    if err:
+        return "", "", err
     pk_val = _extract_key_val(attrs.get(table["pk_name"]))
     sk_val = _extract_key_val(attrs.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
     return pk_val, sk_val, None
@@ -7056,7 +7240,428 @@ def _validate_index_key_values(table: dict, item: dict, update_expr: bool = Fals
     msg = _index_key_empty_reason(table, item, update_expr=update_expr)
     if msg:
         return error_response_json("ValidationException", msg, 400)
+    msg = _vector_write_reason(table, item, update_expr=update_expr)
+    if msg:
+        return error_response_json("ValidationException", msg, 400)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Vector indexes (CreateTable/UpdateTable VectorIndexes, SearchVectors)
+# ---------------------------------------------------------------------------
+
+_VECTOR_MAX_DIMENSIONS = 4096
+_VECTOR_MAX_INDEXES = 5
+_VECTOR_TOPK_MAX = 100
+_VECTOR_WRITE_FLOOR_BYTES = 1024
+# An index added by UpdateTable allocates (table UPDATING, Backfilling false),
+# then backfills (table ACTIVE, Backfilling true), then turns ACTIVE.
+_VECTOR_ALLOCATION_SECONDS = 3.0
+_VECTOR_BACKFILL_SECONDS = 9.0
+_VECTOR_DISTANCE_FUNCTIONS = ("COSINE", "DOT_PRODUCT", "EUCLIDEAN")
+_VECTOR_INVALID = "One or more parameter values were invalid: "
+
+
+def _vector_phase(vix: dict) -> str:
+    """'allocating', 'backfilling' or 'active'."""
+    started = vix.get("_online_since")
+    if started is None:
+        return "active"
+    elapsed = time.time() - started
+    if elapsed < _VECTOR_ALLOCATION_SECONDS:
+        return "allocating"
+    if elapsed < _VECTOR_ALLOCATION_SECONDS + _VECTOR_BACKFILL_SECONDS:
+        return "backfilling"
+    vix.pop("_online_since", None)
+    return "active"
+
+
+def _vector_index_request_error(vix, member: str) -> tuple | None:
+    """Request-model constraints from botocore's CreateVectorIndexAction / VectorIndex."""
+    def bad(field, value, constraint):
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value {value} at '{member}.{field}' "
+            f"failed to satisfy constraint: {constraint}", 400)
+    if not isinstance(vix, dict):
+        return error_response_json("ValidationException", "VectorIndex must be a structure", 400)
+    name = vix.get("IndexName")
+    if not isinstance(name, str) or len(name) < 3:
+        return bad("indexName", f"'{name}'", "Member must have length greater than or equal to 3")
+    if len(name) > 255:
+        return bad("indexName", f"'{name}'", "Member must have length less than or equal to 255")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
+        return bad("indexName", f"'{name}'", "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+    dims = vix.get("Dimensions")
+    if not isinstance(dims, int) or isinstance(dims, bool) or dims < 1:
+        return bad("dimensions", f"'{dims}'", "Member must have value greater than or equal to 1")
+    fn = vix.get("DistanceFunction")
+    if fn not in _VECTOR_DISTANCE_FUNCTIONS:
+        return bad("distanceFunction", f"'{fn}'", "Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]")
+    attr = (vix.get("VectorAttribute") or {}).get("AttributeName")
+    if not isinstance(attr, str) or not attr:
+        return bad("vectorAttribute.attributeName", f"'{attr}'", "Member must have length greater than or equal to 1")
+    ptype = (vix.get("Projection") or {}).get("ProjectionType")
+    if ptype is not None and ptype not in _VALID_PROJECTION_TYPES:
+        return bad("projection.projectionType", f"'{ptype}'", "Member must satisfy enum value set: [ALL, KEYS_ONLY, INCLUDE]")
+    for element in vix.get("SearchSchema") or []:
+        etype = (element or {}).get("SearchSchemaElementType")
+        if etype not in ("HASH", "INLINE_FILTER"):
+            return error_response_json("ValidationException",
+                f"1 validation error detected: Value '{etype}' at '{member}.searchSchema' "
+                "failed to satisfy constraint: Member must satisfy enum value set: [HASH, INLINE_FILTER]", 400)
+    return None
+
+
+def _vector_indexes_error(new: list, existing: list, billing_mode: str, defined_attrs: set) -> tuple | None:
+    """Service-layer checks for vector indexes being added next to `existing`."""
+    if not new:
+        return None
+    if billing_mode != "PAY_PER_REQUEST":
+        return error_response_json("ValidationException",
+            _VECTOR_INVALID + "Vector indexes are only supported for PAY_PER_REQUEST tables", 400)
+    if len(existing) + len(new) > _VECTOR_MAX_INDEXES:
+        return error_response_json("ValidationException",
+            _VECTOR_INVALID + f"VectorIndex count exceeds the per-table limit of {_VECTOR_MAX_INDEXES}", 400)
+    dims_by_attr = {v["VectorAttribute"]["AttributeName"]: v["Dimensions"] for v in existing}
+    for vix in new:
+        if vix["Dimensions"] > _VECTOR_MAX_DIMENSIONS:
+            return error_response_json("ValidationException",
+                _VECTOR_INVALID + f"Number of dimensions must be between 1 and {_VECTOR_MAX_DIMENSIONS} inclusive.", 400)
+        for element in vix.get("SearchSchema") or []:
+            if element.get("AttributeName") not in defined_attrs:
+                return error_response_json("ValidationException",
+                    _VECTOR_INVALID + "One element in SearchSchema is not defined in attribute definitions", 400)
+        attr = vix["VectorAttribute"]["AttributeName"]
+        if dims_by_attr.setdefault(attr, vix["Dimensions"]) != vix["Dimensions"]:
+            return error_response_json("ValidationException",
+                _VECTOR_INVALID + f"Conflicting attribute definition for '{attr}'. "
+                "All VectorIndexes on the same vector attribute must use the same dimensions.", 400)
+    return None
+
+
+def _vector_index_record(table_name: str, vix: dict, online: bool) -> dict:
+    record = {
+        "IndexName": vix["IndexName"],
+        "VectorAttribute": {"AttributeName": vix["VectorAttribute"]["AttributeName"]},
+        "Projection": copy.deepcopy(vix.get("Projection") or {"ProjectionType": "ALL"}),
+        "Dimensions": vix["Dimensions"],
+        "DistanceFunction": vix["DistanceFunction"],
+        "IndexArn": f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:table/{table_name}/index/{vix['IndexName']}",
+    }
+    if vix.get("SearchSchema"):
+        record["SearchSchema"] = [{"AttributeName": e["AttributeName"],
+                                   "SearchSchemaElementType": e["SearchSchemaElementType"]}
+                                  for e in vix["SearchSchema"]]
+    if online:
+        record["_online_since"] = time.time()
+    return record
+
+
+def _apply_vector_index_updates(name: str, table: dict, data: dict, billing_mode: str) -> tuple | None:
+    updates = data.get("VectorIndexUpdates") or []
+    if not updates:
+        return None
+    limit_error = error_response_json("LimitExceededException",
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted simultaneously per table", 400)
+    if len(updates) > 1:
+        return limit_error
+    update = updates[0] if isinstance(updates[0], dict) else {}
+    existing = table.get("VectorIndexes") or []
+    if "Create" in update:
+        vix = update["Create"]
+        err = _vector_index_request_error(vix, "vectorIndexUpdates.1.member.create")
+        if err:
+            return err
+        if any(_vector_phase(v) != "active" for v in existing):
+            return limit_error
+        index_names = {i.get("IndexName") for i in (table.get("GlobalSecondaryIndexes") or [])
+                       + (table.get("LocalSecondaryIndexes") or []) + existing}
+        if vix["IndexName"] in index_names:
+            return error_response_json("ValidationException",
+                f"Attempting to create a duplicate index: {vix['IndexName']}", 400)
+        defined = {a.get("AttributeName") for a in data.get("AttributeDefinitions") or []}
+        err = _vector_indexes_error([vix], existing, billing_mode, defined)
+        if err:
+            return err
+        table["VectorIndexes"] = existing + [_vector_index_record(name, vix, online=True)]
+    elif "Delete" in update:
+        index_name = (update["Delete"] or {}).get("IndexName")
+        vix = next((v for v in existing if v["IndexName"] == index_name), None)
+        if vix is None:
+            return error_response_json("ResourceNotFoundException",
+                f"Requested resource not found: Index: {index_name}", 400)
+        if _vector_phase(vix) == "allocating":
+            return error_response_json("ResourceInUseException",
+                "Attempt to change a resource which is still in use: Index creation is in resource allocation "
+                "phase. Retry deletion during backfilling phase or when the index is active. "
+                f"Table: {name} Index: {index_name}", 400)
+        table["VectorIndexes"] = [v for v in existing if v is not vix]
+    return None
+
+
+def _vector_index_info(vix: dict) -> dict:
+    return {k: copy.deepcopy(v) for k, v in vix.items()
+            if k in ("IndexName", "VectorAttribute", "SearchSchema", "Projection", "Dimensions", "DistanceFunction")}
+
+
+def _restore_create_request(target, key_schema, attr_defs, billing_mode, throughput, data, gsis, lsis, vector_indexes):
+    """CreateTable input for a restore, applying the request's index overrides."""
+    create_req = {"TableName": target, "KeySchema": key_schema, "BillingMode": billing_mode}
+    if billing_mode == "PROVISIONED":
+        create_req["ProvisionedThroughput"] = throughput or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    for field, override, source in (("GlobalSecondaryIndexes", "GlobalSecondaryIndexOverride", gsis),
+                                    ("LocalSecondaryIndexes", "LocalSecondaryIndexOverride", lsis),
+                                    ("VectorIndexes", "VectorIndexOverride", vector_indexes)):
+        chosen = data[override] if data.get(override) is not None else source
+        if chosen:
+            create_req[field] = copy.deepcopy(chosen)
+    referenced = {k.get("AttributeName") for k in key_schema}
+    for idx in create_req.get("GlobalSecondaryIndexes", []) + create_req.get("LocalSecondaryIndexes", []):
+        referenced |= {k.get("AttributeName") for k in idx.get("KeySchema") or []}
+    for vix in create_req.get("VectorIndexes", []):
+        referenced |= _vector_search_attrs(vix)
+    create_req["AttributeDefinitions"] = [ad for ad in attr_defs if ad.get("AttributeName") in referenced]
+    return create_req
+
+
+def _vector_index_description(vix: dict) -> dict:
+    phase = _vector_phase(vix)
+    desc = {k: copy.deepcopy(v) for k, v in vix.items() if not k.startswith("_")}
+    desc["IndexStatus"] = "ACTIVE" if phase == "active" else "CREATING"
+    if phase != "active":
+        desc["Backfilling"] = phase == "backfilling"
+    desc["IndexSizeBytes"] = 0
+    desc["ItemCount"] = 0
+    return desc
+
+
+def _vector_search_attrs(vix: dict) -> set:
+    return {e["AttributeName"] for e in vix.get("SearchSchema") or []}
+
+
+def _vector_hash_attr(vix: dict) -> str | None:
+    for e in vix.get("SearchSchema") or []:
+        if e.get("SearchSchemaElementType") == "HASH":
+            return e.get("AttributeName")
+    return None
+
+
+def _to_f32(text) -> float | None:
+    try:
+        value = struct.unpack("f", struct.pack("f", float(text)))[0]
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _f32_number_text(value: float) -> str:
+    packed = struct.pack("f", value)
+    for digits in range(1, 10):
+        text = f"{value:.{digits}g}"
+        if struct.pack("f", float(text)) == packed:
+            break
+    return _ddb_canonicalize_number(text) or text
+
+
+def _vector_write_reason(table: dict, item: dict, update_expr: bool = False) -> str | None:
+    """AWS's message for an item a vector index on `table` cannot take, or None."""
+    attr_defs = {ad["AttributeName"]: ad["AttributeType"] for ad in (table.get("AttributeDefinitions") or [])}
+    for vix in table.get("VectorIndexes") or []:
+        name = vix["IndexName"]
+        attr = vix["VectorAttribute"]["AttributeName"]
+        if attr in item:
+            raw = item[attr]
+            values = raw.get("L") if isinstance(raw, dict) and len(raw) == 1 else None
+            if not isinstance(values, list):
+                return ("One or more parameter values were invalid. Invalid type for parameter "
+                        f"{attr}, Expected: 32-bit floating point number list IndexName: {name}")
+            for i, element in enumerate(values):
+                etype = next(iter(element)) if isinstance(element, dict) and len(element) == 1 else "M"
+                if etype != "N" or _to_f32(element["N"]) is None:
+                    return ("One or more parameter values were invalid. Invalid type for parameter "
+                            f"{attr}[{i}], Expected: 32-bit floating point number, Actual: {etype}. IndexName: {name}")
+            if len(values) != vix["Dimensions"]:
+                return ("One or more parameter values were invalid. Invalid size for parameter "
+                        f"{attr}, Expected: {vix['Dimensions']}, Actual: {len(values)} IndexName: {name}")
+        for key_name in _vector_search_attrs(vix):
+            raw = item.get(key_name)
+            if not isinstance(raw, dict) or len(raw) != 1:
+                continue
+            actual_type = next(iter(raw))
+            expected_type = attr_defs.get(key_name)
+            if expected_type and actual_type != expected_type:
+                return (_VECTOR_INVALID + f"Type mismatch for Index Key {key_name} Expected: {expected_type} "
+                        f"Actual: {actual_type} IndexName: {name}")
+            if (actual_type == "S" and raw["S"] == "") or (actual_type == "B" and not raw["B"]):
+                kind = "string" if actual_type == "S" else "binary"
+                if update_expr:
+                    return ("One or more parameter values are not valid. The update expression attempted to update a "
+                            "secondary index key to a value that is not supported. The AttributeValue for a key "
+                            f"attribute cannot contain an empty {kind} value.")
+                return ("One or more parameter values are not valid. A value specified for a secondary index key is "
+                        f"not supported. The AttributeValue for a key attribute cannot contain an empty {kind} value. "
+                        f"IndexName: {name}, IndexKey: {key_name}")
+    return None
+
+
+def _vector_entry(table: dict, vix: dict, item: dict | None) -> dict | None:
+    """The item as `vix` stores it, or None when the item is not in the index."""
+    if not item:
+        return None
+    attr = vix["VectorAttribute"]["AttributeName"]
+    values = (item.get(attr) or {}).get("L")
+    if not isinstance(values, list) or len(values) != vix["Dimensions"]:
+        return None
+    vector = [_to_f32((v or {}).get("N")) for v in values]
+    if any(v is None for v in vector):
+        return None
+    hash_attr = _vector_hash_attr(vix)
+    if hash_attr and hash_attr not in item:
+        return None
+    projection = vix.get("Projection") or {}
+    ptype = projection.get("ProjectionType", "ALL")
+    keep = {table.get("pk_name"), table.get("sk_name"), attr} | _vector_search_attrs(vix)
+    if ptype == "INCLUDE":
+        keep |= set(projection.get("NonKeyAttributes") or [])
+    entry = {k: v for k, v in item.items() if ptype == "ALL" or k in keep}
+    entry[attr] = {"L": [{"N": _f32_number_text(v)} for v in vector]}
+    return entry
+
+
+def _vector_entry_bytes(vix: dict, entry: dict) -> int:
+    attr = vix["VectorAttribute"]["AttributeName"]
+    size = sum(len(k.encode("utf-8")) + _attribute_value_size(v) for k, v in entry.items() if k != attr)
+    return size + len(attr.encode("utf-8")) + 4 * vix["Dimensions"]
+
+
+def _vector_write_bytes(table: dict, old_item: dict | None, new_item: dict | None) -> dict:
+    """VectorWriteRequestBytes per index whose stored entry the write changes."""
+    charged = {}
+    for vix in table.get("VectorIndexes") or []:
+        old_entry = _vector_entry(table, vix, old_item)
+        new_entry = _vector_entry(table, vix, new_item)
+        if old_entry == new_entry:
+            continue
+        entry = new_entry if new_entry is not None else old_entry
+        charged[vix["IndexName"]] = float(max(_VECTOR_WRITE_FLOOR_BYTES, _vector_entry_bytes(vix, entry)))
+    return charged
+
+
+def _vector_condition_terms(expr: str, attr_names: dict, attr_values: dict, vix: dict):
+    """Parse `a = :v AND b = :w` into [(name, value)], or return an error message."""
+    comparator_error = "Invalid SearchConditionExpression: Invalid comparator used in SearchConditionExpression"
+    terms = []
+    for part in re.split(r"\s+AND\s+", expr.strip(), flags=re.IGNORECASE):
+        match = re.fullmatch(r"\s*(#?[A-Za-z0-9_]+)\s*(<>|<=|>=|=|<|>)\s*(:[A-Za-z0-9_]+)\s*", part)
+        lhs = match.group(1) if match else re.split(r"[\s<>=(]", part.strip(), maxsplit=1)[0]
+        name = attr_names.get(lhs, lhs) if lhs.startswith("#") else lhs
+        if name and name not in _vector_search_attrs(vix):
+            return None, ("SearchConditionExpression must not contain any attributes that is not in SearchSchema. "
+                          f"Invalid attribute: {name}")
+        if not match or match.group(2) != "=":
+            return None, comparator_error
+        if match.group(3) not in attr_values:
+            return None, ("Invalid SearchConditionExpression: An expression attribute value used in expression "
+                          f"is not defined; attribute value: {match.group(3)}")
+        terms.append((name, attr_values[match.group(3)]))
+    return terms, None
+
+
+def _vector_score(fn: str, query: list, vector: list) -> float:
+    dot = sum(a * b for a, b in zip(query, vector))
+    if fn == "DOT_PRODUCT":
+        score = dot
+    elif fn == "EUCLIDEAN":
+        score = math.sqrt(sum((a - b) ** 2 for a, b in zip(query, vector)))
+    else:
+        norms = math.sqrt(sum(a * a for a in query)) * math.sqrt(sum(b * b for b in vector))
+        score = 1.0 - (dot / norms if norms else 0.0)
+    return _to_f32(score) or 0.0
+
+
+def _search_vectors(data):
+    name = _normalize_table_name(data.get("TableName"))
+    err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    top_k = data.get("TopK")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{top_k}' at 'topK' failed to satisfy constraint: "
+            "Member must have value greater than or equal to 1", 400)
+    search_vector = data.get("SearchVector")
+    if not isinstance(search_vector, list) or not search_vector:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value '[]' at 'searchVector' failed to satisfy constraint: "
+            "Member must have length greater than or equal to 1", 400)
+    if len(search_vector) > _VECTOR_MAX_DIMENSIONS:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value at 'searchVector' failed to satisfy constraint: "
+            f"Member must have length less than or equal to {_VECTOR_MAX_DIMENSIONS}", 400)
+    err = _validate_return_consumed_capacity(data)
+    if err:
+        return err
+    table = _tables.get(name)
+    if not table:
+        return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
+    if top_k > _VECTOR_TOPK_MAX:
+        return error_response_json("ValidationException",
+            f"Provided TopK value '{top_k}' is out of valid range. The value must be between 1 and {_VECTOR_TOPK_MAX} inclusive", 400)
+    index_name = data.get("IndexName")
+    vix = next((v for v in table.get("VectorIndexes") or [] if v["IndexName"] == index_name), None)
+    phase = _vector_phase(vix) if vix else None
+    if vix is None or phase == "allocating":
+        return error_response_json("ValidationException",
+            f"The table does not have the specified index: {index_name}", 400)
+    if phase == "backfilling":
+        return error_response_json("ValidationException",
+            f"Cannot search backfilling vector index: {index_name}", 400)
+    query = []
+    for element in search_vector:
+        value = _to_f32(element.get("N")) if isinstance(element, dict) and set(element) == {"N"} else None
+        if value is None:
+            return error_response_json("ValidationException",
+                "Search vector contains invalid values. All values in the search vector must be a 32-bit "
+                "floating-point number attribute", 400)
+        query.append(value)
+    if len(query) != vix["Dimensions"]:
+        return error_response_json("ValidationException",
+            f"Input search vector dimension {len(query)} does not match vector index dimension {vix['Dimensions']}", 400)
+    condition = data.get("SearchConditionExpression")
+    terms = []
+    if condition:
+        terms, msg = _vector_condition_terms(condition, data.get("ExpressionAttributeNames") or {},
+                                             data.get("ExpressionAttributeValues") or {}, vix)
+        if msg:
+            return error_response_json("ValidationException", msg, 400)
+    elif _vector_hash_attr(vix):
+        return error_response_json("ValidationException",
+            "SearchConditionExpression must be provided when SearchSchema has a HASH key", 400)
+
+    attr = vix["VectorAttribute"]["AttributeName"]
+    scored = []
+    candidates = 0
+    for item in (it for bucket in list(table["items"].values()) for it in list(bucket.values())):
+        entry = _vector_entry(table, vix, item)
+        if entry is None or any(entry.get(k) != v for k, v in terms):
+            continue
+        candidates += 1
+        vector = [float(v["N"]) for v in entry[attr]["L"]]
+        scored.append((_vector_score(vix["DistanceFunction"], query, vector), entry))
+    scored.sort(key=lambda pair: -pair[0] if vix["DistanceFunction"] == "DOT_PRODUCT" else pair[0])
+    results = []
+    for score, entry in scored[:top_k]:
+        if data.get("ProjectionExpression"):
+            shown = _project_item(entry, data["ProjectionExpression"], data.get("ExpressionAttributeNames") or {})
+        else:
+            shown = {k: v for k, v in entry.items() if k != attr}
+        results.append({"Item": shown, "Score": score})
+    result = {"SearchResults": results}
+    if data.get("ReturnConsumedCapacity", "NONE") != "NONE":
+        result["ConsumedCapacity"] = {
+            "VectorSearchRequestBytes": float(4 * vix["Dimensions"] * (candidates + 1))}
+    return json_response(result)
+
 
 def _key_type_mismatch_reason(table, attrs):
     """Return the AWS message for a key attribute present with the wrong type,
@@ -8051,6 +8656,9 @@ def _add_consumed_capacity(result, data, table_name, write=False, old_item=None,
             cap["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in gsi_units.items()}
         if lsi_units:
             cap["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in lsi_units.items()}
+        vector_bytes = _vector_write_bytes(table, old_item, new_item) if write else {}
+        if vector_bytes:
+            cap["VectorIndexes"] = {n: {"VectorWriteRequestBytes": b} for n, b in vector_bytes.items()}
     result["ConsumedCapacity"] = cap
 
 

@@ -16533,6 +16533,181 @@ def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs, rollback)
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_metric_filter_template(uid, filter_props):
+    return json.dumps({
+        "Resources": {
+            "GroupA": {"Type": "AWS::Logs::LogGroup",
+                       "Properties": {"LogGroupName": f"/cfn/metricfilter-a-{uid}"}},
+            "GroupB": {"Type": "AWS::Logs::LogGroup",
+                       "Properties": {"LogGroupName": f"/cfn/metricfilter-b-{uid}"}},
+            "Filter": {"Type": "AWS::Logs::MetricFilter", "Properties": filter_props},
+        },
+        "Outputs": {"FilterRef": {"Value": {"Ref": "Filter"}}},
+    })
+
+
+def _cfn_metric_filter_props(group="GroupA", pattern='"ERROR"', name=None, **transformation):
+    props = {
+        "LogGroupName": {"Ref": group},
+        "FilterPattern": pattern,
+        "MetricTransformations": [
+            {"MetricNamespace": "CfnMf", "MetricName": "Errors", "MetricValue": "1", **transformation},
+        ],
+    }
+    if name:
+        props["FilterName"] = name
+    return props
+
+
+def _metric_filters(logs, group):
+    return [{k: v for k, v in f.items() if k != "creationTime"}
+            for f in logs.describe_metric_filters(logGroupName=group)["metricFilters"]]
+
+
+def test_cfn_logs_metric_filter_provisions(cfn, logs):
+    """Ref is the filter name, generated as <LogicalId>- and 12 letters and
+    digits; Dimensions become the API's map and a stack delete removes the
+    filter."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-metricfilter-{uid}"
+    group = f"/cfn/metricfilter-a-{uid}"
+    body = json.loads(_cfn_metric_filter_template(
+        uid, _cfn_metric_filter_props(DefaultValue=0, Unit="Count")))
+    body["Resources"]["Named"] = {"Type": "AWS::Logs::MetricFilter", "Properties": {
+        **_cfn_metric_filter_props(pattern='{ $.level = "ERROR" }', name=f"cfn-mf-{uid}",
+                                   MetricName="Latency", MetricValue="$.ms", Unit="Milliseconds",
+                                   Dimensions=[{"Key": "Service", "Value": "$.service"}]),
+    }}
+    body["Outputs"]["NamedRef"] = {"Value": {"Ref": "Named"}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        generated = _output(stack, "FilterRef")
+        assert re.fullmatch(r"Filter-[A-Za-z0-9]{12}", generated)
+        assert _output(stack, "NamedRef") == f"cfn-mf-{uid}"
+        resource = cfn.describe_stack_resource(StackName=stack_name, LogicalResourceId="Filter")
+        assert resource["StackResourceDetail"]["PhysicalResourceId"] == generated
+
+        assert _metric_filters(logs, group) == [
+            {"filterName": generated, "filterPattern": '"ERROR"', "logGroupName": group,
+             "metricTransformations": [{"metricName": "Errors", "metricNamespace": "CfnMf",
+                                        "metricValue": "1", "defaultValue": 0.0, "unit": "Count"}]},
+            {"filterName": f"cfn-mf-{uid}", "filterPattern": '{ $.level = "ERROR" }', "logGroupName": group,
+             "metricTransformations": [{"metricName": "Latency", "metricNamespace": "CfnMf",
+                                        "metricValue": "$.ms", "dimensions": {"Service": "$.service"},
+                                        "unit": "Milliseconds"}]},
+        ]
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        left = [f for metric in ("Errors", "Latency")
+                for f in logs.describe_metric_filters(
+                    metricNamespace="CfnMf", metricName=metric)["metricFilters"]
+                if f["logGroupName"] == group]
+        assert left == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_cfn_logs_metric_filter_updates_in_place(cfn, logs, rollback):
+    """FilterPattern and MetricTransformations change on the existing filter,
+    which keeps its name; a dropped DefaultValue or Unit is gone from it.
+    When a later resource fails the update, the rollback restores both."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-metricfilter-upd-{uid}"
+    group = f"/cfn/metricfilter-a-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_metric_filter_template(
+        uid, _cfn_metric_filter_props(DefaultValue=0, Unit="Count")))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        filter_name = _output(stack, "FilterRef")
+
+        body = json.loads(_cfn_metric_filter_template(
+            uid, _cfn_metric_filter_props(pattern='"WARN"', MetricValue="2")))
+        if rollback:
+            body["Resources"]["Bad"] = {"Type": "AWS::SSM::Parameter", "DependsOn": "Filter",
+                                        "Properties": {"Type": "Bogus", "Value": "v"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+        stack = _wait_stack(cfn, stack_name)
+        expected = "UPDATE_ROLLBACK_COMPLETE" if rollback else "UPDATE_COMPLETE"
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+        assert _output(stack, "FilterRef") == filter_name
+        transformation = ({"metricValue": "1", "defaultValue": 0.0, "unit": "Count"} if rollback
+                          else {"metricValue": "2"})
+        assert _metric_filters(logs, group) == [
+            {"filterName": filter_name, "filterPattern": '"ERROR"' if rollback else '"WARN"',
+             "logGroupName": group,
+             "metricTransformations": [{"metricName": "Errors", "metricNamespace": "CfnMf",
+                                        **transformation}]},
+        ]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("named,rollback", [(False, False), (True, False), (True, True)])
+def test_cfn_logs_metric_filter_group_change_replaces_it(cfn, logs, named, rollback):
+    """LogGroupName requires replacement: the filter is created on the new
+    group and removed from the old one. A generated name is generated anew,
+    an explicit FilterName is kept. When a later resource fails the update,
+    the rollback removes the new filter and the old one stays."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-metricfilter-move-{uid}"
+    group_a = f"/cfn/metricfilter-a-{uid}"
+    group_b = f"/cfn/metricfilter-b-{uid}"
+    name = f"cfn-mf-move-{uid}" if named else None
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_metric_filter_template(
+        uid, _cfn_metric_filter_props(name=name)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_name = _output(stack, "FilterRef")
+
+        body = json.loads(_cfn_metric_filter_template(
+            uid, _cfn_metric_filter_props(group="GroupB", name=name)))
+        if rollback:
+            body["Resources"]["Bad"] = {"Type": "AWS::SSM::Parameter", "DependsOn": "Filter",
+                                        "Properties": {"Type": "Bogus", "Value": "v"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+        stack = _wait_stack(cfn, stack_name)
+        expected = "UPDATE_ROLLBACK_COMPLETE" if rollback else "UPDATE_COMPLETE"
+        assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+        new_name = _output(stack, "FilterRef")
+        assert (new_name == old_name) == (named or rollback)
+        kept, moved = (group_a, group_b) if rollback else (group_b, group_a)
+        assert [f["filterName"] for f in _metric_filters(logs, kept)] == [new_name]
+        assert _metric_filters(logs, moved) == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_logs_metric_filter_rename_replaces_it(cfn, logs):
+    """A FilterName change creates the renamed filter and removes the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-metricfilter-rename-{uid}"
+    group = f"/cfn/metricfilter-a-{uid}"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_metric_filter_template(
+        uid, _cfn_metric_filter_props(name=f"cfn-mf-old-{uid}")))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_metric_filter_template(
+            uid, _cfn_metric_filter_props(name=f"cfn-mf-new-{uid}")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "FilterRef") == f"cfn-mf-new-{uid}"
+        assert [f["filterName"] for f in _metric_filters(logs, group)] == [f"cfn-mf-new-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn, logs):
     """Logs resource policies provision through the CloudWatch Logs API."""
     suffix = _uuid_mod.uuid4().hex[:8]

@@ -405,6 +405,8 @@ def _delete_log_group(data):
     _forget_log_records_for_group(name)
     del _log_groups[name]
     _log_group_policies.pop(name, None)
+    for key in [k for k in _metric_filters if k[0] == name]:
+        del _metric_filters[key]
     return json_response({})
 
 
@@ -1765,10 +1767,24 @@ def _delete_metric_filter(data):
 
 def _describe_metric_filters(data):
     group = data.get("logGroupName")
-    prefix = data.get("filterNamePrefix", "")
+    # The prefix only applies within a log group.
+    prefix = data.get("filterNamePrefix", "") if group else ""
+    metric_name = data.get("metricName")
+    namespace = data.get("metricNamespace")
     limit = min(data.get("limit", 50), 50)
     token = data.get("nextToken")
 
+    if bool(metric_name) != bool(namespace):
+        return error_response_json(
+            "InvalidParameterException",
+            "Describe Metric Filters request must contain both MetricName and MetricNamespace", 400,
+        )
+    if group and metric_name:
+        return error_response_json(
+            "InvalidParameterException",
+            "Describe Metric Filters request must contain either logGroupName "
+            "or metricName and metricNamespace", 400,
+        )
     if group and group not in _log_groups:
         return error_response_json(
             "ResourceNotFoundException",
@@ -1778,7 +1794,10 @@ def _describe_metric_filters(data):
     filters = sorted(
         (mf for mf in _metric_filters.values()
          if (not group or mf["logGroupName"] == group)
-         and (not prefix or mf["filterName"].startswith(prefix))),
+         and (not prefix or mf["filterName"].startswith(prefix))
+         and (not metric_name or any(
+             t.get("metricName") == metric_name and t.get("metricNamespace") == namespace
+             for t in mf["metricTransformations"]))),
         key=lambda f: f["filterName"],
     )
 

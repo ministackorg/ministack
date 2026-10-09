@@ -6112,7 +6112,7 @@ def test_dynamodb_deleteitem_multi_enum_errors_accumulated():
     assert "2 validation errors detected" in msg
 
 
-def test_dynamodb_updateitem_multi_enum_errors_accumulated():
+def test_dynamodb_updateitem_reports_the_first_enum_error():
     code, body = _raw_ddb("UpdateItem", {
         "TableName": "intg-multi-upd",
         "Key": {"pk": {"S": "x"}},
@@ -6121,7 +6121,8 @@ def test_dynamodb_updateitem_multi_enum_errors_accumulated():
     })
     assert code == 400
     msg = body.get("message", "")
-    assert "2 validation errors detected" in msg
+    assert msg.startswith("1 validation error detected: Value 'BOGUS' at 'returnValues'")
+    assert "returnConsumedCapacity" not in msg
 
 
 def test_dynamodb_query_invalid_table_pattern():
@@ -7622,5 +7623,211 @@ def test_dynamodb_query_and_scan_pages_stop_at_1mb(ddb):
         filtered = ddb.scan(TableName=name, FilterExpression="sk = :none",
                             ExpressionAttributeValues={":none": {"S": "none"}})
         assert filtered["Count"] == 0 and filtered["ScannedCount"] == 10 and "LastEvaluatedKey" in filtered
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def _vector_index(name="vix", attr="embedding", dims=3, fn="COSINE", **extra):
+    return {"IndexName": name, "VectorAttribute": {"AttributeName": attr}, "Dimensions": dims,
+            "DistanceFunction": fn, "Projection": {"ProjectionType": "ALL"}, **extra}
+
+
+def _vector_table(ddb, name, indexes, attrs=("pk",)):
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": a, "AttributeType": "S"} for a in attrs],
+        VectorIndexes=indexes,
+    )
+
+
+def _vec(*ns):
+    return {"L": [{"N": str(n)} for n in ns]}
+
+
+def test_dynamodb_vector_index_create_describe_and_search(ddb):
+    name = f"vec-{_uuid_mod.uuid4().hex[:8]}"
+    _vector_table(ddb, name, [_vector_index("cos"), _vector_index("dot", fn="DOT_PRODUCT")])
+    try:
+        ix = ddb.describe_table(TableName=name)["Table"]["VectorIndexes"][0]
+        assert ix["IndexStatus"] == "ACTIVE" and "Backfilling" not in ix
+        assert ix["IndexArn"].endswith(f"table/{name}/index/cos")
+        for pk, v in (("a", (1, 0, 0)), ("b", (0, 1, 0)), ("c", (-1, 0, 0))):
+            ddb.put_item(TableName=name, Item={"pk": {"S": pk}, "label": {"S": pk}, "embedding": _vec(*v)})
+        res = ddb.search_vectors(TableName=name, IndexName="cos", SearchVector=[{"N": "1"}, {"N": "0"}, {"N": "0"}], TopK=3)
+        assert [(r["Item"]["pk"]["S"], r["Score"]) for r in res["SearchResults"]] == [("a", 0), ("b", 1), ("c", 2)]
+        assert "embedding" not in res["SearchResults"][0]["Item"]
+        res = ddb.search_vectors(TableName=name, IndexName="dot", SearchVector=[{"N": "1"}, {"N": "0"}, {"N": "0"}],
+                                 TopK=1, ReturnConsumedCapacity="TOTAL")
+        assert res["SearchResults"][0]["Score"] == 1
+        assert set(res["ConsumedCapacity"]) == {"VectorSearchRequestBytes"}
+        with pytest.raises(ClientError) as exc:
+            ddb.search_vectors(TableName=name, IndexName="cos", SearchVector=[{"N": "1"}], TopK=1)
+        assert exc.value.response["Error"]["Message"] == "Input search vector dimension 1 does not match vector index dimension 3"
+        with pytest.raises(ClientError) as exc:
+            ddb.search_vectors(TableName=name, IndexName="cos", SearchVector=[{"N": "1"}] * 3, TopK=101)
+        assert "between 1 and 100 inclusive" in exc.value.response["Error"]["Message"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_vector_index_validates_writes(ddb):
+    name = f"vec-{_uuid_mod.uuid4().hex[:8]}"
+    _vector_table(ddb, name, [_vector_index("plain")])
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.put_item(TableName=name, Item={"pk": {"S": "x"}, "embedding": _vec(1, 0)})
+        assert exc.value.response["Error"]["Message"] == (
+            "One or more parameter values were invalid. Invalid size for parameter embedding, "
+            "Expected: 3, Actual: 2 IndexName: plain")
+        with pytest.raises(ClientError) as exc:
+            ddb.transact_write_items(TransactItems=[{"Put": {"TableName": name,
+                                                             "Item": {"pk": {"S": "x"}, "embedding": {"S": "v"}}}}])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_vector_index_rejects_provisioned_tables(ddb):
+    with pytest.raises(ClientError) as exc:
+        ddb.create_table(
+            TableName=f"vec-{_uuid_mod.uuid4().hex[:8]}",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+            VectorIndexes=[_vector_index()],
+        )
+    assert exc.value.response["Error"]["Message"] == (
+        "One or more parameter values were invalid: Vector indexes are only supported for PAY_PER_REQUEST tables")
+
+
+def test_dynamodb_vector_index_added_by_update_table(ddb):
+    name = f"vec-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(TableName=name, BillingMode="PAY_PER_REQUEST",
+                     KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}])
+    try:
+        resp = ddb.update_table(TableName=name, VectorIndexUpdates=[{"Create": _vector_index()}])
+        assert resp["TableDescription"]["TableStatus"] == "UPDATING"
+        ix = resp["TableDescription"]["VectorIndexes"][0]
+        assert ix["IndexStatus"] == "CREATING" and ix["Backfilling"] is False
+        with pytest.raises(ClientError) as exc:
+            ddb.search_vectors(TableName=name, IndexName="vix", SearchVector=[{"N": "1"}] * 3, TopK=1)
+        assert exc.value.response["Error"]["Message"] == "The table does not have the specified index: vix"
+        with pytest.raises(ClientError) as exc:
+            ddb.update_table(TableName=name, VectorIndexUpdates=[{"Create": _vector_index("vix2")}])
+        assert exc.value.response["Error"]["Code"] == "LimitExceededException"
+        with pytest.raises(ClientError) as exc:
+            ddb.delete_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+        with pytest.raises(ClientError) as exc:
+            ddb.update_table(TableName=name, VectorIndexUpdates=[{"Delete": {"IndexName": "vix"}}])
+        assert "resource allocation phase" in exc.value.response["Error"]["Message"]
+        for _ in range(60):
+            ix = ddb.describe_table(TableName=name)["Table"]["VectorIndexes"][0]
+            if ix.get("Backfilling") is True:
+                break
+            time.sleep(0.5)
+        assert ix["IndexStatus"] == "CREATING"
+        ddb.update_table(TableName=name, VectorIndexUpdates=[{"Delete": {"IndexName": "vix"}}])
+        assert "VectorIndexes" not in ddb.describe_table(TableName=name)["Table"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_vector_write_capacity_in_batch_and_transactions(ddb):
+    name = f"vec-{_uuid_mod.uuid4().hex[:8]}"
+    _vector_table(ddb, name, [_vector_index()])
+    try:
+        resp = ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": {"pk": {"S": "a"}, "embedding": _vec(1, 0, 0)}}}]},
+                                    ReturnConsumedCapacity="INDEXES")
+        assert resp["ConsumedCapacity"][0]["VectorIndexes"]["vix"]["VectorWriteRequestBytes"] == 1024
+        resp = ddb.transact_write_items(TransactItems=[{"Put": {"TableName": name, "Item": {"pk": {"S": "b"}, "embedding": _vec(0, 1, 0)}}}],
+                                        ReturnConsumedCapacity="INDEXES")
+        assert resp["ConsumedCapacity"][0]["VectorIndexes"]["vix"]["VectorWriteRequestBytes"] == 1024
+        resp = ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "embedding": _vec(0, 1, 0)}, ReturnConsumedCapacity="INDEXES")
+        assert "VectorIndexes" not in resp["ConsumedCapacity"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_vector_indexes_survive_backup_restore_and_pitr(ddb):
+    name = f"vec-{_uuid_mod.uuid4().hex[:8]}"
+    schema = [{"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}]
+    _vector_table(ddb, name, [_vector_index("plain"), _vector_index("schema", SearchSchema=schema)], attrs=("pk", "tenant"))
+    restored = []
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "tenant": {"S": "t"}, "embedding": _vec(1, 0, 0)})
+        backup = ddb.create_backup(TableName=name, BackupName="vec-backup")["BackupDetails"]["BackupArn"]
+        feat = ddb.describe_backup(BackupArn=backup)["BackupDescription"]["SourceTableFeatureDetails"]
+        assert [v["IndexName"] for v in feat["VectorIndexes"]] == ["plain", "schema"]
+        assert "IndexStatus" not in feat["VectorIndexes"][0]
+
+        full = f"{name}-full"
+        restored.append(full)
+        ddb.restore_table_from_backup(TargetTableName=full, BackupArn=backup)
+        assert [v["IndexName"] for v in ddb.describe_table(TableName=full)["Table"]["VectorIndexes"]] == ["plain", "schema"]
+        res = ddb.search_vectors(TableName=full, IndexName="schema", SearchVector=[{"N": "1"}] * 3, TopK=1,
+                                 SearchConditionExpression="tenant = :t", ExpressionAttributeValues={":t": {"S": "t"}})
+        assert res["SearchResults"][0]["Item"]["pk"]["S"] == "a"
+
+        trimmed = f"{name}-trimmed"
+        restored.append(trimmed)
+        ddb.restore_table_from_backup(TargetTableName=trimmed, BackupArn=backup,
+                                      VectorIndexOverride=[_vector_index("plain")])
+        table = ddb.describe_table(TableName=trimmed)["Table"]
+        assert [v["IndexName"] for v in table["VectorIndexes"]] == ["plain"]
+        assert [a["AttributeName"] for a in table["AttributeDefinitions"]] == ["pk"]
+
+        none = f"{name}-none"
+        restored.append(none)
+        ddb.restore_table_from_backup(TargetTableName=none, BackupArn=backup, VectorIndexOverride=[])
+        assert "VectorIndexes" not in ddb.describe_table(TableName=none)["Table"]
+
+        ddb.update_continuous_backups(TableName=name, PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
+        pitr = f"{name}-pitr"
+        restored.append(pitr)
+        ddb.restore_table_to_point_in_time(SourceTableName=name, TargetTableName=pitr, UseLatestRestorableTime=True)
+        assert [v["IndexName"] for v in ddb.describe_table(TableName=pitr)["Table"]["VectorIndexes"]] == ["plain", "schema"]
+        ddb.delete_backup(BackupArn=backup)
+    finally:
+        for t in [name] + restored:
+            with contextlib.suppress(ClientError):
+                ddb.delete_table(TableName=t)
+
+
+def test_dynamodb_restore_to_point_in_time_keeps_secondary_indexes(ddb):
+    name = f"pitr-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "g", "AttributeType": "S"}],
+        GlobalSecondaryIndexes=[{"IndexName": "by-g", "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                                 "Projection": {"ProjectionType": "ALL"}}],
+    )
+    target = f"{name}-r"
+    try:
+        ddb.update_continuous_backups(TableName=name, PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
+        ddb.restore_table_to_point_in_time(SourceTableName=name, TargetTableName=target, UseLatestRestorableTime=True)
+        assert [g["IndexName"] for g in ddb.describe_table(TableName=target)["Table"]["GlobalSecondaryIndexes"]] == ["by-g"]
+    finally:
+        for t in (name, target):
+            with contextlib.suppress(ClientError):
+                ddb.delete_table(TableName=t)
+
+
+def test_dynamodb_import_table_creates_vector_indexes(ddb):
+    name = f"vec-imp-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.import_table(
+        S3BucketSource={"S3Bucket": "import-src"}, InputFormat="DYNAMODB_JSON",
+        TableCreationParameters={
+            "TableName": name, "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "VectorIndexes": [_vector_index()],
+        },
+    )
+    try:
+        assert ddb.describe_table(TableName=name)["Table"]["VectorIndexes"][0]["IndexName"] == "vix"
     finally:
         ddb.delete_table(TableName=name)

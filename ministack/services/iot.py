@@ -35,8 +35,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``SearchIndex`` over the live registry, shadows and MQTT connectivity
   - Registry events: ``DescribeEventConfigurations`` /
     ``UpdateEventConfigurations``
-  - Jobs (control plane): ``CreateJob``, ``DescribeJob``, ``ListJobs``,
-    ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
+  - Jobs (control plane): ``CreateJob``, ``UpdateJob``, ``DescribeJob``,
+    ``ListJobs``, ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
     ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
     ``CancelJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import copy
 import hashlib
@@ -76,6 +77,7 @@ import re
 import ssl
 import struct
 import time
+import unicodedata
 import uuid
 import weakref
 from datetime import datetime, timezone
@@ -483,15 +485,8 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     """Route an IoT control-plane request, then publish the registry events it raised."""
-    events: list = []
-    token = _pending_events.set(events)
-    try:
-        response = await _route_request(method, path, headers, body, query_params)
-    finally:
-        _pending_events.reset(token)
-    for account_id, region, topic, event in events:
-        await _publish_event(account_id, region, topic, event)
-    return response
+    async with publishing_events():
+        return await _route_request(method, path, headers, body, query_params)
 
 
 async def _route_request(
@@ -3684,16 +3679,33 @@ async def _publish_event(account_id: str, region: str, topic: str, event: dict) 
         logger.warning("IoT event publish failed on %s", topic, exc_info=True)
 
 
+@contextlib.asynccontextmanager
+async def publishing_events():
+    """Collect the ``$aws/events`` messages raised inside the block and publish them after it."""
+    events: list = []
+    token = _pending_events.set(events)
+    try:
+        yield
+    finally:
+        _pending_events.reset(token)
+    for account_id, region, topic, event in events:
+        await _publish_event(account_id, region, topic, event)
+
+
+def _event_wanted(config_type: str) -> bool:
+    """Whether events are being collected and ``config_type`` is enabled for the account and region."""
+    enabled = (_event_config.get(_EVENT_CONFIG_KEY) or {}).get("enabled", ())
+    return _pending_events.get() is not None and config_type in enabled
+
+
 def _registry_event(
     config_type: str, topic: str, event_type: str, operation: str, fields: dict,
     event_id: str | None = None, with_account: bool = True,
 ) -> None:
     """Queue ``$aws/events/{topic}`` when ``config_type`` is enabled for the request's account and region."""
-    pending = _pending_events.get()
-    enabled = (_event_config.get(_EVENT_CONFIG_KEY) or {}).get("enabled", ())
-    if pending is None or config_type not in enabled:
+    if not _event_wanted(config_type):
         return
-    pending.append((get_account_id(), get_region(), f"$aws/events/{topic}", {
+    _pending_events.get().append((get_account_id(), get_region(), f"$aws/events/{topic}", {
         "eventType": event_type,
         "eventId": event_id or uuid.uuid4().hex,
         "timestamp": int(time.time() * 1000),
@@ -5033,6 +5045,7 @@ def _jobs_thing_left_group(thing: str) -> bool:
             continue
         execution["status"] = "REMOVED"
         execution["lastUpdatedAt"] = now
+        _job_execution_event(execution)
         removed = True
     return removed
 
@@ -5040,6 +5053,75 @@ def _jobs_thing_left_group(thing: str) -> bool:
 def _jobs_with_history(execution: dict) -> list[dict]:
     """A thing's executions of one job, newest first."""
     return [execution, *execution.get("history", [])]
+
+
+def _jobs_status_counts(job_id: str) -> dict:
+    """Executions of a job per status, a rejoined thing's earlier ones included."""
+    counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            for execution in _jobs_with_history(latest):
+                counts[execution["status"]] += 1
+    return counts
+
+
+def _job_event(job: dict, operation: str) -> None:
+    """Queue ``$aws/events/job/{jobId}/{operation}``; completed and canceled carry the execution counts."""
+    if not _event_wanted("JOB"):
+        return
+    fields = {
+        "jobId": job["jobId"],
+        "status": operation.upper(),
+        "targetSelection": job["targetSelection"],
+        "targets": list(job.get("targets") or []),
+        "createdAt": job["createdAt"],
+        "lastUpdatedAt": job["lastUpdatedAt"],
+        "timestamp": int(time.time()),
+    }
+    if job.get("description") is not None:
+        fields["description"] = job["description"]
+    if operation == "completed":
+        fields["completedAt"] = job["completedAt"]
+    if operation in ("cancellation_in_progress", "canceled"):
+        fields["forceCanceled"] = bool(job.get("forceCanceled"))
+        for member in ("comment", "reasonCode"):
+            if job.get(member) is not None:
+                fields[member] = job[member]
+    if operation in ("completed", "canceled"):
+        counts = _jobs_status_counts(job["jobId"])
+        fields["jobProcessDetails"] = {
+            f"numberOf{name}Things": counts[status]
+            for name, status in (
+                ("Canceled", "CANCELED"), ("Rejected", "REJECTED"), ("Failed", "FAILED"),
+                ("Removed", "REMOVED"), ("Succeeded", "SUCCEEDED"), ("TimedOut", "TIMED_OUT"),
+            )
+        }
+    _registry_event(
+        "JOB", f"job/{job['jobId']}/{operation}", "JOB", operation, fields,
+        str(uuid.uuid4()), with_account=False,
+    )
+
+
+def _job_execution_event(
+    execution: dict, status: str | None = None, force_canceled: bool | None = None
+) -> None:
+    """Queue ``$aws/events/jobExecution/{jobId}/{status}`` for an execution that reached ``status``."""
+    status = status or execution["status"]
+    fields = {
+        "jobId": execution["jobId"],
+        "thingArn": _thing_arn(execution["thingName"]),
+        "status": status,
+        "executionNumber": execution["executionNumber"],
+        "timestamp": int(time.time()),
+    }
+    if force_canceled is not None:
+        fields["forceCanceled"] = force_canceled
+    if execution.get("statusDetails"):
+        fields["statusDetails"] = dict(execution["statusDetails"])
+    _registry_event(
+        "JOB_EXECUTION", f"jobExecution/{execution['jobId']}/{status.lower()}",
+        "JOB_EXECUTION", status.lower(), fields, str(uuid.uuid4()), with_account=False,
+    )
 
 
 def _jobs_materialize_all() -> None:
@@ -5052,13 +5134,17 @@ def _jobs_timeout_minutes(execution: dict, job: dict | None) -> int | None:
 
     ``stepTimeoutInMinutes`` from the device's own UpdateJobExecution wins over
     the job's ``timeoutConfig.inProgressTimeoutInMinutes``, which the reference
-    describes as applying to every execution of the job.
+    describes as applying to every execution of the job. An execution that was
+    running when UpdateJob changed the job's timeout keeps the earlier value.
     """
     step = execution.get("stepTimeoutInMinutes")
     if step is not None:
         return step
-    cfg = (job or {}).get("timeoutConfig") or {}
-    minutes = cfg.get("inProgressTimeoutInMinutes")
+    if "jobTimeoutInMinutes" in execution:
+        minutes = execution["jobTimeoutInMinutes"]
+    else:
+        cfg = (job or {}).get("timeoutConfig") or {}
+        minutes = cfg.get("inProgressTimeoutInMinutes")
     return minutes if isinstance(minutes, int) else None
 
 
@@ -5102,6 +5188,7 @@ def _jobs_apply_timeout(execution: dict) -> dict:
     execution["status"] = "TIMED_OUT"
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
+    _job_execution_event(execution)
     _jobs_maybe_complete(execution["jobId"])
     return execution
 
@@ -5127,6 +5214,7 @@ def _jobs_maybe_complete(job_id: str) -> None:
         job["status"] = "COMPLETED"
         job["completedAt"] = now
         job["lastUpdatedAt"] = now
+        _job_event(job, "completed")
 
 
 def _jobs_check_expected_version(
@@ -5194,6 +5282,8 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return await _create_job(job_id, _parse_body(body))
     if method == "GET":
         return _describe_job(job_id)
+    if method == "PATCH":
+        return _update_job(job_id, _parse_body(body))
     if method == "DELETE":
         return await _delete_job(job_id, qp)
     return error_response_json(
@@ -5245,17 +5335,9 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             )
     timeout_cfg = payload.get("timeoutConfig") or {}
     if timeout_cfg:
-        minutes = timeout_cfg.get("inProgressTimeoutInMinutes")
-        try:
-            minutes = int(minutes)
-        except (TypeError, ValueError):
-            minutes = None
-        if minutes is None or not 1 <= minutes <= 10080:
-            return error_response_json(
-                "InvalidRequestException",
-                "inProgressTimeoutInMinutes must be between 1 and 10080",
-                400,
-            )
+        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -5354,6 +5436,218 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
     return json_response(response)
 
 
+# The members UpdateJob takes; each one given replaces the stored one whole.
+_JOB_UPDATE_MEMBERS = (
+    "description", "presignedUrlConfig", "jobExecutionsRolloutConfig",
+    "abortConfig", "timeoutConfig", "jobExecutionsRetryConfig",
+)
+_JOB_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+$")
+
+
+def _job_update_violations(job_id: str, payload: dict) -> list[str]:
+    """Model constraint failures of an UpdateJob request."""
+    found: list[str] = []
+
+    def bound(value, member, low=None, high=None, double=False):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        shown = float(value) if double else value
+        if low is not None and value < low:
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have value greater than or equal to {low}"))
+        elif high is not None and value > high:
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have value less than or equal to {high}"))
+
+    def enum(value, member, allowed):
+        if value is not None and value not in allowed:
+            found.append(_job_validation_clause(
+                value, member, f"Member must satisfy enum value set: {allowed}"))
+
+    def criteria_list(cfg, member, high=None):
+        items = cfg.get("criteriaList") if isinstance(cfg, dict) else None
+        if not isinstance(items, list):
+            return []
+        if not items:
+            found.append(_job_validation_clause(
+                "[]", member, "Member must have length greater than or equal to 1"))
+        elif high is not None and len(items) > high:
+            shown = "[" + ", ".join(
+                f"RetryCriteria(failureType={c.get('failureType')}, "
+                f"numberOfRetries={c.get('numberOfRetries')})" for c in items
+            ) + "]"
+            found.append(_job_validation_clause(
+                shown, member, f"Member must have length less than or equal to {high}"))
+        return [c for c in items if isinstance(c, dict)]
+
+    # Fixed order, independent of the request's member order.
+    if len(job_id) > 64:
+        found.append(_job_validation_clause(
+            job_id, "jobId", "Member must have length less than or equal to 64"))
+    elif not _JOB_ID_RE.match(job_id):
+        found.append(_job_validation_clause(
+            job_id, "jobId", "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+"))
+    rollout = payload.get("jobExecutionsRolloutConfig") or {}
+    if isinstance(rollout, dict):
+        at = "jobExecutionsRolloutConfig"
+        bound(rollout.get("maximumPerMinute"), f"{at}.maximumPerMinute", low=1, high=1000)
+        rate = rollout.get("exponentialRate") or {}
+        if isinstance(rate, dict):
+            bound(rate.get("baseRatePerMinute"), f"{at}.exponentialRate.baseRatePerMinute",
+                  low=1, high=1000)
+            bound(rate.get("incrementFactor"), f"{at}.exponentialRate.incrementFactor",
+                  low=1.1, high=5, double=True)
+            criteria = rate.get("rateIncreaseCriteria") or {}
+            if isinstance(criteria, dict):
+                for name in ("numberOfNotifiedThings", "numberOfSucceededThings"):
+                    bound(criteria.get(name),
+                          f"{at}.exponentialRate.rateIncreaseCriteria.{name}", low=1)
+    description = payload.get("description")
+    if isinstance(description, str):
+        if len(description) > 2028:
+            found.append(_job_validation_clause(
+                description, "description",
+                "Member must have length less than or equal to 2028"))
+        elif any(unicodedata.category(ch).startswith("C") for ch in description):
+            found.append(_job_validation_clause(
+                description, "description",
+                r"Member must satisfy regular expression pattern: [^\p{C}]+"))
+    presign = payload.get("presignedUrlConfig") or {}
+    if isinstance(presign, dict):
+        bound(presign.get("expiresInSec"), "presignedUrlConfig.expiresInSec",
+              low=60, high=3600)
+    for i, c in enumerate(criteria_list(payload.get("jobExecutionsRetryConfig"),
+                                        "jobExecutionsRetryConfig.criteriaList", 2), 1):
+        at = f"jobExecutionsRetryConfig.criteriaList.{i}.member"
+        bound(c.get("numberOfRetries"), f"{at}.numberOfRetries", low=0, high=10)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED]")
+    for i, c in enumerate(criteria_list(payload.get("abortConfig"),
+                                        "abortConfig.criteriaList"), 1):
+        at = f"abortConfig.criteriaList.{i}.member"
+        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]")
+        enum(c.get("action"), f"{at}.action", "[CANCEL]")
+        bound(c.get("thresholdPercentage"), f"{at}.thresholdPercentage", high=100,
+              double=True)
+    return found
+
+
+def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
+    """Checks that need no job: they answer even for an unknown job id."""
+    violations = _job_update_violations(job_id, payload)
+    if violations:
+        return _job_validation_error(violations)
+    if all(payload.get(member) is None for member in _JOB_UPDATE_MEMBERS):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Update Job request for job {job_id} cannot be empty.", 400,
+        )
+    if payload.get("timeoutConfig") is not None:
+        err = _job_timeout_error(
+            (payload["timeoutConfig"] or {}).get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
+    rollout = payload.get("jobExecutionsRolloutConfig")
+    if isinstance(rollout, dict):
+        maximum, rate = rollout.get("maximumPerMinute"), rollout.get("exponentialRate")
+        message = None
+        if maximum is None:
+            message = (
+                "Provide MaximumPerMinute value when ExponentialRate is defined"
+                if rate is not None else
+                "Provide MaximumPerMinute value or provide ExponentialRate and "
+                "MaximumPerMinute"
+            )
+        elif isinstance(rate, dict):
+            criteria = rate.get("rateIncreaseCriteria") or {}
+            given = sum(criteria.get(name) is not None for name in (
+                "numberOfNotifiedThings", "numberOfSucceededThings"))
+            if given != 1:
+                message = (
+                    f"Provide {'either' if not given else 'only one of'} "
+                    "NumberOfNotifiedThings or NumberOfSucceededThings when "
+                    "RateIncreaseCriteria is defined"
+                )
+            elif (rate.get("baseRatePerMinute") or 0) > maximum:
+                message = (
+                    "Exponential rollout baseRatePerMinute should be less than "
+                    "maximumPerMinute."
+                )
+        if message:
+            return error_response_json("InvalidRequestException", message, 400)
+    role = (payload.get("presignedUrlConfig") or {}).get("roleArn")
+    if role is not None and not _JOB_ROLE_ARN_RE.match(str(role)):
+        return error_response_json(
+            "InvalidRequestException", f"Given role {role} is invalid.", 400
+        )
+    return None
+
+
+def _job_retry_update_error(job: dict, retry: dict) -> tuple | None:
+    """A retry config can only set the retries of its creation-time failure types to 0."""
+    criteria = [c for c in retry.get("criteriaList") or [] if isinstance(c, dict)]
+    message = None
+    if any(c.get("numberOfRetries") != 0 for c in criteria):
+        message = "The number of retries cannot be updated to any number other than 0."
+    elif len(criteria) > 1 and any(c.get("failureType") == "ALL" for c in criteria):
+        message = "A retryCriteria with failure type ALL must be used by itself."
+    elif not job.get("jobExecutionsRetryConfig"):
+        message = (
+            "RetryConfig cannot be updated if the job has no RetryConfig defined "
+            "during creation."
+        )
+    else:
+        existing = {
+            c.get("failureType")
+            for c in job["jobExecutionsRetryConfig"].get("criteriaList") or []
+        }
+        if {c.get("failureType") for c in criteria} != existing:
+            message = "FailureTypes must match existing FailureTypes defined in RetryConfig."
+    if message:
+        return error_response_json("InvalidRequestException", message, 400)
+    return None
+
+
+def _update_job(job_id: str, payload: dict) -> tuple:
+    err = _job_update_request_error(job_id, payload)
+    if err:
+        return err
+    job = _jobs.get(job_id)
+    if job is None:
+        return error_response_json(
+            "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+        )
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} in status {job['status']} cannot be updated.", 400,
+        )
+    if payload.get("jobExecutionsRetryConfig") is not None:
+        err = _job_retry_update_error(job, payload["jobExecutionsRetryConfig"])
+        if err:
+            return err
+    if payload.get("timeoutConfig") is not None:
+        # A running execution keeps the in-progress timeout it started with.
+        _jobs_materialize_executions(job_id)
+        minutes = (job.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
+        for execution in _job_executions.values():
+            if (
+                execution["jobId"] == job_id
+                and execution["status"] == "IN_PROGRESS"
+                and "jobTimeoutInMinutes" not in execution
+            ):
+                execution["jobTimeoutInMinutes"] = minutes
+    changes = {
+        member: copy.deepcopy(payload[member])
+        for member in _JOB_UPDATE_MEMBERS
+        if payload.get(member) is not None
+    }
+    _job_config_floats(changes)
+    job.update(changes)
+    job["lastUpdatedAt"] = _jobs_now_ms()
+    return 200, {}, b""
+
+
 def _job_summary(job: dict) -> dict:
     summary = {
         "jobArn": job["jobArn"],
@@ -5375,11 +5669,7 @@ def _describe_job(job_id: str) -> tuple:
     _jobs_materialize_executions(job_id)
     # Every execution counts, a rejoined thing's earlier ones included
     # (measured eu-central-1 2026-10-05).
-    counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
-    for latest in _job_executions.values():
-        if latest["jobId"] == job_id:
-            for execution in _jobs_with_history(latest):
-                counts[execution["status"]] += 1
+    counts = _jobs_status_counts(job_id)
     job_doc = {
         **_job_summary(job),
         "targets": list(job.get("targets") or []),
@@ -5449,9 +5739,13 @@ async def _delete_job(job_id: str, qp: dict) -> tuple:
         and execution["status"] in ("QUEUED", "IN_PROGRESS")
     })
     prev_next = {t: jobs_first_pending_job_id(t) for t in affected}
+    job["lastUpdatedAt"] = _jobs_now_ms()
+    _job_event(job, "deletion_in_progress")
     del _jobs[job_id]
     for key in [k for k in _job_executions.keys() if k[1] == job_id]:
+        _job_execution_event(_job_executions[key], "DELETED")
         del _job_executions[key]
+    _job_event(job, "deleted")
     account_id, region = get_account_id(), get_region()
     for thing_name in affected:
         await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
@@ -5502,14 +5796,43 @@ def _job_template_arn(template_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:jobtemplate/{template_id}"
 
 
-def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+def _job_validation_clause(value, member: str, constraint: str) -> str:
     shown = "null" if value is None else f"'{value}'"
+    return f"Value {shown} at '{member}' failed to satisfy constraint: {constraint}"
+
+
+def _job_validation_error(clauses: list[str]) -> tuple:
+    noun = "error" if len(clauses) == 1 else "errors"
     return error_response_json(
         "InvalidRequestException",
-        f"1 validation error detected: Value {shown} at '{member}' failed to "
-        f"satisfy constraint: {constraint}",
+        f"{len(clauses)} validation {noun} detected: " + "; ".join(clauses),
         400,
     )
+
+
+def _job_template_validation_error(value, member: str, constraint: str) -> tuple:
+    return _job_validation_error([_job_validation_clause(value, member, constraint)])
+
+
+def _job_timeout_error(minutes) -> tuple | None:
+    if isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= 10080:
+        return None
+    return error_response_json(
+        "InvalidRequestException",
+        "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
+        f"{'null' if minutes is None else minutes}.",
+        400,
+    )
+
+
+def _job_config_floats(record: dict) -> None:
+    """The two `double` members read back as floats (25 comes back as 25.0)."""
+    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
+        if isinstance(criteria.get("thresholdPercentage"), int):
+            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
+    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
+    if isinstance(rate.get("incrementFactor"), int):
+        rate["incrementFactor"] = float(rate["incrementFactor"])
 
 
 def _job_template_id_error(template_id: str) -> tuple | None:
@@ -5563,13 +5886,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
             document, "document", "Member must have length less than or equal to 32768"
         )
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
-    if minutes is not None and not (isinstance(minutes, int) and 1 <= minutes <= 10080):
-        return error_response_json(
-            "InvalidRequestException",
-            "Provide valid timeout value, inProgressTimeoutInMinutes cannot be "
-            f"{minutes}.",
-            400,
-        )
+    if minutes is not None and (err := _job_timeout_error(minutes)):
+        return err
     source = payload.get("documentSource")
     if document and source:
         return error_response_json(
@@ -5616,13 +5934,7 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
     ):
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
-    # The two `double` members read back as floats (25 comes back as 25.0).
-    for criteria in (record.get("abortConfig") or {}).get("criteriaList") or []:
-        if isinstance(criteria.get("thresholdPercentage"), int):
-            criteria["thresholdPercentage"] = float(criteria["thresholdPercentage"])
-    rate = (record.get("jobExecutionsRolloutConfig") or {}).get("exponentialRate") or {}
-    if isinstance(rate.get("incrementFactor"), int):
-        rate["incrementFactor"] = float(rate["incrementFactor"])
+    _job_config_floats(record)
     _job_templates[template_id] = record
     return json_response({
         "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
@@ -5784,6 +6096,7 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
         job["comment"] = payload["comment"]
     if payload.get("reasonCode") is not None:
         job["reasonCode"] = payload["reasonCode"]
+    _job_event(job, "cancellation_in_progress")
     # QUEUED executions are always canceled with the job; IN_PROGRESS ones
     # only when force is set — as on AWS. Queue fronts are snapshotted before
     # the sweep so notify-next fires only where the front actually changed.
@@ -5804,7 +6117,9 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             execution["status"] = "CANCELED"
             execution["lastUpdatedAt"] = now
             execution["versionNumber"] += 1
+            _job_execution_event(execution, force_canceled=force)
             canceled_things.add(execution["thingName"])
+    _job_event(job, "canceled")
     account_id, region = get_account_id(), get_region()
     for thing_name in sorted(canceled_things):
         await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
@@ -5944,6 +6259,7 @@ async def _cancel_job_execution(
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
+    _job_execution_event(execution, force_canceled=force)
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
     return json_response({})
@@ -6122,6 +6438,8 @@ def jobs_update_execution(
         execution["timeoutStartedAt"] = now
     execution["lastUpdatedAt"] = now
     execution["versionNumber"] += 1
+    if status in _JOB_EXECUTION_TERMINAL:
+        _job_execution_event(execution)
     _jobs_maybe_complete(job_id)
     return dict(execution), None
 
@@ -7696,7 +8014,8 @@ async def broker_publish(
     jobs = _parse_jobs_topic(topic)
     if jobs is not None:
         try:
-            await _handle_jobs_publish(account_id, region, *jobs, payload)
+            async with publishing_events():
+                await _handle_jobs_publish(account_id, region, *jobs, payload)
         except Exception:
             # Same guard as the shadow bridge above.
             _broker_logger.warning(
