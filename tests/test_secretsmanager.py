@@ -541,6 +541,32 @@ def test_secretsmanager_delete_with_recovery(sm):
     resp = sm.get_secret_value(SecretId="sm-del-rec")
     assert resp["SecretString"] == "recoverable"
 
+def test_secretsmanager_force_delete_secret_scheduled_for_deletion(sm):
+    name = f"sm-force-pending-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sm.create_secret(Name=name, SecretString="v")["ARN"]
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+
+    resp = sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    assert resp["ARN"] == arn
+    assert resp["Name"] == name
+    with pytest.raises(ClientError) as exc:
+        sm.describe_secret(SecretId=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    sm.create_secret(Name=name, SecretString="reused")
+    assert sm.get_secret_value(SecretId=name)["SecretString"] == "reused"
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+def test_secretsmanager_delete_secret_scheduled_for_deletion_without_force(sm):
+    name = f"sm-delete-pending-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=name, SecretString="v")
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert "DeletedDate" in sm.describe_secret(SecretId=name)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
 def test_secretsmanager_put_value_version_stages_v2(sm):
     sm.create_secret(Name="sm-pvs-v2", SecretString="v1")
     sm.put_secret_value(SecretId="sm-pvs-v2", SecretString="v2")

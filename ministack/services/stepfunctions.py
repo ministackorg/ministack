@@ -3406,7 +3406,10 @@ def _invoke_dynamodb(op_name, input_data):
     status, _, body = fn(input_data)
     result = json.loads(body) if body else {}
     if status >= 400:
-        error_type = result.get("__type", "DynamoDB.AmazonDynamoDBException")
+        # Optimized integrations use DynamoDB.*, unlike the SDK's DynamoDb.*.
+        # The service wire error may be bare, already prefixed, or #-qualified.
+        error_name = result.get("__type", "AmazonDynamoDBException").rsplit("#", 1)[-1].rsplit(".", 1)[-1]
+        error_type = f"DynamoDB.{error_name}"
         raise _ExecutionError(error_type, result.get("message", ""))
     return result
 
@@ -4363,9 +4366,11 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
             "/2015-03-31/functions/"
             f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
         )
-    elif pascal_action == "GetFunctionConfiguration":
+    elif pascal_action in {"GetFunction", "GetFunctionConfiguration"}:
         function_name = input_data.get("FunctionName", "")
-        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}"
+        if pascal_action == "GetFunctionConfiguration":
+            path += "/configuration"
         qualifier = input_data.get("Qualifier")
         if qualifier is not None:
             query_params["Qualifier"] = str(qualifier)
@@ -4414,7 +4419,7 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
             "(lambda REST dispatcher covers createFunction, updateFunctionConfiguration, "
-            "updateFunctionCode, createAlias, updateAlias, getAlias, and getFunctionConfiguration)",
+            "updateFunctionCode, createAlias, updateAlias, getAlias, getFunction, and getFunctionConfiguration)",
         )
 
     # Embed the current SFN execution's account ID as the access-key segment
@@ -4457,7 +4462,15 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     except (json.JSONDecodeError, TypeError):
         return decoded
 
-    return _convert_keys_to_sfn_convention(result)
+    output = _convert_keys_to_sfn_convention(result)
+    if pascal_action == "GetFunction" and isinstance(result, dict):
+        # Tags and environment variables are user maps, not SDK member names.
+        if "Tags" in result:
+            output["Tags"] = result["Tags"]
+        environment = result.get("Configuration", {}).get("Environment", {})
+        if "Variables" in environment:
+            output["Configuration"]["Environment"]["Variables"] = environment["Variables"]
+    return output
 
 
 # ---------------------------------------------------------------------------

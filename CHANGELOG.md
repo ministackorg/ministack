@@ -15,6 +15,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EC2 `DescribeInstances` validates ID format before existence** — a malformed `InstanceId` (e.g. `i-0000000000000000x`) now returns `InvalidInstanceID.Malformed`, matching the AWS capture; a well-formed unknown id still returns `InvalidInstanceID.NotFound`.
 - **ELBv2 `DescribeLoadBalancers` validates name length before existence** — a `Names` entry over 32 characters returns `ValidationError`, matching the AWS capture.
 - **WAFv2 `GetWebACL` validates the `Id` shape before existence** — a non-UUID or >36-char `Id` returns `ValidationException` listing the failed constraints, matching the AWS capture; a well-formed unknown id still returns `WAFNonexistentItemException`.
+- **Step Functions — optimized DynamoDB error names** — conditional failures and other service errors now use the `DynamoDB.` prefix so exact `Catch` and `Retry` handlers match AWS.
+- **Step Functions — Lambda `GetFunction` SDK integration** — workflows can read function configuration, code metadata and tags through `aws-sdk:lambda:getFunction`, including qualified reads.
+- **Secrets Manager — force delete of a secret scheduled for deletion** — `DeleteSecret` with `ForceDeleteWithoutRecovery` returned `InvalidRequestException` for a secret already scheduled for deletion. It now deletes the secret permanently. Reported by @fabio-andre-rodrigues.
 
 ## [1.5.24] — 2026-10-08
 
