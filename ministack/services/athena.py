@@ -1000,14 +1000,6 @@ async def _rewrite_data_paths(query, database, catalog=None):
             continue
         files = _materialize_table_files(s3_location, workdirs)
         relation = _table_relation(table_data, files) if files else _empty_relation(table_data)
-
-        p = urlparse(s3_location)
-        stripped = f"{p.netloc}{p.path}".rstrip("/")
-        local_dir = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-        if next(glob.iglob(f"{local_dir}/**/*", recursive=True), None):
-            relation = _file_relation(f"{local_dir}/**/*.{_data_format(table_data)}", table_data)
-        else:
-            relation = _empty_relation(table_data)
         alias = "" if ref.aliased else f' AS "{ref.table}"'
         edits.append((ref.start, ref.end, relation + alias))
         if not ref.aliased:
@@ -1073,15 +1065,16 @@ def _table_relation(table_data, files):
     fmt = _data_format(table_data)
     storage = table_data.get("StorageDescriptor") or {}
     columns = storage.get("Columns") or []
-    hive = "true" if table_data.get("PartitionKeys") else "false"
+    partitions = _path_partition_keys(table_data, files)
+    hive = _hive_options(partitions)
     if fmt == "parquet":
-        return f"read_parquet({_sql_list(files)}, union_by_name = true, hive_partitioning = {hive})"
+        return f"read_parquet({_sql_list(files)}, union_by_name = true, {hive})"
     if fmt == "json":
-        return f"read_json_auto({_sql_list(files)}, union_by_name = true, hive_partitioning = {hive})"
+        return f"read_json_auto({_sql_list(files)}, union_by_name = true, {hive})"
     if fmt == "avro":
         return f"read_avro({_sql_list(files)})"
     if fmt != "csv" or not columns:
-        return f"read_csv_auto({_sql_list(files)}, hive_partitioning = {hive})"
+        return f"read_csv_auto({_sql_list(files)}, {hive})"
     serde = storage.get("SerdeInfo") or {}
     params = serde.get("Parameters") or {}
     library = serde.get("SerializationLibrary") or ""
@@ -1103,17 +1096,35 @@ def _table_relation(table_data, files):
         return "'" + value.replace("'", "''") + "'"
     reader = (f"read_csv({_sql_list(files)}, auto_detect = false, header = false, skip = {skip}, delim = {lit(delim)}, "
               f"quote = {lit(quote)}, escape = {lit(quote)}, columns = {{{raw}}}, null_padding = true, "
-              f"strict_mode = false, hive_partitioning = {hive})")
+              f"strict_mode = false, {hive})")
     projected = []
     for i, column in enumerate(columns):
         base = str(column.get("Type", "string")).lower().split("(")[0].strip()
         duck_type = "DECIMAL(38,9)" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
         name = names[i].replace('"', '""')
         projected.append(f'TRY_CAST("c{i}" AS {duck_type}) AS "{name}"')
+    in_paths = {str(key.get("Name", "")) for key in partitions}
     for key in table_data.get("PartitionKeys") or []:
         name = str(key.get("Name", "")).replace('"', '""')
-        projected.append(f'"{name}"')
+        value = f'"{name}"' if key.get("Name") in in_paths else f"CAST(NULL AS {_duckdb_type(key)})"
+        projected.append(f'{value} AS "{name}"')
     return f"(SELECT {', '.join(projected)} FROM {reader})"
+
+
+def _path_partition_keys(table_data, files):
+    """The Glue partition keys every file's path carries as a ``key=value`` folder."""
+    def folders(path):
+        return {part.split("=", 1)[0] for part in path.split("/")[:-1] if "=" in part}
+    present = set.intersection(*(folders(f) for f in files)) if files else set()
+    return [key for key in table_data.get("PartitionKeys") or [] if key.get("Name") in present]
+
+
+def _hive_options(partitions):
+    """Hive partitioning typed from Glue; DuckDB refuses a type for a key no path carries."""
+    if not partitions:
+        return "hive_partitioning = false"
+    types = ", ".join("'{}': {}".format(str(key["Name"]).replace("'", "''"), _duckdb_type(key)) for key in partitions)
+    return f"hive_partitioning = true, hive_types = {{{types}}}"
 
 
 # Athena names each S3 table bucket's catalog "s3tablescatalog/<bucket>".
@@ -1150,23 +1161,6 @@ _DUCKDB_TYPE_BY_ATHENA = {
     "bigint": "BIGINT", "float": "FLOAT", "real": "FLOAT", "double": "DOUBLE", "date": "DATE",
     "timestamp": "TIMESTAMP", "binary": "BLOB", "varbinary": "BLOB",
 }
-
-
-# Readers that accept ``hive_types``, so partition columns get their Glue types.
-_HIVE_TYPED_READERS = {"parquet": "read_parquet", "csv": "read_csv", "json": "read_json"}
-
-
-def _file_relation(pattern, table_data):
-    """The table's files; partition keys are typed from Glue instead of inferred from the path."""
-    path = "'" + pattern.replace("'", "''") + "'"
-    reader = _HIVE_TYPED_READERS.get(_data_format(table_data))
-    partition_keys = table_data.get("PartitionKeys") or []
-    if not reader or not partition_keys:
-        return path  # DuckDB reads the files, or reports why not
-    hive_types = ", ".join(
-        "'{}': {}".format(str(key.get("Name", "")).replace("'", "''"), _duckdb_type(key)) for key in partition_keys
-    )
-    return f"{reader}({path}, hive_partitioning = true, hive_types = {{{hive_types}}})"
 
 
 def _duckdb_type(column):
