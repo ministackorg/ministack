@@ -184,6 +184,17 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -e ".[test]" -r requirements.txt
 
+      # Docker Hub pulls go through mirror.gcr.io (no credentials, no per-IP cap);
+      # the daemon falls back to Docker Hub on a miss. SIGHUP reloads
+      # registry-mirrors without restarting the daemon or the redis service.
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        run: |
+          config=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          echo "$config" | jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo kill -HUP "$(pidof dockerd)"
+          sleep 2
+          docker info --format '{{json .RegistryConfig.Mirrors}}' | grep -q mirror.gcr.io
+
       - name: Validate Docker and create isolated network
         run: |
           docker info
