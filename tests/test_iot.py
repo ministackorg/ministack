@@ -6558,15 +6558,17 @@ def _registry_events(calls, enable=_EVENT_TYPES) -> list:
     """Run ``calls`` in-process with ``enable`` on and return the ``$aws/events`` messages."""
     from ministack.core.responses import set_request_account_id, set_request_region
     from ministack.services import iot as iot_module
+    from ministack.services import iot_jobs_data
 
     received: list = []
 
     async def _collect(topic, payload, qos):
         received.append((topic, json.loads(payload)))
 
-    async def _call(method, path, body=None):
-        status, _, resp = await iot_module.handle_request(
-            method, path, {}, json.dumps(body or {}).encode(), {}
+    async def _call(method, path, body=None, query=None, device=False):
+        plane = iot_jobs_data if device else iot_module
+        status, _, resp = await plane.handle_request(
+            method, path, {}, json.dumps(body or {}).encode(), query or {}
         )
         assert status == 200, resp
         return json.loads(resp or b"{}")
@@ -6588,8 +6590,15 @@ def _registry_events(calls, enable=_EVENT_TYPES) -> list:
         iot_module.reset()
         iot_module.broker_reset()
     for _topic, event in received:
+        timestamp = event.pop("timestamp")
+        assert isinstance(timestamp, int)
+        if event["eventType"] in ("JOB", "JOB_EXECUTION"):
+            # Job events carry a dashed UUID and epoch seconds, and no accountId.
+            assert str(uuid.UUID(event["eventId"])) == event["eventId"]
+            assert timestamp < 10**11
+            assert "accountId" not in event
+            continue
         assert re.fullmatch(r"[0-9a-f]{32}", event["eventId"])
-        assert isinstance(event.pop("timestamp"), int)
         if event["eventType"] == "THING_TYPE_ASSOCIATION_EVENT":
             assert "accountId" not in event
         else:
@@ -6787,6 +6796,213 @@ def test_iot_deleting_a_thing_announces_its_group_memberships():
         "$aws/events/thing/ev-thing/deleted",
         "$aws/events/thingGroupMembership/thingGroup/ev-group/thing/ev-thing/removed",
     ]
+
+
+_JOB_ARN = f"arn:aws:iot:{_TEST_REGION}:{_EVENTS_ACCOUNT}"
+
+
+async def _create_job(call, job_id, things, **extra):
+    await call("PUT", f"/jobs/{job_id}", {
+        "targets": [f"{_JOB_ARN}:thing/{t}" for t in things], "document": "{}", **extra,
+    })
+
+
+def _job_counts(**counts) -> dict:
+    return {f"numberOf{name}Things": counts.get(name, 0) for name in (
+        "Canceled", "Rejected", "Failed", "Removed", "Succeeded", "TimedOut",
+    )}
+
+
+def _job_stamps(event: dict) -> None:
+    """Drop the epoch-millisecond job stamps after checking their unit."""
+    for member in ("createdAt", "lastUpdatedAt", "completedAt"):
+        if member in event:
+            assert event.pop(member) > 10**12
+
+
+def test_iot_job_execution_events_for_device_reports():
+    async def calls(call):
+        from ministack.services import iot as iot_module
+
+        await call("POST", "/things/ev-t1")
+        await _create_job(call, "ev-ok", ["ev-t1"], description="jd")
+        await call("POST", "/things/ev-t1/jobs/ev-ok", {"status": "IN_PROGRESS"}, device=True)
+        await call("POST", "/things/ev-t1/jobs/ev-ok",
+                   {"status": "SUCCEEDED", "statusDetails": {"s": "2"}}, device=True)
+        await _create_job(call, "ev-fail", ["ev-t1"])
+        await iot_module.broker_publish(
+            _EVENTS_ACCOUNT, _TEST_REGION, "$aws/things/ev-t1/jobs/ev-fail/update",
+            json.dumps({"status": "FAILED", "statusDetails": {"errorCode": "E43"}}).encode(),
+        )
+        await _create_job(call, "ev-rej", ["ev-t1"])
+        await call("POST", "/things/ev-t1/jobs/ev-rej", {"status": "REJECTED"}, device=True)
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    assert [t for t, _e in events] == [
+        "$aws/events/jobExecution/ev-ok/succeeded", "$aws/events/job/ev-ok/completed",
+        "$aws/events/jobExecution/ev-fail/failed", "$aws/events/job/ev-fail/completed",
+        "$aws/events/jobExecution/ev-rej/rejected", "$aws/events/job/ev-rej/completed",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    execution = {"eventType": "JOB_EXECUTION", "executionNumber": 1,
+                 "thingArn": f"{_JOB_ARN}:thing/ev-t1"}
+    assert events[0][1] == {**execution, "operation": "succeeded", "jobId": "ev-ok",
+                            "status": "SUCCEEDED", "statusDetails": {"s": "2"}}
+    assert events[1][1] == {
+        "eventType": "JOB", "operation": "completed", "jobId": "ev-ok",
+        "status": "COMPLETED", "targetSelection": "SNAPSHOT",
+        "targets": [f"{_JOB_ARN}:thing/ev-t1"], "description": "jd",
+        "jobProcessDetails": _job_counts(Succeeded=1),
+    }
+    assert events[2][1] == {**execution, "operation": "failed", "jobId": "ev-fail",
+                            "status": "FAILED", "statusDetails": {"errorCode": "E43"}}
+    assert events[3][1]["jobProcessDetails"] == _job_counts(Failed=1)
+    assert events[4][1] == {**execution, "operation": "rejected", "jobId": "ev-rej",
+                            "status": "REJECTED"}
+    assert events[5][1]["jobProcessDetails"] == _job_counts(Rejected=1)
+
+
+def test_iot_job_cancel_events():
+    async def calls(call):
+        for thing in ("ev-t1", "ev-t2"):
+            await call("POST", f"/things/{thing}")
+        await _create_job(call, "ev-cancel", ["ev-t1", "ev-t2"])
+        await call("POST", "/things/ev-t1/jobs/ev-cancel", {"status": "IN_PROGRESS"}, device=True)
+        await call("PUT", "/jobs/ev-cancel/cancel", {"comment": "c1", "reasonCode": "R1"})
+        await call("POST", "/things/ev-t1/jobs/ev-cancel", {"status": "SUCCEEDED"}, device=True)
+        await _create_job(call, "ev-force", ["ev-t1", "ev-t2"])
+        await call("POST", "/things/ev-t1/jobs/ev-force",
+                   {"status": "IN_PROGRESS", "statusDetails": {"p": "1"}}, device=True)
+        await call("PUT", "/jobs/ev-force/cancel", {"comment": "c2"}, {"force": "true"})
+        await _create_job(call, "ev-exec", ["ev-t1", "ev-t2"])
+        await call("PUT", "/things/ev-t2/jobs/ev-exec/cancel")
+        await call("POST", "/things/ev-t1/jobs/ev-exec", {"status": "IN_PROGRESS"}, device=True)
+        await call("PUT", "/things/ev-t1/jobs/ev-exec/cancel",
+                   {"statusDetails": {"why": "w"}}, {"force": "true"})
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    topics = [t for t, _e in events]
+    assert topics == [
+        "$aws/events/job/ev-cancel/cancellation_in_progress",
+        "$aws/events/jobExecution/ev-cancel/canceled",
+        "$aws/events/job/ev-cancel/canceled",
+        "$aws/events/jobExecution/ev-cancel/succeeded",
+        "$aws/events/job/ev-force/cancellation_in_progress",
+        "$aws/events/jobExecution/ev-force/canceled",
+        "$aws/events/jobExecution/ev-force/canceled",
+        "$aws/events/job/ev-force/canceled",
+        "$aws/events/jobExecution/ev-exec/canceled",
+        "$aws/events/jobExecution/ev-exec/canceled",
+        "$aws/events/job/ev-exec/completed",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    job = {"eventType": "JOB", "targetSelection": "SNAPSHOT",
+           "targets": [f"{_JOB_ARN}:thing/ev-t1", f"{_JOB_ARN}:thing/ev-t2"]}
+    assert events[0][1] == {**job, "operation": "cancellation_in_progress",
+                            "jobId": "ev-cancel", "status": "CANCELLATION_IN_PROGRESS",
+                            "forceCanceled": False, "comment": "c1", "reasonCode": "R1"}
+    assert events[1][1] == {
+        "eventType": "JOB_EXECUTION", "operation": "canceled", "jobId": "ev-cancel",
+        "thingArn": f"{_JOB_ARN}:thing/ev-t2", "status": "CANCELED",
+        "executionNumber": 1, "forceCanceled": False,
+    }
+    # The IN_PROGRESS execution a cancel without force leaves running is not counted.
+    assert events[2][1] == {**job, "operation": "canceled", "jobId": "ev-cancel",
+                            "status": "CANCELED", "forceCanceled": False,
+                            "comment": "c1", "reasonCode": "R1",
+                            "jobProcessDetails": _job_counts(Canceled=1)}
+    forced = {e["thingArn"]: e for _t, e in events[5:7]}
+    assert forced[f"{_JOB_ARN}:thing/ev-t1"]["statusDetails"] == {"p": "1"}
+    assert {e["forceCanceled"] for e in forced.values()} == {True}
+    assert events[7][1]["forceCanceled"] is True
+    assert events[7][1]["jobProcessDetails"] == _job_counts(Canceled=2)
+    assert [e["forceCanceled"] for _t, e in events[8:10]] == [False, True]
+    assert events[9][1]["statusDetails"] == {"why": "w"}
+    assert events[10][1]["jobProcessDetails"] == _job_counts(Canceled=2)
+    assert "forceCanceled" not in events[10][1]
+
+
+def test_iot_job_removed_timed_out_and_deleted_events():
+    async def calls(call):
+        from ministack.services import iot as iot_module
+
+        for thing in ("ev-t3", "ev-t4"):
+            await call("POST", f"/things/{thing}")
+        await call("POST", "/thing-groups/ev-group")
+        await call("PUT", "/thing-groups/addThingToThingGroup",
+                   {"thingGroupName": "ev-group", "thingName": "ev-t3"})
+        await call("PUT", "/jobs/ev-cont", {
+            "targets": [f"{_JOB_ARN}:thinggroup/ev-group"], "document": "{}",
+            "targetSelection": "CONTINUOUS",
+        })
+        await call("PUT", "/thing-groups/removeThingFromThingGroup",
+                   {"thingGroupName": "ev-group", "thingName": "ev-t3"})
+        await _create_job(call, "ev-timeout", ["ev-t4"],
+                          timeoutConfig={"inProgressTimeoutInMinutes": 1})
+        await call("POST", "/things/ev-t4/jobs/ev-timeout",
+                   {"status": "IN_PROGRESS", "statusDetails": {"d": "1"}}, device=True)
+        iot_module._job_executions[("ev-t4", "ev-timeout")]["startedAt"] -= 61_000
+        await call("GET", "/things/ev-t4/jobs/ev-timeout", device=True)
+        await call("DELETE", "/jobs/ev-timeout")
+        await call("DELETE", "/jobs/ev-cont", query={"force": "true"})
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    assert [t for t, _e in events] == [
+        "$aws/events/jobExecution/ev-cont/removed",
+        "$aws/events/jobExecution/ev-timeout/timed_out",
+        "$aws/events/job/ev-timeout/completed",
+        "$aws/events/job/ev-timeout/deletion_in_progress",
+        "$aws/events/jobExecution/ev-timeout/deleted",
+        "$aws/events/job/ev-timeout/deleted",
+        "$aws/events/job/ev-cont/deletion_in_progress",
+        "$aws/events/jobExecution/ev-cont/deleted",
+        "$aws/events/job/ev-cont/deleted",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    assert events[0][1] == {
+        "eventType": "JOB_EXECUTION", "operation": "removed", "jobId": "ev-cont",
+        "thingArn": f"{_JOB_ARN}:thing/ev-t3", "status": "REMOVED", "executionNumber": 1,
+    }
+    assert events[1][1]["status"] == "TIMED_OUT"
+    assert events[2][1]["jobProcessDetails"] == _job_counts(TimedOut=1)
+    job = {"eventType": "JOB", "jobId": "ev-timeout", "targetSelection": "SNAPSHOT",
+           "targets": [f"{_JOB_ARN}:thing/ev-t4"]}
+    assert events[3][1] == {**job, "operation": "deletion_in_progress",
+                            "status": "DELETION_IN_PROGRESS"}
+    assert events[4][1] == {
+        "eventType": "JOB_EXECUTION", "operation": "deleted", "jobId": "ev-timeout",
+        "thingArn": f"{_JOB_ARN}:thing/ev-t4", "status": "DELETED", "executionNumber": 1,
+        "statusDetails": {"d": "1"},
+    }
+    assert events[5][1] == {**job, "operation": "deleted", "status": "DELETED"}
+    assert events[8][1]["targetSelection"] == "CONTINUOUS"
+
+
+@pytest.mark.parametrize("enable", [("JOB",), ("JOB_EXECUTION",), ()])
+def test_iot_job_events_follow_the_event_configuration(enable):
+    async def calls(call):
+        await call("POST", "/things/ev-t1")
+        await _create_job(call, "ev-ok", ["ev-t1"])
+        await call("POST", "/things/ev-t1/jobs/ev-ok", {"status": "SUCCEEDED"}, device=True)
+        await _create_job(call, "ev-cancel", ["ev-t1"])
+        await call("PUT", "/jobs/ev-cancel/cancel")
+
+    events = _registry_events(calls, enable=enable)
+    expected = {
+        ("JOB",): ["$aws/events/job/ev-ok/completed",
+                   "$aws/events/job/ev-cancel/cancellation_in_progress",
+                   "$aws/events/job/ev-cancel/canceled"],
+        ("JOB_EXECUTION",): ["$aws/events/jobExecution/ev-ok/succeeded",
+                             "$aws/events/jobExecution/ev-cancel/canceled"],
+        (): [],
+    }
+    assert [t for t, _e in events] == expected[enable]
 
 
 # ----------------------------------------------------------------------

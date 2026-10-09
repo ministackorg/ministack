@@ -48,16 +48,22 @@ Behaviour that follows the live service (measured 2026-08-26 unless noted):
 
 Deliberate divergences from AWS, each pinned by a test:
 
-  * Signing is SYNCHRONOUS and SYNTHETIC. Real Signer queues an async job;
-    here StartSigningJob validates the source object against MiniStack's own
-    S3 store in-process, writes a JSON signature marker (source reference +
-    SHA-256 of the source bytes, not real cryptography) to
+  * Signing is SYNCHRONOUS. Real Signer queues an async job; here
+    StartSigningJob validates the source object against MiniStack's own S3
+    store in-process, writes the signed object to
     `destination.s3.bucketName`, and returns with the job already
     `Succeeded`. Callers whose contract is the S3 side effect work without
-    polling DescribeSigningJob; the signature BYTES are not a real signature.
+    polling DescribeSigningJob.
+  * On AWSIoTDeviceManagement-SHA256-ECDSA, when ACM holds the private
+    key of the profile's certificate, the job signs the source bytes with
+    it and writes the JSON document AWS writes; a non-EC key fails the job
+    as on AWS. Otherwise the signed object is a JSON receipt (source
+    reference + SHA-256 of the source bytes), which is not a signature, and
+    a warning is logged when AWS would have signed with the certificate.
   * A missing source object or destination bucket fails at Start with
     ResourceNotFoundException and records NO job — there is no async
-    pipeline that could fail later, so nothing ever lists as `Failed`.
+    pipeline that could fail later. The only job that lists as `Failed` is
+    the non-EC key above.
   * ListSigningJobs pages: `maxResults` (1..25) limits the page and a
     `nextToken` carries the sort position of the last job returned, so a
     paginator walks the whole list. `status`, `isRevoked`,
@@ -89,6 +95,7 @@ import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import ministack.services.acm as acm_svc
 import ministack.services.s3 as s3_svc
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
@@ -167,6 +174,10 @@ _ACCOUNT_ID_RE = re.compile(r"[0-9]{12}")
 _DEFAULT_VALIDITY = {"type": "MONTHS", "value": 135}
 # The one platform whose signed-object key was measured to differ.
 _LAMBDA_PLATFORM_ID = "AWSLambda-SHA384-ECDSA"
+# The platform whose signed object is emulated.
+_IOT_PLATFORM_ID = "AWSIoTDeviceManagement-SHA256-ECDSA"
+# Platforms that sign with the profile's ACM certificate on AWS.
+_ACM_SIGNED_PLATFORMS = (_IOT_PLATFORM_ID, "AmazonFreeRTOS-Default", "AmazonFreeRTOS-TI-CC3220SF")
 
 
 def _now():
@@ -271,9 +282,7 @@ def _validate_overrides(overrides):
 
 
 def _validate_signing_material(material):
-    """certificateArn is the shape's one member and is Required: Yes. The
-    certificate itself is not resolved: nothing signs for real here, so there
-    is no ACM lookup to make."""
+    """certificateArn is required; StartSigningJob resolves it, so an ARN ACM does not hold is accepted."""
     if material is None:
         return None
     if not isinstance(material, dict):
@@ -414,6 +423,66 @@ def _signed_key(prefix, job_id, platform_id, src_key):
     return key
 
 
+def _acm_private_key(profile):
+    """(key, None) for the private key ACM holds for the profile's certificate, else (None, reason)."""
+    arn = (profile.get("signingMaterial") or {}).get("certificateArn")
+    if not arn:
+        return None, "the profile has no signingMaterial"
+    cert = acm_svc._get_local_certificate(arn)
+    if cert is None:
+        return None, f"ACM in this account and region has no certificate {arn}"
+    pem = cert.get("_private_key")
+    if not pem:
+        if cert.get("Type") == "IMPORTED" and "_private_key" not in cert:
+            return None, f"the private key of {arn} is not persisted across restarts; import it again"
+        return None, f"ACM holds no private key for {arn}"
+    try:
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    except ImportError:
+        return None, "the cryptography package is not installed"
+    try:
+        return load_pem_private_key(pem.encode(), password=None), None
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return None, f"the private key of {arn} cannot be loaded"
+
+
+def _signing_key(profile):
+    """The key that signs the profile's jobs, or None for the receipt, with a warning where AWS would sign."""
+    platform_id = profile.get("platformId")
+    if platform_id not in _ACM_SIGNED_PLATFORMS:
+        return None
+    if platform_id == _IOT_PLATFORM_ID:
+        key, reason = _acm_private_key(profile)
+    else:
+        key, reason = None, f"the {platform_id} signed object format is not emulated"
+    if key is None:
+        logger.warning("Signer profile %s writes a receipt instead of a signature: %s",
+                       profile.get("profileName"), reason)
+    return key
+
+
+def _iot_signed_object(key, data, src_bucket, src_key, version_id):
+    """The compact JSON AWS writes on the IoT platform, or None for a non-EC key."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        return None
+    signature = key.sign(data, ec.ECDSA(hashes.SHA256()))
+    document = {
+        "rawPayloadSize": len(data),
+        "signature": base64.b64encode(signature).decode("ascii"),
+        "signatureAlgorithm": "SHA256withECDSA",
+        "payloadLocation": {"s3": {
+            "bucketName": src_bucket,
+            "key": src_key,
+            "version": version_id,
+        }},
+    }
+    return json.dumps(document, separators=(",", ":")).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -487,38 +556,49 @@ def _start_signing_job(body, headers=None):
     signed_key = _signed_key(prefix, job_id, platform_id, src_key)
     now = _now()
 
-    marker = {
-        "jobId": job_id,
-        "profileName": profile_name,
-        "platformId": platform_id,
-        "source": {
-            "bucketName": src_bucket,
-            "key": src_key,
-            "version": version_id,
-        },
-        "sourceSha256": hashlib.sha256(data).hexdigest(),
-        "signedAt": now,
-        "signedBy": "ministack-signer",
-    }
-    marker_bytes = json.dumps(marker, ensure_ascii=False).encode("utf-8")
-    status, _headers, resp_body = s3_svc._put_object(
-        dst_bucket, signed_key, marker_bytes,
-        {"content-type": "application/json",
-         "content-length": str(len(marker_bytes))},
-    )
-    if status >= 300:
-        # Bucket existence was checked above, so this is some other S3
-        # rejection (Object Lock, SSE config, ...) — surface it as the
-        # service-side failure it is instead of mislabeling it "not found".
-        logger.error(
-            "Signed-object write to s3://%s/%s failed with S3 status %s: %s",
-            dst_bucket, signed_key, status, resp_body,
+    key = _signing_key(profile)
+    failed = False
+    if key is not None:
+        signed_bytes = _iot_signed_object(key, data, src_bucket, src_key, version_id)
+        # AWS fails the job and writes nothing.
+        failed = signed_bytes is None
+        content_type = "application/octet-stream"
+    else:
+        marker = {
+            "jobId": job_id,
+            "profileName": profile_name,
+            "platformId": platform_id,
+            "source": {
+                "bucketName": src_bucket,
+                "key": src_key,
+                "version": version_id,
+            },
+            "sourceSha256": hashlib.sha256(data).hexdigest(),
+            "signedAt": now,
+            "signedBy": "ministack-signer",
+        }
+        signed_bytes = json.dumps(marker, ensure_ascii=False).encode("utf-8")
+        content_type = "application/json"
+    if not failed:
+        status, _headers, resp_body = s3_svc._put_object(
+            dst_bucket, signed_key, signed_bytes,
+            {"content-type": content_type,
+             "content-length": str(len(signed_bytes))},
         )
-        return _error(500, "InternalServiceErrorException",
-                      f"Writing the signed object to s3://{dst_bucket}/"
-                      f"{signed_key} failed with S3 status {status}.")
+        if status >= 300:
+            # Bucket existence was checked above, so this is some other S3
+            # rejection (Object Lock, SSE config, ...) — surface it as the
+            # service-side failure it is instead of mislabeling it "not found".
+            logger.error(
+                "Signed-object write to s3://%s/%s failed with S3 status %s: %s",
+                dst_bucket, signed_key, status, resp_body,
+            )
+            return _error(500, "InternalServiceErrorException",
+                          f"Writing the signed object to s3://{dst_bucket}/"
+                          f"{signed_key} failed with S3 status {status}.")
 
     account = get_account_id()
+    # A failed job has no signedObject and no signatureExpiresAt.
     _jobs[job_id] = {
         "jobId": job_id,
         "source": {"s3": {
@@ -526,18 +606,18 @@ def _start_signing_job(body, headers=None):
             "key": src_key,
             "version": version_id,
         }},
-        "signedObject": {"s3": {"bucketName": dst_bucket, "key": signed_key}},
+        "signedObject": None if failed else {"s3": {"bucketName": dst_bucket, "key": signed_key}},
         "profileName": profile_name,
         "profileVersion": profile.get("profileVersion"),
         "platformId": platform_id,
         "signingMaterial": profile.get("signingMaterial"),
         "overrides": profile.get("overrides"),
         "signingParameters": profile.get("signingParameters"),
-        "signatureExpiresAt": _signature_expires_at(
+        "signatureExpiresAt": None if failed else _signature_expires_at(
             now, profile.get("signatureValidityPeriod")
         ),
-        "status": "Succeeded",
-        "statusReason": "Signing Succeeded",  # live-measured Describe wording
+        "status": "Failed" if failed else "Succeeded",
+        "statusReason": "can't identify EC private key." if failed else "Signing Succeeded",
         "createdAt": now,
         "completedAt": now,
         "requestedBy": _requested_by(headers),

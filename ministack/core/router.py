@@ -20,6 +20,40 @@ from ministack.core.arn import ArnParseError, parse_arn
 
 logger = logging.getLogger("ministack")
 
+_KNOWN_AWS_SERVICE_NAMES: frozenset | None = None
+
+
+def _is_aws_service_name(scope_name: str) -> bool:
+    """Whether a SigV4 credential scope names a real AWS service.
+
+    Built lazily from the botocore catalog — service name, endpoint prefix,
+    and signing name per model — so new AWS services are recognized without a
+    table to maintain. Only consulted for scopes that matched no registered
+    service or alias, so a miss never changes routing for implemented
+    services.
+    """
+    global _KNOWN_AWS_SERVICE_NAMES
+    if _KNOWN_AWS_SERVICE_NAMES is None:
+        names = set()
+        try:
+            import botocore.session
+
+            session = botocore.session.get_session()
+            for service in session.get_available_services():
+                names.add(service)
+                try:
+                    meta = session.get_service_model(service).metadata
+                except Exception:
+                    continue
+                names.add(meta.get("endpointPrefix", ""))
+                names.add(meta.get("signingName", ""))
+        except Exception:
+            pass
+        names.discard("")
+        _KNOWN_AWS_SERVICE_NAMES = frozenset(names)
+    return scope_name in _KNOWN_AWS_SERVICE_NAMES
+
+
 # Lambda API paths are versioned by date prefix. Resources enumerated per
 # AWS Lambda API Reference (functions, layers, event-source-mappings,
 # account-settings, runtime, tags, code-signing-configs). Matches any
@@ -819,6 +853,13 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
+            # A request signed for a real AWS service MiniStack does not
+            # implement must not fall through to the S3 path catch-all —
+            # answering NoSuchBucket for a glacier/pinpoint call lies about
+            # which service failed. Surface it as its (unsupported) service
+            # so dispatch returns "Unsupported service: <name>".
+            if _is_aws_service_name(svc_name):
+                return svc_name
 
     # 3. Check query parameters for Action-based APIs (SQS, SNS, IAM, STS, CloudWatch)
     action = (
