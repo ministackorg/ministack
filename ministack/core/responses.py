@@ -11,6 +11,7 @@ import contextvars
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -693,6 +694,64 @@ def apply_image_prefix(image: str) -> str:
     if image.startswith(prefix + "/"):
         return image
     return f"{prefix}/{image}"
+
+
+def _docker_hub_repository(repository: str) -> str | None:
+    """The Docker Hub path of ``repository`` (``library/x`` for official images),
+    or None when it names another registry."""
+    first, _, rest = repository.partition("/")
+    if rest and first in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        repository = rest
+    elif rest and ("." in first or ":" in first or first == "localhost"):
+        return None
+    return repository if "/" in repository else f"library/{repository}"
+
+
+def docker_hub_mirrors(repository: str) -> list[str]:
+    """Public mirrors of a Docker Hub repository, tried when Docker Hub fails."""
+    hub = _docker_hub_repository(repository)
+    if hub is None:
+        return []
+    ecr = f"docker/{hub}" if hub.startswith("library/") else hub
+    return [f"public.ecr.aws/{ecr}", f"mirror.gcr.io/{hub}"]
+
+
+def install_docker_hub_fallback() -> None:
+    """Retry a failed Docker Hub pull from ECR Public, then mirror.gcr.io, and tag
+    the result with the name that was asked for. Covers every Docker client,
+    including the pull ``containers.run`` makes for a missing image."""
+    try:
+        from docker.errors import APIError
+        from docker.models.images import ImageCollection
+        from docker.utils import parse_repository_tag
+    except ImportError:
+        return
+    original = ImageCollection.pull
+    if getattr(original, "_ministack_fallback", False):
+        return
+
+    def pull(self, repository, tag=None, all_tags=False, **kwargs):
+        try:
+            return original(self, repository, tag=tag, all_tags=all_tags, **kwargs)
+        except APIError as hub_error:
+            repo, parsed_tag = parse_repository_tag(repository)
+            tag = tag or parsed_tag or "latest"
+            if all_tags or ":" in tag:  # digests cannot be re-tagged
+                raise
+            for mirror in docker_hub_mirrors(repo):
+                try:
+                    image = original(self, mirror, tag=tag, **kwargs)
+                except APIError:
+                    continue
+                image.tag(repo, tag)
+                logging.getLogger("ministack").warning(
+                    "Docker Hub pull of %s:%s failed (%s); pulled %s:%s instead",
+                    repo, tag, hub_error.explanation or hub_error, mirror, tag)
+                return image
+            raise
+
+    pull._ministack_fallback = True
+    ImageCollection.pull = pull
 
 
 def sha256_hash(data: bytes) -> str:

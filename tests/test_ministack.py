@@ -1154,3 +1154,45 @@ def test_unknown_scope_still_falls_through_to_s3():
 def test_implemented_scope_routes_normally():
     assert detect_service("POST", "/", _auth("dynamodb"), {}) == "dynamodb"
     assert detect_service("POST", "/", _auth("states"), {}) == "states"
+
+
+def test_docker_hub_mirrors_cover_hub_images_only():
+    from ministack.core.responses import docker_hub_mirrors
+
+    assert docker_hub_mirrors("postgres") == ["public.ecr.aws/docker/library/postgres", "mirror.gcr.io/library/postgres"]
+    assert docker_hub_mirrors("docker.io/library/redis") == ["public.ecr.aws/docker/library/redis", "mirror.gcr.io/library/redis"]
+    assert docker_hub_mirrors("rancher/k3s") == ["public.ecr.aws/rancher/k3s", "mirror.gcr.io/rancher/k3s"]
+    for other_registry in ("public.ecr.aws/lambda/python", "localhost:5000/app", "ghcr.io/org/app", "proxy.corp.net/postgres"):
+        assert docker_hub_mirrors(other_registry) == []
+
+
+def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkeypatch):
+    from docker.errors import APIError
+    from docker.models.images import ImageCollection
+
+    from ministack.core.responses import install_docker_hub_fallback
+
+    pulled, tagged = [], []
+
+    class _Image:
+        def tag(self, repository, tag):
+            tagged.append(f"{repository}:{tag}")
+
+    def registry(self, repository, tag=None, all_tags=False, **kwargs):
+        pulled.append(f"{repository}:{tag}" if tag else repository)
+        if repository.startswith("mirror.gcr.io/"):
+            return _Image()
+        raise APIError("500 Server Error: registry unavailable")
+
+    monkeypatch.setattr(ImageCollection, "pull", registry)
+    install_docker_hub_fallback()
+
+    ImageCollection.pull(None, "rancher/k3s:v1.31.4-k3s1", platform="linux/amd64")
+    assert pulled == ["rancher/k3s:v1.31.4-k3s1", "public.ecr.aws/rancher/k3s:v1.31.4-k3s1",
+                      "mirror.gcr.io/rancher/k3s:v1.31.4-k3s1"]
+    assert tagged == ["rancher/k3s:v1.31.4-k3s1"]
+
+    pulled.clear()
+    with pytest.raises(APIError, match="registry unavailable"):
+        ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
+    assert pulled == ["public.ecr.aws/lambda/python:3.12"]

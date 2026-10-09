@@ -2987,6 +2987,9 @@ async def _handle_lifespan(scope, receive, send):
                 )
             )
             logger.info("Worker thread pool: %d threads", _max_workers)
+            from ministack.core.responses import install_docker_hub_fallback
+
+            install_docker_hub_fallback()
             _run_init_scripts()
             # Reap any container that survived a hard kill of the previous
             # process. Persistence strips container ids from snapshots, so any
