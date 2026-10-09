@@ -978,12 +978,15 @@ async def _rewrite_data_paths(query, database):
         stripped = f"{p.netloc}{p.path}".rstrip("/")
         local_dir = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
         if next(glob.iglob(f"{local_dir}/**/*", recursive=True), None):
-            relation = f"'{local_dir}/**/*.{_data_format(table_data)}'"  # DuckDB reads the files, or reports why not
+            relation = _file_relation(f"{local_dir}/**/*.{_data_format(table_data)}", table_data)
         else:
             relation = _empty_relation(table_data)
         alias = "" if ref.aliased else f' AS "{ref.table}"'
         edits.append((ref.start, ref.end, relation + alias))
+        if not ref.aliased:
+            edits.extend(_qualified_column_prefixes(query, db_name, ref.table, edits[-1]))
 
+    edits = sorted(set(edits))  # a table named twice yields its column-prefix edits twice
     for span_start, span_end, replacement in reversed(edits):
         query = query[:span_start] + replacement + query[span_end:]
     return _rewrite_s3_paths(query)
@@ -996,6 +999,56 @@ _DUCKDB_TYPE_BY_ATHENA = {
 }
 
 
+# Readers that accept ``hive_types``, so partition columns get their Glue types.
+_HIVE_TYPED_READERS = {"parquet": "read_parquet", "csv": "read_csv", "json": "read_json"}
+
+
+def _file_relation(pattern, table_data):
+    """The table's files; partition keys are typed from Glue instead of inferred from the path."""
+    path = "'" + pattern.replace("'", "''") + "'"
+    reader = _HIVE_TYPED_READERS.get(_data_format(table_data))
+    partition_keys = table_data.get("PartitionKeys") or []
+    if not reader or not partition_keys:
+        return path  # DuckDB reads the files, or reports why not
+    hive_types = ", ".join(
+        "'{}': {}".format(str(key.get("Name", "")).replace("'", "''"), _duckdb_type(key)) for key in partition_keys
+    )
+    return f"{reader}({path}, hive_partitioning = true, hive_types = {{{hive_types}}})"
+
+
+def _duckdb_type(column):
+    base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+    return "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+
+
+def _qualified_column_prefixes(query, database, table, table_edit):
+    """Edits turning ``database.table.column`` (optionally catalog-qualified) into ``"table".column``.
+
+    The table itself is replaced by a relation aliased ``"table"``, so DuckDB cannot
+    resolve column references qualified with the database name.
+    """
+    tokens = list(_sql_tokens(query))
+    edits = []
+    for i in range(len(tokens) - 4):
+        if table_edit[0] <= tokens[i][2] < table_edit[1]:
+            continue  # the FROM/JOIN reference itself
+        if i and tokens[i - 1][:2] == ("punct", "."):
+            continue
+        names, j = [], i
+        while j < len(tokens) and tokens[j][0] in ("name", "qname"):
+            names.append(tokens[j])
+            if j + 1 < len(tokens) and tokens[j + 1][:2] == ("punct", "."):
+                j += 2
+            else:
+                break
+        if len(names) not in (3, 4):
+            continue
+        db_token, table_token = names[-3], names[-2]
+        if db_token[1] == database and table_token[1] == table:
+            edits.append((names[0][2], table_token[3], '"{}"'.format(table.replace('"', '""'))))
+    return edits
+
+
 def _empty_relation(table_data):
     """Zero rows with the table's Glue columns and partition keys; complex types read as VARCHAR."""
     columns = ((table_data.get("StorageDescriptor") or {}).get("Columns") or []) + (table_data.get("PartitionKeys") or [])
@@ -1003,10 +1056,8 @@ def _empty_relation(table_data):
         return "(SELECT 1 WHERE FALSE)"
     projected = []
     for column in columns:
-        base = str(column.get("Type", "string")).lower().split("(")[0].strip()
-        duck_type = "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
         name = str(column.get("Name", "")).replace('"', '""')
-        projected.append(f'CAST(NULL AS {duck_type}) AS "{name}"')
+        projected.append(f'CAST(NULL AS {_duckdb_type(column)}) AS "{name}"')
     return f"(SELECT {', '.join(projected)} WHERE FALSE)"
 
 

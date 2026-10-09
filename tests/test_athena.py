@@ -1082,6 +1082,43 @@ def test_athena_reads_a_parquet_table_created_without_classification(
     assert [row["Data"][0]["VarCharValue"] for row in rows] == ["id", "1", "2"]
 
 
+def test_athena_partitioned_table_types_partitions_and_resolves_qualified_columns(
+    athena, glue, s3, persisted_parquet_store, tmp_path,
+):
+    """Partition keys take their Glue types, and ``db.table.column`` resolves against the table."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket, database = f"athena-partitions-{suffix}", f"partitions_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+    parquet = tmp_path / "event.parquet"
+    with duckdb.connect() as connection:
+        connection.execute("COPY (SELECT 'a' AS note, 1 AS action) TO '%s' (FORMAT PARQUET)" % parquet)
+    persisted_parquet_store._persist_object(
+        bucket, "usage/year=2026/month=04/day=23/event.parquet", parquet.read_bytes(),
+    )
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "usage",
+        "StorageDescriptor": {
+            "Location": f"s3://{bucket}/usage/",
+            "Columns": [{"Name": "note", "Type": "string"}, {"Name": "action", "Type": "int"}],
+        },
+        "PartitionKeys": [
+            {"Name": "year", "Type": "string"},
+            {"Name": "month", "Type": "string"},
+            {"Name": "day", "Type": "string"},
+        ],
+        "Parameters": {"classification": "parquet"},
+    })
+
+    query_id, execution = _run_to_completion(
+        athena, f"SELECT {database}.usage.note, year, month, day FROM {database}.usage", database,
+    )
+    assert execution["Status"]["State"] == "SUCCEEDED", execution["Status"]
+    result = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]
+    assert [cell["VarCharValue"] for cell in result["Rows"][1]["Data"]] == ["a", "2026", "04", "23"]
+    assert [column["Type"] for column in result["ResultSetMetadata"]["ColumnInfo"]] == ["varchar"] * 4
+
+
 # ---- DDL and table-reference parsing (in-process, no server) ----
 
 
