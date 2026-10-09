@@ -4193,6 +4193,9 @@ def _accumulate_write_capacity(cap, table, old_item, new_item):
             u = _index_write_units(table, idx, old_item, new_item)
             if u:
                 cap[key][idx["IndexName"]] = cap[key].get(idx["IndexName"], 0.0) + u
+    for index_name, size in _vector_write_bytes(table, old_item, new_item).items():
+        vector = cap.setdefault("vector", {})
+        vector[index_name] = vector.get(index_name, 0.0) + size
 
 
 def _batch_write_item(data):
@@ -4302,6 +4305,8 @@ def _batch_write_item(data):
                     entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["gsi"].items()}
                 if cap["lsi"]:
                     entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["lsi"].items()}
+                if cap.get("vector"):
+                    entry["VectorIndexes"] = {n: {"VectorWriteRequestBytes": b} for n, b in cap["vector"].items()}
             consumed.append(entry)
         result["ConsumedCapacity"] = consumed
     return json_response(result)
@@ -4467,7 +4472,7 @@ def _transact_write_items(data):
             # Empty-string/binary secondary-index key -> top-level
             # ValidationException; wrong-typed index keys instead cancel in
             # Phase 1 (measured against real DynamoDB by paritysuite).
-            msg = _index_key_empty_reason(tbl, key_src)
+            msg = _index_key_empty_reason(tbl, key_src) or _vector_write_reason(tbl, key_src)
             if msg:
                 return error_response_json("ValidationException", msg, 400)
         elif op_type == "Update" and op.get("UpdateExpression"):
@@ -4622,6 +4627,7 @@ def _transact_write_items(data):
         write_units = 0.0
         gsi_units: dict = {}
         lsi_units: dict = {}
+        vector_bytes: dict = {}
         for old_it, new_it in effects:
             sz = max(_item_size_bytes(old_it) if old_it else 0,
                      _item_size_bytes(new_it) if new_it else 0)
@@ -4632,6 +4638,8 @@ def _transact_write_items(data):
                     u = _index_write_units(tbl, idx, old_it, new_it)
                     if u:
                         acc[idx["IndexName"]] = acc.get(idx["IndexName"], 0.0) + u
+            for index_name, size in _vector_write_bytes(tbl, old_it, new_it).items():
+                vector_bytes[index_name] = vector_bytes.get(index_name, 0.0) + size
         txn_sizes[tname] = sizes
         if rc != "NONE":
             total = write_units + sum(gsi_units.values()) + sum(lsi_units.values())
@@ -4641,6 +4649,8 @@ def _transact_write_items(data):
                     entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in gsi_units.items()}
                 if lsi_units:
                     entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in lsi_units.items()}
+                if vector_bytes:
+                    entry["VectorIndexes"] = {n: {"VectorWriteRequestBytes": b} for n, b in vector_bytes.items()}
             consumed.append(entry)
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
@@ -6025,7 +6035,10 @@ def _create_backup(data):
         },
         # Stash a deep snapshot of the items so Restore can rebuild the table.
         "_items_snapshot": copy.deepcopy(dict(table.get("items", {}))),
+        "_attribute_definitions": copy.deepcopy(table.get("AttributeDefinitions", [])),
     }
+    if table.get("VectorIndexes"):
+        desc["SourceTableFeatureDetails"]["VectorIndexes"] = [_vector_index_info(v) for v in table["VectorIndexes"]]
     _backups[arn] = desc
     return json_response({"BackupDetails": details})
 
@@ -6106,22 +6119,12 @@ def _restore_table_from_backup(data):
             f"Target table {target} already exists", 400)
     src = desc.get("SourceTableDetails", {})
     feat = desc.get("SourceTableFeatureDetails", {})
-    create_req = {
-        "TableName": target,
-        "KeySchema": src.get("KeySchema", []),
-        "AttributeDefinitions": _tables.get(src.get("TableName"), {}).get("AttributeDefinitions", []),
-        "BillingMode": data.get("BillingModeOverride") or src.get("BillingMode", "PROVISIONED"),
-    }
-    if create_req["BillingMode"] == "PROVISIONED":
-        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
-    if data.get("GlobalSecondaryIndexOverride") is not None:
-        create_req["GlobalSecondaryIndexes"] = data["GlobalSecondaryIndexOverride"]
-    elif feat.get("GlobalSecondaryIndexes"):
-        create_req["GlobalSecondaryIndexes"] = feat["GlobalSecondaryIndexes"]
-    if data.get("LocalSecondaryIndexOverride") is not None:
-        create_req["LocalSecondaryIndexes"] = data["LocalSecondaryIndexOverride"]
-    elif feat.get("LocalSecondaryIndexes"):
-        create_req["LocalSecondaryIndexes"] = feat["LocalSecondaryIndexes"]
+    attr_defs = desc.get("_attribute_definitions") or _tables.get(src.get("TableName"), {}).get("AttributeDefinitions", [])
+    create_req = _restore_create_request(
+        target, src.get("KeySchema", []), attr_defs,
+        data.get("BillingModeOverride") or src.get("BillingMode", "PROVISIONED"),
+        src.get("ProvisionedThroughput"), data,
+        feat.get("GlobalSecondaryIndexes"), feat.get("LocalSecondaryIndexes"), feat.get("VectorIndexes"))
     status, _, body = _create_table(create_req)
     if status != 200:
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
@@ -6155,14 +6158,12 @@ def _restore_table_to_point_in_time(data):
         return error_response_json("TableAlreadyExistsException",
             f"Target table {target} already exists", 400)
     src = _tables[src_name]
-    create_req = {
-        "TableName": target,
-        "KeySchema": src.get("KeySchema", []),
-        "AttributeDefinitions": src.get("AttributeDefinitions", []),
-        "BillingMode": data.get("BillingModeOverride") or src.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
-    }
-    if create_req["BillingMode"] == "PROVISIONED":
-        create_req["ProvisionedThroughput"] = src.get("ProvisionedThroughput") or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    create_req = _restore_create_request(
+        target, src.get("KeySchema", []), src.get("AttributeDefinitions", []),
+        data.get("BillingModeOverride") or src.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+        src.get("ProvisionedThroughput"), data,
+        src.get("GlobalSecondaryIndexes"), src.get("LocalSecondaryIndexes"),
+        [_vector_index_info(v) for v in src.get("VectorIndexes") or []])
     status, _, body = _create_table(create_req)
     if status != 200:
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
@@ -7396,6 +7397,31 @@ def _apply_vector_index_updates(name: str, table: dict, data: dict, billing_mode
                 f"Table: {name} Index: {index_name}", 400)
         table["VectorIndexes"] = [v for v in existing if v is not vix]
     return None
+
+
+def _vector_index_info(vix: dict) -> dict:
+    return {k: copy.deepcopy(v) for k, v in vix.items()
+            if k in ("IndexName", "VectorAttribute", "SearchSchema", "Projection", "Dimensions", "DistanceFunction")}
+
+
+def _restore_create_request(target, key_schema, attr_defs, billing_mode, throughput, data, gsis, lsis, vector_indexes):
+    """CreateTable input for a restore, applying the request's index overrides."""
+    create_req = {"TableName": target, "KeySchema": key_schema, "BillingMode": billing_mode}
+    if billing_mode == "PROVISIONED":
+        create_req["ProvisionedThroughput"] = throughput or {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    for field, override, source in (("GlobalSecondaryIndexes", "GlobalSecondaryIndexOverride", gsis),
+                                    ("LocalSecondaryIndexes", "LocalSecondaryIndexOverride", lsis),
+                                    ("VectorIndexes", "VectorIndexOverride", vector_indexes)):
+        chosen = data[override] if data.get(override) is not None else source
+        if chosen:
+            create_req[field] = copy.deepcopy(chosen)
+    referenced = {k.get("AttributeName") for k in key_schema}
+    for idx in create_req.get("GlobalSecondaryIndexes", []) + create_req.get("LocalSecondaryIndexes", []):
+        referenced |= {k.get("AttributeName") for k in idx.get("KeySchema") or []}
+    for vix in create_req.get("VectorIndexes", []):
+        referenced |= _vector_search_attrs(vix)
+    create_req["AttributeDefinitions"] = [ad for ad in attr_defs if ad.get("AttributeName") in referenced]
+    return create_req
 
 
 def _vector_index_description(vix: dict) -> dict:
