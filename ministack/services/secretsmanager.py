@@ -743,16 +743,19 @@ def _delete_secret(data):
             "ResourceNotFoundException",
             "Secrets Manager can't find the specified secret.", 400,
         )
-    if secret.get("DeletedDate"):
+    force = data.get("ForceDeleteWithoutRecovery", False)
+    window = data.get("RecoveryWindowInDays")
+
+    # "If you forcibly delete an already deleted or nonexistent secret, the
+    # operation does not return ResourceNotFoundException." A force delete
+    # purges a secret that is already scheduled for deletion.
+    if secret.get("DeletedDate") and not force:
         return error_response_json(
             "InvalidRequestException",
             "You can't perform this operation on the secret because it was already scheduled for deletion.", 400,
         )
     if _is_replica(secret):
         return _replica_mutation_error()
-
-    force = data.get("ForceDeleteWithoutRecovery", False)
-    window = data.get("RecoveryWindowInDays")
 
     if force and window is not None:
         return error_response_json(

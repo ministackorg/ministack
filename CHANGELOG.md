@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Secrets Manager — force delete of a secret scheduled for deletion** — `DeleteSecret` with `ForceDeleteWithoutRecovery` returned `InvalidRequestException` for a secret already scheduled for deletion. It now deletes the secret permanently. Reported by @fabio-andre-rodrigues.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added
