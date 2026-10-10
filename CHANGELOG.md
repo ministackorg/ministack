@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **SSM — service settings** — `GetServiceSetting`, `UpdateServiceSetting` and `ResetServiceSetting`, per account and region, persisted. `SettingValue` is validated for the ids whose accepted values AWS documents, and `/ssm/parameter-store/default-parameter-tier` sets the `Tier` of a `PutParameter` that names none. Unblocks Terraform's `aws_ssm_service_setting`.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added

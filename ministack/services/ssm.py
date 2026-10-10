@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import spawn_background
+from ministack.core.iam_evaluator import request_caller_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -40,6 +41,33 @@ _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _commands = AccountRegionScopedDict()
+_service_settings = AccountRegionScopedDict()
+
+# SettingIds are the botocore ssm model's list; (default value, default LastModifiedDate) observed on AWS
+# (GetServiceSetting, us-east-1, 2026-10-10), except high-throughput-enabled (ResetServiceSetting API reference example).
+_SERVICE_SETTING_DEFAULTS = {
+    "/ssm/parameter-store/high-throughput-enabled": ("false", 1555532571.138),
+    "/ssm/parameter-store/default-parameter-tier": ("Standard", 1565131339.38),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", 1612382724.747),
+    "/ssm/managed-instance/activation-tier": ("standard", 1579134984.656),
+    "/ssm/managed-instance/default-ec2-instance-management-role": ("$None", 1636561263.576),
+    "/ssm/automation/customer-script-log-destination": ("None", 1572919724.731),
+    "/ssm/automation/customer-script-log-group-name": ("/aws/ssm/automation/executeScript", 1572898415.256),
+    "/ssm/automation/enable-adaptive-concurrency": ("False", 1632330231.776),
+    "/ssm/appmanager/appmanager-enabled": ("False", 1604983265.572),
+    "/ssm/opsinsights/opscenter": ("Disabled", 1622077352.094),
+}
+# Accepted SettingValues per the UpdateServiceSetting API reference; an id missing here takes any string.
+# The error message is observed for default-parameter-tier; its format for the other ids is inferred.
+_SERVICE_SETTING_VALUES = {
+    "/ssm/parameter-store/high-throughput-enabled": ("true", "false"),
+    "/ssm/parameter-store/default-parameter-tier": ("Standard", "Advanced", "Intelligent-Tiering"),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", "Disable"),
+    "/ssm/managed-instance/activation-tier": ("standard", "advanced"),
+    "/ssm/appmanager/appmanager-enabled": ("True", "False"),
+    "/ssm/opsinsights/opscenter": ("Enabled", "Disabled"),
+}
+_DEFAULT_TIER_SETTING = "/ssm/parameter-store/default-parameter-tier"
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -50,6 +78,7 @@ def get_state():
         "parameter_history": copy.deepcopy(_parameter_history),
         "tags": copy.deepcopy(_tags),
         "commands": copy.deepcopy(_commands),
+        "service_settings": copy.deepcopy(_service_settings),
     }
 
 
@@ -106,6 +135,7 @@ def _restore_state(data):
         _restore_parameter_history(data.get("parameter_history", {}))
         _tags.update(data.get("tags", {}))
         _commands.update(data.get("commands", {}))
+        _service_settings.update(data.get("service_settings", {}))
 
 
 def _now_iso() -> str:
@@ -248,6 +278,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetCommandInvocation": _get_command_invocation,
         "ListCommands": _list_commands,
         "DescribeInstanceInformation": _describe_instance_information,
+        "GetServiceSetting": _get_service_setting,
+        "UpdateServiceSetting": lambda d: _update_service_setting(d, request_caller_arn(headers, query_params)),
+        "ResetServiceSetting": _reset_service_setting,
     }
 
     handler = handlers.get(action)
@@ -351,7 +384,7 @@ def _put_parameter(data):
         "LastModifiedDate": now,
         "DataType": data.get("DataType", "text"),
         "Description": data.get("Description", existing.get("Description", "") if existing else ""),
-        "Tier": data.get("Tier", "Standard"),
+        "Tier": data.get("Tier") or _default_tier(data, value),
         "AllowedPattern": data.get("AllowedPattern", ""),
         "Policies": data.get("Policies", []),
         "Labels": [],
@@ -1062,7 +1095,73 @@ def _describe_instance_information(data):
     return json_response(out)
 
 
+def _service_setting_id(data):
+    value = data.get("SettingId") or ""
+    if value.startswith("arn:"):
+        resource = value.split(":", 5)[-1]
+        value = resource[len("servicesetting"):] if resource.startswith("servicesetting/") else ""
+    return value if value in _SERVICE_SETTING_DEFAULTS else None
+
+
+def _service_setting_out(setting_id):
+    default_value, default_date = _SERVICE_SETTING_DEFAULTS[setting_id]
+    stored = _service_settings.get(setting_id)
+    return {
+        "SettingId": setting_id,
+        "SettingValue": stored["value"] if stored else default_value,
+        "LastModifiedDate": stored["modified"] if stored else default_date,
+        "LastModifiedUser": stored["user"] if stored else "System",
+        "ARN": f"arn:aws:ssm:{get_region()}:{get_account_id()}:servicesetting{setting_id}",
+        "Status": "Customized" if stored else "Default",
+    }
+
+
+def _default_tier(data, value):
+    """Tier of a parameter put without one: the account and region's default-parameter-tier setting."""
+    setting = _service_settings.get(_DEFAULT_TIER_SETTING)
+    tier = setting["value"] if setting else "Standard"
+    if tier == "Intelligent-Tiering":
+        return "Advanced" if len(value.encode()) > 4096 or data.get("Policies") else "Standard"
+    return tier
+
+
+def _service_setting_not_found(data):
+    return error_response_json(
+        "ServiceSettingNotFound", f"ServiceSetting {data.get('SettingId')} does not exist.", 400
+    )
+
+
+def _get_service_setting(data):
+    setting_id = _service_setting_id(data)
+    if setting_id is None:
+        return _service_setting_not_found(data)
+    return json_response({"ServiceSetting": _service_setting_out(setting_id)})
+
+
+def _update_service_setting(data, caller):
+    setting_id = _service_setting_id(data)
+    if setting_id is None:
+        return _service_setting_not_found(data)
+    value = data.get("SettingValue")
+    accepted = _SERVICE_SETTING_VALUES.get(setting_id)
+    if accepted and value not in accepted:
+        return error_response_json(
+            "ValidationException", f"Invalid setting value, allowed value pattern: {'|'.join(accepted)}", 400
+        )
+    _service_settings[setting_id] = {"value": value, "modified": _now_epoch(), "user": caller}
+    return json_response({})
+
+
+def _reset_service_setting(data):
+    setting_id = _service_setting_id(data)
+    if setting_id is None:
+        return _service_setting_not_found(data)
+    _service_settings.pop(setting_id, None)
+    return json_response({"ServiceSetting": _service_setting_out(setting_id)})
+
+
 def reset():
+    _service_settings.clear()
     _parameters.clear()
     _parameter_history.clear()
     _tags.clear()
