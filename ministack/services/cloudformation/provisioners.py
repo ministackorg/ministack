@@ -1189,10 +1189,18 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
             own = [{"Key": key, "Value": value} for key, value in own.items()]
         own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
         present = {t["Key"] for t in own_list}
+        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
+            _validate_iam_identity_tag_keys(resource_type, own_list)
+            present = {_iam._identity_tag_key(k) for k in present}
+            extra = {k: v for k, v in extra.items() if _iam._identity_tag_key(k) not in present}
+        else:
+            extra = {k: v for k, v in extra.items() if k not in present}
         merged = own_list + [
             {"Key": key, "Value": value}
-            for key, value in extra.items() if key not in present
+            for key, value in extra.items()
         ]
+        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
+            _validate_iam_identity_tag_keys(resource_type, merged)
     out = dict(props)
     out[prop] = merged
     return out
@@ -2385,7 +2393,14 @@ def _lambda_url_delete(physical_id, props):
 
 # --- IAM Role ---
 
+def _validate_iam_identity_tag_keys(resource_type, tags):
+    """Validate only user/role key uniqueness, before merging or changing state."""
+    if _iam._identity_tags_have_duplicate_keys([{"Key": t.get("Key", "")} for t in tags]):
+        raise ValueError(f"{resource_type} Tags contain duplicate keys (case insensitive)")
+
+
 def _iam_role_create(logical_id, props, stack_name):
+    _validate_iam_identity_tag_keys("AWS::IAM::Role", props.get("Tags") or [])
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
@@ -2439,6 +2454,7 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     RoleName and Path are replaced in ``_update_resource``; the rest updates
     in place, so policies attached from outside the template survive.
     """
+    _validate_iam_identity_tag_keys("AWS::IAM::Role", new_props.get("Tags") or [])
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
@@ -2569,6 +2585,7 @@ def _iam_user_create(logical_id, props, stack_name):
 
 
 def _iam_user_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _validate_iam_identity_tag_keys("AWS::IAM::User", new_props.get("Tags") or [])
     user = _iam._users.get(physical_id)
     if user is None:
         return _iam_user_create(logical_id or physical_id, new_props, stack_name)
@@ -2577,11 +2594,15 @@ def _iam_user_update(physical_id, old_props, new_props, stack_name, logical_id=N
         user["Path"] = path
         user["Arn"] = f"arn:aws:iam::{get_account_id()}:user{path}{physical_id}"
     _iam_user_reconcile(physical_id, old_props, new_props, "update")
-    old_tags, new_tags = _tag_map(old_props.get("Tags")), _tag_map(new_props.get("Tags"))
-    removed = sorted(old_tags.keys() - new_tags.keys())
+    old_tags, new_tags = [
+        {_iam._identity_tag_key(k): (k, v) for k, v in _tag_map(props.get("Tags")).items()}
+        for props in (old_props, new_props)
+    ]
+    removed = [old_tags[k][0] for k in sorted(old_tags.keys() - new_tags.keys())]
     if removed:
         _iam_user_call(_iam._untag_user, {"UserName": physical_id, **_ec_query({"TagKeys": removed})}, "update")
-    changed = [{"Key": k, "Value": v} for k, v in new_tags.items() if old_tags.get(k) != v]
+    changed = [{"Key": key, "Value": value} for k, (key, value) in new_tags.items()
+               if old_tags.get(k) != (key, value)]
     if changed:
         _iam_user_call(_iam._tag_user, {"UserName": physical_id, **_ec_query({"Tags": changed})}, "update")
     return physical_id, {"Arn": user["Arn"]}

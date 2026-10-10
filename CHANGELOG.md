@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IAM / CloudFormation — user and role tag keys** — IAM user and role tag keys now compare without case while preserving their spelling. Create and tag operations reject duplicate keys, untag operations match keys regardless of case, and CloudFormation validates duplicate keys and merges stack tags accordingly. User tag updates also compare keys without case. Other resource types retain case-sensitive tag handling.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
