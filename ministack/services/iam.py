@@ -3103,9 +3103,12 @@ def _error(status, code, message, ns="iam"):
         "iam": "https://iam.amazonaws.com/doc/2010-05-08/",
         "sts": "https://sts.amazonaws.com/doc/2011-06-15/",
     }.get(ns, "")
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>'
-            f'<ErrorResponse xmlns="{ns_url}">'
-            f'<Error><Code>{code}</Code><Message>{message}</Message></Error>'
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx)
+    # and no <?xml?> declaration.
+    fault_type = "Sender" if status < 500 else "Receiver"
+    body = (f'<ErrorResponse xmlns="{ns_url}">'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body

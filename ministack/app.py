@@ -2533,8 +2533,9 @@ def _unknown_query_error(body: bytes, request_id: str):
         else "The requested action is not valid for this web service."
     )
     msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Query-protocol error envelopes carry no <?xml?> declaration on the
+    # real AWS wire (17-region capture sweep, 0/85 declarations).
     xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
         f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
         f"<RequestId>{request_id}</RequestId></ErrorResponse>"

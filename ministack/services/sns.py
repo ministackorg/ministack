@@ -1671,9 +1671,10 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> and no <?xml?> declaration.
     error_type = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">'
         f'<Error><Type>{error_type}</Type><Code>{code}</Code><Message>{_xml_escape(message)}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'

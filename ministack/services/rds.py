@@ -11253,12 +11253,13 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
-    # Real AWS Query-protocol responses include <Type>Sender|Receiver</Type>
-    # — Sender for 4xx (caller's fault), Receiver for 5xx. Most SDKs ignore
-    # this field but it's part of the documented AWS shape.
+    # Real AWS Query-protocol error envelopes include
+    # <Type>Sender|Receiver</Type> — Sender for 4xx (caller's fault),
+    # Receiver for 5xx — and carry no <?xml?> declaration (17-region
+    # real-AWS capture sweep). Most SDKs ignore the field but it's part
+    # of the observed AWS shape.
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
-    body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+    body = f"""<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
     <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
     <RequestId>{new_uuid()}</RequestId>
 </ErrorResponse>""".encode("utf-8")
