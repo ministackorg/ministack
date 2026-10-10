@@ -533,20 +533,21 @@ class StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
-# Error-envelope Content-Type normalization
+# Envelope Content-Type normalization
 #
-# Real AWS picks an error's Content-Type from the *service's protocol*, not
-# from a generic default — and services disagree: DynamoDB answers
-# ``application/x-amz-json-1.0`` while Kinesis answers
+# Real AWS picks a response envelope's Content-Type from the *service's
+# protocol*, not from a generic default — and services disagree: DynamoDB
+# answers ``application/x-amz-json-1.0`` while Kinesis answers
 # ``application/x-amz-json-1.1``; query-protocol services answer
 # ``text/xml`` while EC2 answers ``text/xml;charset=UTF-8``. The botocore
 # service model carries everything needed to reproduce this: ``protocol``
-# and ``jsonVersion``. A small override table covers wire quirks the model
+# and ``jsonVersion``. Small override tables cover wire quirks the model
 # does not declare.
 #
-# Evidence: real AWS wire captures diffed per service (us-east-1) — the
-# model values below matched the captured Content-Type on every probed
-# service.
+# Evidence: real AWS wire captures diffed per service — error-path values
+# from a us-east-1 sweep, success-path values from a us-east-1/us-west-2/
+# eu-west-1/ap-southeast-2 sweep. The model values below matched the
+# captured Content-Type on every probed service.
 # ---------------------------------------------------------------------------
 
 # Ministack registry/service names that differ from the botocore client name.
@@ -561,12 +562,26 @@ _BOTOCORE_NAME = {
 
 # Wire-observed Content-Types that contradict what the model implies.
 #   sesv2 — rest-json service, but AWS emits application/x-amz-json-1.1 on
-#           errors (capture: get_email_identity 404).
+#           errors (capture: get_email_identity 404). Error-path only: its
+#           successes answer application/json like any rest-json service,
+#           so this override does not apply to success envelopes.
 #   s3    — rest-xml, but S3 answers application/xml where the other
 #           rest-xml services (route53) answer text/xml.
 _WIRE_CT_OVERRIDE = {
     "sesv2": "application/x-amz-json-1.1",
     "s3": "application/xml",
+}
+
+# Success-path overrides. The s3 quirk holds on both paths; sesv2's does
+# not (see above), so it is absent here.
+#   monitoring — declared ``smithy-rpc-v2-cbor`` in newer botocore, but
+#              MiniStack also serves its query-compatible JSON mode,
+#              which AWS answers as application/x-amz-json-1.0 (real-AWS
+#              capture). Same-family scoping keeps the XML query path on
+#              the model-independent text/xml below.
+_WIRE_CT_SUCCESS_OVERRIDE = {
+    "s3": "application/xml",
+    "monitoring": "application/x-amz-json-1.0",
 }
 
 _JSON_FAMILY = {
@@ -591,20 +606,34 @@ def _service_model(service: str):
         return None
 
 
-def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
-    """The Content-Type real AWS emits for this service's error envelope.
+def _family_of(ct_base: str):
+    """The envelope family ``ct_base`` belongs to, or None for payload
+    types (``application/octet-stream``, ``image/*``, ``text/plain``, ...)."""
+    if ct_base in _JSON_FAMILY:
+        return _JSON_FAMILY
+    if ct_base in _XML_FAMILY:
+        return _XML_FAMILY
+    return None
+
+
+def _expected_envelope_content_type(service: str, emitted_ct: str,
+                                    overrides: dict) -> str | None:
+    """The Content-Type real AWS emits for this service's envelopes.
 
     ``emitted_ct`` decides which family to correct within: a service that
     answered an XML envelope gets the XML value for its protocol, a JSON
-    envelope gets the JSON value. Returns None when there is nothing
-    evidence-backed to enforce (unknown service, non-envelope type, or a
-    protocol ministack does not wire-map, e.g. declared-cbor services it
-    serves as query-compatible JSON).
+    envelope gets the JSON value. ``overrides`` is the path-appropriate
+    wire-quirk table; an override only applies inside its own family (the
+    s3 override must not turn a JSON success/error into XML). Returns None
+    when there is nothing evidence-backed to enforce (unknown service,
+    non-envelope type, or a family the model does not wire-map — e.g. a
+    JSON body from a declared-cbor service served as query-compatible
+    JSON).
     """
     base = emitted_ct.split(";", 1)[0].strip().lower()
-    families = _JSON_FAMILY | _XML_FAMILY
-    if base in families and service in _WIRE_CT_OVERRIDE:
-        return _WIRE_CT_OVERRIDE[service]
+    override = overrides.get(service)
+    if override is not None and _family_of(base) is _family_of(override):
+        return override
 
     model = _service_model(service)
     if model is None:
@@ -619,7 +648,11 @@ def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
             return "application/json"
         return None
     if base in _XML_FAMILY:
-        if protocol == "query":
+        # A declared-cbor service that emitted an XML envelope is serving
+        # its legacy Query API mode (cloudwatch is the case in point) —
+        # AWS's query endpoint answers text/xml there like any other
+        # query-protocol service.
+        if protocol in ("query", "smithy-rpc-v2-cbor"):
             return "text/xml"
         if protocol == "ec2":
             return "text/xml;charset=UTF-8"
@@ -628,13 +661,33 @@ def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
     return None
 
 
+def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's error envelope."""
+    return _expected_envelope_content_type(service, emitted_ct, _WIRE_CT_OVERRIDE)
+
+
+def expected_success_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's success envelope.
+
+    An emitted ``text/xml`` is already wire-final and is never rewritten:
+    on an API envelope it is the correct value (route53, cloudfront), and
+    on e.g. an S3 object stored with a ``text/xml`` Content-Type it is
+    payload that the s3 override would otherwise corrupt to
+    ``application/xml``.
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    if base == "text/xml":
+        return None
+    return _expected_envelope_content_type(service, emitted_ct,
+                                           _WIRE_CT_SUCCESS_OVERRIDE)
+
+
 def fix_error_content_type(service: str, status: int, headers: dict) -> None:
     """Rewrite ``headers['Content-Type']`` in place when an error envelope
     carries the wrong wire value for the service's protocol.
 
-    Scoped to error responses: the captures that drive this table are
-    error probes, and success payloads (e.g. an S3 object that happens to
-    be JSON) must never be rewritten.
+    Scoped to error responses: success payloads (e.g. an S3 object that
+    happens to be JSON) must never be rewritten by the error table.
     """
     if status < 400:
         return
@@ -642,6 +695,26 @@ def fix_error_content_type(service: str, status: int, headers: dict) -> None:
     if not emitted:
         return
     expected = expected_error_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
+
+
+def fix_success_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when a success envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to non-error responses and, within them, to known envelope
+    Content-Types: binary/streaming/payload types
+    (``application/octet-stream``, ``text/plain``, ``image/*``, ...) are
+    never touched, and an emitted ``text/xml`` passes through untouched
+    (see ``expected_success_content_type``).
+    """
+    if status >= 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_success_content_type(service, emitted)
     if expected and emitted != expected:
         headers["Content-Type"] = expected
 

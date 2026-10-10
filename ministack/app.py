@@ -223,6 +223,7 @@ from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
     fix_error_content_type,
+    fix_success_content_type,
     set_request_account_id,
     set_request_region,
 )
@@ -2722,10 +2723,12 @@ async def _dispatch_service_request(
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
 
-    # Real AWS picks an error's Content-Type from the service's protocol —
-    # normalize any generic envelope the service emitted to the wire value
-    # (evidence: diffs against committed real-AWS wire captures).
+    # Real AWS picks a response envelope's Content-Type from the service's
+    # protocol — normalize any generic envelope the service emitted to the
+    # wire value (evidence: diffs against committed real-AWS wire captures;
+    # multi-region for the success path).
     fix_error_content_type(service, status, resp_headers)
+    fix_success_content_type(service, status, resp_headers)
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
