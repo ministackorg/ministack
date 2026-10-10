@@ -1292,6 +1292,8 @@ def evaluate_trust_policy(trust_doc: str | dict,
       - ``{"AWS": "ACCT"}`` — account ID shorthand
       - ``{"Service": "lambda.amazonaws.com"}`` — service principal
       - ``{"AWS": ["arn1", "arn2"]}`` — list of principals
+      - ``{"Federated": "PROVIDER"}`` — web identity provider, for
+        ``sts:AssumeRoleWithWebIdentity`` only
     """
     if isinstance(trust_doc, str):
         try:
@@ -1313,6 +1315,7 @@ def evaluate_trust_policy(trust_doc: str | dict,
             principal_account=_account_from_arn(caller_arn) or "",
             action="sts:AssumeRole", resource_arn="*", region="",
         )
+    federated = ctx.action == "sts:AssumeRoleWithWebIdentity"
     allowed = False
     for stmt in statements:
         if not isinstance(stmt, dict):
@@ -1326,11 +1329,11 @@ def evaluate_trust_policy(trust_doc: str | dict,
             actions = [actions]
         if isinstance(not_actions, str):
             not_actions = [not_actions]
-        if not (actions or not_actions) or not _action_matches("sts:AssumeRole", actions, not_actions):
+        if not (actions or not_actions) or not _action_matches(ctx.action, actions, not_actions):
             continue
         # Check Principal
         principal = stmt.get("Principal", {})
-        if not _principal_matches(principal, caller_arn):
+        if not _trust_principal_matches(principal, caller_arn, federated):
             continue
         if not _conditions_met(stmt.get("Condition", {}), ctx):
             continue
@@ -1339,6 +1342,16 @@ def evaluate_trust_policy(trust_doc: str | dict,
         allowed = True
 
     return allowed
+
+
+def _trust_principal_matches(principal: Any, caller_arn: str, federated: bool) -> bool:
+    """Whether a trust-policy Principal names the caller or, if *federated*, the provider."""
+    if not federated:
+        return _principal_matches(principal, caller_arn)
+    if principal == "*":
+        return True
+    providers = principal.get("Federated", []) if isinstance(principal, dict) else []
+    return caller_arn in ([providers] if isinstance(providers, str) else providers)
 
 
 def _principal_matches(principal: Any, caller_arn: str) -> bool:
@@ -1375,20 +1388,8 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True
-        # Service principals — match if the caller ARN looks like it came from
-        # that service (e.g., lambda.amazonaws.com allows Lambda-invoked assumes).
-        # In local dev, service principals are typically used by MiniStack's own
-        # service dispatch (Lambda, ECS, etc.), so we also allow if the caller
-        # is root (service-to-service calls use root credentials internally).
-        svc_principals = principal.get("Service", [])
-        if isinstance(svc_principals, str):
-            svc_principals = [svc_principals]
-        if svc_principals:
-            if ":root" in caller_arn:
-                return True
-            for svc in svc_principals:
-                # Extract service prefix: "lambda.amazonaws.com" → "lambda"
-                svc_prefix = svc.split(".")[0] if "." in svc else svc
-                if svc_prefix in caller_arn:
-                    return True
+        # No IAM principal is a service, but MiniStack's own service calls
+        # use root credentials, so a Service principal lets root through.
+        if principal.get("Service") and caller_arn.endswith(":root"):
+            return True
     return False

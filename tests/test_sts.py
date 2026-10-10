@@ -118,6 +118,34 @@ def test_sts_assume_role(sts):
     assert "AssumedRoleId" in assumed
 
 
+@pytest.mark.parametrize("auth, status", [(True, 400), (False, 200)])
+def test_sts_assume_role_refuses_session_tag_keys_differing_in_case_under_auth(monkeypatch, auth, status):
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    role = f"tag-case-{os.urandom(4).hex()}"
+    trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": "000000000000"},
+                            "Action": ["sts:AssumeRole", "sts:TagSession"]}]}
+    iam_svc._roles[role] = {"RoleName": role, "Arn": f"arn:aws:iam::000000000000:role/{role}", "Tags": [],
+                            "AssumeRolePolicyDocument": json.dumps(trust)}
+    body = (f"Action=AssumeRole&Version=2011-06-15&RoleSessionName=tags&RoleArn=arn:aws:iam::000000000000:role/{role}"
+            "&Tags.member.1.Key=team&Tags.member.1.Value=blue&Tags.member.2.Key=TEAM&Tags.member.2.Value=red").encode()
+    headers = {"content-type": "application/x-www-form-urlencoded",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20260930/us-east-1/sts/aws4_request"}
+    try:
+        got, _headers, payload = asyncio.run(sts_mod.handle_request("POST", "/", headers, body, {}))
+    finally:
+        iam_svc._roles.pop(role, None)
+    assert got == status
+    if auth:
+        assert b"<Code>InvalidParameterValue</Code>" in payload
+        assert b"Tag keys are case insensitive" in payload
+
+
 def test_sts_assumed_role_arn_uses_sts_service(sts):
     """Real AWS returns AssumeRole's AssumedRoleUser.Arn under the sts
     service, not iam — e.g. arn:aws:sts::123456789012:assumed-role/demo/Sess.
@@ -504,19 +532,68 @@ def test_sts_policies_reach_only_get_access_key_info(monkeypatch, auth_enabled, 
 def test_sts_assume_role_with_web_identity(sts, iam):
     iam.create_role(
         RoleName="test-oidc-role",
-        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+            "Principal": {"Federated": "arn:aws:iam::000000000000:oidc-provider/oidc.example.com"}}]}),
     )
     role_arn = "arn:aws:iam::000000000000:role/test-oidc-role"
     resp = sts.assume_role_with_web_identity(
         RoleArn=role_arn,
         RoleSessionName="ci-session",
-        WebIdentityToken="fake-oidc-token-value",
+        WebIdentityToken=_web_token({"iss": "https://oidc.example.com", "aud": "ci", "sub": "ci-user"}),
     )
     creds = resp["Credentials"]
     assert "AccessKeyId" in creds
     assert "SecretAccessKey" in creds
     assert "SessionToken" in creds
     assert "Expiration" in creds
+
+
+def _web_token(claims):
+    import base64
+
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{b64({'alg': 'RS256'})}.{b64(claims)}.sig"
+
+
+@pytest.mark.parametrize("role,status", [
+    ("trust-web", 200), ("trust-web-aud", 403), ("trust-web-aws", 403),
+])
+def test_sts_assume_role_with_web_identity_checks_trust(monkeypatch, role, status):
+    import asyncio
+    from urllib.parse import urlencode
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    account, host = "000000000000", "issuer.example.com/pool"
+    provider = f"arn:aws:iam::{account}:oidc-provider/{host}"
+
+    def federated(aud):
+        return [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity", "Principal": {"Federated": provider},
+                 "Condition": {"StringEquals": {f"{host}:aud": aud}}}]
+    trust = {"trust-web": federated("client-a"), "trust-web-aud": federated("client-b"),
+             "trust-web-aws": [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+                                "Principal": {"AWS": account}}]}[role]
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam_svc._roles.set_scoped(account, None, role, {
+        "RoleName": role, "Arn": f"arn:aws:iam::{account}:role/{role}", "Tags": [],
+        "AssumeRolePolicyDocument": json.dumps({"Version": "2012-10-17", "Statement": trust})})
+    body = urlencode({"Action": "AssumeRoleWithWebIdentity", "RoleSessionName": "trust",
+                      "RoleArn": f"arn:aws:iam::{account}:role/{role}",
+                      "WebIdentityToken": _web_token({"iss": f"https://{host}", "aud": "client-a", "sub": "u-1"})})
+    try:
+        with request_scope(account, "us-east-1"):
+            got, _, payload = asyncio.run(sts_svc.handle_request(
+                "POST", "/", {"content-type": "application/x-www-form-urlencoded"}, body.encode(), {}))
+    finally:
+        iam_svc._roles.pop_scoped(account, None, role, None)
+    assert got == status
+    if status == 403:
+        assert b"Not authorized to perform sts:AssumeRoleWithWebIdentity" in payload
 
 
 def _gwit_post(data: bytes):

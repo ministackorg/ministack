@@ -748,12 +748,11 @@ class TestTrustPolicy:
                                 "Action": "sts:AssumeRole"}]}
         assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:root")
 
-    def test_service_principal_allows_matching_service(self):
-        """Service principal matches callers containing the service name."""
+    def test_service_principal_denies_user_named_after_service(self):
         trust = {"Statement": [{"Effect": "Allow",
                                 "Principal": {"Service": "lambda.amazonaws.com"},
                                 "Action": "sts:AssumeRole"}]}
-        assert evaluate_trust_policy(trust, "arn:aws:lambda:us-east-1:123:function:test")
+        assert not evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/lambda-ops")
 
     def test_service_principal_denies_unrelated_user(self):
         """A service principal does NOT allow arbitrary IAM users."""
@@ -789,6 +788,20 @@ class TestTrustPolicy:
         trust = {"Statement": [{"Effect": "Deny", "Principal": "*",
                                 "Action": "sts:AssumeRole"}]}
         assert not evaluate_trust_policy(trust, "arn:aws:iam::123:user/a")
+
+    def test_federated_principal_matches_only_web_identity(self):
+        provider = "arn:aws:iam::123456789012:oidc-provider/issuer.example.com"
+        trust = {"Statement": [
+            {"Effect": "Allow", "Principal": {"Federated": provider},
+             "Action": "sts:AssumeRoleWithWebIdentity"},
+            {"Effect": "Allow", "Principal": {"AWS": "123456789012"},
+             "Action": "sts:AssumeRoleWithWebIdentity"}]}
+        other = "arn:aws:iam::123456789012:oidc-provider/other.example.com"
+        for arn, allowed in ((provider, True), (other, False)):
+            ctx = EvalContext(principal_arn=arn, principal_type="WebIdentityUser",
+                              principal_account="123456789012", action="sts:AssumeRoleWithWebIdentity",
+                              resource_arn="*", region="")
+            assert evaluate_trust_policy(trust, arn, ctx) is allowed
 
     def test_string_json_input(self):
         trust_str = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*",
@@ -4652,6 +4665,50 @@ def test_trust_not_action_denies(trust_api, operation, deny_first, excluded, con
     statements = [deny, ALLOW] if deny_first else [ALLOW, deny]
     _install_policy(trust_api, operation, _document(*statements))
     _assume(trust_api, expected, ExternalId="deployment-id", RoleSessionName="deploy-123")
+
+
+def _tags(protocol, **tags):
+    if protocol == "json":
+        return {"Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
+    return {f"Tags.member.{n}.{field}": text for n, (key, value) in enumerate(tags.items(), 1)
+            for field, text in (("Key", key), ("Value", value))}
+
+
+def test_trust_conditions_see_the_caller_principal_tags(trust_api):
+    call, _, _ = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(
+        ALLOW, Condition={"StringEquals": {"aws:PrincipalTag/team": "blue"}})))
+    _assume(trust_api, 403, RoleSessionName="untagged")
+    assert call("iam", "TagUser", UserName="trust-deployer", **_tags("query", team="blue"))[0] == 200
+    _assume(trust_api, 200, RoleSessionName="tagged")
+
+
+@pytest.mark.parametrize("actions, tagged, expected", [
+    ("sts:AssumeRole", False, 200),
+    ("sts:AssumeRole", True, 403),
+    (["sts:AssumeRole", "sts:TagSession"], True, 200),
+])
+def test_trust_session_tags_need_tag_session(trust_api, actions, tagged, expected):
+    call, sessions, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(ALLOW, Action=actions)))
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **(_tags(protocol, team="blue") if tagged else {}))
+    assert status == expected, body
+    if expected == 403:
+        assert f"{CALLER} is not authorized to perform: sts:TagSession on resource: {ROLE_ARN}".encode() in body
+    elif tagged:
+        assert [s["SessionTags"] for s in sessions.values()] == [[{"Key": "team", "Value": "blue"}]]
+
+
+@pytest.mark.parametrize("key, expected", [("team", 200), ("dept", 403)])
+def test_trust_conditions_see_session_tags_as_request_tags(trust_api, key, expected):
+    _, _, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(ALLOW, dict(
+        ALLOW, Action="sts:TagSession", Condition={"StringLike": {"aws:RequestTag/team": "*"}})))
+    call, _, _ = trust_api
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **_tags(protocol, **{key: "blue"}))
+    assert status == expected, body
 
 
 @pytest.mark.parametrize("operation", ["CreateRole", "UpdateAssumeRolePolicy"])

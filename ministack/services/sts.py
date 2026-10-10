@@ -9,6 +9,7 @@ Actions:
 """
 
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -22,6 +23,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     CredentialResolutionError,
+    _principal_keys,
     find_iam_access_key_account,
     is_root_access_key,
     resolve_credential,
@@ -114,6 +116,7 @@ def _caller_identity(
         "principalType": credential.principal_type,
         "principalName": credential.principal_name,
         "isTemporary": credential.session_token is not None,
+        "principalKeys": _principal_keys(credential),
     }
 
 
@@ -193,16 +196,67 @@ def _role_id(role_arn: str) -> str:
     return (role or {}).get("RoleId") or "AROA" + new_uuid().replace("-", "")[:17].upper()
 
 
-def _session_tags(params: dict) -> list[dict]:
-    """The session tags of an AssumeRole call, from the query or the JSON form."""
+def _session_tags(params: dict, check=True):
+    """The session tags of a request, from the query or the JSON form, or, if *check*, their validation error."""
     tags = params.get("Tags")
     if isinstance(tags, list) and tags and isinstance(tags[0], dict):
-        return [{"Key": str(t.get("Key")), "Value": str(t.get("Value", ""))} for t in tags]
-    return _extract_tags(params)
+        tags = [{"Key": str(t.get("Key")), "Value": str(t.get("Value", ""))} for t in tags]
+    else:
+        tags = _extract_tags(params)
+    if check and len({t["Key"].lower() for t in tags}) < len(tags):
+        return None, _error(400, "InvalidParameterValue",
+                            "Duplicate tag keys found. Please note that Tag keys are case insensitive.", ns="sts")
+    return tags, None
 
 
 def _invalid_role_arn(role_arn: str):
     return _error(400, "ValidationError", f"Invalid RoleArn: {role_arn}", ns="sts")
+
+
+_WELL_KNOWN_WEB_IDENTITY_PROVIDERS = {
+    "accounts.google.com", "cognito-identity.amazonaws.com", "graph.facebook.com", "www.amazon.com",
+}
+
+
+def _web_identity_principal(token: str, provider_id: str, role_arn: str):
+    """The Federated principal a web identity token names, with its condition keys."""
+    from ministack.services.cognito import _decode_id_token_unverified
+
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, TypeError):
+        claims = {}
+    if not isinstance(claims, dict):
+        claims = {}
+    host = str(claims.get("iss") or provider_id or "").split("://", 1)[-1].rstrip("/")
+    principal = host
+    if host and host not in _WELL_KNOWN_WEB_IDENTITY_PROVIDERS:
+        parts = role_arn.split(":")
+        principal = f"arn:{parts[1]}:iam::{parts[4]}:oidc-provider/{host}"
+    return principal, {f"{host}:{k}".lower(): claims[k] for k in ("aud", "sub", "amr") if k in claims}
+
+
+def _web_identity_trust_denied(role_arn: str, params: dict, use_json: bool):
+    """AccessDenied unless the role's trust policy lets the token's provider assume it."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
+    from ministack.services import iam as iam_svc
+
+    account = role_arn.split(":")[4]
+    role = iam_svc._roles.get_scoped(account, None, role_arn.rsplit("/", 1)[-1])
+    provider, keys = _web_identity_principal(
+        _p(params, "WebIdentityToken"), _p(params, "ProviderId"), role_arn)
+    trust_context = EvalContext(
+        principal_arn=provider, principal_type="WebIdentityUser", principal_account=account,
+        action="sts:AssumeRoleWithWebIdentity", resource_arn=role_arn, region=get_region(),
+        service_context=keys,
+    )
+    if role is not None and evaluate_trust_policy(
+            role.get("AssumeRolePolicyDocument", "{}"), provider, trust_context):
+        return None
+    message = "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+    if use_json:
+        return error_response_json("AccessDenied", message, 403)
+    return _error(403, "AccessDenied", message, ns="sts")
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -256,12 +310,15 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
         if validation_error:
             return validation_error
+        from ministack.app import AUTH
+        session_tags, validation_error = _session_tags(params, check=AUTH)
+        if validation_error:
+            return validation_error
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
 
         # When AUTH=true, validate role exists and trust policy permits the caller
-        from ministack.app import AUTH
         if AUTH:
             from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
             from ministack.services import iam as iam_svc
@@ -302,10 +359,19 @@ async def handle_request(method, path, headers, body, query_params):
                     "sts:externalid": _p(params, "ExternalId", None),
                     "sts:rolesessionname": _p(params, "RoleSessionName", None),
                 },
+                principal_keys=caller["principalKeys"],
+                request_tags={t["Key"]: t["Value"] for t in session_tags},
+                tag_keys=[t["Key"] for t in session_tags],
             )
+            denied_action = None
             if not evaluate_trust_policy(trust_doc, caller_arn, trust_context):
+                denied_action = "sts:AssumeRole"
+            elif session_tags and not evaluate_trust_policy(
+                    trust_doc, caller_arn, dataclasses.replace(trust_context, action="sts:TagSession")):
+                denied_action = "sts:TagSession"
+            if denied_action:
                 message = (f"User: {caller_arn} is not authorized to perform: "
-                           f"sts:AssumeRole on resource: {role_arn}")
+                           f"{denied_action} on resource: {role_arn}")
                 if use_json:
                     return error_response_json("AccessDenied", message, 403)
                 return _error(403, "AccessDenied", message, ns="sts")
@@ -326,7 +392,7 @@ async def handle_request(method, path, headers, body, query_params):
             "PrincipalType": "AssumedRole",
             "SourceAccessKeyId": caller["accessKey"],
             "SourcePrincipalArn": caller["userArn"],
-            "SessionTags": _session_tags(params),
+            "SessionTags": session_tags,
         })
         if use_json:
             return json_response({
@@ -356,6 +422,11 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session)
         if validation_error:
             return validation_error
+        from ministack.app import AUTH
+        if AUTH:
+            denied = _web_identity_trust_denied(role_arn, params, use_json)
+            if denied:
+                return denied
         duration = int(_p(params, "DurationSeconds") or 3600)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
