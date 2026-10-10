@@ -1498,6 +1498,141 @@ def test_iot_rule_sqs_action_applies_select_projection(iot_client, iot_data_clie
     iot_client.delete_topic_rule(ruleName=rule)
 
 
+def _take_bodies(sqs, url, count, timeout=10):
+    """The JSON bodies of the next ``count`` messages, deleted as they are read."""
+    bodies = []
+    deadline = time.time() + timeout
+    while len(bodies) < count and time.time() < deadline:
+        msg = _poll_message(sqs, url, timeout=max(0.0, deadline - time.time()))
+        if msg:
+            sqs.delete_message(QueueUrl=url, ReceiptHandle=msg["ReceiptHandle"])
+            bodies.append(json.loads(msg["Body"]))
+    return bodies
+
+
+def _rule_role(iam):
+    """A role the rules engine can assume, so the rule also creates under AUTH=true."""
+    name = _unique("rule-role")
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"}, "Action": "sts:AssumeRole"}
+        ],
+    }
+    return iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust))["Role"]
+
+
+def _iam_user_key(iam):
+    """A fresh IAM user allowed to publish, its access key, and its GetCallerIdentity UserId."""
+    user = _unique("publisher")
+    iam.create_user(UserName=user)
+    iam.put_user_policy(
+        UserName=user,
+        PolicyName="publish",
+        PolicyDocument=json.dumps(
+            {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:*", "Resource": "*"}]}
+        ),
+    )
+    key = iam.create_access_key(UserName=user)["AccessKey"]
+    caller = boto3.client(
+        "sts",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=key["AccessKeyId"],
+        aws_secret_access_key=key["SecretAccessKey"],
+        region_name="us-east-1",
+    ).get_caller_identity()
+    return user, key, caller["UserId"]
+
+
+def _drop_iam_user(iam, user, key):
+    iam.delete_access_key(UserName=user, AccessKeyId=key["AccessKeyId"])
+    iam.delete_user_policy(UserName=user, PolicyName="publish")
+    iam.delete_user(UserName=user)
+
+
+def test_iot_rule_principal_is_the_http_callers_user_id(iot_client, iam, sqs, sts):
+    """principal() of an HTTP Publish is the caller's UserId; every message gets its own trace id."""
+    queue = sqs.create_queue(QueueName=_unique("rule-principal"))["QueueUrl"]
+    topic = _unique("principal/http")
+    rule = _unique("principal").replace("-", "_")
+    user, key, user_id = _iam_user_key(iam)
+    role = _rule_role(iam)
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT principal() AS p, traceid() AS t FROM '{topic}'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}],
+        },
+    )
+    try:
+        callers = (
+            (key["AccessKeyId"], key["SecretAccessKey"], user_id),
+            ("test", "test", sts.get_caller_identity()["UserId"]),
+        )
+        trace_ids = []
+        for access_key, secret, expected in callers:
+            boto3.client(
+                "iot-data",
+                endpoint_url=ENDPOINT,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret,
+                region_name="us-east-1",
+            ).publish(topic=topic, payload=b"{}")
+            [event] = _take_bodies(sqs, queue, 1)
+            assert event["p"] == expected
+            assert str(uuid.UUID(event["t"])) == event["t"]
+            trace_ids.append(event["t"])
+        assert trace_ids[0] != trace_ids[1]
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
+        iam.delete_role(RoleName=role["RoleName"])
+        _drop_iam_user(iam, user, key)
+
+
+def test_iot_rule_principal_is_the_websocket_signers_user_id(iot_client, iam, sqs):
+    """principal() and the connected event's principalIdentifier are the WebSocket signer's UserId."""
+    queue = sqs.create_queue(QueueName=_unique("rule-ws-principal"))["QueueUrl"]
+    topic = _unique("principal/ws")
+    client_id = _unique("ws-signed")
+    user, key, user_id = _iam_user_key(iam)
+    role = _rule_role(iam)
+    rules = {
+        _unique("wspub").replace("-", "_"): f"SELECT 'publish' AS kind, principal() AS p FROM '{topic}'",
+        _unique("wscon").replace("-", "_"): (
+            "SELECT 'connected' AS kind, principalIdentifier AS p "
+            f"FROM '$aws/events/presence/connected/{client_id}'"
+        ),
+    }
+    for name, sql in rules.items():
+        iot_client.create_topic_rule(
+            ruleName=name,
+            topicRulePayload={"sql": sql, "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}]},
+        )
+    parsed = urlparse(ENDPOINT)
+    cred = quote(f"{key['AccessKeyId']}/20240101/us-east-1/iotdevicegateway/aws4_request")
+    url = (
+        f"ws://prefix-ats.iot.us-east-1.{parsed.hostname or 'localhost'}:{parsed.port or 4566}/mqtt"
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred}"
+    )
+
+    async def _run():
+        ws = await _mqtt_connect(client_id, url)
+        await ws.send(_make_publish(topic, b"{}"))
+        await asyncio.sleep(0.5)
+        await _mqtt_disconnect(ws)
+
+    try:
+        with patch_endpoint_dns():
+            asyncio.run(_run())
+        events = {event["kind"]: event["p"] for event in _take_bodies(sqs, queue, 2)}
+        assert events == {"publish": user_id, "connected": user_id}
+    finally:
+        for name in rules:
+            iot_client.delete_topic_rule(ruleName=name)
+        iam.delete_role(RoleName=role["RoleName"])
+        _drop_iam_user(iam, user, key)
+
+
 def test_iot_rule_sqs_action_missing_queue_does_not_stop_the_rule(
     iot_client, iot_data_client, sqs
 ):
@@ -3388,6 +3523,37 @@ def test_mtls_publish_is_brokered(broker, tmp_path):
         assert subscriber.next_publish() == (topic, b"sticky")
     finally:
         subscriber.close()
+
+
+def test_mtls_publish_principal_is_the_certificate_id(broker, tmp_path):
+    """principal() of an mTLS publish is the id of the client certificate."""
+    cert_id, cert_pem, key_pem = _new_cert(broker)
+    topic = _unique("mtls/principal")
+    rule = _unique("mtlsprincipal").replace("-", "_")
+    role = _rule_role(broker.client("iam"))
+    broker.client("iot").create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT principal() AS p, traceid() AS t FROM '{topic}'",
+            "actions": [{"republish": {"topic": f"{topic}/out", "roleArn": role["Arn"]}}],
+        },
+    )
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("device")))
+        peer.subscribe(f"{topic}/out")
+        peer.send(_make_publish(topic, b"{}"))
+        received = peer.next_publish()
+        assert received is not None, "the rule's republish did not arrive"
+        out_topic, payload = received
+        event = json.loads(payload)
+        assert out_topic == f"{topic}/out"
+        assert event["p"] == cert_id
+        assert str(uuid.UUID(event["t"])) == event["t"]
+    finally:
+        peer.close()
+        broker.client("iot").delete_topic_rule(ruleName=rule)
+        broker.client("iam").delete_role(RoleName=role["RoleName"])
 
 
 def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):

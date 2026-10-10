@@ -74,7 +74,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import ssl
+import string
 import struct
 import time
 import unicodedata
@@ -82,6 +84,7 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -95,6 +98,7 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.core.x509_utils import (
     certificate_is_signed_by,
     generate_ca,
@@ -4019,10 +4023,12 @@ _IMPLEMENTED_SQL_FUNCS = frozenset({
     "encode",
     "isundefined",
     "newuuid",
+    "principal",
     "regexp_matches",
     "replace",
     "timestamp",
     "topic",
+    "traceid",
 })
 _warned_sql_funcs: set[str] = set()
 
@@ -4087,9 +4093,10 @@ def _eval_select_function(
     if name == "clientid" and not args:
         # Documented as the client id "or n/a if the message wasn't sent over MQTT".
         return client_id if client_id else "n/a"
-    # principal() and traceid() land here too: this publish path carries no
-    # certificate identity or trace id to report, so they warn like any other
-    # function the evaluator does not implement.
+    if name == "principal" and not args:
+        return _rule_message_identity.get()[0] or _MISSING
+    if name == "traceid" and not args:
+        return _rule_message_identity.get()[1] or _MISSING
     _warn_unimplemented_sql_function(name)
     return _MISSING
 
@@ -7114,6 +7121,26 @@ _republish_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "_iot_republish_depth", default=0
 )
 
+_ROLE_SESSION_NAME_CHARS = string.ascii_letters + string.digits
+
+
+def _rule_role_principal(account_id: str, role_arn: str) -> str | None:
+    """principal() of a republished message: the rule role's session, as GetCallerIdentity names it."""
+    from ministack.services import iam as _iam
+
+    try:
+        arn = parse_arn(role_arn)
+    except ArnParseError:
+        return None
+    if arn.account_id != account_id or not arn.resource.startswith("role/"):
+        return None
+    role = _iam._roles.get_scoped(account_id, None, arn.resource.rsplit("/", 1)[-1])
+    if not role:
+        return None
+    # The rules engine names its role sessions with eight random letters and digits.
+    session = "".join(secrets.choice(_ROLE_SESSION_NAME_CHARS) for _ in range(8))
+    return f"{role['RoleId']}:{session}"
+
 
 async def _dispatch_rule_republish(
     account_id: str, region: str, rule_name: str, spec: dict, event
@@ -7146,6 +7173,7 @@ async def _dispatch_rule_republish(
             target_topic,
             json.dumps(event).encode("utf-8"),
             qos=qos,
+            principal=_rule_role_principal(account_id, spec.get("roleArn") or ""),
         )
     finally:
         _republish_depth.reset(token)
@@ -7315,8 +7343,8 @@ async def _dispatch_rule_error_action(
     error_event = {
         "ruleName": rule_name,
         "topic": topic,
-        # The emulator's publish path carries no CloudWatch trace id.
-        "cloudwatchTraceId": "",
+        # The id traceid() returns for the same message.
+        "cloudwatchTraceId": _rule_message_identity.get()[1],
         # "N/A", not "" — and not clientid()'s lowercase "n/a" (measured eu-north-1 2026-09-19).
         "clientId": client_id or "N/A",
         "sourceIp": _publish_source_ip.get(),
@@ -7896,6 +7924,7 @@ async def broker_publish(
     retain: bool = False,
     properties: bytes = b"",
     client_id: str | None = None,
+    principal: str | None = None,
 ) -> int:
     """Deliver a message to every matching subscriber.
 
@@ -7910,6 +7939,9 @@ async def broker_publish(
     its own messages back. A publish with no client identity — iot_data's HTTP
     Publish, a rule, an in-process caller — matches no subscriber's identity
     and so is delivered to all of them.
+
+    ``principal`` is who published the message, what the rule SQL
+    ``principal()`` returns; rules also see a fresh trace id per message.
     """
     delivered = 0
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
@@ -7917,16 +7949,17 @@ async def broker_publish(
     if topic.startswith(_BASIC_INGEST_PREFIX):
         remainder = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)
         rule_name = remainder[0]
-        await _run_rule_actions(
-            account_id,
-            region,
-            _topic_rules.get_scoped(account_id, region, rule_name),
-            payload,
-            # Under Basic Ingest `topic()` reports the topic after the
-            # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
-            remainder[1] if len(remainder) > 1 else "",
-            client_id,
-        )
+        with _rule_message_scope(principal):
+            await _run_rule_actions(
+                account_id,
+                region,
+                _topic_rules.get_scoped(account_id, region, rule_name),
+                payload,
+                # Under Basic Ingest `topic()` reports the topic after the
+                # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
+                remainder[1] if len(remainder) > 1 else "",
+                client_id,
+            )
         return delivered
 
     scoped = _scoped_topic(account_id, region, topic)
@@ -7988,7 +8021,8 @@ async def broker_publish(
                     delivered += 1
                     break
 
-    await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
+    with _rule_message_scope(principal):
+        await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
 
     # Shadow-over-MQTT bridge — AFTER delivery and rule evaluation, so rules
     # matching `$aws/things/+/shadow/update` fire on the request, and the
@@ -8361,6 +8395,32 @@ _delivery_retain: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+# The principal and trace id of the message the rules engine is evaluating, for
+# principal(), traceid() and the errorAction document. Scoped to one message's
+# rule evaluation, so a republished message carries its own.
+_rule_message_identity: contextvars.ContextVar[tuple[str | None, str]] = contextvars.ContextVar(
+    "_iot_rule_message_identity", default=(None, "")
+)
+
+
+@contextlib.contextmanager
+def _rule_message_scope(principal: str | None):
+    """Scope a message's principal and a fresh trace id over its rule evaluation."""
+    token = _rule_message_identity.set((principal, new_uuid()))
+    try:
+        yield
+    finally:
+        _rule_message_identity.reset(token)
+
+
+def _caller_principal(access_key: str) -> str:
+    """principal() of an IAM-signed publish: the caller's user id as GetCallerIdentity reports it."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+
+    identity = resolve_caller_identity(access_key)
+    return identity["userId"] if identity else get_account_id()
+
+
 def _encode_remaining_length(n: int) -> bytes:
     out = bytearray()
     while True:
@@ -8609,7 +8669,8 @@ class _WSSession:
         self._send = send_coro
         self.account_id = account_id
         self.region = region
-        # Lifecycle-event principal: the client certificate id, else the account.
+        # The client certificate id or the IAM caller's user id, else the account:
+        # lifecycle events' principalIdentifier and the rule SQL principal().
         self._principal = principal or account_id
         self._session_identifier = ""
         self._presence_version = 0
@@ -9059,6 +9120,7 @@ class _WSSession:
                 retain=retain,
                 properties=properties,
                 client_id=self._client_id or None,
+                principal=self._principal,
             )
             if qos == 1 and packet_id is not None:
                 if self.protocol_version == MQTT_5:
@@ -9315,7 +9377,9 @@ async def handle_websocket(
     await send(accept)
 
     ctx_token = _request_account_id.set(account_id)
-    session = _WSSession(send, account_id, region)
+    query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+    principal = _caller_principal(extract_access_key_id(sub_headers, query))
+    session = _WSSession(send, account_id, region, principal)
     max_buffer = _max_frame_buffer_bytes()
 
     try:

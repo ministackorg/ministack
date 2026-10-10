@@ -4690,8 +4690,8 @@ def test_rule_event_from_less_basic_ingest_projects():
 
 
 # ----------------------------------------------------------------------
-# Rule SQL functions: newuuid(), replace(), clientid() (and the accepted
-# but unresolvable principal() / traceid()).
+# Rule SQL functions: newuuid(), replace(), clientid(), principal(),
+# traceid().
 # ----------------------------------------------------------------------
 
 
@@ -4757,22 +4757,23 @@ def test_rule_event_replace_handles_escaped_quotes():
     assert event == {"n": "it is on"}
 
 
-def test_rule_event_principal_and_traceid_accepted_but_unresolved(caplog):
-    """Both are real AWS functions, so a rule using them is stored rather than
-    failing a stack that deploys on AWS — but this publish path carries no
-    certificate identity or trace id, so they warn like any other function the
-    evaluator does not implement."""
+def test_rule_event_principal_and_traceid_read_the_message_identity(caplog):
+    """Both read the message under evaluation, without a warning, and are Undefined outside one."""
     from ministack.services import iot as iot_module
-    from ministack.services.iot import _rule_event, _validate_rule_sql
+    from ministack.services.iot import _rule_event, _unimplemented_sql_functions, _validate_rule_sql
 
     sql = "SELECT principal() AS p, traceid() AS t, temp FROM 't'"
     assert _validate_rule_sql(sql) is None
-    # The evaluator warns once per function name for the life of the process.
+    assert _unimplemented_sql_functions(sql) == []
     iot_module._warned_sql_funcs.clear()
     with caplog.at_level(logging.WARNING, logger="iot"):
         assert _rule_event(sql, "t", b'{"temp": 1}') == {"temp": 1}
-    warned = " ".join(r.message for r in caplog.records)
-    assert "principal()" in warned and "traceid()" in warned
+        token = iot_module._rule_message_identity.set(("c0ffee", "trace-1"))
+        try:
+            assert _rule_event(sql, "t", b'{"temp": 1}') == {"p": "c0ffee", "t": "trace-1", "temp": 1}
+        finally:
+            iot_module._rule_message_identity.reset(token)
+    assert not caplog.records
 
 
 def test_eval_where_clientid_reaches_every_leaf_form():
@@ -4801,6 +4802,31 @@ def test_eval_where_clientid_reaches_every_leaf_form():
     # ...but "n/a" is a value, so the function is never Undefined.
     assert _eval_where("isUndefined(clientid())", "t", raw, message) is False
     assert _eval_where("clientid() = 'n/a'", "t", raw, message) is True
+
+
+def test_eval_where_principal_and_traceid_are_operands():
+    """A rule can gate on who published (`WHERE principal() = '<certificate id>'`)."""
+    from ministack.services import iot as iot_module
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"temp": 1}'
+    message = _rule_message(raw)
+    token = iot_module._rule_message_identity.set(("c0ffee", "trace-1"))
+    try:
+        for pred, expected in (
+            ("principal() = 'c0ffee'", True),
+            ("principal() IN ('beef', 'c0ffee')", True),
+            ("principal() LIKE 'c0%'", True),
+            ("principal() = 'beef'", False),
+            ("traceid() = 'trace-1'", True),
+            ("isUndefined(traceid())", False),
+        ):
+            assert _eval_where(pred, "t", raw, message) is expected
+    finally:
+        iot_module._rule_message_identity.reset(token)
+    # With no message identity both are Undefined, so a comparison fails closed.
+    assert _eval_where("principal() = 'c0ffee'", "t", raw, message) is False
+    assert _eval_where("isUndefined(traceid())", "t", raw, message) is True
 
 
 def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
@@ -4843,6 +4869,56 @@ def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
     try:
         asyncio.run(_run())
         assert dispatched == [{"cid": "sensor-7"}, {"cid": "n/a"}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_broker_publish_threads_principal_and_trace_id_into_rules(monkeypatch):
+    """principal() is the publisher's; traceid() is one id per message, shared by every rule it reaches."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    for name in ("pt_a", "pt_b"):
+        iot_module._topic_rules.set_scoped(
+            account_id,
+            _TEST_REGION,
+            name,
+            {
+                "ruleName": name,
+                "sql": "SELECT principal() AS p, traceid() AS t FROM 'sensors/#'",
+                "ruleDisabled": False,
+                "actions": [{"lambda": {"functionArn": f"arn:aws:lambda:us-east-1:123456789012:function:{name}"}}],
+            },
+        )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append((arn.rsplit(":", 1)[-1], event)),
+    )
+
+    async def _run():
+        send, _sent = _mock_send()
+        session = _IoTWSSession(send, account_id, _TEST_REGION, "c0ffee")
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("sensor-7"))
+        for _ in range(2):
+            await session.handle_packet(PKT_PUBLISH, 0, _encode_string("sensors/door") + b"{}")
+        await session.cleanup()
+        # An in-process publish names no principal; it still gets a trace id.
+        await publish(account_id, "sensors/door", b"{}")
+
+    try:
+        asyncio.run(_run())
+        assert [rule for rule, _event in dispatched] == ["pt_a", "pt_b"] * 3
+        events = [event for _rule, event in dispatched]
+        assert [event.get("p") for event in events] == ["c0ffee"] * 4 + [None] * 2
+        trace_ids = [event["t"] for event in events]
+        assert all(str(uuid.UUID(t)) == t for t in trace_ids)
+        assert trace_ids[0] == trace_ids[1] and trace_ids[2] == trace_ids[3] and trace_ids[4] == trace_ids[5]
+        assert len(set(trace_ids)) == 3
     finally:
         iot_module._topic_rules.clear()
         reset()
@@ -5405,6 +5481,54 @@ def test_rule_republish_action_delivers_projected_event():
         reset()
 
 
+def test_rule_republish_is_a_new_message_from_the_rule_role_session():
+    """A republished message comes from the rule role's session and gets its own trace id."""
+    from ministack.services import iam as iam_module
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iam_module._roles.set_scoped(
+        account_id, None, "rule-role", {"RoleName": "rule-role", "RoleId": "AROAEXAMPLEROLEID0001"}
+    )
+    role_arn = f"arn:aws:iam::{account_id}:role/rule-role"
+    _put_rule(
+        account_id,
+        "chain_first",
+        "SELECT traceid() AS t FROM 'chain/in'",
+        [{"republish": {"topic": "chain/mid", "roleArn": role_arn}}],
+    )
+    _put_rule(
+        account_id,
+        "chain_second",
+        "SELECT principal() AS p, traceid() AS t, t AS original FROM 'chain/mid'",
+        [{"republish": {"topic": "chain/out", "roleArn": role_arn}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "chain/out", _collect)
+        await publish(account_id, "chain/in", b"{}", principal="c0ffee")
+
+    try:
+        asyncio.run(_run())
+        [event] = received
+        assert re.fullmatch(r"AROAEXAMPLEROLEID0001:[A-Za-z0-9]{8}", event["p"])
+        assert str(uuid.UUID(event["t"])) == event["t"]
+        assert event["t"] != event["original"]
+        # A role the account does not have names no session.
+        assert iot_module._rule_role_principal(account_id, f"arn:aws:iam::{account_id}:role/absent") is None
+        assert iot_module._rule_role_principal("210987654321", role_arn) is None
+    finally:
+        iam_module._roles.pop_scoped(account_id, None, "rule-role", None)
+        iot_module._topic_rules.clear()
+        reset()
+
+
 def test_rule_republish_onto_own_topic_terminates():
     """A rule republishing onto its own topic filter is user error, but the
     broker must cut the chain instead of recursing forever."""
@@ -5611,6 +5735,56 @@ def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
             {"failedAction": "DynamoDBv2Action", "failedResource": "absent",
              "errorMessage": "RuntimeError: dispatch blew up"}
         ]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_reports_the_message_trace_id(monkeypatch):
+    """The errorAction document's cloudwatchTraceId is the message's traceid()."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "err_rule",
+        {
+            "ruleName": "err_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+    _put_rule(
+        account_id,
+        "trace_rule",
+        "SELECT traceid() AS t FROM 'err/topic'",
+        [{"republish": {"topic": "err/trace"}}],
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+    received = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received[topic] = json.loads(payload)
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await subscribe(account_id, "err/trace", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        trace_id = received["err/trace"]["t"]
+        assert str(uuid.UUID(trace_id)) == trace_id
+        assert received["err/dlq"]["cloudwatchTraceId"] == trace_id
     finally:
         iot_module._topic_rules.clear()
         reset()

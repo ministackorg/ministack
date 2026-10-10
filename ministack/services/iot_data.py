@@ -28,6 +28,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.services import iot as _iot_module
 
 logger = logging.getLogger("iot_data")
@@ -114,7 +115,8 @@ async def handle_request(
     )
 
     if method == "POST" and path.startswith("/topics/"):
-        return await _publish(path[len("/topics/"):], body, qp)
+        access_key = extract_access_key_id(headers, query_params)
+        return await _publish(path[len("/topics/"):], body, qp, access_key)
 
     # Device Shadow: /things/{thingName}/shadow[?name={shadowName}]
     if path.startswith("/things/") and path.endswith("/shadow"):
@@ -203,7 +205,7 @@ async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
     return json_response(doc)
 
 
-async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
+async def _publish(raw_topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
     """``POST /topics/{topic}`` — forward body to the broker.
 
     ``raw_topic`` is what came after ``/topics/`` in the URL. The SDK URL-
@@ -241,6 +243,7 @@ async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
             body or b"",
             qos=qos,
             retain=retain,
+            principal=_iot_module._caller_principal(access_key),
         )
     except Exception as e:
         logger.exception("iot-data publish failed")

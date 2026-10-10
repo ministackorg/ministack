@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IoT — rule SQL `principal()` and `traceid()`** — both resolved to Undefined; `principal()` now returns the client certificate id for mTLS, the caller's `GetCallerIdentity` `UserId` for HTTP Publish and SigV4 WebSocket sessions (also their lifecycle events' `principalIdentifier`) and the rule role's session for a republish, and `traceid()` returns a per-message id that the errorAction document carries as `cloudwatchTraceId`. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
