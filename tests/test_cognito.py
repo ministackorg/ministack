@@ -6905,6 +6905,19 @@ def test_custom_auth_client_missing_explicit_flow(cognito_idp):
             AuthParameters={"USERNAME": "user@example.com"},
         )
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "CUSTOM_AUTH is not enabled for the client."
+
+
+@pytest.mark.parametrize("flows", [None, ["ADMIN_NO_SRP_AUTH"], ["USER_PASSWORD_AUTH"]])
+def test_custom_auth_enabled_without_allow_entries(cognito_idp, flows):
+    """A client without ALLOW_ entries in ExplicitAuthFlows keeps CUSTOM_AUTH enabled."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomAuthDefaultPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", **({"ExplicitAuthFlows": flows} if flows else {}),
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    answer = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "alice"})
+    assert answer["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
 # ── Test 6: RespondToAuthChallenge — missing Session ─────────────────────────

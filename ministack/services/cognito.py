@@ -4009,9 +4009,10 @@ def _admin_initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
@@ -4317,9 +4318,10 @@ def _initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
