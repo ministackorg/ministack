@@ -6920,6 +6920,54 @@ def test_custom_auth_enabled_without_allow_entries(cognito_idp, flows):
     assert answer["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
+_FLOW_REFUSALS = {
+    "USER_PASSWORD_AUTH": "USER_PASSWORD_AUTH flow not enabled for this client",
+    "ADMIN_USER_PASSWORD_AUTH": "Auth flow not enabled for this client",
+    "ADMIN_NO_SRP_AUTH": "Auth flow not enabled for this client",
+    "CUSTOM_AUTH": "CUSTOM_AUTH is not enabled for the client.",
+}
+
+
+def _sign_in_with_each_flow(call, flows):
+    """{auth flow: the InitiateAuth / AdminInitiateAuth answer} on a new client with these ExplicitAuthFlows."""
+    pid = call("CreateUserPool", PoolName="AuthFlowsPool")["UserPool"]["Id"]
+    call("AdminCreateUser", UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    call("AdminSetUserPassword", UserPoolId=pid, Username="alice", Password="Passw0rd!", Permanent=True)
+    cid = call("CreateUserPoolClient", UserPoolId=pid, ClientName="app",
+               ExplicitAuthFlows=flows)["UserPoolClient"]["ClientId"]
+    password = {"USERNAME": "alice", "PASSWORD": "Passw0rd!"}
+    return {flow: call("AdminInitiateAuth" if flow.startswith("ADMIN") else "InitiateAuth",
+                       UserPoolId=pid, ClientId=cid, AuthFlow=flow,
+                       AuthParameters={"USERNAME": "alice"} if flow == "CUSTOM_AUTH" else password)
+            for flow in _FLOW_REFUSALS}
+
+
+@pytest.mark.parametrize("flows, enabled", [
+    (["ALLOW_REFRESH_TOKEN_AUTH"], set()),
+    (["ALLOW_USER_PASSWORD_AUTH"], {"USER_PASSWORD_AUTH"}),
+    (["ALLOW_ADMIN_USER_PASSWORD_AUTH"], {"ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"}),
+    (["ALLOW_CUSTOM_AUTH"], {"CUSTOM_AUTH"}),
+    (["ADMIN_NO_SRP_AUTH"], {"ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH"}),
+    (["USER_PASSWORD_AUTH"], {"USER_PASSWORD_AUTH", "CUSTOM_AUTH"}),
+    ([], set(_FLOW_REFUSALS)),
+])
+def test_cognito_explicit_auth_flows_enable_each_flow_under_auth(monkeypatch, flows, enabled):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    for flow, answer in _sign_in_with_each_flow(call, flows).items():
+        if flow in enabled:
+            assert not isinstance(answer, tuple), (flow, answer)
+        else:
+            assert answer == ("InvalidParameterException", _FLOW_REFUSALS[flow]), flow
+
+
+def test_cognito_password_flows_not_checked_without_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=False)
+    answers = _sign_in_with_each_flow(call, ["ALLOW_REFRESH_TOKEN_AUTH"])
+    assert answers.pop("CUSTOM_AUTH") == ("InvalidParameterException", _FLOW_REFUSALS["CUSTOM_AUTH"])
+    for answer in answers.values():
+        assert "AuthenticationResult" in answer
+
+
 # ── Test 6: RespondToAuthChallenge — missing Session ─────────────────────────
 
 def test_custom_auth_respond_missing_session(cognito_idp):
