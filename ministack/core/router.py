@@ -961,6 +961,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateRoleDescription": "iam",
             "PutRolePermissionsBoundary": "iam",
             "DeleteRolePermissionsBoundary": "iam",
+            "PutUserPermissionsBoundary": "iam",
+            "DeleteUserPermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",

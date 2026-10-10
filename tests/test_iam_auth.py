@@ -305,6 +305,16 @@ class TestEvaluate:
         assert evaluate(_ctx(action="s3:DeleteBucket"), [allow, deny]).decision == "Deny"
         assert evaluate(_ctx(action="s3:PutObject"), [allow, deny]).decision == "Allow"
 
+    def test_every_limit_must_allow(self):
+        identity = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "sqs:*"], "Resource": "*"}]})
+        boundary = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "ec2:*"], "Resource": "*"}]})
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], [boundary]).decision == "Allow"
+        assert evaluate(_ctx(action="sqs:SendMessage"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="ec2:RunInstances"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], []).decision == "ImplicitDeny"
+
 
 # ---------------------------------------------------------------------------
 # Condition operators (per IAM condition operators reference)
@@ -1101,6 +1111,99 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+
+
+_PROBES = {"S": "sqs:ListQueues", "D": "dynamodb:ListTables",
+           "B": "s3:ListAllMyBuckets", "L": "logs:DescribeLogGroups"}
+_IDENTITY = {"Statement": [{"Effect": "Allow", "Resource": "*",
+                            "Action": ["sqs:ListQueues", "dynamodb:ListTables", "logs:DescribeLogGroups"]}]}
+_BOUNDARY = {"Statement": [
+    {"Effect": "Allow", "Resource": "*",
+     "Action": ["sqs:ListQueues", "dynamodb:ListTables", "s3:ListAllMyBuckets"]},
+    {"Effect": "Deny", "Action": "dynamodb:ListTables", "Resource": "*"},
+]}
+
+
+def _allowed(access_key):
+    """The probe actions ``enforce`` lets through, as letters."""
+    return "".join(letter for letter, action in _PROBES.items()
+                   if enforce(access_key, action, action.split(":")[0], "us-east-1") is None)
+
+
+def _iam_call(action, **params):
+    from ministack.services import iam as iam_svc
+    status, _headers, body = iam_svc._IAM_HANDLERS[action](
+        {"Action": [action], **{k: [v] for k, v in params.items()}})
+    assert status == 200, body
+    return body
+
+
+@pytest.fixture
+def boundary_principals():
+    """A user and a role session with the probe identity policy, and a boundary policy."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+    boundary = "arn:aws:iam::000000000000:policy/probe-boundary"
+    iam_svc.store_policy(boundary, "probe-boundary", "/", json.dumps(_BOUNDARY))
+    _iam_call("CreateUser", UserName="probe-user")
+    _iam_call("PutUserPolicy", UserName="probe-user", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    iam_svc._access_keys["AKIATESTBOUNDARY01"] = {
+        "UserName": "probe-user", "AccessKeyId": "AKIATESTBOUNDARY01",
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument="{}")
+    _iam_call("PutRolePolicy", RoleName="probe-role", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    sts_svc._sessions["ASIATESTBOUNDARY01"] = {
+        "Arn": "arn:aws:sts::000000000000:assumed-role/probe-role/s",
+        "UserId": "AROA123:s", "SecretAccessKey": "s", "PrincipalType": "AssumedRole",
+        "AccountId": "000000000000", "Expiration": time.time() + 3600,
+    }
+    try:
+        yield {"user": "AKIATESTBOUNDARY01", "role": "ASIATESTBOUNDARY01", "boundary": boundary}
+    finally:
+        sts_svc._sessions.pop("ASIATESTBOUNDARY01", None)
+        iam_svc._access_keys.pop("AKIATESTBOUNDARY01", None)
+        iam_svc._user_inline_policies.pop("probe-user", None)
+        iam_svc._users.pop("probe-user", None)
+        iam_svc._roles.pop("probe-role", None)
+        iam_svc._policies.pop(boundary, None)
+
+
+class TestPermissionsBoundary:
+    """A boundary limits identity policies: only actions both allow pass, and its Deny denies."""
+
+    @pytest.mark.parametrize("kind", ["user", "role"])
+    def test_boundary_limits_identity_policies(self, boundary_principals, kind):
+        key, boundary = boundary_principals[kind], boundary_principals["boundary"]
+        name = {"UserName": "probe-user"} if kind == "user" else {"RoleName": "probe-role"}
+        entity = "User" if kind == "user" else "Role"
+        assert _allowed(key) == "SDL"
+        _iam_call(f"Put{entity}PermissionsBoundary", PermissionsBoundary=boundary, **name)
+        assert _allowed(key) == "S"
+        _iam_call(f"Delete{entity}PermissionsBoundary", **name)
+        assert _allowed(key) == "SDL"
+
+    def test_boundary_set_at_creation(self, boundary_principals):
+        from ministack.services import iam as iam_svc
+        _iam_call("CreateUser", UserName="probe-user-2", PermissionsBoundary=boundary_principals["boundary"])
+        _iam_call("PutUserPolicy", UserName="probe-user-2", PolicyName="identity",
+                  PolicyDocument=json.dumps(_IDENTITY))
+        iam_svc._access_keys["AKIATESTBOUNDARY02"] = {
+            "UserName": "probe-user-2", "AccessKeyId": "AKIATESTBOUNDARY02",
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        try:
+            assert _allowed("AKIATESTBOUNDARY02") == "S"
+            denied = enforce("AKIATESTBOUNDARY02", "dynamodb:ListTables", "dynamodb", "us-east-1")
+            assert denied.decision == "Deny"
+        finally:
+            iam_svc._access_keys.pop("AKIATESTBOUNDARY02", None)
+            iam_svc._user_inline_policies.pop("probe-user-2", None)
+            iam_svc._users.pop("probe-user-2", None)
+
+
 class TestCustomerManagedPolicyResolution:
     """Customer policies belong to the explicit account and use full ARNs."""
 

@@ -45,6 +45,7 @@ from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
 from xml.sax.saxutils import escape as _xml_escape
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("iam")
@@ -420,6 +421,9 @@ def _create_user(p):
     if name in _users:
         return _error(409, "EntityAlreadyExists",
                       f"User with name {name} already exists.", ns="iam")
+    boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
     path = _p(p, "Path") or "/"
     _users[name] = {
         "UserName": name,
@@ -459,7 +463,7 @@ def _get_user(p):
 def _list_users(p):
     prefix = _p(p, "PathPrefix") or "/"
     members = "".join(
-        f"<member>{_user_xml(n)}</member>"
+        f"<member>{_user_xml(n, boundary=False)}</member>"
         for n, u in _users.items()
         if u.get("Path", "/").startswith(prefix)
     )
@@ -475,6 +479,9 @@ def _put_user_permissions_boundary(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {name} cannot be found.", ns="iam")
+    boundary_err = _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
     user["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
     return _xml(200, "PutUserPermissionsBoundaryResponse", "", ns="iam")
 
@@ -485,6 +492,9 @@ def _delete_user_permissions_boundary(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {name} cannot be found.", ns="iam")
+    absent_err = _absent_boundary_error(user, user["UserId"])
+    if absent_err:
+        return absent_err
     user["PermissionsBoundary"] = None
     return _xml(200, "DeleteUserPermissionsBoundaryResponse", "", ns="iam")
 
@@ -546,6 +556,9 @@ def _create_role(p):
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
+    boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
     path = _p(p, "Path") or "/"
     _roles[name] = {
         "RoleName": name,
@@ -579,7 +592,7 @@ def _get_role(p):
 def _list_roles(p):
     prefix = _p(p, "PathPrefix") or "/"
     members = "".join(
-        f"<member>{_role_xml(n)}</member>"
+        f"<member>{_role_xml(n, boundary=False)}</member>"
         for n, r in _roles.items()
         if r.get("Path", "/").startswith(prefix)
     )
@@ -656,6 +669,9 @@ def _put_role_permissions_boundary(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
+    boundary_err = _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
     role["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
     return _xml(200, "PutRolePermissionsBoundaryResponse", "", ns="iam")
 
@@ -666,8 +682,43 @@ def _delete_role_permissions_boundary(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
+    absent_err = _absent_boundary_error(role, role["RoleId"])
+    if absent_err:
+        return absent_err
     role["PermissionsBoundary"] = None
     return _xml(200, "DeleteRolePermissionsBoundaryResponse", "", ns="iam")
+
+
+def _boundary_policy_error(arn):
+    """Under AUTH, ValidationError for a malformed ARN and NoSuchEntity unless it names a known policy."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    try:
+        parse_arn(arn)
+    except ArnParseError:
+        return _error(400, "ValidationError", "Invalid ARN:  Could not be parsed!", ns="iam")
+    if _policy_exists(arn):
+        return None
+    return _error(404, "NoSuchEntity",
+                  f"Scope ARN: {arn} does not exist or is not attachable.", ns="iam")
+
+
+def _absent_boundary_error(entity, principal_id):
+    """Under AUTH, NoSuchEntity for deleting a permissions boundary that is not set."""
+    from ministack.app import AUTH
+    if AUTH and not entity.get("PermissionsBoundary"):
+        return _error(404, "NoSuchEntity", f"Principal {principal_id} does not have scope", ns="iam")
+    return None
+
+
+def _boundary_usage_counts():
+    """The number of users and roles that use each policy ARN as their permissions boundary."""
+    counts = {}
+    for entity in (*_roles.values(), *_users.values()):
+        if entity.get("PermissionsBoundary"):
+            counts[entity["PermissionsBoundary"]] = counts.get(entity["PermissionsBoundary"], 0) + 1
+    return counts
 
 
 # -------------------- Managed policy management --------------------
@@ -851,18 +902,19 @@ def _list_policies(p):
     scope = _p(p, "Scope") or "All"
     prefix = _p(p, "PathPrefix") or "/"
     members = ""
+    usage_counts = _boundary_usage_counts()
     # Customer-managed policies — always returned unless scope == "AWS".
     if scope != "AWS":
         for arn, pol in _policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn)}</member>"
+            members += f"<member>{_managed_policy_xml(arn, usage_counts)}</member>"
     # AWS-managed policies — returned for scope "All" or "AWS".
     if scope != "Local":
         for arn, pol in _aws_managed_policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn)}</member>"
+            members += f"<member>{_managed_policy_xml(arn, usage_counts)}</member>"
     return _xml(200, "ListPoliciesResponse",
                 f"<ListPoliciesResult><Policies>{members}</Policies>"
                 "<IsTruncated>false</IsTruncated></ListPoliciesResult>",
@@ -877,7 +929,8 @@ def _delete_policy(p):
     if arn not in _policies:
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     pol = _policies[arn]
-    if pol.get("AttachmentCount", 0) > 0:
+    from ministack.app import AUTH
+    if pol.get("AttachmentCount", 0) > 0 or (AUTH and _boundary_usage_counts().get(arn)):
         return _error(409, "DeleteConflict",
                       "Cannot delete a policy attached to entities.", ns="iam")
     del _policies[arn]
@@ -892,13 +945,18 @@ def _list_entities_for_policy(p):
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     entity_filter = _p(p, "EntityFilter") or ""
     path_prefix = _p(p, "PathPrefix") or "/"
+    usage_filter = _p(p, "PolicyUsageFilter")
+
+    def uses(entity):
+        return ((usage_filter != "PermissionsBoundary" and arn in entity.get("AttachedPolicies", []))
+                or (usage_filter != "PermissionsPolicy" and entity.get("PermissionsBoundary") == arn))
 
     groups_xml = ""
     if entity_filter in ("", "Group"):
         for g in _groups.values():
             if not g.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in g.get("AttachedPolicies", []):
+            if uses(g):
                 groups_xml += (f"<member><GroupName>{g['GroupName']}</GroupName>"
                                f"<GroupId>{g['GroupId']}</GroupId></member>")
 
@@ -907,7 +965,7 @@ def _list_entities_for_policy(p):
         for r in _roles.values():
             if not r.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in r.get("AttachedPolicies", []):
+            if uses(r):
                 roles_xml += (f"<member><RoleName>{r['RoleName']}</RoleName>"
                               f"<RoleId>{r['RoleId']}</RoleId></member>")
 
@@ -916,7 +974,7 @@ def _list_entities_for_policy(p):
         for u in _users.values():
             if not u.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in u.get("AttachedPolicies", []):
+            if uses(u):
                 users_xml += (f"<member><UserName>{u['UserName']}</UserName>"
                               f"<UserId>{u['UserId']}</UserId></member>")
 
@@ -2959,7 +3017,7 @@ def _extract_tag_keys(p):
 
 # -------------------- XML builders --------------------
 
-def _user_xml(name):
+def _user_xml(name, boundary=True):
     u = _users[name]
     # Tags are emitted when present (#441). _role_xml follows the same pattern.
     tags_xml = ""
@@ -2970,7 +3028,7 @@ def _user_xml(name):
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
     boundary_xml = ""
-    if u.get("PermissionsBoundary"):
+    if boundary and u.get("PermissionsBoundary"):
         boundary_xml = (
             "<PermissionsBoundary>"
             "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
@@ -2986,7 +3044,7 @@ def _user_xml(name):
             f"{tags_xml}")
 
 
-def _role_xml(name):
+def _role_xml(name, boundary=True):
     r = _roles[name]
     assume_doc = _url_quote(r.get("AssumeRolePolicyDocument") or "{}", safe="")
     desc = r.get("Description") or ""
@@ -2999,7 +3057,7 @@ def _role_xml(name):
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
     boundary_xml = ""
-    if r.get("PermissionsBoundary"):
+    if boundary and r.get("PermissionsBoundary"):
         boundary_xml = (
             "<PermissionsBoundary>"
             "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
@@ -3018,7 +3076,7 @@ def _role_xml(name):
             f"{tags_xml}")
 
 
-def _managed_policy_xml(arn):
+def _managed_policy_xml(arn, usage_counts=None):
     pol = _lookup_policy(arn)
     # Description is omitted when empty to match real AWS (#438).
     description = pol.get("Description") or ""
@@ -3046,6 +3104,9 @@ def _managed_policy_xml(arn):
             f"<PolicyId>{pol['PolicyId']}</PolicyId>"
             f"<DefaultVersionId>{pol['DefaultVersionId']}</DefaultVersionId>"
             f"<AttachmentCount>{attachment_count}</AttachmentCount>"
+            f"<PermissionsBoundaryUsageCount>"
+            f"{(_boundary_usage_counts() if usage_counts is None else usage_counts).get(arn, 0)}"
+            f"</PermissionsBoundaryUsageCount>"
             f"<IsAttachable>true</IsAttachable>"
             f"<CreateDate>{pol['CreateDate']}</CreateDate>"
             f"<UpdateDate>{pol.get('UpdateDate', pol['CreateDate'])}</UpdateDate>"

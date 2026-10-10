@@ -3,11 +3,11 @@
 """IAM policy evaluation engine.
 
 Implements the AWS IAM policy evaluation algorithm (single-account,
-no SCPs/permissions boundaries/session policies) behind the AUTH=true flag.
+no SCPs/session policies) behind the AUTH=true flag.
 
 Evaluation order:
-  1. Explicit Deny in any applicable policy → DENY
-  2. Explicit Allow in any applicable policy → ALLOW
+  1. Explicit Deny in any applicable policy or permissions boundary → DENY
+  2. Explicit Allow in an identity policy, also allowed by the boundary → ALLOW
   3. No matching Allow → implicit DENY
 """
 
@@ -75,6 +75,7 @@ class PrincipalInfo:
     account: str
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
     keys: dict[str, Any] = field(default_factory=dict)
+    limits: list[list[list[ParsedStatement]]] = field(default_factory=list)
 
 
 @dataclass
@@ -567,43 +568,35 @@ def validate_policy_document(doc: str | dict) -> str | None:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
+def _first_match(ctx: EvalContext, stmts: list[ParsedStatement],
+                 effect: str) -> ParsedStatement | None:
+    for stmt in stmts:
+        if (stmt.effect == effect
+                and _action_matches(ctx.action, stmt.actions, stmt.not_actions)
+                and _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources)
+                and _conditions_met(stmt.conditions, ctx)):
+            return stmt
+    return None
+
+
 def evaluate(ctx: EvalContext,
-             policies: list[list[ParsedStatement]]) -> EvalResult:
+             policies: list[list[ParsedStatement]],
+             *limits: list[list[ParsedStatement]]) -> EvalResult:
     """Evaluate all policies against a request context.
 
     ``policies`` is a list of parsed-statement lists (one per policy document).
+    Each of ``limits`` (a permissions boundary) has the same shape: a Deny in
+    it denies, and an Allow in ``policies`` counts only if every limit allows.
     Returns Allow, Deny, or ImplicitDeny.
     """
-    # Flatten all statements
-    all_stmts: list[ParsedStatement] = []
-    for stmts in policies:
-        all_stmts.extend(stmts)
-
-    # Step 1: explicit Deny
-    for stmt in all_stmts:
-        if stmt.effect != "Deny":
-            continue
-        if not _action_matches(ctx.action, stmt.actions, stmt.not_actions):
-            continue
-        if not _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources):
-            continue
-        if not _conditions_met(stmt.conditions, ctx):
-            continue
-        return EvalResult("Deny", ctx.principal_arn, stmt.sid, "Explicit deny")
-
-    # Step 2: explicit Allow
-    for stmt in all_stmts:
-        if stmt.effect != "Allow":
-            continue
-        if not _action_matches(ctx.action, stmt.actions, stmt.not_actions):
-            continue
-        if not _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources):
-            continue
-        if not _conditions_met(stmt.conditions, ctx):
-            continue
-        return EvalResult("Allow", ctx.principal_arn, stmt.sid, "Explicit allow")
-
-    # Step 3: implicit deny
+    layers = [[stmt for stmts in layer for stmt in stmts] for layer in (policies, *limits)]
+    for stmts in layers:
+        deny = _first_match(ctx, stmts, "Deny")
+        if deny:
+            return EvalResult("Deny", ctx.principal_arn, deny.sid, "Explicit deny")
+    allow = _first_match(ctx, layers[0], "Allow")
+    if allow and all(_first_match(ctx, stmts, "Allow") for stmts in layers[1:]):
+        return EvalResult("Allow", ctx.principal_arn, allow.sid, "Explicit allow")
     return EvalResult("ImplicitDeny", ctx.principal_arn, "",
                       "No matching Allow statement")
 
@@ -791,6 +784,16 @@ def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedSt
                     if stmts:
                         policies.append(stmts)
     return policies
+
+
+def _permissions_boundary(store, name: str,
+                          account_id: str) -> list[list[list[ParsedStatement]]]:
+    """The evaluation limits a user's or role's permissions boundary sets."""
+    arn = (store.get_scoped(account_id, None, name) or {}).get("PermissionsBoundary")
+    if not arn:
+        return []
+    doc = _resolve_managed_policy_document(arn, account_id)
+    return [[parse_policy_document(doc) if doc else []]]
 
 
 def _resolve_managed_policy_document(policy_arn: str,
@@ -1089,17 +1092,21 @@ def resolve_principal(access_key_id: str,
     from ministack.core.responses import _account_from_sts_session
 
     account_id = _account_from_sts_session(access_key_id) or account_id
+    from ministack.services import iam as iam_svc
+
     credential = resolve_credential(access_key_id, account_id)
     if isinstance(credential, CredentialResolutionError):
         return AuthError(credential.code, credential.message)
+    limits = []
     if credential.principal_type == "Root":
         policies = None
     elif credential.principal_type == "User":
         policies = _gather_user_policies(credential.principal_name, account_id)
+        limits = _permissions_boundary(iam_svc._users, credential.principal_name, account_id)
     elif credential.principal_type == "AssumedRole":
-        policies = _gather_role_policies(
-            _role_name_from_assumed_arn(credential.principal_arn), account_id
-        )
+        role_name = _role_name_from_assumed_arn(credential.principal_arn)
+        policies = _gather_role_policies(role_name, account_id)
+        limits = _permissions_boundary(iam_svc._roles, role_name, account_id)
     else:
         return AuthError(
             "UnrecognizedClientException",
@@ -1111,6 +1118,7 @@ def resolve_principal(access_key_id: str,
         account=credential.account_id,
         policies=policies,
         keys=_principal_keys(credential),
+        limits=limits,
     )
 
 
@@ -1227,7 +1235,7 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         principal_keys=principal.keys,
     )
 
-    result = evaluate(ctx, principal.policies)
+    result = evaluate(ctx, principal.policies, *principal.limits)
 
     if result.decision == "Allow":
         return None

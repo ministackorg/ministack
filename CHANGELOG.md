@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IAM — permissions boundaries are enforced** — the boundaries of users and roles were stored and never applied; under `AUTH=true` a boundary now limits what the identity policies allow and a `Deny` in it denies, a boundary must name a known managed policy (`ValidationError` for a malformed ARN, CloudFormation `AWS::IAM::User` included), deleting an absent boundary answers `NoSuchEntity`, and a policy in use as a boundary cannot be deleted. `ListUsers` and `ListRoles` leave the boundary out, `ListEntitiesForPolicy` lists boundary users and roles and honours `PolicyUsageFilter`, and a managed policy reports `PermissionsBoundaryUsageCount`. Contributed by @iot-rocket.
+
 ### Fixed
 - **STS — trust policies see principal tags, session tags and web identities under `AUTH=true`** — `AssumeRole` trust conditions had no `aws:PrincipalTag/*`, a `Service` principal matched any IAM user whose ARN contained the service name, `Tags` passed without `sts:TagSession` in the trust policy, and `AssumeRoleWithWebIdentity` skipped the trust policy; trust conditions now see the caller's keys and the session tags as `aws:RequestTag/*` and `aws:TagKeys`, a `Service` principal no longer matches an IAM user, session tags need `sts:TagSession`, and a web identity needs a `Federated` principal naming its issuer, with `<issuer>:aud`, `:sub` and `:amr` evaluated. Under `AUTH=true` session tag keys that differ only in case answer `InvalidParameterValue`. Contributed by @iot-rocket.
 - **IAM — `aws:ResourceTag/*` under `AUTH=true`** — the key was always absent outside CloudWatch Logs, so a tag-scoped grant denied every request; a request on an existing SQS queue, SNS topic, DynamoDB table, Lambda function, IAM user or role, SSM parameter, Secrets Manager secret or KMS key now sees that resource's tags. Contributed by @iot-rocket.

@@ -156,6 +156,146 @@ def test_iam_user_permissions_boundary_missing_user(iam, operation):
     assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
 
 
+def _boundary_policy(iam, name):
+    doc = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]})
+    return iam.create_policy(PolicyName=name, PolicyDocument=doc)["Policy"]["Arn"]
+
+
+def _iam_action(monkeypatch, auth, action, **params):
+    """Run one IAM query action in-process with AUTH set to *auth*; return (status, body)."""
+    import asyncio
+    from urllib.parse import urlencode
+
+    from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    body = urlencode({"Action": action, "Version": "2010-05-08", **params}).encode()
+    status, _headers, payload = asyncio.run(iam_svc.handle_request("POST", "/", {}, body, {}))
+    return status, payload.decode()
+
+
+def _message(body):
+    return body.split("<Message>", 1)[1].split("</Message>", 1)[0]
+
+
+@pytest.mark.parametrize("auth", [True, False])
+@pytest.mark.parametrize("kind", ["customer", "aws"])
+@pytest.mark.parametrize("operation", [
+    "CreateRole", "CreateUser", "PutRolePermissionsBoundary", "PutUserPermissionsBoundary"])
+def test_iam_permissions_boundary_must_name_a_known_policy_under_auth(monkeypatch, auth, kind, operation):
+    name = f"boundary-missing-{_uuid_mod.uuid4().hex[:8]}"
+    missing = f"arn:aws:iam::{'aws' if kind == 'aws' else '000000000000'}:policy/{name}"
+    entity = "Role" if "Role" in operation else "User"
+    key = {f"{entity}Name": name}
+    create = {"AssumeRolePolicyDocument": "{}"} if entity == "Role" else {}
+    if operation.startswith("Put"):
+        assert _iam_action(monkeypatch, False, f"Create{entity}", **key, **create)[0] == 200
+    params = {**key, **(create if operation.startswith("Create") else {})}
+    try:
+        status, body = _iam_action(monkeypatch, auth, operation, PermissionsBoundary=missing, **params)
+        if auth:
+            assert (status, f"Scope ARN: {missing} does not exist or is not attachable.") == (404, _message(body))
+        else:
+            assert status == 200
+    finally:
+        _iam_action(monkeypatch, False, f"Delete{entity}", **key)
+
+
+@pytest.mark.parametrize("auth, status", [(True, 400), (False, 200)])
+def test_iam_permissions_boundary_must_be_an_arn_under_auth(monkeypatch, auth, status):
+    name = f"boundary-malformed-{_uuid_mod.uuid4().hex[:8]}"
+    _iam_action(monkeypatch, False, "CreateUser", UserName=name)
+    try:
+        got, body = _iam_action(monkeypatch, auth, "PutUserPermissionsBoundary", UserName=name,
+                                PermissionsBoundary=f"not-an-arn-{name}")
+        assert got == status
+        if auth:
+            assert _message(body) == "Invalid ARN:  Could not be parsed!"
+    finally:
+        _iam_action(monkeypatch, False, "DeleteUser", UserName=name)
+
+
+@pytest.mark.parametrize("auth, status", [(True, 404), (False, 200)])
+@pytest.mark.parametrize("entity", ["Role", "User"])
+def test_iam_delete_absent_permissions_boundary_under_auth(monkeypatch, auth, status, entity):
+    name = f"boundary-absent-{_uuid_mod.uuid4().hex[:8]}"
+    create = {"AssumeRolePolicyDocument": "{}"} if entity == "Role" else {}
+    _, created = _iam_action(monkeypatch, False, f"Create{entity}", **{f"{entity}Name": name}, **create)
+    principal_id = created.split(f"<{entity}Id>", 1)[1].split("<", 1)[0]
+    try:
+        got, body = _iam_action(monkeypatch, auth, f"Delete{entity}PermissionsBoundary", **{f"{entity}Name": name})
+        assert got == status
+        if auth:
+            assert _message(body) == f"Principal {principal_id} does not have scope"
+    finally:
+        _iam_action(monkeypatch, False, f"Delete{entity}", **{f"{entity}Name": name})
+
+
+@pytest.mark.parametrize("auth, status", [(True, 409), (False, 200)])
+def test_iam_delete_policy_in_use_as_a_boundary_under_auth(monkeypatch, auth, status):
+    name = f"boundary-delete-{_uuid_mod.uuid4().hex[:8]}"
+    _, created = _iam_action(monkeypatch, False, "CreatePolicy", PolicyName=name, PolicyDocument=json.dumps(
+        {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]}))
+    arn = created.split("<Arn>", 1)[1].split("<", 1)[0]
+    _iam_action(monkeypatch, False, "CreateUser", UserName=name, PermissionsBoundary=arn)
+    try:
+        assert _iam_action(monkeypatch, auth, "DeletePolicy", PolicyArn=arn)[0] == status
+    finally:
+        _iam_action(monkeypatch, False, "DeleteUser", UserName=name)
+        _iam_action(monkeypatch, False, "DeletePolicy", PolicyArn=arn)
+
+
+def test_iam_permissions_boundary_uses_are_listed_as_policy_entities(iam):
+    name = f"boundary-entities-{_uuid_mod.uuid4().hex[:8]}"
+    boundary = _boundary_policy(iam, name)
+    iam.create_user(UserName=name, PermissionsBoundary=boundary)
+    iam.create_role(RoleName=name, PermissionsBoundary=boundary,
+                    AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}))
+
+    def entities(**kwargs):
+        resp = iam.list_entities_for_policy(PolicyArn=boundary, **kwargs)
+        return [r["RoleName"] for r in resp["PolicyRoles"]], [u["UserName"] for u in resp["PolicyUsers"]]
+
+    assert entities() == ([name], [name])
+    assert entities(PolicyUsageFilter="PermissionsBoundary") == ([name], [name])
+    assert entities(PolicyUsageFilter="PermissionsPolicy") == ([], [])
+    listed_user = next(u for u in iam.list_users()["Users"] if u["UserName"] == name)
+    listed_role = next(r for r in iam.list_roles()["Roles"] if r["RoleName"] == name)
+    assert "PermissionsBoundary" not in listed_user and "PermissionsBoundary" not in listed_role
+    iam.delete_user(UserName=name)
+    iam.delete_role(RoleName=name)
+    iam.delete_policy(PolicyArn=boundary)
+
+
+def test_iam_permissions_boundary_accepts_an_aws_managed_policy(iam):
+    name = f"boundary-managed-{_uuid_mod.uuid4().hex[:8]}"
+    boundary = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    iam.create_user(UserName=name)
+    iam.put_user_permissions_boundary(UserName=name, PermissionsBoundary=boundary)
+    assert iam.get_user(UserName=name)["User"]["PermissionsBoundary"]["PermissionsBoundaryArn"] == boundary
+    iam.delete_user(UserName=name)
+
+
+def test_iam_policy_counts_its_permissions_boundary_uses(iam):
+    name = f"boundary-count-{_uuid_mod.uuid4().hex[:8]}"
+    boundary = _boundary_policy(iam, name)
+    assert iam.get_policy(PolicyArn=boundary)["Policy"]["PermissionsBoundaryUsageCount"] == 0
+    iam.create_user(UserName=f"{name}-user", PermissionsBoundary=boundary)
+    iam.create_role(RoleName=f"{name}-role", PermissionsBoundary=boundary,
+                    AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}))
+    policy = iam.get_policy(PolicyArn=boundary)["Policy"]
+    assert (policy["AttachmentCount"], policy["PermissionsBoundaryUsageCount"]) == (0, 2)
+    listed = next(p for p in iam.list_policies(Scope="Local")["Policies"] if p["Arn"] == boundary)
+    assert listed["PermissionsBoundaryUsageCount"] == 2
+    iam.delete_user(UserName=f"{name}-user")
+    iam.delete_role_permissions_boundary(RoleName=f"{name}-role")
+    assert iam.get_policy(PolicyArn=boundary)["Policy"]["PermissionsBoundaryUsageCount"] == 0
+    iam.delete_role(RoleName=f"{name}-role")
+    iam.delete_policy(PolicyArn=boundary)
+
+
 def test_iam_list_roles(iam):
     resp = iam.list_roles()
     names = [r["RoleName"] for r in resp["Roles"]]
