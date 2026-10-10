@@ -825,6 +825,10 @@ _CUSTOM_NAME_REPLACEMENT = {
     },
     "AWS::RDS::DBParameterGroup": {"name": "DBParameterGroupName"},
     "AWS::RDS::DBClusterParameterGroup": {"name": "DBClusterParameterGroupName"},
+    "AWS::DocDB::DBCluster": {"name": "DBClusterIdentifier"},
+    "AWS::DocDB::DBInstance": {"name": "DBInstanceIdentifier"},
+    "AWS::DocDB::DBSubnetGroup": {"name": "DBSubnetGroupName"},
+    "AWS::DocDB::DBClusterParameterGroup": {"name": "Name"},
     # Type and WorkflowName are "Update requires: Replacement" in the
     # aws-resource-glue-trigger reference.
     "AWS::Glue::Trigger": {
@@ -1138,11 +1142,13 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Logs::LogGroup": ("Tags", "list"),
     "AWS::OpenSearchService::Domain": ("Tags", "list"),
     "AWS::RDS::DBInstance": ("Tags", "list"),
-    "AWS::DocDB::DBCluster": ("Tags", "list"),
-    "AWS::DocDB::DBInstance": ("Tags", "list"),
     "AWS::RDS::DBClusterParameterGroup": ("Tags", "list"),
     "AWS::RDS::DBParameterGroup": ("Tags", "list"),
     "AWS::RDS::DBSubnetGroup": ("Tags", "list"),
+    "AWS::DocDB::DBCluster": ("Tags", "list"),
+    "AWS::DocDB::DBInstance": ("Tags", "list"),
+    "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
+    "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -11205,205 +11211,6 @@ def _rds_db_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
-# DocumentDB (AWS::DocDB::*)
-# ---------------------------------------------------------------------------
-
-def _docdb_extract_error(resp):
-    """Pull (code, message) out of a documentdb service XML error tuple."""
-    body = resp[2]
-    if isinstance(body, bytes):
-        body = body.decode("utf-8", errors="replace")
-    code_m = re.search(r"<Code>([^<]+)</Code>", body)
-    msg_m = re.search(r"<Message>([^<]+)</Message>", body)
-    return (
-        code_m.group(1) if code_m else "Unknown",
-        msg_m.group(1) if msg_m else repr(body),
-    )
-
-
-def _docdb_dbsubnetgroup_create(logical_id, props, stack_name):
-    name = props.get("DBSubnetGroupName") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=255)
-    params = {
-        "DBSubnetGroupName": name,
-        "DBSubnetGroupDescription": props.get(
-            "DBSubnetGroupDescription", "Managed by CloudFormation"),
-    }
-    subnet_ids = props.get("SubnetIds") or []
-    if isinstance(subnet_ids, str):
-        subnet_ids = [subnet_ids]
-    for i, sid in enumerate(subnet_ids, 1):
-        params[f"SubnetIds.member.{i}"] = sid
-    resp = _docdb._create_subnet_group(params)
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        raise ValueError(f"AWS::DocDB::DBSubnetGroup create failed: {code}: {msg}")
-    sg = _docdb._subnet_groups[name]
-    return name, {"DBSubnetGroup.Arn": sg["DBSubnetGroupArn"]}
-
-
-def _docdb_dbsubnetgroup_delete(physical_id, props):
-    _docdb._delete_subnet_group({"DBSubnetGroupName": physical_id})
-
-
-def _docdb_dbcluster_create(logical_id, props, stack_name):
-    cluster_id = props.get("DBClusterIdentifier") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=63)
-    params = {
-        "DBClusterIdentifier": cluster_id,
-        "EngineVersion": props.get("EngineVersion") or "",
-        "MasterUsername": props.get("MasterUsername") or "",
-        "MasterUserPassword": props.get("MasterUserPassword") or "",
-        "DBSubnetGroupName": props.get("DBSubnetGroupName") or "",
-        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow") or "",
-        "BackupRetentionPeriod": str(props.get("BackupRetentionPeriod", "")),
-        "DeletionProtection": "true" if props.get("DeletionProtection") else "false",
-        "StorageEncrypted": "true" if props.get("StorageEncrypted") else "false",
-        "KmsKeyId": props.get("KmsKeyId") or "",
-        "Port": str(props.get("Port") or ""),
-    }
-    for i, az in enumerate(props.get("AvailabilityZones") or [], 1):
-        params[f"AvailabilityZones.member.{i}"] = az
-    resp = _docdb._create_db_cluster(params)
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        raise ValueError(f"AWS::DocDB::DBCluster create failed: {code}: {msg}")
-    cluster = _docdb._clusters[cluster_id]
-    # CDK L2 sets ManageMasterUserPassword with the credentials in a
-    # Secrets Manager secret the template Fn::Join-dynamic-references into
-    # MasterUsername/MasterUserPassword; surface the linked secret the way
-    # the real API does (MasterUserSecretArn passthrough as well).
-    secret_arn = props.get("MasterUserSecretArn") or (
-        props.get("MasterUserSecret", {}).get("SecretArn")
-        if isinstance(props.get("MasterUserSecret"), dict) else None)
-    if secret_arn:
-        cluster["MasterUserSecret"] = {"SecretArn": secret_arn, "SecretStatus": "active"}
-    return cluster_id, {
-        "Endpoint": cluster["Endpoint"],
-        "Port": str(cluster["Port"]),
-        "Endpoint.Address": cluster["Endpoint"],
-        "Endpoint.Port": str(cluster["Port"]),
-        "ReadEndpoint.Address": cluster["ReaderEndpoint"],
-        "ClusterResourceId": cluster["DbClusterResourceId"],
-        "Arn": cluster["DBClusterArn"],
-    }
-
-
-def _docdb_dbcluster_delete(physical_id, props):
-    resp = _docdb._delete_db_cluster({"DBClusterIdentifier": physical_id})
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        if code == "DBClusterNotFoundFault":
-            return
-        raise ValueError(f"AWS::DocDB::DBCluster delete failed: {code}: {msg}")
-
-
-def _docdb_dbinstance_create(logical_id, props, stack_name):
-    db_id = props.get("DBInstanceIdentifier") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=63)
-    params = {
-        "DBInstanceIdentifier": db_id,
-        "DBInstanceClass": props.get("DBInstanceClass") or "db.t3.medium",
-        "Engine": "docdb",
-        "DBClusterIdentifier": props.get("DBClusterIdentifier") or "",
-        "EngineVersion": props.get("EngineVersion") or "",
-        "AvailabilityZone": props.get("AvailabilityZone") or "",
-        "AutoMinorVersionUpgrade": (
-            "false" if props.get("AutoMinorVersionUpgrade") is False else "true"),
-        "PreferredMaintenanceWindow": props.get("PreferredMaintenanceWindow") or "",
-        "PromotionTier": str(props.get("PromotionTier", "")),
-    }
-    resp = _docdb._create_db_instance(params)
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        raise ValueError(f"AWS::DocDB::DBInstance create failed: {code}: {msg}")
-    inst = _docdb._instances[db_id]
-    endpoint = inst.get("Endpoint") or {}
-    return db_id, {
-        "Endpoint.Address": endpoint.get("Address", ""),
-        "Endpoint.Port": str(endpoint.get("Port", "")),
-        "DBInstanceArn": inst["DBInstanceArn"],
-    }
-
-
-def _docdb_dbinstance_delete(physical_id, props):
-    resp = _docdb._delete_db_instance({"DBInstanceIdentifier": physical_id})
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        if code == "DBInstanceNotFound":
-            return
-        raise ValueError(f"AWS::DocDB::DBInstance delete failed: {code}: {msg}")
-
-
-def _docdb_dbclusterparametergroup_create(logical_id, props, stack_name):
-    name = props.get("DBClusterParameterGroupName") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=255)
-    params = {
-        "DBClusterParameterGroupName": name,
-        "DBParameterGroupFamily": props.get("Family") or "docdb5.0",
-        "Description": props.get("Description")
-        or f"Managed by CloudFormation for stack {stack_name}",
-    }
-    resp = _docdb._create_db_cluster_parameter_group(params)
-    if resp[0] >= 400:
-        code, msg = _docdb_extract_error(resp)
-        raise ValueError(
-            f"AWS::DocDB::DBClusterParameterGroup create failed: {code}: {msg}")
-    for i, param in enumerate(props.get("Parameters") or [], 1):
-        if not isinstance(param, dict) or not param.get("ParameterName"):
-            continue
-        modify = {
-            "DBClusterParameterGroupName": name,
-            f"Parameters.member.{i}.ParameterName": param["ParameterName"],
-            f"Parameters.member.{i}.ParameterValue": param.get("ParameterValue", ""),
-            f"Parameters.member.{i}.ApplyMethod": param.get("ApplyMethod", "immediate"),
-        }
-        _docdb._modify_db_cluster_parameter_group(modify)
-    return name, {"DBClusterParameterGroup.Arn":
-                  _docdb._db_cluster_param_groups[name]["DBClusterParameterGroupArn"]}
-
-
-def _docdb_dbclusterparametergroup_delete(physical_id, props):
-    _docdb._delete_db_cluster_parameter_group(
-        {"DBClusterParameterGroupName": physical_id})
-
-
-def _sm_secret_target_attachment_create(logical_id, props, stack_name):
-    """AWS::SecretsManager::SecretTargetAttachment.
-
-    Links a secret to a provisioned target (DocumentDB cluster here); on AWS
-    this injects the target's connection info into the secret payload. The
-    secret and the DocDB cluster already hold their records, so the link
-    stamps the target's details onto the secret record and reports the
-    secret's ARN, matching what CDK reads back.
-    """
-    secret_id = props.get("SecretId") or ""
-    target_id = props.get("TargetId") or ""
-    target_type = props.get("TargetType") or ""
-    secret = _sm._secrets.get(secret_id)
-    cluster = _docdb._clusters.get(target_id)
-    if secret is not None and cluster is not None:
-        secret.setdefault("Versions", {})
-        current = None
-        for ver in secret["Versions"].values():
-            if "AWSCURRENT" in ver.get("Stages", []):
-                current = ver
-                break
-        if current is not None:
-            try:
-                payload = json.loads(current.get("SecretString") or "{}")
-            except ValueError:
-                payload = {}
-            payload.setdefault("engine", "docdb")
-            payload.setdefault("host", cluster.get("Endpoint", ""))
-            payload.setdefault("port", cluster.get("Port", 27017))
-            payload.setdefault("dbClusterIdentifier", target_id)
-            current["SecretString"] = json.dumps(payload)
-    return f"{secret_id}-{target_type}", {"SecretArn": secret_id}
-
-
-def _sm_secret_target_attachment_delete(physical_id, props):
-    pass  # the link record is stateless; the secret and target delete separately
 # RDS DBSubnetGroup / DBParameterGroup / DBClusterParameterGroup
 # ---------------------------------------------------------------------------
 
@@ -11576,6 +11383,138 @@ def _rds_cluster_param_group_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# DocumentDB (AWS::DocDB::*): RDS clusters and instances with Engine docdb
+# ---------------------------------------------------------------------------
+
+_DOCDB_CLUSTER_PROPS = (
+    "EngineVersion", "MasterUsername", "MasterUserPassword", "DBSubnetGroupName",
+    "DBClusterParameterGroupName", "PreferredBackupWindow", "PreferredMaintenanceWindow", "KmsKeyId",
+    "StorageType", "NetworkType", "BackupRetentionPeriod", "Port", "DeletionProtection",
+    "StorageEncrypted", "CopyTagsToSnapshot", "ManageMasterUserPassword", "MasterUserSecretKmsKeyId",
+    "AvailabilityZones", "VpcSecurityGroupIds", "EnableCloudwatchLogsExports",
+)
+_DOCDB_CLUSTER_MODIFIABLE = (
+    "EngineVersion", "MasterUserPassword", "DBClusterParameterGroupName", "PreferredBackupWindow",
+    "PreferredMaintenanceWindow", "BackupRetentionPeriod", "Port", "DeletionProtection",
+    "CopyTagsToSnapshot", "VpcSecurityGroupIds", "StorageType", "ManageMasterUserPassword",
+    "MasterUserSecretKmsKeyId",
+)
+_DOCDB_INSTANCE_PROPS = (
+    "DBInstanceClass", "AvailabilityZone", "PreferredMaintenanceWindow", "AutoMinorVersionUpgrade",
+    "CACertificateIdentifier", "EnablePerformanceInsights",
+)
+_DOCDB_INSTANCE_MODIFIABLE = (
+    "DBInstanceClass", "PreferredMaintenanceWindow", "AutoMinorVersionUpgrade",
+    "CACertificateIdentifier", "EnablePerformanceInsights",
+)
+
+
+def _docdb_sync_tags(arn, old_props, new_props, resource_type):
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
+        _rds_call(_docdb._remove_tags, {"ResourceName": arn, **_ec_query({"TagKeys": removed})},
+                  resource_type, "untag")
+    changed = {k: v for k, v in new_tags.items() if old_tags.get(k) != v}
+    if changed:
+        _rds_call(_docdb._add_tags, {"ResourceName": arn, **_ec_query({
+            "Tags": [{"Key": k, "Value": v} for k, v in changed.items()]})}, resource_type, "tag")
+
+
+def _docdb_cluster_attrs(cluster):
+    return {
+        "ClusterResourceId": cluster["DbClusterResourceId"],
+        "Endpoint": cluster["Endpoint"],
+        "Port": str(cluster["Port"]),
+        "ReadEndpoint": cluster["ReaderEndpoint"],
+    }
+
+
+def _docdb_cluster_create(logical_id, props, stack_name):
+    cluster_id = props.get("DBClusterIdentifier") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=63)
+    _rds_call(_docdb._create_db_cluster, {
+        "DBClusterIdentifier": cluster_id, "Engine": "docdb",
+        **_ec_query({k: props[k] for k in _DOCDB_CLUSTER_PROPS if props.get(k) not in (None, "")}),
+        **_ec_query({"Tags": props.get("Tags") or []}),
+    }, "AWS::DocDB::DBCluster", "create")
+    return cluster_id, _docdb_cluster_attrs(_docdb._clusters[cluster_id])
+
+
+def _docdb_cluster_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    cluster = _docdb._clusters.get(physical_id)
+    if cluster is None:
+        return _docdb_cluster_create(logical_id or physical_id, new_props, stack_name)
+    changed = {k: new_props.get(k) for k in _DOCDB_CLUSTER_MODIFIABLE
+               if old_props.get(k) != new_props.get(k) and new_props.get(k) not in (None, "")}
+    if changed:
+        _rds_call(_docdb._modify_db_cluster, {
+            "DBClusterIdentifier": physical_id, "ApplyImmediately": "true", **_ec_query(changed),
+        }, "AWS::DocDB::DBCluster", "update")
+    _docdb_sync_tags(cluster["DBClusterArn"], old_props, new_props, "AWS::DocDB::DBCluster")
+    return physical_id, _docdb_cluster_attrs(cluster)
+
+
+def _docdb_cluster_delete(physical_id, props):
+    if physical_id in _docdb._clusters:
+        _rds_call(_docdb._delete_db_cluster, {"DBClusterIdentifier": physical_id, "SkipFinalSnapshot": "true"},
+                  "AWS::DocDB::DBCluster", "delete")
+
+
+def _docdb_instance_attrs(instance):
+    endpoint = instance.get("Endpoint") or {}
+    return {"Endpoint": endpoint.get("Address", ""), "Port": str(endpoint.get("Port", ""))}
+
+
+def _docdb_instance_create(logical_id, props, stack_name):
+    db_id = props.get("DBInstanceIdentifier") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=63)
+    _rds_call(_docdb._create_db_instance, {
+        "DBInstanceIdentifier": db_id, "Engine": "docdb",
+        "DBClusterIdentifier": props.get("DBClusterIdentifier", ""),
+        **_ec_query({k: props[k] for k in _DOCDB_INSTANCE_PROPS if props.get(k) not in (None, "")}),
+        **_ec_query({"Tags": props.get("Tags") or []}),
+    }, "AWS::DocDB::DBInstance", "create")
+    return db_id, _docdb_instance_attrs(_docdb._instances[db_id])
+
+
+def _docdb_instance_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    instance = _docdb._instances.get(physical_id)
+    if instance is None:
+        return _docdb_instance_create(logical_id or physical_id, new_props, stack_name)
+    changed = {k: new_props.get(k) for k in _DOCDB_INSTANCE_MODIFIABLE
+               if old_props.get(k) != new_props.get(k) and new_props.get(k) not in (None, "")}
+    if changed:
+        _rds_call(_docdb._modify_db_instance, {
+            "DBInstanceIdentifier": physical_id, "ApplyImmediately": "true", **_ec_query(changed),
+        }, "AWS::DocDB::DBInstance", "update")
+    _docdb_sync_tags(instance["DBInstanceArn"], old_props, new_props, "AWS::DocDB::DBInstance")
+    return physical_id, _docdb_instance_attrs(instance)
+
+
+def _docdb_instance_delete(physical_id, props):
+    if physical_id in _docdb._instances:
+        _rds_call(_docdb._delete_db_instance, {"DBInstanceIdentifier": physical_id},
+                  "AWS::DocDB::DBInstance", "delete")
+
+
+def _docdb_param_group_props(props):
+    """AWS::DocDB::DBClusterParameterGroup names the group ``Name``."""
+    return {**{k: v for k, v in props.items() if k != "Name"},
+            "DBClusterParameterGroupName": props.get("Name")}
+
+
+def _docdb_cluster_param_group_create(logical_id, props, stack_name):
+    return _rds_cluster_param_group_create(logical_id, _docdb_param_group_props(props), stack_name)
+
+
+def _docdb_cluster_param_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    return _rds_cluster_param_group_update(physical_id, _docdb_param_group_props(old_props),
+                                           _docdb_param_group_props(new_props), stack_name, logical_id)
+
+
+# ---------------------------------------------------------------------------
 # SecretsManager SecretTargetAttachment
 # ---------------------------------------------------------------------------
 
@@ -11584,13 +11523,15 @@ _SM_TARGET_KEYS = ("engine", "host", "port", "dbname")
 
 def _sm_target_connection(target_type, target_id):
     """The connection keys the attachment writes into the secret JSON."""
-    if target_type == "AWS::RDS::DBInstance":
-        record = _rds._instances.get(target_id)
+    if target_type in ("AWS::RDS::DBInstance", "AWS::DocDB::DBInstance"):
+        store = _docdb._instances if target_type == "AWS::DocDB::DBInstance" else _rds._instances
+        record = store.get(target_id)
         if record:
             endpoint = record.get("Endpoint") or {}
             host, port, dbname = endpoint.get("Address"), endpoint.get("Port"), record.get("DBName")
-    elif target_type == "AWS::RDS::DBCluster":
-        record = _rds._clusters.get(target_id)
+    elif target_type in ("AWS::RDS::DBCluster", "AWS::DocDB::DBCluster"):
+        store = _docdb._clusters if target_type == "AWS::DocDB::DBCluster" else _rds._clusters
+        record = store.get(target_id)
         if record:
             host, port, dbname = record.get("Endpoint"), record.get("Port"), record.get("DatabaseName")
     else:
@@ -11600,7 +11541,7 @@ def _sm_target_connection(target_type, target_id):
         raise ValueError(f"AWS::SecretsManager::SecretTargetAttachment: {target_type} "
                          f"{target_id} not found")
     engine = record.get("Engine", "")
-    for prefix, name in (("aurora-postgresql", "postgres"), ("aurora", "mysql"),
+    for prefix, name in (("docdb", "mongo"), ("aurora-postgresql", "postgres"), ("aurora", "mysql"),
                          ("oracle", "oracle"), ("sqlserver", "sqlserver")):
         if engine.startswith(prefix):
             engine = name
@@ -14078,6 +14019,12 @@ def _location_tracker_delete(physical_id, props):
 
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
+                              "MasterUsername", "SnapshotIdentifier", "SourceDBClusterIdentifier",
+                              "StorageEncrypted"),
+    "AWS::DocDB::DBInstance": ("AvailabilityZone", "DBClusterIdentifier", "DBInstanceIdentifier"),
+    "AWS::DocDB::DBSubnetGroup": ("DBSubnetGroupName",),
+    "AWS::DocDB::DBClusterParameterGroup": ("Description", "Family", "Name"),
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
@@ -14965,18 +14912,6 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "update": _rds_db_instance_update,
                              "update_with_logical_id": True, "delete": _rds_db_instance_delete,
                              "snapshot": _rds_db_instance_snapshot},
-    "AWS::DocDB::DBSubnetGroup": {
-        "create": _docdb_dbsubnetgroup_create, "delete": _docdb_dbsubnetgroup_delete,
-    },
-    "AWS::DocDB::DBCluster": {"create": _docdb_dbcluster_create, "delete": _docdb_dbcluster_delete},
-    "AWS::DocDB::DBInstance": {"create": _docdb_dbinstance_create, "delete": _docdb_dbinstance_delete},
-    "AWS::DocDB::DBClusterParameterGroup": {
-        "create": _docdb_dbclusterparametergroup_create,
-        "delete": _docdb_dbclusterparametergroup_delete,
-    },
-    "AWS::SecretsManager::SecretTargetAttachment": {
-        "create": _sm_secret_target_attachment_create,
-        "delete": _sm_secret_target_attachment_delete,
     "AWS::RDS::DBSubnetGroup": {
         "create": _rds_subnet_group_create,
         "update": _rds_subnet_group_update,
@@ -14992,6 +14927,22 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBClusterParameterGroup": {
         "create": _rds_cluster_param_group_create,
         "update": _rds_cluster_param_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_cluster_param_group_delete,
+    },
+    "AWS::DocDB::DBCluster": {"create": _docdb_cluster_create, "update": _docdb_cluster_update,
+                              "update_with_logical_id": True, "delete": _docdb_cluster_delete},
+    "AWS::DocDB::DBInstance": {"create": _docdb_instance_create, "update": _docdb_instance_update,
+                               "update_with_logical_id": True, "delete": _docdb_instance_delete},
+    "AWS::DocDB::DBSubnetGroup": {
+        "create": _rds_subnet_group_create,
+        "update": _rds_subnet_group_update,
+        "update_with_logical_id": True,
+        "delete": _rds_subnet_group_delete,
+    },
+    "AWS::DocDB::DBClusterParameterGroup": {
+        "create": _docdb_cluster_param_group_create,
+        "update": _docdb_cluster_param_group_update,
         "update_with_logical_id": True,
         "delete": _rds_cluster_param_group_delete,
     },

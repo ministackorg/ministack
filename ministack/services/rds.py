@@ -5404,13 +5404,16 @@ def _describe_db_instances(p):
                 return invalid_arn
             return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
         instances = [instance]
+        docdb_members = ""
     else:
         instances = list(_instances.values())
         filters = _parse_filters(p)
         if filters:
             instances = _apply_instance_filters(instances, filters)
+        from ministack.services import documentdb
+        docdb_members = documentdb.instance_members_xml(filters)
 
-    members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances)
+    members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances) + docdb_members
     return _xml(200, "DescribeDBInstancesResponse",
         f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
 
@@ -6081,13 +6084,16 @@ def _describe_db_clusters(p):
                 return wrong_region
             return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
         clusters = [cluster]
+        docdb_members = ""
     else:
         clusters = list(_clusters.values())
         filters = _parse_filters(p)
         if filters:
             clusters = _apply_cluster_filters(clusters, filters)
+        from ministack.services import documentdb
+        docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
+    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 

@@ -34620,3 +34620,75 @@ def test_cfn_rds_custom_named_parameter_group_cannot_be_replaced(cfn):
         assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+
+def _docdb_template(retention):
+    username = {"Fn::Join": ["", ["{{resolve:secretsmanager:", {"Ref": "Secret"}, ":SecretString:username}}"]]}
+    password = {"Fn::Join": ["", ["{{resolve:secretsmanager:", {"Ref": "Secret"}, ":SecretString:password}}"]]}
+    return json.dumps({
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.0.0.0/16"}},
+            "SubA": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.0.1.0/24", "AvailabilityZone": "us-east-1a"}},
+            "SubB": {"Type": "AWS::EC2::Subnet", "Properties": {
+                "VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.0.2.0/24", "AvailabilityZone": "us-east-1b"}},
+            "Subnets": {"Type": "AWS::DocDB::DBSubnetGroup", "Properties": {
+                "DBSubnetGroupDescription": "docdb", "SubnetIds": [{"Ref": "SubA"}, {"Ref": "SubB"}]}},
+            "Params": {"Type": "AWS::DocDB::DBClusterParameterGroup", "Properties": {
+                "Description": "docdb", "Family": "docdb8.0", "Parameters": {"tls": "enabled"}}},
+            "Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {"GenerateSecretString": {
+                "SecretStringTemplate": '{"username": "docdbadmin"}', "GenerateStringKey": "password",
+                "ExcludeCharacters": '"@/\\'}}},
+            "Cluster": {"Type": "AWS::DocDB::DBCluster", "Properties": {
+                "MasterUsername": username, "MasterUserPassword": password,
+                "DBSubnetGroupName": {"Ref": "Subnets"}, "DBClusterParameterGroupName": {"Ref": "Params"},
+                "BackupRetentionPeriod": retention}},
+            "Instance": {"Type": "AWS::DocDB::DBInstance", "Properties": {
+                "DBClusterIdentifier": {"Ref": "Cluster"}, "DBInstanceClass": "db.r6g.large"}},
+            "Attach": {"Type": "AWS::SecretsManager::SecretTargetAttachment", "Properties": {
+                "SecretId": {"Ref": "Secret"}, "TargetId": {"Ref": "Cluster"},
+                "TargetType": "AWS::DocDB::DBCluster"}},
+        },
+        "Outputs": {
+            "ClusterId": {"Value": {"Ref": "Cluster"}},
+            "Endpoint": {"Value": {"Fn::GetAtt": ["Cluster", "Endpoint"]}},
+            "Port": {"Value": {"Fn::GetAtt": ["Cluster", "Port"]}},
+            "ReadEndpoint": {"Value": {"Fn::GetAtt": ["Cluster", "ReadEndpoint"]}},
+            "ResourceId": {"Value": {"Fn::GetAtt": ["Cluster", "ClusterResourceId"]}},
+            "InstancePort": {"Value": {"Fn::GetAtt": ["Instance", "Port"]}},
+            "SecretArn": {"Value": {"Ref": "Secret"}},
+        },
+    })
+
+
+def test_cfn_docdb_cluster_lifecycle(cfn, sm):
+    docdb = make_client("docdb")
+    stack = f"docdb-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=_docdb_template(1))
+    result = _wait_stack(cfn, stack, timeout=120)
+    assert result["StackStatus"] == "CREATE_COMPLETE", result
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in result["Outputs"]}
+    assert outputs["Endpoint"].endswith(".docdb.amazonaws.com")
+    assert ".cluster-ro-" in outputs["ReadEndpoint"]
+    assert outputs["Port"] == "27017"
+    assert outputs["ResourceId"].startswith("cluster-")
+
+    cluster = docdb.describe_db_clusters(DBClusterIdentifier=outputs["ClusterId"])["DBClusters"][0]
+    assert cluster["Engine"] == "docdb"
+    assert cluster["MasterUsername"] == "docdbadmin"
+    assert [m["DBInstanceIdentifier"] for m in cluster["DBClusterMembers"]]
+    secret = json.loads(sm.get_secret_value(SecretId=outputs["SecretArn"])["SecretString"])
+    assert secret["engine"] == "mongo"
+    assert secret["host"] == outputs["Endpoint"]
+    assert secret["port"] == 27017
+
+    cfn.update_stack(StackName=stack, TemplateBody=_docdb_template(7))
+    assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_COMPLETE"
+    cluster = docdb.describe_db_clusters(DBClusterIdentifier=outputs["ClusterId"])["DBClusters"][0]
+    assert cluster["BackupRetentionPeriod"] == 7
+
+    cfn.delete_stack(StackName=stack)
+    assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError):
+        docdb.describe_db_clusters(DBClusterIdentifier=outputs["ClusterId"])

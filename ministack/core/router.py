@@ -124,13 +124,8 @@ SERVICE_PATTERNS = {
         "path_patterns": [r"^/2025-09-09/microvm"],
         "host_patterns": [r"lambda-microvms\."],
     },
-    # DocumentDB shares RDS's signing name (`rds`) and Query API version, so
-    # credential-scope routing cannot tell the two apart (real AWS serves both
-    # from one control plane). detect_service() therefore dispatches
-    # `rds`-scoped requests on the endpoint host: docdb.*/documentdb.* hosts
-    # are DocumentDB, everything else is RDS.
+    # DocumentDB signs as `rds`; detect_service() claims its requests by host or content.
     "documentdb": {
-        "target_prefixes": ["AmazonRDS", "DocDB"],
         "host_patterns": [r"docdb\.", r"documentdb\."],
     },
     "lambda": {
@@ -690,6 +685,12 @@ _LIST_SIGNING_JOBS_PARAMS = frozenset({
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def _documentdb_claims(params):
+    from ministack.services.documentdb import claims_request
+
+    return claims_request(params)
+
+
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
     """Detect which AWS service a request is targeting."""
     host = headers.get("host", "")
@@ -790,10 +791,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
                 return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
-                # DocDB signs as `rds` (shared signing name and Query API
-                # version), so before returning RDS give DocumentDB's host
-                # patterns first claim — see the SERVICE_PATTERNS note above.
-                if svc_name == "rds" and re.search(r"^(docdb|documentdb)\.", host):
+                # DocumentDB signs as `rds`: a docdb host, Engine=docdb, or a
+                # DocumentDB cluster or instance named in the request is DocumentDB's.
+                if svc_name == "rds" and (re.search(r"^(docdb|documentdb)\.", host)
+                                          or _documentdb_claims(query_params)):
                     return "documentdb"
                 return svc_name
             # Map common credential scope names
