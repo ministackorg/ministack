@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IoT — deleting things, certificates, policies and thing types still in use** — `DeleteThing` detached a thing's certificates and deleted it, and `DeleteCertificate` refused only an `ACTIVE` certificate. Now `DeleteThing` refuses a thing with a certificate attached, `DeleteCertificate` refuses a certificate with things attached and, without `forceDelete`, one with policies attached (`forceDelete` detaches them), `DeletePolicy` refuses a policy with non-default versions and `DeleteThingType` one that things still use, all with AWS's messages. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added

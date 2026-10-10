@@ -1376,12 +1376,12 @@ def _delete_thing(name: str) -> tuple:
     thing = _things.get(name)
     if thing is None:
         return _error_not_found("Thing", name)
-    # Detach all attached certificates
-    thing_arn = thing["thingArn"]
-    for cert_id, cert in list(_certificates.items()):
-        if thing_arn in cert.get("attachedThings", []):
-            cert["attachedThings"].remove(thing_arn)
-            _certificates[cert_id] = cert
+    if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Cannot delete. Thing {name} is still attached to one or more principals",
+            400,
+        )
     _thing_events("DELETED", thing, thing.get("thingTypeName"))
     # Remove from groups
     for gname in list(thing.get("thingGroupNames", [])):
@@ -1533,6 +1533,12 @@ def _delete_thing_type(name: str) -> tuple:
         return error_response_json(
             "InvalidRequestException",
             "ThingType must be deprecated for at least 5 minutes before deletion",
+            400,
+        )
+    if any(thing.get("thingTypeName") == name for thing in _things.values()):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Can not delete thing type {name} with things associated with it",
             400,
         )
     del _thing_types[name]
@@ -2412,9 +2418,27 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
         if record["status"] == "ACTIVE":
             return error_response_json(
                 "CertificateStateException",
-                "Certificate is ACTIVE; deactivate before deletion",
+                f"Certificate must be deactivated (not ACTIVE) before deletion. Id: {cert_id}",
                 406,
             )
+        # Attached things refuse even forceDelete; attached policies only
+        # refuse without it, and forceDelete detaches them.
+        arn = record["certificateArn"]
+        if any(_thing_name_from_arn(t) in _things for t in record.get("attachedThings", [])):
+            return error_response_json(
+                "DeleteConflictException",
+                f"Things must be detached before deletion (arn: {arn})",
+                409,
+            )
+        policies = _policies_attached_to(arn)
+        if policies and not _qp_bool(qp, "forceDelete"):
+            return error_response_json(
+                "DeleteConflictException",
+                f"Certificate policies must be detached before deletion (arn: {arn})",
+                409,
+            )
+        for policy in policies:
+            _change_policy_target(policy["policyName"], arn, attach=False)
         del _certificates[cert_id]
         return json_response({})
     return error_response_json(
@@ -2858,10 +2882,17 @@ def _delete_policy(name: str) -> tuple:
     p = _policies.get(name)
     if p is None:
         return _error_not_found("Policy", name)
+    if len(p["versions"]) > 1:
+        return error_response_json(
+            "DeleteConflictException",
+            f"The policy cannot be deleted as multiple versions of the policy exist (name={name}). "
+            "Use DeletePolicyVersion action to delete all non-default versions of the policy and retry.",
+            409,
+        )
     if p.get("targets"):
         return error_response_json(
             "DeleteConflictException",
-            "Policy is attached; detach it before deletion",
+            f"The policy cannot be deleted as the policy is attached to one or more principals (name={name})",
             409,
         )
     del _policies[name]

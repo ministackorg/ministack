@@ -684,6 +684,24 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
     iot_client.delete_thing_type(thingTypeName=name)
 
 
+def test_iot_delete_thing_type_refused_while_a_thing_uses_it(iot_client):
+    """A deprecated thing type that a thing still uses is refused."""
+    type_name, thing = _unique("type"), _unique("thing")
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(thingName=thing, thingTypeName=type_name)
+    iot_client.deprecate_thing_type(thingTypeName=type_name)
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing_type(thingTypeName=type_name)
+    err = ei.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        400, "InvalidRequestException", f"Can not delete thing type {type_name} with things associated with it")
+    assert iot_client.describe_thing_type(thingTypeName=type_name)["thingTypeName"] == type_name
+
+    iot_client.update_thing(thingName=thing, removeThingType=True)
+    iot_client.delete_thing_type(thingTypeName=type_name)
+    iot_client.delete_thing(thingName=thing)
+
+
 # ---------------------------------------------------------------------------
 # ThingGroup CRUD + membership
 # ---------------------------------------------------------------------------
@@ -937,6 +955,43 @@ def test_iot_delete_active_certificate_rejected(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_delete_certificate_refused_while_attached(iot_client):
+    """ACTIVE is refused first, then attached things even when forced, then policies unless forced."""
+    pytest.importorskip("cryptography")
+    thing, policy = _unique("thing"), _unique("policy")
+    iot_client.create_thing(thingName=thing)
+    iot_client.create_policy(policyName=policy, policyDocument=_POLICY_DOC)
+    cert = iot_client.create_keys_and_certificate(setAsActive=True)
+    cert_id, arn = cert["certificateId"], cert["certificateArn"]
+    iot_client.attach_thing_principal(thingName=thing, principal=arn)
+    iot_client.attach_policy(policyName=policy, target=arn)
+
+    def refusal(**kwargs):
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_certificate(certificateId=cert_id, **kwargs)
+        err = ei.value.response
+        return err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]
+
+    active = (406, "CertificateStateException",
+              f"Certificate must be deactivated (not ACTIVE) before deletion. Id: {cert_id}")
+    things = (409, "DeleteConflictException", f"Things must be detached before deletion (arn: {arn})")
+    policies = (409, "DeleteConflictException", f"Certificate policies must be detached before deletion (arn: {arn})")
+    assert refusal() == refusal(forceDelete=True) == active
+    for status in ("INACTIVE", "REVOKED"):
+        iot_client.update_certificate(certificateId=cert_id, newStatus=status)
+        assert refusal() == refusal(forceDelete=True) == things
+    iot_client.detach_thing_principal(thingName=thing, principal=arn)
+    assert refusal() == policies
+    assert iot_client.list_targets_for_policy(policyName=policy)["targets"] == [arn]
+
+    iot_client.delete_certificate(certificateId=cert_id, forceDelete=True)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_certificate(certificateId=cert_id)
+    assert iot_client.list_targets_for_policy(policyName=policy)["targets"] == []
+    iot_client.delete_policy(policyName=policy)
+    iot_client.delete_thing(thingName=thing)
+
+
 def test_iot_register_certificate_preserves_pem_verbatim(iot_client):
     pytest.importorskip("cryptography")
     # Issue a cert, capture its PEM, delete it, then re-register the SAME PEM.
@@ -991,6 +1046,31 @@ def test_iot_attach_detach_thing_principal(iot_client):
     iot_client.update_certificate(certificateId=cert["certificateId"], newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert["certificateId"])
     iot_client.delete_thing(thingName=name)
+
+
+def test_iot_delete_thing_refused_while_a_principal_is_attached(iot_client):
+    """A thing with a certificate attached is refused whatever the certificate's status."""
+    pytest.importorskip("cryptography")
+    name = _unique("thing")
+    iot_client.create_thing(thingName=name)
+    cert = iot_client.create_keys_and_certificate(setAsActive=True)
+    cert_id, arn = cert["certificateId"], cert["certificateArn"]
+    iot_client.attach_thing_principal(thingName=name, principal=arn)
+    for status in ("ACTIVE", "INACTIVE", "REVOKED"):
+        iot_client.update_certificate(certificateId=cert_id, newStatus=status)
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_thing(thingName=name)
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException", f"Cannot delete. Thing {name} is still attached to one or more principals")
+    assert iot_client.list_thing_principals(thingName=name)["principals"] == [arn]
+    assert iot_client.list_principal_things(principal=arn)["things"] == [name]
+
+    iot_client.detach_thing_principal(thingName=name, principal=arn)
+    iot_client.delete_thing(thingName=name)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+    iot_client.delete_certificate(certificateId=cert_id)
 
 
 def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
@@ -1105,6 +1185,37 @@ def test_iot_attach_detach_policy(iot_client):
     assert arn not in targets2
 
     iot_client.delete_policy(policyName=name)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+def test_iot_delete_policy_refused_while_versioned_or_attached(iot_client):
+    """A non-default version is refused before an attachment."""
+    pytest.importorskip("cryptography")
+    name = _unique("policy")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    iot_client.create_policy_version(policyName=name, policyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Subscribe", "Resource": "*"}]}))
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    iot_client.attach_policy(policyName=name, target=cert["certificateArn"])
+
+    def refusal():
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_policy(policyName=name)
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"]) == (409, "DeleteConflictException")
+        return err["Error"]["Message"]
+
+    assert refusal() == (
+        f"The policy cannot be deleted as multiple versions of the policy exist (name={name}). "
+        "Use DeletePolicyVersion action to delete all non-default versions of the policy and retry.")
+    iot_client.delete_policy_version(policyName=name, policyVersionId="2")
+    assert refusal() == (
+        f"The policy cannot be deleted as the policy is attached to one or more principals (name={name})")
+
+    iot_client.detach_policy(policyName=name, target=cert["certificateArn"])
+    iot_client.delete_policy(policyName=name)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.get_policy(policyName=name)
     iot_client.delete_certificate(certificateId=cert["certificateId"])
 
 
