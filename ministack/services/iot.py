@@ -4639,6 +4639,10 @@ class RuleRoleError(ValueError):
     `put_topic_rule`."""
 
 
+class RuleRepublishError(ValueError):
+    """A republish action inside the rule's own topic filter, raised by `put_topic_rule`."""
+
+
 def _validate_rule_sql(sql: str) -> str | None:
     """Return an error message when the rule SQL cannot be parsed, else None."""
     sql = sql or ""
@@ -4693,6 +4697,27 @@ def _unimplemented_sql_functions(sql: str) -> list[str]:
     return sorted(names - _IMPLEMENTED_SQL_FUNCS - _SQL_KEYWORDS)
 
 
+def _republish_inside_filter(sql: str, actions) -> str | None:
+    """The refusal when an action republishes (templates unexpanded) into the rule's FROM filter, else None."""
+    filter_ = _rule_topic_filter(sql)
+    if not filter_:
+        return None
+    for action in actions or []:
+        republish = action.get("republish") if isinstance(action, dict) else None
+        target = republish.get("topic") if isinstance(republish, dict) else None
+        if not isinstance(target, str):
+            continue
+        # `$$` is the documented escape for a topic that starts with `$`.
+        if target.startswith("$$"):
+            target = target[1:]
+        # As in MQTT, a filter that starts with a wildcard does not match a `$` topic.
+        if target.startswith("$") and filter_[:1] in ("#", "+"):
+            continue
+        if _topic_matches(filter_, target):
+            return f"Republish topic cannot be within topic space of rule's topic pattern '{filter_}'"
+    return None
+
+
 def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None) -> dict:
     """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``.
 
@@ -4704,11 +4729,16 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
     AWS) but warns, so the resulting misfire is visible. Raises `RuleRoleError`
     (under AUTH=true) for an action role IAM cannot resolve, through the same
     two doors — real IoT probes the role at create time and fails the call.
+    Raises `RuleRepublishError` for a republish action inside the rule's own
+    topic filter (the errorAction is not checked).
     """
     sql = payload.get("sql", "")
     error = _validate_rule_sql(sql)
     if error:
         raise RuleSqlError(error)
+    refusal = _republish_inside_filter(sql, payload.get("actions"))
+    if refusal:
+        raise RuleRepublishError(refusal)
     for func in _unimplemented_sql_functions(sql):
         logger.warning(
             "Topic rule %s calls %s(), which MiniStack does not implement: it "
@@ -4777,7 +4807,7 @@ def _create_topic_rule(name: str, payload: dict) -> tuple:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
-    except RuleRoleError as exc:
+    except (RuleRoleError, RuleRepublishError) as exc:
         return error_response_json("InvalidRequestException", str(exc), 400)
     return json_response({})
 
@@ -4789,7 +4819,7 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
-    except RuleRoleError as exc:
+    except (RuleRoleError, RuleRepublishError) as exc:
         return error_response_json("InvalidRequestException", str(exc), 400)
     return json_response({})
 
@@ -7105,10 +7135,10 @@ def _dispatch_rule_to_lambda(
     ).start()
 
 
-# Depth guard for republish chains: rule A republishing onto a topic that rule
-# A (or a cycle of rules) matches again would recurse without bound. Real AWS
-# does not loop-protect either — such a rule is user error — but the emulator
-# must at least not crash, so the chain is cut and logged past this depth.
+# Depth guard for republish chains: put_topic_rule refuses an action that
+# republishes into the rule's own filter, but an errorAction that does, a
+# cycle across rules or a rule restored from saved state would still recurse
+# without bound, so the chain is cut and logged past this depth.
 _MAX_REPUBLISH_DEPTH = 8
 _republish_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "_iot_republish_depth", default=0
@@ -7127,8 +7157,7 @@ async def _dispatch_rule_republish(
     depth = _republish_depth.get()
     if depth >= _MAX_REPUBLISH_DEPTH:
         _broker_logger.warning(
-            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r "
-            "(a rule republishing onto its own topic filter loops forever on AWS too)",
+            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r",
             rule_name,
             _MAX_REPUBLISH_DEPTH,
             target_topic,

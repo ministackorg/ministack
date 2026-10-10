@@ -2106,6 +2106,84 @@ def test_iot_create_topic_rule_accepts_full_where_grammar(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def _republish_role(iam) -> str:
+    """A role the republish actions can name, so the rules also resolve it under AUTH=true."""
+    trust = {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    try:
+        iam.create_role(RoleName="iot-republish-role", AssumeRolePolicyDocument=json.dumps(trust))
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "EntityAlreadyExists":
+            raise
+    return iam.get_role(RoleName="iot-republish-role")["Role"]["Arn"]
+
+
+def _republish(role_arn: str, topic: str) -> dict:
+    return {"republish": {"roleArn": role_arn, "topic": topic}}
+
+
+@pytest.mark.parametrize(
+    "topic_filter, targets, disabled",
+    [
+        ("loop/#", ["loop/x"], False),
+        ("loop/exact", ["loop/exact"], False),
+        ("loop/+/c", ["loop/b/c"], False),
+        ("loop/par/#", ["loop/par"], False),
+        ("loop/#", ["loop/${clientid()}"], False),
+        ("loop/#", ["loop/x"], True),
+        ("loop/#", ["elsewhere", "loop/x"], False),
+        ("$aws/things/t/shadow/update", ["$$aws/things/t/shadow/update"], False),
+    ],
+    ids=[
+        "hash", "exact", "plus", "hash-parent-level", "template-suffix", "disabled", "second-action",
+        "escaped-dollar",
+    ],
+)
+def test_iot_create_topic_rule_republish_inside_own_filter_rejected(
+    iot_client, iam, topic_filter, targets, disabled
+):
+    """A republish topic the rule's own FROM filter matches is refused, and nothing is stored."""
+    role_arn, name = _republish_role(iam), _rule_name()
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(ruleName=name, topicRulePayload={
+            "sql": f"SELECT * FROM '{topic_filter}'",
+            "ruleDisabled": disabled,
+            "actions": [_republish(role_arn, target) for target in targets],
+        })
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Republish topic cannot be within topic space of rule's topic pattern '{topic_filter}'"
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.get_topic_rule(ruleName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.parametrize(
+    "topic_filter, target, error_target",
+    [
+        ("loop/#", "elsewhere", None),
+        ("loop/+", "loop/a/b", None),
+        ("loop/#", "elsewhere", "loop/x"),
+        ("loop/#", "${topic()}", None),
+        ("+/b/c", "$$a/b/c", None),
+    ],
+    ids=["outside", "plus-one-level", "error-action-inside", "template-only", "dollar-under-leading-wildcard"],
+)
+def test_iot_create_topic_rule_republish_outside_own_filter_accepted(
+    iot_client, iam, topic_filter, target, error_target
+):
+    """Only the actions' topics as written are checked, so these rules are stored."""
+    role_arn, name = _republish_role(iam), _rule_name()
+    payload = {"sql": f"SELECT * FROM '{topic_filter}'", "actions": [_republish(role_arn, target)]}
+    if error_target:
+        payload["errorAction"] = _republish(role_arn, error_target)
+    iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["actions"] == [_republish(role_arn, target)]
+    iot_client.delete_topic_rule(ruleName=name)
+
+
 def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
     name = _rule_name()
     iot_client.create_topic_rule(
@@ -2118,6 +2196,24 @@ def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
     assert ei.value.response["Error"]["Code"] == "SqlParseException"
     # The stored rule is untouched.
     assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'a'"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_topic_rule_republish_inside_own_filter_rejected(iot_client, iam):
+    role_arn, name = _republish_role(iam), _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": [_republish(role_arn, "b")]}
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": [_republish(role_arn, "a")]}
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        "Republish topic cannot be within topic space of rule's topic pattern 'a'"
+    )
+    # The stored rule is untouched.
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["actions"] == [_republish(role_arn, "b")]
     iot_client.delete_topic_rule(ruleName=name)
 
 
@@ -5406,8 +5502,7 @@ def test_rule_republish_action_delivers_projected_event():
 
 
 def test_rule_republish_onto_own_topic_terminates():
-    """A rule republishing onto its own topic filter is user error, but the
-    broker must cut the chain instead of recursing forever."""
+    """A rule restored from saved state can still republish onto its own filter; the broker cuts the chain."""
     from ministack.services import iot as iot_module
 
     reset()

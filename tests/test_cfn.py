@@ -20804,6 +20804,80 @@ def test_cfn_update_iot_topic_rule_in_place(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_iot_republish_rule(rule_name, target):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+                    "Action": "sts:AssumeRole"}]}},
+            },
+            "Rule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule_name,
+                    "TopicRulePayload": {
+                        "Sql": "SELECT * FROM 'things/in/#'",
+                        "Actions": [{"Republish": {
+                            "Topic": target,
+                            "RoleArn": {"Fn::GetAtt": ["Role", "Arn"]},
+                        }}],
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_create(cfn, iot_client):
+    """The resource fails with IoT's refusal, the stack rolls back and no rule is stored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-self-{suffix}", f"cfn_rule_self_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "CREATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        with pytest.raises(ClientError) as ei:
+            iot_client.get_topic_rule(ruleName=rule_name)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_update(cfn, iot_client):
+    """An update that moves the republish topic inside the filter fails and rolls back to the old rule."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-selfup-{suffix}", f"cfn_rule_selfup_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "out/topic")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "UPDATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        rule = iot_client.get_topic_rule(ruleName=rule_name)["rule"]
+        assert rule["actions"][0]["republish"]["topic"] == "out/topic"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_sns_topic_in_place(cfn, sns):
     """A topic's DisplayName updates in place: the ARN — and a subscription
     created outside the stack — survive."""

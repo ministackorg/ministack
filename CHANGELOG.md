@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IoT — republish inside the rule's own topic filter** — `CreateTopicRule` and `ReplaceTopicRule` accepted a `republish` action whose topic the rule's `FROM` filter matches, so the rule fed on its own output; they now refuse it with AWS's `InvalidRequestException`, and an `AWS::IoT::TopicRule` with such an action fails its stack. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
