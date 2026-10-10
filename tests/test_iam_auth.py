@@ -1305,6 +1305,78 @@ class TestGlobalConditionKeys:
         assert seen == [origin]
 
 
+class TestRequestTagContext:
+    """aws:RequestTag/* and aws:TagKeys of create, tag and untag calls."""
+
+    @pytest.mark.parametrize("service,action,body,params,context", [
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"env":"dev"}}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b"", {"Tag.1.Key": ["env"], "Tag.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("dynamodb", "dynamodb:TagResource", b'{"Tags":[{"Key":"env","Value":"dev"},{"Key":"t","Value":"1"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:requesttag/t": "1", "aws:TagKeys": ["env", "t"]}),
+        ("kms", "kms:CreateKey", b'{"Tags":[{"TagKey":"env","TagValue":"dev"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("iam", "iam:CreateUser", b"", {"Tags.member.1.Key": ["env"], "Tags.member.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"Env":"a","env":"b"}}', {},
+         {"aws:requesttag/env": ["a", "b"], "aws:TagKeys": ["Env", "env"]}),
+        ("sns", "sns:UntagResource", b"", {"TagKeys.member.1": ["env"]}, {"aws:TagKeys": ["env"]}),
+        ("ssm", "ssm:RemoveTagsFromResource", b'{"TagKeys":["env"]}', {}, {"aws:TagKeys": ["env"]}),
+        ("lambda", "lambda:UntagResource", b"", {"tagKeys": ["env", "temp"]}, {"aws:TagKeys": ["env", "temp"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q"}', {}, {}),
+        ("lambda", "lambda:InvokeFunction", b'{"Tags":{"env":"dev"}}', {}, {}),
+        ("sqs", "sqs:SendMessage", b'{"MessageBody":"x","tags":{"env":"dev"}}', {}, {}),
+    ])
+    def test_wire_shapes(self, service, action, body, params, context):
+        from ministack.core.iam_actions import request_tag_context
+        assert request_tag_context(service, action, body, params) == context
+
+    @pytest.mark.parametrize("tags,allowed", [
+        ({"env": "dev"}, True),
+        ({"env": "prod"}, False),
+        ({"env": "dev", "blocked": "1"}, False),
+        ({}, False),
+    ])
+    def test_create_is_decided_by_the_request_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-user") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"StringEquals": {"aws:RequestTag/env": "dev"}}},
+                {"Effect": "Deny", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "blocked"}}},
+            ]}))
+            denied = enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context)
+        assert (denied is None) is allowed
+
+    @pytest.mark.parametrize("tags,allowed", [({}, True), ({"env": "dev"}, False)])
+    def test_tag_keys_is_absent_without_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-null") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                                                  "Condition": {"Null": {"aws:TagKeys": "true"}}}]}))
+            assert (enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context) is None) is allowed
+
+    @pytest.mark.parametrize("method,grant,allowed", [
+        ("POST", "function:f", True), ("GET", "function:f*", True), ("DELETE", "function:g", False)])
+    def test_lambda_tag_calls_match_a_function_scoped_grant(self, method, grant, allowed):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        action = extract_iam_action("lambda", method, path, {}, b"", {})
+        arn = extract_resource_arn("lambda", method, path, {}, b"", {}, "us-east-1", "000000000000")
+        with _iam_user("rt-fn") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{
+                "Effect": "Allow", "Action": ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"],
+                "Resource": f"arn:aws:lambda:us-east-1:000000000000:{grant}"}]}))
+            denied = enforce(key, action, "lambda", "us-east-1", resource_arn=arn)
+        assert (denied is None) is allowed
+
+
 class TestSeededAwsManagedPolicies:
     """The AWS-managed policies CDK, SAM and Serverless attach by their real ARNs
     resolve to a document: the service-role/* path is the only one AWS has for the
@@ -1623,6 +1695,14 @@ class TestResourceArn:
     def test_lambda_invoke(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
+
+    @pytest.mark.parametrize("arn", [
+        "arn:aws:lambda:us-east-1:123:function:f", "arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Af"])
+    @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+    def test_lambda_tags(self, method, arn):
+        from ministack.core.iam_actions import extract_resource_arn
+        resolved = extract_resource_arn("lambda", method, f"/2017-03-31/tags/{arn}", {}, b"", {}, "us-east-1", "123")
+        assert resolved == "arn:aws:lambda:us-east-1:123:function:f"
 
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2538,6 +2618,13 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions", {}, b"", {}) == "lambda:CreateFunction"
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions/f/invocations", {}, b"", {}) == "lambda:InvokeFunction"
+
+    def test_lambda_tags_rest(self):
+        from ministack.core.iam_actions import extract_iam_action
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
+        assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
+        assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action

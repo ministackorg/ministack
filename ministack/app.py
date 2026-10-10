@@ -2583,6 +2583,7 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
             logs_service_context,
+            request_tag_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2613,6 +2614,8 @@ async def _dispatch_service_request(
                 service_context = logs_service_context(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
+            service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (

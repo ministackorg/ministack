@@ -1203,6 +1203,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     if principal.policies is None:
         return None
 
+    context = {key.lower(): value for key, value in (service_context or {}).items()}
+    # A request that names no tags has no aws:TagKeys.
+    context.setdefault("aws:tagkeys", None)
     ctx = EvalContext(
         principal_arn=principal.arn,
         principal_type=principal.type,
@@ -1210,9 +1213,7 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         action=iam_action,
         resource_arn=resource_arn,
         region=region,
-        service_context={
-            key.lower(): value for key, value in (service_context or {}).items()
-        },
+        service_context=context,
         principal_keys=principal.keys,
     )
 
