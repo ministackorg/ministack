@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — `TagResource`, `UntagResource` and `ListTagsForResource`** — the three operations answered `Unsupported IoT path`, so the tags the Create calls accept could not be read back. They now work on thing types, thing groups, policies, topic rules, jobs, job templates, CA certificates, provisioning templates and domain configurations with AWS's limits and errors, Create calls and CloudFormation `Tags` write the same tags, and deleting a resource drops them. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added

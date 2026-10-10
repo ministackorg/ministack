@@ -49,6 +49,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateDomainConfiguration``, ``DeleteDomainConfiguration``, including
     the ``iot:Data-ATS`` / ``iot:CredentialProvider`` configurations IoT owns
     (control plane only: the broker does not serve a configured domain)
+  - Tags: ``TagResource``, ``UntagResource``, ``ListTagsForResource`` on the
+    taggable types above, which also take ``tags`` when created
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
 dependency. The data plane (``iot_data.py``) is
@@ -82,6 +84,7 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from urllib.parse import parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -139,6 +142,8 @@ _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
 _job_templates: AccountRegionScopedDict = AccountRegionScopedDict()  # jobTemplateId -> record
+# Tags of the taggable resources: resource ARN -> {key: value}
+_tags: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -265,6 +270,7 @@ def get_state() -> dict:
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
         "job_templates": copy.deepcopy(_job_templates),
+        "tags": copy.deepcopy(_tags),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -303,6 +309,15 @@ def _restore_state(data: dict | None) -> None:
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
     _job_templates.update(data.get("job_templates", {}))
+    _tags.update(data.get("tags", {}))
+    # Older state kept these tags on the records.
+    for store, arn_key in ((_thing_groups, "thingGroupArn"), (_jobs, "jobArn"),
+                           (_job_templates, "jobTemplateArn")):
+        for (account, region, _), record in store.all_items():
+            legacy = record.pop("tags", None)
+            if legacy and not _tags.contains_scoped(account, region, record[arn_key]):
+                _tags.set_scoped(account, region, record[arn_key],
+                                 {t["Key"]: t.get("Value", "") for t in legacy})
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -346,6 +361,7 @@ def reset() -> None:
     _jobs.clear()
     _job_executions.clear()
     _job_templates.clear()
+    _tags.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -646,7 +662,14 @@ async def _route_request(
     if path == "/rules" and method == "GET":
         return _list_topic_rules(qp)
     if path.startswith("/rules/"):
-        return _handle_topic_rule(method, path, body)
+        return _handle_topic_rule(method, path, body, hdr)
+
+    if path == "/tags" and method == "POST":
+        return _tag_resource(_parse_body(body))
+    if path == "/untag" and method == "POST":
+        return _untag_resource(_parse_body(body))
+    if path == "/tags" and method == "GET":
+        return _list_tags_for_resource(qp)
 
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -970,7 +993,8 @@ def _create_domain_configuration(name: str, payload: dict) -> tuple:
     the configuration is AWS_MANAGED and gets a generated ``-ats`` host; with
     one it is CUSTOMER_MANAGED on the caller's ``domainName``."""
     err = (_domain_config_name_error(name, _DOMAIN_CONFIG_NAME_RE)
-           or _domain_config_model_error(payload))
+           or _domain_config_model_error(payload)
+           or _tags_error(payload.get("tags"), required=False))
     if err:
         return err
     service_type = payload.get("serviceType") or "DATA"
@@ -1049,6 +1073,7 @@ def _create_domain_configuration(name: str, payload: dict) -> tuple:
         if payload.get(member):
             record[member] = payload[member]
     _domain_configurations[name] = record
+    _set_created_tags(record["domainConfigurationArn"], payload.get("tags"))
     return json_response({
         "domainConfigurationName": name,
         "domainConfigurationArn": record["domainConfigurationArn"],
@@ -1195,6 +1220,7 @@ def _delete_domain_configuration(name: str) -> tuple:
             "AWS Managed Domain Configuration must be disabled for at least 7 days "
             "before it can be deleted")
     del _domain_configurations[name]
+    _tags.pop(record["domainConfigurationArn"], None)
     return json_response({})
 
 
@@ -1459,6 +1485,9 @@ def _thing_type_props_identity(props: dict) -> tuple:
 
 
 def _create_thing_type(name: str, payload: dict) -> tuple:
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_TAG_WITHOUT_VALUE)
+    if err:
+        return err
     props = payload.get("thingTypeProperties") or {}
     existing = _thing_types.get(name)
     if existing is not None:
@@ -1493,6 +1522,7 @@ def _create_thing_type(name: str, payload: dict) -> tuple:
         },
     }
     _thing_types[name] = record
+    _set_created_tags(record["thingTypeArn"], payload.get("tags"))
     _thing_type_event("CREATED", record)
     logger.info("IoT Thing Type created: %s", name)
     return json_response({
@@ -1536,6 +1566,7 @@ def _delete_thing_type(name: str) -> tuple:
             400,
         )
     del _thing_types[name]
+    _tags.pop(t["thingTypeArn"], None)
     _thing_type_event("DELETED", t)
     return json_response({})
 
@@ -1572,10 +1603,6 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
-def _thing_group_tag_pairs(tags: list | None) -> list:
-    return sorted((t.get("Key"), t.get("Value")) for t in tags or [])
-
-
 def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
     """CreateThingGroup on a name that exists. AWS answers 200 with the
     existing group when the request describes it exactly: description,
@@ -1597,7 +1624,8 @@ def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
         or (payload.get("parentGroupName") or None) != stored_parent
     ):
         message = f"Thing Group {group['thingGroupName']} already exists in current account"
-    elif _thing_group_tag_pairs(payload.get("tags")) != _thing_group_tag_pairs(group.get("tags")):
+    elif ({t.get("Key"): t.get("Value") for t in payload.get("tags") or []}
+          != (_tags.get(group["thingGroupArn"]) or {})):
         message = f"Resource {group['thingGroupArn']} already exists in current account"
     else:
         return json_response({
@@ -1620,6 +1648,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
             f"ThingGroup {name!r} already exists",
             409,
         )
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_TAG_WITHOUT_VALUE)
+    if err:
+        return err
     props = payload.get("thingGroupProperties") or {}
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
@@ -1636,8 +1667,6 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "version": 1,
         "things": [],
         "creationDate": _now_epoch(),
-        # Kept for a repeated CreateThingGroup to compare; not echoed.
-        "tags": list(payload.get("tags") or []),
     }
     if parent:
         # DescribeThingGroup reports the parent under thingGroupMetadata, as
@@ -1647,6 +1676,7 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
             "creationDate": record["creationDate"],
         }
     _thing_groups[name] = record
+    _set_created_tags(record["thingGroupArn"], payload.get("tags"))
     _thing_group_event("CREATED", record)
     if parent:
         _hierarchy_event("ADDED", _thing_groups[parent], record)
@@ -1753,6 +1783,7 @@ def _delete_thing_group(name: str) -> tuple:
     if parent:
         _hierarchy_event("REMOVED", parent, g)
     del _thing_groups[name]
+    _tags.pop(g["thingGroupArn"], None)
     return json_response({})
 
 
@@ -1901,7 +1932,8 @@ def _create_provisioning_template(payload: dict) -> tuple:
             return error_response_json(
                 "InvalidRequestException", f"{field} is required", 400
             )
-    err = _validate_provisioning_template_body(payload["templateBody"])
+    err = (_validate_provisioning_template_body(payload["templateBody"])
+           or _tags_error(payload.get("tags"), required=False))
     if err:
         return err
     if name in _provisioning_templates:
@@ -1929,6 +1961,7 @@ def _create_provisioning_template(payload: dict) -> tuple:
     if payload.get("preProvisioningHook"):
         record["preProvisioningHook"] = payload["preProvisioningHook"]
     _provisioning_templates[name] = record
+    _set_created_tags(record["templateArn"], payload.get("tags"))
     logger.info("IoT provisioning template created: %s", name)
     return json_response({
         "templateArn": record["templateArn"],
@@ -1996,7 +2029,7 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
 def _delete_provisioning_template(name: str) -> tuple:
     if _provisioning_templates.get(name) is None:
         return _provisioning_template_not_found(name)
-    del _provisioning_templates[name]
+    _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
     return json_response({})
 
@@ -2545,7 +2578,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         )
     refused = _verification_certificate_error(
         ca_pem, payload.get("verificationCertificate"), certificate_mode
-    )
+    ) or _tags_error(payload.get("tags"), required=False)
     if refused is not None:
         return refused
     if ca_id in _ca_certificates:
@@ -2565,6 +2598,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     if registration_config is not None:
         record["registrationConfig"] = registration_config
     _ca_certificates[ca_id] = record
+    _set_created_tags(record["certificateArn"], payload.get("tags"))
     return json_response({
         "certificateArn": record["certificateArn"],
         "certificateId": ca_id,
@@ -2671,6 +2705,7 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
                 406,
             )
         del _ca_certificates[ca_id]
+        _tags.pop(record["certificateArn"], None)
         return json_response({})
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
@@ -2802,6 +2837,9 @@ def _create_policy(name: str, payload: dict) -> tuple:
         return error_response_json(
             "InvalidRequestException", "policyDocument is required", 400
         )
+    err = _tags_error(payload.get("tags"), required=False)
+    if err:
+        return err
     try:
         json.loads(doc)
     except (TypeError, json.JSONDecodeError):
@@ -2824,6 +2862,7 @@ def _create_policy(name: str, payload: dict) -> tuple:
         "targets": [],
     }
     _policies[name] = record
+    _set_created_tags(record["policyArn"], payload.get("tags"))
     return json_response({
         "policyName": name,
         "policyArn": record["policyArn"],
@@ -2865,6 +2904,7 @@ def _delete_policy(name: str) -> tuple:
             409,
         )
     del _policies[name]
+    _tags.pop(p["policyArn"], None)
     return json_response({})
 
 
@@ -4743,12 +4783,13 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
 
 def delete_topic_rule(name: str) -> None:
     _topic_rules.pop(name, None)
+    _tags.pop(_topic_rule_arn(name), None)
 
 
-def _handle_topic_rule(method: str, path: str, body: bytes) -> tuple:
+def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tuple:
     name = path[len("/rules/"):]
     if method == "POST":
-        return _create_topic_rule(name, _parse_body(body))
+        return _create_topic_rule(name, _parse_body(body), headers.get("x-amz-tagging"))
     if method == "GET":
         return _get_topic_rule(name)
     if method == "PATCH":
@@ -4760,7 +4801,8 @@ def _handle_topic_rule(method: str, path: str, body: bytes) -> tuple:
     )
 
 
-def _create_topic_rule(name: str, payload: dict) -> tuple:
+def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
+    """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
     if not _RULE_NAME_RE.match(name or ""):
         return error_response_json(
             "InvalidRequestException",
@@ -4774,11 +4816,23 @@ def _create_topic_rule(name: str, payload: dict) -> tuple:
     if not payload.get("sql"):
         return error_response_json("SqlParseException", "sql is required", 400)
     try:
+        pairs = parse_qsl(tagging or "", keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid tag parameters, please make sure the tags are in correct format with tagKeys "
+            "not exceeding 128 characters and tagValues not exceeding 256 characters", 400)
+    tags = [{"Key": k, "Value": v} for k, v in pairs]
+    err = _tags_error(tags, required=False)
+    if err:
+        return err
+    try:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
     except RuleRoleError as exc:
         return error_response_json("InvalidRequestException", str(exc), 400)
+    _set_created_tags(_topic_rule_arn(name), tags)
     return json_response({})
 
 
@@ -4802,7 +4856,7 @@ def _get_topic_rule(name: str) -> tuple:
 
 
 def _delete_topic_rule(name: str) -> tuple:
-    _topic_rules.pop(name, None)
+    delete_topic_rule(name)
     return json_response({})
 
 
@@ -4817,6 +4871,178 @@ def _list_topic_rules(qp: dict) -> tuple:
             "ruleDisabled": r["ruleDisabled"],
         })
     return json_response({"rules": rules})
+
+
+# ---------------------------------------------------------------------------
+# Tags (TagResource / UntagResource / ListTagsForResource)
+# ---------------------------------------------------------------------------
+
+_TAG_KEY_PATTERN = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$"
+_TAGS_PER_RESOURCE = 50
+_TOO_MANY_TAGS = "Too many tags provided in the request. Please check the input."
+_INVALID_TAG_REQUEST = "Invalid request exception. Please check the input."
+# What CreateThingType/CreateThingGroup and CreateJob/CreateJobTemplate answer for a tag without a value.
+_TAG_WITHOUT_VALUE = "All tags in request should have keys and values."
+_INVALID_JOB_TAG = "Invalid tag parameter exception. Please check the input."
+
+# ARN resource type -> (the store keyed by what follows the type, the message of
+# TagResource and UntagResource for a resource that does not exist)
+_TAGGABLE_RESOURCES = {
+    "thinggroup": (_thing_groups, "Thing Group {name} does not exist."),
+    "thingtype": (_thing_types, "Thing Type {name} does not exist."),
+    "policy": (_policies, "This resource is not found"),
+    "rule": (_topic_rules, "Rule {name} not found. accountId: {account}, resourceArn: {arn}"),
+    "job": (_jobs, "Job {name} cannot be found."),
+    "jobtemplate": (_job_templates, "Job Template {name} cannot be found."),
+    "cacert": (_ca_certificates, "CA Certificate {name} not found"),
+    "provisioningtemplate": (_provisioning_templates, "Unable to get template id, template not found"),
+    "domainconfiguration": (_domain_configurations, None),
+}
+# Resource types IoT has but does not tag.
+_UNTAGGABLE_RESOURCE_TYPES = ("thing", "cert")
+
+
+def _tag_request_error(message: str) -> tuple:
+    return error_response_json("InvalidRequestException", message, 400)
+
+
+def _tag_key_error(key) -> str | None:
+    """The model constraint a tag key fails, or None."""
+    if not isinstance(key, str):
+        return "Member must not be null"
+    if not key:
+        return "Member must have length greater than or equal to 1"
+    if len(key) > 128:
+        return "Member must have length less than or equal to 128"
+    if not all(unicodedata.category(c)[0] in "LNZ" or c in "_.:/=+-@" for c in key):
+        return f"Member must satisfy regular expression pattern: {_TAG_KEY_PATTERN}"
+    return None
+
+
+def _tags_error(tags, required: bool = True,
+                missing_value: str = _INVALID_TAG_REQUEST) -> tuple | None:
+    """The refusal of the tag list of a TagResource (or, not required, a Create) call."""
+    if not tags:
+        if not required:
+            return None
+        if tags is None:
+            return _job_template_validation_error(None, "tags", "Member must not be null")
+        return _tag_request_error("The validated collection is empty")
+    if not isinstance(tags, list) or not all(isinstance(t, dict) for t in tags):
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    clauses = []
+    for index, tag in enumerate(tags, 1):
+        constraint = _tag_key_error(tag.get("Key"))
+        if constraint:
+            clauses.append(_job_validation_clause(
+                tag.get("Key"), f"tags.{index}.member.key", constraint))
+        value = tag.get("Value")
+        if isinstance(value, str) and len(value) > 256:
+            clauses.append(_job_validation_clause(
+                value, f"tags.{index}.member.value",
+                "Member must have length less than or equal to 256"))
+    if clauses:
+        return _job_validation_error(clauses)
+    for tag in tags:
+        if not isinstance(tag.get("Value"), str):
+            return _tag_request_error(missing_value)
+        if tag["Key"].lower().startswith("aws:"):
+            return _tag_request_error(f'Tags cannot begin with "aws:", offending tag: {tag["Key"]}')
+    if len({tag["Key"] for tag in tags}) > _TAGS_PER_RESOURCE:
+        return _tag_request_error(_TOO_MANY_TAGS)
+    return None
+
+
+def _set_created_tags(arn: str, tags: list | None) -> None:
+    """Store the tags a Create call carried; none drops what a deleted namesake left."""
+    if tags:
+        _tags[arn] = {tag["Key"]: tag["Value"] for tag in tags}
+    else:
+        _tags.pop(arn, None)
+
+
+def _tag_target_error(arn, must_exist: bool) -> tuple | None:
+    """The refusal of a tagging call on ``arn``, or None; ListTagsForResource passes must_exist=False."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    rtype, _, rest = spec.resource.partition("/") if spec else ("", "", "")
+    if not rest or spec.service != "iot" or (
+            rtype not in _TAGGABLE_RESOURCES and rtype not in _UNTAGGABLE_RESOURCE_TYPES):
+        return _tag_request_error("Invalid arn in request")
+    if spec.account_id != get_account_id():
+        return _tag_request_error("ResourceArn doesn't belong in requester's account")
+    if rtype in _UNTAGGABLE_RESOURCE_TYPES:
+        return _tag_request_error(f"Invalid resource type in ARN: {rtype}")
+    if not must_exist:
+        return None
+    if spec.region != get_region():
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    store, message = _TAGGABLE_RESOURCES[rtype]
+    # A domain configuration ARN ends in a generated id after the name.
+    name = rest.partition("/")[0] if rtype == "domainconfiguration" else rest
+    record = store.get(name)
+    if record is not None and record.get("domainConfigurationArn", arn) == arn:
+        return None
+    if message is None:
+        return _domain_config_not_found(name)
+    return error_response_json(
+        "ResourceNotFoundException",
+        message.format(name=name, account=spec.account_id, arn=arn), 404)
+
+
+def _tag_resource(payload: dict) -> tuple:
+    """``POST /tags``: add or overwrite tags; the last of a repeated key wins."""
+    arn, tags = payload.get("resourceArn"), payload.get("tags")
+    err = _tags_error(tags) or _tag_target_error(arn, must_exist=True)
+    if err:
+        return err
+    merged = {**(_tags.get(arn) or {}), **{tag["Key"]: tag["Value"] for tag in tags}}
+    if len(merged) > _TAGS_PER_RESOURCE:
+        return _tag_request_error(_TOO_MANY_TAGS)
+    _tags[arn] = merged
+    return json_response({})
+
+
+def _untag_resource(payload: dict) -> tuple:
+    """``POST /untag``: a key the resource does not carry is no error."""
+    keys = payload.get("tagKeys")
+    if keys is None:
+        return _job_template_validation_error(None, "tagKeys", "Member must not be null")
+    if not keys:
+        return _tag_request_error("The validated collection is empty")
+    if not isinstance(keys, list):
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    if any(_tag_key_error(key) for key in keys):
+        return _job_template_validation_error(
+            "[" + ", ".join(map(str, keys)) + "]", "tagKeys",
+            "Member must satisfy constraint: [Member must have length less than or equal "
+            "to 128, Member must have length greater than or equal to 1, Member must "
+            f"satisfy regular expression pattern: {_TAG_KEY_PATTERN}]")
+    reserved = next((key for key in keys if key.lower().startswith("aws:")), None)
+    if reserved is not None:
+        return _tag_request_error(f'Tags cannot begin with "aws:", offending tag: {reserved}')
+    arn = payload.get("resourceArn")
+    err = _tag_target_error(arn, must_exist=True)
+    if err:
+        return err
+    stored = _tags.get(arn) or {}
+    for key in keys:
+        stored.pop(key, None)
+    return json_response({})
+
+
+def _list_tags_for_resource(qp: dict) -> tuple:
+    """``GET /tags``: every tag in one page, whatever nextToken says."""
+    arn = qp.get("resourceArn")
+    err = _tag_target_error(arn, must_exist=False)
+    if err:
+        return err
+    return json_response({
+        "nextToken": None,
+        "tags": [{"Key": k, "Value": v} for k, v in (_tags.get(arn) or {}).items()],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -5306,6 +5532,9 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         payload, err = _job_payload_from_template(payload)
         if err:
             return err
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_INVALID_JOB_TAG)
+    if err:
+        return err
     # Absent means SNAPSHOT (the AWS default); present means it has to be one
     # of the two modeled values — including the empty string, which would
     # otherwise default its way to a SNAPSHOT job the caller never asked for.
@@ -5415,9 +5644,9 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "documentParameters": payload.get("documentParameters"),
         "schedulingConfig": payload.get("schedulingConfig"),
         "destinationPackageVersions": payload.get("destinationPackageVersions"),
-        "tags": payload.get("tags"),
         "snapshotted": False,
     }
+    _set_created_tags(_job_arn(job_id), payload.get("tags"))
     _jobs_materialize_executions(job_id)
     # New QUEUED executions joined each target's pending set — notify, as AWS
     # does (notify-next only reaches the things whose queue front changed).
@@ -5742,6 +5971,7 @@ async def _delete_job(job_id: str, qp: dict) -> tuple:
     job["lastUpdatedAt"] = _jobs_now_ms()
     _job_event(job, "deletion_in_progress")
     del _jobs[job_id]
+    _tags.pop(job["jobArn"], None)
     for key in [k for k in _job_executions.keys() if k[1] == job_id]:
         _job_execution_event(_job_executions[key], "DELETED")
         del _job_executions[key]
@@ -5895,6 +6125,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
             "Job document and job document source cannot be specified at the same time.",
             400,
         )
+    if err := _tags_error(payload.get("tags"), required=False, missing_value=_INVALID_JOB_TAG):
+        return err
     if not document and not source and not payload.get("jobArn"):
         return error_response_json(
             "InvalidRequestException",
@@ -5930,12 +6162,13 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         # Same stand-in as CreateJob's: the S3 object is not fetched.
         record["document"] = json.dumps({"documentSource": source})
     for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
-        "maintenanceWindows", "destinationPackageVersions", "tags",
+        "maintenanceWindows", "destinationPackageVersions",
     ):
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
     _job_config_floats(record)
     _job_templates[template_id] = record
+    _set_created_tags(record["jobTemplateArn"], payload.get("tags"))
     return json_response({
         "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
     })
@@ -6018,7 +6251,7 @@ def _list_job_templates(qp: dict) -> tuple:
 def _delete_job_template(template_id: str) -> tuple:
     if _job_templates.get(template_id) is None:
         return _job_template_not_found(template_id)
-    del _job_templates[template_id]
+    _tags.pop(_job_templates.pop(template_id)["jobTemplateArn"], None)
     # AWS answers 200 with an empty body.
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
 

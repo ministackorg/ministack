@@ -3699,7 +3699,12 @@ def _pascal_to_camel(obj):
 def _iot_topic_rule_create(logical_id, props, stack_name):
     name = props.get("RuleName") or _physical_name(stack_name, logical_id).replace("-", "_")
     payload = _pascal_to_camel(props.get("TopicRulePayload", {}))
+    tags = _iot_tags(props)
+    err = _iot._tags_error(tags, required=False)
+    if err:
+        raise ValueError(f"AWS::IoT::TopicRule create failed: {err[2]!r}")
     _iot.put_topic_rule(name, payload)
+    _iot._set_created_tags(_iot._topic_rule_arn(name), tags)
     return name, {"Arn": _iot._topic_rule_arn(name)}
 
 
@@ -3721,6 +3726,7 @@ def _iot_topic_rule_update(physical_id, old_props, new_props, stack_name, logica
         name, payload,
         created_at=existing.get("createdAt") if existing else None,
     )
+    _iot_update_tags(_iot._topic_rule_arn(name), old_props, new_props)
     return name, {"Arn": _iot._topic_rule_arn(name)}
 
 
@@ -13261,9 +13267,19 @@ def _iot_policy_principal_attachment_delete(physical_id, props):
 # readable back through its real API instead of the stack rolling back.
 
 
+def _iot_tags(props):
+    """A Tags property as the IoT API's tag list."""
+    return [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+
+
+def _iot_update_tags(arn, old_props, new_props):
+    _reconcile_tag_map(_iot._tags.setdefault(arn, {}), old_props, new_props)
+
+
 def _iot_thing_type_create(logical_id, props, stack_name):
     name = props.get("ThingTypeName") or _physical_name(stack_name, logical_id)
-    payload = {"thingTypeProperties": _pascal_to_camel(props.get("ThingTypeProperties") or {})}
+    payload = {"thingTypeProperties": _pascal_to_camel(props.get("ThingTypeProperties") or {}),
+               "tags": _iot_tags(props)}
     resp = _iot._create_thing_type(name, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::ThingType create failed: {resp[2]!r}")
@@ -13287,6 +13303,7 @@ def _iot_thing_type_import(identifier):
 
 def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
+    _iot._tags.pop(_iot._thing_type_arn(physical_id), None)
 
 
 def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
@@ -13329,6 +13346,7 @@ def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
         status, _headers, body = _iot._deprecate_thing_type(physical_id, {"undoDeprecate": not deprecate})
         if status >= 400:
             raise ValueError(f"DeprecateThingType failed: {body}")
+    _iot_update_tags(_iot._thing_type_arn(physical_id), old_props, new_props)
     return physical_id, _iot_thing_type_attrs(physical_id)
 
 
@@ -13360,7 +13378,7 @@ def _iot_thing_group_create(logical_id, props, stack_name):
     # anything, whatever the properties (measured eu-central-1, 2026-10-05).
     if name in _iot._thing_groups:
         raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
-    payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
+    payload = {"thingGroupProperties": _iot_thing_group_properties(props), "tags": _iot_tags(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]
     resp = _iot._create_thing_group(name, payload)
@@ -13377,9 +13395,8 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
     """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
     is the one property the reference marks No interruption that the service
     stores. ThingGroupName and ParentGroupName changes are replaced in
-    ``_update_resource`` before this runs. QueryString and Tags are accepted
-    without effect — the service has no dynamic groups and no tag store for
-    thing groups."""
+    ``_update_resource`` before this runs. Tags go to the tag store; QueryString
+    is accepted without effect, the service has no dynamic groups."""
     rec = _iot_thing_group_record(physical_id)
     if rec is None:
         return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
@@ -13388,6 +13405,7 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
         name, {"thingGroupProperties": _iot_thing_group_properties(new_props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::ThingGroup update failed: {resp[2]!r}")
+    _iot_update_tags(rec["thingGroupArn"], old_props, new_props)
     return physical_id, {"Arn": rec["thingGroupArn"], "Id": physical_id}
 
 
@@ -13432,7 +13450,8 @@ def _iot_policy_prune_versions(name):
 
 def _iot_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
-    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props)})
+    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props),
+                                      "tags": _iot_tags(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::Policy create failed: {resp[2]!r}")
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
@@ -13459,6 +13478,7 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     )
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
+    _iot_update_tags(_iot._policy_arn(name), old_props, new_props)
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
 
@@ -13469,6 +13489,7 @@ def _iot_policy_import(identifier):
 
 def _iot_policy_delete(physical_id, props):
     _iot._policies.pop(physical_id, None)
+    _iot._tags.pop(_iot._policy_arn(physical_id), None)
 
 
 def _iot_provisioning_template_body(props):
@@ -13510,7 +13531,7 @@ def _iot_provisioning_template_create(logical_id, props, stack_name):
         stack_name, logical_id, max_len=36
     )
     resp = _iot._create_provisioning_template(
-        _iot_provisioning_template_payload(name, props)
+        {**_iot_provisioning_template_payload(name, props), "tags": _iot_tags(props)}
     )
     if resp[0] == 409:
         # Re-create of a surviving template (rollback replay re-enters create):
@@ -13568,6 +13589,7 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
             )
         tmpl["templateBody"] = body
         _iot._provisioning_templates[name] = tmpl
+    _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 
 
@@ -13668,6 +13690,7 @@ def _iot_ca_certificate_create(logical_id, props, stack_name):
         "verificationCertificate": props.get("VerificationCertificatePem"),
         "certificateMode": props.get("CertificateMode"),
         "registrationConfig": _registration_config_payload(props),
+        "tags": _iot_tags(props),
     }
     resp = _iot._register_ca_certificate(
         {k: v for k, v in payload.items() if v is not None},
@@ -13724,6 +13747,7 @@ def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
             "AWS::IoT::CACertificate cannot change CertificateMode in place: "
             "CloudFormation documents it as update-requires-replacement."
         )
+    _iot_update_tags(_iot._ca_cert_arn(physical_id), old_props, new_props)
     return _iot_ca_certificate_apply(physical_id, new_props)
 
 
@@ -13786,7 +13810,7 @@ def _iot_domain_configuration_create(logical_id, props, stack_name):
         k: v for k, v in props.items()
         if k not in ("DomainConfigurationName", "DomainConfigurationStatus", "Tags")
     })
-    resp = _iot._create_domain_configuration(name, payload)
+    resp = _iot._create_domain_configuration(name, {**payload, "tags": _iot_tags(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::DomainConfiguration create failed: {resp[2]!r}")
     if props.get("DomainConfigurationStatus") != "ENABLED":
@@ -13803,7 +13827,9 @@ def _iot_domain_configuration_update(physical_id, old_props, new_props, stack_na
     })
     if payload:
         _iot_domain_configuration_set(physical_id, payload, "update")
-    return physical_id, _iot_domain_configuration_attrs(physical_id)
+    attrs = _iot_domain_configuration_attrs(physical_id)
+    _iot_update_tags(attrs["Arn"], old_props, new_props)
+    return physical_id, attrs
 
 
 def _iot_domain_configuration_delete(physical_id, props):

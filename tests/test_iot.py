@@ -778,6 +778,20 @@ def test_iot_create_thing_group_repeat_compares_tags(iot_client):
     iot_client.delete_thing_group(thingGroupName=tagged)
 
 
+def test_iot_create_thing_group_repeat_compares_current_tags(iot_client):
+    name = _unique("group")
+    created = [{"Key": "team", "Value": "a"}]
+    arn = iot_client.create_thing_group(thingGroupName=name, tags=created)["thingGroupArn"]
+    iot_client.tag_resource(resourceArn=arn, tags=[{"Key": "added", "Value": "1"}])
+    for tags in (created, None):
+        kwargs = {} if tags is None else {"tags": tags}
+        assert _iot_error(iot_client.create_thing_group, thingGroupName=name, **kwargs) == (
+            409, f"Resource {arn} already exists in current account with different properties")
+    current = [{"Key": "added", "Value": "1"}, {"Key": "team", "Value": "a"}]
+    for tags in (current, current[::-1]):
+        assert iot_client.create_thing_group(thingGroupName=name, tags=tags)["thingGroupArn"] == arn
+
+
 def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     parent, child = _unique("parent"), _unique("child")
     iot_client.create_thing_group(thingGroupName=parent)
@@ -841,6 +855,309 @@ def test_iot_list_thing_groups_for_thing(iot_client):
     iot_client.delete_thing(thingName=tname)
     iot_client.delete_thing_group(thingGroupName=g1)
     iot_client.delete_thing_group(thingGroupName=g2)
+
+
+# ---------------------------------------------------------------------------
+# Tags (TagResource / UntagResource / ListTagsForResource)
+# ---------------------------------------------------------------------------
+
+
+def _iot_tags(iot_client, arn):
+    return {t["Key"]: t["Value"] for t in iot_client.list_tags_for_resource(resourceArn=arn)["tags"]}
+
+
+def _iot_error(call, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        call(**kwargs)
+    response = ei.value.response
+    return response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Message"]
+
+
+def test_iot_create_time_tags_are_listed(iot_client):
+    tags = [{"Key": "team", "Value": "a"}, {"Key": "env", "Value": "dev"}]
+    thing_arn = iot_client.create_thing(thingName=_unique("thing"))["thingArn"]
+    rule = _unique("rule").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule, topicRulePayload={"sql": "SELECT * FROM 't'", "actions": []},
+        tags="team=a&env=dev")
+    template_arn = iot_client.create_job_template(
+        jobTemplateId=_unique("jt"), description="d", document="{}", tags=tags)["jobTemplateArn"]
+    arns = [
+        iot_client.create_thing_type(thingTypeName=_unique("type"), tags=tags)["thingTypeArn"],
+        iot_client.create_thing_group(thingGroupName=_unique("group"), tags=tags)["thingGroupArn"],
+        iot_client.create_policy(policyName=_unique("policy"), policyDocument="{}", tags=tags)["policyArn"],
+        iot_client.get_topic_rule(ruleName=rule)["ruleArn"],
+        template_arn,
+        iot_client.create_job(jobId=_unique("job"), targets=[thing_arn], document="{}", tags=tags)["jobArn"],
+        iot_client.register_ca_certificate(
+            caCertificate=iot_test_ca("unused")[0], certificateMode="SNI_ONLY", tags=tags)["certificateArn"],
+        iot_client.create_provisioning_template(
+            templateName=_unique("prov"), templateBody=_provisioning_template_body(),
+            provisioningRoleArn="arn:aws:iam::000000000000:role/p", tags=tags)["templateArn"],
+        iot_client.create_domain_configuration(
+            domainConfigurationName=_unique("dc-tags"), tags=tags)["domainConfigurationArn"],
+    ]
+    for arn in arns:
+        assert _iot_tags(iot_client, arn) == {"team": "a", "env": "dev"}, arn
+    # A job created from a tagged template does not take the template's tags.
+    job_arn = iot_client.create_job(
+        jobId=_unique("job"), targets=[thing_arn], jobTemplateArn=template_arn)["jobArn"]
+    assert _iot_tags(iot_client, job_arn) == {}
+    # The generated id after a domain configuration's name is part of its ARN.
+    assert _iot_error(iot_client.tag_resource, resourceArn=arns[-1].rsplit("/", 1)[0] + "/other",
+                      tags=tags)[0] == 404
+
+
+def test_iot_create_calls_refuse_bad_tags(iot_client):
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    thing_arn = iot_client.create_thing(thingName=_unique("thing"))["thingArn"]
+    type_name, policy_name = _unique("type"), _unique("policy")
+    generic = "Invalid request exception. Please check the input."
+    job_tag = "Invalid tag parameter exception. Please check the input."
+    for create, missing_value in (
+        (lambda tags: raw.create_thing_type(thingTypeName=type_name, tags=tags),
+         "All tags in request should have keys and values."),
+        (lambda tags: raw.create_thing_group(thingGroupName=_unique("group"), tags=tags),
+         "All tags in request should have keys and values."),
+        (lambda tags: raw.create_policy(policyName=policy_name, policyDocument="{}", tags=tags), generic),
+        (lambda tags: raw.create_job_template(
+            jobTemplateId=_unique("jt"), description="d", document="{}", tags=tags), job_tag),
+        (lambda tags: raw.create_job(
+            jobId=_unique("job"), targets=[thing_arn], document="{}", tags=tags), job_tag),
+        (lambda tags: raw.create_provisioning_template(
+            templateName=_unique("prov"), templateBody=_provisioning_template_body(),
+            provisioningRoleArn="arn:aws:iam::000000000000:role/p", tags=tags), generic),
+        (lambda tags: raw.register_ca_certificate(
+            caCertificate=iot_test_ca("unused")[0], certificateMode="SNI_ONLY", tags=tags), generic),
+    ):
+        assert _iot_error(create, tags=[{"Key": "aws:x", "Value": "v"}]) == (
+            400, 'Tags cannot begin with "aws:", offending tag: aws:x')
+        assert _iot_error(create, tags=[{"Key": "k"}]) == (400, missing_value)
+    assert _iot_error(iot_client.describe_thing_type, thingTypeName=type_name)[0] == 404
+    assert _iot_error(iot_client.get_policy, policyName=policy_name)[0] == 404
+
+    rule = _unique("rule").replace("-", "_")
+    for tagging, message in (
+        ("aws:x=v", 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ("k", "Invalid tag parameters, please make sure the tags are in correct format with tagKeys "
+              "not exceeding 128 characters and tagValues not exceeding 256 characters"),
+    ):
+        assert _iot_error(iot_client.create_topic_rule, ruleName=rule, tags=tagging,
+                          topicRulePayload={"sql": "SELECT * FROM 't'", "actions": []}) == (400, message)
+    assert rule not in [r["ruleName"] for r in iot_client.list_topic_rules()["rules"]]
+
+
+def test_iot_tag_untag_and_delete(iot_client):
+    raw = iot_client.list_tags_for_resource
+    name = _unique("group")
+    arn = iot_client.create_thing_group(thingGroupName=name)["thingGroupArn"]
+    listed = raw(resourceArn=arn)
+    assert listed["tags"] == [] and "nextToken" not in listed
+    out = iot_client.tag_resource(resourceArn=arn, tags=[
+        {"Key": "a", "Value": "1"}, {"Key": "b", "Value": ""},
+        {"Key": "dup", "Value": "1"}, {"Key": "dup", "Value": "2"}])
+    assert out["ResponseMetadata"]["HTTPStatusCode"] == 200
+    iot_client.tag_resource(resourceArn=arn, tags=[{"Key": "a", "Value": "new"}])
+    assert _iot_tags(iot_client, arn) == {"a": "new", "b": "", "dup": "2"}
+    iot_client.untag_resource(resourceArn=arn, tagKeys=["b", "missing"])
+    assert _iot_tags(iot_client, arn) == {"a": "new", "dup": "2"}
+
+    # Deleting a resource drops its tags; a namesake starts without them.
+    rule, payload = name.replace("-", "_"), {"sql": "SELECT * FROM 't'", "actions": []}
+
+    def create():
+        iot_client.create_thing_group(thingGroupName=name)
+        iot_client.create_policy(policyName=name, policyDocument="{}")
+        iot_client.create_topic_rule(ruleName=rule, topicRulePayload=payload)
+
+    def delete():
+        iot_client.delete_thing_group(thingGroupName=name)
+        iot_client.delete_policy(policyName=name)
+        iot_client.delete_topic_rule(ruleName=rule)
+
+    iot_client.create_policy(policyName=name, policyDocument="{}")
+    iot_client.create_topic_rule(ruleName=rule, topicRulePayload=payload)
+    resources = (arn, arn.replace(f"thinggroup/{name}", f"policy/{name}"),
+                 arn.replace(f"thinggroup/{name}", f"rule/{rule}"))
+    for resource in resources[1:]:
+        iot_client.tag_resource(resourceArn=resource, tags=[{"Key": "k", "Value": "v"}])
+    delete()
+    for resource in resources:
+        assert _iot_tags(iot_client, resource) == {}
+        assert _iot_error(iot_client.tag_resource, resourceArn=resource,
+                          tags=[{"Key": "k", "Value": "v"}])[0] == 404
+    create()
+    for resource in resources:
+        assert _iot_tags(iot_client, resource) == {}
+    delete()
+
+
+def test_iot_tagging_refuses_unknown_and_foreign_arns(iot_client):
+    arn = iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+    head, account = arn.rsplit(":", 1)[0], arn.split(":")[4]
+    tags, missing = [{"Key": "k", "Value": "v"}], _unique("missing").replace("-", "_")
+    for resource, message in (
+        (f"thinggroup/{missing}", f"Thing Group {missing} does not exist."),
+        (f"thingtype/{missing}", f"Thing Type {missing} does not exist."),
+        (f"policy/{missing}", "This resource is not found"),
+        (f"rule/{missing}", f"Rule {missing} not found. accountId: {account}, "
+                            f"resourceArn: {head}:rule/{missing}"),
+        (f"job/{missing}", f"Job {missing} cannot be found."),
+        (f"jobtemplate/{missing}", f"Job Template {missing} cannot be found."),
+        ("cacert/" + "0" * 64, f"CA Certificate {'0' * 64} not found"),
+        (f"provisioningtemplate/{missing}", "Unable to get template id, template not found"),
+    ):
+        target = f"{head}:{resource}"
+        assert _iot_error(iot_client.tag_resource, resourceArn=target, tags=tags) == (404, message)
+        assert _iot_error(iot_client.untag_resource, resourceArn=target, tagKeys=["k"]) == (404, message)
+        assert iot_client.list_tags_for_resource(resourceArn=target)["tags"] == []
+
+    other_region = arn.replace(":us-east-1:", ":eu-west-1:")
+    for call, kwargs in ((iot_client.tag_resource, {"tags": tags}),
+                         (iot_client.untag_resource, {"tagKeys": ["k"]})):
+        assert _iot_error(call, resourceArn=other_region, **kwargs) == (
+            400, "Invalid request exception. Please check the input.")
+    assert iot_client.list_tags_for_resource(resourceArn=other_region)["tags"] == []
+
+    for target, message in (
+        (f"{head}:thing/{missing}", "Invalid resource type in ARN: thing"),
+        (f"{head}:cert/{'0' * 64}", "Invalid resource type in ARN: cert"),
+        (f"{head}:widget/{missing}", "Invalid arn in request"),
+        (f"{head}:", "Invalid arn in request"),
+        ("not-an-arn", "Invalid arn in request"),
+        (f"arn:aws:sqs:us-east-1:{account}:{missing}", "Invalid arn in request"),
+        (arn.replace(f":{account}:", ":123456789012:"), "ResourceArn doesn't belong in requester's account"),
+    ):
+        assert _iot_error(iot_client.tag_resource, resourceArn=target, tags=tags) == (400, message)
+        assert _iot_error(iot_client.untag_resource, resourceArn=target, tagKeys=["k"]) == (400, message)
+        assert _iot_error(iot_client.list_tags_for_resource, resourceArn=target) == (400, message)
+
+
+def test_iot_tag_limits_and_validation(iot_client):
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    arn = iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+    too_many = "Too many tags provided in the request. Please check the input."
+    fifty = [{"Key": f"k{i:02d}", "Value": "v"} for i in range(50)]
+    assert _iot_error(raw.tag_resource, resourceArn=arn, tags=fifty + [{"Key": "k50", "Value": "v"}]) == (
+        400, too_many)
+    raw.tag_resource(resourceArn=arn, tags=fifty)
+    assert _iot_error(raw.tag_resource, resourceArn=arn, tags=[{"Key": "k50", "Value": "v"}]) == (
+        400, too_many)
+    raw.tag_resource(resourceArn=arn, tags=[{"Key": "k00", "Value": "new"}])
+    assert len(_iot_tags(iot_client, arn)) == 50
+    raw.untag_resource(resourceArn=arn, tagKeys=[t["Key"] for t in fifty])
+
+    pattern = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$"
+    for tags, message in (
+        ([{"Key": "b" * 129, "Value": "v"}], f"1 validation error detected: Value '{'b' * 129}' at "
+         "'tags.1.member.key' failed to satisfy constraint: Member must have length less than or equal to 128"),
+        ([{"Key": "v", "Value": "x" * 257}], f"1 validation error detected: Value '{'x' * 257}' at "
+         "'tags.1.member.value' failed to satisfy constraint: Member must have length less than or equal to 256"),
+        ([{"Key": "", "Value": "v"}], "1 validation error detected: Value '' at 'tags.1.member.key' failed "
+         "to satisfy constraint: Member must have length greater than or equal to 1"),
+        ([{"Key": "a#b", "Value": "v"}], "1 validation error detected: Value 'a#b' at 'tags.1.member.key' "
+         f"failed to satisfy constraint: Member must satisfy regular expression pattern: {pattern}"),
+        ([{"Key": "AWS:x", "Value": "v"}], 'Tags cannot begin with "aws:", offending tag: AWS:x'),
+        ([{"Key": "novalue"}], "Invalid request exception. Please check the input."),
+        ([], "The validated collection is empty"),
+        (None, "1 validation error detected: Value null at 'tags' failed to satisfy constraint: "
+         "Member must not be null"),
+    ):
+        kwargs = {} if tags is None else {"tags": tags}
+        assert _iot_error(raw.tag_resource, resourceArn=arn, **kwargs) == (400, message)
+    raw.tag_resource(resourceArn=arn, tags=[
+        {"Key": "a" * 128, "Value": "x" * 256}, {"Key": "a b+-=._:/@", "Value": "aws:x"},
+        {"Key": "awsx", "Value": ""}])
+    assert len(_iot_tags(iot_client, arn)) == 3
+
+    for keys, message in (
+        (["aws:x"], 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ([], "The validated collection is empty"),
+        (None, "1 validation error detected: Value null at 'tagKeys' failed to satisfy constraint: "
+         "Member must not be null"),
+        (["b" * 129], f"1 validation error detected: Value '[{'b' * 129}]' at 'tagKeys' failed to "
+         "satisfy constraint: Member must satisfy constraint: [Member must have length less than or "
+         "equal to 128, Member must have length greater than or equal to 1, Member must satisfy "
+         f"regular expression pattern: {pattern}]"),
+    ):
+        kwargs = {} if keys is None else {"tagKeys": keys}
+        assert _iot_error(raw.untag_resource, resourceArn=arn, **kwargs) == (400, message)
+
+    # A Create call refuses the same tags, and creates nothing.
+    for tags, message in (
+        ([{"Key": "aws:x", "Value": "v"}], 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ([{"Key": f"k{i:02d}", "Value": "v"} for i in range(51)], too_many),
+    ):
+        name = _unique("group")
+        assert _iot_error(raw.create_thing_group, thingGroupName=name, tags=tags) == (400, message)
+        assert _iot_error(iot_client.describe_thing_group, thingGroupName=name)[0] == 404
+
+
+def test_iot_tags_are_persisted_and_reset():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("group")
+    arn = f"arn:aws:iot:eu-west-1:123456789012:thinggroup/{name}"
+
+    async def _tags():
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        _status, _headers, body = await iot_module.handle_request(
+            "GET", "/tags", {}, b"", {"resourceArn": arn})
+        return json.loads(body)["tags"]
+
+    async def _run():
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        body = json.dumps({"tags": [{"Key": "k", "Value": "v"}]}).encode()
+        status, _headers, _body = await iot_module.handle_request(
+            "POST", f"/thing-groups/{name}", {}, body, {})
+        assert status == 200
+        assert await _tags() == [{"Key": "k", "Value": "v"}]
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert await _tags() == []
+        iot_module.load_persisted_state(saved)
+        assert await _tags() == [{"Key": "k", "Value": "v"}]
+
+    asyncio.run(_run())
+
+
+def test_iot_tags_on_records_of_older_state_move_to_the_store():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name, tags = _unique("group"), [{"Key": "k", "Value": "v"}]
+    arn = f"arn:aws:iot:eu-west-1:123456789012:thinggroup/{name}"
+
+    async def _call(method, path, body=b"", qp=None):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        return await iot_module.handle_request(method, path, {}, body, qp or {})
+
+    async def _run():
+        body = json.dumps({"tags": tags}).encode()
+        assert (await _call("POST", f"/thing-groups/{name}", body))[0] == 200
+        saved = iot_module.get_state()
+        # What older versions saved: the tags on the record and no tag store.
+        del saved["tags"]
+        saved["thing_groups"].get_scoped("123456789012", "eu-west-1", name)["tags"] = tags
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        _status, _headers, listed = await _call("GET", "/tags", qp={"resourceArn": arn})
+        assert json.loads(listed)["tags"] == tags
+        assert (await _call("POST", f"/thing-groups/{name}", body))[0] == 200
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
