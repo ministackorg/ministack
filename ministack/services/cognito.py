@@ -2429,7 +2429,7 @@ def _run_idp_handler(handler, action: str, data: dict):
         _pin_unsigned_idp_scope(data)
     from ministack.app import AUTH
     error = (_validate_client_secret_hash(action, data) or _auth_flow_error(action, data)
-             or _access_token_error(data)) if AUTH else None
+             or _access_token_error(data) or _confirmation_code_error(action, data)) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -4666,6 +4666,33 @@ def _sign_up(data):
     return json_response(resp)
 
 
+def _code_error(issued, code):
+    """ExpiredCodeException when no code was issued, CodeMismatchException for another code, else None."""
+    if not issued:
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400)
+    if code != issued:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400)
+    return None
+
+
+def _confirmation_code_error(action: str, data: dict):
+    """The error for a ConfirmSignUp or ConfirmForgotPassword the issued code does not allow, or None."""
+    if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
+        return None
+    pool, _pid = _pool_for_client(data.get("ClientId"))
+    user = _resolve_user(pool, data.get("Username"))[0] if pool else None
+    if not user:
+        return None
+    if action == "ConfirmForgotPassword":
+        return _code_error(user.get("_reset_code"), data.get("ConfirmationCode"))
+    if user.get("UserStatus") != "UNCONFIRMED":
+        return error_response_json(
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {user.get('UserStatus')}", 400)
+    return _code_error(user.get("_confirmation_code"), data.get("ConfirmationCode"))
+
+
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
@@ -4683,7 +4710,8 @@ def _confirm_sign_up(data):
     if err:
         return err
 
-    # Accept any code in emulation
+    # Codes are checked under AUTH=true (_confirmation_code_error).
+    user.pop("_confirmation_code", None)
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
@@ -4740,10 +4768,11 @@ def _confirm_forgot_password(data):
             )
         return _err
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
+    user.pop("_reset_code", None)
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()

@@ -459,6 +459,50 @@ def test_cognito_forgot_password_and_confirm(cognito_idp):
     )
     assert "AuthenticationResult" in auth
 
+
+def test_cognito_confirmation_codes_checked_under_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    pid, cid, _ = _password_client_with_users(call, "alice", "bob")
+    mismatch = ("CodeMismatchException", "Invalid verification code provided, please try again.")
+    expired = ("ExpiredCodeException", "Invalid code provided, please request a code again.")
+
+    call("SignUp", ClientId=cid, Username="carol", Password="Passw0rd!")
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="000000") == mismatch
+    assert call("AdminGetUser", UserPoolId=pid, Username="carol")["UserStatus"] == "UNCONFIRMED"
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="123456") == {}
+    call("AdminCreateUser", UserPoolId=pid, Username="dave", TemporaryPassword="Passw0rd!", MessageAction="SUPPRESS")
+    for name, status in (("carol", "CONFIRMED"), ("alice", "CONFIRMED"), ("dave", "FORCE_CHANGE_PASSWORD")):
+        assert call("ConfirmSignUp", ClientId=cid, Username=name, ConfirmationCode="123456") == (
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {status}")
+
+    def reset(name, code, password="Passw0rd!2"):
+        return call("ConfirmForgotPassword", ClientId=cid, Username=name, ConfirmationCode=code, Password=password)
+
+    def sign_in(name, password):
+        return call("InitiateAuth", ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                    AuthParameters={"USERNAME": name, "PASSWORD": password})
+
+    assert reset("alice", "654321") == expired
+    assert "AuthenticationResult" in sign_in("alice", "Passw0rd!")
+    call("ForgotPassword", ClientId=cid, Username="bob")
+    assert reset("bob", "000000") == mismatch
+    assert reset("bob", "000000", password="weak") == mismatch
+    assert "AuthenticationResult" in sign_in("bob", "Passw0rd!")
+    assert reset("bob", "654321") == {}
+    assert "AuthenticationResult" in sign_in("bob", "Passw0rd!2")
+    assert reset("bob", "654321") == expired
+
+
+def test_cognito_confirmation_codes_not_checked_without_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=False)
+    pid, cid, _ = _password_client_with_users(call, "alice")
+    call("SignUp", ClientId=cid, Username="carol", Password="Passw0rd!")
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="000000") == {}
+    assert call("AdminGetUser", UserPoolId=pid, Username="carol")["UserStatus"] == "CONFIRMED"
+    assert call("ConfirmForgotPassword", ClientId=cid, Username="alice", ConfirmationCode="000000",
+                Password="Passw0rd!2") == {}
+
+
 def test_cognito_admin_update_user_attributes(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="UpdateAttrPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(
@@ -10152,7 +10196,13 @@ def test_cognito_secret_hash_dispatch_prevents_side_effects(monkeypatch, action,
         if action in ("SignUp", "ConfirmForgotPassword"):
             payload["Password"] = "Changed1!"
         if action in ("ConfirmSignUp", "ConfirmForgotPassword"):
-            payload["ConfirmationCode"] = "123456"
+            payload["ConfirmationCode"] = "123456" if action == "ConfirmSignUp" else "654321"
+            # A user the code was issued to, so only the secret decides.
+            existing = mod._user_pools[pid]["_users"]["existing"]
+            if action == "ConfirmSignUp":
+                existing.update(UserStatus="UNCONFIRMED", _confirmation_code="123456")
+            else:
+                existing["_reset_code"] = "654321"
         hash_container, hash_key = payload, "SecretHash"
     if action.startswith("Admin"):
         payload["UserPoolId"] = pid
