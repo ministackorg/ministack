@@ -21128,6 +21128,53 @@ def test_cfn_update_logs_log_group_in_place(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
+def test_cfn_logs_log_group_removal_drops_api_metric_filters(cfn, logs, rename):
+    """A stack delete or a LogGroupName replacement drops the group's API metric filters."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-gone-{uid}"
+    group = f"/cfn/logs-gone-{uid}"
+    namespace = f"CfnGone{uid}"
+
+    def tpl(name):
+        return json.dumps({"Resources": {
+            "Group": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": name}},
+        }})
+
+    def described():
+        return [g for g in logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+                if g["logGroupName"] == group]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=tpl(group))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        logs.put_metric_filter(
+            logGroupName=group, filterName="api", filterPattern='"ERROR"',
+            metricTransformations=[{"metricNamespace": namespace, "metricName": "Errors", "metricValue": "1"}])
+
+        if rename:
+            cfn.update_stack(StackName=stack_name, TemplateBody=tpl(f"{group}-new"))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        else:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        assert described() == []
+        assert logs.describe_metric_filters(
+            metricNamespace=namespace, metricName="Errors")["metricFilters"] == []
+
+        logs.create_log_group(logGroupName=group)
+        assert described()[0]["metricFilterCount"] == 0
+        assert logs.describe_metric_filters(logGroupName=group)["metricFilters"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            logs.delete_log_group(logGroupName=group)
+        except ClientError:
+            pass
+
+
 def test_cfn_update_s3_bucket_policy_in_place(cfn, s3):
     """A bucket policy's document is rewritten in place on the same bucket."""
     suffix = _uuid_mod.uuid4().hex[:8]

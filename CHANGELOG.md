@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudFormation — `AWS::Logs::LogGroup` delete** — a stack delete or a `LogGroupName` replacement removed only the group record, so a metric filter or resource policy added through the Logs API stayed and came back with a new group of the same name; the group is now deleted through `DeleteLogGroup`. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
