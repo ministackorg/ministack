@@ -6984,6 +6984,34 @@ def test_iot_job_removed_timed_out_and_deleted_events():
     assert events[8][1]["targetSelection"] == "CONTINUOUS"
 
 
+def test_iot_job_execution_deleted_events():
+    async def calls(call):
+        for thing in ("ev-t1", "ev-t2"):
+            await call("POST", f"/things/{thing}")
+        await _create_job(call, "ev-del", ["ev-t1", "ev-t2"])
+        await call("POST", "/things/ev-t2/jobs/ev-del",
+                   {"status": "IN_PROGRESS", "statusDetails": {"p": "2"}}, device=True)
+        await call("DELETE", "/things/ev-t1/jobs/ev-del/executionNumber/1")
+        await call("DELETE", "/things/ev-t2/jobs/ev-del/executionNumber/1",
+                   query={"force": "true"})
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    assert [t for t, _e in events] == [
+        "$aws/events/jobExecution/ev-del/deleted",
+        "$aws/events/jobExecution/ev-del/deleted",
+        "$aws/events/job/ev-del/completed",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    deleted = {"eventType": "JOB_EXECUTION", "operation": "deleted", "jobId": "ev-del",
+               "status": "DELETED", "executionNumber": 1}
+    assert events[0][1] == {**deleted, "thingArn": f"{_JOB_ARN}:thing/ev-t1"}
+    assert events[1][1] == {**deleted, "thingArn": f"{_JOB_ARN}:thing/ev-t2",
+                            "statusDetails": {"p": "2"}}
+    assert events[2][1]["jobProcessDetails"] == _job_counts()
+
+
 @pytest.mark.parametrize("enable", [("JOB",), ("JOB_EXECUTION",), ()])
 def test_iot_job_events_follow_the_event_configuration(enable):
     async def calls(call):

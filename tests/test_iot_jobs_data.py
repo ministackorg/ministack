@@ -1401,6 +1401,210 @@ def test_iot_jobs_cancel_job_and_delete(iot_client, iot_jobs_data):
         _cleanup(iot_client, things=[thing])
 
 
+def test_iot_jobs_delete_job_execution(iot_client, iot_jobs_data):
+    """An IN_PROGRESS execution needs force; a deleted one leaves both planes and the counts."""
+    queued, running, failed = (_unique("jobs-thing") for _ in range(3))
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, t) for t in (queued, running, failed)]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT)
+        _drive(iot_jobs_data, running, job_id, "IN_PROGRESS")
+        _drive(iot_jobs_data, failed, job_id, "FAILED")
+
+        def refused(**kwargs):
+            with pytest.raises(ClientError) as ei:
+                iot_client.delete_job_execution(
+                    **{"jobId": job_id, "executionNumber": 1, **kwargs}
+                )
+            response = ei.value.response
+            return (
+                response["ResponseMetadata"]["HTTPStatusCode"],
+                response["Error"]["Code"],
+                response["Error"]["Message"],
+            )
+
+        assert refused(thingName=running) == (
+            409, "InvalidStateTransitionException",
+            f"Job execution for thing {running} within job {job_id} in status "
+            "IN_PROGRESS cannot be deleted without force flag.",
+        )
+        assert refused(thingName=running, force=False)[:2] == (
+            409, "InvalidStateTransitionException",
+        )
+        assert refused(thingName=failed, executionNumber=2) == (
+            404, "ResourceNotFoundException",
+            f"Job execution for thing {failed} cannot be found within job {job_id}.",
+        )
+        assert refused(thingName=failed, executionNumber=0) == (
+            400, "InvalidRequestException", "Execution number is invalid.",
+        )
+        assert refused(thingName=failed, jobId="no-such-job") == (
+            404, "ResourceNotFoundException",
+            "Job execution cannot be found as the Job no-such-job does not exist.",
+        )
+        status, body = _raw(
+            _IOT_AUTH, "DELETE", f"/things/{failed}/jobs/{job_id}/executionNumber/x"
+        )
+        assert (status, body["__type"]) == (400, "SerializationException")
+
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=queued, executionNumber=1
+        )
+        assert refused(thingName=queued, force=True)[0] == 404
+        assert _executions_for(iot_client, queued, job_id) == []
+        assert (
+            iot_jobs_data.get_pending_job_executions(thingName=queued)["queuedJobs"]
+            == []
+        )
+
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=running, executionNumber=1, force=True
+        )
+        for call in (
+            lambda: iot_jobs_data.describe_job_execution(
+                jobId=job_id, thingName=running
+            ),
+            lambda: iot_jobs_data.update_job_execution(
+                jobId=job_id, thingName=running, status="SUCCEEDED"
+            ),
+        ):
+            with pytest.raises(ClientError) as ei:
+                call()
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "COMPLETED"
+        details = job["jobProcessDetails"]
+        assert (
+            details["numberOfQueuedThings"],
+            details["numberOfInProgressThings"],
+            details["numberOfFailedThings"],
+        ) == (0, 0, 1)
+
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=failed, executionNumber=1
+        )
+        details = iot_client.describe_job(jobId=job_id)["job"]["jobProcessDetails"]
+        assert details["numberOfFailedThings"] == 0
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[queued, running, failed])
+
+
+def test_iot_jobs_delete_continuous_job_executions(iot_client, iot_jobs_data):
+    """A thing's older or newer execution goes; one left with none gets REMOVED 1 on leaving."""
+    group, other = _unique("jobs-group"), _unique("jobs-other")
+    job_id = _unique("job-cont")
+    emptied, kept = _unique("jobs-emptied"), _unique("jobs-kept")
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        for thing in (emptied, kept):
+            _create_thing(iot_client, thing)
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+            _drive(iot_jobs_data, thing, job_id, "SUCCEEDED")
+            iot_client.remove_thing_from_thing_group(
+                thingGroupName=group, thingName=thing
+            )
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+            assert _executions_for(iot_client, thing, job_id) == [
+                (2, "QUEUED"), (1, "SUCCEEDED"),
+            ]
+
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=emptied, executionNumber=1
+        )
+        assert _executions_for(iot_client, emptied, job_id) == [(2, "QUEUED")]
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=emptied, executionNumber=2
+        )
+        iot_client.delete_job_execution(jobId=job_id, thingName=kept, executionNumber=2)
+        assert _executions_for(iot_client, kept, job_id) == [(1, "SUCCEEDED")]
+        execution = iot_client.describe_job_execution(jobId=job_id, thingName=kept)
+        assert execution["execution"]["executionNumber"] == 1
+        pending = iot_jobs_data.get_pending_job_executions(thingName=emptied)
+        assert (pending["inProgressJobs"], pending["queuedJobs"]) == ([], [])
+        assert _executions_for(iot_client, emptied, job_id) == []
+
+        for thing in (emptied, kept):
+            iot_client.remove_thing_from_thing_group(
+                thingGroupName=group, thingName=thing
+            )
+        assert _executions_for(iot_client, emptied, job_id) == [(1, "REMOVED")]
+        assert _executions_for(iot_client, kept, job_id) == [(1, "SUCCEEDED")]
+        for thing in (emptied, kept):
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        assert _executions_for(iot_client, emptied, job_id) == [
+            (2, "QUEUED"), (1, "REMOVED"),
+        ]
+        assert _executions_for(iot_client, kept, job_id) == [
+            (2, "QUEUED"), (1, "SUCCEEDED"),
+        ]
+
+        # Leaving a group the job does not target adds nothing, and neither
+        # does a removal from a group the thing is not in, also for a later
+        # thing of the same name.
+        iot_client.create_thing_group(thingGroupName=other)
+        iot_client.add_thing_to_thing_group(thingGroupName=other, thingName=emptied)
+        for number in (2, 1):
+            iot_client.delete_job_execution(
+                jobId=job_id, thingName=emptied, executionNumber=number
+            )
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=emptied)
+        assert _executions_for(iot_client, emptied, job_id) == [(1, "REMOVED")]
+        iot_client.delete_job_execution(
+            jobId=job_id, thingName=emptied, executionNumber=1
+        )
+        iot_client.remove_thing_from_thing_group(thingGroupName=other, thingName=emptied)
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=emptied)
+        assert _executions_for(iot_client, emptied, job_id) == []
+        iot_client.delete_thing(thingName=emptied)
+        _create_thing(iot_client, emptied)
+        iot_client.add_thing_to_thing_group(thingGroupName=other, thingName=emptied)
+        iot_client.remove_thing_from_thing_group(thingGroupName=other, thingName=emptied)
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=emptied)
+        assert _executions_for(iot_client, emptied, job_id) == []
+    finally:
+        _cleanup(
+            iot_client, jobs=[job_id], things=[emptied, kept], groups=[group, other]
+        )
+
+
+def test_iot_jobs_deleted_continuous_executions_survive_persistence():
+    """A thing whose CONTINUOUS executions were all deleted gets none back after a restore."""
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    try:
+        with request_scope("123456789012", "us-east-1"):
+            iot_module._things["t1"] = {"thingName": "t1"}
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "targets": [iot_module._thing_arn("t1")],
+                "targetSelection": "CONTINUOUS", "status": "IN_PROGRESS",
+                "document": "{}",
+            }
+            assert [e["jobId"] for e in iot_module.jobs_pending_for_thing("t1")] == [
+                "j1"
+            ]
+            status, _, _ = asyncio.run(
+                iot_module._delete_job_execution("t1", "j1", "1", {})
+            )
+            assert status == 200
+            state = iot_module.get_state()
+            iot_module.reset()
+            iot_module.load_persisted_state(state)
+            assert iot_module.jobs_pending_for_thing("t1") == []
+            assert ("t1", "j1") not in iot_module._job_executions
+    finally:
+        iot_module.reset()
+
+
 # ---------------------------------------------------------------------------
 # UpdateJob
 # ---------------------------------------------------------------------------
@@ -2605,6 +2809,43 @@ def test_jobs_mqtt_rejoining_continuous_job_group_notifies(
         }
     finally:
         _cleanup(iot_client, jobs=[job_id], things=[thing], groups=[group])
+
+
+def test_jobs_mqtt_deleting_a_pending_execution_notifies(
+    iot_client, iot_data_client, iot_jobs_data
+):
+    """Deleting a QUEUED execution publishes notify and notify-next; a finished one neither."""
+    thing = _unique("jobs-mqtt-del")
+    done_job, job_id = _unique("job-done"), _unique("job")
+    base = f"$aws/things/{thing}/jobs"
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=done_job, targets=[thing_arn], document=_DOCUMENT)
+        _drive(iot_jobs_data, thing, done_job, "SUCCEEDED")
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.delete_job_execution(
+                jobId=job_id, thingName=thing, executionNumber=1
+            ),
+            want=2,
+        )
+        frames = _frames_by_topic(received)
+        assert frames[f"{base}/notify"]["jobs"] == {}
+        assert set(frames[f"{base}/notify-next"]) == {"timestamp"}
+
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.delete_job_execution(
+                jobId=done_job, thingName=thing, executionNumber=1
+            ),
+            want=1,
+            timeout=2.0,
+        )
+        assert received == []
+    finally:
+        _cleanup(iot_client, jobs=[done_job, job_id], things=[thing])
 
 
 def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):
