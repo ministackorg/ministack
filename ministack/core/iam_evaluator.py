@@ -3,11 +3,12 @@
 """IAM policy evaluation engine.
 
 Implements the AWS IAM policy evaluation algorithm (single-account,
-no SCPs/session policies) behind the AUTH=true flag.
+no SCPs) behind the AUTH=true flag.
 
 Evaluation order:
-  1. Explicit Deny in any applicable policy or permissions boundary → DENY
-  2. Explicit Allow in an identity policy, also allowed by the boundary → ALLOW
+  1. Explicit Deny in any applicable policy, boundary or session policy → DENY
+  2. Explicit Allow in an identity policy, also allowed by the boundary
+     and the session policies → ALLOW
   3. No matching Allow → implicit DENY
 """
 
@@ -47,7 +48,7 @@ class ParsedStatement:
 @dataclass
 class EvalContext:
     principal_arn: str
-    principal_type: str  # "User", "AssumedRole", "Root"
+    principal_type: str  # "User", "AssumedRole", "FederatedUser", "Root"
     principal_account: str
     action: str  # "s3:PutObject"
     resource_arn: str  # "*" until per-service resource ARN construction
@@ -71,7 +72,7 @@ class EvalResult:
 @dataclass
 class PrincipalInfo:
     arn: str
-    type: str  # "User", "AssumedRole", "Root"
+    type: str  # "User", "AssumedRole", "FederatedUser", "Root"
     account: str
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
     keys: dict[str, Any] = field(default_factory=dict)
@@ -585,7 +586,7 @@ def evaluate(ctx: EvalContext,
     """Evaluate all policies against a request context.
 
     ``policies`` is a list of parsed-statement lists (one per policy document).
-    Each of ``limits`` (a permissions boundary) has the same shape: a Deny in
+    Each of ``limits`` (a permissions boundary, the session policies) has the same shape: a Deny in
     it denies, and an Allow in ``policies`` counts only if every limit allows.
     Returns Allow, Deny, or ImplicitDeny.
     """
@@ -794,6 +795,17 @@ def _permissions_boundary(store, name: str,
         return []
     doc = _resolve_managed_policy_document(arn, account_id)
     return [[parse_policy_document(doc) if doc else []]]
+
+
+def _session_policy_limits(session: dict,
+                           account_id: str) -> list[list[list[ParsedStatement]]]:
+    """The evaluation limits the session policies of an STS session set."""
+    passed = session.get("SessionPolicies")
+    if passed is None:
+        return []
+    docs = [passed["Policy"]] if passed.get("Policy") else []
+    docs += [_resolve_managed_policy_document(arn, account_id) for arn in passed.get("PolicyArns", [])]
+    return [[parse_policy_document(doc) for doc in docs if doc]]
 
 
 def _resolve_managed_policy_document(policy_arn: str,
@@ -1093,10 +1105,12 @@ def resolve_principal(access_key_id: str,
 
     account_id = _account_from_sts_session(access_key_id) or account_id
     from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
 
     credential = resolve_credential(access_key_id, account_id)
     if isinstance(credential, CredentialResolutionError):
         return AuthError(credential.code, credential.message)
+    session = sts_svc._sessions.get(access_key_id) or {}
     limits = []
     if credential.principal_type == "Root":
         policies = None
@@ -1107,11 +1121,21 @@ def resolve_principal(access_key_id: str,
         role_name = _role_name_from_assumed_arn(credential.principal_arn)
         policies = _gather_role_policies(role_name, account_id)
         limits = _permissions_boundary(iam_svc._roles, role_name, account_id)
+    elif credential.principal_type == "FederatedUser":
+        user_name = session.get("PrincipalName")
+        if user_name:
+            policies = _gather_user_policies(user_name, account_id)
+            limits = _permissions_boundary(iam_svc._users, user_name, account_id)
+        else:
+            # Federated by the account root, which holds every permission.
+            policies = [parse_policy_document({"Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}})]
     else:
         return AuthError(
             "UnrecognizedClientException",
             "The security token included in the request is invalid.",
         )
+    if policies is not None:
+        limits += _session_policy_limits(session, account_id)
     return PrincipalInfo(
         arn=credential.principal_arn,
         type=credential.principal_type,

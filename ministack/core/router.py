@@ -978,6 +978,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "GetCallerIdentity": "sts",
             "AssumeRole": "sts",
             "GetSessionToken": "sts",
+            "GetFederationToken": "sts",
             "AssumeRoleWithWebIdentity": "sts",
             "AssumeRoleWithSAML": "sts",
             # CloudWatch actions

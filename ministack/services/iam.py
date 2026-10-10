@@ -203,6 +203,13 @@ def _policy_exists(arn: str) -> bool:
     return _lookup_policy(arn) is not None
 
 
+def policy_known(arn: str, account_id: str | None = None) -> bool:
+    """Whether ``arn`` names a known AWS managed policy or one stored in ``account_id`` (default: the caller's)."""
+    if _is_aws_managed_arn(arn) or account_id is None:
+        return _lookup_policy(arn) is not None
+    return _policies.get_scoped(account_id, None, arn) is not None
+
+
 def _seed_aws_managed_policies() -> None:
     """Seed the global AWS-managed policy store with the canonical
     documents for the most commonly referenced AWS-managed policies.

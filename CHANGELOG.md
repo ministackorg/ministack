@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **STS — session policies and `GetFederationToken`** — `AssumeRole` ignored `Policy` and `PolicyArns` and `GetFederationToken` answered `InvalidAction`; under `AUTH=true` a role session now gets only what both the role and its session policies allow, a `Deny` in them denies, and `AssumeRole` rejects a malformed policy with `MalformedPolicyDocument` and an unknown policy ARN with `ValidationError`. `GetFederationToken` is added: its federated user gets the calling user's permissions within the session policies (none without one) and its `Tags`, not the user's tags, as `aws:PrincipalTag/*`; it checks its `Name`, policies and tags, and under `AUTH=true` a temporary caller answers `AccessDenied`. Contributed by @iot-rocket.
 - **IAM — permissions boundaries are enforced** — the boundaries of users and roles were stored and never applied; under `AUTH=true` a boundary now limits what the identity policies allow and a `Deny` in it denies, a boundary must name a known managed policy (`ValidationError` for a malformed ARN, CloudFormation `AWS::IAM::User` included), deleting an absent boundary answers `NoSuchEntity`, and a policy in use as a boundary cannot be deleted. `ListUsers` and `ListRoles` leave the boundary out, `ListEntitiesForPolicy` lists boundary users and roles and honours `PolicyUsageFilter`, and a managed policy reports `PermissionsBoundaryUsageCount`. Contributed by @iot-rocket.
 
 ### Fixed

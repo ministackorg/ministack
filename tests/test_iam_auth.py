@@ -1152,7 +1152,8 @@ def boundary_principals():
         "UserName": "probe-user", "AccessKeyId": "AKIATESTBOUNDARY01",
         "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
     }
-    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument="{}")
+    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
     _iam_call("PutRolePolicy", RoleName="probe-role", PolicyName="identity",
               PolicyDocument=json.dumps(_IDENTITY))
     sts_svc._sessions["ASIATESTBOUNDARY01"] = {
@@ -1202,6 +1203,88 @@ class TestPermissionsBoundary:
             iam_svc._access_keys.pop("AKIATESTBOUNDARY02", None)
             iam_svc._user_inline_policies.pop("probe-user-2", None)
             iam_svc._users.pop("probe-user-2", None)
+
+
+def _sts_key(access_key, **params):
+    """Call STS in-process as ``access_key`` and return the issued access key."""
+    import re
+    from urllib.parse import urlencode
+
+    from ministack.services import sts as sts_svc
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/20260930/us-east-1/sts/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    body = urlencode({"Version": "2011-06-15", **params}).encode()
+    status, _headers, payload = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+    assert status == 200, payload
+    return re.search(r"<AccessKeyId>(.*?)</AccessKeyId>", payload.decode()).group(1)
+
+
+def _allow(*actions, deny=None):
+    stmts = [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]
+    if deny:
+        stmts.append({"Effect": "Deny", "Action": deny, "Resource": "*"})
+    return json.dumps({"Version": "2012-10-17", "Statement": stmts})
+
+
+@pytest.fixture
+def issued_sessions():
+    from ministack.services import sts as sts_svc
+    before = set(sts_svc._sessions)
+    yield
+    for key in set(sts_svc._sessions) - before:
+        sts_svc._sessions.pop(key, None)
+
+
+class TestSessionPolicies:
+    """Session policies narrow a session to what both allow; a federated user without one gets nothing."""
+
+    def _assume(self, **params):
+        return _sts_key("test", Action="AssumeRole", RoleSessionName="s",
+                        RoleArn="arn:aws:iam::000000000000:role/probe-role", **params)
+
+    def test_session_policy_limits_the_role(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        logs = "arn:aws:iam::000000000000:policy/probe-logs"
+        iam_svc.store_policy(logs, "probe-logs", "/", _allow("logs:DescribeLogGroups"))
+        try:
+            assert _allowed(self._assume()) == "SDL"
+            assert _allowed(self._assume(Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))) == "S"
+            assert _allowed(self._assume(**{"PolicyArns.member.1.arn": logs})) == "L"
+            assert _allowed(self._assume(Policy=_allow("*", deny="dynamodb:ListTables"))) == "SL"
+        finally:
+            iam_svc._policies.pop(logs, None)
+
+    def test_session_policy_and_boundary_both_limit(self, boundary_principals, issued_sessions):
+        _iam_call("PutRolePermissionsBoundary", RoleName="probe-role",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(self._assume(Policy=_allow("dynamodb:ListTables", "logs:DescribeLogGroups"))) == ""
+        assert _allowed(self._assume(Policy=_allow("*"))) == "S"
+
+    def test_federated_user_is_limited_by_user_and_session_policies(self, boundary_principals, issued_sessions):
+        user = boundary_principals["user"]
+        fed = _sts_key(user, Action="GetFederationToken", Name="fed",
+                       Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))
+        assert _allowed(fed) == "S"
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed")) == ""
+        _iam_call("PutUserPermissionsBoundary", UserName="probe-user",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed", Policy=_allow("*"))) == "S"
+
+    def test_federated_user_principal_tags_are_the_session_tags(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        iam_svc._users["probe-user"]["Tags"] = [{"Key": "team", "Value": "blue"}, {"Key": "env", "Value": "dev"}]
+        fed = _sts_key(boundary_principals["user"], Action="GetFederationToken", Name="fed", Policy=_allow("*"),
+                       **{"Tags.member.1.Key": "TEAM", "Tags.member.1.Value": "green"})
+        keys = resolve_principal(fed, "000000000000").keys
+        assert keys["aws:principaltag/team"] == "green" and "aws:principaltag/env" not in keys
+        assert keys["aws:userid"] == "000000000000:fed" and "aws:username" not in keys
+
+    def test_root_federation_is_limited_by_the_session_policy(self, issued_sessions):
+        fed = _sts_key("test", Action="GetFederationToken", Name="fed", Policy=_allow("sqs:ListQueues"))
+        assert _allowed(fed) == "S"
+        assert resolve_principal(fed, "000000000000").arn == "arn:aws:sts::000000000000:federated-user/fed"
 
 
 class TestCustomerManagedPolicyResolution:

@@ -5,7 +5,7 @@ STS Service Emulator (AWS-compatible).
 
 Actions:
   GetCallerIdentity, AssumeRole, AssumeRoleWithWebIdentity,
-  GetSessionToken, GetAccessKeyInfo, GetWebIdentityToken.
+  GetSessionToken, GetFederationToken, GetAccessKeyInfo, GetWebIdentityToken.
 """
 
 import base64
@@ -27,6 +27,7 @@ from ministack.core.iam_evaluator import (
     find_iam_access_key_account,
     is_root_access_key,
     resolve_credential,
+    validate_policy_document,
 )
 from ministack.core.responses import (
     _account_from_sts_session,
@@ -49,6 +50,7 @@ from ministack.services.iam import (
     _gen_session_token,
     _p,
     _xml,
+    policy_known,
 )
 
 _sessions: dict[str, dict] = {}
@@ -209,6 +211,54 @@ def _session_tags(params: dict, check=True):
     return tags, None
 
 
+def _session_policies(params, account_id=None, check=True):
+    """Policy and PolicyArns of a request, or with *check* its validation error (ARNs must be in ``account_id``)."""
+    policy = _p(params, "Policy")
+    arns = [a.get("arn", "") for a in params.get("PolicyArns", []) if isinstance(a, dict)]
+    while arn := _p(params, f"PolicyArns.member.{len(arns) + 1}.arn"):
+        arns.append(arn)
+    if not check:
+        return {"Policy": policy, "PolicyArns": arns}, None
+    if len(policy) > 2048:
+        return None, _error(400, "ValidationError",
+                            f"1 validation error detected: Value '{escape(policy)}' at 'policy' failed to satisfy "
+                            "constraint: Member must have length less than or equal to 2048", ns="sts")
+    malformed = policy and validate_policy_document(policy)
+    if malformed:
+        return None, _error(400, "MalformedPolicyDocument", escape(malformed), ns="sts")
+    if not all(policy_known(arn, account_id) for arn in arns):
+        return None, _error(400, "ValidationError",
+                            "At least one Policy ARN in the PolicyArns parameter does not match "
+                            "an existing IAM Managed Policy ARN.", ns="sts")
+    return {"Policy": policy, "PolicyArns": arns}, None
+
+
+def _federated_name_error(name):
+    """ValidationError unless ``name`` is a valid GetFederationToken Name."""
+    if name is None:
+        constraint = "Member must not be null"
+    elif len(name) < 2:
+        constraint = "Member must have length greater than or equal to 2"
+    elif len(name) > 32:
+        constraint = "Member must have length less than or equal to 32"
+    elif not re.fullmatch(r"[\w+=,.@-]*", name, re.ASCII):
+        constraint = "Member must satisfy regular expression pattern: [\\w+=,.@-]*"
+    else:
+        return None
+    value = "null" if name is None else f"'{escape(name)}'"
+    return _error(400, "ValidationError",
+                  f"1 validation error detected: Value {value} at 'name' failed to satisfy constraint: {constraint}",
+                  ns="sts")
+
+
+def _session_caller_refused(caller, action):
+    """AccessDenied for temporary credentials under AUTH, or None."""
+    from ministack.app import AUTH
+    if AUTH and caller["isTemporary"]:
+        return _error(403, "AccessDenied", f"Cannot call {action} with session credentials", ns="sts")
+    return None
+
+
 def _invalid_role_arn(role_arn: str):
     return _error(400, "ValidationError", f"Invalid RoleArn: {role_arn}", ns="sts")
 
@@ -314,6 +364,9 @@ async def handle_request(method, path, headers, body, query_params):
         session_tags, validation_error = _session_tags(params, check=AUTH)
         if validation_error:
             return validation_error
+        session_policies, validation_error = _session_policies(params, role_arn.split(":")[4], check=AUTH)
+        if validation_error:
+            return validation_error
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
@@ -393,6 +446,7 @@ async def handle_request(method, path, headers, body, query_params):
             "SourceAccessKeyId": caller["accessKey"],
             "SourcePrincipalArn": caller["userArn"],
             "SessionTags": session_tags,
+            "SessionPolicies": session_policies if any(session_policies.values()) else None,
         })
         if use_json:
             return json_response({
@@ -477,14 +531,9 @@ async def handle_request(method, path, headers, body, query_params):
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
-        from ministack.app import AUTH
-        if AUTH and caller["isTemporary"]:
-            return _error(
-                403,
-                "AccessDenied",
-                "Cannot call GetSessionToken with session credentials",
-                ns="sts",
-            )
+        refused = _session_caller_refused(caller, action)
+        if refused:
+            return refused
         register_session(access_key, {
             "Arn": caller["userArn"],
             "UserId": caller["userId"],
@@ -510,6 +559,66 @@ async def handle_request(method, path, headers, body, query_params):
                     f"<Expiration>{expiration}</Expiration>"
                     f"</Credentials>"
                     f"</GetSessionTokenResult>",
+                    ns="sts")
+
+    if action == "GetFederationToken":
+        name = _p(params, "Name", None)
+        validation_error = _federated_name_error(name)
+        if validation_error:
+            return validation_error
+        session_tags, validation_error = _session_tags(params)
+        if validation_error:
+            return validation_error
+        session_policies, validation_error = _session_policies(params)
+        if validation_error:
+            return validation_error
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
+        refused = _session_caller_refused(caller, action)
+        if refused:
+            return refused
+        duration = int(_p(params, "DurationSeconds") or 43200)
+        access_key = _gen_session_access_key()
+        secret_key = _gen_secret()
+        session_token = _gen_session_token()
+        federated_arn = f"arn:aws:sts::{caller['accountId']}:federated-user/{name}"
+        federated_id = f"{caller['accountId']}:{name}"
+        register_session(access_key, {
+            "Arn": federated_arn,
+            "UserId": federated_id,
+            "SecretAccessKey": secret_key,
+            "SessionToken": session_token,
+            "Expiration": time.time() + duration,
+            "AccountId": caller["accountId"],
+            "PrincipalType": "FederatedUser",
+            "PrincipalName": caller["principalName"],
+            "SourceAccessKeyId": caller["accessKey"],
+            "SourcePrincipalArn": caller["userArn"],
+            "SessionTags": session_tags,
+            "SessionPolicies": session_policies,
+        })
+        if use_json:
+            return json_response({
+                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key,
+                                "SessionToken": session_token, "Expiration": int(time.time() + duration)},
+                "FederatedUser": {"FederatedUserId": federated_id, "Arn": federated_arn},
+                "PackedPolicySize": 0,
+            })
+        return _xml(200, "GetFederationTokenResponse",
+                    f"<GetFederationTokenResult>"
+                    f"<Credentials>"
+                    f"<AccessKeyId>{access_key}</AccessKeyId>"
+                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
+                    f"<SessionToken>{session_token}</SessionToken>"
+                    f"<Expiration>{_future(duration)}</Expiration>"
+                    f"</Credentials>"
+                    f"<FederatedUser>"
+                    f"<FederatedUserId>{federated_id}</FederatedUserId>"
+                    f"<Arn>{federated_arn}</Arn>"
+                    f"</FederatedUser>"
+                    f"<PackedPolicySize>0</PackedPolicySize>"
+                    f"</GetFederationTokenResult>",
                     ns="sts")
 
     if action == "GetAccessKeyInfo":
