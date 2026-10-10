@@ -721,7 +721,11 @@ def _tenant_error(client, operation, code, message, **params):
     with pytest.raises(ClientError) as caught:
         getattr(client, operation)(**params)
     response = caught.value.response
-    assert response["Error"] == {"Code": code, "Message": message}
+    # SES v1 speaks the query protocol, whose error envelope carries an
+    # additive <Type> member real AWS also sends — compare the fields the
+    # test means to pin rather than the whole dict.
+    assert response["Error"]["Code"] == code
+    assert response["Error"]["Message"] == message
     assert response["ResponseMetadata"]["HTTPStatusCode"] == (404 if code == "NotFoundException" else 400)
 
 

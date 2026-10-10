@@ -79,9 +79,14 @@ def test_sns_topics_are_region_scoped_by_name(sns):
     assert west_arn in west_arns
     assert east_arn not in west_arns
 
+    # Real AWS evaluates authorization before existence on
+    # GetTopicAttributes: a topic arn that does not exist in this region
+    # answers InvalidClientTokenId/403, not NotFound/404 (real-AWS
+    # capture).
     with pytest.raises(ClientError) as exc:
         sns.get_topic_attributes(TopicArn=west_arn)
-    assert exc.value.response["Error"]["Code"] == "NotFound"
+    assert exc.value.response["Error"]["Code"] == "InvalidClientTokenId"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
 
 
 def test_sns_set_topic_attributes(sns):

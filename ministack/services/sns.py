@@ -124,15 +124,20 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
                   f"{iam_action} on resource: {topic_arn}", 403)
 
 
-def _get_topic(topic_arn: str, action: str | None = None):
+def _get_topic(topic_arn: str, action: str | None = None, *,
+               not_found_error=None):
     """Resolve a topic by ARN, enforcing its Policy when *action* is given.
 
     Returns ``(topic, None)`` on success or ``(None, error_tuple)`` with a
     ``NotFound`` (404) or ``AuthorizationError`` (403) response.
+    ``not_found_error`` overrides the NotFound response for the APIs where
+    real AWS evaluates authorization before existence.
     """
     arn = _normalize_arn(topic_arn)
     topic = _topic_by_arn_any_scope(arn)
     if topic is None:
+        if not_found_error is not None:
+            return None, not_found_error
         return None, _error("NotFound", f"Topic does not exist: {arn}", 404)
     if action is not None:
         denied = _enforce_topic_policy(topic, action)
@@ -484,7 +489,16 @@ def _list_topics(params):
 
 
 def _get_topic_attributes(params):
-    topic, err = _get_topic(_p(params, "TopicArn"), "sns:GetTopicAttributes")
+    # Real AWS evaluates authorization before existence on this API:
+    # GetTopicAttributes on a nonexistent topic answers
+    # InvalidClientTokenId at 403, not NotFound/404 (real AWS wire
+    # capture). Neighboring topic APIs were not captured, so they keep
+    # their existing NotFound/404 ordering.
+    topic, err = _get_topic(
+        _p(params, "TopicArn"), "sns:GetTopicAttributes",
+        not_found_error=_error(
+            "InvalidClientTokenId",
+            "The security token included in the request is invalid.", 403))
     if err is not None:
         return err
     _refresh_subscription_counts(topic)
@@ -1671,9 +1685,10 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> and no <?xml?> declaration.
     error_type = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">'
         f'<Error><Type>{error_type}</Type><Code>{code}</Code><Message>{_xml_escape(message)}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'

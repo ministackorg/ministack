@@ -1917,9 +1917,10 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         return 403, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "query-xml":
+        # Query-protocol error envelopes carry no <?xml?> declaration on
+        # the real AWS wire (17-region capture sweep, 0/85 declarations).
         ns = _QUERY_XML_NS.get(service, "https://iam.amazonaws.com/doc/2010-05-08/")
         body = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<ErrorResponse xmlns="{ns}">'
             f"<Error><Type>Sender</Type><Code>{_esc_code}</Code>"
             f"<Message>{_esc_msg}</Message></Error>"
