@@ -11584,7 +11584,10 @@ def _docdb_instance_create(logical_id, props, stack_name):
         **_ec_query({k: props[k] for k in _DOCDB_INSTANCE_PROPS if props.get(k) not in (None, "")}),
         **_ec_query({"Tags": props.get("Tags") or []}),
     }, "AWS::DocDB::DBInstance", "create")
-    return db_id, _docdb_instance_attrs(_docdb._instances[db_id])
+    instance = _ec_wait_available(_docdb._instances, db_id, "DBInstanceStatus", "AWS::DocDB::DBInstance")
+    if instance.get("DBInstanceStatus") == "failed":
+        raise ValueError(f"AWS::DocDB::DBInstance {db_id} failed to start")
+    return db_id, _docdb_instance_attrs(instance)
 
 
 def _docdb_instance_update(physical_id, old_props, new_props, stack_name, logical_id=None):

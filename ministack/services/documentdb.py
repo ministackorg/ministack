@@ -19,7 +19,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
-from ministack.core.concurrency import run_offloop
+from ministack.core.concurrency import run_offloop, spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -1015,18 +1015,38 @@ def _create_db_instance(params):
         instance["TagList"] = req_tags
 
     if cluster:
+        _register_instance_in_cluster(instance)
+    if _get_docker():
+        # AWS returns at once with "creating"; the image pull and container start run behind it.
+        instance["DBInstanceStatus"] = "creating"
+        spawn_background(_provision_instance, db_id, instance, cluster,
+                         thread_name=f"ministack-docdb-create-{db_id}")
+    elif cluster:
         _ensure_cluster_compute(cluster)
         _attach_instance_to_shared_cluster(instance, cluster)
-        _register_instance_in_cluster(instance)
-        _log_readiness_async(
-            cluster.get("_shared_internal_address") or "127.0.0.1",
-            (cluster.get("_shared_endpoint") or {}).get("Port") or port,
-            f"cluster {cluster['DBClusterIdentifier']}",
-        )
-    else:
-        _start_instance_container(db_id, instance)
 
     return _single_instance_response("CreateDBInstanceResponse", "CreateDBInstanceResult", instance)
+
+
+def _provision_instance(db_id, instance, cluster):
+    """Start a new instance's compute and publish its status once it accepts connections."""
+    if cluster:
+        _ensure_cluster_compute(cluster)
+        _attach_instance_to_shared_cluster(instance, cluster)
+        container_id = cluster.get("_shared_container_id")
+        host = cluster.get("_shared_internal_address") or "127.0.0.1"
+        port = cluster.get("_shared_internal_port") or cluster.get("_shared_host_port")
+    else:
+        _start_instance_container(db_id, instance)
+        container_id = instance.get("_docker_container_id")
+        host = instance.get("_internal_address") or "127.0.0.1"
+        port = instance.get("_internal_port") or instance.get("_host_port")
+    ok = bool(container_id) and _wait_for_port(host, int(port or 0))
+    if _instances.get(db_id) is not instance:
+        return
+    if cluster and ok:
+        cluster["_shared_container_ready"] = True
+    instance["DBInstanceStatus"] = "available" if ok else "failed"
 
 
 def _ensure_cluster_compute(cluster):
@@ -1076,23 +1096,6 @@ def _start_instance_container(db_id, instance):
         "_host_port": host_port,
         "Endpoint": {"Address": ep_addr, "Port": ep_port, "HostedZoneId": "Z2R2ITUGPM61AM"},
     })
-    _log_readiness_async(
-        internal_addr or "127.0.0.1", internal_port or host_port, f"instance {db_id}")
-
-
-def _log_readiness_async(host, port, label):
-    """Spawn a daemon thread that waits for the port and logs readiness."""
-    def _bg_wait(h=host, p=int(port or 0), lbl=label):
-        if not p:
-            return
-        if _wait_for_port(h, p):
-            logger.info("docdb: DocumentDB container for %s ready at %s:%s", lbl, h, p)
-        else:
-            logger.warning(
-                "docdb: DocumentDB container for %s at %s:%s not ready after timeout",
-                lbl, h, p)
-
-    threading.Thread(target=_bg_wait, daemon=True).start()
 
 
 def _delete_db_instance(params):
