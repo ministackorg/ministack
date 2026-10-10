@@ -1477,32 +1477,42 @@ def _start_db_cluster(params):
                     f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
                     f"</DBCluster></StartDBClusterResult>")
 
-    if had_compute:
-        result = _restart_cluster_shared_container(cluster_id, cluster)
+    # AWS returns at once with "starting"; the container restart runs behind it.
+    cluster["Status"] = "starting"
+    for member in members:
+        member["DBInstanceStatus"] = "starting"
+    spawn_background(_start_cluster_compute, cluster_id, cluster, members, had_compute,
+                     thread_name=f"ministack-docdb-start-{cluster_id}")
+    return _xml(200, "StartDBClusterResponse",
+                f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
+                f"</DBCluster></StartDBClusterResult>")
+
+
+def _start_cluster_compute(cluster_id, cluster, members, had_compute):
+    """Bring a started cluster's container back and publish the resulting status."""
+    with _shared_container_lock:
+        result = {"failed": True}
+        if had_compute:
+            result = _restart_cluster_shared_container(cluster_id, cluster)
         if result.get("failed"):
             result = _start_cluster_shared_container(cluster_id, cluster, remove_stale=True)
-    else:
-        result = _start_cluster_shared_container(cluster_id, cluster, remove_stale=True)
-
-    if not result.get("started") and result.get("failed"):
-        # Compute did not come back; keep everything stopped so Start can retry.
-        return _error(
-            "InternalFailure", f"Failed to start compute for DB cluster {cluster_id}.", 500)
-
     if result.get("started"):
-        readiness_host = result.get("readiness_host") or "127.0.0.1"
         readiness_port = result.get("readiness_port")
-        ok = _wait_for_port(readiness_host, readiness_port) if readiness_port else True
+        ok = _wait_for_port(result.get("readiness_host") or "127.0.0.1",
+                            readiness_port) if readiness_port else True
         status = "available" if ok else "failed"
+    elif result.get("failed"):
+        # Compute did not come back; leave the cluster stopped so Start can retry.
+        logger.warning("docdb: failed to start compute for cluster %s", cluster_id)
+        status = "stopped"
     else:
         status = "available"
+    if _clusters.get(cluster_id) is not cluster:
+        return
     cluster["_shared_container_ready"] = status == "available"
     cluster["Status"] = status
     for member in members:
         member["DBInstanceStatus"] = status
-    return _xml(200, "StartDBClusterResponse",
-                f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
-                f"</DBCluster></StartDBClusterResult>")
 
 
 def _stop_db_cluster(params):
