@@ -734,6 +734,7 @@ _CUSTOM_NAME_REPLACEMENT = {
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
     "AWS::IAM::Role": {"name": "RoleName"},
+    "AWS::IAM::User": {"name": "UserName"},
     "AWS::IAM::ManagedPolicy": {
         "name": "ManagedPolicyName",
         "exists": "A policy called {name} already exists. Duplicate names are not allowed.",
@@ -1135,6 +1136,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ElasticLoadBalancingV2::TargetGroup": ("Tags", "list"),
     "AWS::Events::EventBus": ("Tags", "list"),
     "AWS::IAM::Role": ("Tags", "list"),
+    "AWS::IAM::User": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
@@ -2496,6 +2498,107 @@ def _iam_role_delete(physical_id, props):
         # instead of leaking the attachment on the surviving policy record.
         for policy_arn in list(role.get("AttachedPolicies", [])):
             _iam.detach_managed_policy(role, policy_arn)
+
+
+# --- IAM User ---
+
+def _iam_user_call(fn, params, action):
+    status, _headers, body = fn(params)
+    if status >= 400:
+        _rds_raise(status, body, "AWS::IAM::User", action)
+
+
+def _iam_user_policies(props):
+    out = {}
+    for pol in props.get("Policies") or []:
+        doc = pol.get("PolicyDocument", {})
+        out[pol.get("PolicyName", "")] = doc if isinstance(doc, str) else json.dumps(doc)
+    return out
+
+
+def _iam_user_login_profile(name, old, new, action):
+    if old == new:
+        return
+    if not new:
+        _iam_user_call(_iam._delete_login_profile, {"UserName": name}, action)
+        return
+    params = {"UserName": name, "Password": new.get("Password", ""),
+              "PasswordResetRequired": str(_cfn_bool(new.get("PasswordResetRequired", False))).lower()}
+    _iam_user_call(_iam._update_login_profile if old else _iam._create_login_profile, params, action)
+
+
+def _iam_user_reconcile(name, old_props, new_props, action):
+    """Bring groups, managed and inline policies, boundary and login profile to the template."""
+    old_groups, new_groups = set(old_props.get("Groups") or []), set(new_props.get("Groups") or [])
+    for group in sorted(old_groups - new_groups):
+        _iam_user_call(_iam._remove_user_from_group, {"UserName": name, "GroupName": group}, action)
+    for group in sorted(new_groups - old_groups):
+        _iam_user_call(_iam._add_user_to_group, {"UserName": name, "GroupName": group}, action)
+    old_managed = set(old_props.get("ManagedPolicyArns") or [])
+    new_managed = set(new_props.get("ManagedPolicyArns") or [])
+    for arn in sorted(old_managed - new_managed):
+        _iam_user_call(_iam._detach_user_policy, {"UserName": name, "PolicyArn": arn}, action)
+    for arn in sorted(new_managed - old_managed):
+        _iam_user_call(_iam._attach_user_policy, {"UserName": name, "PolicyArn": arn}, action)
+    old_inline, new_inline = _iam_user_policies(old_props), _iam_user_policies(new_props)
+    for policy_name in sorted(old_inline.keys() - new_inline.keys()):
+        _iam_user_call(_iam._delete_user_policy, {"UserName": name, "PolicyName": policy_name}, action)
+    for policy_name, doc in new_inline.items():
+        if old_inline.get(policy_name) != doc:
+            _iam_user_call(_iam._put_user_policy,
+                           {"UserName": name, "PolicyName": policy_name, "PolicyDocument": doc}, action)
+    old_boundary, new_boundary = old_props.get("PermissionsBoundary"), new_props.get("PermissionsBoundary")
+    if new_boundary and new_boundary != old_boundary:
+        _iam_user_call(_iam._put_user_permissions_boundary,
+                       {"UserName": name, "PermissionsBoundary": new_boundary}, action)
+    elif old_boundary and not new_boundary:
+        _iam_user_call(_iam._delete_user_permissions_boundary, {"UserName": name}, action)
+    _iam_user_login_profile(name, old_props.get("LoginProfile"), new_props.get("LoginProfile"), action)
+
+
+def _iam_user_create(logical_id, props, stack_name):
+    name = props.get("UserName") or _physical_name(stack_name, logical_id, max_len=64)
+    _iam_user_call(_iam._create_user, {"UserName": name, **_ec_query({
+        k: props[k] for k in ("Path", "PermissionsBoundary", "Tags") if props.get(k)})}, "create")
+    try:
+        _iam_user_reconcile(name, {"PermissionsBoundary": props.get("PermissionsBoundary")}, props, "create")
+    except ValueError:
+        _iam_user_delete(name, props)
+        raise
+    return name, {"Arn": _iam._users[name]["Arn"]}
+
+
+def _iam_user_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    user = _iam._users.get(physical_id)
+    if user is None:
+        return _iam_user_create(logical_id or physical_id, new_props, stack_name)
+    path = new_props.get("Path") or "/"
+    if path != user["Path"]:
+        user["Path"] = path
+        user["Arn"] = f"arn:aws:iam::{get_account_id()}:user{path}{physical_id}"
+    _iam_user_reconcile(physical_id, old_props, new_props, "update")
+    old_tags, new_tags = _tag_map(old_props.get("Tags")), _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
+        _iam_user_call(_iam._untag_user, {"UserName": physical_id, **_ec_query({"TagKeys": removed})}, "update")
+    changed = [{"Key": k, "Value": v} for k, v in new_tags.items() if old_tags.get(k) != v]
+    if changed:
+        _iam_user_call(_iam._tag_user, {"UserName": physical_id, **_ec_query({"Tags": changed})}, "update")
+    return physical_id, {"Arn": user["Arn"]}
+
+
+def _iam_user_delete(physical_id, props):
+    user = _iam._users.get(physical_id)
+    if user is None:
+        return
+    for group in _iam._groups.values():
+        if physical_id in group.get("Users", []):
+            group["Users"].remove(physical_id)
+    for arn in list(user.get("AttachedPolicies", [])):
+        _iam.detach_managed_policy(user, arn)
+    _iam._user_inline_policies.pop(physical_id, None)
+    _iam._login_profiles.pop(physical_id, None)
+    _iam_user_call(_iam._delete_user, {"UserName": physical_id}, "delete")
 
 
 # --- IAM Policy ---
@@ -9092,7 +9195,12 @@ def _flatten_listener_rule_conditions(cfn_conditions):
             values = cfg.get("Values") or []
             if not values and field == "query-string" and cfg.get("Values") is None:
                 values = [f"{q.get('Key','')}={q.get('Value','')}" for q in (cfg.get("Values") or [])]
-        out.append({"Field": field, "Values": list(values)})
+        condition = {"Field": field, "Values": list(values)}
+        header = c.get("HttpHeaderConfig") if field == "http-header" else None
+        if header:
+            condition = {"Field": field, "Values": [], "HttpHeaderConfig": {
+                "HttpHeaderName": header.get("HttpHeaderName", ""), "Values": list(header.get("Values") or [])}}
+        out.append(condition)
     return out
 
 
@@ -14054,6 +14162,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
+    "AWS::IAM::User": ("UserName",),
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
@@ -14309,6 +14418,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_role_delete,
         "import": _iam_role_import,
+    },
+    "AWS::IAM::User": {
+        "create": _iam_user_create,
+        "update": _iam_user_update,
+        "update_with_logical_id": True,
+        "delete": _iam_user_delete,
     },
     "AWS::IAM::Policy": {
         "create": _iam_policy_create,

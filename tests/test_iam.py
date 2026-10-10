@@ -127,6 +127,35 @@ def test_iam_role_permissions_boundary_missing_role(iam, operation):
             iam.delete_role_permissions_boundary(RoleName=name)
     assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
 
+def test_iam_user_permissions_boundary_roundtrip(iam):
+    name = f"boundary-user-{_uuid_mod.uuid4().hex[:8]}"
+    original_boundary = "arn:aws:iam::000000000000:policy/original-boundary"
+    replacement_boundary = "arn:aws:iam::000000000000:policy/replacement-boundary"
+
+    created = iam.create_user(UserName=name, PermissionsBoundary=original_boundary)["User"]
+    assert created["PermissionsBoundary"] == {
+        "PermissionsBoundaryType": "PermissionsBoundaryPolicy",
+        "PermissionsBoundaryArn": original_boundary,
+    }
+    iam.put_user_permissions_boundary(UserName=name, PermissionsBoundary=replacement_boundary)
+    assert iam.get_user(UserName=name)["User"]["PermissionsBoundary"]["PermissionsBoundaryArn"] == replacement_boundary
+    iam.delete_user_permissions_boundary(UserName=name)
+    assert "PermissionsBoundary" not in iam.get_user(UserName=name)["User"]
+    iam.delete_user(UserName=name)
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_iam_user_permissions_boundary_missing_user(iam, operation):
+    name = f"missing-boundary-user-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        if operation == "put":
+            iam.put_user_permissions_boundary(
+                UserName=name, PermissionsBoundary="arn:aws:iam::000000000000:policy/boundary")
+        else:
+            iam.delete_user_permissions_boundary(UserName=name)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
 def test_iam_list_roles(iam):
     resp = iam.list_roles()
     names = [r["RoleName"] for r in resp["Roles"]]

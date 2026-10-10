@@ -1896,3 +1896,37 @@ def test_alb_describe_lbs_validates_name_length_before_existence(elbv2):
     with pytest.raises(ClientError) as exc:
         elbv2.describe_load_balancers(Names=["definitely-not-there"])
     assert exc.value.response["Error"]["Code"] == "LoadBalancerNotFound"
+
+
+def test_alb_http_header_condition_round_trips_and_matches(elbv2):
+    """An http-header condition keeps its HttpHeaderConfig, and the data plane matches
+    the header name and values case-insensitively with * and ? wildcards."""
+    name = f"hdr-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn = elbv2.create_load_balancer(Name=name, Subnets=["subnet-1"])["LoadBalancers"][0]["LoadBalancerArn"]
+
+    def fixed(body):
+        return {"Type": "fixed-response",
+                "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/plain", "MessageBody": body}}
+
+    l_arn = elbv2.create_listener(LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+                                  DefaultActions=[fixed("default")])["Listeners"][0]["ListenerArn"]
+    header = {"HttpHeaderName": "X-Example-Origin-Token", "Values": ["example-token", "tok?n-*"]}
+    try:
+        elbv2.create_rule(ListenerArn=l_arn, Priority=1,
+                          Conditions=[{"Field": "http-header", "HttpHeaderConfig": header}],
+                          Actions=[fixed("matched")])
+        rule = next(r for r in elbv2.describe_rules(ListenerArn=l_arn)["Rules"] if r["Priority"] == "1")
+        assert rule["Conditions"][0]["Field"] == "http-header"
+        assert rule["Conditions"][0]["HttpHeaderConfig"] == header
+
+        def body(headers):
+            return _req.urlopen(_req.Request(f"{_endpoint}/_alb/{name}/", headers=headers)).read()
+
+        assert body({"x-example-origin-token": "example-token"}) == b"matched"
+        assert body({"X-EXAMPLE-ORIGIN-TOKEN": "EXAMPLE-TOKEN"}) == b"matched"
+        assert body({"X-Example-Origin-Token": "token-123"}) == b"matched"
+        assert body({"X-Example-Origin-Token": "wrong"}) == b"default"
+        assert body({}) == b"default"
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)

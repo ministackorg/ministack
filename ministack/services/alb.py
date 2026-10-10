@@ -27,10 +27,12 @@ import json
 import logging
 import os
 import random
+import re
 import socket
 import string
 import time
 from urllib.parse import parse_qs, urlencode
+from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
@@ -342,7 +344,17 @@ def _parse_conditions(params, prefix="Conditions"):
         field = _p(params, f"{base}.Field")
         if not field:
             break
-        conditions.append({"Field": field, "Values": _parse_condition_values(params, base)})
+        condition = {"Field": field, "Values": _parse_condition_values(params, base)}
+        if field == "http-header":
+            values, j = [], 1
+            while value := _p(params, f"{base}.HttpHeaderConfig.Values.member.{j}"):
+                values.append(value)
+                j += 1
+            condition["HttpHeaderConfig"] = {
+                "HttpHeaderName": _p(params, f"{base}.HttpHeaderConfig.HttpHeaderName"),
+                "Values": values,
+            }
+        conditions.append(condition)
         i += 1
     return conditions
 
@@ -535,6 +547,11 @@ def _condition_xml(c):
     config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
     if config_key:
         xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
+    header = c.get("HttpHeaderConfig")
+    if header:
+        header_values = "".join(f"<member>{_esc(v)}</member>" for v in header.get("Values", []))
+        xml += (f"<HttpHeaderConfig><HttpHeaderName>{_esc(header.get('HttpHeaderName', ''))}</HttpHeaderName>"
+                f"<Values>{header_values}</Values></HttpHeaderConfig>")
     return xml + "</member>"
 
 
@@ -1238,6 +1255,11 @@ def _find_lb_by_name(name):
 # Data-plane: rule matching
 # ---------------------------------------------------------------------------
 
+def _header_value_matches(actual, pattern):
+    regex = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.fullmatch(regex, actual, re.IGNORECASE | re.DOTALL) is not None
+
+
 def _match_condition(cond, method, path, headers, query_params):
     field = cond.get("Field", "")
     values = cond.get("Values", [])
@@ -1268,11 +1290,12 @@ def _match_condition(cond, method, path, headers, query_params):
         return True
 
     if field == "http-header":
-        cfg = cond.get("HttpHeaderConfig", {})
-        hname = cfg.get("HttpHeaderName", "").lower()
-        hvals = cfg.get("Values", values)
-        actual = headers.get(hname, "")
-        return any(fnmatch.fnmatch(actual, v) for v in hvals)
+        # Case-insensitive name and values; only * and ? are wildcards.
+        cfg = cond.get("HttpHeaderConfig") or {}
+        actual = headers.get(cfg.get("HttpHeaderName", "").lower())
+        if actual is None:
+            return False
+        return any(_header_value_matches(actual, v) for v in cfg.get("Values") or values)
 
     # source-ip is not implemented (no real network in emulator) — always matches.
     # Unknown condition types also always match to avoid silently dropping traffic.

@@ -34692,3 +34692,117 @@ def test_cfn_docdb_cluster_lifecycle(cfn, sm):
     assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "DELETE_COMPLETE"
     with pytest.raises(ClientError):
         docdb.describe_db_clusters(DBClusterIdentifier=outputs["ClusterId"])
+
+
+def test_cfn_elbv2_listener_rule_keeps_http_header_config(cfn, elbv2):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-hdr-{uid}"
+    header = {"HttpHeaderName": "X-Origin-Token", "Values": ["secret"]}
+    template = json.loads(_cfn_elbv2_template(uid))
+    template["Resources"]["R"]["Properties"]["Conditions"] = [
+        {"Field": "http-header", "HttpHeaderConfig": header}]
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rule = elbv2.describe_rules(RuleArns=[_output(stack, "RuleRef")])["Rules"][0]
+        assert rule["Conditions"][0]["HttpHeaderConfig"] == header
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def _cfn_iam_user_template(group_names, policy_doc, login, tags, path="/", user_name=None, boundary=None):
+    user = {"Groups": list(group_names),
+            "ManagedPolicyArns": [{"Ref": "Managed"}],
+            "Policies": [{"PolicyName": "inline", "PolicyDocument": policy_doc}],
+            "Path": path, "Tags": tags}
+    if login:
+        user["LoginProfile"] = login
+    if user_name:
+        user["UserName"] = user_name
+    if boundary:
+        user["PermissionsBoundary"] = boundary
+    doc = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}]}
+    return json.dumps({
+        "Resources": {
+            "Managed": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": doc}},
+            "User": {"Type": "AWS::IAM::User", "Properties": user},
+        },
+        "Outputs": {"UserRef": {"Value": {"Ref": "User"}},
+                    "UserArn": {"Value": {"Fn::GetAtt": ["User", "Arn"]}},
+                    "ManagedArn": {"Value": {"Ref": "Managed"}}},
+    })
+
+
+def test_cfn_iam_user_lifecycle(cfn, iam):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-user-{uid}"
+    allow = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    deny = {"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "s3:*", "Resource": "*"}]}
+    boundary = "arn:aws:iam::aws:policy/PowerUserAccess"
+    group_a, group_b = f"ga-{uid}", f"gb-{uid}"
+    iam.create_group(GroupName=group_a)
+    iam.create_group(GroupName=group_b)
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_iam_user_template(
+        [group_a, group_b], allow, {"Password": "Initial-Passw0rd!", "PasswordResetRequired": True},
+        [{"Key": "team", "Value": "a"}], user_name=f"named-{uid}", boundary=boundary))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name = _output(stack, "UserRef")
+        assert name == f"named-{uid}"
+        user = iam.get_user(UserName=name)["User"]
+        assert _output(stack, "UserArn") == user["Arn"] == f"arn:aws:iam::000000000000:user/{name}"
+        assert user["PermissionsBoundary"]["PermissionsBoundaryArn"] == boundary
+        assert [t for t in user["Tags"] if not t["Key"].startswith("aws:")] == [{"Key": "team", "Value": "a"}]
+        groups = {g["GroupName"] for g in iam.list_groups_for_user(UserName=name)["Groups"]}
+        assert groups == {group_a, group_b}
+        attached = [p["PolicyArn"] for p in iam.list_attached_user_policies(UserName=name)["AttachedPolicies"]]
+        assert attached == [_output(stack, "ManagedArn")]
+        assert iam.list_user_policies(UserName=name)["PolicyNames"] == ["inline"]
+        assert iam.get_login_profile(UserName=name)["LoginProfile"]["PasswordResetRequired"] is True
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_iam_user_template(
+            [group_a], deny, None, [{"Key": "team", "Value": "b"}], path="/ops/", user_name=f"named-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        user = iam.get_user(UserName=name)["User"]
+        assert user["Path"] == "/ops/" and user["Arn"] == f"arn:aws:iam::000000000000:user/ops/{name}"
+        assert _output(stack, "UserArn") == user["Arn"]
+        assert "PermissionsBoundary" not in user
+        assert [t for t in user["Tags"] if not t["Key"].startswith("aws:")] == [{"Key": "team", "Value": "b"}]
+        groups = {g["GroupName"] for g in iam.list_groups_for_user(UserName=name)["Groups"]}
+        assert groups == {group_a}
+        doc = iam.get_user_policy(UserName=name, PolicyName="inline")["PolicyDocument"]
+        doc = json.loads(doc) if isinstance(doc, str) else doc
+        assert doc["Statement"][0]["Effect"] == "Deny"
+        with pytest.raises(ClientError) as exc:
+            iam.get_login_profile(UserName=name)
+        assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        iam.get_user(UserName=f"named-{uid}")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+    assert iam.get_group(GroupName=group_a)["Users"] == []
+    iam.delete_group(GroupName=group_a)
+    iam.delete_group(GroupName=group_b)
+
+
+def test_cfn_iam_user_generated_name(cfn, iam):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-genuser-{uid}"
+    template = json.dumps({"Resources": {"User": {"Type": "AWS::IAM::User"}},
+                           "Outputs": {"UserRef": {"Value": {"Ref": "User"}}}})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name = _output(stack, "UserRef")
+        assert name.startswith(stack_name)
+        assert iam.get_user(UserName=name)["User"]["Path"] == "/"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)

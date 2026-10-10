@@ -234,7 +234,8 @@ def _resolve_dest_update_config(data: dict):
     return None, None
 
 
-def _apply_lambda_processors(stream: dict, dest: dict, records: list, metadata_sink: dict = None) -> list:
+def _apply_lambda_processors(stream: dict, dest: dict, records: list, metadata_sink: dict = None,
+                             partition_sink: dict = None) -> list:
     """Apply a destination's ProcessingConfiguration Lambda processors to a
     batch of records.
 
@@ -343,6 +344,10 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list, metadata_s
                 otf = (r.get("metadata") or {}).get("otfMetadata")
                 if isinstance(otf, dict):
                     metadata_sink[rid] = otf
+            if partition_sink is not None:
+                keys = (r.get("metadata") or {}).get("partitionKeys")
+                if isinstance(keys, dict):
+                    partition_sink[rid] = {str(k): str(v) for k, v in keys.items()}
             outcome = r.get("result", "Ok")
             if outcome in ("Dropped", "ProcessingFailed"):
                 continue
@@ -360,37 +365,435 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list, metadata_s
     return current
 
 
-def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes):
-    """Best-effort delivery of a record to the local S3 emulator.
+# ─── S3 delivery: prefixes, dynamic partitioning, record format conversion ────
 
-    Called while holding _lock so must not block the event loop.
-    Schedules a coroutine on the running loop (fire-and-forget).
-    """
+
+class _DeliveryError(Exception):
+    """A record goes to the error prefix with this error-output-type."""
+
+    def __init__(self, output_type, message, code=None):
+        super().__init__(message)
+        self.output_type = output_type
+        self.message = message
+        self.code = code
+
+
+_PREFIX_EXPR_RE = re.compile(r"!\{([A-Za-z]+):([^}]*)\}")
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December")
+
+
+def _java_time(pattern, t):
+    """Format ``t`` (struct_time) with a Java DateTimeFormatter pattern: y M d H m s D, 'quoted' literals."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "'":
+            end = pattern.find("'", i + 1)
+            if end == i + 1:
+                out.append("'")
+                i += 2
+                continue
+            out.append(pattern[i + 1:] if end < 0 else pattern[i + 1:end])
+            i = len(pattern) if end < 0 else end + 1
+            continue
+        if c in "yMdHmsD":
+            n = 1
+            while i + n < len(pattern) and pattern[i + n] == c:
+                n += 1
+            value = {"y": t.tm_year, "M": t.tm_mon, "d": t.tm_mday, "H": t.tm_hour,
+                     "m": t.tm_min, "s": t.tm_sec, "D": t.tm_yday}[c]
+            if c == "y" and n == 2:
+                out.append(f"{value % 100:02d}")
+            elif c == "M" and n >= 3:
+                out.append(_MONTHS[value - 1][:3] if n == 3 else _MONTHS[value - 1])
+            else:
+                out.append(str(value).zfill(n))
+            i += n
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _evaluate_prefix(template, t, query_keys=None, lambda_keys=None, error_type=None):
+    """Evaluate a Prefix / ErrorOutputPrefix; ``yyyy/MM/dd/HH/`` is appended when it has no timestamp expression."""
+    has_timestamp = False
+
+    def expand(match):
+        nonlocal has_timestamp
+        namespace, value = match.group(1), match.group(2)
+        if namespace == "timestamp":
+            has_timestamp = True
+            return _java_time(value, t)
+        if namespace == "firehose" and value == "random-string":
+            return new_uuid().replace("-", "")[:11]
+        if namespace == "firehose" and value == "error-output-type" and error_type:
+            return error_type
+        keys = {"partitionKeyFromQuery": query_keys, "partitionKeyFromLambda": lambda_keys}.get(namespace)
+        if keys is not None and value in keys:
+            return keys[value]
+        raise _DeliveryError("processing-failed", f"Cannot evaluate !{{{namespace}:{value}}} in the S3 prefix.")
+
+    evaluated = _PREFIX_EXPR_RE.sub(expand, template or "")
+    if not has_timestamp:
+        evaluated += _java_time("yyyy/MM/dd/HH/", t)
+    return evaluated
+
+
+# jq 1.6, the subset Firehose metadata extraction uses: an object of
+# key: .path (fields, ["key"], [n], [m:n]) optionally piped to strftime("fmt").
+_JQ_TOKEN_RE = re.compile(r'\s*(?:("(?:[^"\\]|\\.)*")|(-?\d+)|([A-Za-z_][A-Za-z0-9_]*)|([{}\[\]:,.|()]))')
+
+
+def _jq_tokens(expression):
+    tokens, pos = [], 0
+    while pos < len(expression):
+        if expression[pos:].strip() == "":
+            break
+        match = _JQ_TOKEN_RE.match(expression, pos)
+        if not match:
+            raise ValueError(f"unsupported jq syntax at {expression[pos:]!r}")
+        string, number, ident, punct = match.groups()
+        if string is not None:
+            tokens.append(("str", json.loads(string)))
+        elif number is not None:
+            tokens.append(("num", int(number)))
+        elif ident is not None:
+            tokens.append(("ident", ident))
+        else:
+            tokens.append(("punct", punct))
+        pos = match.end()
+    return tokens
+
+
+def _jq_parse(expression):
+    """Parse ``{key: .path | strftime("fmt"), ...}`` into ``[(key, steps, functions)]``."""
+    tokens, i = _jq_tokens(expression), 0
+
+    def peek(kind=None, value=None):
+        if i >= len(tokens):
+            return False
+        tk, tv = tokens[i]
+        return (kind is None or tk == kind) and (value is None or tv == value)
+
+    def take(kind=None, value=None):
+        nonlocal i
+        if not peek(kind, value):
+            raise ValueError(f"unsupported jq expression: {expression!r}")
+        i += 1
+        return tokens[i - 1][1]
+
+    def path():
+        steps = []
+        take("punct", ".")
+        if peek("ident") or peek("str"):
+            steps.append(("key", take()))
+        while peek("punct", ".") or peek("punct", "["):
+            if peek("punct", "."):
+                take()
+                steps.append(("key", take("str") if peek("str") else take("ident")))
+                continue
+            take("punct", "[")
+            if peek("str"):
+                steps.append(("key", take()))
+            else:
+                start = take("num") if peek("num") else None
+                if peek("punct", ":"):
+                    take()
+                    end = take("num") if peek("num") else None
+                    steps.append(("slice", start, end))
+                elif start is None:
+                    raise ValueError(f"unsupported jq expression: {expression!r}")
+                else:
+                    steps.append(("index", start))
+            take("punct", "]")
+        return steps
+
+    pairs = []
+    take("punct", "{")
+    while not peek("punct", "}"):
+        key = take("str") if peek("str") else take("ident")
+        if peek("punct", ":"):
+            take()
+            steps, functions = path(), []
+            while peek("punct", "|"):
+                take()
+                name = take("ident")
+                if name != "strftime":
+                    raise ValueError(f"unsupported jq function: {name}")
+                take("punct", "(")
+                functions.append(("strftime", take("str")))
+                take("punct", ")")
+        else:
+            steps, functions = [("key", key)], []
+        pairs.append((key, steps, functions))
+        if not peek("punct", ","):
+            break
+        take()
+    take("punct", "}")
+    if i != len(tokens):
+        raise ValueError(f"unsupported jq expression: {expression!r}")
+    return pairs
+
+
+def _jq_value(document, steps, functions):
+    value = document
+    for step in steps:
+        if value is None:
+            return None
+        if step[0] == "key":
+            if not isinstance(value, dict):
+                raise ValueError(f"Cannot index {type(value).__name__} with \"{step[1]}\"")
+            value = value.get(step[1])
+        elif step[0] == "index":
+            if not isinstance(value, list):
+                raise ValueError(f"Cannot index {type(value).__name__} with number")
+            value = value[step[1]] if -len(value) <= step[1] < len(value) else None
+        else:
+            if not isinstance(value, (list, str)):
+                raise ValueError(f"Cannot index {type(value).__name__} with object")
+            value = value[step[1]:step[2]]
+    for _name, fmt in functions:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("strftime/1 requires parsed datetime inputs")
+        value = time.strftime(fmt, time.gmtime(value))
+    return value
+
+
+def _metadata_extraction_keys(cfg, data):
+    """Partition keys from a MetadataExtraction processor, or None when there is none."""
+    processing = cfg.get("ProcessingConfiguration") or {}
+    if not processing.get("Enabled"):
+        return None
+    query = None
+    for processor in processing.get("Processors") or []:
+        if processor.get("Type") == "MetadataExtraction":
+            for parameter in processor.get("Parameters") or []:
+                if parameter.get("ParameterName") == "MetadataExtractionQuery":
+                    query = parameter.get("ParameterValue")
+    if query is None:
+        return None
     try:
-        from ministack.services import s3 as s3_svc
+        document = json.loads(data)
+        if not isinstance(document, dict):
+            raise ValueError("the record is not a JSON object")
+        keys = {}
+        for key, steps, functions in _jq_parse(query):
+            value = _jq_value(document, steps, functions)
+            if value is None or isinstance(value, (dict, list)):
+                raise ValueError(f"partition key {key} has no scalar value")
+            keys[key] = value if isinstance(value, str) else json.dumps(value)
+        return keys
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _DeliveryError("processing-failed", f"Metadata extraction failed: {exc}") from exc
 
-        cfg = dest["config"]
-        bucket_arn = cfg.get("BucketARN", "")
-        bucket = _s3_bucket_from_arn(bucket_arn)
-        prefix = cfg.get("Prefix", "")
-        ts = time.strftime("%Y/%m/%d/%H", time.gmtime())
-        key = f"{prefix}{ts}/{stream['name']}-{new_uuid()}"
 
-        async def _put():
-            fake_headers = {
-                "content-type": "application/octet-stream",
-                "content-length": str(len(record_data)),
-                "host": "s3.localhost",
-            }
-            await s3_svc.handle_request("PUT", f"/{bucket}/{key}", fake_headers, record_data, {})
+_CONVERSION_ERRORS = {
+    "empty": ("DataFormatConversion.MalformedData", "The record was empty or contained only whitespace."),
+    "primitive": ("DataFormatConversion.MalformedData",
+                  "The input JSON contained a primitive at the top level. The top level must be an object or array."),
+    "malformed": ("DataFormatConversion.ParseError", "Encountered malformed JSON."),
+    "mismatch": ("DataFormatConversion.MalformedData", "Data does not match the schema."),
+    "table": ("DataFormatConversion.EntityNotFound",
+              "The specified table/database could not be found. Please ensure that the table/database exists and "
+              "that the values provided in the schema configuration are correct, especially with regards to casing."),
+    "unsupported": ("DataFormatConversion.ConversionFailureException", "ConversionFailureException"),
+}
 
+
+def _conversion_error(kind):
+    code, message = _CONVERSION_ERRORS[kind]
+    return _DeliveryError("format-conversion-failed", message, code)
+
+
+def _hive_to_duckdb_type(hive_type):
+    """Glue/Hive column type to a DuckDB type, nested types included."""
+    text = hive_type.strip()
+    lower = text.lower()
+
+    def split_args(inner):
+        parts, depth, start = [], 0, 0
+        for pos, ch in enumerate(inner):
+            if ch in "<(":
+                depth += 1
+            elif ch in ">)":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(inner[start:pos])
+                start = pos + 1
+        parts.append(inner[start:])
+        return [p.strip() for p in parts]
+
+    if lower.startswith("array<") and lower.endswith(">"):
+        return f"{_hive_to_duckdb_type(text[6:-1])}[]"
+    if lower.startswith("map<") and lower.endswith(">"):
+        key, value = split_args(text[4:-1])
+        return f"MAP({_hive_to_duckdb_type(key)}, {_hive_to_duckdb_type(value)})"
+    if lower.startswith("struct<") and lower.endswith(">"):
+        fields = []
+        for field in split_args(text[7:-1]):
+            name, _, ftype = field.partition(":")
+            fields.append(f'"{name.strip()}" {_hive_to_duckdb_type(ftype)}')
+        return f"STRUCT({', '.join(fields)})"
+    if lower.startswith("decimal"):
+        return text.upper()
+    from ministack.services.athena import _DUCKDB_TYPE_BY_ATHENA
+
+    return _DUCKDB_TYPE_BY_ATHENA.get(lower.split("(")[0], "VARCHAR")
+
+
+def _json_documents(data):
+    """The JSON objects in a record: one, or several concatenated."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _conversion_error("malformed") from exc
+    if not text.strip():
+        raise _conversion_error("empty")
+    decoder, pos, documents = json.JSONDecoder(), 0, []
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            return documents
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_put())
-        except RuntimeError:
-            asyncio.run(_put())
+            document, pos = decoder.raw_decode(text, pos)
+        except ValueError as exc:
+            raise _conversion_error("malformed") from exc
+        if not isinstance(document, dict):
+            raise _conversion_error("primitive" if not isinstance(document, list) else "mismatch")
+        documents.append(document)
+
+
+def _convert_to_parquet(conversion, data):
+    """JSON record to a Parquet object with the Glue table's columns, or a _DeliveryError."""
+    serializer = ((conversion.get("OutputFormatConfiguration") or {}).get("Serializer") or {})
+    if "ParquetSerDe" not in serializer:
+        raise _conversion_error("unsupported")
+    schema = conversion.get("SchemaConfiguration") or {}
+    from ministack.services import glue as glue_svc
+
+    table = glue_svc._tables.get(f"{schema.get('DatabaseName', '')}/{schema.get('TableName', '')}")
+    columns = ((table or {}).get("StorageDescriptor") or {}).get("Columns") or []
+    if not columns:
+        raise _conversion_error("table")
+    deserializer = ((conversion.get("InputFormatConfiguration") or {}).get("Deserializer") or {})
+    openx = deserializer.get("OpenXJsonSerDe")
+    case_insensitive = True if openx is None else openx.get("CaseInsensitive", True)
+    dots_to_underscores = bool(openx and openx.get("ConvertDotsInJsonKeysToUnderscores"))
+    key_mappings = (openx or {}).get("ColumnToJsonKeyMappings") or {}
+
+    rows = []
+    for document in _json_documents(data):
+        fields = {}
+        for key, value in document.items():
+            name = key.replace(".", "_") if dots_to_underscores else key
+            fields[name.lower() if case_insensitive else name] = value
+        row = []
+        for column in columns:
+            name = column["Name"]
+            source = key_mappings.get(name, name)
+            row.append(fields.get(source.lower() if case_insensitive else source))
+        rows.append(row)
+
+    try:
+        import duckdb
+    except ImportError as exc:
+        logger.warning("Firehose record format conversion needs DuckDB (the full image)")
+        raise _conversion_error("unsupported") from exc
+    import tempfile
+
+    compression = {"GZIP": "gzip", "UNCOMPRESSED": "uncompressed"}.get(
+        (serializer.get("ParquetSerDe") or {}).get("Compression", "SNAPPY"), "snappy")
+    definition = ", ".join(f'"{c["Name"]}" {_hive_to_duckdb_type(c.get("Type", "string"))}' for c in columns)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "out.parquet")
+        con = duckdb.connect()
+        try:
+            con.execute(f"CREATE TABLE t ({definition})")
+            con.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in columns)})", rows)
+            con.execute(f"COPY t TO '{path}' (FORMAT PARQUET, COMPRESSION {compression})")
+        except duckdb.Error as exc:
+            raise _conversion_error("mismatch") from exc
+        finally:
+            con.close()
+        with open(path, "rb") as fh:
+            return fh.read()
+
+
+def _put_s3_object(bucket, key, body):
+    from ministack.services import s3 as s3_svc
+
+    async def _put():
+        headers = {"content-type": "application/octet-stream", "content-length": str(len(body)),
+                   "host": "s3.localhost"}
+        await s3_svc.handle_request("PUT", f"/{bucket}/{key}", headers, body, {})
+
+    try:
+        asyncio.get_running_loop().create_task(_put())
+    except RuntimeError:
+        asyncio.run(_put())
+
+
+def _arrival_time(cfg):
+    zone = cfg.get("CustomTimeZone")
+    if zone and zone != "UTC":
+        try:
+            import datetime
+            from zoneinfo import ZoneInfo
+
+            return datetime.datetime.now(ZoneInfo(zone)).timetuple()
+        except Exception:
+            pass
+    return time.gmtime()
+
+
+def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes, lambda_keys=None):
+    """Deliver one record: partition keys, format conversion, evaluated prefix, AWS object name."""
+    try:
+        cfg = dest["config"]
+        bucket = _s3_bucket_from_arn(cfg.get("BucketARN", ""))
+        t = _arrival_time(cfg)
+        suffix = f"{stream['name']}-{stream.get('version', 1)}-{_java_time('yyyy-MM-dd-HH-mm-ss', t)}-{new_uuid()}"
+        conversion = cfg.get("DataFormatConversionConfiguration") or {}
+        try:
+            query_keys = None
+            if (cfg.get("DynamicPartitioningConfiguration") or {}).get("Enabled"):
+                query_keys = _metadata_extraction_keys(cfg, record_data)
+            prefix = _evaluate_prefix(cfg.get("Prefix", ""), t, query_keys, lambda_keys)
+            body, extension = record_data, ""
+            if conversion and conversion.get("Enabled", True):
+                body, extension = _convert_to_parquet(conversion, record_data), ".parquet"
+            _put_s3_object(bucket, f"{prefix}{suffix}{cfg.get('FileExtension') or extension}", body)
+        except _DeliveryError as err:
+            now_ms = int(time.time() * 1000)
+            document = {"attemptsMade": 1, "arrivalTimestamp": now_ms, "attemptEndingTimestamp": now_ms,
+                        "rawData": base64.b64encode(record_data).decode()}
+            if err.code:
+                document["ErrorCode"] = err.code
+            document["ErrorMessage"] = err.message
+            if err.output_type == "format-conversion-failed":
+                schema = conversion.get("SchemaConfiguration") or {}
+                document["dataCatalogTable"] = {
+                    "catalogId": schema.get("CatalogId") or get_account_id(),
+                    "databaseName": schema.get("DatabaseName"), "tableName": schema.get("TableName"),
+                    "region": schema.get("Region") or get_region(), "versionId": schema.get("VersionId", "LATEST")}
+            error_prefix = cfg.get("ErrorOutputPrefix")
+            if error_prefix:
+                prefix = _evaluate_prefix(error_prefix, t, error_type=err.output_type)
+            else:
+                prefix = f"{cfg.get('Prefix', '')}{err.output_type}/{_java_time('yyyy/MM/dd/HH/', t)}"
+            _put_s3_object(bucket, f"{prefix}{suffix}", (json.dumps(document) + "\n").encode())
     except Exception as e:
         logger.warning("Firehose S3 delivery failed: %s", e)
+
+
+def _deliver_records_to_s3(stream: dict, dest: dict, records: list):
+    """Run the processors over ``records`` [(recordId, bytes)] and deliver each result to S3."""
+    partition_keys = {}
+    for rid, payload in _apply_lambda_processors(stream, dest, records, partition_sink=partition_keys):
+        _deliver_to_s3(stream, dest, payload, partition_keys.get(rid))
 
 
 def _gateway_port() -> str:
@@ -605,8 +1008,7 @@ def ingest_from_kinesis_source(stream_arn: str, records: list) -> None:
                     plan.append((stream, dest, rid, raw))
     for stream, dest, rid, raw in plan:
         try:
-            for _rid, payload in _apply_lambda_processors(stream, dest, [(rid, raw)]):
-                _deliver_to_s3(stream, dest, payload)
+            _deliver_records_to_s3(stream, dest, [(rid, raw)])
         except Exception as exc:
             logger.warning(
                 "Firehose Kinesis-source delivery to %s failed: %s",
@@ -770,9 +1172,7 @@ def _put_record(data: dict):
         for dest in stream["destinations"]:
             dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
             if dest["type"] in ("ExtendedS3", "S3"):
-                # Apply ProcessingConfiguration.Lambda transforms before S3.
-                for _rid, payload in _apply_lambda_processors(stream, dest, [(record_id, decoded)]):
-                    _deliver_to_s3(stream, dest, payload)
+                _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
             elif dest["type"] == "Iceberg":
                 _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
 
@@ -807,8 +1207,7 @@ def _put_record_batch(data: dict):
                 for dest in stream["destinations"]:
                     dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
                     if dest["type"] in ("ExtendedS3", "S3"):
-                        for _rid, payload in _apply_lambda_processors(stream, dest, [(record_id, decoded)]):
-                            _deliver_to_s3(stream, dest, payload)
+                        _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
                     elif dest["type"] == "Iceberg":
                         _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
                 responses.append({"RecordId": record_id, "Encrypted": False})

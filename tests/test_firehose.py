@@ -1,6 +1,8 @@
+import base64
 import io
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
 import zipfile
@@ -949,3 +951,127 @@ def test_firehose_iceberg_delivery_writes_queryable_rows(fh):
         assert rows == [(1, "alice")]
     finally:
         fh.delete_delivery_stream(DeliveryStreamName=stream)
+
+
+def _wait_objects(s3, bucket, prefix, count=1):
+    for _ in range(40):
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+        if len(objs) >= count:
+            return objs
+        time.sleep(0.1)
+    return s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+
+
+def _partitioned_parquet_stream(fh, glue, s3, suffix, query):
+    bucket, database, name = f"fh-dp-{suffix}", f"fh_dp_{suffix}", f"fh-dp-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+    glue.create_table(DatabaseName=database, TableInput={"Name": "events", "StorageDescriptor": {
+        "Columns": [{"Name": "timestamp", "Type": "string"}, {"Name": "action", "Type": "int"}],
+        "Location": f"s3://{bucket}/usage/"}})
+    fh.create_delivery_stream(DeliveryStreamName=name, DeliveryStreamType="DirectPut",
+                              ExtendedS3DestinationConfiguration={
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose", "BucketARN": f"arn:aws:s3:::{bucket}",
+        "Prefix": "usage/year=!{partitionKeyFromQuery:year}/month=!{partitionKeyFromQuery:month}/"
+                  "day=!{partitionKeyFromQuery:day}/",
+        "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/",
+        "DynamicPartitioningConfiguration": {"Enabled": True},
+        "ProcessingConfiguration": {"Enabled": True, "Processors": [{"Type": "MetadataExtraction", "Parameters": [
+            {"ParameterName": "JsonParsingEngine", "ParameterValue": "JQ-1.6"},
+            {"ParameterName": "MetadataExtractionQuery", "ParameterValue": query}]}]},
+        "DataFormatConversionConfiguration": {"Enabled": True, "SchemaConfiguration": {
+            "RoleARN": "arn:aws:iam::000000000000:role/firehose", "DatabaseName": database,
+            "TableName": "events", "Region": "us-east-1"},
+            "InputFormatConfiguration": {"Deserializer": {"HiveJsonSerDe": {}}},
+            "OutputFormatConfiguration": {"Serializer": {"ParquetSerDe": {"Compression": "SNAPPY"}}}},
+    })
+    return bucket, name
+
+
+def test_firehose_dynamic_partitioning_writes_parquet(fh, glue, s3, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    bucket, name = _partitioned_parquet_stream(
+        fh, glue, s3, _uuid_mod.uuid4().hex[:8],
+        "{year: .timestamp[0:4], month: .timestamp[5:7], day: .timestamp[8:10]}")
+    fh.put_record(DeliveryStreamName=name,
+                  Record={"Data": json.dumps({"timestamp": "2026-04-23T11:30:00Z", "action": 1})})
+    objs = _wait_objects(s3, bucket, "usage/")
+    assert len(objs) == 1, objs
+    key = objs[0]["Key"]
+    # No timestamp expression in the prefix, so Firehose appends yyyy/MM/dd/HH/.
+    assert re.fullmatch(rf"usage/year=2026/month=04/day=23/\d{{4}}/\d{{2}}/\d{{2}}/\d{{2}}/{name}-1-"
+                        r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-[0-9a-f-]{36}\.parquet", key), key
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    assert body[:4] == b"PAR1" and body[-4:] == b"PAR1"
+    path = tmp_path / "out.parquet"
+    path.write_bytes(body)
+    con = duckdb.connect()
+    assert con.execute(f"SELECT * FROM '{path}'").fetchall() == [("2026-04-23T11:30:00Z", 1)]
+    assert con.execute(f"SELECT DISTINCT compression FROM parquet_metadata('{path}')").fetchall() == [("SNAPPY",)]
+
+
+def test_firehose_failed_records_go_to_the_error_prefix(fh, glue, s3):
+    pytest.importorskip("duckdb")
+    bucket, name = _partitioned_parquet_stream(
+        fh, glue, s3, _uuid_mod.uuid4().hex[:8], "{year: .timestamp[0:4], month: .month, day: .day}")
+    missing_key = json.dumps({"timestamp": "2026-04-23T11:30:00Z", "action": 1})
+    fh.put_record(DeliveryStreamName=name, Record={"Data": missing_key})
+    failed = _wait_objects(s3, bucket, "errors/processing-failed/")
+    assert len(failed) == 1, failed
+    document = json.loads(s3.get_object(Bucket=bucket, Key=failed[0]["Key"])["Body"].read())
+    assert base64.b64decode(document["rawData"]).decode() == missing_key
+    assert {"attemptsMade", "arrivalTimestamp", "attemptEndingTimestamp", "ErrorMessage"} <= set(document)
+
+    bad_type = json.dumps({"timestamp": "2026-04-23T11:30:00Z", "action": "abc", "month": "04", "day": "23"})
+    fh.put_record(DeliveryStreamName=name, Record={"Data": bad_type})
+    failed = _wait_objects(s3, bucket, "errors/format-conversion-failed/")
+    assert len(failed) == 1, failed
+    document = json.loads(s3.get_object(Bucket=bucket, Key=failed[0]["Key"])["Body"].read())
+    assert document["ErrorCode"] == "DataFormatConversion.MalformedData"
+    assert document["ErrorMessage"] == "Data does not match the schema."
+    assert document["dataCatalogTable"]["tableName"] == "events"
+    assert not s3.list_objects_v2(Bucket=bucket, Prefix="usage/").get("Contents")
+
+
+def test_firehose_prefix_timestamp_expressions_replace_the_default(fh, s3):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, name = f"fh-ts-{suffix}", f"fh-ts-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    fh.create_delivery_stream(DeliveryStreamName=name, ExtendedS3DestinationConfiguration={
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose", "BucketARN": f"arn:aws:s3:::{bucket}",
+        "Prefix": "logs/year=!{timestamp:yyyy}/", "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/"})
+    fh.put_record(DeliveryStreamName=name, Record={"Data": b"raw"})
+    objs = _wait_objects(s3, bucket, "logs/")
+    assert len(objs) == 1
+    assert re.fullmatch(rf"logs/year=\d{{4}}/{name}-1-\d{{4}}(-\d{{2}}){{5}}-[0-9a-f-]{{36}}", objs[0]["Key"]), objs
+    assert s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read() == b"raw"
+
+
+def test_firehose_partition_keys_from_lambda(fh, s3, lam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, fn, name = f"fh-lk-{suffix}", f"fh-lk-fn-{suffix}", f"fh-lk-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    handler = (
+        "import base64, json\n"
+        "def handler(event, context):\n"
+        "    out = []\n"
+        "    for r in event['records']:\n"
+        "        doc = json.loads(base64.b64decode(r['data']))\n"
+        "        out.append({'recordId': r['recordId'], 'result': 'Ok', 'data': r['data'],\n"
+        "                    'metadata': {'partitionKeys': {'customer': doc['customer']}}})\n"
+        "    return {'records': out}\n"
+    )
+    arn = _make_processor_fn(lam, fn, handler)
+    fh.create_delivery_stream(DeliveryStreamName=name, ExtendedS3DestinationConfiguration={
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose", "BucketARN": f"arn:aws:s3:::{bucket}",
+        "Prefix": "c=!{partitionKeyFromLambda:customer}/", "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/",
+        "DynamicPartitioningConfiguration": {"Enabled": True},
+        "ProcessingConfiguration": {"Enabled": True, "Processors": [{"Type": "Lambda", "Parameters": [
+            {"ParameterName": "LambdaArn", "ParameterValue": arn}]}]}})
+    try:
+        fh.put_record(DeliveryStreamName=name, Record={"Data": json.dumps({"customer": "acme"})})
+        objs = _wait_objects(s3, bucket, "c=acme/")
+        assert len(objs) == 1, s3.list_objects_v2(Bucket=bucket).get("Contents")
+    finally:
+        fh.delete_delivery_stream(DeliveryStreamName=name)
+        lam.delete_function(FunctionName=fn)

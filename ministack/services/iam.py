@@ -9,6 +9,7 @@ IAM actions:
   CreateUser, GetUser, ListUsers, DeleteUser,
   CreateRole, GetRole, ListRoles, DeleteRole,
   UpdateRoleDescription, PutRolePermissionsBoundary, DeleteRolePermissionsBoundary,
+  PutUserPermissionsBoundary, DeleteUserPermissionsBoundary,
   CreatePolicy, GetPolicy, GetPolicyVersion, ListPolicyVersions, ListPolicies, DeletePolicy,
   CreatePolicyVersion, DeletePolicyVersion,
   AttachRolePolicy, DetachRolePolicy, ListAttachedRolePolicies,
@@ -426,6 +427,7 @@ def _create_user(p):
         "UserId": _gen_id("AIDA"),
         "CreateDate": _now(),
         "Path": path,
+        "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
         "Tags": _extract_tags(p),
     }
@@ -465,6 +467,26 @@ def _list_users(p):
                 f"<ListUsersResult><Users>{members}</Users>"
                 "<IsTruncated>false</IsTruncated></ListUsersResult>",
                 ns="iam")
+
+
+def _put_user_permissions_boundary(p):
+    name = _p(p, "UserName")
+    user = _users.get(name)
+    if not user:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    user["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
+    return _xml(200, "PutUserPermissionsBoundaryResponse", "", ns="iam")
+
+
+def _delete_user_permissions_boundary(p):
+    name = _p(p, "UserName")
+    user = _users.get(name)
+    if not user:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    user["PermissionsBoundary"] = None
+    return _xml(200, "DeleteUserPermissionsBoundaryResponse", "", ns="iam")
 
 
 def _delete_user(p):
@@ -2945,11 +2967,20 @@ def _user_xml(name):
             for t in u["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
+    boundary_xml = ""
+    if u.get("PermissionsBoundary"):
+        boundary_xml = (
+            "<PermissionsBoundary>"
+            "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
+            f"<PermissionsBoundaryArn>{u['PermissionsBoundary']}</PermissionsBoundaryArn>"
+            "</PermissionsBoundary>"
+        )
     return (f"<UserName>{u['UserName']}</UserName>"
             f"<UserId>{u['UserId']}</UserId>"
             f"<Arn>{u['Arn']}</Arn>"
             f"<Path>{u['Path']}</Path>"
             f"<CreateDate>{u['CreateDate']}</CreateDate>"
+            f"{boundary_xml}"
             f"{tags_xml}")
 
 
@@ -3129,6 +3160,8 @@ _IAM_HANDLERS = {
     "UpdateAssumeRolePolicy": _update_assume_role_policy,
     "UpdateRoleDescription": _update_role_description,
     "PutRolePermissionsBoundary": _put_role_permissions_boundary,
+    "PutUserPermissionsBoundary": _put_user_permissions_boundary,
+    "DeleteUserPermissionsBoundary": _delete_user_permissions_boundary,
     "DeleteRolePermissionsBoundary": _delete_role_permissions_boundary,
     "TagRole": _tag_role,
     "UntagRole": _untag_role,
