@@ -11491,7 +11491,7 @@ def _rds_cluster_param_group_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
-# DocumentDB (AWS::DocDB::*): RDS clusters and instances with Engine docdb
+# DocumentDB (AWS::DocDB::*)
 # ---------------------------------------------------------------------------
 
 _DOCDB_CLUSTER_PROPS = (
