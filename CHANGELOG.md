@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IoT — `RegisterCertificate` under an inactive CA** — a certificate issued by a CA that is not `ACTIVE` registered anyway; it is now refused with `CertificateStateException`, with or without `caCertificatePem`. An unregistered CA and a CA that did not issue the certificate are refused with AWS's codes and messages. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added

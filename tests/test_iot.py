@@ -7242,24 +7242,36 @@ def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client
         _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 
 
+def _assert_register_refused(iot_client, http_status, code, message, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate(**kwargs)
+    assert ei.value.response["Error"]["Code"] == code
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == http_status
+
+
 def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
-    """``caCertificatePem`` naming a CA that was never registered is a
-    ``CertificateValidationException``, and nothing is stored — otherwise the
-    CA id is whatever the caller sent and DescribeCertificate points at a CA
-    that does not exist."""
+    """``caCertificatePem`` naming a CA that was never registered, or was
+    deleted, is a ``CertificateStateException``, and nothing is stored —
+    otherwise the CA id is whatever the caller sent and DescribeCertificate
+    points at a CA that does not exist."""
     from ministack.core.x509_utils import get_certificate_id
 
     ca_pem, _verification, leaf_pem = _generate_ca_and_leaf("never-registered")
-    with pytest.raises(ClientError) as ei:
-        iot_client.register_certificate(
-            certificatePem=leaf_pem, caCertificatePem=ca_pem
+    deleted_pem, _verification, deleted_leaf_pem = _generate_ca_and_leaf("deleted")
+    deleted_id = iot_client.register_ca_certificate(
+        caCertificate=deleted_pem, certificateMode="SNI_ONLY"
+    )["certificateId"]
+    iot_client.delete_ca_certificate(certificateId=deleted_id)
+    for ca, leaf in ((ca_pem, leaf_pem), (deleted_pem, deleted_leaf_pem)):
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "No CA certificate exists for the given certificate",
+            certificatePem=leaf, caCertificatePem=ca,
         )
-    assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
-    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-
-    with pytest.raises(ClientError) as ei:
-        iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaf))
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
@@ -7304,6 +7316,110 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
         for ca_id in (ca_x_id, ca_y_id):
             iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
             iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_certificate_refuses_a_ca_that_is_not_active(iot_client):
+    """A CA set INACTIVE refuses its leaves with or without
+    ``caCertificatePem``, whatever status they ask for and ahead of the
+    duplicate check. A leaf registered before keeps its status,
+    RegisterCertificateWithoutCA still takes the CA's leaves, and the CA set
+    ACTIVE again accepts them."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+        _registration_code(iot_client), count=4
+    )
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    cert_ids = [iot_client.register_certificate(
+        certificatePem=leaves[0], caCertificatePem=ca_pem, setAsActive=True
+    )["certificateId"]]
+    try:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        flags = [{}, {"setAsActive": True}, {"status": "ACTIVE"}, {"status": "INACTIVE"},
+                 {"status": "REVOKED"}]
+        for leaf in leaves[:2]:
+            for kwargs in [{"caCertificatePem": ca_pem, **f} for f in flags] + [{"status": "ACTIVE"}]:
+                _assert_register_refused(
+                    iot_client, 406, "CertificateStateException", "The CA certificate is not active",
+                    certificatePem=leaf, **kwargs,
+                )
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "Not allowed to register certificate with PENDING_ACTIVATION status",
+            certificatePem=leaves[1], caCertificatePem=ca_pem, status="PENDING_ACTIVATION",
+        )
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaves[1]))
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        desc = iot_client.describe_certificate(certificateId=cert_ids[0])["certificateDescription"]
+        assert (desc["status"], desc["caCertificateId"]) == ("ACTIVE", ca_id)
+
+        cert_ids.append(iot_client.register_certificate_without_ca(
+            certificatePem=leaves[2], status="ACTIVE"
+        )["certificateId"])
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="ACTIVE")
+        cert_ids.append(iot_client.register_certificate(
+            certificatePem=leaves[3], caCertificatePem=ca_pem
+        )["certificateId"])
+        desc = iot_client.describe_certificate(certificateId=cert_ids[-1])["certificateDescription"]
+        assert (desc["status"], desc["caCertificateId"]) == ("INACTIVE", ca_id)
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, [ca_id])
+
+
+def test_iot_register_certificate_checks_the_issuer_before_the_ca_status(iot_client):
+    """An unregistered CA is refused first, then a CA that did not issue the
+    leaf (issuer name, then signature), then a CA that is not ACTIVE. Without
+    ``caCertificatePem`` the signature picks the CA, so of two CAs with one
+    subject only the INACTIVE one's leaf is refused."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    subject = _unique("twin-ca")
+    (a_pem, a_key), (b_pem, b_key) = twins = [generate_ca(common_name=subject) for _ in range(2)]
+    other_pem, other_key = generate_ca(common_name=_unique("other-ca"))
+    unregistered_pem, _key = generate_ca(common_name=_unique("unregistered-ca"))
+
+    def leaf(ca_pem, ca_key):
+        return sign_leaf_certificate(
+            ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=_unique("device")
+        )[0]
+
+    ca_ids, cert_ids = [], []
+    try:
+        for ca_pem in (*(pem for pem, _key in twins), other_pem):
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, certificateMode="SNI_ONLY", setAsActive=True,
+            )["certificateId"])
+        iot_client.update_ca_certificate(certificateId=ca_ids[1], newStatus="INACTIVE")
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "No CA certificate exists for the given certificate",
+            certificatePem=leaf(other_pem, other_key), caCertificatePem=unregistered_pem,
+        )
+        _assert_register_refused(
+            iot_client, 400, "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the provided CA certificate.",
+            certificatePem=leaf(other_pem, other_key), caCertificatePem=b_pem,
+        )
+        _assert_register_refused(
+            iot_client, 400, "CertificateValidationException",
+            "The signature of the certificate failed verification against the provided CA certificate.",
+            certificatePem=leaf(a_pem, a_key), caCertificatePem=b_pem,
+        )
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException", "The CA certificate is not active",
+            certificatePem=leaf(b_pem, b_key), status="ACTIVE",
+        )
+        cert_ids.append(iot_client.register_certificate(
+            certificatePem=leaf(a_pem, a_key), status="ACTIVE"
+        )["certificateId"])
+        desc = iot_client.describe_certificate(certificateId=cert_ids[0])["certificateDescription"]
+        assert desc["caCertificateId"] == ca_ids[0]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 
 
 def _delete_certificates_and_cas(iot_client, cert_ids, ca_ids):

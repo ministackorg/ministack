@@ -2127,14 +2127,36 @@ def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
 
 
 def _registered_issuer_id(cert_pem: str) -> str | None:
-    """The id of the ACTIVE CA registered in this account/region that signed
-    ``cert_pem``, or None. Several CAs may share a subject, so the signature
-    decides, not the issuer name."""
+    """The id of the registered CA that signed ``cert_pem``, an ACTIVE one first, or None."""
+    issuer_id = None
     for ca in _ca_certificates.values():
-        if ca.get("status") == "ACTIVE" and certificate_is_signed_by(
-            cert_pem, ca.get("certificatePem") or ""
-        ):
-            return ca["certificateId"]
+        if certificate_is_signed_by(cert_pem, ca.get("certificatePem") or ""):
+            if ca.get("status") == "ACTIVE":
+                return ca["certificateId"]
+            issuer_id = issuer_id or ca["certificateId"]
+    return issuer_id
+
+
+def _not_issued_by_error(cert_pem: str, ca_pem: str) -> tuple | None:
+    """400 when ``ca_pem`` did not issue ``cert_pem``, checking the issuer name before the signature."""
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
+    if cert.issuer != ca.subject:
+        return error_response_json(
+            "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the "
+            "provided CA certificate.",
+            400,
+        )
+    if not certificate_is_signed_by(cert_pem, ca_pem):
+        return error_response_json(
+            "CertificateValidationException",
+            "The signature of the certificate failed verification against the "
+            "provided CA certificate.",
+            400,
+        )
     return None
 
 
@@ -2151,12 +2173,12 @@ async def _register_certificate(
     CA reference and takes its status from the plain ``status`` body field
     only — it has no deprecated ``setAsActive``.
 
-    ``caCertificatePem`` must name a CA registered via
+    ``caCertificatePem`` must name an ACTIVE CA registered via
     ``RegisterCACertificate`` in this account/region that really signed the
-    leaf; anything else is a ``CertificateValidationException``. Without it,
-    ``RegisterCertificate`` links the certificate to the registered ACTIVE CA
-    that signed it, as AWS does, so DescribeCertificate names that CA and
-    ListCertificatesByCA lists the certificate. Registering
+    leaf; anything else is refused. Without it, ``RegisterCertificate`` links
+    the certificate to the registered CA that signed it, as AWS does, so
+    DescribeCertificate names that CA and ListCertificatesByCA lists the
+    certificate, and refuses it while that CA is not ACTIVE. Registering
     publishes no JITR event, whatever the CA's ``autoRegistrationStatus``: AWS
     sends that event only from a device connect (see ``_mtls_auto_register``),
     and refuses a registration with status PENDING_ACTIVATION.
@@ -2194,33 +2216,25 @@ async def _register_certificate(
     # fleet, so the claim is verified the way AWS does before anything is
     # stored — the CA has to be registered in this account/region, and it has to
     # be the certificate that actually signed the leaf.
-    ca = None
     if ca_id is not None:
-        ca = _ca_certificates.get(ca_id)
-        if ca is None:
+        if ca_id not in _ca_certificates:
             return error_response_json(
-                "CertificateValidationException",
-                (
-                    f"The CA certificate {ca_id} is not registered in this "
-                    "account and region. Register it with RegisterCACertificate, "
-                    "or use RegisterCertificateWithoutCA."
-                ),
-                400,
+                "CertificateStateException",
+                "No CA certificate exists for the given certificate",
+                406,
             )
-        if not certificate_is_signed_by(cert_pem, ca_pem):
-            return error_response_json(
-                "CertificateValidationException",
-                (
-                    f"The certificate was not signed by CA {ca_id}. "
-                    "caCertificatePem must be the CA certificate that issued "
-                    "certificatePem."
-                ),
-                400,
-            )
+        refused = _not_issued_by_error(cert_pem, ca_pem)
+        if refused is not None:
+            return refused
+    elif not without_ca:
+        ca_id = _registered_issuer_id(cert_pem)
+    # A CA that is not ACTIVE refuses the leaf, ahead of the duplicate check.
+    if ca_id is not None and _ca_certificates[ca_id]["status"] != "ACTIVE":
+        return error_response_json(
+            "CertificateStateException", "The CA certificate is not active", 406
+        )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
-    if ca_id is None and not without_ca:
-        ca_id = _registered_issuer_id(cert_pem)
     record = _certificate_record(
         cert_id, cert_pem, status or ("ACTIVE" if set_active else "INACTIVE"), ca_id
     )
@@ -2476,27 +2490,15 @@ def _verification_certificate_error(
         )
     try:
         cert = x509.load_pem_x509_certificate(verification_pem.encode("utf-8"))
-        ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
     except Exception:
         return error_response_json(
             "InvalidRequestException",
             "Contents of the Verification Certificate are not correct",
             400,
         )
-    if cert.issuer != ca.subject:
-        return error_response_json(
-            "CertificateValidationException",
-            "The issuer of the certificate did not match the subject of the "
-            "provided CA certificate.",
-            400,
-        )
-    if not certificate_is_signed_by(verification_pem, ca_pem):
-        return error_response_json(
-            "CertificateValidationException",
-            "The signature of the certificate failed verification against the "
-            "provided CA certificate.",
-            400,
-        )
+    refused = _not_issued_by_error(verification_pem, ca_pem)
+    if refused is not None:
+        return refused
     common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     if [a.value for a in common_names] != [_registration_code()]:
         return error_response_json(
