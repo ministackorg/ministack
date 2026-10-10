@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Signer — signing material checks in `PutSigningProfile` under `AUTH=true`** — `PutSigningProfile` accepted any certificate ARN, or no `signingMaterial` at all, on every platform; with `AUTH=true` the IoT and FreeRTOS platforms now refuse a profile without `signingMaterial` and a certificate ARN that is malformed, in another region or account, unknown to ACM or not issued, and the Lambda and Notation platforms refuse any `signingMaterial`, with AWS's errors. Contributed by @iot-rocket.
+
 ## [1.5.26] — 2026-10-11
 
 ### Fixed
