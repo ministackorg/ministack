@@ -200,15 +200,15 @@ _retained: dict[str, "_RetainedMessage"] = {}
 class _RetainedMessage:
     __slots__ = ("payload", "properties", "qos", "topic", "ts")
 
-    def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b""):
+    def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b"",
+                 ts: float | None = None):
         self.topic = topic
         self.payload = payload
         self.qos = qos
         # Encoded MQTT 5 property block forwarded to v5 subscribers, empty for
-        # a message published by a 3.1.1 client. Runtime only: properties are
-        # not part of the persisted retained-message state.
+        # a message published by a 3.1.1 client.
         self.properties = properties
-        self.ts = time.time()
+        self.ts = time.time() if ts is None else ts
 
 
 def _broker_get_state() -> dict:
@@ -221,6 +221,8 @@ def _broker_get_state() -> dict:
             "topic": msg.topic,
             "payload": base64.b64encode(msg.payload).decode("ascii"),
             "qos": msg.qos,
+            "properties": base64.b64encode(msg.properties).decode("ascii"),
+            "ts": msg.ts,
         })
     return {"region_scoped": True, "retained": retained_list}
 
@@ -239,7 +241,8 @@ def _broker_restore_state(data: dict | None) -> None:
                 )
         payload = base64.b64decode(entry["payload"])
         qos = entry.get("qos", 0)
-        _retained[topic] = _RetainedMessage(topic, payload, qos)
+        properties = base64.b64decode(entry.get("properties", ""))
+        _retained[topic] = _RetainedMessage(topic, payload, qos, properties, entry.get("ts"))
 
 
 # ---------------------------------------------------------------------------
@@ -8103,6 +8106,19 @@ async def broker_unsubscribe(subscription_id: str) -> None:
                     subs.discard(s)
             if not subs:
                 _subscriptions.pop(filter_, None)
+
+
+def broker_get_retained(account_id: str, region: str, topic: str) -> "_RetainedMessage | None":
+    """The retained message stored for ``topic``, or None."""
+    return _retained.get(_scoped_topic(account_id, region, topic))
+
+
+def broker_list_retained(account_id: str, region: str) -> list[tuple[str, "_RetainedMessage"]]:
+    """``(topic, message)`` for every retained message here, most recently stored first."""
+    prefix = f"{account_id}/{region}/"
+    found = [(k[len(prefix):], m) for k, m in _retained.items() if k.startswith(prefix)]
+    found.sort(key=lambda item: item[1].ts, reverse=True)
+    return found
 
 
 def broker_reset() -> None:

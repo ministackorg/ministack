@@ -4,7 +4,8 @@
 
 Implements the HTTP-side of the AWS IoT Data Plane. The data plane mirrors
 the broker over a small REST surface (``Publish`` is the primary
-operation; ``GetRetainedMessage`` / ``ListRetainedMessages`` are not yet implemented).
+operation; ``GetRetainedMessage`` / ``ListRetainedMessages`` read the broker's
+retained messages).
 
 Routing reaches us either through credential-scope detection (the SDK signs
 requests with the ``iotdata`` scope) or via the host pattern
@@ -16,6 +17,7 @@ which applies account-and-region-scoped topic prefixing transparently.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
@@ -35,6 +37,10 @@ logger = logging.getLogger("iot_data")
 
 # AWS IoT topics: max 7 segments, max 256 UTF-8 bytes total.
 _MAX_TOPIC_BYTES = 256
+
+# ListRetainedMessages page size without maxResults, and the most it allows.
+_RETAINED_PAGE_DEFAULT = 20
+_RETAINED_PAGE_MAX = 200
 
 # HTTPS Publish to a topic starting with "$" is refused unless the topic sits
 # under one of these reserved families. Within them, the device-side jobs,
@@ -120,20 +126,10 @@ async def handle_request(
     if path.startswith("/things/") and path.endswith("/shadow"):
         return await _shadow(method, path, body, qp)
 
-    # Placeholders — return 501 so SDKs that probe these endpoints
-    # get a clear "not implemented" rather than a generic 404.
-    if path == "/retainedMessage":
-        return error_response_json(
-            "InvalidRequestException",
-            "ListRetainedMessages is not yet implemented",
-            501,
-        )
-    if path.startswith("/retainedMessage/"):
-        return error_response_json(
-            "InvalidRequestException",
-            "GetRetainedMessage is not yet implemented",
-            501,
-        )
+    if method == "GET" and path == "/retainedMessage":
+        return _list_retained_messages(qp)
+    if method == "GET" and path.startswith("/retainedMessage/"):
+        return _get_retained_message(path[len("/retainedMessage/"):])
 
     return error_response_json(
         "InvalidRequestException", f"Unsupported iot-data path: {method} {path}", 400
@@ -249,3 +245,91 @@ async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
         )
     # AWS returns 200 with empty body for Publish.
     return 200, {"Content-Type": "application/json"}, b""
+
+
+def _user_properties(properties: bytes) -> bytes:
+    """MQTT 5 user properties as the JSON array AWS returns, or b"" without any."""
+    if not properties:
+        return b""
+    props, _ = _iot_module._decode_properties(properties, 0)
+    pairs = [
+        {value[0]: value[1]}
+        for identifier, value in props
+        if identifier == _iot_module.PROP_USER_PROPERTY
+    ]
+    if not pairs:
+        return b""
+    return json.dumps(pairs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _get_retained_message(raw_topic: str) -> tuple:
+    """``GET /retainedMessage/{topic}``: the retained message stored for the topic."""
+    topic = unquote(raw_topic)
+    if not topic:
+        return error_response_json("InvalidRequestException", "unknown", 400)
+    if "+" in topic or "#" in topic:
+        return error_response_json(
+            "InvalidRequestException", "Invalid topic filter", 400
+        )
+    msg = _iot_module.broker_get_retained(get_account_id(), get_region(), topic)
+    if msg is None:
+        return error_response_json(
+            "ResourceNotFoundException", "Retained message not found", 404
+        )
+    body = {
+        "topic": topic,
+        "qos": msg.qos,
+        "payload": base64.b64encode(msg.payload).decode("ascii"),
+    }
+    user_properties = _user_properties(msg.properties)
+    if user_properties:
+        body["userProperties"] = base64.b64encode(user_properties).decode("ascii")
+    body["lastModifiedTime"] = int(msg.ts * 1000)
+    return json_response(body)
+
+
+def _list_retained_messages(qp: dict) -> tuple:
+    """``GET /retainedMessage``: retained topics, newest first, paged by an offset token."""
+    raw = qp.get("maxResults")
+    try:
+        limit = _RETAINED_PAGE_DEFAULT if raw is None else int(raw)
+    except (TypeError, ValueError):
+        return error_response_json(
+            "InvalidRequestException", f"Invalid maxResults value: {raw}", 400
+        )
+    if not 1 <= limit <= _RETAINED_PAGE_MAX:
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid maxResults value: Invalid max results parameter",
+            400,
+        )
+    start = 0
+    token = qp.get("nextToken")
+    if token:
+        try:
+            raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+            prefix, _, offset = raw_token.partition(":")
+            start = int(offset) if prefix == "retainedmessages" else -1
+        except ValueError:  # binascii.Error and UnicodeDecodeError included
+            start = -1
+        if start < 0:
+            return error_response_json("InvalidRequestException", "unknown", 400)
+    ordered = _iot_module.broker_list_retained(get_account_id(), get_region())
+    body: dict = {
+        "retainedTopics": [
+            {
+                "payloadSize": len(msg.payload),
+                "lastModifiedTime": int(msg.ts * 1000),
+                "topic": topic,
+                "qos": msg.qos,
+            }
+            for topic, msg in ordered[start:start + limit]
+        ],
+        # The last page carries an empty token.
+        "nextToken": "",
+    }
+    if start + limit < len(ordered):
+        body["nextToken"] = base64.urlsafe_b64encode(
+            f"retainedmessages:{start + limit}".encode()
+        ).decode().rstrip("=")
+    return json_response(body)

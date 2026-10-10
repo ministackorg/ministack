@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IoT — retained messages** — `GetRetainedMessage` and `ListRetainedMessages` answered 501 `not yet implemented`; they now return the broker's retained messages (newest first, paged by `maxResults` and `nextToken`, with the user properties of an MQTT 5 publish), and a `PERSIST_STATE=1` restart keeps each message's `lastModifiedTime` and user properties. Contributed by @iot-rocket.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added

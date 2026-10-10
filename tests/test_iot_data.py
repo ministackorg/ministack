@@ -59,6 +59,187 @@ def test_iot_data_publish_accepts_qos_and_retain(iot_data_client):
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
+def _own_account_iot_data(**config):
+    """An iot-data client in a fresh account, so other tests' retained messages stay out of its listings."""
+    return boto3.client(
+        "iot-data",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=f"{uuid.uuid4().int % 10**12:012d}",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}, **config),
+    )
+
+
+def test_get_retained_message_returns_the_retained_publish():
+    client = _own_account_iot_data()
+    payload = bytes(range(256))
+    for topic in ("sensors/bin", "sensors/a b%c/ü"):
+        before = int(time.time() * 1000)
+        client.publish(topic=topic, qos=1, retain=True, payload=payload)
+        after = int(time.time() * 1000)
+        resp = client.get_retained_message(topic=topic)
+        assert resp["topic"] == topic
+        assert resp["payload"] == payload
+        assert resp["qos"] == 1
+        assert before <= resp["lastModifiedTime"] <= after
+        assert "userProperties" not in resp
+
+
+def test_get_retained_message_errors():
+    client = _own_account_iot_data(parameter_validation=False)
+    with pytest.raises(ClientError) as ei:
+        client.get_retained_message(topic="sensors/never")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Message"] == "Retained message not found"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    for topic, message in (
+        ("sensors/+", "Invalid topic filter"),
+        ("sensors/#", "Invalid topic filter"),
+        ("sensors/a+b", "Invalid topic filter"),
+        ("", "unknown"),
+    ):
+        with pytest.raises(ClientError) as ei:
+            client.get_retained_message(topic=topic)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == message
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_retained_message_is_replaced_kept_and_cleared():
+    """A live publish keeps the retained message, a retained one replaces it, an empty one clears it."""
+    client = _own_account_iot_data()
+    client.publish(topic="t", qos=0, retain=True, payload=b"hello")
+    first = client.get_retained_message(topic="t")
+    client.publish(topic="t", qos=1, payload=b"live")
+    client.publish(topic="t", qos=0, payload=b"")
+    kept = client.get_retained_message(topic="t")
+    assert (kept["payload"], kept["qos"]) == (b"hello", 0)
+    assert kept["lastModifiedTime"] == first["lastModifiedTime"]
+
+    time.sleep(0.01)
+    client.publish(topic="t", qos=1, retain=True, payload=b"second")
+    replaced = client.get_retained_message(topic="t")
+    assert (replaced["payload"], replaced["qos"]) == (b"second", 1)
+    assert replaced["lastModifiedTime"] > first["lastModifiedTime"]
+
+    client.publish(topic="t", qos=0, retain=True, payload=b"")
+    with pytest.raises(ClientError) as ei:
+        client.get_retained_message(topic="t")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert client.list_retained_messages()["retainedTopics"] == []
+
+
+def test_list_retained_messages_newest_first_in_pages():
+    client = _own_account_iot_data()
+    for name in ("c", "a", "d", "b"):
+        client.publish(topic=f"order/{name}", qos=1, retain=True, payload=name.encode() * 3)
+        time.sleep(0.01)
+    client.publish(topic="order/a", qos=0, payload=b"live")
+
+    resp = client.list_retained_messages()
+    assert resp["nextToken"] == ""
+    assert [e["topic"] for e in resp["retainedTopics"]] == [
+        "order/b", "order/d", "order/a", "order/c"
+    ]
+    entry = resp["retainedTopics"][0]
+    assert set(entry) == {"topic", "payloadSize", "qos", "lastModifiedTime"}
+    assert (entry["payloadSize"], entry["qos"]) == (3, 1)
+    assert entry["lastModifiedTime"] == client.get_retained_message(
+        topic="order/b")["lastModifiedTime"]
+
+    seen, kwargs = [], {"maxResults": 3}
+    while True:
+        page = client.list_retained_messages(**kwargs)
+        seen.append([e["topic"] for e in page["retainedTopics"]])
+        if not page["nextToken"]:
+            break
+        kwargs["nextToken"] = page["nextToken"]
+    assert seen == [["order/b", "order/d", "order/a"], ["order/c"]]
+
+
+def test_list_retained_messages_pages_by_twenty_without_max_results():
+    client = _own_account_iot_data()
+    for i in range(21):
+        client.publish(topic=f"page/{i:02d}", retain=True, payload=b"p")
+    first = client.list_retained_messages()
+    assert len(first["retainedTopics"]) == 20
+    rest = client.list_retained_messages(nextToken=first["nextToken"])
+    assert [e["topic"] for e in rest["retainedTopics"]] == ["page/00"]
+    assert rest["nextToken"] == ""
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"maxResults": 0}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": 201}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": -1}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": "abc"}, "Invalid maxResults value: abc"),
+        ({"nextToken": "not-a-token"}, "unknown"),
+    ],
+)
+def test_list_retained_messages_rejects_bad_paging(kwargs, message):
+    client = _own_account_iot_data(parameter_validation=False)
+    with pytest.raises(ClientError) as ei:
+        client.list_retained_messages(**kwargs)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_retained_user_properties_and_time_survive_persistence():
+    """User properties come back as AWS's JSON array and survive a restore with lastModifiedTime, per region."""
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+    from ministack.services import iot_data
+
+    account = "123456789012"
+    user_props = iot_module._encode_properties([
+        (iot_module.PROP_CONTENT_TYPE, "text/plain"),
+        (iot_module.PROP_USER_PROPERTY, ("app", "demo")),
+        (iot_module.PROP_USER_PROPERTY, ("k", "v1")),
+        (iot_module.PROP_USER_PROPERTY, ("k", "v2")),
+        (iot_module.PROP_USER_PROPERTY, ("u", "ü")),
+    ])
+    content_type_only = iot_module._encode_properties([(iot_module.PROP_CONTENT_TYPE, "text/plain")])
+
+    async def _get(region, path):
+        set_request_account_id(account)
+        set_request_region(region)
+        status, _headers, body = await iot_data.handle_request("GET", path, {}, b"", {})
+        return status, json.loads(body)
+
+    async def _run():
+        await iot_module.broker_publish(
+            account, "eu-west-1", "dev/props", b"{}", qos=1, retain=True, properties=user_props)
+        await iot_module.broker_publish(
+            account, "eu-west-1", "dev/plain", b"x", retain=True, properties=content_type_only)
+        status, before = await _get("eu-west-1", "/retainedMessage/dev/props")
+        assert status == 200
+        assert base64.b64decode(before["userProperties"]) == (
+            '[{"app":"demo"},{"k":"v1"},{"k":"v2"},{"u":"ü"}]'.encode())
+        assert "userProperties" not in (await _get("eu-west-1", "/retainedMessage/dev/plain"))[1]
+        assert (await _get("eu-west-3", "/retainedMessage"))[1]["retainedTopics"] == []
+
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.broker_reset()
+        assert (await _get("eu-west-1", "/retainedMessage/dev/props"))[0] == 404
+        await asyncio.sleep(0.01)
+        iot_module.load_persisted_state(saved)
+        assert await _get("eu-west-1", "/retainedMessage/dev/props") == (200, before)
+
+    iot_module.broker_reset()
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
 def test_iot_data_publish_rejects_wildcard_topic():
     """Wildcard characters in publish topics must produce a 400."""
     import urllib.request
