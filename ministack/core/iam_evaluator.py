@@ -1178,6 +1178,12 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
     return None
 
 
+def _names_condition_key(policies: list[list[ParsedStatement]], prefix: str) -> bool:
+    """Whether a condition in *policies* uses a key starting with *prefix* (lower case)."""
+    return any(key.lower().startswith(prefix) for stmts in policies for stmt in stmts
+               for block in stmt.conditions.values() if isinstance(block, dict) for key in block)
+
+
 def enforce(access_key_id: str, iam_action: str, service: str,
             region: str, resource_arn: str = "*",
             service_context: dict[str, Any] | None = None) -> EvalResult | AuthError | None:
@@ -1206,6 +1212,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     context = {key.lower(): value for key, value in (service_context or {}).items()}
     # A request that names no tags has no aws:TagKeys.
     context.setdefault("aws:tagkeys", None)
+    if _names_condition_key(principal.policies, "aws:resourcetag/"):
+        from ministack.services.tagging import resource_tags
+        for name, value in (resource_tags(resource_arn) or {}).items():
+            context.setdefault(f"aws:resourcetag/{name}".lower(), value)
     ctx = EvalContext(
         principal_arn=principal.arn,
         principal_type=principal.type,

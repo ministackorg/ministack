@@ -1377,6 +1377,64 @@ class TestRequestTagContext:
         assert (denied is None) is allowed
 
 
+class TestResourceTagCondition:
+    """aws:ResourceTag/* from the tags of the resource a request names."""
+
+    def test_resource_tags_come_from_each_store(self):
+        from ministack.core.responses import get_account_id, get_region
+        from ministack.services import iam as iam_svc
+        from ministack.services import secretsmanager as sm
+        from ministack.services import sns, ssm
+        from ministack.services.tagging import resource_tags
+
+        acct, region = get_account_id(), get_region()
+        topic = f"arn:aws:sns:{region}:{acct}:rt-topic"
+        param = f"arn:aws:ssm:{region}:{acct}:parameter/rt-param"
+        sns._topics[topic] = {"tags": {"env": "dev"}}
+        ssm._tags[param] = {"env": "dev"}
+        secret = sm.create_secret_in_process("rt-secret", "v")
+        sm._secrets["rt-secret"]["Tags"] = [{"Key": "env", "Value": "dev"}]
+        iam_svc._roles["rt-role"] = {"RoleName": "rt-role", "Arn": f"arn:aws:iam::{acct}:role/rt-role",
+                                     "Tags": [{"Key": "env", "Value": "dev"}]}
+        try:
+            for arn in (topic, param, secret, f"arn:aws:iam::{acct}:role/rt-role"):
+                assert resource_tags(arn) == {"env": "dev"}, arn
+            assert resource_tags(f"arn:aws:sns:{region}:{acct}:missing") is None
+            assert resource_tags("arn:aws:s3:::bucket") is None
+            assert resource_tags("*") is None
+        finally:
+            sns._topics.pop(topic, None)
+            ssm._tags.pop(param, None)
+            sm._secrets.pop("rt-secret", None)
+            iam_svc._roles.pop("rt-role", None)
+
+    @pytest.mark.parametrize("condition,resource,allowed", [
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/ENV": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-prod", False),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-missing", False),
+        ({"Null": {"aws:ResourceTag/env": "true"}}, "rt-missing", True),
+    ])
+    def test_read_is_decided_by_the_resource_tags(self, condition, resource, allowed):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-reader") as (key, put_policy), _iam_user("rt-dev", [{"Key": "env", "Value": "dev"}]), \
+                _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*", "Condition": condition}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1",
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/{resource}")
+        assert (denied is None) is allowed
+
+    def test_tags_a_service_supplies_keep_precedence(self):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-ctx") as (key, put_policy), _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*",
+                                                  "Condition": {"StringEquals": {"aws:ResourceTag/env": "dev"}}}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1", service_context={"aws:ResourceTag/env": "dev"},
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/rt-prod")
+        assert denied is None
+
+
 class TestSeededAwsManagedPolicies:
     """The AWS-managed policies CDK, SAM and Serverless attach by their real ARNs
     resolve to a document: the service-role/* path is the only one AWS has for the
