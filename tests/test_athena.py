@@ -9,31 +9,19 @@ import duckdb
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 @pytest.fixture
-def persisted_parquet_store(monkeypatch, tmp_path):
-    """Make a local Parquet file visible to MiniStack's Glue-backed Athena reader."""
-    from ministack.services import s3 as s3mod
+def persisted_parquet_store(s3):
+    """Uploads table data through the S3 API, the way a client stores it on AWS."""
 
-    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    class _Uploader:
+        @staticmethod
+        def _persist_object(bucket, key, body):
+            s3.put_object(Bucket=bucket, Key=key, Body=body)
 
-    def configure(path):
-        request = urllib.request.Request(
-            f"{endpoint}/_ministack/config",
-            data=json.dumps({"athena.ATHENA_DATA_DIR": path}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=5).close()
-
-    configure(str(tmp_path))
-    try:
-        yield s3mod
-    finally:
-        configure(os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3"))
+    return _Uploader()
 
 
 def test_athena_queries_glue_backed_parquet(
@@ -790,11 +778,8 @@ def test_athena_mixed_glue_and_s3_uri(athena, glue, monkeypatch, tmp_path):
     )
     urllib.request.urlopen(req, timeout=5)
 
-    s3mod._persist_object(
-        bucket_name,
-        "tables/users/data.csv",
-        b"id,name\n1,alice\n2,bob"
-    )
+    make_client("s3").put_object(Bucket=bucket_name, Key="tables/users/data.csv",
+                                  Body=b"id,name\n1,alice\n2,bob")
 
     s3mod._persist_object(
         bucket_name,
@@ -860,6 +845,13 @@ def _create_s3_results_bucket(s3):
     s3.create_bucket(Bucket="athena-results")
 
 
+@pytest.fixture(autouse=True)
+def _primary_result_location(athena):
+    """AWS's primary workgroup has no result location until the user sets one."""
+    athena.update_work_group(WorkGroup="primary", ConfigurationUpdates={
+        "ResultConfigurationUpdates": {"OutputLocation": "s3://athena-results/"}})
+
+
 def test_athena_list_and_get_databases_from_glue(athena, glue):
     """ListDatabases / GetDatabase read the Glue Data Catalog, so a catalog client that
     walks databases before tables sees what Glue holds."""
@@ -911,7 +903,8 @@ def _seed_users(monkeypatch, tmp_path, glue, db_name):
         headers={"Content-Type": "application/json"}, method="POST",
     )
     urllib.request.urlopen(req, timeout=5)
-    s3mod._persist_object("athena-results", f"{db_name}/users/data.csv", b"id,email\n1,a@example.com\n2,b@example.com")
+    make_client("s3").put_object(Bucket="athena-results", Key=f"{db_name}/users/data.csv",
+                                  Body=b"id,email\n1,a@example.com\n2,b@example.com")
     glue.create_database(DatabaseInput={"Name": db_name})
     glue.create_table(DatabaseName=db_name, TableInput={
         "Name": "users",
@@ -919,7 +912,7 @@ def _seed_users(monkeypatch, tmp_path, glue, db_name):
             "Columns": [{"Name": "id", "Type": "bigint"}, {"Name": "email", "Type": "string"}],
             "Location": f"s3://athena-results/{db_name}/users/",
         },
-        "Parameters": {"classification": "csv"},
+        "Parameters": {"classification": "csv", "skip.header.line.count": "1"},
     })
 
 
@@ -1082,6 +1075,43 @@ def test_athena_reads_a_parquet_table_created_without_classification(
     assert [row["Data"][0]["VarCharValue"] for row in rows] == ["id", "1", "2"]
 
 
+def test_athena_partitioned_table_types_partitions_and_resolves_qualified_columns(
+    athena, glue, s3, persisted_parquet_store, tmp_path,
+):
+    """Partition keys take their Glue types, and ``db.table.column`` resolves against the table."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket, database = f"athena-partitions-{suffix}", f"partitions_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+    parquet = tmp_path / "event.parquet"
+    with duckdb.connect() as connection:
+        connection.execute("COPY (SELECT 'a' AS note, 1 AS action) TO '%s' (FORMAT PARQUET)" % parquet)
+    persisted_parquet_store._persist_object(
+        bucket, "usage/year=2026/month=04/day=23/event.parquet", parquet.read_bytes(),
+    )
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "usage",
+        "StorageDescriptor": {
+            "Location": f"s3://{bucket}/usage/",
+            "Columns": [{"Name": "note", "Type": "string"}, {"Name": "action", "Type": "int"}],
+        },
+        "PartitionKeys": [
+            {"Name": "year", "Type": "string"},
+            {"Name": "month", "Type": "string"},
+            {"Name": "day", "Type": "string"},
+        ],
+        "Parameters": {"classification": "parquet"},
+    })
+
+    query_id, execution = _run_to_completion(
+        athena, f"SELECT {database}.usage.note, year, month, day FROM {database}.usage", database,
+    )
+    assert execution["Status"]["State"] == "SUCCEEDED", execution["Status"]
+    result = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]
+    assert [cell["VarCharValue"] for cell in result["Rows"][1]["Data"]] == ["a", "2026", "04", "23"]
+    assert [column["Type"] for column in result["ResultSetMetadata"]["ColumnInfo"]] == ["varchar"] * 4
+
+
 # ---- DDL and table-reference parsing (in-process, no server) ----
 
 
@@ -1209,7 +1239,8 @@ def test_table_references_qualified_quoted_and_aliased():
     query = 'SELECT u.id FROM "awsdatacatalog"."acme"."users" u JOIN orders ON u.id = orders.uid'
     refs = _table_references(query)
     assert refs == [
-        _TableReference("acme", "users", query.index('"awsdatacatalog"'), query.index(" u JOIN"), aliased=True),
+        _TableReference("acme", "users", query.index('"awsdatacatalog"'), query.index(" u JOIN"), aliased=True,
+                        catalog="awsdatacatalog"),
         _TableReference(None, "orders", query.index("orders ON"), query.index(" ON u.id"), aliased=False),
     ]
 
@@ -1222,3 +1253,192 @@ def test_table_references_skip_ctes_and_keep_clause_keywords_unaliased():
     assert _table_references("SELECT 1") == []
     assert _table_references("SELECT 1 FROM a.b.c.d") == []
     assert [r.aliased for r in _table_references('SELECT * FROM t AS "x" LIMIT 1')] == [True]
+
+
+def _s3tables_writer(bucket_arn, key_id="test"):
+    """A client-side DuckDB attached to the bucket's Iceberg REST catalog, the way
+    Spark or PyIceberg would write an S3 table; skips when the extensions are unavailable."""
+    from urllib.parse import urlparse
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    parsed = urlparse(endpoint)
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
+        con.execute(f"CREATE SECRET s (TYPE S3, KEY_ID '{key_id}', SECRET 'test', "
+                    f"ENDPOINT '{parsed.hostname}:{parsed.port or 4566}', URL_STYLE 'path', "
+                    f"USE_SSL false, REGION 'us-east-1')")
+        # SigV4 clients carry their account in the Credential scope; DuckDB only signs AWS hosts.
+        credential = f"AWS4-HMAC-SHA256 Credential={key_id}/19700101/us-east-1/s3tables/aws4_request"
+        con.execute(f"CREATE SECRET h (TYPE HTTP, SCOPE '{endpoint}/iceberg', "
+                    f"EXTRA_HTTP_HEADERS MAP {{'Authorization': '{credential}'}})")
+        con.execute(f"ATTACH '{bucket_arn}' AS cat (TYPE ICEBERG, ENDPOINT '{endpoint}/iceberg', "
+                    f"AUTHORIZATION_TYPE 'none')")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        con.close()
+        pytest.skip(f"DuckDB Iceberg REST writes unavailable: {exc}")
+    return con
+
+
+def _athena_rows(athena, query, context, output=None):
+    extra = {"ResultConfiguration": {"OutputLocation": output}} if output else {}
+    query_id = athena.start_query_execution(QueryString=query, QueryExecutionContext=context,
+                                            **extra)["QueryExecutionId"]
+    for _ in range(100):
+        execution = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]
+        if execution["Status"]["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    if execution["Status"]["State"] != "SUCCEEDED":
+        return execution["Status"]["State"], None
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    return "SUCCEEDED", [[d.get("VarCharValue") for d in r["Data"]] for r in rows[1:]]
+
+
+def test_athena_queries_s3_tables_through_s3tablescatalog(athena):
+    """Both documented forms: "s3tablescatalog/<bucket>".ns.table, and the context
+    Catalog s3tablescatalog/<bucket> with an unqualified table. Each bucket reads its own rows."""
+    s3t = boto3.client("s3tables", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    names = {}
+    for label, rows in (("one", "(1, 'apple'), (2, 'pear')"), ("two", "(7, 'plum')")):
+        name = f"ath-s3t-{label}-{suffix}"
+        arn = s3t.create_table_bucket(name=name)["arn"]
+        s3t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+        con = _s3tables_writer(arn)
+        con.execute("CREATE TABLE cat.sales.orders (id INTEGER, item VARCHAR)")
+        con.execute(f"INSERT INTO cat.sales.orders VALUES {rows}")
+        con.close()
+        names[label] = name
+
+    state, rows = _athena_rows(
+        athena, f'SELECT id, item FROM "s3tablescatalog/{names["one"]}"."sales"."orders" ORDER BY id',
+        {"Database": "default"})
+    assert (state, rows) == ("SUCCEEDED", [["1", "apple"], ["2", "pear"]])
+
+    state, rows = _athena_rows(
+        athena, "SELECT o.id, o.item FROM orders o",
+        {"Catalog": f"s3tablescatalog/{names['two']}", "Database": "sales"})
+    assert (state, rows) == ("SUCCEEDED", [["7", "plum"]])
+
+    state, _ = _athena_rows(
+        athena, f'SELECT * FROM "s3tablescatalog/{names["one"]}"."sales"."missing"', {"Database": "default"})
+    assert state == "FAILED"
+
+
+def test_athena_reads_glue_csv_by_position_from_every_visible_object(athena, glue, s3):
+    """S3 objects are read whatever their names, without S3_PERSIST; hidden "_"/"." files and
+    folders are skipped; CSV fields map to the Glue columns by position, a value that does not
+    cast reads as NULL and a missing trailing field as NULL."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, database = f"ath-csv-{suffix}", f"csv_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/part-00000", Body=b"1,alice\n2,bob\n")
+    s3.put_object(Bucket=bucket, Key="t/more/part-00001.csv", Body=b"x,carol\n4\n")
+    s3.put_object(Bucket=bucket, Key="t/_SUCCESS", Body=b"")
+    s3.put_object(Bucket=bucket, Key="t/.part-00000.crc", Body=b"garbage,garbage\n")
+    s3.put_object(Bucket=bucket, Key="t/_temporary/0/part-9", Body=b"9,ghost\n")
+    s3.put_object(Bucket=bucket, Key="other/part-00000", Body=b"8,elsewhere\n")
+    glue.create_database(DatabaseInput={"Name": database})
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "people",
+        "StorageDescriptor": {
+            "Columns": [{"Name": "id", "Type": "int"}, {"Name": "name", "Type": "string"}],
+            "Location": f"s3://{bucket}/t/",
+            "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+                          "Parameters": {"field.delim": ","}},
+        },
+        "Parameters": {"classification": "csv"},
+    })
+    state, rows = _athena_rows(athena, "SELECT id, name FROM people ORDER BY name NULLS LAST",
+                               {"Database": database})
+    assert (state, rows) == ("SUCCEEDED", [["1", "alice"], ["2", "bob"], [None, "carol"], ["4", None]])
+
+
+def test_athena_csv_skip_header_line_count(athena, glue, s3):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, database = f"ath-hdr-{suffix}", f"hdr_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/a.csv", Body=b"id,name\n1,alice\n")
+    glue.create_database(DatabaseInput={"Name": database})
+    for name, params in (("skipped", {"skip.header.line.count": "1"}), ("kept", {})):
+        glue.create_table(DatabaseName=database, TableInput={
+            "Name": name,
+            "StorageDescriptor": {
+                "Columns": [{"Name": "id", "Type": "int"}, {"Name": "name", "Type": "string"}],
+                "Location": f"s3://{bucket}/t/",
+                "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+                              "Parameters": {"field.delim": ","}},
+            },
+            "Parameters": {"classification": "csv", **params},
+        })
+    assert _athena_rows(athena, "SELECT id, name FROM skipped", {"Database": database}) == (
+        "SUCCEEDED", [["1", "alice"]])
+    assert _athena_rows(athena, "SELECT id, name FROM kept ORDER BY name", {"Database": database}) == (
+        "SUCCEEDED", [["1", "alice"], [None, "name"]])
+
+
+def test_athena_s3_tables_query_in_a_non_default_account():
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    kw = dict(endpoint_url=endpoint, region_name="us-east-1",
+              aws_access_key_id="111111111111", aws_secret_access_key="test")
+    s3t, athena = boto3.client("s3tables", **kw), boto3.client("athena", **kw)
+    name = f"ath-s3t-acct-{_uuid_mod.uuid4().hex[:8]}"
+    boto3.client("s3", **kw).create_bucket(Bucket=f"{name}-results")
+    arn = s3t.create_table_bucket(name=name)["arn"]
+    assert ":111111111111:" in arn
+    s3t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+    con = _s3tables_writer(arn, key_id="111111111111")
+    con.execute("CREATE TABLE cat.sales.orders (id INTEGER)")
+    con.execute("INSERT INTO cat.sales.orders VALUES (5)")
+    con.close()
+    assert _athena_rows(athena, "SELECT id FROM orders",
+                        {"Catalog": f"s3tablescatalog/{name}", "Database": "sales"},
+                        output=f"s3://{name}-results/") == ("SUCCEEDED", [["5"]])
+
+
+
+def test_athena_start_query_without_output_location_is_refused():
+    athena = _client("us-east-1")
+    workgroup = f"ath-noout-{_uuid_mod.uuid4().hex[:8]}"
+    athena.create_work_group(Name=workgroup)
+    with pytest.raises(ClientError) as exc:
+        athena.start_query_execution(QueryString="SELECT 1", WorkGroup=workgroup)
+    err = exc.value.response
+    assert err["Error"]["Code"] == "InvalidRequestException"
+    assert err["Error"]["Message"] == ("No output location provided. An output location is required either "
+                                       "through the Workgroup result configuration setting or as an API input.")
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    query_id = athena.start_query_execution(
+        QueryString="SELECT 1", WorkGroup=workgroup,
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"})["QueryExecutionId"]
+    assert query_id
+
+
+def test_athena_reads_avro_tables(athena, glue, s3, tmp_path):
+    path = tmp_path / "rows.avro"
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL avro; LOAD avro;")
+        con.execute(f"COPY (SELECT 1::INT AS id, 'a' AS name UNION ALL SELECT 2, 'b') TO '{path}' (FORMAT avro)")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"DuckDB Avro unavailable: {exc}")
+    finally:
+        con.close()
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, database = f"ath-avro-{suffix}", f"avro_{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/part-00000", Body=path.read_bytes())
+    glue.create_database(DatabaseInput={"Name": database})
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": "rows",
+        "StorageDescriptor": {
+            "Columns": [{"Name": "id", "Type": "int"}, {"Name": "name", "Type": "string"}],
+            "Location": f"s3://{bucket}/t/",
+            "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.serde2.avro.AvroSerDe"},
+        },
+        "Parameters": {"classification": "avro"},
+    })
+    assert _athena_rows(athena, "SELECT id, name FROM rows ORDER BY id", {"Database": database}) == (
+        "SUCCEEDED", [["1", "a"], ["2", "b"]])

@@ -1402,6 +1402,399 @@ def test_iot_jobs_cancel_job_and_delete(iot_client, iot_jobs_data):
 
 
 # ---------------------------------------------------------------------------
+# UpdateJob
+# ---------------------------------------------------------------------------
+
+
+def _patch_job(job_id, payload):
+    """Raw UpdateJob, so botocore's own validation does not get in the way."""
+    return _raw(_IOT_AUTH, "PATCH", f"/jobs/{job_id}", payload)
+
+
+def test_iot_jobs_update_job_replaces_each_member(iot_client, iot_jobs_data):
+    """UpdateJob replaces each given member whole and answers with an empty body."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(
+            jobId=job_id, targets=[thing_arn], document=_DOCUMENT,
+            description="before", timeoutConfig={"inProgressTimeoutInMinutes": 60},
+        )
+        iot_jobs_data.start_next_pending_job_execution(thingName=thing)
+        before = iot_client.describe_job(jobId=job_id)["job"]
+        time.sleep(1.1)
+        req = urllib.request.Request(
+            f"{ENDPOINT}/jobs/{job_id}", data=b'{"description": "after"}',
+            method="PATCH",
+            headers={"Authorization": _IOT_AUTH, "content-type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert (resp.status, resp.read()) == (200, b"")
+        after = iot_client.describe_job(jobId=job_id)["job"]
+        assert after["description"] == "after"
+        assert after["lastUpdatedAt"] > before["lastUpdatedAt"]
+        assert after["jobProcessDetails"] == before["jobProcessDetails"]
+        assert after["timeoutConfig"] == {"inProgressTimeoutInMinutes": 60}
+
+        role = "arn:aws:iam::000000000000:role/presign"
+        rate = {"baseRatePerMinute": 5, "incrementFactor": 2,
+                "rateIncreaseCriteria": {"numberOfNotifiedThings": 10}}
+        abort = {"criteriaList": [{"failureType": "FAILED", "action": "CANCEL",
+                                   "thresholdPercentage": 50,
+                                   "minNumberOfExecutedThings": 3}]}
+        for member, value, stored in (
+            ("presignedUrlConfig", {"roleArn": role, "expiresInSec": 600}, None),
+            ("jobExecutionsRolloutConfig",
+             {"maximumPerMinute": 20, "exponentialRate": rate},
+             {"maximumPerMinute": 20,
+              "exponentialRate": {**rate, "incrementFactor": 2.0}}),
+            # A member given replaces the stored one: the exponentialRate goes.
+            ("jobExecutionsRolloutConfig", {"maximumPerMinute": 30}, None),
+            ("abortConfig", abort, None),
+            ("timeoutConfig", {"inProgressTimeoutInMinutes": 120}, None),
+        ):
+            iot_client.update_job(jobId=job_id, **{member: value})
+            status, body = _raw(_IOT_AUTH, "GET", f"/jobs/{job_id}")
+            assert body["job"][member] == (stored or value), member
+        threshold = body["job"]["abortConfig"]["criteriaList"][0]["thresholdPercentage"]
+        assert isinstance(threshold, float)
+        assert body["job"]["jobProcessDetails"]["numberOfInProgressThings"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_update_job_rejects_invalid_values(iot_client):
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    role = "arn:aws:iam::000000000000:role/presign"
+    rate = {"maximumPerMinute": 20, "exponentialRate": {
+        "baseRatePerMinute": 5, "incrementFactor": 2,
+        "rateIncreaseCriteria": {"numberOfNotifiedThings": 10}}}
+
+    def with_rate(**over):
+        return {"jobExecutionsRolloutConfig": {
+            **rate, "exponentialRate": {**rate["exponentialRate"], **over}}}
+
+    def clause(value, member, rule):
+        return f"Value '{value}' at '{member}' failed to satisfy constraint: Member must {rule}"
+
+    def constraint(value, member, rule):
+        return f"1 validation error detected: {clause(value, member, rule)}"
+
+    abort = "abortConfig.criteriaList.1.member"
+    retry = "jobExecutionsRetryConfig.criteriaList.1.member"
+    cases = [
+        ({}, f"Update Job request for job {job_id} cannot be empty."),
+        ({"timeoutConfig": {"inProgressTimeoutInMinutes": 0}},
+         "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 0."),
+        ({"timeoutConfig": {"inProgressTimeoutInMinutes": 10081}},
+         "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 10081."),
+        ({"timeoutConfig": {}},
+         "Provide valid timeout value, inProgressTimeoutInMinutes cannot be null."),
+        ({"jobExecutionsRolloutConfig": {"maximumPerMinute": 0}},
+         constraint(0, "jobExecutionsRolloutConfig.maximumPerMinute",
+                    "have value greater than or equal to 1")),
+        ({"jobExecutionsRolloutConfig": {"maximumPerMinute": 1001}},
+         constraint(1001, "jobExecutionsRolloutConfig.maximumPerMinute",
+                    "have value less than or equal to 1000")),
+        ({"jobExecutionsRolloutConfig": {}},
+         "Provide MaximumPerMinute value or provide ExponentialRate and "
+         "MaximumPerMinute"),
+        ({"jobExecutionsRolloutConfig": {"exponentialRate": rate["exponentialRate"]}},
+         "Provide MaximumPerMinute value when ExponentialRate is defined"),
+        (with_rate(baseRatePerMinute=50),
+         "Exponential rollout baseRatePerMinute should be less than maximumPerMinute."),
+        (with_rate(incrementFactor=5.1),
+         constraint(5.1, "jobExecutionsRolloutConfig.exponentialRate.incrementFactor",
+                    "have value less than or equal to 5")),
+        (with_rate(rateIncreaseCriteria={}),
+         "Provide either NumberOfNotifiedThings or NumberOfSucceededThings when "
+         "RateIncreaseCriteria is defined"),
+        (with_rate(rateIncreaseCriteria={"numberOfNotifiedThings": 10,
+                                         "numberOfSucceededThings": 5}),
+         "Provide only one of NumberOfNotifiedThings or NumberOfSucceededThings when "
+         "RateIncreaseCriteria is defined"),
+        ({"abortConfig": {"criteriaList": [{"failureType": "BAD", "action": "CANCEL",
+                                            "thresholdPercentage": 50,
+                                            "minNumberOfExecutedThings": 3}]}},
+         constraint("BAD", f"{abort}.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]")),
+        ({"abortConfig": {"criteriaList": [{"failureType": "FAILED", "action": "CANCEL",
+                                            "thresholdPercentage": 101,
+                                            "minNumberOfExecutedThings": 3}]}},
+         constraint(101.0, f"{abort}.thresholdPercentage",
+                    "have value less than or equal to 100")),
+        ({"abortConfig": {"criteriaList": []}},
+         constraint("[]", "abortConfig.criteriaList",
+                    "have length greater than or equal to 1")),
+        ({"jobExecutionsRetryConfig": {"criteriaList": [
+            {"failureType": "REJECTED", "numberOfRetries": 0}]}},
+         constraint("REJECTED", f"{retry}.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED]")),
+        ({"jobExecutionsRetryConfig": {"criteriaList": [
+            {"failureType": "FAILED", "numberOfRetries": 11}]}},
+         constraint(11, f"{retry}.numberOfRetries", "have value less than or equal to 10")),
+        ({"jobExecutionsRetryConfig": {"criteriaList": [
+            {"failureType": t, "numberOfRetries": 1} for t in ("FAILED", "TIMED_OUT", "ALL")
+        ]}},
+         constraint("[RetryCriteria(failureType=FAILED, numberOfRetries=1), "
+                    "RetryCriteria(failureType=TIMED_OUT, numberOfRetries=1), "
+                    "RetryCriteria(failureType=ALL, numberOfRetries=1)]",
+                    "jobExecutionsRetryConfig.criteriaList",
+                    "have length less than or equal to 2")),
+        ({"presignedUrlConfig": {"roleArn": role, "expiresInSec": 59}},
+         constraint(59, "presignedUrlConfig.expiresInSec",
+                    "have value greater than or equal to 60")),
+        ({"presignedUrlConfig": {"roleArn": "short", "expiresInSec": 600}},
+         "Given role short is invalid."),
+        ({"description": "x" * 2029},
+         constraint("x" * 2029, "description", "have length less than or equal to 2028")),
+        ({"description": "a\u0001b"},
+         constraint("a\u0001b", "description",
+                    r"satisfy regular expression pattern: [^\p{C}]+")),
+        ({"jobExecutionsRolloutConfig": {"maximumPerMinute": 0},
+          "presignedUrlConfig": {"roleArn": role, "expiresInSec": 59}},
+         "2 validation errors detected: Value '0' at "
+         "'jobExecutionsRolloutConfig.maximumPerMinute' failed to satisfy constraint: "
+         "Member must have value greater than or equal to 1; Value '59' at "
+         "'presignedUrlConfig.expiresInSec' failed to satisfy constraint: Member must "
+         "have value greater than or equal to 60"),
+        # The same order whatever order the request sends the members in.
+        ({"abortConfig": {"criteriaList": [{"minNumberOfExecutedThings": 3,
+                                            "thresholdPercentage": 50,
+                                            "failureType": "BAD", "action": "CANCEL"}]},
+          "presignedUrlConfig": {"roleArn": role, "expiresInSec": 59},
+          "jobExecutionsRetryConfig": {"criteriaList": [
+              {"failureType": "FAILED", "numberOfRetries": 11}]},
+          "jobExecutionsRolloutConfig": {"maximumPerMinute": 0}},
+         "4 validation errors detected: " + "; ".join([
+             clause(0, "jobExecutionsRolloutConfig.maximumPerMinute",
+                    "have value greater than or equal to 1"),
+             clause(59, "presignedUrlConfig.expiresInSec",
+                    "have value greater than or equal to 60"),
+             clause(11, f"{retry}.numberOfRetries", "have value less than or equal to 10"),
+             clause("BAD", f"{abort}.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]"),
+         ])),
+        ({"abortConfig": {"criteriaList": [{"failureType": "BAD", "action": "BAD",
+                                            "thresholdPercentage": 101,
+                                            "minNumberOfExecutedThings": 0}]}},
+         "4 validation errors detected: " + "; ".join([
+             clause(0, f"{abort}.minNumberOfExecutedThings",
+                    "have value greater than or equal to 1"),
+             clause("BAD", f"{abort}.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]"),
+             clause("BAD", f"{abort}.action", "satisfy enum value set: [CANCEL]"),
+             clause(101.0, f"{abort}.thresholdPercentage",
+                    "have value less than or equal to 100"),
+         ])),
+    ]
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        before = iot_client.describe_job(jobId=job_id)["job"]
+        for payload, message in cases:
+            status, body = _patch_job(job_id, payload)
+            assert (status, body["message"]) == (400, message), payload
+        assert iot_client.describe_job(jobId=job_id)["job"] == before
+
+        # The request checks answer before the job is looked up.
+        assert _patch_job("bad.id", {"description": "x"})[1]["message"] == constraint(
+            "bad.id", "jobId", "satisfy regular expression pattern: [a-zA-Z0-9_-]+")
+        missing = _unique("job")
+        assert _patch_job(missing, {})[1]["message"] == (
+            f"Update Job request for job {missing} cannot be empty.")
+        status, body = _patch_job(missing, {"description": "x"})
+        assert (status, body["message"]) == (404, f"Job {missing} cannot be found.")
+
+        # CreateJob refuses a bad timeout with the same message.
+        status, body = _raw(_IOT_AUTH, "PUT", f"/jobs/{missing}", {
+            "targets": [thing_arn], "document": _DOCUMENT,
+            "timeoutConfig": {"inProgressTimeoutInMinutes": 0}})
+        assert (status, body["message"]) == (
+            400, "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 0.")
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_update_job_only_while_in_progress(iot_client, iot_jobs_data):
+    """A CANCELED or COMPLETED job, or one in another account, is not updated."""
+    thing = _unique("jobs-thing")
+    canceled, done = _unique("job"), _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=canceled, targets=[thing_arn], document=_DOCUMENT)
+        iot_client.cancel_job(jobId=canceled)
+        iot_client.create_job(jobId=done, targets=[thing_arn], document=_DOCUMENT)
+        iot_jobs_data.start_next_pending_job_execution(thingName=thing)
+        iot_jobs_data.update_job_execution(thingName=thing, jobId=done, status="SUCCEEDED")
+        for job_id, status in ((canceled, "CANCELED"), (done, "COMPLETED")):
+            assert iot_client.describe_job(jobId=job_id)["job"]["status"] == status
+            for payload in ({"description": "late"},
+                            {"timeoutConfig": {"inProgressTimeoutInMinutes": 5}}):
+                with pytest.raises(ClientError) as ei:
+                    iot_client.update_job(jobId=job_id, **payload)
+                assert _error(ei) == (
+                    400, "InvalidRequestException",
+                    f"Job {job_id} in status {status} cannot be updated.",
+                )
+        with pytest.raises(ClientError) as ei:
+            _account_client("iot", "222222222222").update_job(
+                jobId=done, description="x")
+        assert _error(ei) == (
+            404, "ResourceNotFoundException", f"Job {done} cannot be found.")
+    finally:
+        _cleanup(iot_client, jobs=[canceled, done], things=[thing])
+
+
+def test_iot_jobs_update_job_retry_config_only_drops_to_zero(iot_client):
+    thing = _unique("jobs-thing")
+    plain, single, with_retry = _unique("job"), _unique("job"), _unique("job")
+
+    def retry(*criteria):
+        return {"criteriaList": [
+            {"failureType": failure, "numberOfRetries": number}
+            for failure, number in criteria]}
+
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=plain, targets=[thing_arn], document=_DOCUMENT)
+        iot_client.create_job(jobId=single, targets=[thing_arn], document=_DOCUMENT,
+                              jobExecutionsRetryConfig=retry(("FAILED", 2)))
+        iot_client.create_job(
+            jobId=with_retry, targets=[thing_arn], document=_DOCUMENT,
+            timeoutConfig={"inProgressTimeoutInMinutes": 10},
+            jobExecutionsRetryConfig=retry(("FAILED", 2), ("TIMED_OUT", 3)),
+        )
+        for job_id, config, message in (
+            (plain, retry(("FAILED", 2)),
+             "The number of retries cannot be updated to any number other than 0."),
+            (plain, retry(("FAILED", 0)),
+             "RetryConfig cannot be updated if the job has no RetryConfig defined "
+             "during creation."),
+            (with_retry, retry(("FAILED", 1)),
+             "The number of retries cannot be updated to any number other than 0."),
+            (single, retry(("TIMED_OUT", 0)),
+             "FailureTypes must match existing FailureTypes defined in RetryConfig."),
+            (single, retry(("FAILED", 0), ("TIMED_OUT", 0)),
+             "FailureTypes must match existing FailureTypes defined in RetryConfig."),
+            (with_retry, retry(("FAILED", 0)),
+             "FailureTypes must match existing FailureTypes defined in RetryConfig."),
+            (with_retry, retry(("FAILED", 0), ("ALL", 0)),
+             "A retryCriteria with failure type ALL must be used by itself."),
+        ):
+            with pytest.raises(ClientError) as ei:
+                iot_client.update_job(jobId=job_id, jobExecutionsRetryConfig=config)
+            assert _error(ei) == (400, "InvalidRequestException", message), config
+
+        # The same failure types in any order; stored as sent.
+        both = retry(("TIMED_OUT", 0), ("FAILED", 0))
+        iot_client.update_job(jobId=with_retry, jobExecutionsRetryConfig=both)
+        job = iot_client.describe_job(jobId=with_retry)["job"]
+        assert job["jobExecutionsRetryConfig"] == both
+    finally:
+        _cleanup(iot_client, jobs=[plain, single, with_retry], things=[thing])
+
+
+def test_iot_jobs_update_job_timeout_reaches_executions_that_start_later(
+    iot_client, iot_jobs_data
+):
+    """A new timeout reaches later starts; a running execution keeps its own."""
+    things = [_unique("jobs-thing") for _ in range(2)]
+    job_id = _unique("job")
+
+    def seconds_left(thing):
+        execution = iot_jobs_data.describe_job_execution(
+            thingName=thing, jobId=job_id)["execution"]
+        return execution.get("approximateSecondsBeforeTimedOut")
+
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              timeoutConfig={"inProgressTimeoutInMinutes": 60})
+        iot_jobs_data.start_next_pending_job_execution(thingName=things[0])
+        iot_client.update_job(jobId=job_id,
+                              timeoutConfig={"inProgressTimeoutInMinutes": 120})
+        iot_jobs_data.start_next_pending_job_execution(thingName=things[1])
+        assert 3500 < seconds_left(things[0]) <= 3600
+        assert 7100 < seconds_left(things[1]) <= 7200
+        iot_client.update_job(jobId=job_id,
+                              timeoutConfig={"inProgressTimeoutInMinutes": 30})
+        assert 3500 < seconds_left(things[0]) <= 3600
+        assert 7100 < seconds_left(things[1]) <= 7200
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+def test_iot_jobs_update_job_timeout_on_a_continuous_job(iot_client, iot_jobs_data):
+    """A running execution stays without a timeout; a later joiner gets the new one."""
+    group = _unique("jobs-group")
+    early, late = _unique("jobs-thing"), _unique("jobs-thing")
+    job_id = _unique("job")
+
+    def seconds_left(thing):
+        execution = iot_jobs_data.describe_job_execution(
+            thingName=thing, jobId=job_id)["execution"]
+        return execution.get("approximateSecondsBeforeTimedOut")
+
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)["thingGroupArn"]
+        for thing in (early, late):
+            _create_thing(iot_client, thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=early)
+        iot_client.create_job(jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+                              targetSelection="CONTINUOUS")
+        iot_jobs_data.start_next_pending_job_execution(thingName=early)
+        iot_client.update_job(jobId=job_id,
+                              timeoutConfig={"inProgressTimeoutInMinutes": 20})
+        assert seconds_left(early) is None
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=late)
+        iot_jobs_data.start_next_pending_job_execution(thingName=late)
+        assert 1100 < seconds_left(late) <= 1200
+        iot_client.update_job(jobId=job_id,
+                              timeoutConfig={"inProgressTimeoutInMinutes": 40})
+        assert seconds_left(early) is None
+        assert 1100 < seconds_left(late) <= 1200
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[early, late], groups=[group])
+
+
+def test_iot_jobs_update_job_survives_persistence():
+    """Updated members and a kept timeout survive get_state / load_persisted_state."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    try:
+        with request_scope("123456789012", "us-east-1"):
+            now = iot_module._jobs_now_ms()
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "targets": [], "targetSelection": "SNAPSHOT",
+                "status": "IN_PROGRESS", "document": "{}", "snapshotted": True,
+                "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+            }
+            iot_module._job_executions[("t1", "j1")] = {
+                "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+                "statusDetails": {}, "queuedAt": now, "startedAt": now,
+                "lastUpdatedAt": now, "executionNumber": 1, "versionNumber": 2,
+            }
+            status, _, body = iot_module._update_job("j1", {
+                "description": "d", "timeoutConfig": {"inProgressTimeoutInMinutes": 9}})
+            assert (status, body) == (200, b"")
+            state = iot_module.get_state()
+            iot_module.reset()
+            iot_module.load_persisted_state(state)
+            job = iot_module._jobs["j1"]
+            assert job["description"] == "d"
+            assert job["timeoutConfig"] == {"inProgressTimeoutInMinutes": 9}
+            execution = iot_module._job_executions[("t1", "j1")]
+            assert iot_module._jobs_seconds_before_timeout(execution) == 60
+    finally:
+        iot_module.reset()
+
+
+# ---------------------------------------------------------------------------
 # CancelJob with in-flight executions + control-plane version conflicts
 # ---------------------------------------------------------------------------
 

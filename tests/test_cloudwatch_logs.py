@@ -259,6 +259,64 @@ def test_logs_metric_filter(logs):
     assert not any(f["filterName"] == "error-count" for f in resp2.get("metricFilters", []))
 
 
+def _put_metric_filters_for_query(logs):
+    """Filters a (<ns>A/Errors), b (<ns>B/Errors) and c (<ns>A/Latency) on one new group."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group, ns = f"/intg/metricfilter-query/{uid}", f"Query{uid}"
+    logs.create_log_group(logGroupName=group)
+    for name, suffix, metric in (("a", "A", "Errors"), ("b", "B", "Errors"), ("c", "A", "Latency")):
+        logs.put_metric_filter(
+            logGroupName=group, filterName=f"mf-{uid}-{name}", filterPattern="ERROR",
+            metricTransformations=[{"metricName": metric, "metricNamespace": ns + suffix,
+                                    "metricValue": "1"}],
+        )
+    return group, ns, uid
+
+
+def test_logs_describe_metric_filters_by_metric(logs):
+    group, ns, uid = _put_metric_filters_for_query(logs)
+
+    def names(**params):
+        return sorted(f["filterName"].rsplit("-", 1)[-1]
+                      for f in logs.describe_metric_filters(**params)["metricFilters"]
+                      if f["filterName"].startswith(f"mf-{uid}-"))
+
+    assert names(metricNamespace=ns + "A", metricName="Errors") == ["a"]
+    assert names(metricNamespace=ns + "A", metricName="Latency") == ["c"]
+    assert names(metricNamespace=ns, metricName="Errors") == []
+    assert names(metricNamespace=ns + "A", metricName="errors") == []
+    # The name prefix applies only together with logGroupName.
+    assert names(logGroupName=group, filterNamePrefix=f"mf-{uid}-a") == ["a"]
+    assert names(filterNamePrefix=f"mf-{uid}-a") == ["a", "b", "c"]
+    assert names(metricNamespace=ns + "A", metricName="Errors", filterNamePrefix=f"mf-{uid}-c") == ["a"]
+
+
+@pytest.mark.parametrize("params,message", [
+    ({"metricNamespace": "QueryA"},
+     "Describe Metric Filters request must contain both MetricName and MetricNamespace"),
+    ({"metricName": "Errors"},
+     "Describe Metric Filters request must contain both MetricName and MetricNamespace"),
+    ({"metricNamespace": "QueryA", "metricName": "Errors", "logGroupName": True},
+     "Describe Metric Filters request must contain either logGroupName or metricName and metricNamespace"),
+], ids=["namespace-only", "name-only", "with-log-group"])
+def test_logs_describe_metric_filters_metric_parameters(logs, params, message):
+    group, _, _ = _put_metric_filters_for_query(logs)
+    if params.get("logGroupName"):
+        params = {**params, "logGroupName": group}
+    with pytest.raises(ClientError) as exc:
+        logs.describe_metric_filters(**params)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def test_logs_delete_log_group_removes_its_metric_filters(logs):
+    group, ns, _ = _put_metric_filters_for_query(logs)
+    logs.delete_log_group(logGroupName=group)
+    assert logs.describe_metric_filters(metricNamespace=ns + "A", metricName="Errors")["metricFilters"] == []
+    logs.create_log_group(logGroupName=group)
+    assert logs.describe_metric_filters(logGroupName=group)["metricFilters"] == []
+
+
 def test_logs_metric_filters_are_region_scoped():
     group = f"/intg/metricfilter-region/{_uuid_mod.uuid4().hex[:8]}"
     east = _regional_client("logs", "us-east-1")

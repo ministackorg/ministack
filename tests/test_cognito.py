@@ -5281,6 +5281,186 @@ def test_cognito_username_attributes_lookup_by_email(cognito_idp):
     assert user["Username"] == real_username
 
 
+@pytest.mark.parametrize("alias, value", [
+    ("email", "sub-user@example.com"),
+    ("phone_number", "+15555550123"),
+])
+def test_cognito_username_attributes_admin_create_user_username_is_sub(cognito_idp, alias, value):
+    """In a UsernameAttributes pool the generated Username is the user's sub."""
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"UsernameIsSub-{alias}", UsernameAttributes=[alias],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    user = cognito_idp.admin_create_user(
+        UserPoolId=pid, Username=value, MessageAction="SUPPRESS",
+    )["User"]
+    attrs = {a["Name"]: a["Value"] for a in user["Attributes"]}
+    sub = attrs["sub"]
+    assert user["Username"] == sub
+    assert attrs[alias] == value
+    for lookup in (value, sub):
+        assert cognito_idp.admin_get_user(UserPoolId=pid, Username=lookup)["Username"] == sub
+    listed = cognito_idp.list_users(UserPoolId=pid, Filter=f'username = "{sub}"')["Users"]
+    assert [u["Username"] for u in listed] == [sub]
+    assert cognito_idp.list_users(UserPoolId=pid, Filter=f'username = "{value}"')["Users"] == []
+
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username=value, Password="StrongPass1!", Permanent=True,
+    )
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": value, "PASSWORD": "StrongPass1!"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(tokens["IdToken"])["cognito:username"] == sub
+    assert _decode_jwt_claims(tokens["AccessToken"])["username"] == sub
+    assert cognito_idp.get_user(AccessToken=tokens["AccessToken"])["Username"] == sub
+
+
+def test_cognito_username_attributes_sign_up_username_is_sub(cognito_idp):
+    """SignUp in a UsernameAttributes pool stores the email as an alias and the sub as Username."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="SignUpUsernameIsSub", UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    email = "signup-sub@example.com"
+    sub = cognito_idp.sign_up(ClientId=cid, Username=email, Password="StrongPass1!")["UserSub"]
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username=email)
+    assert user["Username"] == sub
+    assert {a["Name"]: a["Value"] for a in user["UserAttributes"]}["email"] == email
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username=email, Password="StrongPass1!")
+    assert exc.value.response["Error"]["Code"] == "UsernameExistsException"
+    resent = cognito_idp.resend_confirmation_code(ClientId=cid, Username=email)
+    assert resent["CodeDeliveryDetails"]["AttributeName"] == "email"
+
+    cognito_idp.confirm_sign_up(ClientId=cid, Username=email, ConfirmationCode="123456")
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": email, "PASSWORD": "StrongPass1!"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(tokens["IdToken"])["cognito:username"] == sub
+    assert cognito_idp.forgot_password(ClientId=cid, Username=email)["CodeDeliveryDetails"]
+
+
+@pytest.mark.parametrize("attributes, refused, accepted, message", [
+    (["email"], ["plain-name", "a@", "a@@b", "+15555550123", "a@b\n"], ["a@b"], "Username should be an email."),
+    (["phone_number"], ["plain-name", "+12", "+1234x", "+1234567890123456789"], ["+123", "+123456789012345678"],
+     "Username should be a phone number."),
+    (["email", "phone_number"], ["plain-name", "@example.com", "+12"], ["a@b", "+123"],
+     "Username should be either an email or a phone number."),
+], ids=["email", "phone", "both"])
+def test_cognito_username_attributes_refuse_other_usernames(cognito_idp, attributes, refused, accepted, message):
+    """A UsernameAttributes pool refuses a Username that is not one of its sign-in attributes."""
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"UsernameFormat-{len(attributes)}", UsernameAttributes=attributes,
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+    for username in refused:
+        for call in (
+            lambda: cognito_idp.admin_create_user(UserPoolId=pid, Username=username, MessageAction="SUPPRESS"),
+            lambda: cognito_idp.sign_up(ClientId=cid, Username=username, Password="StrongPass1!"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+            assert exc.value.response["Error"]["Message"] == message
+    for username in accepted:
+        user = cognito_idp.admin_create_user(UserPoolId=pid, Username=username, MessageAction="SUPPRESS")["User"]
+        # RESEND names the user by its sign-in attribute; the generated Username is refused.
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.admin_create_user(UserPoolId=pid, Username=user["Username"], MessageAction="RESEND")
+        assert exc.value.response["Error"]["Message"] == message
+    assert len(cognito_idp.list_users(UserPoolId=pid)["Users"]) == len(accepted)
+
+
+def test_cognito_admin_create_user_and_sign_up_refuse_a_sub_attribute(cognito_idp):
+    """sub is not writable: AdminCreateUser and SignUp refuse it in every kind of pool."""
+    for options, username in (
+        ({"UsernameAttributes": ["email"]}, "subattr@example.com"),
+        ({"AliasAttributes": ["email"]}, "subattr-alias"),
+        ({}, "subattr-plain"),
+    ):
+        pid = cognito_idp.create_user_pool(PoolName="SubAttributePool", **options)["UserPool"]["Id"]
+        cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+        supplied = [{"Name": "sub", "Value": str(_uuid_mod.uuid4())}]
+        for call in (
+            lambda: cognito_idp.admin_create_user(
+                UserPoolId=pid, Username=username, MessageAction="SUPPRESS", UserAttributes=supplied),
+            lambda: cognito_idp.sign_up(
+                ClientId=cid, Username=username, Password="StrongPass1!", UserAttributes=supplied),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+            assert exc.value.response["Error"]["Message"] == "Cannot modify the non-mutable attribute sub"
+        assert cognito_idp.list_users(UserPoolId=pid)["Users"] == []
+
+
+@pytest.mark.parametrize("attributes, username, name, value, message", [
+    (["email"], "m1@example.com", "email", "M1@example.com",
+     "User email should be empty or same as username, since username attribute is email."),
+    (["phone_number"], "+15555550101", "phone_number", "+15555550102",
+     "User phone number should be empty or same as username, since username attribute is phone_number."),
+    (["email", "phone_number"], "m4@example.com", "email", "m5@example.com",
+     "User email should be empty or same as username, since username attribute is email."),
+    (["email", "phone_number"], "m6@example.com", "phone_number", "+15555550103", None),
+    (["email", "phone_number"], "+15555550104", "email", "m7@example.com", None),
+], ids=["email", "phone", "both-email", "both-email-with-phone", "both-phone-with-email"])
+def test_cognito_username_attributes_alias_attribute_must_match_username(
+    cognito_idp, attributes, username, name, value, message,
+):
+    """The attribute a UsernameAttributes Username registers as may be omitted or equal it, nothing else."""
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"AliasMatch-{len(attributes)}", UsernameAttributes=attributes,
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+    given = [{"Name": name, "Value": value}]
+    for call in (
+        lambda: cognito_idp.admin_create_user(
+            UserPoolId=pid, Username=username, MessageAction="SUPPRESS", UserAttributes=given),
+        lambda: cognito_idp.sign_up(
+            ClientId=cid, Username=username.replace("m", "s", 1).replace("+1555", "+1556"),
+            Password="StrongPass1!", UserAttributes=given),
+    ):
+        if message is None:
+            call()
+            continue
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == message
+    assert len(cognito_idp.list_users(UserPoolId=pid)["Users"]) == (2 if message is None else 0)
+
+
+def test_cognito_username_attributes_persisted_legacy_username_still_resolves(_enable_persistence):
+    """A persisted UsernameAttributes user whose Username is not its sub keeps resolving."""
+    mod = _cognito_module()
+    mod.reset()
+    try:
+        pid = json.loads(mod._create_user_pool(
+            {"PoolName": "LegacyUsernamePool", "UsernameAttributes": ["email"]})[2])["UserPool"]["Id"]
+        user = json.loads(mod._admin_create_user(
+            {"UserPoolId": pid, "Username": "legacy@example.com", "MessageAction": "SUPPRESS"})[2])["User"]
+        sub = {a["Name"]: a["Value"] for a in user["Attributes"]}["sub"]
+        legacy = str(_uuid_mod.uuid4())
+        users = mod._user_pools[pid]["_users"]
+        users[legacy] = users.pop(user["Username"])
+        users[legacy]["Username"] = legacy
+
+        _cognito_round_trip(mod)
+
+        for lookup in ("legacy@example.com", sub, legacy):
+            body = mod._admin_get_user({"UserPoolId": pid, "Username": lookup})[2]
+            assert json.loads(body)["Username"] == legacy
+    finally:
+        mod.reset()
+
+
 def test_cognito_admin_delete_user_by_email_alias(cognito_idp):
     """AdminDeleteUser must delete the user that the alias resolves to. In a
     UsernameAttributes pool the "_users" key is a generated UUID, so a delete
@@ -9223,6 +9403,26 @@ def test_cognito_presignup_trigger_fires_on_plain_signup(cognito_idp, lam):
 
     cognito_idp.delete_user_pool(UserPoolId=pid)
     lam.delete_function(FunctionName=fname)
+
+
+def test_cognito_presignup_event_username_is_sub_in_username_attributes_pool(cognito_idp, lam):
+    """The PreSignUp event's userName is the generated sub, not the email signed up with."""
+    fn_arn = _create_lambda(lam, f"presignup-sub-{_uuid_mod.uuid4().hex[:8]}", (
+        "def handler(event, context):\n"
+        "    raise Exception('userName=' + event['userName'])\n"
+    ))
+    pid = cognito_idp.create_user_pool(
+        PoolName="PreSignUpUsernameIsSub", UsernameAttributes=["email"],
+        LambdaConfig={"PreSignUp": fn_arn},
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username="presignup-sub@example.com", Password="Passw0rd!x")
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    user_name = exc.value.response["Error"]["Message"].split("userName=", 1)[1][:36]
+    assert str(_uuid_mod.UUID(user_name)) == user_name
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fn_arn.rsplit(":", 1)[-1])
 
 
 def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():

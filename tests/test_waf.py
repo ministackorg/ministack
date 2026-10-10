@@ -843,3 +843,19 @@ def test_waf_list_resources_for_web_acl(wafv2):
         WebACLArn=acl_arn, ResourceType="APPLICATION_LOAD_BALANCER"
     )
     assert resource_arn in list_resp.get("ResourceArns", [])
+
+
+def test_wafv2_get_web_acl_validates_id_shape_before_existence(wafv2):
+    """AWS validates the Id shape before lookup — evidence: real AWS wire
+    capture answered ValidationException listing the failed constraints."""
+    from botocore.exceptions import ClientError
+
+    with pytest.raises(ClientError) as exc:
+        wafv2.get_web_acl(Name="nope", Scope="REGIONAL", Id="not-a-uuid")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    with pytest.raises(ClientError) as exc:
+        wafv2.get_web_acl(
+            Name="nope", Scope="REGIONAL", Id=str(_uuid_mod.uuid4())
+        )
+    assert exc.value.response["Error"]["Code"] == "WAFNonexistentItemException"

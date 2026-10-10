@@ -70,6 +70,12 @@ def reset() -> None:
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
+    """Route a device-plane request, then publish the job events it raised."""
+    async with _iot_module.publishing_events():
+        return await _route_request(method, path, body, query_params)
+
+
+async def _route_request(method: str, path: str, body: bytes, query_params: dict) -> tuple:
     qp = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
 
     if not path.startswith("/things/"):

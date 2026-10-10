@@ -1049,3 +1049,150 @@ def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
         removed = container_reaper.drop_containers([_C("a" * 64, False), _C("b" * 64, True)])
     assert removed == 1
     assert "bbbbbbbbbbbb" in caplog.text and "aaaaaaaaaaaa" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Error-envelope Content-Type fidelity + credential-scope honesty
+#
+# The expected values are real AWS observations: MiniStack responses were
+# diffed against committed real-AWS wire captures on the fields SDKs read
+# (status, parsed Error.Code, Content-Type).
+# ---------------------------------------------------------------------------
+
+from ministack.core.responses import (  # noqa: E402
+    expected_error_content_type,
+    fix_error_content_type,
+)
+from ministack.core.router import detect_service  # noqa: E402
+
+
+def _auth(scope_name):
+    return {
+        "host": "localhost:4566",
+        "authorization": (
+            "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/"
+            f"{scope_name}/aws4_request, SignedHeaders=host, Signature=x"
+        ),
+    }
+
+
+@pytest.mark.parametrize("service,emitted,expected", [
+    # json protocol: jsonVersion decides — kinesis/athena/kms answer 1.1,
+    # dynamodb/states/sqs answer 1.0.
+    ("kinesis", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("athena", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("kms", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("dynamodb", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("states", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("sqs", "application/x-amz-json-1.0", "application/x-amz-json-1.0"),
+    # rest-json answers application/json.
+    ("lambda", "application/x-amz-json-1.0", "application/json"),
+    ("appsync", "application/x-amz-json-1.0", "application/json"),
+    ("apigateway", "application/json", "application/json"),
+    # Wire quirks the model does not declare.
+    ("sesv2", "application/json", "application/x-amz-json-1.1"),
+    # query protocol answers text/xml; ec2 adds charset.
+    ("iam", "application/xml", "text/xml"),
+    ("sns", "application/xml", "text/xml"),
+    ("rds", "application/xml", "text/xml"),
+    ("cloudformation", "application/xml", "text/xml"),
+    ("elasticloadbalancing", "application/xml", "text/xml"),
+    ("ec2", "application/xml", "text/xml;charset=UTF-8"),
+    # rest-xml answers text/xml — except S3, which answers application/xml.
+    ("route53", "application/xml", "text/xml"),
+    ("route53", "text/xml", "text/xml"),
+    ("s3", "application/xml", "application/xml"),
+    ("s3", "text/xml", "application/xml"),
+])
+def test_expected_error_content_type(service, emitted, expected):
+    assert expected_error_content_type(service, emitted) == expected
+
+
+def test_family_mismatch_is_not_rewritten():
+    # A query-protocol service that emitted a JSON body stays as-is: the
+    # family guard only corrects within the emitted envelope family.
+    assert expected_error_content_type("iam", "application/json") is None
+    # Declared-cbor services ministack serves as query-compat JSON are
+    # left alone.
+    assert expected_error_content_type("monitoring", "application/x-amz-json-1.0") is None
+
+
+def test_fix_error_content_type_scopes():
+    headers = {"Content-Type": "application/x-amz-json-1.0"}
+    fix_error_content_type("kinesis", 400, headers)
+    assert headers["Content-Type"] == "application/x-amz-json-1.1"
+
+    # success responses are never rewritten — an S3 object that happens to
+    # be JSON must keep its real content type.
+    headers = {"Content-Type": "application/json"}
+    fix_error_content_type("s3", 200, headers)
+    assert headers["Content-Type"] == "application/json"
+
+    # non-envelope payloads and unknown services are untouched
+    headers = {"Content-Type": "image/png"}
+    fix_error_content_type("s3", 400, headers)
+    assert headers["Content-Type"] == "image/png"
+    headers = {"Content-Type": "application/xml"}
+    fix_error_content_type("not-a-service", 400, headers)
+    assert headers["Content-Type"] == "application/xml"
+
+
+@pytest.mark.parametrize("scope", ["glacier", "pinpoint", "route53resolver"])
+def test_unimplemented_real_service_surfaces_by_name(scope):
+    # A request signed for a real AWS service ministack does not implement
+    # must not fall through to the S3 catch-all — it routes to its own
+    # (unsupported) name so dispatch answers "Unsupported service".
+    assert detect_service("GET", "/anything", _auth(scope), {}) == scope
+
+
+def test_unknown_scope_still_falls_through_to_s3():
+    # A scope that is not a real AWS service keeps legacy path routing —
+    # e.g. unsigned/garbage credentials hitting S3 path style.
+    assert detect_service("GET", "/bucket/key", _auth("totally-fake-svc"), {}) == "s3"
+
+
+def test_implemented_scope_routes_normally():
+    assert detect_service("POST", "/", _auth("dynamodb"), {}) == "dynamodb"
+    assert detect_service("POST", "/", _auth("states"), {}) == "states"
+
+
+def test_docker_hub_mirrors_cover_hub_images_only():
+    from ministack.core.responses import docker_hub_mirrors
+
+    assert docker_hub_mirrors("postgres") == ["public.ecr.aws/docker/library/postgres", "mirror.gcr.io/library/postgres"]
+    assert docker_hub_mirrors("docker.io/library/redis") == ["public.ecr.aws/docker/library/redis", "mirror.gcr.io/library/redis"]
+    assert docker_hub_mirrors("rancher/k3s") == ["public.ecr.aws/rancher/k3s", "mirror.gcr.io/rancher/k3s"]
+    for other_registry in ("public.ecr.aws/lambda/python", "localhost:5000/app", "ghcr.io/org/app", "proxy.corp.net/postgres"):
+        assert docker_hub_mirrors(other_registry) == []
+
+
+def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkeypatch):
+    from docker.errors import APIError
+    from docker.models.images import ImageCollection
+
+    from ministack.core.responses import install_docker_hub_fallback
+
+    pulled, tagged = [], []
+
+    class _Image:
+        def tag(self, repository, tag):
+            tagged.append(f"{repository}:{tag}")
+
+    def registry(self, repository, tag=None, all_tags=False, **kwargs):
+        pulled.append(f"{repository}:{tag}" if tag else repository)
+        if repository.startswith("mirror.gcr.io/"):
+            return _Image()
+        raise APIError("500 Server Error: registry unavailable")
+
+    monkeypatch.setattr(ImageCollection, "pull", registry)
+    install_docker_hub_fallback()
+
+    ImageCollection.pull(None, "rancher/k3s:v1.31.4-k3s1", platform="linux/amd64")
+    assert pulled == ["rancher/k3s:v1.31.4-k3s1", "public.ecr.aws/rancher/k3s:v1.31.4-k3s1",
+                      "mirror.gcr.io/rancher/k3s:v1.31.4-k3s1"]
+    assert tagged == ["rancher/k3s:v1.31.4-k3s1"]
+
+    pulled.clear()
+    with pytest.raises(APIError, match="registry unavailable"):
+        ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
+    assert pulled == ["public.ecr.aws/lambda/python:3.12"]

@@ -1248,3 +1248,101 @@ def test_s3tables_iceberg_rest_sequence_numbers_and_requirements(s3tables):
             s3tables.delete_table(tableBucketARN=arn, namespace="ns", name="t")
             s3tables.delete_namespace(tableBucketARN=arn, namespace="ns")
             s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_s3tables_bucket_subresources_defaults_and_updates(s3tables):
+    """Documented defaults until set: SSE-S3, STANDARD, unreferenced file removal 3/10 days."""
+    arn = s3tables.create_table_bucket(name=f"sub-{_uuid_mod.uuid4().hex[:8]}",
+                                       tags={"team": "data"})["arn"]
+    got = s3tables.get_table_bucket(tableBucketARN=arn)
+    assert set(got) - {"ResponseMetadata"} <= {"arn", "name", "ownerAccountId", "createdAt", "tableBucketId", "type"}
+    assert got["type"] == "customer" and got["tableBucketId"]
+
+    assert s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"] == {
+        "sseAlgorithm": "AES256"}
+    s3tables.put_table_bucket_encryption(tableBucketARN=arn, encryptionConfiguration={
+        "sseAlgorithm": "aws:kms", "kmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/k"})
+    assert s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]["sseAlgorithm"] == "aws:kms"
+    s3tables.delete_table_bucket_encryption(tableBucketARN=arn)
+    assert s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"] == {
+        "sseAlgorithm": "AES256"}
+
+    removal = s3tables.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"][
+        "icebergUnreferencedFileRemoval"]
+    assert removal == {"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {
+        "unreferencedDays": 3, "nonCurrentDays": 10}}}
+    s3tables.put_table_bucket_maintenance_configuration(
+        tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+        value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 4}}})
+    removal = s3tables.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"][
+        "icebergUnreferencedFileRemoval"]
+    assert removal["settings"]["icebergUnreferencedFileRemoval"] == {"unreferencedDays": 4, "nonCurrentDays": 10}
+
+    with pytest.raises(ClientError) as exc:
+        s3tables.get_table_bucket_policy(tableBucketARN=arn)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    s3tables.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy='{"Version":"2012-10-17","Statement":[]}')
+    assert s3tables.get_table_bucket_policy(tableBucketARN=arn)["resourcePolicy"].startswith('{"Version"')
+    s3tables.delete_table_bucket_policy(tableBucketARN=arn)
+
+    assert s3tables.get_table_bucket_storage_class(tableBucketARN=arn)["storageClassConfiguration"] == {
+        "storageClass": "STANDARD"}
+    s3tables.put_table_bucket_storage_class(tableBucketARN=arn,
+                                            storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})
+    assert s3tables.get_table_bucket_storage_class(tableBucketARN=arn)["storageClassConfiguration"][
+        "storageClass"] == "INTELLIGENT_TIERING"
+
+    s3tables.put_table_bucket_metrics_configuration(tableBucketARN=arn)
+    assert s3tables.get_table_bucket_metrics_configuration(tableBucketARN=arn)["id"]
+    s3tables.delete_table_bucket_metrics_configuration(tableBucketARN=arn)
+
+    assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"team": "data"}
+    s3tables.tag_resource(resourceArn=arn, tags={"env": "dev"})
+    s3tables.untag_resource(resourceArn=arn, tagKeys=["team"])
+    assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "dev"}
+
+
+def test_s3tables_table_subresources_and_rename(s3tables):
+    arn = s3tables.create_table_bucket(name=f"tsub-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    for ns in ("a", "b"):
+        s3tables.create_namespace(tableBucketARN=arn, namespace=[ns])
+    created = s3tables.create_table(tableBucketARN=arn, namespace="a", name="t", format="ICEBERG",
+                                    tags={"k": "v"})
+    table = s3tables.get_table(tableBucketARN=arn, namespace="a", name="t")
+    assert table["type"] == "customer" and table["versionToken"] == created["versionToken"]
+    assert "tableBucketARN" not in table
+
+    config = s3tables.get_table_maintenance_configuration(tableBucketARN=arn, namespace="a", name="t")["configuration"]
+    assert config["icebergCompaction"] == {"status": "enabled", "settings": {"icebergCompaction": {
+        "targetFileSizeMB": 512, "strategy": "auto"}}}
+    assert config["icebergSnapshotManagement"] == {"status": "enabled", "settings": {"icebergSnapshotManagement": {
+        "minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120}}}
+    s3tables.put_table_maintenance_configuration(
+        tableBucketARN=arn, namespace="a", name="t", type="icebergCompaction",
+        value={"status": "disabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 256}}})
+    compaction = s3tables.get_table_maintenance_configuration(
+        tableBucketARN=arn, namespace="a", name="t")["configuration"]["icebergCompaction"]
+    assert compaction["status"] == "disabled"
+    assert compaction["settings"]["icebergCompaction"]["targetFileSizeMB"] == 256
+
+    status = s3tables.get_table_maintenance_job_status(tableBucketARN=arn, namespace="a", name="t")["status"]
+    assert {v["status"] for v in status.values()} == {"Not_Yet_Run"}
+    assert s3tables.get_table_encryption(tableBucketARN=arn, namespace="a", name="t")[
+        "encryptionConfiguration"] == {"sseAlgorithm": "AES256"}
+    assert s3tables.get_table_storage_class(tableBucketARN=arn, namespace="a", name="t")[
+        "storageClassConfiguration"] == {"storageClass": "STANDARD"}
+
+    with pytest.raises(ClientError) as exc:
+        s3tables.get_table_policy(tableBucketARN=arn, namespace="a", name="t")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    s3tables.put_table_policy(tableBucketARN=arn, namespace="a", name="t", resourcePolicy="{}")
+    assert s3tables.get_table_policy(tableBucketARN=arn, namespace="a", name="t")["resourcePolicy"] == "{}"
+
+    assert s3tables.list_tags_for_resource(resourceArn=created["tableARN"])["tags"] == {"k": "v"}
+
+    s3tables.rename_table(tableBucketARN=arn, namespace="a", name="t", newNamespaceName="b", newName="t2")
+    renamed = s3tables.get_table(tableBucketARN=arn, namespace="b", name="t2")
+    assert renamed["tableARN"] == created["tableARN"] and renamed["namespace"] == ["b"]
+    with pytest.raises(ClientError) as exc:
+        s3tables.get_table(tableBucketARN=arn, namespace="a", name="t")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"

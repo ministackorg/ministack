@@ -3383,6 +3383,72 @@ def _cwlogs_subfilter_delete(physical_id, props):
         grp.get("subscriptionFilters", {}).pop(physical_id, None)
 
 
+# --- CloudWatch Logs MetricFilter ---
+
+def _cwlogs_metric_filter_payload(group, filter_name, props):
+    """The PutMetricFilter request for a template's properties, for create and update alike."""
+    transformations = []
+    for t in props.get("MetricTransformations") or []:
+        entry = {
+            "metricName": t.get("MetricName"),
+            "metricNamespace": t.get("MetricNamespace"),
+            "metricValue": t.get("MetricValue"),
+        }
+        if t.get("DefaultValue") is not None:
+            entry["defaultValue"] = float(t["DefaultValue"])
+        if t.get("Dimensions"):
+            entry["dimensions"] = {d["Key"]: d["Value"] for d in t["Dimensions"]}
+        if t.get("Unit"):
+            entry["unit"] = t["Unit"]
+        transformations.append(entry)
+    return {
+        "logGroupName": group,
+        "filterName": filter_name,
+        "filterPattern": props.get("FilterPattern", ""),
+        "metricTransformations": transformations,
+    }
+
+
+def _cwlogs_metric_filter_create(logical_id, props, stack_name):
+    """Ref is the filter name; a generated name is <LogicalId>- + 12 random letters and digits."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    filter_name = props.get("FilterName") or f"{logical_id}-{suffix}"
+    resp = _cw_logs._put_metric_filter(
+        _cwlogs_metric_filter_payload(props.get("LogGroupName"), filter_name, props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::MetricFilter create failed: {resp[2]!r}")
+    return filter_name, {}
+
+
+def _cwlogs_metric_filter_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a metric filter in place; a FilterName or LogGroupName change replaces it."""
+    old_group = old_props.get("LogGroupName")
+    new_group = new_props.get("LogGroupName")
+    # A filter is keyed by group and name, so a kept FilterName on another
+    # group replaces under the same physical id.
+    name_kept = old_props.get("FilterName") == new_props.get("FilterName")
+    current = _cw_logs._metric_filters.get((old_group, physical_id))
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_group, physical_id if name_kept else new_props.get("FilterName")),
+        (old_group, physical_id) if current else None,
+        _cwlogs_metric_filter_create, _cwlogs_metric_filter_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _cw_logs._put_metric_filter(
+        _cwlogs_metric_filter_payload(new_group, physical_id, new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::MetricFilter update failed: {resp[2]!r}")
+    return physical_id, {}
+
+
+def _cwlogs_metric_filter_delete(physical_id, props):
+    _cw_logs._delete_metric_filter(
+        {"logGroupName": props.get("LogGroupName"), "filterName": physical_id})
+
+
 # --- EventBridge Rule ---
 
 def _eb_rule_create(logical_id, props, stack_name):
@@ -5156,9 +5222,7 @@ def _apigw_api_key_create(logical_id, props, stack_name):
     """Provision an ``AWS::ApiGateway::ApiKey``.
 
     Ref returns the generated key id; ``Fn::GetAtt APIKeyId`` returns the same
-    id, matching the AWS CloudFormation resource contract. The runtime create
-    always mints a fresh value, so an explicit ``Value`` is applied afterwards
-    to honor a caller-pinned key.
+    id, matching the AWS CloudFormation resource contract.
     """
     data = {
         "name": props.get("Name") or _physical_name(stack_name, logical_id),
@@ -5169,22 +5233,13 @@ def _apigw_api_key_create(logical_id, props, stack_name):
             for sk in props.get("StageKeys", [])
         ],
         "tags": _tag_map(props.get("Tags")),
+        "value": props.get("Value"),
+        "customerId": props.get("CustomerId"),
     }
     status, _headers, body = _apigw_v1._create_api_key(data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::ApiKey create failed: {body!r}")
-    api_key = json.loads(body)
-    key_id = api_key.get("id", "")
-    value = props.get("Value")
-    if value:
-        stored = _apigw_v1._api_keys.get(key_id)
-        if stored is not None:
-            stored["value"] = value
-    customer_id = props.get("CustomerId")
-    if customer_id:
-        stored = _apigw_v1._api_keys.get(key_id)
-        if stored is not None:
-            stored["customerId"] = customer_id
+    key_id = json.loads(body).get("id", "")
     return key_id, {"APIKeyId": key_id}
 
 
@@ -14374,6 +14429,12 @@ _RESOURCE_HANDLERS = {
         "update": _cwlogs_subfilter_update,
         "update_with_logical_id": True,
         "delete": _cwlogs_subfilter_delete,
+    },
+    "AWS::Logs::MetricFilter": {
+        "create": _cwlogs_metric_filter_create,
+        "update": _cwlogs_metric_filter_update,
+        "update_with_logical_id": True,
+        "delete": _cwlogs_metric_filter_delete,
     },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},

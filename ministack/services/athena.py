@@ -17,12 +17,12 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
 import asyncio
 import copy
 import csv
-import glob
 import io
 import json
 import logging
 import os
 import re
+import shutil
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -74,8 +74,8 @@ def _ensure_default_workgroup():
             "State": "ENABLED",
             "Description": "Primary workgroup",
             "CreationTime": int(time.time()),
+            # Like AWS's primary workgroup, no query result location until one is set.
             "Configuration": {
-                "ResultConfiguration": {"OutputLocation": "s3://athena-results/"},
                 # AUTO is the default selection; the effective version is what Athena resolved it to.
                 # https://docs.aws.amazon.com/athena/latest/APIReference/API_EngineVersion.html
                 "EngineVersion": {
@@ -478,6 +478,7 @@ class _TableReference:
     start: int
     end: int
     aliased: bool
+    catalog: str | None = None
 
 
 # After a table reference, these keywords start the next clause; anything else is an alias.
@@ -501,13 +502,13 @@ def _table_references(query):
         name = cursor.dotted_name(3)
         if name is None:
             continue
-        _, database, table = name  # the catalog qualifier is dropped: Glue is the only catalog here
+        catalog, database, table = name
         if database is None and table in ctes:
             continue
         end = cursor.tokens[cursor.i - 1][3]
         next_kind, next_text = cursor.peek()[:2]
         aliased = next_kind == "qname" or (next_kind == "name" and next_text not in _CLAUSE_KEYWORDS)
-        references.append(_TableReference(database, table, start, end, aliased))
+        references.append(_TableReference(database, table, start, end, aliased, catalog))
     return references
 
 
@@ -822,7 +823,13 @@ def _start_query_execution(data):
         "OutputLocation"
     ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
         "ResultConfiguration", {}
-    ).get("OutputLocation", "s3://athena-results/")
+    ).get("OutputLocation")
+    if not output_location:
+        return error_response_json(
+            "InvalidRequestException",
+            "No output location provided. An output location is required either through the "
+            "Workgroup result configuration setting or as an API input.", 400,
+        )
     db = data.get("QueryExecutionContext", {}).get("Database", "default")
     catalog = data.get("QueryExecutionContext", {}).get("Catalog", "AwsDataCatalog")
     # Athena rejects any malformed statement here; with no Trino parser, only this DDL rule is
@@ -866,12 +873,12 @@ def _start_query_execution(data):
     }
     _executions[query_id] = execution
 
-    asyncio.create_task(_execute_query(query_id, query, db, ddl))
+    asyncio.create_task(_execute_query(query_id, query, db, ddl, catalog))
 
     return json_response({"QueryExecutionId": query_id})
 
 
-async def _execute_query(query_id, query, database, ddl):
+async def _execute_query(query_id, query, database, ddl, catalog=None):
     execution = _executions.get(query_id)
     if not execution:
         return
@@ -885,7 +892,7 @@ async def _execute_query(query_id, query, database, ddl):
         if ddl is not None:
             results = _run_ddl(ddl, database)
         elif engine == "duckdb":
-            results = await _run_duckdb(query, database)
+            results = await _run_duckdb(query, database, catalog)
         else:
             results = _mock_query_results(query)
 
@@ -913,7 +920,7 @@ async def _execute_query(query_id, query, database, ddl):
     execution["Status"]["CompletionDateTime"] = int(time.time())
 
 
-async def _run_duckdb(query, database):
+async def _run_duckdb(query, database, catalog=None):
     """Run a DuckDB query off the event loop.
 
     DuckDB's ``conn.execute()`` is a blocking C-extension call — running it
@@ -924,11 +931,15 @@ async def _run_duckdb(query, database):
     """
     import duckdb
 
-    rewritten = await _rewrite_data_paths(query, database)
+    rewritten, s3_table_buckets, workdirs = await _rewrite_data_paths(query, database, catalog)
 
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            if s3_table_buckets:
+                _attach_s3_table_buckets(conn, s3_table_buckets)
+            if "read_avro(" in rewritten:
+                conn.execute("INSTALL avro; LOAD avro;")
             result = conn.execute(rewritten)
             columns = []
             column_types = []
@@ -950,18 +961,32 @@ async def _run_duckdb(query, database):
             }
         finally:
             conn.close()
+            for workdir in workdirs:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     return await asyncio.to_thread(_execute_blocking)
 
 
-async def _rewrite_data_paths(query, database):
-    """Replace each Glue table reference with a DuckDB relation over its local S3 data."""
+async def _rewrite_data_paths(query, database, catalog=None):
+    """Replace each Glue table reference with a DuckDB relation over its local S3 data,
+    and each ``s3tablescatalog/<bucket>`` reference with that bucket's attached Iceberg
+    catalog. Returns the query and the table bucket ARNs to attach, by alias."""
     from ministack.services import glue as glue_svc
 
     account_id = get_account_id()
     edits = []
+    s3_table_buckets = {}
+    workdirs = []
     for ref in _table_references(query):
         db_name = ref.database or database or "default"
+        ref_catalog = ref.catalog or catalog or ""
+        if ref_catalog.lower().startswith(_S3_TABLES_CATALOG_PREFIX):
+            bucket = ref_catalog[len(_S3_TABLES_CATALOG_PREFIX):]
+            bucket_arn = f"arn:aws:s3tables:{get_region()}:{account_id}:bucket/{bucket}"
+            alias = s3_table_buckets.setdefault(bucket_arn, f"__s3t{len(s3_table_buckets)}")
+            relation = f'{alias}."{db_name.replace(chr(34), chr(34) * 2)}"."{ref.table.replace(chr(34), chr(34) * 2)}"'
+            edits.append((ref.start, ref.end, relation + ("" if ref.aliased else f' AS "{ref.table}"')))
+            continue
 
         # Read directly from glue's internal store rather than going through
         # the HTTP handler. The store is account-scoped via AccountScopedDict
@@ -973,20 +998,162 @@ async def _rewrite_data_paths(query, database):
         s3_location = (table_data.get("StorageDescriptor") or {}).get("Location")
         if not s3_location:
             continue
-
-        p = urlparse(s3_location)
-        stripped = f"{p.netloc}{p.path}".rstrip("/")
-        local_dir = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-        if next(glob.iglob(f"{local_dir}/**/*", recursive=True), None):
-            relation = f"'{local_dir}/**/*.{_data_format(table_data)}'"  # DuckDB reads the files, or reports why not
-        else:
-            relation = _empty_relation(table_data)
+        files = _materialize_table_files(s3_location, workdirs)
+        relation = _table_relation(table_data, files) if files else _empty_relation(table_data)
         alias = "" if ref.aliased else f' AS "{ref.table}"'
         edits.append((ref.start, ref.end, relation + alias))
+        if not ref.aliased:
+            edits.extend(_qualified_column_prefixes(query, db_name, ref.table, edits[-1]))
 
+    edits = sorted(set(edits))  # a table named twice yields its column-prefix edits twice
     for span_start, span_end, replacement in reversed(edits):
         query = query[:span_start] + replacement + query[span_end:]
-    return _rewrite_s3_paths(query)
+    return _rewrite_s3_paths(query), {alias: arn for arn, alias in s3_table_buckets.items()}, workdirs
+
+
+def _hidden(relative_key):
+    # Trino's Hive reader skips files and directories whose name starts with "_" or ".".
+    return any(part.startswith(("_", ".")) for part in relative_key.split("/"))
+
+
+def _materialize_table_files(location, workdirs):
+    """Copy every object under the table LOCATION out of the S3 store into a
+    per-query directory, keeping relative paths for Hive partition folders.
+    Athena reads all data under the location, whatever the object names."""
+    import tempfile
+
+    from ministack.services import s3 as s3_svc
+
+    parsed = urlparse(location)
+    bucket_name, prefix = parsed.netloc, parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    bucket = s3_svc._buckets.get(bucket_name)
+    if bucket is None:
+        return []
+    keys = sorted(k for k in list(bucket["objects"].keys())
+                  if k.startswith(prefix) and not k.endswith("/") and not _hidden(k[len(prefix):]))
+    if not keys:
+        return []
+    root = tempfile.mkdtemp(prefix="ministack-athena-")
+    workdirs.append(root)
+    files = []
+    for key in keys:
+        data = s3_svc._get_object_data(bucket_name, key)
+        if data is None:
+            continue
+        path = os.path.join(root, key[len(prefix):])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        files.append(path)
+    return files
+
+
+def _datum_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _sql_list(paths):
+    return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
+
+
+def _table_relation(table_data, files):
+    """A DuckDB relation over the table's files, columns as the table defines them."""
+    fmt = _data_format(table_data)
+    storage = table_data.get("StorageDescriptor") or {}
+    columns = storage.get("Columns") or []
+    partitions = _path_partition_keys(table_data, files)
+    hive = _hive_options(partitions)
+    if fmt == "parquet":
+        return f"read_parquet({_sql_list(files)}, union_by_name = true, {hive})"
+    if fmt == "json":
+        return f"read_json_auto({_sql_list(files)}, union_by_name = true, {hive})"
+    if fmt == "avro":
+        return f"read_avro({_sql_list(files)})"
+    if fmt != "csv" or not columns:
+        return f"read_csv_auto({_sql_list(files)}, {hive})"
+    serde = storage.get("SerdeInfo") or {}
+    params = serde.get("Parameters") or {}
+    library = serde.get("SerializationLibrary") or ""
+    if "OpenCSVSerde" in library:
+        delim, quote = params.get("separatorChar", ","), params.get("quoteChar", '"')
+    elif "LazySimpleSerDe" in library:
+        # Hive's LazySimpleSerDe splits on Ctrl-A unless field.delim is set, and does not unquote.
+        delim, quote = params.get("field.delim", params.get("serialization.format", "\x01")), ""
+        delim = "\x01" if delim == "1" else delim
+    else:
+        delim, quote = params.get("field.delim", ","), '"'
+    try:
+        skip = int((table_data.get("Parameters") or {}).get("skip.header.line.count", 0))
+    except (TypeError, ValueError):
+        skip = 0
+    names = [str(c.get("Name", "")) for c in columns]
+    raw = ", ".join(f"'c{i}': 'VARCHAR'" for i in range(len(names)))
+    def lit(value):
+        return "'" + value.replace("'", "''") + "'"
+    reader = (f"read_csv({_sql_list(files)}, auto_detect = false, header = false, skip = {skip}, delim = {lit(delim)}, "
+              f"quote = {lit(quote)}, escape = {lit(quote)}, columns = {{{raw}}}, null_padding = true, "
+              f"strict_mode = false, {hive})")
+    projected = []
+    for i, column in enumerate(columns):
+        base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+        duck_type = "DECIMAL(38,9)" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+        name = names[i].replace('"', '""')
+        projected.append(f'TRY_CAST("c{i}" AS {duck_type}) AS "{name}"')
+    in_paths = {str(key.get("Name", "")) for key in partitions}
+    for key in table_data.get("PartitionKeys") or []:
+        name = str(key.get("Name", "")).replace('"', '""')
+        value = f'"{name}"' if key.get("Name") in in_paths else f"CAST(NULL AS {_duckdb_type(key)})"
+        projected.append(f'{value} AS "{name}"')
+    return f"(SELECT {', '.join(projected)} FROM {reader})"
+
+
+def _path_partition_keys(table_data, files):
+    """The Glue partition keys every file's path carries as a ``key=value`` folder."""
+    def folders(path):
+        return {part.split("=", 1)[0] for part in path.split("/")[:-1] if "=" in part}
+    present = set.intersection(*(folders(f) for f in files)) if files else set()
+    return [key for key in table_data.get("PartitionKeys") or [] if key.get("Name") in present]
+
+
+def _hive_options(partitions):
+    """Hive partitioning typed from Glue; DuckDB refuses a type for a key no path carries."""
+    if not partitions:
+        return "hive_partitioning = false"
+    types = ", ".join("'{}': {}".format(str(key["Name"]).replace("'", "''"), _duckdb_type(key)) for key in partitions)
+    return f"hive_partitioning = true, hive_types = {{{types}}}"
+
+
+# Athena names each S3 table bucket's catalog "s3tablescatalog/<bucket>".
+_S3_TABLES_CATALOG_PREFIX = "s3tablescatalog/"
+
+
+def _attach_s3_table_buckets(conn, buckets):
+    """Attach each table bucket through MiniStack's own Iceberg REST catalog, as
+    Firehose's Iceberg delivery does; runs on the query's worker thread."""
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    conn.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
+    from ministack.services.s3tables import _vended_access_key
+
+    # The access key names the caller's account, so the loopback calls stay in its scope.
+    key = _vended_access_key()
+    conn.execute(
+        f"CREATE SECRET __ms_athena (TYPE S3, KEY_ID '{key}', SECRET 'test', "
+        f"ENDPOINT 'localhost:{port}', URL_STYLE 'path', USE_SSL false, REGION '{get_region()}')"
+    )
+    credential = f"AWS4-HMAC-SHA256 Credential={key}/19700101/{get_region()}/s3tables/aws4_request"
+    conn.execute(
+        f"CREATE SECRET __ms_athena_catalog (TYPE HTTP, SCOPE 'http://localhost:{port}/iceberg', "
+        f"EXTRA_HTTP_HEADERS MAP {{'Authorization': '{credential}'}})"
+    )
+    for alias, bucket_arn in buckets.items():
+        conn.execute(
+            f"ATTACH '{bucket_arn}' AS {alias} (TYPE ICEBERG, READ_ONLY, "
+            f"ENDPOINT 'http://localhost:{port}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
 
 
 _DUCKDB_TYPE_BY_ATHENA = {
@@ -996,6 +1163,39 @@ _DUCKDB_TYPE_BY_ATHENA = {
 }
 
 
+def _duckdb_type(column):
+    base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+    return "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+
+
+def _qualified_column_prefixes(query, database, table, table_edit):
+    """Edits turning ``database.table.column`` (optionally catalog-qualified) into ``"table".column``.
+
+    The table itself is replaced by a relation aliased ``"table"``, so DuckDB cannot
+    resolve column references qualified with the database name.
+    """
+    tokens = list(_sql_tokens(query))
+    edits = []
+    for i in range(len(tokens) - 4):
+        if table_edit[0] <= tokens[i][2] < table_edit[1]:
+            continue  # the FROM/JOIN reference itself
+        if i and tokens[i - 1][:2] == ("punct", "."):
+            continue
+        names, j = [], i
+        while j < len(tokens) and tokens[j][0] in ("name", "qname"):
+            names.append(tokens[j])
+            if j + 1 < len(tokens) and tokens[j + 1][:2] == ("punct", "."):
+                j += 2
+            else:
+                break
+        if len(names) not in (3, 4):
+            continue
+        db_token, table_token = names[-3], names[-2]
+        if db_token[1] == database and table_token[1] == table:
+            edits.append((names[0][2], table_token[3], '"{}"'.format(table.replace('"', '""'))))
+    return edits
+
+
 def _empty_relation(table_data):
     """Zero rows with the table's Glue columns and partition keys; complex types read as VARCHAR."""
     columns = ((table_data.get("StorageDescriptor") or {}).get("Columns") or []) + (table_data.get("PartitionKeys") or [])
@@ -1003,10 +1203,8 @@ def _empty_relation(table_data):
         return "(SELECT 1 WHERE FALSE)"
     projected = []
     for column in columns:
-        base = str(column.get("Type", "string")).lower().split("(")[0].strip()
-        duck_type = "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
         name = str(column.get("Name", "")).replace('"', '""')
-        projected.append(f'CAST(NULL AS {duck_type}) AS "{name}"')
+        projected.append(f'CAST(NULL AS {_duckdb_type(column)}) AS "{name}"')
     return f"(SELECT {', '.join(projected)} WHERE FALSE)"
 
 
@@ -1217,7 +1415,8 @@ def _get_query_results(data):
         result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
         result_rows.append(
-            {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
+            # A NULL is a Datum with no VarCharValue.
+            {"Data": [{} if v is None else {"VarCharValue": _datum_text(v)} for v in row]}
         )
 
     column_info = []

@@ -13,7 +13,9 @@ from ministack.core.responses import new_uuid
 
 logger = logging.getLogger("cloudformation")
 
-CFN_NS = "http://cloudformation.amazonaws.com/doc/2010-05-08/"
+# Evidence: real AWS wire capture — AWS emits xmlns doc/2010-05-15,
+# matching the apiVersion in the botocore model.
+CFN_NS = "http://cloudformation.amazonaws.com/doc/2010-05-15/"
 
 # The CloudFormation quotas page: the template body of a request and of an
 # S3 object behind TemplateURL. CreateStack documents the stack name as

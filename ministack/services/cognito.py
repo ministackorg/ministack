@@ -3307,21 +3307,50 @@ def _send_email_otp(pool, username, attr_dict, code):
 # USER MANAGEMENT
 # ===========================================================================
 
+_USERNAME_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
+_USERNAME_PHONE_RE = re.compile(r"\+[0-9]{3,18}")
+
+
 def _username_alias_attribute(pool: dict, username: str):
     """Return which UsernameAttributes alias ("email"/"phone_number") the
     given Username value should be registered as, or None if the pool
     doesn't use UsernameAttributes. Real Cognito never uses the caller-
-    supplied value as the actual Username in this mode: it auto-generates a
-    UUID Username and stores the supplied value as the alias attribute.
+    supplied value as the actual Username in this mode: the Username is the
+    user's sub and the supplied value is stored as the alias attribute.
     """
     username_attrs = set(pool.get("UsernameAttributes") or [])
     if "email" in username_attrs and "phone_number" in username_attrs:
-        return "phone_number" if username.startswith("+") else "email"
+        return "phone_number" if _USERNAME_PHONE_RE.fullmatch(username) else "email"
     if "email" in username_attrs:
         return "email"
     if "phone_number" in username_attrs:
         return "phone_number"
     return None
+
+
+def _new_user_error(pool: dict, username: str, attr_dict: dict):
+    """InvalidParameterException for a Username or attributes AdminCreateUser and SignUp refuse, else None."""
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    message = None
+    if username_attrs and not (
+        "email" in username_attrs and _USERNAME_EMAIL_RE.fullmatch(username)
+        or "phone_number" in username_attrs and _USERNAME_PHONE_RE.fullmatch(username)
+    ):
+        if username_attrs == {"email"}:
+            message = "Username should be an email."
+        elif username_attrs == {"phone_number"}:
+            message = "Username should be a phone number."
+        else:
+            message = "Username should be either an email or a phone number."
+    elif "sub" in attr_dict:
+        message = "Cannot modify the non-mutable attribute sub"
+    elif username_attrs:
+        alias_attr = _username_alias_attribute(pool, username)
+        if attr_dict.get(alias_attr) and attr_dict[alias_attr] != username:
+            label = "email" if alias_attr == "email" else "phone number"
+            message = (f"User {label} should be empty or same as username, "
+                       f"since username attribute is {alias_attr}.")
+    return error_response_json("InvalidParameterException", message, 400) if message else None
 
 
 def _admin_create_user(data):
@@ -3333,6 +3362,9 @@ def _admin_create_user(data):
     username = data.get("Username")
     if not username:
         return error_response_json("InvalidParameterException", "Username is required.", 400)
+    username_err = _new_user_error(pool, username, _attr_list_to_dict(data.get("UserAttributes", [])))
+    if username_err:
+        return username_err
 
     alias_attr = _username_alias_attribute(pool, username)
     message_action = (data.get("MessageAction") or "").upper()
@@ -3376,7 +3408,7 @@ def _admin_create_user(data):
         attr_dict["sub"] = new_uuid()
     if alias_attr:
         attr_dict.setdefault(alias_attr, username)
-        real_username = new_uuid()
+        real_username = attr_dict["sub"]
     else:
         real_username = username
     attrs = _dict_to_attr_list(attr_dict)
@@ -3587,7 +3619,7 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
+    user, _err = _resolve_user(pool, username)
     if not user:
         if _hides_user_existence(pool, cid):
             return _code_delivery_response(_masked_destination(username))
@@ -4460,7 +4492,12 @@ def _sign_up(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    if username in pool["_users"]:
+    username_err = _new_user_error(pool, username or "", _attr_list_to_dict(data.get("UserAttributes", [])))
+    if username_err:
+        return username_err
+    alias_attr = _username_alias_attribute(pool, username)
+    existing = _resolve_user(pool, username)[0] if alias_attr else pool["_users"].get(username)
+    if existing:
         return error_response_json("UsernameExistsException", "User already exists.", 400)
 
     pw_err = _validate_password(pool, password)
@@ -4472,6 +4509,10 @@ def _sign_up(data):
     attr_dict = _attr_list_to_dict(attrs)
     if "sub" not in attr_dict:
         attr_dict["sub"] = new_uuid()
+    if alias_attr:
+        # As in AdminCreateUser: the email/phone becomes the alias, the sub the Username.
+        attr_dict.setdefault(alias_attr, username)
+        username = attr_dict["sub"]
     attrs = _dict_to_attr_list(attr_dict)
 
     # SignUp creates UNCONFIRMED unless the pool's PreSignUp Lambda trigger

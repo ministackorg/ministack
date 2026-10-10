@@ -75,7 +75,7 @@ jobs:
 
     services:
       redis:
-        image: redis:7-alpine
+        image: public.ecr.aws/docker/library/redis:7-alpine
         ports:
           - 6379:6379
         options: >-
@@ -162,7 +162,7 @@ jobs:
       MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
     services:
       redis:
-        image: redis:7-alpine
+        image: public.ecr.aws/docker/library/redis:7-alpine
         ports:
           - 6379:6379
         options: >-

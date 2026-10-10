@@ -15,6 +15,7 @@ import copy
 import json
 import logging
 import os
+import re
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -275,6 +276,34 @@ def _waf_err(code, message):
     return error_response_json(code, message, 400)
 
 
+_WAFV2_ID_PATTERN = r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$"
+_WAFV2_ID_RE = re.compile(_WAFV2_ID_PATTERN)
+
+
+def _validate_web_acl_id(uid):
+    """AWS validates the WebACL Id shape before checking existence — a non-UUID
+    or >36-char value is a ValidationException, never WAFNonexistentItem.
+    Evidence: real AWS wire capture observation."""
+    errors = []
+    if not _WAFV2_ID_RE.match(uid):
+        errors.append(
+            f"Value '{uid}' at 'id' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_WAFV2_ID_PATTERN}"
+        )
+    if len(uid) > 36:
+        errors.append(
+            f"Value '{uid}' at 'id' failed to satisfy constraint: "
+            "Member must have length less than or equal to 36"
+        )
+    if errors:
+        n = len(errors)
+        return _waf_err(
+            "ValidationException",
+            f"{n} validation error{'s' if n > 1 else ''} detected: {'; '.join(errors)}",
+        )
+    return None
+
+
 def _waf_invalid_arn(arn):
     return _waf_err("WAFInvalidParameterException", f"Invalid WAFv2 resource ARN: {arn}")
 
@@ -418,6 +447,8 @@ def _create_web_acl(data):
 
 def _get_web_acl(data):
     uid = data.get("Id", "")
+    if err := _validate_web_acl_id(uid):
+        return err
     acl = _resource_from_scope(_web_acls, uid, data.get("Scope", "REGIONAL"))
     if not acl:
         return _waf_err("WAFNonexistentItemException", f"WebACL {uid} not found")

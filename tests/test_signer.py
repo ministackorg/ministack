@@ -1,17 +1,22 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
-Integration tests for the AWS Signer emulator (synchronous, synthetic signing).
+Integration tests for the AWS Signer emulator (synchronous signing).
 
 The contract under test is the S3 side effect: StartSigningJob validates the
-source object against the local S3 store and synchronously writes a JSON
-signature marker to `destination.prefix + jobId`, so a caller whose contract
-is the signed object at `prefix + jobId` never has to poll
-DescribeSigningJob.
+source object against the local S3 store and synchronously writes the signed
+object to `destination.prefix + jobId`, so a caller whose contract is the
+signed object at `prefix + jobId` never has to poll DescribeSigningJob. The
+object is a real signature on the IoT platform when ACM holds the profile
+certificate's key, and a JSON receipt otherwise.
 """
+import base64
+import datetime
 import hashlib
 import json
+import logging
 import re
+import sys
 import urllib.error
 import urllib.request
 import uuid
@@ -22,6 +27,7 @@ from conftest import ENDPOINT, make_client, sqs_policy_allow_s3
 
 _IOT_PLATFORM = "AWSIoTDeviceManagement-SHA256-ECDSA"
 _LAMBDA_PLATFORM = "AWSLambda-SHA384-ECDSA"
+_CERT_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/9ec626ca-0bbb-4be5-83a2-ee563f8386ca"
 
 _SIGNER_AUTH = (
     "AWS4-HMAC-SHA256 "
@@ -80,6 +86,35 @@ def _keys(s3, bucket):
     return [o["Key"] for o in s3.list_objects_v2(Bucket=bucket).get("Contents", [])]
 
 
+def _import_code_signing_cert(acm_client, key):
+    """Import a self-signed code-signing certificate for `key` into ACM; returns (arn, cert)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "signer-test.example.invalid")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=7))
+        .add_extension(x509.KeyUsage(True, False, False, False, False, False, False, False, False), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    arn = acm_client.import_certificate(
+        Certificate=cert.public_bytes(serialization.Encoding.PEM),
+        PrivateKey=key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )["CertificateArn"]
+    return arn, cert
+
+
 # ---------------------------------------------------------------------------
 # StartSigningJob — the S3 side effect
 # ---------------------------------------------------------------------------
@@ -103,6 +138,168 @@ def test_signer_start_writes_marker_at_prefix_plus_job_id(signer, s3, buckets, p
     assert marker["source"]["bucketName"] == src
     assert marker["source"]["key"] == "fw/image.bin"
     assert marker["sourceSha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_signer_iot_platform_signs_with_the_imported_certificate_key(signer, s3, acm_client, buckets):
+    """The signed object is AWS's compact JSON with a DER ECDSA signature the certificate verifies."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    src, dst = buckets
+    s3.put_bucket_versioning(Bucket=src, VersioningConfiguration={"Status": "Enabled"})
+    payload = b"ssl = false\nserver = mqtt.example.invalid\nport = 8883\n"
+    version = s3.put_object(Bucket=src, Key="cfg/config.cfg", Body=payload)["VersionId"]
+    cert_arn, cert = _import_code_signing_cert(acm_client, ec.generate_private_key(ec.SECP256R1()))
+    name = f"real_{_uid()}"
+    signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM,
+                               signingMaterial={"certificateArn": cert_arn})
+
+    job_id = _start(signer, src, dst, key="cfg/config.cfg", profile=name,
+                    prefix="cfg/", version=version)["jobId"]
+
+    obj = s3.get_object(Bucket=dst, Key=f"cfg/{job_id}")
+    assert obj["ContentType"] == "application/octet-stream"
+    raw = obj["Body"].read()
+    document = json.loads(raw)
+    assert list(document) == ["rawPayloadSize", "signature", "signatureAlgorithm", "payloadLocation"]
+    assert json.dumps(document, separators=(",", ":")).encode() == raw
+    assert document["rawPayloadSize"] == len(payload)
+    assert document["signatureAlgorithm"] == "SHA256withECDSA"
+    assert document["payloadLocation"] == {
+        "s3": {"bucketName": src, "key": "cfg/config.cfg", "version": version}
+    }
+    signature = base64.b64decode(document["signature"])
+    cert.public_key().verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+    with pytest.raises(InvalidSignature):
+        cert.public_key().verify(signature, payload.replace(b"false", b"true "), ec.ECDSA(hashes.SHA256()))
+    assert signer.describe_signing_job(jobId=job_id)["status"] == "Succeeded"
+
+
+def test_signer_iot_platform_rsa_certificate_fails_the_job(signer, s3, acm_client, buckets):
+    """An RSA certificate on the ECDSA-only IoT platform fails the job and writes nothing."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="c.cfg", Body=b"ssl = false\n")
+    cert_arn, _cert = _import_code_signing_cert(
+        acm_client, rsa.generate_private_key(public_exponent=65537, key_size=2048))
+    name = f"rsa_{_uid()}"
+    signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM,
+                               signingMaterial={"certificateArn": cert_arn})
+
+    job_id = _start(signer, src, dst, key="c.cfg", profile=name, prefix="out/")["jobId"]
+
+    job = signer.describe_signing_job(jobId=job_id)
+    assert job["status"] == "Failed"
+    assert job["statusReason"] == "can't identify EC private key."
+    assert "signedObject" not in job
+    assert "signatureExpiresAt" not in job
+    assert _keys(s3, dst) == []
+    failed = signer.list_signing_jobs(status="Failed")["jobs"]
+    assert job_id in [j["jobId"] for j in failed]
+
+
+def test_signer_iot_platform_without_an_imported_key_writes_the_receipt(signer, s3, buckets):
+    """Control: with no key in ACM for the certificate ARN the receipt is written as before."""
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="r.cfg", Body=b"r")
+    name = f"receipt_{_uid()}"
+    signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM,
+                               signingMaterial={"certificateArn": _CERT_ARN})
+
+    job_id = _start(signer, src, dst, key="r.cfg", profile=name)["jobId"]
+
+    obj = s3.get_object(Bucket=dst, Key=f"signed/{job_id}")
+    assert obj["ContentType"] == "application/json"
+    assert json.loads(obj["Body"].read())["signedBy"] == "ministack-signer"
+
+
+def _ec_private_key_pem():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def _signing_key_and_warnings(caplog, platform, material):
+    from ministack.services import signer as signer_module
+
+    profile = {"profileName": "warned", "platformId": platform, "signingMaterial": material}
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="signer"):
+        key = signer_module._signing_key(profile)
+    return key, [r.getMessage() for r in caplog.records if r.name == "signer"]
+
+
+@pytest.mark.parametrize("platform, material, cert, reason", [
+    pytest.param(_IOT_PLATFORM, None, None, "the profile has no signingMaterial", id="no-material"),
+    pytest.param(_IOT_PLATFORM, {"certificateArn": _CERT_ARN}, None, "has no certificate", id="unknown-arn"),
+    pytest.param(_IOT_PLATFORM, {"certificateArn": _CERT_ARN}, {"Type": "AMAZON_ISSUED", "_private_key": ""},
+                 "holds no private key", id="requested-certificate"),
+    pytest.param(_IOT_PLATFORM, {"certificateArn": _CERT_ARN}, {"Type": "IMPORTED", "_private_key": "-----BEGIN"},
+                 "cannot be loaded", id="unreadable-key"),
+    pytest.param("AmazonFreeRTOS-Default", {"certificateArn": _CERT_ARN}, None, "format is not emulated",
+                 id="freertos-default"),
+    pytest.param("AmazonFreeRTOS-TI-CC3220SF", {"certificateArn": _CERT_ARN}, None, "format is not emulated",
+                 id="freertos-cc3220sf"),
+])
+def test_signer_receipt_on_an_acm_signed_platform_logs_a_warning(monkeypatch, caplog, platform, material,
+                                                                  cert, reason):
+    """Every receipt written where AWS signs with the profile's ACM certificate logs one warning."""
+    from ministack.services import acm as acm_module
+
+    monkeypatch.setattr(acm_module, "_get_local_certificate", lambda arn: cert)
+    key, warnings = _signing_key_and_warnings(caplog, platform, material)
+    assert key is None
+    assert len(warnings) == 1
+    assert "warned" in warnings[0] and reason in warnings[0]
+
+
+def test_signer_receipt_without_cryptography_logs_a_warning(monkeypatch, caplog):
+    """Without the cryptography package nothing can sign, so the receipt is written with a warning."""
+    from ministack.services import acm as acm_module
+
+    cert = {"Type": "IMPORTED", "_private_key": _ec_private_key_pem()}
+    monkeypatch.setattr(acm_module, "_get_local_certificate", lambda arn: cert)
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat.primitives.serialization", None)
+    key, warnings = _signing_key_and_warnings(caplog, _IOT_PLATFORM, {"certificateArn": _CERT_ARN})
+    assert key is None
+    assert len(warnings) == 1 and "cryptography package is not installed" in warnings[0]
+
+
+@pytest.mark.parametrize("platform", [_LAMBDA_PLATFORM, "Notation-OCI-SHA384-ECDSA"])
+def test_signer_receipt_on_a_signer_managed_platform_is_silent(caplog, platform):
+    """Signer signs Lambda and container images with its own keys, so the receipt there warns nothing."""
+    key, warnings = _signing_key_and_warnings(caplog, platform, {"certificateArn": _CERT_ARN})
+    assert key is None
+    assert warnings == []
+
+
+def test_signer_warm_boot_drops_the_key_and_logs_a_warning(caplog):
+    """ACM does not persist private keys, so after a restart the IoT profile writes the receipt and warns."""
+    from ministack.services import acm as acm_module
+
+    acm_module._certificates._data.clear()
+    try:
+        _status, _headers, body = acm_module._import_certificate({
+            "Certificate": "-----BEGIN CERTIFICATE-----\nBODY\n-----END CERTIFICATE-----\n",
+            "PrivateKey": _ec_private_key_pem(),
+        })
+        material = {"certificateArn": json.loads(body)["CertificateArn"]}
+        key, warnings = _signing_key_and_warnings(caplog, _IOT_PLATFORM, material)
+        assert key is not None and warnings == []
+
+        acm_module.load_persisted_state(acm_module.get_state())
+        key, warnings = _signing_key_and_warnings(caplog, _IOT_PLATFORM, material)
+        assert key is None
+        assert len(warnings) == 1 and "not persisted across restarts" in warnings[0]
+    finally:
+        acm_module._certificates._data.clear()
 
 
 def test_signer_empty_prefix_lands_marker_at_job_id(signer, s3, buckets, profile):
@@ -587,11 +784,17 @@ def test_signer_list_jobs_last_page_has_no_next_token(signer, s3, buckets, profi
     paginator."""
     src, dst = buckets
     s3.put_object(Bucket=src, Key="t.bin", Body=b"t")
-    _start(signer, src, dst, key="t.bin", profile=profile)
+    job_id = _start(signer, src, dst, key="t.bin", profile=profile)["jobId"]
 
+    # Other tests share the account, so the list can be longer than a page:
+    # walk to the end rather than assume the first page is the last.
+    seen = []
     page = signer.list_signing_jobs(maxResults=25)
+    while "nextToken" in page:
+        seen += [j["jobId"] for j in page["jobs"]]
+        page = signer.list_signing_jobs(maxResults=25, nextToken=page["nextToken"])
     assert page["jobs"]
-    assert "nextToken" not in page
+    assert job_id in seen + [j["jobId"] for j in page["jobs"]]
 
 
 def test_signer_job_records_the_calling_principal(signer, s3, buckets, profile):

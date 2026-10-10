@@ -19,6 +19,11 @@ import boto3
 import pytest
 from botocore.config import Config
 
+from ministack.core.responses import install_docker_hub_fallback
+
+# Fixtures that pull images themselves get the same Docker Hub fallback as the server.
+install_docker_hub_fallback()
+
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 ENDPOINT_HOST = urlparse(ENDPOINT).hostname
 # The port the services advertise themselves on, read the way they read it: an
