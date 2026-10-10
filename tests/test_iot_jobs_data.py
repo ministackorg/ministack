@@ -2402,6 +2402,133 @@ def test_iot_jobs_list_executions_for_thing_filters(iot_client, iot_jobs_data):
         _cleanup(iot_client, jobs=[queued_job, done_job], things=[thing])
 
 
+def test_iot_jobs_list_executions_for_job(iot_client, iot_jobs_data):
+    """Newest update first, narrowed by status, paged with no token after the last page."""
+    queued, running, done, failed = (_unique("jobs-thing") for _ in range(4))
+    job_id = _unique("job")
+    try:
+        arns = {t: _create_thing(iot_client, t) for t in (queued, running, done, failed)}
+        iot_client.create_job(jobId=job_id, targets=list(arns.values()), document=_DOCUMENT)
+        for thing, status in ((failed, "FAILED"), (done, "SUCCEEDED"), (running, "IN_PROGRESS")):
+            time.sleep(0.01)
+            _drive(iot_jobs_data, thing, job_id, status)
+
+        listed = iot_client.list_job_executions_for_job(jobId=job_id)
+        assert "nextToken" not in listed
+        entries = listed["executionSummaries"]
+        newest_first = [arns[t] for t in (running, done, failed, queued)]
+        assert [e["thingArn"] for e in entries] == newest_first
+        assert set(entries[0]) == {"thingArn", "jobExecutionSummary"}
+        summary = entries[0]["jobExecutionSummary"]
+        assert set(summary) == {
+            "status", "queuedAt", "startedAt", "lastUpdatedAt", "executionNumber",
+            "retryAttempt",
+        }
+        assert (summary["status"], summary["executionNumber"], summary["retryAttempt"]) == (
+            "IN_PROGRESS", 1, 0,
+        )
+        assert isinstance(summary["lastUpdatedAt"], datetime)
+        assert "startedAt" not in entries[3]["jobExecutionSummary"]
+
+        def arns_of(**kwargs):
+            page = iot_client.list_job_executions_for_job(jobId=job_id, **kwargs)
+            return [e["thingArn"] for e in page["executionSummaries"]], page.get("nextToken")
+
+        assert arns_of(status="SUCCEEDED") == ([arns[done]], None)
+        assert arns_of(status="CANCELED") == ([], None)
+        first, token = arns_of(maxResults=3)
+        assert first == newest_first[:3] and token
+        assert arns_of(maxResults=3, nextToken=token) == (newest_first[3:], None)
+        assert arns_of(maxResults=4) == (newest_first, None)
+        assert arns_of(maxResults=1, status="QUEUED") == ([arns[queued]], None)
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[queued, running, done, failed])
+
+
+def test_iot_jobs_list_executions_for_job_includes_earlier_executions(
+    iot_client, iot_jobs_data
+):
+    """A thing that rejoined a CONTINUOUS job's group is listed once per execution."""
+    group = _unique("jobs-group")
+    thing = _unique("jobs-thing")
+    job_id = _unique("job-cont")
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)[
+            "thingGroupArn"
+        ]
+        iot_client.create_job(
+            jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+            targetSelection="CONTINUOUS",
+        )
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        _drive(iot_jobs_data, thing, job_id, "SUCCEEDED")
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=thing)
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+
+        entries = iot_client.list_job_executions_for_job(jobId=job_id)[
+            "executionSummaries"
+        ]
+        assert [
+            (
+                e["thingArn"],
+                e["jobExecutionSummary"]["executionNumber"],
+                e["jobExecutionSummary"]["status"],
+            )
+            for e in entries
+        ] == [(thing_arn, 2, "QUEUED"), (thing_arn, 1, "SUCCEEDED")]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing], groups=[group])
+
+
+def test_iot_jobs_list_executions_for_job_refusals(iot_client):
+    """An unknown job and a bad job id, status, maxResults or nextToken are refused."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    invalid = "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: "
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        cases = {
+            "/jobs/no-such-job/things": (
+                404, "ResourceNotFoundException", "Job no-such-job cannot be found.",
+            ),
+            f"/jobs/{job_id}/things?status=queued": (
+                400, "InvalidRequestException",
+                invalid.format("queued", "status") + "Member must satisfy enum value set: "
+                "[REMOVED, SUCCEEDED, TIMED_OUT, IN_PROGRESS, QUEUED, CANCELED, FAILED, REJECTED]",
+            ),
+            f"/jobs/{job_id}/things?maxResults=0": (
+                400, "InvalidRequestException",
+                invalid.format("0", "maxResults")
+                + "Member must have value greater than or equal to 1",
+            ),
+            "/jobs/no-such-job/things?maxResults=0": (
+                400, "InvalidRequestException",
+                invalid.format("0", "maxResults")
+                + "Member must have value greater than or equal to 1",
+            ),
+            f"/jobs/{job_id}/things?maxResults=251": (
+                400, "InvalidRequestException",
+                invalid.format("251", "maxResults")
+                + "Member must have value less than or equal to 250",
+            ),
+            f"/jobs/{job_id}/things?nextToken=bogus": (
+                400, "InvalidRequestException", "Next token is invalid.",
+            ),
+            "/jobs/a%20b/things": (
+                400, "InvalidRequestException",
+                invalid.format("a b", "jobId")
+                + "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+",
+            ),
+        }
+        for path, expected in cases.items():
+            status, body = _raw(_IOT_AUTH, "GET", path)
+            assert (status, body.get("__type"), body.get("message")) == expected, path
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
 # ---------------------------------------------------------------------------
 # Account / region isolation
 # ---------------------------------------------------------------------------

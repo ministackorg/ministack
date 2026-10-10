@@ -37,8 +37,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateEventConfigurations``
   - Jobs (control plane): ``CreateJob``, ``UpdateJob``, ``DescribeJob``,
     ``ListJobs``, ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
-    ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
-    ``CancelJobExecution``, ``DeleteJobExecution`` — execution state shared with the
+    ``ListJobExecutionsForThing``, ``ListJobExecutionsForJob``,
+    ``DescribeJobExecution``, ``CancelJobExecution``,
+    ``DeleteJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
   - Job templates: ``CreateJobTemplate``, ``DescribeJobTemplate``,
     ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
@@ -5297,6 +5298,8 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return await _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
     if suffix.endswith("/job-document") and method == "GET":
         return _get_job_document(suffix[:-len("/job-document")])
+    if suffix.endswith("/things") and method == "GET":
+        return _list_job_executions_for_job(suffix[:-len("/things")], qp)
     if "/" in suffix:
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -5813,7 +5816,7 @@ _JOB_TEMPLATE_CONFIG_MEMBERS = (
     "presignedUrlConfig", "jobExecutionsRolloutConfig", "abortConfig",
     "timeoutConfig", "jobExecutionsRetryConfig",
 )
-_JOB_TEMPLATE_PAGE_MAX = 250
+_JOB_PAGE_MAX = 250
 
 
 def _job_template_arn(template_id: str) -> str:
@@ -5999,43 +6002,51 @@ def _describe_job_template(template_id: str) -> tuple:
     })
 
 
-def _list_job_templates(qp: dict) -> tuple:
-    """``GET /job-templates``, newest first, paged by ``maxResults`` /
-    ``nextToken``; the token carries an offset into that order."""
+def _jobs_page(items: list, qp: dict, kind: str) -> tuple[list, str | None, tuple | None]:
+    """The ``maxResults`` / ``nextToken`` page of ``items`` as (page, token, error); a token is an offset."""
     raw = qp.get("maxResults")
     try:
-        limit = _JOB_TEMPLATE_PAGE_MAX if raw in (None, "") else int(raw)
+        limit = _JOB_PAGE_MAX if raw in (None, "") else int(raw)
     except (TypeError, ValueError):
         limit = 0
-    if not 1 <= limit <= _JOB_TEMPLATE_PAGE_MAX:
+    if not 1 <= limit <= _JOB_PAGE_MAX:
         bound = ("greater than or equal to 1" if limit < 1
-                 else f"less than or equal to {_JOB_TEMPLATE_PAGE_MAX}")
-        return _job_template_validation_error(
+                 else f"less than or equal to {_JOB_PAGE_MAX}")
+        return [], None, _job_validation_error([_job_validation_clause(
             raw, "maxResults", f"Member must have value {bound}"
-        )
+        )])
     start = 0
     token = qp.get("nextToken")
     if token:
         try:
             raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
             prefix, _, offset = raw_token.partition(":")
-            start = int(offset) if prefix == "jobtemplates" else -1
+            start = int(offset) if prefix == kind else -1
         except ValueError:  # binascii.Error and UnicodeDecodeError included
             start = -1
         if start < 0:
-            return error_response_json(
+            return [], None, error_response_json(
                 "InvalidRequestException", "Next token is invalid.", 400
             )
+    if start + limit >= len(items):
+        return items[start:], None, None
+    token = base64.urlsafe_b64encode(f"{kind}:{start + limit}".encode()).decode().rstrip("=")
+    return items[start:start + limit], token, None
+
+
+def _list_job_templates(qp: dict) -> tuple:
+    """``GET /job-templates``, newest first, paged by ``maxResults`` /
+    ``nextToken``; the token carries an offset into that order."""
     ordered = sorted(_job_templates.values(), key=lambda t: t["createdAt"], reverse=True)
-    page = ordered[start:start + limit]
+    page, token, error = _jobs_page(ordered, qp, "jobtemplates")
+    if error:
+        return error
     response = {"jobTemplates": [
         {k: t[k] for k in ("jobTemplateArn", "jobTemplateId", "description", "createdAt")}
         for t in page
     ]}
-    if start + limit < len(ordered):
-        response["nextToken"] = base64.urlsafe_b64encode(
-            f"jobtemplates:{start + limit}".encode()
-        ).decode().rstrip("=")
+    if token:
+        response["nextToken"] = token
     return json_response(response)
 
 
@@ -6209,19 +6220,68 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
             continue
         if wanted_job and execution["jobId"] != wanted_job:
             continue
-        summary = {
-            "status": execution["status"],
-            "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
-            "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
-            "executionNumber": execution["executionNumber"],
-            "retryAttempt": execution.get("retryAttempt", 0),
-        }
-        if execution.get("startedAt") is not None:
-            summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
-        summaries.append(
-            {"jobId": execution["jobId"], "jobExecutionSummary": summary}
-        )
+        summaries.append({
+            "jobId": execution["jobId"],
+            "jobExecutionSummary": _job_execution_summary(execution),
+        })
     return json_response({"executionSummaries": summaries})
+
+
+def _job_execution_summary(execution: dict) -> dict:
+    """Control-plane JobExecutionSummary, as both execution lists nest it."""
+    summary = {
+        "status": execution["status"],
+        "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
+        "executionNumber": execution["executionNumber"],
+        "retryAttempt": execution.get("retryAttempt", 0),
+    }
+    if execution.get("startedAt") is not None:
+        summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
+    return summary
+
+
+def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
+    """``GET /jobs/{jobId}/things``, most recently updated first, paged like ``ListJobTemplates``."""
+    clauses = []
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", job_id):
+        clauses.append(_job_validation_clause(
+            job_id, "jobId", "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+"
+        ))
+    status = qp.get("status")
+    if status is not None and status not in _JOB_EXECUTION_STATUSES:
+        clauses.append(_job_validation_clause(
+            status, "status", "Member must satisfy enum value set: [REMOVED, SUCCEEDED, "
+            "TIMED_OUT, IN_PROGRESS, QUEUED, CANCELED, FAILED, REJECTED]"
+        ))
+    if clauses:
+        return _job_validation_error(clauses)
+    _, _, error = _jobs_page([], qp, "jobexecutions")
+    if error:
+        return error
+    if job_id not in _jobs:
+        return error_response_json(
+            "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+        )
+    _jobs_materialize_executions(job_id)
+    executions = [
+        execution
+        for latest in _job_executions.values()
+        if latest["jobId"] == job_id
+        for execution in _jobs_with_history(latest)
+        if status is None or execution["status"] == status
+    ]
+    executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
+    page, token, error = _jobs_page(executions, qp, "jobexecutions")
+    if error:
+        return error
+    response = {"executionSummaries": [
+        {"thingArn": _thing_arn(e["thingName"]), "jobExecutionSummary": _job_execution_summary(e)}
+        for e in page
+    ]}
+    if token:
+        response["nextToken"] = token
+    return json_response(response)
 
 
 def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
