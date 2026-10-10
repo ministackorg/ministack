@@ -514,9 +514,15 @@ def _describe_state_machine(data):
             "loggingConfiguration": base_sm.get("loggingConfiguration", {"level": "OFF"}),
             "revisionId": base_sm.get("revisionId", ""),
         })
+    # Real AWS evaluates authorization before existence on
+    # DescribeStateMachine: a stateMachineArn that resolves to nothing
+    # (no machine, version, or alias) answers AccessDeniedException, not
+    # StateMachineDoesNotExist (real AWS wire capture; also the API
+    # reference's error list). Other lookups were not captured and keep
+    # StateMachineDoesNotExist.
     return error_response_json(
-        "StateMachineDoesNotExist",
-        f"State machine {arn} not found", 400)
+        "AccessDeniedException",
+        "User is not authorized to access this resource.", 400)
 
 
 def _update_state_machine(data):
