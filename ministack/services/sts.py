@@ -38,7 +38,16 @@ from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
 # and reuses IAM's XML builders and credential generators.
-from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
+from ministack.services.iam import (
+    _error,
+    _extract_tags,
+    _future,
+    _gen_secret,
+    _gen_session_access_key,
+    _gen_session_token,
+    _p,
+    _xml,
+)
 
 _sessions: dict[str, dict] = {}
 
@@ -62,6 +71,7 @@ def _session_expired(session) -> bool:
 def register_session(access_key: str, session: dict) -> None:
     """Register a temporary-credential session (AssumeRole, identity pools)."""
     _evict_expired_sessions()
+    session.setdefault("IssuedAt", time.time())
     _sessions[access_key] = session
 
 
@@ -169,6 +179,26 @@ def _assumed_role_arn(role_arn: str, session_name: str):
         return None, _invalid_role_arn(role_arn)
 
     return f"arn:{spec.partition}:sts::{spec.account_id}:assumed-role/{role_name}/{session_name}", None
+
+
+def _role_id(role_arn: str) -> str:
+    """The RoleId of the role *role_arn* names, or a new one for a role that is not stored."""
+    from ministack.services import iam as iam_svc
+
+    try:
+        spec = parse_arn(role_arn)
+        role = iam_svc._roles.get_scoped(spec.account_id, None, spec.resource.rsplit("/", 1)[-1])
+    except ArnParseError:
+        role = None
+    return (role or {}).get("RoleId") or "AROA" + new_uuid().replace("-", "")[:17].upper()
+
+
+def _session_tags(params: dict) -> list[dict]:
+    """The session tags of an AssumeRole call, from the query or the JSON form."""
+    tags = params.get("Tags")
+    if isinstance(tags, list) and tags and isinstance(tags[0], dict):
+        return [{"Key": str(t.get("Key")), "Value": str(t.get("Value", ""))} for t in tags]
+    return _extract_tags(params)
 
 
 def _invalid_role_arn(role_arn: str):
@@ -285,7 +315,7 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        role_id = _role_id(role_arn)
         register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session_name}",
@@ -296,6 +326,7 @@ async def handle_request(method, path, headers, body, query_params):
             "PrincipalType": "AssumedRole",
             "SourceAccessKeyId": caller["accessKey"],
             "SourcePrincipalArn": caller["userArn"],
+            "SessionTags": _session_tags(params),
         })
         if use_json:
             return json_response({
@@ -329,7 +360,7 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        role_id = _role_id(role_arn)
         register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session}",

@@ -218,6 +218,7 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
+    pin_request_origin,
 )
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
@@ -2849,6 +2850,9 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    if AUTH:
+        pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
+                           headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
 
     request_id = str(uuid.uuid4())
 

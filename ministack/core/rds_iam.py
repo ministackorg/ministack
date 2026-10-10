@@ -295,7 +295,7 @@ def authorize_rds_iam_token(
             result = evaluate(EvalContext(
                 principal_arn=principal.arn, principal_type=principal.type,
                 principal_account=account_id, action="rds-db:connect",
-                resource_arn=resource_arn, region=region,
+                resource_arn=resource_arn, region=region, principal_keys=principal.keys,
             ), principal.policies)
             if result.decision != "Allow":
                 return RdsIamAuthorizationError(result.decision)

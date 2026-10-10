@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **IAM — caller and transport condition keys under `AUTH=true`** — identity policies saw none of the caller's keys and a fixed `127.0.0.1` over plain HTTP; they now see `aws:username`, `aws:userid`, `aws:PrincipalTag/*` (the user's or role's tags, `AssumeRole` session tags taking precedence; in `rds-db:connect` too), for temporary credentials `aws:MultiFactorAuthPresent` and `aws:TokenIssueTime`, the client's address as `aws:SourceIp` and `aws:SecureTransport` as `true` over HTTPS or behind a proxy that sends `X-Forwarded-Proto: https`, and `AssumedRoleId` starts with the role's `RoleId` with or without `AUTH`. Contributed by @iot-rocket.
 - **Cognito Identity — `GetOpenIdToken` claims** — the token was a user-pool ID token with an empty audience; it is now issued by `https://cognito-identity.amazonaws.com` with the identity pool id as `aud`, the identity id as `sub`, an `amr` list naming the login providers and the user-pool sign-in, the pool ARN in `https://cognito-identity.amazonaws.com/identity-pool-arn` and a 10-minute lifetime. An identity id that no pool knows gets `ResourceNotFoundException` instead of a token. Contributed by @iot-rocket.
 
 ## [1.5.26] — 2026-10-11

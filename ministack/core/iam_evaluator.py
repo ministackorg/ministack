@@ -25,6 +25,9 @@ from typing import Any
 
 logger = logging.getLogger("ministack")
 
+_request_origin: contextvars.ContextVar[tuple[str, bool]] = contextvars.ContextVar(
+    "ministack_request_origin", default=("127.0.0.1", False))
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -49,11 +52,12 @@ class EvalContext:
     action: str  # "s3:PutObject"
     resource_arn: str  # "*" until per-service resource ARN construction
     region: str
-    source_ip: str = "127.0.0.1"
-    secure_transport: bool = False
+    source_ip: str = field(default_factory=lambda: _request_origin.get()[0])
+    secure_transport: bool = field(default_factory=lambda: _request_origin.get()[1])
     request_tags: dict[str, str] = field(default_factory=dict)
     tag_keys: list[str] = field(default_factory=list)
     service_context: dict[str, Any] = field(default_factory=dict)
+    principal_keys: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +74,7 @@ class PrincipalInfo:
     type: str  # "User", "AssumedRole", "Root"
     account: str
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
+    keys: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -223,6 +228,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         # role conditions its S3 grant on this key, so leaving it unresolved
         # denied every `cdk deploy` under AUTH=true.
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
+    if k in ctx.principal_keys:
+        return ctx.principal_keys[k]
     if k in ctx.service_context:
         return ctx.service_context[k]
     if k == "aws:principalorgid":
@@ -636,6 +643,11 @@ def pin_request_caller(headers: dict, query_params: dict | None = None) -> None:
     _request_caller_arn.set(request_caller_arn(headers, query_params))
 
 
+def pin_request_origin(source_ip: str, secure_transport: bool) -> None:
+    """Remember the caller's address and transport for this request's policy checks."""
+    _request_origin.set((source_ip, secure_transport))
+
+
 def caller_arn() -> str:
     """The pinned caller ARN, or the caller account's root ARN."""
     from ministack.core.responses import get_account_id
@@ -1042,6 +1054,31 @@ def _is_root_key(access_key_id: str) -> bool:
     return is_root_access_key(access_key_id)
 
 
+def _principal_keys(credential: ResolvedCredential) -> dict[str, Any]:
+    """The condition keys that describe the caller, keyed in lower case."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    keys: dict[str, Any] = {"aws:userid": credential.principal_id}
+    entity = {}
+    if credential.principal_type == "User":
+        keys["aws:username"] = credential.principal_name
+        entity = iam_svc._users.get_scoped(credential.account_id, None, credential.principal_name)
+    elif credential.principal_type == "AssumedRole":
+        entity = iam_svc._roles.get_scoped(
+            credential.account_id, None, _role_name_from_assumed_arn(credential.principal_arn))
+    tags = list((entity or {}).get("Tags") or [])
+    session = sts_svc._sessions.get(credential.access_key_id)
+    if session is not None:
+        tags += session.get("SessionTags") or []
+        keys["aws:multifactorauthpresent"] = "false"
+        if isinstance(session.get("IssuedAt"), (int, float)):
+            keys["aws:tokenissuetime"] = _dt.datetime.fromtimestamp(
+                session["IssuedAt"], _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    keys.update({f"aws:principaltag/{t['Key'].lower()}": t["Value"] for t in tags})
+    return keys
+
+
 def resolve_principal(access_key_id: str,
                       account_id: str) -> PrincipalInfo | AuthError:
     """Resolve an access key to a principal and their policies.
@@ -1073,6 +1110,7 @@ def resolve_principal(access_key_id: str,
         type=credential.principal_type,
         account=credential.account_id,
         policies=policies,
+        keys=_principal_keys(credential),
     )
 
 
@@ -1175,6 +1213,7 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         service_context={
             key.lower(): value for key, value in (service_context or {}).items()
         },
+        principal_keys=principal.keys,
     )
 
     result = evaluate(ctx, principal.policies)

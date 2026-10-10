@@ -11,7 +11,10 @@ the MiniStack server and work with AUTH=false.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
+import re
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
@@ -1149,6 +1152,157 @@ class TestCustomerManagedPolicyResolution:
             policy["DefaultVersionId"] = "v1"
             assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Allow"
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
+
+
+@contextlib.contextmanager
+def _iam_user(name, tags=()):
+    """A stored IAM user with one access key; yields the key and a setter for its inline policy."""
+    from ministack.core.responses import get_account_id
+    from ministack.services import iam as iam_svc
+    key = "AKIATEST" + name.upper().replace("-", "")
+    iam_svc._access_keys[key] = {"UserName": name, "AccessKeyId": key, "SecretAccessKey": "s",
+                                 "Status": "Active", "CreateDate": "2024-01-01"}
+    iam_svc._users[name] = {"UserName": name, "Arn": f"arn:aws:iam::{get_account_id()}:user/{name}",
+                            "UserId": "AIDA" + name.upper().replace("-", ""), "Path": "/",
+                            "AttachedPolicies": [], "Tags": list(tags)}
+    try:
+        yield key, lambda doc: iam_svc._user_inline_policies.__setitem__(name, {"p": doc})
+    finally:
+        iam_svc._access_keys.pop(key, None)
+        iam_svc._users.pop(name, None)
+        iam_svc._user_inline_policies.pop(name, None)
+
+
+def _allows(access_key, put_policy, condition):
+    """Whether *access_key* may call sqs:ListQueues under a policy gated on *condition*."""
+    put_policy(json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*", "Condition": condition}]}))
+    return enforce(access_key, "sqs:ListQueues", "sqs", "us-east-1") is None
+
+
+class TestGlobalConditionKeys:
+    """The caller and transport condition keys."""
+
+    @pytest.fixture
+    def user(self):
+        with _iam_user("ck-user", [{"Key": "Team", "Value": "blue"}]) as user:
+            yield user
+
+    @pytest.fixture
+    def role_session(self):
+        from ministack.core.responses import get_account_id
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+        trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": get_account_id()},
+                                "Action": ["sts:AssumeRole", "sts:TagSession"]}]}
+        iam_svc._roles["ck-role"] = {"RoleName": "ck-role", "RoleId": "AROACKROLE", "AttachedPolicies": [],
+                                     "Arn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "InlinePolicies": {},
+                                     "AssumeRolePolicyDocument": json.dumps(trust),
+                                     "Tags": [{"Key": "team", "Value": "red"}, {"Key": "dept", "Value": "ops"}]}
+        body = (f"Action=AssumeRole&RoleArn=arn:aws:iam::{get_account_id()}:role/ck-role&RoleSessionName=s1"
+                "&Tags.member.1.Key=team&Tags.member.1.Value=green").encode()
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", {}, body, {}))
+        assert status == 200
+        key = re.search(r"<AccessKeyId>([^<]+)", out.decode()).group(1)
+        yield key, lambda doc: iam_svc._roles["ck-role"]["InlinePolicies"].__setitem__("p", doc)
+        sts_svc._sessions.pop(key, None)
+        iam_svc._roles.pop("ck-role", None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"StringEquals": {"aws:username": "ck-user"}}, True),
+        ({"StringEquals": {"aws:userid": "AIDACKUSER"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "blue"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/Team": "red"}}, False),
+        ({"Null": {"aws:MultiFactorAuthPresent": "false"}}, False),
+        ({"Null": {"aws:TokenIssueTime": "false"}}, False),
+    ])
+    def test_iam_user_keys(self, user, condition, allowed):
+        assert _allows(*user, condition) is allowed
+
+    def test_assumed_role_id_starts_with_the_role_id(self, role_session):
+        from ministack.services import sts as sts_svc
+        assert sts_svc._sessions[role_session[0]]["UserId"] == "AROACKROLE:s1"
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"Null": {"aws:username": "true"}}, True),
+        ({"StringEquals": {"aws:userid": "AROACKROLE:s1"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "green"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/dept": "ops"}}, True),
+        ({"Bool": {"aws:MultiFactorAuthPresent": "false"}}, True),
+        ({"DateGreaterThan": {"aws:TokenIssueTime": "2020-01-01T00:00:00Z"}}, True),
+    ])
+    def test_assumed_role_session_keys(self, role_session, condition, allowed):
+        assert _allows(*role_session, condition) is allowed
+
+    def test_assume_role_json_protocol_keeps_session_tags(self, role_session):
+        from ministack.core.responses import get_account_id
+        from ministack.services import sts as sts_svc
+        body = json.dumps({"RoleArn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "RoleSessionName": "s2",
+                           "Tags": [{"Key": "team", "Value": "white"}]}).encode()
+        headers = {"content-type": "application/x-amz-json-1.1",
+                   "x-amz-target": "AWSSecurityTokenServiceV20110615.AssumeRole"}
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+        key = json.loads(out)["Credentials"]["AccessKeyId"]
+        try:
+            assert _allows(key, role_session[1], {"StringEquals": {"aws:PrincipalTag/team": "white"}})
+        finally:
+            sts_svc._sessions.pop(key, None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"IpAddress": {"aws:SourceIp": "10.1.2.0/24"}}, True),
+        ({"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}}, False),
+        ({"Bool": {"aws:SecureTransport": "true"}}, True),
+    ])
+    def test_request_origin_keys(self, user, condition, allowed):
+        from ministack.core.iam_evaluator import pin_request_origin
+
+        def decide():
+            pin_request_origin("10.1.2.3", True)
+            return _allows(*user, condition)
+        assert contextvars.copy_context().run(decide) is allowed
+
+    def test_policy_simulation_ignores_the_request_origin(self):
+        from ministack.core.iam_evaluator import pin_request_origin
+        from ministack.services import iam as iam_svc
+        doc = json.dumps({"Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+            {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*",
+             "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]})
+        body = urlencode({"Action": "SimulateCustomPolicy", "PolicyInputList.member.1": doc,
+                          "ActionNames.member.1": "s3:GetObject"}).encode()
+
+        def simulate():
+            pin_request_origin("10.1.2.3", True)
+            return asyncio.run(iam_svc.handle_request("POST", "/", {}, body, {}))[2]
+        assert b"<EvalDecision>explicitDeny</EvalDecision>" in contextvars.copy_context().run(simulate)
+
+    @pytest.mark.parametrize("auth,scheme,headers,origin", [
+        (True, "https", [], ("10.9.8.7", True)),
+        (True, "http", [], ("10.9.8.7", False)),
+        (True, "http", [(b"x-forwarded-proto", b"https")], ("10.9.8.7", True)),
+        (False, "https", [], ("127.0.0.1", False)),
+    ])
+    def test_http_request_pins_the_client_address_and_scheme(self, monkeypatch, auth, scheme, headers, origin):
+        from ministack import app as app_mod
+        seen = []
+
+        async def capture(*args):
+            ctx = EvalContext("", "", "", "", "*", "us-east-1")
+            seen.append((ctx.source_ip, ctx.secure_transport))
+            return 200, {}, b"ok"
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        monkeypatch.setattr(app_mod, "_handle_pre_body_request", capture)
+        monkeypatch.setattr(app_mod, "AUTH", auth)
+        asyncio.run(app_mod.app({"type": "http", "method": "GET", "path": "/", "scheme": scheme,
+                                 "client": ("10.9.8.7", 50000), "headers": [(b"host", b"sts.localhost"), *headers],
+                                 "query_string": b""}, receive, send))
+        assert seen == [origin]
 
 
 class TestSeededAwsManagedPolicies:
