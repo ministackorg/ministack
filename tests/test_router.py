@@ -206,6 +206,7 @@ _TOKEN_ROUTES = {
     "athena": "athena", "autoscaling": "autoscaling", "backup": "backup",
     "batch": "batch", "bedrock": "bedrock", "bedrock-runtime": "bedrock-runtime",
     "budgets": "budgets",
+    "kinesisanalytics": "kinesisanalyticsv2",
     "cloudcontrolapi": "cloudcontrol", "cloudformation": "cloudformation",
     "cloudfront": "cloudfront", "cloudfront-kvs": "cloudfront-keyvaluestore",
     "cloudtrail": "cloudtrail", "codebuild": "codebuild",

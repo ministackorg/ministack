@@ -532,6 +532,14 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"budgets\."],
         "credential_scope": "budgets",
     },
+    # Managed Service for Apache Flink. The v1 API (KinesisAnalytics_20150814)
+    # shares the `kinesisanalytics` signing name and is not implemented, so
+    # requests route on the v2 target prefix.
+    "kinesisanalyticsv2": {
+        "target_prefixes": ["KinesisAnalytics_20180523"],
+        "host_patterns": [r"kinesisanalytics\."],
+        "credential_scope": "kinesisanalytics",
+    },
     "inspector2": {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
@@ -861,6 +869,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
                 "budgets": "budgets",
+                "kinesisanalytics": "kinesisanalyticsv2",
                 "inspector2": "inspector2",
                 "dsql": "dsql",
                 "s3tables": "s3tables",
