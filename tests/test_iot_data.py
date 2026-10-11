@@ -3766,6 +3766,30 @@ def test_mtls_publish_principal_is_the_certificate_id(broker, tmp_path):
         broker.client("iam").delete_role(RoleName=role["RoleName"])
 
 
+def test_mtls_job_document_urls_name_the_dialled_host(broker, tmp_path):
+    """Presigned URLs a device gets over TLS name the host it dialled, on the gateway port."""
+    iot = broker.client("iot")
+    thing, job_id = _unique("mtls-jobs"), _unique("job")
+    iot.create_job(
+        jobId=job_id, targets=[iot.create_thing(thingName=thing)["thingArn"]],
+        document=json.dumps({"fw": "${aws:iot:s3-presigned-url-v2:s3://bucket/fw.bin}"}),
+        presignedUrlConfig={"roleArn": "arn:aws:iam::000000000000:role/presign"},
+    )
+    port = int(os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566")))
+    topic = f"$aws/things/{thing}/jobs/{job_id}/get"
+    for server_name, host in (("localhost", "localhost"), (None, "127.0.0.1")):
+        peer = _Peer(_mtls_connect(broker, None, None, tmp_path, server_name=server_name))
+        try:
+            _assert_connack(peer.connect(_unique("device")))
+            peer.subscribe(f"{topic}/accepted")
+            peer.send(_make_publish(topic, b"{}"))
+            _topic, payload = peer.next_publish()
+            url = urlparse(json.loads(payload)["execution"]["jobDocument"]["fw"])
+            assert (url.hostname, url.port, url.path) == (host, port, "/bucket/fw.bin")
+        finally:
+            peer.close()
+
+
 def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):
     """No client certificate connects fine, exactly like the WebSocket path,
     and the session runs under the default account."""

@@ -1660,6 +1660,29 @@ def test_cfn_iot_job_template_document_source(cfn, iot_client, s3):
         s3.delete_bucket(Bucket=bucket)
 
 
+def test_cfn_iot_job_template_presigned_url_placeholder(cfn, iot_client):
+    """A Document placeholder needs PresignedUrlConfig.RoleArn; without one the stack fails."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, failing, template_id = f"cfn-iot-jobtmpl-pre-{uid}", f"cfn-iot-jobtmpl-nor-{uid}", f"cfn-jt-pre-{uid}"
+    document = json.dumps({"fw": "${aws:iot:s3-presigned-url:https://s3.amazonaws.com/b/fw.bin}"})
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(template_id, Document=document))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        assert iot_client.describe_job_template(jobTemplateId=template_id)["document"] == document
+
+        cfn.create_stack(StackName=failing, TemplateBody=_cfn_job_template(
+            f"{template_id}-2", Document=document, PresignedUrlConfig=None))
+        assert _wait_stack(cfn, failing)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=failing)["StackEvents"]
+                   if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any(f"Role must be provided for pre-sign S3 urls in job document of job {template_id}-2."
+                   in reason for reason in reasons), reasons
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        _delete_cfn_test_stack(cfn, failing)
+
+
 def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
     """AWS::IoT::CACertificate provisions onto the real CA registry instead of
     rolling the stack back: create registers the PEM (readable back through

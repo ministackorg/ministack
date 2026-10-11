@@ -5721,11 +5721,9 @@ _JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+
 _JOB_DOCUMENT_MAX_BYTES = 32768
 
 
-def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
-    """The job document a documentSource names in this account's S3, or an error."""
+def _job_document_s3_location(source: str) -> tuple[str, str]:
+    """The bucket and key an s3:// or S3 object URL names, empty where it names none."""
     from urllib.parse import unquote, urlsplit
-
-    from ministack.services import s3 as _s3
 
     bucket = key = ""
     if isinstance(source, str) and source.startswith("s3://"):
@@ -5739,6 +5737,14 @@ def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
             elif match:
                 bucket, _, key = parts.path[1:].partition("/")
                 key = unquote(key)
+    return bucket, key
+
+
+def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
+    """The job document a documentSource names in this account's S3, or an error."""
+    from ministack.services import s3 as _s3
+
+    bucket, key = _job_document_s3_location(source)
     if not bucket:
         return None, error_response_json(
             "InvalidRequestException", f"Job document source {source} is invalid.", 400
@@ -5774,6 +5780,37 @@ def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
             400,
         )
     return document, None
+
+
+# ${aws:iot:s3-presigned-url:<url>}; the -v2 form takes the URL encoded.
+_JOB_PRESIGN_RE = re.compile(r"\$\{aws:iot:s3-presigned-url(?P<v2>-v2)?:(?P<url>[^}]*)\}")
+
+
+def _job_presign_error(document: str | None, config: dict | None, job_id: str) -> tuple | None:
+    """AWS's refusal of presigned-URL placeholders without a role or an S3 object URL."""
+    placeholders = list(_JOB_PRESIGN_RE.finditer(document or ""))
+    if not placeholders:
+        return None
+    if not (isinstance(config, dict) and config.get("roleArn")):
+        message = (
+            "presignedUrlConfig role ARN is required to generate an S3 presigned url in job document."
+            if all(m.group("v2") for m in placeholders)
+            else f"Role must be provided for pre-sign S3 urls in job document of job {job_id}."
+        )
+        return error_response_json("InvalidRequestException", message, 400)
+    for m in placeholders:
+        url = m.group("url")
+        bucket, key = _job_document_s3_location(url)
+        if not bucket or (m.group("v2") and re.search(r'[\s"<>\\^`{|}]', url)):
+            return error_response_json(
+                "InvalidRequestException", f"Given S3 url {url} is invalid.", 400
+            )
+        if not key:
+            return error_response_json(
+                "InvalidRequestException",
+                f"Provided S3 url is not valid: {url}. Error: Key cannot be null", 400,
+            )
+    return None
 
 
 async def _create_job(job_id: str, payload: dict) -> tuple:
@@ -5877,6 +5914,9 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         document, err = _job_document_from_source(payload["documentSource"])
         if err:
             return err
+    err = _job_presign_error(document, payload.get("presignedUrlConfig"), job_id)
+    if err:
+        return err
     # Captured BEFORE the job record exists: jobs_first_pending_job_id
     # materializes, and once the new job is in the store it would already
     # count as the front of the queue.
@@ -6430,6 +6470,9 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
     _job_config_floats(record)
+    err = _job_presign_error(record.get("document"), record.get("presignedUrlConfig"), template_id)
+    if err:
+        return err
     _job_templates[template_id] = record
     _set_created_tags(record["jobTemplateArn"], payload.get("tags"))
     return json_response({
@@ -7007,10 +7050,106 @@ def _jobs_device_json(value) -> str:
     return json.dumps(value)
 
 
+# The host a device reached MiniStack on: its presigned URLs name it.
+jobs_device_host: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_iot_jobs_device_host", default=""
+)
+_JOB_PRESIGN_HOST_RE = re.compile(r"[A-Za-z0-9.\-\[\]:_]+")
+# The labels of an IoT endpoint host up to its region; S3 is not routed under them.
+_JOB_PRESIGN_IOT_LABELS_RE = re.compile(r"(?:[^.:]+\.)*?iot\.[a-z0-9-]+\.(?=[^:])")
+# A role session signs an hour of URLs, each valid for its full expiresInSec.
+_JOB_PRESIGN_SESSION_REUSE_SECONDS = 3600
+# (account, role ARN) -> the access key of that role's current session.
+_jobs_presign_sessions: dict[tuple[str, str], str] = {}
+
+
+def _jobs_presign_session(role_arn: str, expires: int) -> tuple[str, dict]:
+    """A session of the presign role, registered with STS, that outlives a URL signed now."""
+    from ministack.services import iam as _iam
+    from ministack.services import sts as _sts
+
+    cache_key = (get_account_id(), role_arn)
+    access_key = _jobs_presign_sessions.get(cache_key, "")
+    session = _sts._sessions.get(access_key)
+    if session is None or session["Expiration"] < time.time() + expires:
+        partition = role_arn.split(":")[1] if _JOB_ROLE_ARN_RE.match(role_arn) else "aws"
+        account = get_account_id()  # the job's account, whatever account the role ARN names
+        name = uuid.uuid4().hex
+        access_key = _iam._gen_session_access_key()
+        session = {
+            "Arn": f"arn:{partition}:sts::{account}:assumed-role/{role_arn.rsplit('/', 1)[-1]}/{name}",
+            "UserId": f"AROA{uuid.uuid4().hex[:17].upper()}:{name}",
+            "SecretAccessKey": _iam._gen_secret(),
+            "SessionToken": _iam._gen_session_token(),
+            "Expiration": time.time() + expires + _JOB_PRESIGN_SESSION_REUSE_SECONDS,
+            "AccountId": account,
+            "PrincipalType": "AssumedRole",
+        }
+        _sts.register_session(access_key, session)
+        _jobs_presign_sessions[cache_key] = access_key
+    return access_key, session
+
+
+def _jobs_presigned_document(job: dict) -> str:
+    """The job document with each placeholder replaced by a presigned GET URL of MiniStack's S3."""
+    document = job.get("document") or "{}"
+    config = job.get("presignedUrlConfig")
+    if "${aws:iot:s3-presigned-url" not in document or not (
+        isinstance(config, dict) and config.get("roleArn")
+    ):
+        return document
+    from ministack.core.sigv4 import (
+        build_canonical_query_string,
+        build_canonical_request,
+        build_string_to_sign,
+        calculate_signature,
+        uri_encode,
+    )
+    from ministack.core.tls import use_ssl_enabled
+
+    expires = config.get("expiresInSec")
+    expires = int(expires) if isinstance(expires, (int, float)) and expires > 0 else 3600
+    access_key, session = _jobs_presign_session(config["roleArn"], expires)
+    host = jobs_device_host.get()
+    if not _JOB_PRESIGN_HOST_RE.fullmatch(host):
+        host = f"{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    elif labels := _JOB_PRESIGN_IOT_LABELS_RE.match(host):
+        host = host[labels.end():]
+    base = f"{'https' if use_ssl_enabled() else 'http'}://{host}"
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    region = get_region()
+    query = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/{amz_date[:8]}/{region}/s3/aws4_request",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": str(expires),
+        "X-Amz-Security-Token": session["SessionToken"],
+        "X-Amz-SignedHeaders": "host",
+    }
+    canonical_query = build_canonical_query_string(query)
+
+    def presign(match: re.Match) -> str:
+        bucket, key = _job_document_s3_location(match.group("url"))
+        if not (bucket and key):
+            return match.group(0)
+        path = f"/{bucket}/{key}"
+        string_to_sign = build_string_to_sign(
+            amz_date, amz_date[:8], region, "s3",
+            build_canonical_request("GET", path, {"host": host}, query, "host"),
+        )
+        signature = calculate_signature(
+            session["SecretAccessKey"], amz_date[:8], region, "s3", string_to_sign
+        )
+        return (f"{base}{uri_encode(path, encode_slash=False)}?{canonical_query}"
+                f"&X-Amz-Signature={signature}")
+
+    return _JOB_PRESIGN_RE.sub(presign, document)
+
+
 def jobs_job_document(job_id: str) -> str:
     """The document a device should run for a job, re-serialized as AWS sends it — ``{}`` if there is none."""
     job = _jobs.get(job_id)
-    document = (job or {}).get("document") or "{}"
+    document = _jobs_presigned_document(job) if job else "{}"
     try:
         return _jobs_device_json(json.loads(document))
     except (ValueError, RecursionError):
@@ -10168,6 +10307,8 @@ async def handle_websocket(
             chosen = proto
             break
 
+    jobs_device_host.set(sub_headers.get("host", ""))
+
     accept: dict = {"type": "websocket.accept"}
     if chosen:
         accept["subprotocol"] = chosen
@@ -10896,6 +11037,10 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
     account_token = _request_account_id.set(account_id)
     region_token = _request_region.set(region)
+    # The name the device dialled (its SNI), or the address, on the gateway port.
+    local = str((writer.get_extra_info("sockname") or ("",))[0])
+    dialled = _mtls_server_names.get(ssl_object) if ssl_object is not None else None
+    jobs_device_host.set(f"{dialled or (f'[{local}]' if ':' in local else local)}:{_GATEWAY_PORT}")
     certificate_id = hashlib.sha256(der).hexdigest() if der else None
     session = _WSSession(_tcp_send, account_id, region, certificate_id)
     session.certificate_id = certificate_id

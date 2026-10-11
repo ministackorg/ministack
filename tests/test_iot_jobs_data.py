@@ -373,6 +373,237 @@ def test_iot_jobs_document_source_is_read_in_the_callers_account():
         _delete_bucket(owner_s3, bucket)
 
 
+def _presign_role(iam, bucket):
+    """A role IoT may assume that reads the bucket's objects: (name, ARN)."""
+    name = _unique("presign")
+    trust = {"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+             "Action": "sts:AssumeRole"}
+    arn = iam.create_role(
+        RoleName=name,
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [trust]}),
+    )["Role"]["Arn"]
+    read = {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*"}
+    iam.put_role_policy(
+        RoleName=name, PolicyName="read",
+        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [read]}),
+    )
+    return name, arn
+
+
+def _delete_presign_role(iam, name):
+    try:
+        iam.delete_role_policy(RoleName=name, PolicyName="read")
+        iam.delete_role(RoleName=name)
+    except ClientError:
+        pass
+
+
+def _presigned_get(url):
+    """A presigned URL's netloc, path and query, and the body a GET of it returns."""
+    from urllib.parse import parse_qs, urlsplit
+
+    parts = urlsplit(url)
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return parts.netloc, parts.path, parse_qs(parts.query), resp.read()
+
+
+def _presign(url, v2=True):
+    return "${aws:iot:s3-presigned-url" + ("-v2" if v2 else "") + ":" + url + "}"
+
+
+def test_iot_jobs_presigned_url_placeholders_reach_the_device(
+    iot_client, iot_jobs_data, s3, iam
+):
+    """The device gets each placeholder as a presigned GET URL of MiniStack's S3 on the host it called."""
+    from urllib.parse import urlsplit
+
+    thing, bucket, role = _unique("jobs-thing"), _unique("jobs-presign"), None
+    jobs = [_unique("job"), _unique("job")]
+    netloc = ENDPOINT.split("://", 1)[1]
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        s3.put_object(Bucket=bucket, Key="dir/fw 1.bin", Body=b"spaced")
+        role, role_arn = _presign_role(iam, bucket)
+        url = f"https://s3.us-east-1.amazonaws.com/{bucket}"
+        document = json.dumps({
+            "classic": _presign(f"{url}/fw.bin", v2=False),
+            "v2": _presign(f"{url}/fw.bin"),
+            "classicRaw": _presign(f"{url}/dir/fw 1.bin", v2=False),
+            "v2Encoded": _presign(f"{url}/dir/fw%201.bin"),
+            "hosted": _presign(f"https://{bucket}.s3.us-east-1.amazonaws.com/fw.bin"),
+            "s3": _presign(f"s3://{bucket}/fw.bin"),
+            "inText": f"get {_presign(f'{url}/fw.bin')} now",
+        })
+        iot_client.create_job(jobId=jobs[0], targets=[thing_arn], document=document,
+                              presignedUrlConfig={"roleArn": role_arn, "expiresInSec": 300})
+        assert iot_client.get_job_document(jobId=jobs[0])["document"] == document
+
+        served = json.loads(iot_jobs_data.describe_job_execution(
+            jobId=jobs[0], thingName=thing, includeJobDocument=True
+        )["execution"]["jobDocument"])
+        bodies = {"classic": b"firmware", "v2": b"firmware", "classicRaw": b"spaced",
+                  "v2Encoded": b"spaced", "hosted": b"firmware", "s3": b"firmware"}
+        for member, body in bodies.items():
+            key = "dir/fw%201.bin" if body == b"spaced" else "fw.bin"
+            got_netloc, path, query, got = _presigned_get(served[member])
+            assert (got_netloc, path, got) == (netloc, f"/{bucket}/{key}", body), member
+            assert sorted(query) == [
+                "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+                "X-Amz-Security-Token", "X-Amz-Signature", "X-Amz-SignedHeaders",
+            ]
+            assert query["X-Amz-Expires"] == ["300"]
+            assert query["X-Amz-SignedHeaders"] == ["host"]
+            assert query["X-Amz-Credential"][0].startswith("ASIA")
+            assert query["X-Amz-Credential"][0].endswith("/us-east-1/s3/aws4_request")
+        before, _, rest = served["inText"].partition("http://")
+        assert (before, rest.endswith(" now")) == ("get ", True)
+
+        execution = iot_jobs_data.start_next_pending_job_execution(thingName=thing)["execution"]
+        assert _presigned_get(json.loads(execution["jobDocument"])["v2"])[3] == b"firmware"
+        updated = iot_jobs_data.update_job_execution(
+            jobId=jobs[0], thingName=thing, status="IN_PROGRESS", includeJobDocument=True
+        )
+        assert _presigned_get(json.loads(updated["jobDocument"])["v2"])[3] == b"firmware"
+
+        # The device's host names the URL; an IoT endpoint host loses its IoT labels.
+        port = netloc.rsplit(":", 1)[1]
+        for host, expected in ((f"a1b2c3.jobs.iot.us-east-1.{netloc}", netloc),
+                               (f"ministack:{port}", f"ministack:{port}")):
+            request = urllib.request.Request(
+                f"{ENDPOINT}/things/{quote(thing)}/jobs/{jobs[0]}?includeJobDocument=true",
+                headers={"Host": host, "Authorization": _JOBS_DATA_AUTH},
+            )
+            with urllib.request.urlopen(request, timeout=5) as resp:
+                document = json.loads(json.loads(resp.read())["execution"]["jobDocument"])
+            signed = urlsplit(document["v2"])
+            fetch = urllib.request.Request(f"{ENDPOINT}{signed.path}?{signed.query}",
+                                           headers={"Host": signed.netloc})
+            with urllib.request.urlopen(fetch, timeout=5) as resp:
+                assert (signed.netloc, resp.read()) == (expected, b"firmware"), host
+
+        # Without expiresInSec a URL lasts an hour.
+        iot_client.cancel_job(jobId=jobs[0], force=True)
+        iot_client.create_job(jobId=jobs[1], targets=[thing_arn],
+                              document=json.dumps({"v2": _presign(f"{url}/fw.bin")}),
+                              presignedUrlConfig={"roleArn": role_arn})
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=jobs[1], thingName=thing, includeJobDocument=True)["execution"]
+        assert _presigned_get(json.loads(execution["jobDocument"])["v2"])[2][
+            "X-Amz-Expires"] == ["3600"]
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+        if role:
+            _delete_presign_role(iam, role)
+
+
+def test_iot_jobs_presigned_url_signs_in_the_jobs_account():
+    """A role ARN of another account signs in the job's account: the URL reaches none of its objects."""
+    owner_s3, owner_iam = _account_client("s3", "111111111111"), _account_client("iam", "111111111111")
+    stranger = _account_client("iot", "222222222222")
+    stranger_jobs = _account_client("iot-jobs-data", "222222222222")
+    thing, bucket, job_id, role = _unique("jobs-thing"), _unique("jobs-presign"), _unique("job"), None
+    try:
+        owner_s3.create_bucket(Bucket=bucket)
+        owner_s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        role, role_arn = _presign_role(owner_iam, bucket)
+        stranger.create_job(jobId=job_id, targets=[_create_thing(stranger, thing)],
+                            document=json.dumps({"fw": _presign(f"s3://{bucket}/fw.bin")}),
+                            presignedUrlConfig={"roleArn": role_arn})
+        url = json.loads(stranger_jobs.describe_job_execution(
+            jobId=job_id, thingName=thing, includeJobDocument=True)["execution"]["jobDocument"])["fw"]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _presigned_get(url)
+        assert ei.value.code == 403
+    finally:
+        _cleanup(stranger, jobs=[job_id], things=[thing])
+        _delete_bucket(owner_s3, bucket)
+        if role:
+            _delete_presign_role(owner_iam, role)
+
+
+@pytest.mark.parametrize("host, expected", [
+    ("ministack:4566", "ministack:4566"),
+    ("host.docker.internal:4566", "host.docker.internal:4566"),
+    ("a1b2c3-ats.iot.us-east-1.localhost:4566", "localhost:4566"),
+    ("a1b2c3.jobs.iot.us-east-1.localhost:4566", "localhost:4566"),
+    ("iot.eu-west-1.ministack:4566", "ministack:4566"),
+    ("", None),
+    ('bad"host', None),
+])
+def test_iot_jobs_presigned_url_host(host, expected):
+    """The URL names the device's host, an IoT endpoint host without its IoT labels, else the configured one."""
+    from urllib.parse import urlsplit
+
+    from ministack.services import iot
+
+    job = {"document": json.dumps({"fw": _presign("s3://bucket/fw.bin")}),
+           "presignedUrlConfig": {"roleArn": "arn:aws:iam::000000000000:role/presign"}}
+    token = iot.jobs_device_host.set(host)
+    try:
+        url = json.loads(iot._jobs_presigned_document(job))["fw"]
+    finally:
+        iot.jobs_device_host.reset(token)
+    assert urlsplit(url).netloc == (expected or f"{iot._MINISTACK_HOST}:{iot._GATEWAY_PORT}")
+
+
+def test_iot_jobs_presigned_url_placeholders_refusals(iot_client, s3):
+    """A placeholder without presignedUrlConfig.roleArn, or naming no S3 object, refuses the job."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-presign")
+    url = "https://s3.us-east-1.amazonaws.com/bucket/fw.bin"
+    classic, v2 = _presign(url, v2=False), _presign(url)
+    role_message = "Role must be provided for pre-sign S3 urls in job document of job {}."
+    v2_message = (
+        "presignedUrlConfig role ARN is required to generate an S3 presigned url in job document."
+    )
+    role = {"roleArn": "arn:aws:iam::000000000000:role/presign"}
+    spaced, keyless = (
+        "https://s3.us-east-1.amazonaws.com/bucket/fw 1.bin",
+        "https://s3.us-east-1.amazonaws.com/bucket",
+    )
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=json.dumps({"a": classic}))
+        cases = [
+            ({"document": json.dumps({"a": classic})}, role_message),
+            ({"document": json.dumps({"a": v2})}, v2_message),
+            ({"document": json.dumps({"a": v2, "b": classic})}, role_message),
+            ({"document": json.dumps({"a": classic}),
+              "presignedUrlConfig": {"expiresInSec": 300}}, role_message),
+            ({"document": json.dumps({"a": v2}),
+              "presignedUrlConfig": {"expiresInSec": 300}}, v2_message),
+            ({"documentSource": f"s3://{bucket}/doc.json"}, role_message),
+            ({"document": json.dumps({"a": _presign("https://example.com/fw.bin", v2=False)}),
+              "presignedUrlConfig": role}, "Given S3 url https://example.com/fw.bin is invalid."),
+            ({"document": json.dumps({"a": _presign(spaced)}), "presignedUrlConfig": role},
+             f"Given S3 url {spaced} is invalid."),
+            ({"document": json.dumps({"a": _presign(keyless)}), "presignedUrlConfig": role},
+             f"Provided S3 url is not valid: {keyless}. Error: Key cannot be null"),
+        ]
+        for kwargs, message in cases:
+            job_id = _unique("job")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job(jobId=job_id, targets=[thing_arn], **kwargs)
+            assert _error(ei) == (400, "InvalidRequestException", message.format(job_id)), kwargs
+            with pytest.raises(ClientError) as ei:
+                iot_client.describe_job(jobId=job_id)
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # A raw space is fine in the classic form, and no placeholder needs no role.
+        job_ids = [_unique("job"), _unique("job")]
+        iot_client.create_job(jobId=job_ids[0], targets=[thing_arn], presignedUrlConfig=role,
+                              document=json.dumps({"a": _presign(spaced, v2=False)}))
+        iot_client.create_job(jobId=job_ids[1], targets=[thing_arn],
+                              document=json.dumps({"a": url}))
+        _cleanup(iot_client, jobs=job_ids)
+    finally:
+        _cleanup(iot_client, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
 def test_iot_jobs_create_duplicate_and_unknown_target_rejected(iot_client):
     thing = _unique("jobs-thing")
     job_id = _unique("job")
@@ -608,6 +839,35 @@ def test_iot_job_template_document_source_reads_the_s3_object(iot_client, s3):
         _delete_templates(iot_client, template_id, from_job)
         _cleanup(iot_client, jobs=[plain, own_source], things=[thing])
         _delete_bucket(s3, bucket)
+
+
+def test_iot_job_template_presigned_url_placeholders(iot_client, iot_jobs_data):
+    """CreateJobTemplate needs a role for a placeholder; a job made from the template hands out URLs."""
+    thing, template_id, refused, job_id = (
+        _unique("jobs-thing"), _unique("tmpl"), _unique("tmpl"), _unique("job")
+    )
+    document = json.dumps({"fw": _presign("s3://bucket/fw.bin", v2=False)})
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job_template(jobTemplateId=refused, description="d", document=document)
+        assert _error(ei) == (
+            400, "InvalidRequestException",
+            f"Role must be provided for pre-sign S3 urls in job document of job {refused}.",
+        )
+        template_arn = iot_client.create_job_template(
+            jobTemplateId=template_id, description="d", document=document,
+            presignedUrlConfig={"roleArn": "arn:aws:iam::000000000000:role/presign",
+                                "expiresInSec": 120},
+        )["jobTemplateArn"]
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], jobTemplateArn=template_arn)
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=job_id, thingName=thing, includeJobDocument=True)["execution"]
+        url = json.loads(execution["jobDocument"])["fw"]
+        assert url.startswith(f"{ENDPOINT}/bucket/fw.bin?") and "&X-Amz-Expires=120&" in url
+    finally:
+        _delete_templates(iot_client, template_id, refused)
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_iot_job_template_rejects_what_aws_rejects(iot_client):
@@ -3074,6 +3334,42 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     assert topics.index(f"{base}/{job_id}/update/accepted") < topics.index(
         f"{base}/notify"
     ) < topics.index(f"{base}/notify-next")
+
+
+def test_jobs_mqtt_presigned_urls(iot_client, iot_data_client, s3, iam):
+    """Over MQTT the document carries presigned URLs too, on the broker host without its IoT labels."""
+    thing, bucket, job_id = _unique("jobs-mqtt-url"), _unique("jobs-presign"), _unique("job")
+    base, role = f"$aws/things/{thing}/jobs", None
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        role, role_arn = _presign_role(iam, bucket)
+        received = _collect_shadow_frames(
+            f"{base}/notify-next",
+            lambda: iot_client.create_job(
+                jobId=job_id, targets=[thing_arn], presignedUrlConfig={"roleArn": role_arn},
+                document=json.dumps({"fw": _presign(f"s3://{bucket}/fw.bin")}),
+            ),
+            want=1,
+        )
+        url = _frames_by_topic(received)[f"{base}/notify-next"]["execution"]["jobDocument"]["fw"]
+        assert _presigned_get(url)[3] == b"firmware"
+
+        received = _collect_shadow_frames(
+            f"{base}/{job_id}/get/accepted",
+            lambda: _mqtt_publish(topic=f"{base}/{job_id}/get", payload=b"{}"),
+            want=1,
+        )
+        url = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"][
+            "jobDocument"]["fw"]
+        netloc, _path, _query, body = _presigned_get(url)
+        assert (netloc, body) == (ENDPOINT.split("://", 1)[1], b"firmware")
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+        _delete_bucket(s3, bucket)
+        if role:
+            _delete_presign_role(iam, role)
 
 
 def test_jobs_mqtt_leaving_continuous_job_group_notifies(iot_client, iot_data_client):
