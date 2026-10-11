@@ -328,6 +328,9 @@ def _restore_state(data: dict | None) -> None:
             if legacy and not _tags.contains_scoped(account, region, record[arn_key]):
                 _tags.set_scoped(account, region, record[arn_key],
                                  {t["Key"]: t.get("Value", "") for t in legacy})
+    for (account_id, region, _), job in _jobs.all_items():
+        if job.get("rolloutQueue"):
+            _jobs_rollout_start(account_id, region, job)
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -5261,7 +5264,8 @@ def _jobs_materialize_executions(job_id: str) -> None:
     SNAPSHOT jobs resolve group membership exactly once (at creation) — the
     `snapshotted` flag latches that. CONTINUOUS jobs re-resolve lazily on
     every read, which is exactly when new membership matters and avoids
-    watching group mutations.
+    watching group mutations. Things in the job's `rolloutQueue` wait for
+    their rollout batch.
     """
     job = _jobs.get(job_id)
     if not job or job.get("status") == "CANCELED":
@@ -5270,9 +5274,10 @@ def _jobs_materialize_executions(job_id: str) -> None:
         return
     now = _jobs_now_ms()
     deleted = job.get("executionsDeletedFor") or ()
+    waiting = set(job.get("rolloutQueue") or ())
     for thing in _job_target_things(job.get("targets")):
         key = (thing, job_id)
-        if key in _job_executions or thing in deleted:
+        if key in _job_executions or thing in deleted or thing in waiting:
             continue
         _jobs_queue_execution(thing, job_id, now)
     if job.get("targetSelection") == "SNAPSHOT":
@@ -5307,6 +5312,97 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
     deleted = (_jobs.get(job_id) or {}).get("executionsDeletedFor")
     if deleted and thing in deleted:
         deleted.remove(thing)
+
+
+# A job with jobExecutionsRolloutConfig creates its executions in batches, one
+# batch per this interval; the things still waiting are in its `rolloutQueue`.
+_JOB_ROLLOUT_INTERVAL_MS = 60_000
+# The running rollout tasks, kept here because the event loop holds only weak references.
+_rollout_tasks: set[asyncio.Task] = set()
+
+
+def _jobs_rollout_batch_size(job: dict, waiting: int) -> int:
+    """How many of `waiting` things a job notifies in its next batch."""
+    config = job.get("jobExecutionsRolloutConfig")
+    config = config if isinstance(config, dict) else {}
+    maximum = config.get("maximumPerMinute")
+    size = maximum if isinstance(maximum, int) and maximum > 0 else waiting
+    rate = config.get("exponentialRate")
+    rate = rate if isinstance(rate, dict) else {}
+    criteria = rate.get("rateIncreaseCriteria")
+    criteria = criteria if isinstance(criteria, dict) else {}
+    if criteria.get("numberOfSucceededThings") is not None:
+        step = criteria["numberOfSucceededThings"]
+        done = _jobs_status_counts(job["jobId"])["SUCCEEDED"]
+    else:
+        step = criteria.get("numberOfNotifiedThings")
+        done = sum(1 for e in _job_executions.values() if e["jobId"] == job["jobId"])
+    base, factor = rate.get("baseRatePerMinute"), rate.get("incrementFactor")
+    if not (
+        isinstance(base, int) and base > 0 and isinstance(step, int) and step > 0
+        and isinstance(factor, (int, float)) and factor > 1
+    ):
+        return size
+    # The rate grows by incrementFactor for every full step of notified (or
+    # succeeded) things, and maximumPerMinute caps it.
+    per_minute = base
+    for _ in range(done // step):
+        if per_minute >= size:
+            break
+        per_minute *= factor
+    return min(size, int(per_minute))
+
+
+def _jobs_rollout_release(job: dict) -> list[tuple[str, str | None]]:
+    """Queue the next batch of a job's waiting things; returns (thing, previous queue front) pairs."""
+    job_id, waiting = job["jobId"], job["rolloutQueue"]
+    batch = waiting[:_jobs_rollout_batch_size(job, len(waiting))]
+    job["rolloutQueue"] = waiting[len(batch):]
+    now = _jobs_now_ms()
+    job["rolloutBatchAt"] = now
+    # A thing deleted meanwhile is skipped, and so is one a CONTINUOUS job no longer targets.
+    targeted = (
+        set(_job_target_things(job.get("targets")))
+        if job.get("targetSelection") == "CONTINUOUS" else _things
+    )
+    released = []
+    for thing in batch:
+        if thing in targeted and (thing, job_id) not in _job_executions:
+            released.append((thing, jobs_first_pending_job_id(thing)))
+            _jobs_queue_execution(thing, job_id, now)
+    _jobs_maybe_complete(job_id)
+    return released
+
+
+async def _jobs_rollout(account_id: str, region: str, job: dict) -> None:
+    """Release a job's waiting things batch by batch until none is left or the job stops."""
+    while True:
+        with request_scope(account_id, region):
+            if (
+                _jobs.get(job["jobId"]) is not job
+                or job["status"] != "IN_PROGRESS"
+                or not job.get("rolloutQueue")
+            ):
+                return
+            wait = job["rolloutBatchAt"] + _JOB_ROLLOUT_INTERVAL_MS - _jobs_now_ms()
+        if wait > 0:
+            await asyncio.sleep(wait / 1000)
+            continue
+        async with publishing_events():
+            with request_scope(account_id, region):
+                released = _jobs_rollout_release(job)
+            for thing, prev_next in released:
+                await jobs_notify_thing(account_id, region, thing, prev_next)
+
+
+def _jobs_rollout_start(account_id: str, region: str, job: dict) -> None:
+    """Run a job's rollout on the running event loop, if there is one."""
+    try:
+        task = asyncio.get_running_loop().create_task(_jobs_rollout(account_id, region, job))
+    except RuntimeError:
+        return
+    _rollout_tasks.add(task)
+    task.add_done_callback(_rollout_tasks.discard)
 
 
 def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
@@ -5532,6 +5628,7 @@ def _jobs_maybe_complete(job_id: str) -> None:
         not job
         or job.get("targetSelection") == "CONTINUOUS"
         or job.get("status") != "IN_PROGRESS"
+        or job.get("rolloutQueue")
     ):
         return
     executions = [e for e in _job_executions.values() if e["jobId"] == job_id]
@@ -5749,6 +5846,12 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "snapshotted": False,
     }
     _set_created_tags(_job_arn(job_id), payload.get("tags"))
+    things = _job_target_things(targets)
+    batch = _jobs_rollout_batch_size(_jobs[job_id], len(things))
+    if batch < len(things):
+        # The other things wait for later batches of the rollout.
+        _jobs[job_id].update(rolloutQueue=things[batch:], rolloutBatchAt=now)
+        _jobs_rollout_start(get_account_id(), get_region(), _jobs[job_id])
     _jobs_materialize_executions(job_id)
     # New QUEUED executions joined each target's pending set — notify, as AWS
     # does (notify-next only reaches the things whose queue front changed).
@@ -6039,10 +6142,10 @@ def _describe_job(job_id: str) -> tuple:
     job_doc["schedulingConfig"] = job.get("schedulingConfig") or {}
     # isConcurrent is false in every steady state (captured eu-north-1
     # 2026-09-19 with a QUEUED, an IN_PROGRESS and a SUCCEEDED execution). It is
-    # true only inside the rollout/cancel window the reference describes, which
-    # this emulator does not model. processingTargets is null throughout the same
+    # true while a rollout still has things to notify; the cancel window the
+    # reference also describes is not modeled. processingTargets is null throughout the same
     # capture, so it stays omitted rather than echoing the target ARNs.
-    job_doc["isConcurrent"] = False
+    job_doc["isConcurrent"] = job["status"] == "IN_PROGRESS" and bool(job.get("rolloutQueue"))
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]

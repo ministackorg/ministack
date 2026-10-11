@@ -228,6 +228,201 @@ def test_iot_jobs_create_duplicate_and_unknown_target_rejected(iot_client):
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
+def test_iot_jobs_rollout_rate_creates_the_first_batch_only(iot_client, iot_jobs_data):
+    """CreateJob creates the first batch only; the job stays IN_PROGRESS and isConcurrent after it finishes."""
+    things = [_unique("jobs-roll") for _ in range(3)]
+    jobs = {}
+    exponential = {"baseRatePerMinute": 1, "incrementFactor": 2,
+                   "rateIncreaseCriteria": {"numberOfNotifiedThings": 1}}
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        for name, config in (
+            ("one", {"maximumPerMinute": 1}),
+            ("two", {"maximumPerMinute": 2}),
+            ("exponential", {"maximumPerMinute": 1000, "exponentialRate": exponential}),
+            ("all", {"maximumPerMinute": 3}),
+        ):
+            jobs[name] = _unique("job")
+            iot_client.create_job(jobId=jobs[name], targets=arns, document=_DOCUMENT,
+                                  jobExecutionsRolloutConfig=config)
+
+        def created(job_id):
+            found = []
+            for thing in things:
+                try:
+                    iot_client.describe_job_execution(jobId=job_id, thingName=thing)
+                    found.append(thing)
+                except ClientError as e:
+                    assert e.response["Error"]["Code"] == "ResourceNotFoundException"
+            return found
+
+        assert created(jobs["one"]) == things[:1]
+        assert created(jobs["two"]) == things[:2]
+        assert created(jobs["exponential"]) == things[:1]
+        assert created(jobs["all"]) == things
+        pending = iot_jobs_data.get_pending_job_executions(thingName=things[2])
+        assert [e["jobId"] for e in pending["queuedJobs"]] == [jobs["all"]]
+
+        iot_jobs_data.update_job_execution(jobId=jobs["one"], thingName=things[0],
+                                           status="SUCCEEDED")
+        job = iot_client.describe_job(jobId=jobs["one"])["job"]
+        assert (job["status"], job["isConcurrent"]) == ("IN_PROGRESS", True)
+        assert job["jobProcessDetails"]["numberOfSucceededThings"] == 1
+        assert job["jobProcessDetails"]["numberOfQueuedThings"] == 0
+        assert iot_client.describe_job(jobId=jobs["all"])["job"]["isConcurrent"] is False
+        iot_client.cancel_job(jobId=jobs["two"])
+        assert iot_client.describe_job(jobId=jobs["two"])["job"]["isConcurrent"] is False
+    finally:
+        _cleanup(iot_client, jobs=list(jobs.values()), things=things)
+
+
+def _rollout_run(monkeypatch, body):
+    """Run `body(iot_module, created, published)` on a new event loop with batches 0.5 s apart."""
+    import asyncio
+
+    from ministack.services import iot as iot_module
+
+    published = []
+
+    async def publish(account_id, region, topic, payload, qos=0, retain=False, **_):
+        published.append((topic, json.loads(payload)))
+
+    monkeypatch.setattr(iot_module, "broker_publish", publish)
+    monkeypatch.setattr(iot_module, "_JOB_ROLLOUT_INTERVAL_MS", 500)
+
+    def created(job_id):
+        return sorted(t for t, j in iot_module._job_executions.keys() if j == job_id)
+
+    iot_module.reset()
+    try:
+        asyncio.run(body(iot_module, created, published))
+    finally:
+        iot_module.reset()
+
+
+async def _rollout_wait(predicate, timeout=5.0):
+    import asyncio
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.02)
+
+
+async def _rollout_create(iot_module, job_id, things, **payload):
+    """Create the things that are missing and a job with a document."""
+    from ministack.core.responses import get_account_id, get_region
+
+    for thing in things:
+        iot_module._things.setdefault(thing, {"thingName": thing})
+    arns = [f"arn:aws:iot:{get_region()}:{get_account_id()}:thing/{t}" for t in things]
+    status, _, _ = await iot_module._create_job(
+        job_id, {"targets": arns, "document": "{}", **payload})
+    assert status == 200
+
+
+def test_iot_jobs_rollout_notifies_a_batch_per_interval(monkeypatch):
+    """Each batch is created and notified one interval after the last; CancelJob and DeleteJob stop the rest."""
+    from ministack.core.responses import request_scope
+
+    things = ["t1", "t2", "t3"]
+    rate = {"jobExecutionsRolloutConfig": {"maximumPerMinute": 1}}
+
+    async def body(iot_module, created, published):
+        with request_scope("111111111111", "eu-central-1"):
+            for job_id in ("roll", "cancel", "delete"):
+                await _rollout_create(iot_module, job_id, things, **rate)
+            await iot_module._cancel_job("cancel", {}, {})
+            await iot_module._delete_job("delete", {"force": "true"})
+            assert created("roll") == ["t1"]
+            assert not any(topic.startswith("$aws/things/t2/") for topic, _ in published)
+            await _rollout_wait(lambda: created("roll") == ["t1", "t2"])
+            await _rollout_wait(lambda: "$aws/things/t2/jobs/notify-next" in dict(published))
+            assert dict(published)["$aws/things/t2/jobs/notify-next"]["execution"]["jobId"] == "roll"
+            assert created("roll") == ["t1", "t2"]
+            assert iot_module._jobs["roll"]["rolloutQueue"] == ["t3"]
+            await _rollout_wait(lambda: created("roll") == things)
+            await _rollout_wait(lambda: not iot_module._rollout_tasks)
+            assert json.loads(iot_module._describe_job("roll")[2])["job"]["isConcurrent"] is False
+            assert created("cancel") == ["t1"]
+            assert created("delete") == []
+
+    _rollout_run(monkeypatch, body)
+
+
+def test_iot_jobs_rollout_exponential_rate_grows_by_step():
+    """The rate grows by incrementFactor per full step, rounds down per batch and stops at maximumPerMinute."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    def batches(count, maximum, rate=None, succeed_first=False):
+        iot_module.reset()
+        things = [f"t{i}" for i in range(count)]
+        config = {"maximumPerMinute": maximum}
+        if rate:
+            config["exponentialRate"] = {"baseRatePerMinute": 1, **rate}
+        with request_scope("111111111111", "eu-central-1"):
+            for thing in things:
+                iot_module._things[thing] = {"thingName": thing}
+            job = iot_module._jobs["j"] = {
+                "jobId": "j", "targets": [], "targetSelection": "SNAPSHOT",
+                "status": "IN_PROGRESS", "jobExecutionsRolloutConfig": config,
+                "rolloutQueue": things, "rolloutBatchAt": 0,
+            }
+            sizes = []
+            while job["rolloutQueue"]:
+                sizes.append(len(iot_module._jobs_rollout_release(job)))
+                if succeed_first:
+                    iot_module._job_executions[("t0", "j")]["status"] = "SUCCEEDED"
+            return sizes
+
+    notified = {"rateIncreaseCriteria": {"numberOfNotifiedThings": 1}}
+    try:
+        assert batches(4, 2) == [2, 2]
+        assert batches(8, 1000, {"incrementFactor": 2, **notified}) == [1, 2, 5]
+        assert batches(7, 1000, {"incrementFactor": 1.5, **notified}) == [1, 1, 2, 3]
+        assert batches(7, 2, {"incrementFactor": 4, **notified}) == [1, 2, 2, 2]
+        succeeded = {"incrementFactor": 2,
+                     "rateIncreaseCriteria": {"numberOfSucceededThings": 1}}
+        assert batches(7, 1000, succeeded, succeed_first=True) == [1, 2, 2, 2]
+    finally:
+        iot_module.reset()
+
+
+def test_iot_jobs_rollout_survives_persistence_in_each_scope_and_stops_on_reset(monkeypatch):
+    """A restored job resumes in its own account and region; reset ends every rollout."""
+    from ministack.core.responses import request_scope
+
+    scopes = [("111111111111", "eu-central-1"), ("222222222222", "us-east-1")]
+
+    async def body(iot_module, created, published):
+        for scope in scopes:
+            with request_scope(*scope):
+                await _rollout_create(iot_module, "roll", ["t1", "t2", "t3"],
+                                      jobExecutionsRolloutConfig={"maximumPerMinute": 2})
+        state = iot_module.get_state()
+        iot_module.reset()
+        iot_module.load_persisted_state(state)
+        for scope in scopes:
+            with request_scope(*scope):
+                assert created("roll") == ["t1", "t2"]
+                assert iot_module._jobs["roll"]["rolloutQueue"] == ["t3"]
+        for scope in scopes:
+            with request_scope(*scope):
+                await _rollout_wait(lambda: created("roll") == ["t1", "t2", "t3"])
+        await _rollout_wait(lambda: not iot_module._rollout_tasks)
+
+        with request_scope(*scopes[0]):
+            await _rollout_create(iot_module, "again", ["t1", "t2"],
+                                  jobExecutionsRolloutConfig={"maximumPerMinute": 1})
+            iot_module.reset()
+            await _rollout_wait(lambda: not iot_module._rollout_tasks)
+            assert "again" not in iot_module._jobs
+            assert created("again") == []
+
+    _rollout_run(monkeypatch, body)
+
+
 # ---------------------------------------------------------------------------
 # Job templates — shapes and messages measured on AWS (eu-central-1,
 # 2026-10-05)
