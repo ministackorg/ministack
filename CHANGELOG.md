@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.26] — 2026-10-11
+
+### Fixed
+- **Docker image — `ensurepip` is back in the slim image** — 1.5.24 removed `ensurepip` from the Alpine image, so `python -m venv` could not install pip in images built on top of MiniStack. Reported by @jin-gizmo.
+- **ECS — `DescribeServices` on a missing cluster** — returned success with every service listed as `MISSING`; it now returns `ClusterNotFoundException`.
+- **Startup memory without Docker** — the Docker Hub pull fallback imported the Docker SDK at boot even when no Docker socket was available. It now loads only when a socket is present.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
