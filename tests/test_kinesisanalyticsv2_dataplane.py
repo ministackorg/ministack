@@ -2,13 +2,16 @@
 Managed Service for Apache Flink data plane: real jobs in the official Flink
 image, driven through the kinesisanalyticsv2 API.
 
-The test job (tests/fixtures/flink) is compiled at setup against the Flink
-classes in the runtime image and aws-kinesisanalytics-runtime, neither of them
-bundled, so no binary is committed and the jar is built the way AWS documents.
-It reads the "Test" runtime property group through KinesisAnalyticsRuntime and
-writes a checkpointed counter to a MiniStack Kinesis stream, which covers the
-runtime library, the property file, the endpoint injection, and restore from
-a savepoint.
+The test job (tests/fixtures/flink/src) is compiled at setup against the
+Flink classes in the runtime image, so no binary is committed. It reads the
+"Test" runtime property group from the properties file and writes a
+checkpointed counter to a MiniStack Kinesis stream, which covers the property
+file, the endpoint injection, and restore from a savepoint.
+
+RuntimeLibraryJob (tests/fixtures/flink/runtime-library-src) reads the same
+group through KinesisAnalyticsRuntime with the library not bundled, as AWS
+documents; its test runs only when aws-kinesisanalytics-runtime is in
+/opt/ministack/flink-lib.
 """
 
 import io
@@ -32,8 +35,7 @@ from ministack.services import kinesisanalyticsv2_flink as dataplane
 
 RUNTIME = "FLINK-1_20"
 ROLE = "arn:aws:iam::000000000000:role/flink-app"
-SOURCE_DIR = Path(__file__).parent / "fixtures" / "flink" / "src"
-MAIN_CLASS = "ministack.flinktest.CounterJob"
+FIXTURES = Path(__file__).parent / "fixtures" / "flink"
 
 requires_docker = pytest.mark.skipif(
     not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- skipping Flink data-plane tests"
@@ -100,14 +102,15 @@ class _Stream:
         return records
 
 
+def _runtime_library():
+    return sorted(Path(dataplane._FLINK_LIB_DIR).glob("aws-kinesisanalytics-runtime-*.jar"))
+
+
 @pytest.fixture(scope="module")
-def counter_jar():
-    """Compile the test job against the Flink classes of the runtime image."""
+def flink_classes():
+    """The Flink classes of the runtime image, to compile test jobs against."""
     if shutil.which("javac") is None or shutil.which("jar") is None:
         pytest.skip("a JDK (javac and jar) is needed to build the Flink test job")
-    libraries = sorted(Path(dataplane._FLINK_LIB_DIR).glob("aws-kinesisanalytics-runtime-*.jar"))
-    if not libraries:
-        pytest.skip(f"aws-kinesisanalytics-runtime is not in {dataplane._FLINK_LIB_DIR}; the test job needs it")
     import docker
 
     client = docker.from_env()
@@ -125,23 +128,41 @@ def counter_jar():
         stream, _ = container.get_archive("/opt/flink/lib")
         with tarfile.open(fileobj=io.BytesIO(b"".join(stream))) as tar:
             tar.extractall(work, filter="data")
-        # Compiled against the runtime library but not bundled: MiniStack, like
-        # Managed Flink, provides it on the cluster classpath.
-        sources = [str(p) for p in SOURCE_DIR.rglob("*.java")]
-        subprocess.run(
-            ["javac", "--release", "11", "-nowarn", "-cp", os.pathsep.join([f"{work / 'lib'}{os.sep}*", *map(str, libraries)]), "-d", str(work / "classes"),
-             *sources],
-            check=True, capture_output=True,
-        )
-        jar_path = work / "counter-job.jar"
-        subprocess.run(
-            ["jar", "--create", "--file", str(jar_path), "--main-class", MAIN_CLASS, "-C", str(work / "classes"), "."],
-            check=True, capture_output=True,
-        )
-        yield jar_path.read_bytes()
+        yield work
     finally:
         container.remove(force=True)
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _build_jar(work, name, main_class, source_dirs, classpath=()):
+    classes = work / f"{name}-classes"
+    sources = [str(p) for d in source_dirs for p in d.rglob("*.java")]
+    subprocess.run(
+        ["javac", "--release", "11", "-nowarn",
+         "-cp", os.pathsep.join([f"{work / 'lib'}{os.sep}*", *map(str, classpath)]), "-d", str(classes), *sources],
+        check=True, capture_output=True,
+    )
+    jar_path = work / f"{name}.jar"
+    subprocess.run(
+        ["jar", "--create", "--file", str(jar_path), "--main-class", main_class, "-C", str(classes), "."],
+        check=True, capture_output=True,
+    )
+    return jar_path.read_bytes()
+
+
+@pytest.fixture(scope="module")
+def counter_jar(flink_classes):
+    return _build_jar(flink_classes, "counter-job", "ministack.flinktest.CounterJob", [FIXTURES / "src"])
+
+
+@pytest.fixture(scope="module")
+def runtime_library_jar(flink_classes):
+    """RuntimeLibraryJob, compiled against aws-kinesisanalytics-runtime but not bundling it."""
+    libraries = _runtime_library()
+    if not libraries:
+        pytest.skip(f"aws-kinesisanalytics-runtime is not in {dataplane._FLINK_LIB_DIR}")
+    return _build_jar(flink_classes, "runtime-library-job", "ministack.flinktest.RuntimeLibraryJob",
+                      [FIXTURES / "src", FIXTURES / "runtime-library-src"], classpath=libraries)
 
 
 def _create_app(kinesisanalyticsv2, s3, kin, jar, checkpoint=None, name=None):
@@ -371,3 +392,17 @@ def test_force_stop_while_starting_then_start_again(kinesisanalyticsv2, kin, fli
     _start_and_wait(kinesisanalyticsv2, name)
     assert stream.wait_for(1)
     assert {c.labels.get("role") for c in _containers(name)} == {"jobmanager", "taskmanager"}
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_runtime_library_is_provided_from_flink_lib(kinesisanalyticsv2, s3, kin, runtime_library_jar):
+    """A job built with aws-kinesisanalytics-runtime in provided scope runs, as on
+    AWS, when the library is in /opt/ministack/flink-lib."""
+    app = _create_app(kinesisanalyticsv2, s3, kin, runtime_library_jar)
+    try:
+        stream = _Stream(kin, app["stream"])
+        _start_and_wait(kinesisanalyticsv2, app["name"])
+        assert stream.wait_for(1)[0]["message"] == app["message"]
+    finally:
+        _cleanup(kinesisanalyticsv2, app["name"])

@@ -6,17 +6,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
-import java.util.Map;
-import java.util.Properties;
-
-import com.amazonaws.services.kinesisanalytics.runtime.KinesisAnalyticsRuntime;
 
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -26,25 +25,32 @@ import org.apache.flink.streaming.api.functions.source.SourceFunction;
 /**
  * Test job for MiniStack's Managed Flink data plane.
  *
- * Reads the "Test" runtime property group through KinesisAnalyticsRuntime, counts
+ * Reads the "Test" property group from the runtime properties file, counts
  * upwards in checkpointed state, and writes {"message", "n"} records to the
  * Kinesis stream named by the "StreamName" property through the endpoint in
  * AWS_ENDPOINT_URL. A restore from a savepoint continues the count.
  *
- * Built the way AWS's getting-started project builds a job: Flink and
- * aws-kinesisanalytics-runtime are provided by the runtime, not bundled, so
- * the jar holds only this class. It needs no connector or AWS SDK.
+ * Uses only Flink and the JDK, so the jar stays a few kilobytes and needs no
+ * connector, AWS SDK or aws-kinesisanalytics-runtime. RuntimeLibraryJob runs
+ * the same pipeline with properties read through KinesisAnalyticsRuntime.
  */
 public class CounterJob {
-    public static void main(String[] args) throws Exception {
-        Map<String, Properties> groups = KinesisAnalyticsRuntime.getApplicationProperties();
-        Properties group = groups.get("Test");
-        if (group == null) {
-            throw new IllegalStateException("runtime property group Test is missing");
-        }
-        String stream = group.getProperty("StreamName");
-        String message = group.getProperty("Message");
+    static final String PROPERTIES = "/etc/flink/application_properties.json";
 
+    public static void main(String[] args) throws Exception {
+        JsonNode group = null;
+        for (JsonNode g : new ObjectMapper().readTree(Files.readString(Path.of(PROPERTIES)))) {
+            if ("Test".equals(g.path("PropertyGroupId").asText())) {
+                group = g.path("PropertyMap");
+            }
+        }
+        if (group == null) {
+            throw new IllegalStateException("property group Test is missing from " + PROPERTIES);
+        }
+        run(group.path("StreamName").asText(), group.path("Message").asText());
+    }
+
+    static void run(String stream, String message) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.addSource(new Counter()).setParallelism(1)
             .addSink(new KinesisSink(stream, message)).setParallelism(1);

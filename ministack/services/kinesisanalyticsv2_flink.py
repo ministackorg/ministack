@@ -75,9 +75,8 @@ _PROPERTIES_PATH = "/etc/flink/application_properties.json"
 # provides on its classpath. Managed Flink provides
 # com.amazonaws:aws-kinesisanalytics-runtime ("Provided dependencies",
 # Managed Flink developer guide, best practices), and AWS documents building
-# jobs with it in provided scope, so it must come from here. The full image
-# ships it; elsewhere, mount a directory here. Same pattern as the RDS IAM
-# plugin's artifact root.
+# jobs with it in provided scope, so it must come from here: mount a
+# directory holding it. Same pattern as the RDS IAM plugin's artifact root.
 _FLINK_LIB_DIR = "/opt/ministack/flink-lib"
 # UID of the ``flink`` user in the official image; the savepoint volume must be
 # writable by it.
