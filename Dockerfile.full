@@ -118,6 +118,22 @@ RUN set -eux; \
     strip "/tmp/libicudata.so.${ver}"; \
     ln -s "libicudata.so.${ver}" /tmp/libicudata.so.slim
 
+# Managed Flink provides com.amazonaws:aws-kinesisanalytics-runtime on the
+# cluster classpath, and AWS documents building jobs with it in provided scope.
+# MiniStack copies every jar in /opt/ministack/flink-lib into its Flink
+# containers, so the full image ships this one. The checksum is the published
+# Maven Central artifact's.
+FROM python:3.13-slim AS flink-lib
+RUN set -eux; \
+    version=1.2.0; \
+    sha256=b3b940a060044304193594756757d9b0d167c63e61e72654a2e41d166f3be67d; \
+    mkdir -p /opt/ministack/flink-lib; \
+    jar="aws-kinesisanalytics-runtime-${version}.jar"; \
+    python -c "import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+      "https://repo1.maven.org/maven2/com/amazonaws/aws-kinesisanalytics-runtime/${version}/${jar}" \
+      "/opt/ministack/flink-lib/${jar}"; \
+    echo "${sha256}  /opt/ministack/flink-lib/${jar}" | sha256sum -c -
+
 
 FROM python:3.13-slim AS prep
 
@@ -148,6 +164,7 @@ RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
 COPY --from=plugin-build /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
+COPY --from=flink-lib /opt/ministack/flink-lib /opt/ministack/flink-lib
 
 RUN groupadd -r ministack && useradd -r -g ministack ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data

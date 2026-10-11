@@ -486,3 +486,151 @@ def test_cloudformation_flink_stack(cfn, logs, kinesisanalyticsv2):
     with pytest.raises(ClientError) as exc:
         _detail(kinesisanalyticsv2, app)
     assert _code(exc) == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Data plane hooks (a fake data plane, in process)
+# ---------------------------------------------------------------------------
+
+class _FakeDataPlane:
+    """Stands in for kinesisanalyticsv2_flink: slow savepoints, optional failure."""
+
+    def __init__(self, savepoint="file:///savepoints/sp-1", delay=0.5):
+        import threading
+
+        self.savepoint = savepoint
+        self.delay = delay
+        self.started = []
+        self.release = threading.Event()
+
+    def available(self):
+        return True
+
+    def supports(self, runtime):
+        return runtime in ("FLINK-1_19", "FLINK-1_20")
+
+    def start(self, app, savepoint_path, on_status):
+        self.started.append(savepoint_path)
+        on_status("RUNNING")
+
+    def _slow(self):
+        self.release.wait(self.delay)
+        return self.savepoint
+
+    def stop(self, app, force, take_snapshot):
+        return self._slow() if take_snapshot else None
+
+    def snapshot(self, app, snapshot_name):
+        return self._slow()
+
+    def delete(self, app):
+        pass
+
+    def reset(self):
+        pass
+
+
+def _wait_until(predicate, timeout=5):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _call(action, payload):
+    import asyncio
+    import json
+
+    status, _, body = asyncio.run(kda.handle_request(
+        "POST", "/", {"x-amz-target": f"KinesisAnalytics_20180523.{action}"}, json.dumps(payload).encode(), {}))
+    return status, json.loads(body) if body else {}
+
+
+@pytest.fixture
+def fake_dataplane(local_state, monkeypatch):
+    fake = _FakeDataPlane()
+    monkeypatch.setattr(kda, "_dataplane", fake)
+    kda.create_application({"ApplicationName": "dp", "RuntimeEnvironment": RUNTIME, "ServiceExecutionRole": ROLE,
+                            "ApplicationConfiguration": {"ApplicationSnapshotConfiguration": {"SnapshotsEnabled": True}}})
+    assert _call("StartApplication", {"ApplicationName": "dp"})[0] == 200
+    assert kda._applications["dp"]["ApplicationStatus"] == "RUNNING"
+    return fake
+
+
+def _status(name="dp"):
+    return kda._applications[name]["ApplicationStatus"]
+
+
+def _snapshot_status(snapshot_name):
+    return kda._snapshots["dp"][snapshot_name]["SnapshotStatus"]
+
+
+def test_snapshot_runs_in_background(fake_dataplane):
+    import time
+
+    started = time.time()
+    assert _call("CreateApplicationSnapshot", {"ApplicationName": "dp", "SnapshotName": "s1"})[0] == 200
+    assert time.time() - started < 0.3  # the request does not wait for the savepoint
+    assert _snapshot_status("s1") == "CREATING"
+    assert _wait_until(lambda: _snapshot_status("s1") == "READY")
+    assert kda._snapshots["dp"]["s1"]["_SavepointPath"] == "file:///savepoints/sp-1"
+
+
+def test_failed_snapshot_is_marked_failed_and_not_restored(fake_dataplane):
+    fake_dataplane.savepoint = None
+    _call("CreateApplicationSnapshot", {"ApplicationName": "dp", "SnapshotName": "bad"})
+    assert _wait_until(lambda: _snapshot_status("bad") == "FAILED")
+    _call("StopApplication", {"ApplicationName": "dp", "Force": True})
+    assert _wait_until(lambda: _status() == "READY")
+    status, body = _call("StartApplication", {"ApplicationName": "dp", "RunConfiguration": {
+        "ApplicationRestoreConfiguration": {"ApplicationRestoreType": "RESTORE_FROM_CUSTOM_SNAPSHOT",
+                                            "SnapshotName": "bad"}}})
+    assert status == 400
+    assert body["__type"] == "InvalidArgumentException"
+
+
+def test_graceful_stop_runs_in_background_and_restores_latest(fake_dataplane):
+    import time
+
+    started = time.time()
+    _call("StopApplication", {"ApplicationName": "dp"})
+    assert time.time() - started < 0.3
+    assert _status() == "STOPPING"
+    assert _wait_until(lambda: _status() == "READY")
+    [snap] = kda._snapshots["dp"].values()
+    assert snap["SnapshotStatus"] == "READY"
+
+    _call("StartApplication", {"ApplicationName": "dp", "RunConfiguration": {
+        "ApplicationRestoreConfiguration": {"ApplicationRestoreType": "RESTORE_FROM_LATEST_SNAPSHOT"}}})
+    assert fake_dataplane.started[-1] == "file:///savepoints/sp-1"
+
+
+def test_data_plane_start_failure_returns_to_ready(local_state, monkeypatch):
+    fake = _FakeDataPlane()
+    fake.start = lambda app, savepoint, on_status: on_status("FAILED", "jar not found")
+    monkeypatch.setattr(kda, "_dataplane", fake)
+    kda.create_application({"ApplicationName": "dp", "RuntimeEnvironment": RUNTIME, "ServiceExecutionRole": ROLE})
+    _call("StartApplication", {"ApplicationName": "dp"})
+    assert _status() == "READY"
+
+
+def test_runtime_without_an_image_stays_control_plane_only(local_state, monkeypatch):
+    fake = _FakeDataPlane()
+    monkeypatch.setattr(kda, "_dataplane", fake)
+    kda.create_application({"ApplicationName": "dp", "RuntimeEnvironment": "FLINK-1_18", "ServiceExecutionRole": ROLE,
+                            "ApplicationConfiguration": {"ApplicationSnapshotConfiguration": {"SnapshotsEnabled": True}}})
+    _call("StartApplication", {"ApplicationName": "dp"})
+    assert fake.started == []
+
+    def described():
+        return _call("DescribeApplication", {"ApplicationName": "dp"})[1]["ApplicationDetail"]["ApplicationStatus"]
+
+    assert described() == "RUNNING"  # settles on read, as without Docker
+    _call("StopApplication", {"ApplicationName": "dp"})
+    assert described() == "READY"
+    [snap] = kda._snapshots["dp"].values()
+    assert snap["SnapshotStatus"] == "READY"
