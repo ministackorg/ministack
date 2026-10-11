@@ -27,6 +27,8 @@ from botocore.exceptions import ClientError
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 _DOCUMENT = json.dumps({"operation": "reboot", "when": "now"})
+# Devices get the document re-serialized without spaces.
+_DEVICE_DOCUMENT = '{"operation":"reboot","when":"now"}'
 
 # A syntactically plausible SigV4 header whose credential scope routes the
 # request to the iot-jobs-data service in the default account and region
@@ -176,34 +178,199 @@ def test_iot_jobs_get_job_document(iot_client):
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
-def test_iot_jobs_document_source_serves_a_placeholder_and_is_not_fetched(
-    iot_client, iot_jobs_data
-):
-    """Documented divergence: AWS fetches `documentSource` from S3 and serves
-    its CONTENT to devices. MiniStack does not fetch it — it serves a
-    placeholder naming the source, so a `documentSource` job still creates,
-    describes, and runs its whole execution lifecycle locally. This test pins
-    that choice; changing it means changing README + CHANGELOG too."""
-    thing = _unique("jobs-thing")
-    job_id = _unique("job")
-    source = "https://ministack-jobs.s3.us-east-1.amazonaws.com/reboot.json"
+def _delete_bucket(s3_client, bucket):
+    try:
+        for obj in s3_client.list_objects_v2(Bucket=bucket).get("Contents", []):
+            s3_client.delete_object(Bucket=bucket, Key=obj["Key"])
+        s3_client.delete_bucket(Bucket=bucket)
+    except ClientError:
+        pass
+
+
+def test_iot_jobs_document_source_reads_the_s3_object(iot_client, iot_jobs_data, s3):
+    """CreateJob reads a documentSource object once, at creation, from any S3 URL form."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    content = json.dumps({"operation": "reboot", "v": 1})
+    jobs = []
+
+    def create(source):
+        jobs.append(_unique("job"))
+        iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], documentSource=source)
+        return jobs[-1]
+
     try:
         thing_arn = _create_thing(iot_client, thing)
-        iot_client.create_job(
-            jobId=job_id, targets=[thing_arn], documentSource=source
-        )
-        # The control plane echoes the source it was handed...
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=content)
+        source = f"https://s3.us-east-1.amazonaws.com/{bucket}/doc.json"
+        job_id = create(source)
         assert iot_client.describe_job(jobId=job_id)["documentSource"] == source
-        # ...and both document reads serve the placeholder, never S3 content.
-        assert json.loads(iot_client.get_job_document(jobId=job_id)["document"]) == {
-            "documentSource": source
-        }
+        assert iot_client.get_job_document(jobId=job_id)["document"] == content
         execution = iot_jobs_data.describe_job_execution(
-            jobId=job_id, thingName=thing
+            jobId=job_id, thingName=thing, includeJobDocument=True
         )["execution"]
-        assert json.loads(execution["jobDocument"]) == {"documentSource": source}
+        assert execution["jobDocument"] == '{"operation":"reboot","v":1}'
+
+        # Overwriting the object changes no job made from it.
+        s3.put_object(Bucket=bucket, Key="doc.json", Body='{"v": 2}')
+        assert iot_client.get_job_document(jobId=job_id)["document"] == content
+        for source in (
+            f"s3://{bucket}/doc.json",
+            f"https://{bucket}.s3.us-east-1.amazonaws.com/doc.json",
+            f"https://{bucket}.s3.amazonaws.com/doc.json",
+            f"https://s3.amazonaws.com/{bucket}/doc.json",
+            f"https://s3-us-east-1.amazonaws.com/{bucket}/doc.json",
+            f"http://s3.eu-west-1.amazonaws.com/{bucket}/doc.json",
+        ):
+            document = iot_client.get_job_document(jobId=create(source))["document"]
+            assert document == '{"v": 2}', source
+
+        # An http(s) path is percent-decoded; an s3:// key is taken as written.
+        s3.put_object(Bucket=bucket, Key="dir/a b+c.json", Body="[1, 2]")
+        for source in (
+            f"https://s3.amazonaws.com/{bucket}/dir/a%20b%2Bc.json",
+            f"https://s3.amazonaws.com/{bucket}/dir/a b+c.json",
+            f"s3://{bucket}/dir/a b+c.json",
+        ):
+            assert iot_client.get_job_document(jobId=create(source))["document"] == "[1, 2]"
+        limit = json.dumps({"pad": "x" * 32757})
+        s3.put_object(Bucket=bucket, Key="limit.json", Body=limit)
+        job_id = create(f"s3://{bucket}/limit.json")
+        assert iot_client.get_job_document(jobId=job_id)["document"] == limit
     finally:
-        _cleanup(iot_client, jobs=[job_id], things=[thing])
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_device_gets_the_document_reserialized(iot_client, iot_jobs_data, s3):
+    """Devices get the document compact, without null members; GetJobDocument keeps it as stored."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    stored = (
+        '{ "z": 1, "a": [ 1 , 2.50, 1E2, 1e-7, -0, 12345678901234567890, 12345678.9, 1E400 ],\n'
+        '  "s": "caf\\u00e9 \\/ \\u001f\\u0041", "n": null, "o": {"n": null, "k": [null]}, "z": 2 }'
+    )
+    device = (
+        '{"z":2,"a":[1,2.5,100.0,1.0E-7,0,12345678901234567890,1.23456789E7,"Infinity"],'
+        '"s":"caf\u00e9 / \\u001FA","o":{"k":[null]}}'
+    )
+    jobs = []
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=stored)
+        for source in ({"document": stored}, {"documentSource": f"s3://{bucket}/doc.json"}):
+            jobs.append(_unique("job"))
+            iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], **source)
+            assert iot_client.get_job_document(jobId=jobs[-1])["document"] == stored
+            execution = iot_jobs_data.describe_job_execution(
+                jobId=jobs[-1], thingName=thing, includeJobDocument=True
+            )["execution"]
+            assert execution["jobDocument"] == device
+            started = iot_jobs_data.start_next_pending_job_execution(thingName=thing)
+            assert started["execution"]["jobDocument"] == device
+            updated = iot_jobs_data.update_job_execution(
+                jobId=jobs[-1], thingName=thing, status="SUCCEEDED", includeJobDocument=True
+            )
+            assert updated["jobDocument"] == device
+        # UTF-8 cannot carry a lone surrogate: it stays escaped.
+        jobs.append(_unique("job"))
+        iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], document='["\\ud83d"]')
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=jobs[-1], thingName=thing, includeJobDocument=True
+        )["execution"]
+        assert execution["jobDocument"] == '["\\uD83D"]'
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_source_refusals(iot_client, s3):
+    """A documentSource that names no readable JSON object refuses the job."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="text.txt", Body="not json")
+        s3.put_object(Bucket=bucket, Key="empty.json", Body="")
+        s3.put_object(Bucket=bucket, Key="big.json", Body=json.dumps({"pad": "x" * 32758}))
+        s3.put_object(Bucket=bucket, Key="dir/a b.json", Body="{}")
+        invalid = "InvalidRequestException"
+        cases = [
+            (f"https://example.com/{bucket}/doc.json", 400, invalid,
+             "Job document source {} is invalid."),
+            (f"s3://{bucket}", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"s3://{bucket}/", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"https://s3.us-east-1.amazonaws.com/{bucket}", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"s3://{bucket}-none/doc.json", 400, invalid,
+             "Bucket specified by url: {} is not found."),
+            (f"https://s3.us-east-1.amazonaws.com/{bucket}/missing.json", 400, invalid,
+             "Job document located at {} is not found."),
+            (f"s3://{bucket}/dir/a%20b.json", 400, invalid,
+             "Job document located at {} is not found."),
+            (f"s3://{bucket}/text.txt", 400, invalid,
+             "Job document located at {} is an invalid JSON document."),
+            (f"s3://{bucket}/empty.json", 400, invalid,
+             "Job document located at {} is an invalid JSON document."),
+            (f"s3://{bucket}/big.json", 410, "LimitExceededException",
+             "Job document from {} exceeds size limit 32768 bytes."),
+        ]
+        for source, status, code, message in cases:
+            job_id = _unique("job")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job(
+                    jobId=job_id, targets=[thing_arn], documentSource=source
+                )
+            assert _error(ei) == (status, code, message.format(source)), source
+            with pytest.raises(ClientError) as ei:
+                iot_client.describe_job(jobId=job_id)
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        status, body = _raw(
+            _IOT_AUTH, "PUT", f"/jobs/{_unique('job')}", {"targets": [thing_arn], "documentSource": 123}
+        )
+        assert (status, body.get("message")) == (400, "Job document source 123 is invalid.")
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job(
+                jobId=_unique("job"), targets=[thing_arn], document=_DOCUMENT,
+                documentSource=f"s3://{bucket}/missing.json",
+            )
+        assert _error(ei) == (
+            400, invalid,
+            "Job document and job document source cannot be specified at the same time.",
+        )
+    finally:
+        _cleanup(iot_client, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_source_is_read_in_the_callers_account():
+    """The bucket is looked up in the caller's account, in any of its regions."""
+    owner_s3 = _account_client("s3", "111111111111")
+    owner_eu = _account_client("iot", "111111111111", region="eu-west-1")
+    stranger = _account_client("iot", "222222222222")
+    thing, bucket, job_id = _unique("jobs-thing"), _unique("jobs-doc"), _unique("job")
+    try:
+        owner_s3.create_bucket(Bucket=bucket)
+        owner_s3.put_object(Bucket=bucket, Key="doc.json", Body=_DOCUMENT)
+        owner_eu.create_job(jobId=job_id, targets=[_create_thing(owner_eu, thing)],
+                            documentSource=f"s3://{bucket}/doc.json")
+        assert owner_eu.get_job_document(jobId=job_id)["document"] == _DOCUMENT
+        with pytest.raises(ClientError) as ei:
+            stranger.create_job(jobId=_unique("job"),
+                                targets=[_create_thing(stranger, thing)],
+                                documentSource=f"s3://{bucket}/doc.json")
+        assert _error(ei) == (
+            400, "InvalidRequestException",
+            f"Bucket specified by url: s3://{bucket}/doc.json is not found.",
+        )
+    finally:
+        _cleanup(owner_eu, jobs=[job_id], things=[thing])
+        _cleanup(stranger, things=[thing])
+        _delete_bucket(owner_s3, bucket)
 
 
 def test_iot_jobs_create_duplicate_and_unknown_target_rejected(iot_client):
@@ -392,6 +559,55 @@ def test_iot_job_template_from_a_job(iot_client):
     finally:
         _delete_templates(iot_client, from_job, with_doc)
         _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_job_template_document_source_reads_the_s3_object(iot_client, s3):
+    """CreateJobTemplate reads its documentSource once; jobs made from it keep that content."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    template_id, from_job = _unique("tmpl"), _unique("tmpl-job")
+    plain, own_source = _unique("job"), _unique("job")
+    source = f"s3://{bucket}/tmpl.json"
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="tmpl.json", Body='{"v": 1}')
+        template_arn = iot_client.create_job_template(
+            jobTemplateId=template_id, description="d", documentSource=source
+        )["jobTemplateArn"]
+        s3.put_object(Bucket=bucket, Key="tmpl.json", Body='{"v": 2}')
+        desc = iot_client.describe_job_template(jobTemplateId=template_id)
+        assert (desc["document"], desc["documentSource"]) == ('{"v": 1}', source)
+
+        job_arn = iot_client.create_job(
+            jobId=plain, targets=[thing_arn], jobTemplateArn=template_arn
+        )["jobArn"]
+        assert iot_client.describe_job(jobId=plain)["documentSource"] == source
+        assert iot_client.get_job_document(jobId=plain)["document"] == '{"v": 1}'
+        iot_client.create_job(jobId=own_source, targets=[thing_arn],
+                              jobTemplateArn=template_arn, documentSource=source)
+        assert iot_client.get_job_document(jobId=own_source)["document"] == '{"v": 2}'
+        iot_client.create_job_template(
+            jobTemplateId=from_job, description="d", jobArn=job_arn
+        )
+        desc = iot_client.describe_job_template(jobTemplateId=from_job)
+        assert (desc["document"], desc["documentSource"]) == ('{"v": 1}', source)
+
+        for missing, message in (
+            (f"s3://{bucket}/missing.json", "Job document located at {} is not found."),
+            (f"s3://{bucket}-none/doc.json", "Bucket specified by url: {} is not found."),
+        ):
+            missing_id = _unique("tmpl")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job_template(
+                    jobTemplateId=missing_id, description="d", documentSource=missing
+                )
+            assert _error(ei) == (400, "InvalidRequestException", message.format(missing))
+            with pytest.raises(ClientError):
+                iot_client.describe_job_template(jobTemplateId=missing_id)
+    finally:
+        _delete_templates(iot_client, template_id, from_job)
+        _cleanup(iot_client, jobs=[plain, own_source], things=[thing])
+        _delete_bucket(s3, bucket)
 
 
 def test_iot_job_template_rejects_what_aws_rejects(iot_client):
@@ -591,7 +807,7 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         assert execution["jobId"] == job_id
         assert execution["status"] == "IN_PROGRESS"
         assert execution["versionNumber"] == 2  # start bumped it from 1
-        assert execution["jobDocument"] == _DOCUMENT
+        assert execution["jobDocument"] == _DEVICE_DOCUMENT
         _assert_epoch_seconds(execution["startedAt"])
 
         pending = iot_jobs_data.get_pending_job_executions(thingName=thing)
@@ -942,7 +1158,7 @@ def test_iot_jobs_next_sentinel_peek_then_start(iot_client, iot_jobs_data):
         assert peeked["jobId"] == job_id
         assert peeked["status"] == "QUEUED"
         assert peeked["versionNumber"] == 1
-        assert peeked["jobDocument"] == _DOCUMENT
+        assert peeked["jobDocument"] == _DEVICE_DOCUMENT
 
         # PUT $next starts it.
         started = iot_jobs_data.start_next_pending_job_execution(thingName=thing)
@@ -3061,6 +3277,27 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
     doc = _frames_by_topic(received)[f"{base}/get/accepted"]
     assert [q["jobId"] for q in doc["queuedJobs"]] == [job_id]
     assert doc["inProgressJobs"] == []
+
+
+def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_client):
+    """The jobDocument object over MQTT is the device's document: no null members, Infinity as a string."""
+    thing = _unique("jobs-mqtt-doc")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    iot_client.create_job(
+        jobId=job_id,
+        targets=[thing_arn],
+        document='{"n": null, "o": {"n": null, "k": [null]}, "f": [1E400, 2.50]}',
+    )
+    base = f"$aws/things/{thing}/jobs"
+
+    received = _collect_shadow_frames(
+        f"{base}/{job_id}/get/accepted",
+        lambda: _mqtt_publish(topic=f"{base}/{job_id}/get", payload=b"{}"),
+        want=1,
+    )
+    execution = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"]
+    assert execution["jobDocument"] == {"o": {"k": [None]}, "f": ["Infinity", 2.5]}
 
 
 def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):

@@ -76,6 +76,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -5715,6 +5716,66 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
+# An S3 host: path style without a bucket label, virtual-hosted with one.
+_JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com")
+_JOB_DOCUMENT_MAX_BYTES = 32768
+
+
+def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
+    """The job document a documentSource names in this account's S3, or an error."""
+    from urllib.parse import unquote, urlsplit
+
+    from ministack.services import s3 as _s3
+
+    bucket = key = ""
+    if isinstance(source, str) and source.startswith("s3://"):
+        bucket, _, key = source[len("s3://"):].partition("/")
+    elif isinstance(source, str) and source.startswith(("https://", "http://")):
+        with contextlib.suppress(ValueError):
+            parts = urlsplit(source)
+            match = _JOB_DOCUMENT_S3_HOST_RE.fullmatch(parts.hostname or "")
+            if match and match.group("bucket"):
+                bucket, key = match.group("bucket"), unquote(parts.path[1:])
+            elif match:
+                bucket, _, key = parts.path[1:].partition("/")
+                key = unquote(key)
+    if not bucket:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document source {source} is invalid.", 400
+        )
+    if not key:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Provided S3 url is not valid: {source}. Error: Key cannot be null", 400,
+        )
+    bucket_record = _s3._ensure_bucket(bucket)
+    if bucket_record is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Bucket specified by url: {source} is not found.", 400
+        )
+    obj = bucket_record["objects"].get(key)
+    if obj is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document located at {source} is not found.", 400
+        )
+    if obj["size"] > _JOB_DOCUMENT_MAX_BYTES:
+        return None, error_response_json(
+            "LimitExceededException",
+            f"Job document from {source} exceeds size limit {_JOB_DOCUMENT_MAX_BYTES} bytes.",
+            410,
+        )
+    try:
+        document = _s3._get_object_data(bucket, key).decode("utf-8")
+        json.loads(document)
+    except ValueError:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Job document located at {source} is an invalid JSON document.",
+            400,
+        )
+    return document, None
+
+
 async def _create_job(job_id: str, payload: dict) -> tuple:
     if not job_id or not _JOB_ID_RE.match(job_id):
         return error_response_json(
@@ -5725,6 +5786,12 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
     if job_id in _jobs:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
+        )
+    if payload.get("document") and payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document and job document source cannot be specified at the same time.",
+            400,
         )
     if payload.get("jobTemplateArn") is not None:
         payload, err = _job_payload_from_template(payload)
@@ -5806,13 +5873,10 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             400,
         )
     if not document and payload.get("documentSource"):
-        # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
-        # serves its CONTENT to devices. MiniStack does not fetch it — it
-        # stands in a placeholder naming the source, so a `documentSource` job
-        # still creates, describes, and runs its whole execution lifecycle.
-        # A device that parses the document therefore sees the URL, not the
-        # payload; pass `document` when the content matters.
-        document = json.dumps({"documentSource": payload["documentSource"]})
+        # The object is read once, here: a later overwrite changes no job.
+        document, err = _job_document_from_source(payload["documentSource"])
+        if err:
+            return err
     # Captured BEFORE the job record exists: jobs_first_pending_job_id
     # materializes, and once the new job is in the store it would already
     # count as the front of the queue.
@@ -6357,8 +6421,9 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         record["document"] = document
         record["documentSource"] = source
     if source and not document:
-        # Same stand-in as CreateJob's: the S3 object is not fetched.
-        record["document"] = json.dumps({"documentSource": source})
+        record["document"], err = _job_document_from_source(source)
+        if err:
+            return err
     for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
         "maintenanceWindows", "destinationPackageVersions",
     ):
@@ -6905,10 +6970,51 @@ def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     return dict(_jobs_apply_timeout(execution))
 
 
+# Control characters as AWS escapes them in the document it sends a device; a lone
+# surrogate stays escaped too, since UTF-8 cannot carry it.
+_JOBS_DEVICE_ESCAPES = {
+    **{code: f"\\u{code:04X}" for code in (*range(0x20), *range(0xD800, 0xE000))},
+    0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\",
+}
+
+
+def _jobs_device_float(value: float) -> str:
+    """A float spelled as Java's Double.toString, with a non-finite value as a string."""
+    if not math.isfinite(value):
+        return f'"{json.dumps(value)}"'
+    if value == 0 or 1e-3 <= abs(value) < 1e7:
+        return repr(value)
+    from decimal import Decimal
+
+    sign, digits, exponent = Decimal(repr(value)).normalize().as_tuple()
+    text = "".join(map(str, digits))
+    return f"{'-' * sign}{text[0]}.{text[1:] or '0'}E{len(text) - 1 + exponent}"
+
+
+def _jobs_device_json(value) -> str:
+    """Compact JSON of a job document as AWS sends it to a device: object members that are null are left out."""
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{_jobs_device_json(key)}:{_jobs_device_json(member)}"
+            for key, member in value.items() if member is not None
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_jobs_device_json, value)) + "]"
+    if isinstance(value, str):
+        return '"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"'
+    if isinstance(value, float):
+        return _jobs_device_float(value)
+    return json.dumps(value)
+
+
 def jobs_job_document(job_id: str) -> str:
-    """The document a device should run for a job — ``{}`` if there is none."""
+    """The document a device should run for a job, re-serialized as AWS sends it — ``{}`` if there is none."""
     job = _jobs.get(job_id)
-    return (job or {}).get("document") or "{}"
+    document = (job or {}).get("document") or "{}"
+    try:
+        return _jobs_device_json(json.loads(document))
+    except (ValueError, RecursionError):
+        return document
 
 
 def _jobs_job_document_object(job_id: str):
