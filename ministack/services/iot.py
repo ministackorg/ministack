@@ -10383,7 +10383,8 @@ async def handle_websocket(
 #   region serve the session, which is what gives a device fleet per-tenant
 #   isolation without any credential handling.
 # * a certificate that is unknown, not ACTIVE, or ACTIVE in several accounts:
-#   refused with a "not authorized" MQTT CONNACK. This reads the X.509
+#   refused with a "not authorized" MQTT CONNACK, or under AUTH=true closed
+#   without one, as on AWS. This reads the X.509
 #   identity lifecycle that the registry already keeps and that the control plane already
 #   enforces (deleting an ACTIVE certificate is CertificateStateException
 #   406), so it is not policy evaluation and not a credential check; a
@@ -10796,8 +10797,7 @@ def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
     WebSocket upgrade. A certificate that IS presented is read against the
     registry, which is the identity lifecycle this service already keeps:
     ACTIVE in exactly one account selects it, and unknown, not ACTIVE, or
-    ACTIVE in several accounts is refused by the caller with a "not
-    authorized" CONNACK.
+    ACTIVE in several accounts is refused by the caller (``_mtls_refuse``).
     """
     if not der:
         return (
@@ -10960,18 +10960,20 @@ async def _mtls_refuse(
 ) -> None:
     """Answer an unusable client certificate with a "not authorized" CONNACK
     (0x05, or reason code 0x87 for an MQTT 5 client) when the client sent a
-    CONNECT, then close.
+    CONNECT, then close; with AUTH=true, close without one.
 
     AWS closes the socket without a CONNACK unless just-in-time registration
-    applies. Diverging here is deliberate: an emulator's job is
+    applies. Diverging here without AUTH is deliberate: an emulator's job is
     diagnosability, "not authorized" is reported cleanly by every device SDK,
     and a TLS-layer rejection could not tell the user "unknown" from
     "deactivated".
     """
+    from ministack import app
+
     _mtls_logger.warning(
         "IoT mTLS: refusing client certificate %s (%s)", cert_id, _mtls_refusal_reason(cert_id)
     )
-    if protocol_level is None:
+    if protocol_level is None or app.AUTH:
         return
     # The CONNACK has to match the client's protocol level: a v5 client
     # handed the two-byte 3.1.1 form dies in its decoder instead of reporting

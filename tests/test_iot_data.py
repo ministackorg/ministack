@@ -3893,6 +3893,65 @@ def test_mtls_inactive_cert_refused(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_auth_refusal_closes_without_connack(tmp_path):
+    """With AUTH=true a refused client certificate's CONNECT is closed without a CONNACK, the log names the reason."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    log_path = tmp_path / "auth.log"
+    proc = _spawn(
+        {"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port, log_path=log_path
+    )
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port, log_path)
+        iot = private.client("iot")
+        policy = _unique("connect")
+        iot.create_policy(policyName=policy, policyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}],
+        }))
+        certs = {name: _new_cert(private) for name in ("active", "inactive", "revoked", "deleted")}
+        for name in ("active", "inactive", "revoked"):
+            arn = iot.describe_certificate(certificateId=certs[name][0])["certificateDescription"]["certificateArn"]
+            iot.attach_policy(policyName=policy, target=arn)
+        iot.update_certificate(certificateId=certs["inactive"][0], newStatus="INACTIVE")
+        iot.update_certificate(certificateId=certs["revoked"][0], newStatus="REVOKED")
+        iot.update_certificate(certificateId=certs["deleted"][0], newStatus="INACTIVE")
+        iot.delete_certificate(certificateId=certs["deleted"][0])
+
+        def answer(cert, protocol_level):
+            """The packet answering a CONNECT, or "closed" when the broker hangs up without one."""
+            peer = _Peer(_mtls_connect(private, cert[1], cert[2], tmp_path))
+            try:
+                peer.send(_make_connect(_unique("device"), protocol_level=protocol_level))
+                pkt = peer.next_packet(timeout=5.0)
+                if pkt is None:
+                    return "closed" if peer.wait_disconnected(timeout=1.0) else "open"
+                return pkt[0], pkt[2][1]
+            finally:
+                peer.close()
+
+        assert answer(certs["active"], MQTT_311) == (PKT_CONNACK, 0)
+        for level in (MQTT_311, MQTT_5):
+            for name in ("inactive", "revoked", "deleted"):
+                assert answer(certs[name], level) == "closed", (name, level)
+
+        _cert_id, active_pem, _key_pem = certs["active"]
+        private.client("iot", access_key="222222222222").register_certificate(
+            certificatePem=active_pem, setAsActive=True
+        )
+        for level in (MQTT_311, MQTT_5):
+            assert answer(certs["active"], level) == "closed", level
+
+        for name, reason in (
+            ("inactive", "status 'INACTIVE'"), ("revoked", "status 'REVOKED'"),
+            ("deleted", "not registered"), ("active", "owner is ambiguous"),
+        ):
+            refusals = [line for line in private.log().splitlines() if certs[name][0] in line]
+            assert refusals and reason in refusals[-1], (name, refusals)
+    finally:
+        _terminate(proc)
+
+
 def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
     """A certificate two accounts hold ACTIVE is refused, not awarded.
 

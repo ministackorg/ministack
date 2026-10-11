@@ -322,6 +322,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_unregistered_cert_gets_connack_5",
     "tests/test_iot_data.py::test_mtls_mqtt5_refusal_is_v5_connack",
     "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
+    "tests/test_iot_data.py::test_mtls_auth_refusal_closes_without_connack",
     "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
     "tests/test_iot_data.py::test_mtls_registered_cert_connects_whatever_its_ca",
     "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
