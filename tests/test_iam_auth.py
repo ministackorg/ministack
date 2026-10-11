@@ -1796,6 +1796,14 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_provisioning_claim(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/provisioning-templates/fleet/provisioning-claim"
+        assert extract_iam_action("iot", "POST", path, {}, b"", {}) == "iot:CreateProvisioningClaim"
+        assert extract_resource_arn(
+            "iot", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
+
     def test_iot_job_template(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn(

@@ -4110,6 +4110,134 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
         peer.close()
 
 
+def test_mtls_provisioning_claim_connects_and_provisions(broker, tmp_path):
+    """A claim certificate connects over mTLS and provisions a thing whose new certificate then connects."""
+    iot = broker.client("iot")
+    name, serial = _unique("fleet"), _unique("device")
+    iot.create_policy(
+        policyName=f"{name}-device",
+        policyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}),
+    )
+    iot.create_provisioning_template(
+        templateName=name,
+        templateBody=json.dumps({
+            "Parameters": {"SerialNumber": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing",
+                          "Properties": {"ThingName": {"Ref": "SerialNumber"}}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}},
+                "policy": {"Type": "AWS::IoT::Policy",
+                           "Properties": {"PolicyName": f"{name}-device"}},
+            },
+        }),
+        enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        created = json.loads(payload)
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": created["certificateOwnershipToken"],
+            "parameters": {"SerialNumber": serial},
+        }).encode(), qos=1, packet_id=4))
+        assert peer.next_publish() == (
+            f"{provision}/accepted",
+            json.dumps({"deviceConfiguration": {}, "thingName": serial}).encode(),
+        )
+    finally:
+        peer.close()
+
+    device = _Peer(_mtls_connect(broker, created["certificatePem"], created["privateKey"], tmp_path))
+    try:
+        _assert_connack(device.connect(serial))
+    finally:
+        device.close()
+
+
+def test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics(tmp_path):
+    """With AUTH=true a claim provisions on its template's topics and is refused anything else, as on AWS."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    proc = _spawn({"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port)
+        iot = private.client("iot")
+        name = _unique("fleet")
+        iot.create_provisioning_template(
+            templateName=name,
+            templateBody=json.dumps({"Resources": {"certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}}}}),
+            enabled=True,
+            provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+        )
+        claim = iot.create_provisioning_claim(templateName=name)
+        create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+        other, unrelated = "$aws/provisioning-templates/other/provision/json", "devices/telemetry"
+
+        def claim_peer(protocol_level=MQTT_311):
+            peer = _Peer(_mtls_connect(private, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+            peer.send(_make_connect(_unique("claim"), protocol_level=protocol_level))
+            _assert_connack(peer.next_packet())
+            return peer
+
+        peer = claim_peer()
+        try:
+            for packet_id, topic in enumerate((f"{create}/accepted", f"{provision}/accepted"), start=1):
+                assert peer.subscribe(topic, packet_id=packet_id)[2][2:] == b"\x00", topic
+            peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+            topic, payload = peer.next_publish()
+            assert topic == f"{create}/accepted"
+            request = json.dumps({"certificateOwnershipToken": json.loads(payload)["certificateOwnershipToken"]})
+            peer.send(_make_publish(provision, request.encode(), qos=1, packet_id=4))
+            assert peer.next_publish() == (f"{provision}/accepted", b'{"deviceConfiguration": {}}')
+        finally:
+            peer.close()
+
+        # MQTT 3.1.1: any refused SUBSCRIBE or PUBLISH closes the connection.
+        for packet in (
+            _make_subscribe(1, unrelated),
+            _make_subscribe(1, f"{other}/accepted"),
+            _make_publish(unrelated, b"{}", qos=1, packet_id=1),
+            _make_publish(other, b"{}", qos=1, packet_id=1),
+        ):
+            peer = claim_peer()
+            try:
+                peer.send(packet)
+                assert peer.wait_disconnected(), packet
+            finally:
+                peer.close()
+
+        # MQTT 5: SUBACK 0x87 for the refused filter and PUBACK 0x87, the connection stays.
+        peer = claim_peer(MQTT_5)
+        try:
+            for packet_id, (topic, code) in enumerate(
+                ((f"{create}/rejected", 0x00), (unrelated, 0x87), (f"{other}/accepted", 0x87)), start=1
+            ):
+                peer.send(_make_subscribe(packet_id, topic, protocol_level=MQTT_5))
+                ptype, _flags, body = peer.next_packet()
+                assert (ptype, body[3:]) == (PKT_SUBACK, bytes([code])), topic
+            for packet_id, topic in enumerate((unrelated, other), start=4):
+                peer.send(_make_publish(topic, b"{}", qos=1, packet_id=packet_id, protocol_level=MQTT_5))
+                ptype, _flags, body = peer.next_packet()
+                assert (ptype, body[2]) == (PKT_PUBACK, 0x87), topic
+        finally:
+            peer.close()
+    finally:
+        _terminate(proc)
+
+
 def test_mtls_jitr_certificate_is_listed_by_its_ca(broker, tmp_path):
     """As measured on AWS, ListCertificatesByCA lists the certificate that
     just-in-time registration created, while it is still PENDING_ACTIVATION."""

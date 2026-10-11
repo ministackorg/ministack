@@ -1812,7 +1812,7 @@ def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
     
     
 # ---------------------------------------------------------------------------
-# Provisioning templates (storage + CRUD — no fleet-provisioning MQTT workflow)
+# Provisioning templates and fleet provisioning by claim
 # ---------------------------------------------------------------------------
 
 
@@ -1982,6 +1982,577 @@ def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
         )["preProvisioningHook"] == hook
     finally:
         iot_client.delete_provisioning_template(templateName=name)
+
+
+def test_iot_create_provisioning_claim(iot_client):
+    """A claim certificate expires in five minutes and stays out of the registry; an unknown template is 404."""
+    from cryptography import x509
+
+    name = _unique("provtemplate")
+    iot_client.create_provisioning_template(
+        templateName=name,
+        templateBody=_provisioning_template_body(),
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+    )
+    try:
+        claim = iot_client.create_provisioning_claim(templateName=name)
+        assert set(claim) - {"ResponseMetadata"} == {
+            "certificateId", "certificatePem", "keyPair", "expiration",
+        }
+        assert set(claim["keyPair"]) == {"PublicKey", "PrivateKey"}
+        expiration = claim["expiration"].timestamp()
+        assert 290 <= expiration - time.time() <= 300
+        leaf = x509.load_pem_x509_certificate(claim["certificatePem"].encode())
+        assert leaf.not_valid_after_utc.timestamp() == expiration
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=claim["certificateId"])
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        listed = {c["certificateId"] for c in iot_client.list_certificates()["certificates"]}
+        assert claim["certificateId"] not in listed
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_claim(templateName=f"{name}-x")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Message"] == f"Unable to find template named {name}-x"
+    finally:
+        iot_client.delete_provisioning_template(templateName=name)
+
+
+# Fleet provisioning over MQTT, driven in-process through a broker session.
+
+_FLEET_ACCOUNT = "123456789012"
+_FLEET_REGION = "us-east-1"
+_FLEET_CREATE = "$aws/certificates/create/json"
+_FLEET_ROLE = "arn:aws:iam::123456789012:role/provisioning"
+_FLEET_REQUEST_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def _fleet_template(**overrides) -> dict:
+    """A required parameter, one with a default, Fn::Join and a device configuration."""
+    return {
+        "Parameters": {
+            "SerialNumber": {"Type": "String"},
+            "Color": {"Type": "String", "Default": "red"},
+        },
+        "Resources": {
+            "thing": {
+                "Type": "AWS::IoT::Thing",
+                "Properties": {
+                    "ThingName": {"Fn::Join": ["", ["fleet-", {"Ref": "SerialNumber"}]]},
+                    "AttributePayload": {
+                        "serial": {"Ref": "SerialNumber"},
+                        "color": {"Ref": "Color"},
+                    },
+                },
+            },
+            "certificate": {
+                "Type": "AWS::IoT::Certificate",
+                "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"},
+                    "Status": "ACTIVE",
+                },
+            },
+            "policy": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-device"}},
+        },
+        "DeviceConfiguration": {"greeting": "hello"},
+        **overrides,
+    }
+
+
+def _fleet_cdk_template(override_settings=None, status="Active") -> dict:
+    """The shape a CDK-deployed fleet template has: every value from a parameter."""
+    thing = {
+        "Type": "AWS::IoT::Thing",
+        "Properties": {
+            "ThingName": {"Ref": "ThingName"},
+            "ThingTypeName": {"Ref": "ThingTypeName"},
+            "AttributePayload": {},
+            "ThingGroups": [{"Ref": "ThingGroup"}],
+        },
+    }
+    if override_settings is not None:
+        thing["OverrideSettings"] = override_settings
+    return {
+        "Parameters": {
+            "ThingName": {"Type": "String"},
+            "ThingTypeName": {"Type": "String"},
+            "ThingGroup": {"Type": "String"},
+            "AWS::IoT::Certificate::Id": {"Type": "String"},
+        },
+        "Resources": {
+            "thing": thing,
+            "certificate": {
+                "Type": "AWS::IoT::Certificate",
+                "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"},
+                    "Status": status,
+                },
+            },
+            "policy_1": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-device"}},
+            "policy_2": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-extra"}},
+        },
+    }
+
+
+async def _fleet_request(method, path, body=None, account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+    """One in-process control-plane call: (status, decoded body)."""
+    from ministack.services import iot as iot_module
+
+    with iot_module.request_scope(account, region):
+        status, _headers, raw = await iot_module.handle_request(
+            method, path, {}, json.dumps(body).encode() if body is not None else b"", {}
+        )
+    return status, json.loads(raw) if raw else {}
+
+
+async def _fleet_setup(templates: dict, account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+    """The two policies the templates attach, and each template, enabled."""
+    for policy in ("fleet-device", "fleet-extra"):
+        await _fleet_request(
+            "POST", f"/policies/{policy}",
+            {"policyDocument": json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]})},
+            account, region,
+        )
+    for name, body in templates.items():
+        status, _ = await _fleet_request(
+            "POST", "/provisioning-templates",
+            {"templateName": name, "templateBody": json.dumps(body), "enabled": True,
+             "provisioningRoleArn": _FLEET_ROLE},
+            account, region,
+        )
+        assert status == 200
+
+
+async def _fleet_client(client_id, templates=(), account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+    """A session subscribed to the replies of CreateKeysAndCertificate and of each template."""
+    send, sent = _mock_send()
+    session = _IoTWSSession(send, account, region)
+    await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
+    filters = [f"{_FLEET_CREATE}/+"] + [
+        f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
+    ]
+    await session.handle_packet(
+        PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(f, 1) for f in filters])
+    )
+    sent.clear()
+    return session, sent
+
+
+async def _fleet_publish(session, sent, topic, payload):
+    """PUBLISH at QoS 1; the one reply this session got, as (topic, document), or None."""
+    sent.clear()
+    await session.handle_packet(
+        PKT_PUBLISH, 0x02, _encode_string(topic) + struct.pack("!H", 9) + payload
+    )
+    replies = [
+        (reply_topic, json.loads(body))
+        for reply_topic, body, _qos, _pid, _dup in _extract_publish_frames(sent)
+        if reply_topic.startswith(f"{topic}/")
+    ]
+    assert len(replies) <= 1
+    return replies[0] if replies else None
+
+
+async def _fleet_certificate(session, sent):
+    """CreateKeysAndCertificate over MQTT: the accepted document."""
+    topic, created = await _fleet_publish(session, sent, _FLEET_CREATE, b"")
+    assert topic == f"{_FLEET_CREATE}/accepted"
+    return created
+
+
+def _fleet_register(token, **parameters) -> bytes:
+    return json.dumps({"certificateOwnershipToken": token, "parameters": parameters}).encode()
+
+
+def _fleet_provision_topic(template: str) -> str:
+    return f"$aws/provisioning-templates/{template}/provision/json"
+
+
+def _fleet_rejection(template, code, message):
+    return (
+        f"{_fleet_provision_topic(template)}/rejected",
+        {"statusCode": 400, "errorCode": code, "errorMessage": message},
+    )
+
+
+def _assert_provisioning_failed(reply, template, message):
+    """A ProvisioningFailed rejection carrying ``message`` and AWS's registry suffix."""
+    topic, doc = reply
+    assert topic == f"{_fleet_provision_topic(template)}/rejected"
+    assert (doc["statusCode"], doc["errorCode"]) == (400, "ProvisioningFailed")
+    assert re.fullmatch(
+        re.escape(f"{message} (Service: AWSIot; Status Code: 400; Error Code: "
+                  "ResourceRegistrationFailureException; Request ID: ")
+        + _FLEET_REQUEST_ID + re.escape("; Proxy: null)"),
+        doc["errorMessage"],
+    ), doc["errorMessage"]
+
+
+async def _fleet_certificate_state(cert_id):
+    """(status, attached policy names, attached thing names) of a registry certificate."""
+    _status, desc = await _fleet_request("GET", f"/certificates/{cert_id}")
+    arn = desc["certificateDescription"]["certificateArn"]
+    _status, policies = await _fleet_request("POST", f"/attached-policies/{arn}")
+    from ministack.services import iot as iot_module
+
+    with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+        things = iot_module._list_principal_things({"x-amzn-principal": arn}, {})
+    return (
+        desc["certificateDescription"]["status"],
+        sorted(p["policyName"] for p in policies["policies"]),
+        json.loads(things[2])["things"],
+    )
+
+
+async def _fleet_thing(name):
+    """(attributes, thing type, sorted groups) of a thing, or None."""
+    status, thing = await _fleet_request("GET", f"/things/{name}")
+    if status != 200:
+        return None
+    _status, groups = await _fleet_request("GET", f"/things/{name}/thing-groups")
+    return (
+        thing["attributes"],
+        thing.get("thingTypeName"),
+        sorted(g["groupName"] for g in groups["thingGroups"]),
+    )
+
+
+def test_fleet_provisioning_create_keys_and_certificate_answers_the_requester_only():
+    """CreateKeysAndCertificate over MQTT makes a PENDING_ACTIVATION certificate and answers only the requester."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+
+    async def _run():
+        session, sent = await _fleet_client("fleet-claim")
+        other, other_sent = await _fleet_client("fleet-observer")
+        created = await _fleet_certificate(session, sent)
+        assert set(created) == {
+            "certificateId", "certificatePem", "privateKey", "certificateOwnershipToken",
+        }
+        assert created["privateKey"].startswith("-----BEGIN RSA PRIVATE KEY-----")
+        assert _extract_publish_frames(other_sent) == []
+        status, _cert, _things = await _fleet_certificate_state(created["certificateId"])
+        assert status == "PENDING_ACTIVATION"
+        # A client that did not subscribe to the replies gets none.
+        quiet_send, quiet_sent = _mock_send()
+        quiet = _IoTWSSession(quiet_send, _FLEET_ACCOUNT, _FLEET_REGION)
+        await quiet.handle_packet(PKT_CONNECT, 0, _build_connect_body("fleet-quiet"))
+        assert await _fleet_publish(quiet, quiet_sent, _FLEET_CREATE, b"") is None
+        for s in (session, other, quiet):
+            await s.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_register_thing_applies_the_template():
+    """RegisterThing checks the token and parameters first, then applies the template; the token registers again."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        created = await _fleet_certificate(session, sent)
+        token, provision = created["certificateOwnershipToken"], _fleet_provision_topic("fleet")
+
+        reply = await _fleet_publish(session, sent, provision, _fleet_register("made-up"))
+        assert reply == _fleet_rejection(
+            "fleet", "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+        )
+        reply = await _fleet_publish(session, sent, provision, b"not json")
+        assert reply == _fleet_rejection("fleet", "InvalidPayload", "Message cannot be parsed")
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token))
+        assert reply == _fleet_rejection(
+            "fleet", "InvalidParameters", "Cannot resolve reference value: SerialNumber"
+        )
+        assert await _fleet_thing("fleet-SN1") is None
+
+        accepted = (
+            f"{provision}/accepted",
+            {"deviceConfiguration": {"greeting": "hello"}, "thingName": "fleet-SN1"},
+        )
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, SerialNumber="SN1"))
+        assert reply == accepted
+        assert await _fleet_thing("fleet-SN1") == ({"serial": "SN1", "color": "red"}, None, [])
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "ACTIVE", ["fleet-device"], ["fleet-SN1"],
+        )
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, SerialNumber="SN1"))
+        assert reply == accepted
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_register_thing_refusals_change_nothing():
+    """A refused RegisterThing leaves the certificate PENDING_ACTIVATION and creates no thing."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    no_policy = _fleet_template()
+    no_policy["Resources"]["policy"]["Properties"]["PolicyName"] = "fleet-none"
+    sub = _fleet_template()
+    sub["Resources"]["thing"]["Properties"]["ThingName"] = {"Fn::Sub": "fleet-${SerialNumber}"}
+    templates = {
+        "fleet": _fleet_template(), "fleet-cdk": _fleet_cdk_template({}),
+        "fleet-nopol": no_policy, "fleet-sub": sub,
+    }
+
+    async def _run():
+        await _fleet_setup(templates)
+        await _fleet_request("POST", "/thing-types/fleet-type", {})
+        await _fleet_request("POST", "/thing-groups/fleet-group", {})
+        await _fleet_request(
+            "PATCH", "/provisioning-templates/fleet", {"enabled": False}
+        )
+        session, sent = await _fleet_client("fleet-claim", [*templates, "fleet-none"])
+        created = await _fleet_certificate(session, sent)
+        token = created["certificateOwnershipToken"]
+
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-none"), _fleet_register(token)
+        )
+        assert reply == _fleet_rejection(
+            "fleet-none", "InvalidTemplate", "Template with name fleet-none does not exist."
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"), _fleet_register(token, SerialNumber="SN2")
+        )
+        assert reply == _fleet_rejection("fleet", "InvalidTemplate", "Template fleet is not enabled.")
+        cdk = _fleet_provision_topic("fleet-cdk")
+        reply = await _fleet_publish(session, sent, cdk, _fleet_register(
+            token, ThingName="fleet-c", ThingTypeName="fleet-notype", ThingGroup="fleet-group"))
+        _assert_provisioning_failed(
+            reply, "fleet-cdk",
+            "Register thing workflow execution terminates due to: "
+            f"Thing Type {_FLEET_ACCOUNT}:fleet-notype not found.",
+        )
+        reply = await _fleet_publish(session, sent, cdk, _fleet_register(
+            token, ThingName="fleet-c", ThingTypeName="fleet-type", ThingGroup="fleet-nogroup"))
+        _assert_provisioning_failed(
+            reply, "fleet-cdk",
+            "Register thing workflow execution terminates due to: "
+            f"ThingGroup {_FLEET_ACCOUNT}:fleet-nogroup not found.",
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-nopol"),
+            _fleet_register(token, SerialNumber="SN3"),
+        )
+        _assert_provisioning_failed(
+            reply, "fleet-nopol",
+            "Register thing workflow execution terminates due to: Policy default version not found",
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-sub"),
+            _fleet_register(token, SerialNumber="SN4"),
+        )
+        assert reply == _fleet_rejection(
+            "fleet-sub", "InvalidTemplate",
+            "Template fleet-sub uses Fn::Sub, which MiniStack does not resolve.",
+        )
+        for name in ("fleet-c", "fleet-SN2", "fleet-SN3", "fleet-SN4"):
+            assert await _fleet_thing(name) is None
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_existing_thing_follows_override_settings():
+    """An existing thing that differs from the template fails unless OverrideSettings allow it; FAIL is no setting."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    templates = {
+        "fleet": _fleet_template(),
+        "fleet-cdk": _fleet_cdk_template(
+            {"AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+             "ThingTypeName": "DO_NOTHING"}),
+        "fleet-plain": _fleet_cdk_template(status="ACTIVE"),
+        "fleet-ovr": _fleet_cdk_template(
+            {"AttributePayload": "MERGE", "ThingTypeName": "REPLACE", "ThingGroups": "MERGE"},
+            status="ACTIVE"),
+        "fleet-fail": _fleet_cdk_template(
+            {"AttributePayload": "FAIL", "ThingTypeName": "FAIL", "ThingGroups": "FAIL"},
+            status="ACTIVE"),
+    }
+    for name in ("fleet-ovr", "fleet-fail"):
+        templates[name]["Resources"]["thing"]["Properties"]["AttributePayload"] = {
+            "color": "green"}
+
+    async def _run():
+        await _fleet_setup(templates)
+        for kind, name in (("thing-types", "fleet-type"), ("thing-types", "fleet-type2"),
+                           ("thing-groups", "fleet-group"), ("thing-groups", "fleet-group2")):
+            await _fleet_request("POST", f"/{kind}/{name}", {})
+        session, sent = await _fleet_client("fleet-claim", list(templates))
+
+        first = await _fleet_certificate(session, sent)
+        await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(first["certificateOwnershipToken"], SerialNumber="SN1"),
+        )
+        second = await _fleet_certificate(session, sent)
+        token = second["certificateOwnershipToken"]
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1", Color="blue"),
+        )
+        _assert_provisioning_failed(
+            reply, "fleet",
+            "Existing AttributePayload: {color=red, serial=SN1} conflicts with "
+            "AttributePayload: {color=blue, serial=SN1} in Template.",
+        )
+        assert await _fleet_certificate_state(second["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+
+        # DO_NOTHING keeps everything; "Active" activates the certificate.
+        cdk = {"ThingTypeName": "fleet-type", "ThingGroup": "fleet-group"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"),
+            _fleet_register(token, ThingName="fleet-SN1", **cdk),
+        )
+        assert reply == (
+            f"{_fleet_provision_topic('fleet-cdk')}/accepted",
+            {"deviceConfiguration": {}, "thingName": "fleet-SN1"},
+        )
+        assert await _fleet_thing("fleet-SN1") == ({"serial": "SN1", "color": "red"}, None, [])
+        assert await _fleet_certificate_state(second["certificateId"]) == (
+            "ACTIVE", ["fleet-device", "fleet-extra"], ["fleet-SN1"],
+        )
+
+        third = await _fleet_certificate(session, sent)
+        token = third["certificateOwnershipToken"]
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"),
+            _fleet_register(token, ThingName="fleet-b", **cdk),
+        )
+        assert reply[0].endswith("/accepted")
+        assert await _fleet_thing("fleet-b") == ({}, "fleet-type", ["fleet-group"])
+
+        plain = _fleet_provision_topic("fleet-plain")
+        reply = await _fleet_publish(
+            session, sent, plain, _fleet_register(token, ThingName="fleet-b", **cdk))
+        assert reply[0] == f"{plain}/accepted"
+        reply = await _fleet_publish(session, sent, plain, _fleet_register(
+            token, ThingName="fleet-b", ThingTypeName="fleet-type2", ThingGroup="fleet-group"))
+        _assert_provisioning_failed(
+            reply, "fleet-plain",
+            "Existing ThingType: fleet-type conflicts with ThingType: fleet-type2 in Template.",
+        )
+        reply = await _fleet_publish(session, sent, plain, _fleet_register(
+            token, ThingName="fleet-b", ThingTypeName="fleet-type", ThingGroup="fleet-group2"))
+        group_arn = f"arn:aws:iot:{_FLEET_REGION}:{_FLEET_ACCOUNT}:thinggroup/fleet-group"
+        _assert_provisioning_failed(
+            reply, "fleet-plain",
+            f"Existing ThingGroups: [{{GroupName: fleet-group,GroupArn: {group_arn}}}] "
+            "conflict with ThingGroups: [fleet-group2] in Template.",
+        )
+        assert await _fleet_thing("fleet-b") == ({}, "fleet-type", ["fleet-group"])
+
+        changed = {"ThingName": "fleet-b", "ThingTypeName": "fleet-type2", "ThingGroup": "fleet-group2"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-ovr"), _fleet_register(token, **changed))
+        assert reply[0].endswith("/accepted")
+        assert await _fleet_thing("fleet-b") == (
+            {"color": "green"}, "fleet-type2", ["fleet-group", "fleet-group2"],
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-fail"), _fleet_register(token, **changed))
+        _assert_provisioning_failed(
+            reply, "fleet-fail",
+            f"Existing ThingGroups: [{{GroupName: fleet-group,GroupArn: {group_arn}}}, "
+            f"{{GroupName: fleet-group2,GroupArn: {group_arn}2}}] "
+            "conflict with ThingGroups: [fleet-group2] in Template.",
+        )
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_claims_and_tokens_are_scoped_persisted_and_expire():
+    """Claims and ownership tokens are scoped to one account and region, persist, expire, and go with reset()."""
+    import ssl as _ssl
+
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    other_account = "210987654321"
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_setup({"fleet": _fleet_template()}, account=other_account)
+        _status, claim = await _fleet_request("POST", "/provisioning-templates/fleet/provisioning-claim")
+        der = _ssl.PEM_cert_to_DER_cert(claim["certificatePem"])
+        assert iot_module._mtls_resolve_identity(der) == (_FLEET_ACCOUNT, _FLEET_REGION, "fleet")
+
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        token = (await _fleet_certificate(session, sent))["certificateOwnershipToken"]
+        await session.cleanup()
+        other, other_sent = await _fleet_client("fleet-claim", ["fleet"], account=other_account)
+        reply = await _fleet_publish(
+            other, other_sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        await other.cleanup()
+
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert iot_module._mtls_resolve_identity(der) is None
+        iot_module.load_persisted_state(saved)
+        assert iot_module._mtls_resolve_identity(der) == (_FLEET_ACCOUNT, _FLEET_REGION, "fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[0].endswith("/accepted")
+
+        for store in (iot_module._provisioning_claims, iot_module._ownership_tokens):
+            for record in store._data.values():
+                record["expiration"] = time.time() - 1
+        assert iot_module._mtls_resolve_identity(der) is None
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
 
 
 # ---------------------------------------------------------------------------

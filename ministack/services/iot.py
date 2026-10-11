@@ -20,9 +20,10 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``$aws/events/certificates/registered/{caCertificateId}``
   - Provisioning templates: ``CreateProvisioningTemplate``,
     ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
-    ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate`` —
-    storage + CRUD only: the fleet-provisioning MQTT workflow
-    (``$aws/provisioning-templates/...``) is not implemented, and
+    ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate``,
+    ``CreateProvisioningClaim``, and fleet provisioning over MQTT
+    (``$aws/certificates/create/json`` and
+    ``$aws/provisioning-templates/{name}/provision/json``);
     ``provisioningRoleArn`` is presence-checked but not resolved
     (MiniStack does not validate IAM role ARNs elsewhere either)
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
@@ -146,6 +147,10 @@ _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 _registration_codes: AccountRegionScopedDict = AccountRegionScopedDict()
 # Provisioning templates (CreateProvisioningTemplate & friends): templateName -> record
 _provisioning_templates: AccountRegionScopedDict = AccountRegionScopedDict()
+# Claim certificates (CreateProvisioningClaim): certificateId -> record, until they expire
+_provisioning_claims: AccountRegionScopedDict = AccountRegionScopedDict()
+# Ownership tokens of certificates created over MQTT: token -> record, until they expire
+_ownership_tokens: AccountRegionScopedDict = AccountRegionScopedDict()
 _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
@@ -278,6 +283,8 @@ def get_state() -> dict:
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
+        "provisioning_claims": copy.deepcopy(_provisioning_claims),
+        "ownership_tokens": copy.deepcopy(_ownership_tokens),
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
         "job_templates": copy.deepcopy(_job_templates),
@@ -317,6 +324,8 @@ def _restore_state(data: dict | None) -> None:
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
+    _provisioning_claims.update(data.get("provisioning_claims", {}))
+    _ownership_tokens.update(data.get("ownership_tokens", {}))
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
     _job_templates.update(data.get("job_templates", {}))
@@ -369,6 +378,8 @@ def reset() -> None:
     _ca_certificates.clear()
     _registration_codes.clear()
     _provisioning_templates.clear()
+    _provisioning_claims.clear()
+    _ownership_tokens.clear()
     _jobs.clear()
     _job_executions.clear()
     _job_templates.clear()
@@ -1865,9 +1876,10 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 # ---------------------------------------------------------------------------
 # Provisioning templates
 #
-# Storage + CRUD only: the fleet-provisioning MQTT workflow
-# ($aws/provisioning-templates/{name}/provision/*) is not implemented, and
-# provisioningRoleArn is presence-checked but never resolved — MiniStack does
+# CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
+# topics) that applies a template to a certificate created over MQTT. The
+# pre-provisioning hook is stored but not invoked, and provisioningRoleArn is
+# presence-checked but never resolved — MiniStack does
 # not validate IAM role ARNs elsewhere either. Template versions are not
 # modeled: a template always carries defaultVersionId 1. Wire shapes and
 # error messages mirror a live probe of the real service (2026-08-26).
@@ -1925,14 +1937,16 @@ def _provisioning_template_not_found(name: str) -> tuple:
 
 def _handle_provisioning_template(method: str, path: str, body: bytes) -> tuple:
     suffix = path[len("/provisioning-templates/"):]
-    if "/" in suffix:
+    name, _, sub = suffix.partition("/")
+    if sub and (method, sub) != ("POST", "provisioning-claim"):
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
         )
-    name = suffix
     err = _validate_provisioning_template_name(name)
     if err:
         return err
+    if sub:
+        return _create_provisioning_claim(name)
     if method == "GET":
         return _describe_provisioning_template(name)
     if method == "PATCH":
@@ -2054,6 +2068,348 @@ def _delete_provisioning_template(name: str) -> tuple:
     _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
     return json_response({})
+
+
+# A claim certificate expires five minutes after it is issued, at the end of its
+# X.509 validity; an ownership token expires after an hour.
+_PROVISIONING_CLAIM_SECONDS = 300
+_OWNERSHIP_TOKEN_SECONDS = 3600
+
+
+def _drop_expired(store: AccountRegionScopedDict) -> None:
+    """Forget the claims or ownership tokens past their expiration, in every scope."""
+    now = time.time()
+    for key, record in list(store._data.items()):
+        if record["expiration"] <= now:
+            store._data.pop(key, None)
+
+
+def _create_provisioning_claim(name: str) -> tuple:
+    """``CreateProvisioningClaim``: a claim certificate kept out of the certificate registry."""
+    if _provisioning_templates.get(name) is None:
+        return _provisioning_template_not_found(name)
+    try:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        cert_pem, private_pem, public_pem = sign_leaf_certificate(
+            ca_cert_pem=ca_cert_pem,
+            ca_key_pem=ca_key_pem,
+            common_name="AWS IoT Certificate",
+            days_valid=_PROVISIONING_CLAIM_SECONDS / 86400,
+        )
+    except RuntimeError as e:
+        return error_response_json("InternalFailureException", str(e), 503)
+    from cryptography import x509
+
+    leaf = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    not_after = getattr(leaf, "not_valid_after_utc", None) or leaf.not_valid_after.replace(
+        tzinfo=timezone.utc
+    )
+    cert_id = get_certificate_id(cert_pem)
+    _drop_expired(_provisioning_claims)
+    _provisioning_claims[cert_id] = {
+        "certificateId": cert_id,
+        "templateName": name,
+        "expiration": not_after.timestamp(),
+    }
+    return json_response({
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+        "keyPair": {"PublicKey": public_pem, "PrivateKey": private_pem},
+        "expiration": not_after.timestamp(),
+    })
+
+
+# The fleet provisioning MQTT API (JSON payloads). A request is answered on the
+# connection that published it, and nowhere else.
+_FLEET_CREATE_TOPIC = "$aws/certificates/create/json"
+_FLEET_TEMPLATES_PREFIX = "$aws/provisioning-templates/"
+_FLEET_PROVISION_SUFFIX = "/provision/json"
+_CERTIFICATE_ID_PARAMETER = "AWS::IoT::Certificate::Id"
+
+
+def _parse_fleet_provisioning_topic(topic: str) -> tuple[str, str | None] | None:
+    """``("create", None)`` for CreateKeysAndCertificate, ``("provision", template)`` for RegisterThing."""
+    if topic == _FLEET_CREATE_TOPIC:
+        return "create", None
+    if topic.startswith(_FLEET_TEMPLATES_PREFIX) and topic.endswith(_FLEET_PROVISION_SUFFIX):
+        name = topic[len(_FLEET_TEMPLATES_PREFIX):-len(_FLEET_PROVISION_SUFFIX)]
+        if name and "/" not in name:
+            return "provision", name
+    return None
+
+
+def _fleet_rejected(code: str, message: str, status: int = 400) -> tuple[str, dict]:
+    return "rejected", {"statusCode": status, "errorCode": code, "errorMessage": message}
+
+
+class _ProvisioningRejected(Exception):
+    """A RegisterThing request the template cannot be applied to."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.reply = _fleet_rejected(code, message)
+
+
+def _provisioning_failed(message: str) -> _ProvisioningRejected:
+    """A registry refusal, worded the way AWS relays it on ``/rejected``."""
+    return _ProvisioningRejected(
+        "ProvisioningFailed",
+        f"{message} (Service: AWSIot; Status Code: 400; Error Code: "
+        f"ResourceRegistrationFailureException; Request ID: {new_uuid()}; Proxy: null)",
+    )
+
+
+async def _fleet_provisioning_reply(
+    account_id: str, region: str, operation: str, template_name: str | None, payload: bytes
+) -> tuple[str, dict]:
+    """The reply suffix (``accepted`` or ``rejected``) and document for one request."""
+    if operation == "create":
+        return await _fleet_create_keys_and_certificate(account_id, region)
+    try:
+        return await _fleet_register_thing(account_id, region, template_name, payload)
+    except _ProvisioningRejected as e:
+        return e.reply
+
+
+async def _fleet_create_keys_and_certificate(account_id: str, region: str) -> tuple[str, dict]:
+    """``CreateKeysAndCertificate`` over MQTT: a PENDING_ACTIVATION certificate and its ownership token."""
+
+    def _issue() -> tuple[str, str, str]:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        return sign_leaf_certificate(ca_cert_pem, ca_key_pem, "AWS IoT Certificate")
+
+    try:
+        # RSA key generation, kept off the broker's loop.
+        cert_pem, private_pem, _public_pem = await asyncio.to_thread(_issue)
+    except RuntimeError as e:
+        return _fleet_rejected("InternalFailure", str(e), 500)
+    cert_id = get_certificate_id(cert_pem)
+    token = secrets.token_urlsafe(48)
+    with request_scope(account_id, region):
+        _certificates[cert_id] = _certificate_record(cert_id, cert_pem, "PENDING_ACTIVATION")
+        _drop_expired(_ownership_tokens)
+        _ownership_tokens[token] = {
+            "certificateId": cert_id,
+            "expiration": time.time() + _OWNERSHIP_TOKEN_SECONDS,
+        }
+    return "accepted", {
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+        "privateKey": private_pem,
+        "certificateOwnershipToken": token,
+    }
+
+
+async def _fleet_register_thing(
+    account_id: str, region: str, template_name: str, payload: bytes
+) -> tuple[str, dict]:
+    """``RegisterThing``: apply the template to the certificate the ownership token stands for."""
+    try:
+        request = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        request = None
+    if not isinstance(request, dict):
+        return _fleet_rejected("InvalidPayload", "Message cannot be parsed")
+    with request_scope(account_id, region):
+        template = _provisioning_templates.get(template_name)
+        if template is None:
+            return _fleet_rejected(
+                "InvalidTemplate", f"Template with name {template_name} does not exist."
+            )
+        if not template.get("enabled"):
+            return _fleet_rejected("InvalidTemplate", f"Template {template_name} is not enabled.")
+        token = request.get("certificateOwnershipToken")
+        record = _ownership_tokens.get(token) if isinstance(token, str) else None
+        cert = (
+            _certificates.get(record["certificateId"])
+            if record is not None and record["expiration"] > time.time()
+            else None
+        )
+        if cert is None:
+            return _fleet_rejected(
+                "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+            )
+        parameters = request.get("parameters")
+        parameters = parameters if isinstance(parameters, dict) else {}
+        plan = _provisioning_plan(template, parameters, cert["certificateId"])
+        thing_name = await _apply_provisioning_plan(plan, cert)
+    reply = {"deviceConfiguration": plan["deviceConfiguration"]}
+    if thing_name is not None:
+        reply["thingName"] = thing_name
+    return "accepted", reply
+
+
+def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
+    """The template's resources with ``Ref`` and ``Fn::Join`` resolved against the parameters."""
+    body = template["templateBody"]
+    body = json.loads(body) if isinstance(body, str) else body
+    declared = body.get("Parameters")
+    values = {
+        name: spec["Default"]
+        for name, spec in (declared.items() if isinstance(declared, dict) else ())
+        if isinstance(spec, dict) and "Default" in spec
+    }
+    values.update(parameters)
+    values[_CERTIFICATE_ID_PARAMETER] = cert_id
+
+    def resolve(value):
+        if isinstance(value, list):
+            return [resolve(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        if len(value) == 1:
+            function, argument = next(iter(value.items()))
+            if function == "Ref":
+                if argument not in values:
+                    raise _ProvisioningRejected(
+                        "InvalidParameters", f"Cannot resolve reference value: {argument}"
+                    )
+                return values[argument]
+            if (
+                function == "Fn::Join"
+                and isinstance(argument, list)
+                and len(argument) == 2
+                and isinstance(argument[1], list)
+            ):
+                return str(argument[0]).join(str(resolve(v)) for v in argument[1])
+            if function.startswith("Fn::"):
+                raise _ProvisioningRejected(
+                    "InvalidTemplate",
+                    f"Template {template['templateName']} uses {function}, "
+                    "which MiniStack does not resolve.",
+                )
+        return {k: resolve(v) for k, v in value.items()}
+
+    plan = {"thing": None, "status": "ACTIVE", "policies": []}
+    resources = body.get("Resources")
+    for resource in resources.values() if isinstance(resources, dict) else ():
+        if not isinstance(resource, dict):
+            continue
+        properties = resolve(resource.get("Properties") or {})
+        kind = resource.get("Type")
+        if kind == "AWS::IoT::Thing":
+            plan["thing"] = (properties, resource.get("OverrideSettings") or {})
+        elif kind == "AWS::IoT::Certificate":
+            plan["status"] = str(properties.get("Status") or "ACTIVE").upper()
+        elif kind == "AWS::IoT::Policy":
+            if "PolicyDocument" in properties:
+                raise _ProvisioningRejected(
+                    "InvalidTemplate",
+                    f"Template {template['templateName']} creates a policy from a "
+                    "PolicyDocument, which MiniStack does not support.",
+                )
+            plan["policies"].append(properties.get("PolicyName"))
+    plan["deviceConfiguration"] = resolve(body.get("DeviceConfiguration") or {})
+    return plan
+
+
+def _java_map(attributes: dict) -> str:
+    return "{" + ", ".join(f"{k}={v}" for k, v in sorted(attributes.items())) + "}"
+
+
+async def _apply_provisioning_plan(plan: dict, cert: dict) -> str | None:
+    """Create or update the thing, then activate and attach the certificate; a rejection changes nothing."""
+    account = get_account_id()
+    for policy in plan["policies"]:
+        if _policies.get(policy) is None:
+            raise _provisioning_failed(
+                "Register thing workflow execution terminates due to: Policy default version not found"
+            )
+    if plan["thing"] is None:
+        name = None
+    else:
+        properties, overrides = plan["thing"]
+        name = properties.get("ThingName")
+        if not isinstance(name, str) or not _NAME_RE.match(name):
+            raise _provisioning_failed("Invalid thingName: must match [a-zA-Z0-9:_-]{1,128}")
+        attributes = properties.get("AttributePayload")
+        type_name = properties.get("ThingTypeName")
+        groups = properties.get("ThingGroups")
+        if type_name and type_name not in _thing_types:
+            raise _provisioning_failed(
+                "Register thing workflow execution terminates due to: "
+                f"Thing Type {account}:{type_name} not found."
+            )
+        for group in groups or ():
+            if group not in _thing_groups:
+                raise _provisioning_failed(
+                    "Register thing workflow execution terminates due to: "
+                    f"ThingGroup {account}:{group} not found."
+                )
+        thing = _things.get(name)
+        if thing is None:
+            _create_thing(name, {
+                "attributePayload": {"attributes": attributes or {}},
+                "thingTypeName": type_name or None,
+            })
+            join, leave = list(groups or ()), []
+        else:
+            update, join, leave = _provisioning_thing_changes(
+                thing, attributes, type_name, groups, overrides
+            )
+            if update:
+                _update_thing(name, update)
+        for group in join:
+            await _add_thing_to_group({"thingGroupName": group, "thingName": name})
+        for group in leave:
+            await _remove_thing_from_group({"thingGroupName": group, "thingName": name})
+        thing = _things[name]
+        if cert["certificateArn"] not in thing.setdefault("principals", []):
+            thing["principals"].append(cert["certificateArn"])
+            _things[name] = thing
+        if thing["thingArn"] not in cert.setdefault("attachedThings", []):
+            cert["attachedThings"].append(thing["thingArn"])
+    cert["status"] = plan["status"]
+    _certificates[cert["certificateId"]] = cert
+    for policy in plan["policies"]:
+        _change_policy_target(policy, cert["certificateArn"], attach=True)
+    return name
+
+
+def _provisioning_thing_changes(
+    thing: dict, attributes, type_name, groups, overrides: dict
+) -> tuple[dict, list, list]:
+    """The UpdateThing payload and the groups to join and leave for a thing that exists."""
+    update: dict = {}
+    join: list = []
+    leave: list = []
+    if attributes is not None:
+        current = thing.get("attributes") or {}
+        setting = overrides.get("AttributePayload")
+        if setting == "MERGE":
+            attributes = {**current, **attributes}
+        if setting in ("REPLACE", "MERGE"):
+            update["attributePayload"] = {"attributes": attributes}
+        elif setting != "DO_NOTHING" and attributes != current:
+            raise _provisioning_failed(
+                f"Existing AttributePayload: {_java_map(current)} conflicts with "
+                f"AttributePayload: {_java_map(attributes)} in Template."
+            )
+    if type_name is not None:
+        current = thing.get("thingTypeName")
+        setting = overrides.get("ThingTypeName")
+        if setting == "REPLACE":
+            update["thingTypeName"] = type_name
+        elif setting != "DO_NOTHING" and type_name != current:
+            raise _provisioning_failed(
+                f"Existing ThingType: {current or 'null'} conflicts with "
+                f"ThingType: {type_name} in Template."
+            )
+    if groups is not None:
+        current = list(thing.get("thingGroupNames") or [])
+        setting = overrides.get("ThingGroups")
+        if setting in ("REPLACE", "MERGE"):
+            join = [g for g in groups if g not in current]
+            leave = [g for g in current if g not in groups] if setting == "REPLACE" else []
+        elif setting != "DO_NOTHING" and set(groups) != set(current):
+            existing = ", ".join(
+                f"{{GroupName: {g},GroupArn: {_thing_group_arn(g)}}}" for g in current
+            )
+            raise _provisioning_failed(
+                f"Existing ThingGroups: [{existing}] conflict with "
+                f"ThingGroups: [{', '.join(groups)}] in Template."
+            )
+    return update, join, leave
 
 
 # ---------------------------------------------------------------------------
@@ -7817,14 +8173,40 @@ def _parsed_iot_policy(document: str, context: tuple) -> list:
     return parse_policy_document(_POLICY_VARIABLE_RE.sub(substitute, document))
 
 
+@functools.lru_cache(maxsize=256)
+def _provisioning_claim_policy(template_name: str) -> str:
+    """The policy of a claim certificate: its template's fleet provisioning topics and nothing else."""
+    topics = [
+        "$aws/certificates/create/*",
+        "$aws/certificates/create-from-csr/*",
+        f"$aws/provisioning-templates/{template_name}/provision/*",
+    ]
+    return json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"},
+        {"Effect": "Allow", "Action": ["iot:Publish", "iot:Receive"],
+         "Resource": [f"arn:aws:iot:*:*:topic/{topic}" for topic in topics]},
+        {"Effect": "Allow", "Action": "iot:Subscribe",
+         "Resource": [f"arn:aws:iot:*:*:topicfilter/{topic}" for topic in topics]},
+    ]})
+
+
 def _mqtt_policy_allows(
-    account_id: str, region: str, certificate_id: str, context: dict, action: str, resource: str
+    account_id: str,
+    region: str,
+    certificate_id: str,
+    context: dict,
+    action: str,
+    resource: str,
+    provisioning_template: str | None = None,
 ) -> bool:
-    """Whether the policies attached to the certificate allow ``action`` on ``resource``."""
-    with request_scope(account_id, region):
-        record = _certificates.get(certificate_id) or {}
-        policies = [_policies.get(name) for name in record.get("attachedPolicies", [])]
-    documents = [p["versions"][p["defaultVersionId"]]["document"] for p in policies if p]
+    """Whether the policies attached to the certificate, or a claim's own policy, allow ``action`` on ``resource``."""
+    if provisioning_template is not None:
+        documents = [_provisioning_claim_policy(provisioning_template)]
+    else:
+        with request_scope(account_id, region):
+            record = _certificates.get(certificate_id) or {}
+            policies = [_policies.get(name) for name in record.get("attachedPolicies", [])]
+        documents = [p["versions"][p["defaultVersionId"]]["document"] for p in policies if p]
     ctx = EvalContext(
         principal_arn=f"arn:aws:iot:{region}:{account_id}:cert/{certificate_id}",
         principal_type="Certificate",
@@ -9554,6 +9936,8 @@ class _WSSession:
         # The client certificate of an mTLS session; its policies are evaluated
         # under AUTH=true.
         self.certificate_id: str | None = None
+        # The template of a provisioning claim certificate, which has a policy of its own.
+        self.provisioning_template: str | None = None
         self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
@@ -9606,6 +9990,27 @@ class _WSSession:
             ipAddress=_publish_source_ip.get(),
             versionNumber=self._presence_version,
         )
+
+    async def _answer_fleet_provisioning(
+        self, topic: str, operation: str, template_name: str | None, payload: bytes
+    ) -> None:
+        """Answer a fleet provisioning request on this connection only, if it subscribed to the reply."""
+        try:
+            async with publishing_events():
+                kind, doc = await _fleet_provisioning_reply(
+                    self.account_id, self.region, operation, template_name, payload
+                )
+        except Exception:
+            _broker_logger.warning("IoT fleet provisioning failed for %r", topic, exc_info=True)
+            return
+        reply_topic = f"{topic}/{kind}"
+        granted = [
+            self._sub_granted_qos.get(sid, 0)
+            for sid, topic_filter in self._sub_filters.items()
+            if _subscription_matches(topic_filter, reply_topic)
+        ]
+        if granted:
+            await self.deliver_to_client(reply_topic, json.dumps(doc).encode("utf-8"), max(granted))
 
     def _alloc_packet_id(self) -> int:
         pid = self._next_pid
@@ -9742,7 +10147,13 @@ class _WSSession:
     def _policy_allows(self, action: str, resource: str) -> bool:
         """Whether this session may do ``action`` on ``resource``."""
         return not self._evaluates_policies() or _mqtt_policy_allows(
-            self.account_id, self.region, self.certificate_id, self._policy_context, action, resource
+            self.account_id,
+            self.region,
+            self.certificate_id,
+            self._policy_context,
+            action,
+            resource,
+            self.provisioning_template,
         )
 
     def _publish_allowed(self, topic: str, retain: bool) -> bool:
@@ -10053,6 +10464,9 @@ class _WSSession:
                     await self.send_bytes(_make_puback(packet_id, reason_code=reason))
                 else:
                     await self.send_bytes(_make_puback(packet_id))
+            fleet = _parse_fleet_provisioning_topic(topic)
+            if fleet is not None:
+                await self._answer_fleet_provisioning(topic, *fleet, payload)
             return True
 
         if pkt_type == PKT_SUBSCRIBE:
@@ -10382,6 +10796,9 @@ async def handle_websocket(
 # * a certificate registered ACTIVE in exactly one account: that account and
 #   region serve the session, which is what gives a device fleet per-tenant
 #   isolation without any credential handling.
+# * a claim certificate from CreateProvisioningClaim, until it expires: the
+#   account and region of its template serve the session, and under AUTH=true
+#   it may use only that template's fleet provisioning topics.
 # * a certificate that is unknown, not ACTIVE, or ACTIVE in several accounts:
 #   refused with a "not authorized" MQTT CONNACK, or under AUTH=true closed
 #   without one, as on AWS. This reads the X.509
@@ -10788,28 +11205,40 @@ def _mtls_refusal_reason(cert_id: str) -> str:
     return "not registered"
 
 
-def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
-    """Map a peer certificate (or none) to (account_id, region), or None.
+def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str, str | None] | None:
+    """Map a peer certificate (or none) to (account_id, region, claim template), or None.
 
     None means "this connection is refused". Presenting no certificate is not
     refused: that caller claims nothing and is served under the default
     account, the same way ``_ws_resolve_iot_account_id`` treats an unsigned
     WebSocket upgrade. A certificate that IS presented is read against the
     registry, which is the identity lifecycle this service already keeps:
-    ACTIVE in exactly one account selects it, and unknown, not ACTIVE, or
-    ACTIVE in several accounts is refused by the caller (``_mtls_refuse``).
+    ACTIVE in exactly one account selects it, as does an unexpired
+    provisioning claim, and unknown, not ACTIVE, or ACTIVE in several
+    accounts is refused by the caller (``_mtls_refuse``). The claim template
+    is set for a provisioning claim only.
     """
     if not der:
         return (
             os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000"),
             os.environ.get("MINISTACK_REGION", "us-east-1"),
+            None,
         )
     # Same derivation as x509_utils.get_certificate_id, without a PEM round-trip.
     cert_id = hashlib.sha256(der).hexdigest()
     active = _mtls_active_registrations(cert_id)
     if len(active) == 1:
         account_id, region, _record = active[0]
-        return account_id, region
+        return account_id, region, None
+    return _mtls_claim_scope(cert_id)
+
+
+def _mtls_claim_scope(cert_id: str) -> tuple[str, str, str] | None:
+    """(account_id, region, templateName) of the unexpired provisioning claim with this certificate id, or None."""
+    now = time.time()
+    for (account_id, region, key), record in list(_provisioning_claims._data.items()):
+        if key == cert_id and record["expiration"] > now:
+            return account_id, region, record["templateName"]
     return None
 
 
@@ -11026,7 +11455,7 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
         finally:
             await _mtls_close(writer)
         return
-    account_id, region = owner
+    account_id, region, provisioning_template = owner
 
     async def _tcp_send(message: dict) -> None:
         """Adapter for the two ASGI messages a session ever sends."""
@@ -11046,6 +11475,7 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
     certificate_id = hashlib.sha256(der).hexdigest() if der else None
     session = _WSSession(_tcp_send, account_id, region, certificate_id)
     session.certificate_id = certificate_id
+    session.provisioning_template = provisioning_template
     max_buffer = _max_frame_buffer_bytes()
     _mtls_logger.info(
         "IoT mTLS: connection from %s serving %s/%s (%s)",
