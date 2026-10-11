@@ -19116,6 +19116,178 @@ def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
         ses.describe_configuration_set(ConfigurationSetName=cs_name)
 
 
+_SES_SET_V1 = {
+    "DeliveryOptions": {"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 900},
+    "ReputationOptions": {"ReputationMetricsEnabled": False},
+    "SendingOptions": {"SendingEnabled": False},
+    "SuppressionOptions": {"SuppressedReasons": ["BOUNCE", "COMPLAINT"]},
+    "VdmOptions": {"DashboardOptions": {"EngagementMetrics": "DISABLED"}},
+    "Tags": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}],
+}
+_SES_DEST_V1 = {
+    "Name": "dest", "Enabled": True, "MatchingEventTypes": ["send", "bounce"],
+    "CloudWatchDestination": {"DimensionConfigurations": [{
+        "DimensionName": "campaign", "DimensionValueSource": "messageTag", "DefaultDimensionValue": "none"}]},
+}
+_SES_SET_V2 = {"DeliveryOptions": {"TlsPolicy": "OPTIONAL"},
+               "Tags": [{"Key": "a", "Value": "10"}, {"Key": "c", "Value": "3"}]}
+_SES_DEST_V2 = {"Name": "dest", "MatchingEventTypes": ["delivery", "complaint", "reject"],
+                "SnsDestination": {"TopicARN": {"Ref": "Topic"}}}
+
+
+def _cfn_ses_template(uid, set_props, dest, name=None):
+    return json.dumps({
+        "Resources": {
+            "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": f"cfn-ses-{uid}"}},
+            "Set": {"Type": "AWS::SES::ConfigurationSet",
+                    "Properties": {"Name": name or f"cfn-ses-{uid}", **set_props}},
+            "Bare": {"Type": "AWS::SES::ConfigurationSet"},
+            "Dest": {"Type": "AWS::SES::ConfigurationSetEventDestination",
+                     "Properties": {"ConfigurationSetName": {"Ref": "Set"}, "EventDestination": dest}},
+        },
+        "Outputs": {"BareRef": {"Value": {"Ref": "Bare"}}, "DestRef": {"Value": {"Ref": "Dest"}}},
+    })
+
+
+def _ses_set(sesv2, name):
+    out = sesv2.get_configuration_set(ConfigurationSetName=name)
+    out.pop("ResponseMetadata")
+    out["Tags"] = sorted((t["Key"], t["Value"]) for t in out["Tags"] if not t["Key"].startswith("aws:"))
+    return out
+
+
+def _ses_destinations(sesv2, name):
+    return sesv2.get_configuration_set_event_destinations(ConfigurationSetName=name)["EventDestinations"]
+
+
+def test_cfn_ses_configuration_set_updates_in_place(cfn, sesv2):
+    """A removed option goes back to its default, the destination changes in place and a rollback restores both."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, name = f"cfn-ses-upd-{uid}", f"cfn-ses-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ses_template(uid, _SES_SET_V1, _SES_DEST_V1))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        bare = _output(stack, "BareRef")
+        assert re.fullmatch(r"Bare-[A-Za-z0-9]{12}", bare)
+        assert _ses_set(sesv2, bare) == {
+            "ConfigurationSetName": bare, "ReputationOptions": {"ReputationMetricsEnabled": True},
+            "SendingOptions": {"SendingEnabled": True}, "Tags": []}
+        tags = sesv2.get_configuration_set(ConfigurationSetName=name)["Tags"]
+        assert {t["Key"]: t["Value"] for t in tags}["aws:cloudformation:logical-id"] == "Set"
+        assert _ses_set(sesv2, name) == {
+            "ConfigurationSetName": name,
+            "DeliveryOptions": {"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 900},
+            "ReputationOptions": {"ReputationMetricsEnabled": False},
+            "SendingOptions": {"SendingEnabled": False},
+            "SuppressionOptions": {"SuppressedReasons": ["BOUNCE", "COMPLAINT"]},
+            "VdmOptions": {"DashboardOptions": {"EngagementMetrics": "DISABLED"}},
+            "Tags": [("a", "1"), ("b", "2")]}
+        assert _ses_destinations(sesv2, name) == [{
+            "Name": "dest", "Enabled": True, "MatchingEventTypes": ["BOUNCE", "SEND"],
+            "CloudWatchDestination": {"DimensionConfigurations": [{
+                "DimensionName": "campaign", "DimensionValueSource": "MESSAGE_TAG",
+                "DefaultDimensionValue": "none"}]}}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_ses_template(uid, _SES_SET_V2, _SES_DEST_V2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert (_output(stack, "BareRef"), _output(stack, "DestRef")) == (bare, f"{name}|dest")
+        updated = _ses_set(sesv2, name)
+        assert "LastFreshStart" in updated["ReputationOptions"]
+        updated["ReputationOptions"].pop("LastFreshStart")
+        assert updated == {
+            "ConfigurationSetName": name, "DeliveryOptions": {"TlsPolicy": "OPTIONAL"},
+            "ReputationOptions": {"ReputationMetricsEnabled": True}, "SendingOptions": {"SendingEnabled": True},
+            "Tags": [("a", "10"), ("c", "3")]}
+        destinations = _ses_destinations(sesv2, name)
+        assert destinations == [{
+            "Name": "dest", "Enabled": False, "MatchingEventTypes": ["COMPLAINT", "DELIVERY", "REJECT"],
+            "SnsDestination": {"TopicArn": destinations[0]["SnsDestination"]["TopicArn"]}}]
+        assert destinations[0]["SnsDestination"]["TopicArn"].endswith(f":cfn-ses-{uid}")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_with_failing_resource(
+            _cfn_ses_template(uid, _SES_SET_V1, _SES_DEST_V1), ["Set", "Dest"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        restored = _ses_set(sesv2, name)
+        restored["ReputationOptions"].pop("LastFreshStart")
+        assert restored == {**updated, "ReputationOptions": {"ReputationMetricsEnabled": True}}
+        assert _ses_destinations(sesv2, name) == destinations
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    for set_name in (name, bare):
+        with pytest.raises(ClientError):
+            sesv2.get_configuration_set(ConfigurationSetName=set_name)
+
+
+def test_cfn_ses_configuration_set_rename_and_destination_changes(cfn, sesv2):
+    """A Name change replaces both; a destination keeps its first Name; an invalid destination rolls back."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, name, renamed = f"cfn-ses-ren-{uid}", f"cfn-ses-{uid}", f"cfn-ses-renamed-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_ses_template(uid, _SES_SET_V2, _SES_DEST_V2))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="rename",
+                              TemplateBody=_cfn_ses_template(uid, _SES_SET_V2, _SES_DEST_V2, name=renamed))
+        described = _wait_change_set(cfn, stack_name, "rename")
+        assert sorted((c["ResourceChange"]["LogicalResourceId"], c["ResourceChange"]["Replacement"])
+                      for c in described["Changes"]) == [("Dest", "True"), ("Set", "True")]
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="rename")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DestRef") == f"{renamed}|dest"
+        assert _ses_set(sesv2, renamed)["Tags"] == [("a", "10"), ("c", "3")]
+        assert [d["MatchingEventTypes"] for d in _ses_destinations(sesv2, renamed)] == [
+            ["COMPLAINT", "DELIVERY", "REJECT"]]
+        with pytest.raises(ClientError):
+            sesv2.get_configuration_set(ConfigurationSetName=name)
+
+        third = {**_SES_DEST_V1, "Name": "dest2", "MatchingEventTypes": ["send"]}
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_ses_template(uid, _SES_SET_V2, third, name=renamed))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DestRef") == f"{renamed}|dest"
+        expected = [{"Name": "dest", "Enabled": True, "MatchingEventTypes": ["SEND"],
+                     "CloudWatchDestination": {"DimensionConfigurations": [{
+                         "DimensionName": "campaign", "DimensionValueSource": "MESSAGE_TAG",
+                         "DefaultDimensionValue": "none"}]}}]
+        assert _ses_destinations(sesv2, renamed) == expected
+
+        for dest, reason in (
+            ({**third, "MatchingEventTypes": ["sent"]}, "The event destination contains an invalid event type."),
+            ({k: v for k, v in third.items() if k != "CloudWatchDestination"}, "Event destination is not provided."),
+        ):
+            cfn.update_stack(StackName=stack_name,
+                             TemplateBody=_cfn_ses_template(uid, _SES_SET_V2, dest, name=renamed))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert reason in _stack_event_reasons(cfn, stack_name)
+            assert _ses_destinations(sesv2, renamed) == expected
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def test_cfn_ses_configuration_set_long_logical_id(cfn, sesv2):
+    """A generated name keeps the first 51 characters of the logical id, so it stays within 64."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, logical_id = f"cfn-ses-long-{uid}", "Long" * 18
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(
+        {"Resources": {logical_id: {"Type": "AWS::SES::ConfigurationSet"}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        name = cfn.describe_stack_resource(StackName=stack_name, LogicalResourceId=logical_id)[
+            "StackResourceDetail"]["PhysicalResourceId"]
+        assert re.fullmatch(logical_id[:51] + r"-[A-Za-z0-9]{12}", name)
+        assert sesv2.get_configuration_set(ConfigurationSetName=name)["ConfigurationSetName"] == name
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def _signer_template(named, validity=30, tags=None, named_validity=None,
                      action="signer:StartSigningJob"):
     named_props = {"ProfileName": named, "PlatformId": "AWSLambda-SHA384-ECDSA"}

@@ -1151,6 +1151,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::DocDB::DBInstance": ("Tags", "list"),
     "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
     "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::SES::ConfigurationSet": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -10651,51 +10652,120 @@ def _ses_email_identity_update(physical_id, old_props, new_props, stack_name,
 # SES ConfigurationSet
 # ---------------------------------------------------------------------------
 
+def _ses_configuration_set_members(props):
+    """The SES v2 CreateConfigurationSet members of a template's properties."""
+    members = {k: copy.deepcopy(props[k]) for k in _ses_v2._CONFIG_SET_OPTIONS.values()
+               if isinstance(props.get(k), dict)}
+    for key, member in (("ReputationOptions", "ReputationMetricsEnabled"), ("SendingOptions", "SendingEnabled")):
+        if member in members.get(key, {}):
+            members[key][member] = _cfn_bool(members[key][member])
+    members["Tags"] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+    return members
+
+
 def _ses_configuration_set_create(logical_id, props, stack_name):
-    # AWS::SES::ConfigurationSet Ref returns the configuration set name; when the
-    # template omits Name, CloudFormation generates one from the stack/logical id.
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    """Ref is the set name; a generated name is <LogicalId>- + 12 random letters and digits."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = props.get("Name") or f"{logical_id[:51]}-{suffix}"
     # Register with both the classic (v1) and v2 SES stores so DescribeConfigurationSet
     # (Query API) and GetConfigurationSet (v2 REST API) both see the set.
     _ses._configuration_sets[name] = {
         "Name": name,
         "CreatedTimestamp": _ses._iso_now(),
     }
-    _ses_v2._config_sets[name] = {"ConfigurationSetName": name, "Tags": []}
+    _ses_v2._create_config_set(name, _ses_configuration_set_members(props))
     # Real AWS AWS::SES::ConfigurationSet supports Ref (the set name) only; it
     # exposes no Fn::GetAtt attributes, so return none.
     return name, {}
 
 
+def _ses_configuration_set_update(physical_id, old_props, new_props, stack_name):
+    """Put every option again, a removed one as a new set has it; a Name change replaces the set."""
+    rec = _ses_v2._config_sets.get(physical_id)
+    if rec is None:
+        return _ses_configuration_set_create(None, {**new_props, "Name": physical_id}, stack_name)
+    members = _ses_configuration_set_members(new_props)
+    for key in _ses_v2._CONFIG_SET_OPTIONS.values():
+        _ses_v2._put_config_set_option(rec, key, members.get(key) or _ses_v2._CONFIG_SET_DEFAULTS.get(key, {}))
+    rec["Tags"] = members["Tags"]
+    _ses_v2._ses_tags[_ses_v2._resource_arn("configuration-set", physical_id)] = list(members["Tags"])
+    return physical_id, {}
+
+
 def _ses_configuration_set_delete(physical_id, props):
     _ses._configuration_sets.pop(physical_id, None)
     _ses_v2._config_sets.pop(physical_id, None)
+    _ses_v2._ses_tags.pop(_ses_v2._resource_arn("configuration-set", physical_id), None)
 
 
 # ---------------------------------------------------------------------------
 # SES ConfigurationSetEventDestination
 # ---------------------------------------------------------------------------
 
+def _ses_v2_enum(value):
+    """A v1 camelCase name as its SES v2 enum value: renderingFailure is RENDERING_FAILURE."""
+    return re.sub(r"([a-z])([A-Z])", r"\1_\2", str(value)).upper()
+
+
+def _ses_event_destination_definition(destination):
+    """The SES v2 EventDestinationDefinition of a template's EventDestination."""
+    definition = {
+        "Enabled": _cfn_bool(destination.get("Enabled", False)),
+        "MatchingEventTypes": [_ses_v2_enum(t) for t in destination.get("MatchingEventTypes") or []],
+    }
+    cloudwatch = destination.get("CloudWatchDestination")
+    if isinstance(cloudwatch, dict):
+        definition["CloudWatchDestination"] = {"DimensionConfigurations": [
+            {**d, "DimensionValueSource": _ses_v2_enum(d.get("DimensionValueSource", ""))}
+            for d in cloudwatch.get("DimensionConfigurations") or []
+        ]}
+    firehose = destination.get("KinesisFirehoseDestination")
+    if isinstance(firehose, dict):
+        definition["KinesisFirehoseDestination"] = {
+            "IamRoleArn": firehose.get("IAMRoleARN"), "DeliveryStreamArn": firehose.get("DeliveryStreamARN")}
+    if isinstance(destination.get("SnsDestination"), dict):
+        definition["SnsDestination"] = {"TopicArn": destination["SnsDestination"].get("TopicARN")}
+    if isinstance(destination.get("EventBridgeDestination"), dict):
+        definition["EventBridgeDestination"] = {
+            "EventBusArn": destination["EventBridgeDestination"].get("EventBusArn")}
+    return definition
+
+
+def _ses_event_destination_put(config_set, dest_name, props, *, create):
+    if config_set not in _ses_v2._config_sets:
+        # A set the v2 store does not know: the destination is not recorded.
+        return
+    err = _ses_v2._put_event_destination(
+        config_set, dest_name, _ses_event_destination_definition(props.get("EventDestination") or {}),
+        create=create)
+    if err:
+        raise ValueError(json.loads(err[2])["message"])
+
+
 def _ses_configuration_set_event_destination_create(logical_id, props, stack_name):
     config_set = props.get("ConfigurationSetName", "")
     destination = props.get("EventDestination", {}) or {}
     dest_name = destination.get("Name") or _physical_name(
         stack_name, logical_id, max_len=64)
-    # Record the event destination against its configuration set (if present) so
-    # the set round-trips with its destinations; the emulator does not deliver
-    # SES events, this is CFN provisioning fidelity only.
-    record = _ses._configuration_sets.get(config_set)
-    if record is not None:
-        record.setdefault("EventDestinations", {})[dest_name] = destination
+    # Recorded through the SES v2 API; the emulator does not deliver SES events.
+    _ses_event_destination_put(config_set, dest_name, props, create=True)
     # The physical id encodes both names so delete can locate the destination.
     return f"{config_set}|{dest_name}", {"Id": dest_name}
 
 
+def _ses_configuration_set_event_destination_update(physical_id, old_props, new_props, stack_name):
+    """Replace the destination's content in place; the physical id keeps its name, as on AWS."""
+    config_set, _, dest_name = physical_id.partition("|")
+    destinations = (_ses_v2._config_sets.get(config_set) or {}).get("EventDestinations") or {}
+    _ses_event_destination_put(config_set, dest_name, new_props, create=dest_name not in destinations)
+    return physical_id, {"Id": dest_name}
+
+
 def _ses_configuration_set_event_destination_delete(physical_id, props):
     config_set, _, dest_name = physical_id.partition("|")
-    record = _ses._configuration_sets.get(config_set)
+    record = _ses_v2._config_sets.get(config_set)
     if record is not None:
-        record.get("EventDestinations", {}).pop(dest_name, None)
+        (record.get("EventDestinations") or {}).pop(dest_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -14226,6 +14296,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
     "AWS::CloudFront::Function": ("Name",),
     "AWS::SSM::Parameter": ("Name",),
+    "AWS::SES::ConfigurationSet": ("Name",),
+    "AWS::SES::ConfigurationSetEventDestination": ("ConfigurationSetName",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
     "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
@@ -14997,8 +15069,16 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ses_email_identity_delete,
     },
-    "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
-    "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::SES::ConfigurationSet": {
+        "create": _ses_configuration_set_create,
+        "update": _ses_configuration_set_update,
+        "delete": _ses_configuration_set_delete,
+    },
+    "AWS::SES::ConfigurationSetEventDestination": {
+        "create": _ses_configuration_set_event_destination_create,
+        "update": _ses_configuration_set_event_destination_update,
+        "delete": _ses_configuration_set_event_destination_delete,
+    },
     "AWS::Signer::SigningProfile": {
         "create": _signer_signing_profile_create,
         "update": _signer_signing_profile_update,
