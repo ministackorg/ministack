@@ -11844,6 +11844,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_hooks(physical_id)
     _asg._delete_group_policies(physical_id)
 
 
@@ -11911,17 +11912,17 @@ def _asg_policy_delete(physical_id, props):
 def _asg_hook_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
-    key = f"{asg_name}/{hook_name}"
-    _asg._hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
-        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
-        "DefaultResult": props.get("DefaultResult", "ABANDON"),
-        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
-        "RoleARN": props.get("RoleARN", ""),
-    }
+    _asg._hooks[f"{asg_name}/{hook_name}"] = _asg._hook_record(asg_name, hook_name, props)
     return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_update(physical_id, old_props, new_props, stack_name):
+    """AutoScalingGroupName and LifecycleHookName replace; the rest is in place and a dropped member stays."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    key = f"{asg_name}/{physical_id}"
+    current = _asg._hooks.get(key, {})
+    _asg._hooks[key] = _asg._hook_record(asg_name, physical_id, {**current, **new_props})
+    return physical_id, {"LifecycleHookName": physical_id}
 
 
 def _asg_hook_delete(physical_id, props):
@@ -14206,6 +14207,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
         "SecurityGroups", "SpotPrice", "UserData",
     ),
+    "AWS::AutoScaling::LifecycleHook": ("AutoScalingGroupName", "LifecycleHookName"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::User": ("UserName",),
@@ -15249,7 +15251,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_policy_delete,
     },
-    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::LifecycleHook": {
+        "create": _asg_hook_create,
+        "update": _asg_hook_update,
+        "delete": _asg_hook_delete,
+    },
     "AWS::AutoScaling::ScheduledAction": {
         "create": _asg_scheduled_create,
         "update": _asg_scheduled_update,

@@ -30407,6 +30407,23 @@ def test_cfn_asg_delete_removes_target_tracking_alarms(cfn, autoscaling, cw):
     assert autoscaling.describe_policies(AutoScalingGroupName=group)["ScalingPolicies"] == []
 
 
+def test_cfn_asg_delete_removes_lifecycle_hooks_put_on_it(cfn, autoscaling):
+    """Deleting a template group deletes the lifecycle hooks put on it through the API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-asg-hookdel-{suffix}"
+    group = f"cfn-asg-hookdel-{suffix}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_policy_template(group, {}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        autoscaling.put_lifecycle_hook(
+            AutoScalingGroupName=group, LifecycleHookName="drain",
+            LifecycleTransition="autoscaling:EC2_INSTANCE_TERMINATING")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert autoscaling.describe_lifecycle_hooks(AutoScalingGroupName=group)["LifecycleHooks"] == []
+
+
 def test_cfn_asg_target_tracking_policy_creates_its_alarms(cfn, autoscaling, cw):
     """A template target tracking policy creates its alarms, replaces them on update and deletes them with the stack."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -30849,6 +30866,134 @@ def test_cfn_asg_scheduled_action_recurrence_change_is_rolled_back(cfn, autoscal
         [after] = actions()
         assert after["Recurrence"] == "0 9 * * *"
         assert after["ScheduledActionARN"] == before["ScheduledActionARN"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_asg_hook_template(hook):
+    group = {"LaunchConfigurationName": {"Ref": "LC"}, "MinSize": "0", "MaxSize": "1",
+             "DesiredCapacity": "0", "AvailabilityZones": ["us-east-1a"]}
+    return json.dumps({
+        "Resources": {
+            "LC": {"Type": "AWS::AutoScaling::LaunchConfiguration",
+                   "Properties": {"ImageId": "ami-12345678", "InstanceType": "t3.micro"}},
+            "GroupA": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": group},
+            "GroupB": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": group},
+            "Hook": {"Type": "AWS::AutoScaling::LifecycleHook", "Properties": hook},
+        },
+        "Outputs": {key: {"Value": {"Ref": key}} for key in ("Hook", "GroupA", "GroupB")},
+    })
+
+
+def _cfn_asg_hooks(autoscaling, group):
+    return [(h["LifecycleHookName"], h["LifecycleTransition"], h["HeartbeatTimeout"],
+             h["DefaultResult"], h.get("NotificationMetadata"))
+            for h in autoscaling.describe_lifecycle_hooks(
+                AutoScalingGroupName=group)["LifecycleHooks"]]
+
+
+def test_cfn_asg_lifecycle_hook_update_in_place_keeps_dropped_members(cfn, autoscaling):
+    """A hook update keeps the name; a member the template drops keeps its value."""
+    stack_name = f"cfn-asg-hook-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(**members):
+        return _cfn_asg_hook_template({"AutoScalingGroupName": {"Ref": "GroupA"}, **members})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        LifecycleTransition="autoscaling:EC2_INSTANCE_LAUNCHING", HeartbeatTimeout=300,
+        DefaultResult="ABANDON"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name, group = _output(stack, "Hook"), _output(stack, "GroupA")
+
+        changed = (name, "autoscaling:EC2_INSTANCE_TERMINATING", 600, "CONTINUE", None)
+        for members in ({"HeartbeatTimeout": 600, "DefaultResult": "CONTINUE"}, {}):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(
+                LifecycleTransition="autoscaling:EC2_INSTANCE_TERMINATING", **members))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _output(stack, "Hook") == name
+            assert _cfn_asg_hooks(autoscaling, group) == [changed]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_lifecycle_hook_notification_metadata_reads_back_and_updates(cfn, autoscaling):
+    """NotificationMetadata reads back, a change applies and a dropped one stays."""
+    stack_name = f"cfn-asg-hookmd-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(**members):
+        return _cfn_asg_hook_template({
+            "AutoScalingGroupName": {"Ref": "GroupA"},
+            "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING", **members})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(NotificationMetadata="v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group = _output(stack, "GroupA")
+        assert [h[4] for h in _cfn_asg_hooks(autoscaling, group)] == ["v1"]
+        for members in ({"NotificationMetadata": "v2"}, {}):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(**members))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert [h[4] for h in _cfn_asg_hooks(autoscaling, group)] == ["v2"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_asg_lifecycle_hook_group_change_replaces_it(cfn, autoscaling):
+    """A hook moved to another group gets a new generated name and leaves the old group."""
+    stack_name = f"cfn-asg-hookmv-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(group):
+        return _cfn_asg_hook_template({
+            "AutoScalingGroupName": {"Ref": group}, "HeartbeatTimeout": 300,
+            "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING"})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("GroupA"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old = _output(stack, "Hook")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("GroupB"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new = _output(stack, "Hook")
+        assert new != old and new.startswith(f"{stack_name}-Hook-")
+        assert _cfn_asg_hooks(autoscaling, _output(stack, "GroupA")) == []
+        assert _cfn_asg_hooks(autoscaling, _output(stack, "GroupB")) == [
+            (new, "autoscaling:EC2_INSTANCE_TERMINATING", 300, "ABANDON", None)]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("change,result", [
+    ({"HeartbeatTimeout": 900}, "ABANDON"),
+    ({"HeartbeatTimeout": 900, "DefaultResult": "CONTINUE"}, "CONTINUE"),
+    ({"AutoScalingGroupName": {"Ref": "GroupB"}}, "ABANDON"),
+], ids=["in-place", "member-added", "group"])
+def test_cfn_asg_lifecycle_hook_change_is_rolled_back(cfn, autoscaling, change, result):
+    """The rollback restores the old template's members; one it lacks keeps the new value."""
+    stack_name = f"cfn-asg-hookrb-{_uuid_mod.uuid4().hex[:8]}"
+    hook = {"AutoScalingGroupName": {"Ref": "GroupA"}, "HeartbeatTimeout": 300,
+            "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_asg_hook_template(hook))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name = _output(stack, "Hook")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_with_failing_resource(
+            _cfn_asg_hook_template({**hook, **change}), "Hook"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Hook") == name
+        assert _cfn_asg_hooks(autoscaling, _output(stack, "GroupA")) == [
+            (name, "autoscaling:EC2_INSTANCE_TERMINATING", 300, result, None)]
+        assert _cfn_asg_hooks(autoscaling, _output(stack, "GroupB")) == []
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
