@@ -1951,11 +1951,35 @@ def test_iot_provisioning_template_update_unknown_404(iot_client):
     )
 
 
-def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
+def _hook_function_arn(lam, iam, permission: dict | None = None) -> str:
+    """The ARN of a new hook function; ``permission`` grants iot.amazonaws.com the invoke, with its extra arguments."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {'allowProvisioning': True}\n")
+    name = _unique("provhook")
+    role = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+    arn = lam.create_function(
+        FunctionName=name, Runtime="python3.12", Role=role["Role"]["Arn"],
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )["FunctionArn"]
+    if permission is not None:
+        lam.add_permission(
+            FunctionName=name, StatementId="iot", Action="lambda:InvokeFunction",
+            Principal="iot.amazonaws.com", **permission,
+        )
+    return arn
+
+
+def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client, lam, iam):
     name = _unique("provtemplate")
     hook = {
         "payloadVersion": "2020-04-01",
-        "targetArn": "arn:aws:lambda:us-east-1:000000000000:function:hook",
+        "targetArn": _hook_function_arn(lam, iam, {}),
     }
     iot_client.create_provisioning_template(
         templateName=name,
@@ -1980,6 +2004,75 @@ def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
         assert iot_client.describe_provisioning_template(
             templateName=name
         )["preProvisioningHook"] == hook
+    finally:
+        iot_client.delete_provisioning_template(templateName=name)
+
+
+def test_iot_provisioning_template_pre_provisioning_hook_validation(iot_client, lam, iam):
+    """Create and Update refuse a hook iot.amazonaws.com may not invoke for this template; payloadVersion defaults."""
+    name = _unique("provtemplate")
+    template_arn = f"arn:aws:iot:us-east-1:000000000000:provisioningtemplate/{name}"
+    allowed = _hook_function_arn(lam, iam, {})
+    own_source = _hook_function_arn(lam, iam, {"SourceArn": template_arn})
+    no_permission = _hook_function_arn(lam, iam)
+    other_source = _hook_function_arn(lam, iam, {"SourceArn": f"{template_arn}-other"})
+    missing = f"{allowed}-missing"
+    denied = "Access denied during lambda validation: "
+    invalid = "Invalid arguments in the call"
+    unsupported = (
+        "The hook version cannot be supported by AWS Iot, the supported versions are: [2020-04-01]"
+    )
+    common = {
+        "templateName": name, "templateBody": _provisioning_template_body(),
+        "provisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+    }
+    for hook, extra, message in (
+        ({"targetArn": missing}, {}, denied + missing),
+        ({"targetArn": "not-an-arn"}, {}, invalid),
+        ({"targetArn": allowed.rsplit(":", 1)[1]}, {}, invalid),
+        ({"targetArn": "arn:aws:sns:us-east-1:000000000000:hook"}, {}, invalid),
+        ({"targetArn": allowed, "payloadVersion": "2019-01-01"}, {}, unsupported),
+        ({"targetArn": allowed, "payloadVersion": "abcdefghij"}, {},
+         "1 validation error detected: Value at 'preProvisioningHook.payloadVersion' failed to "
+         "satisfy constraint: Member must satisfy regular expression pattern: ^[0-9-]+$"),
+        ({"targetArn": allowed}, {"type": "JITP"},
+         "Provisioning hook is not supported for template type: JITP"),
+        ({"targetArn": no_permission}, {}, denied + no_permission),
+        ({"targetArn": other_source}, {}, denied + other_source),
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_template(**common, **extra, preProvisioningHook=hook)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == message
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_provisioning_template(templateName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    iot_client.create_provisioning_template(**common, preProvisioningHook={"targetArn": allowed})
+    try:
+        stored = {"payloadVersion": "2020-04-01", "targetArn": allowed}
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == stored
+        for hook, message in (
+            ({"targetArn": missing}, denied + missing),
+            ({"targetArn": no_permission}, denied + no_permission),
+            ({"targetArn": allowed, "payloadVersion": "2019-01-01"}, unsupported),
+        ):
+            with pytest.raises(ClientError) as ei:
+                iot_client.update_provisioning_template(
+                    templateName=name, description="changed", preProvisioningHook=hook
+                )
+            assert ei.value.response["Error"]["Message"] == message
+        desc = iot_client.describe_provisioning_template(templateName=name)
+        assert desc["preProvisioningHook"] == stored
+        assert "description" not in desc
+        iot_client.update_provisioning_template(
+            templateName=name, preProvisioningHook={"targetArn": own_source}
+        )
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == {"payloadVersion": "2020-04-01", "targetArn": own_source}
     finally:
         iot_client.delete_provisioning_template(templateName=name)
 
@@ -2125,10 +2218,12 @@ async def _fleet_setup(templates: dict, account=_FLEET_ACCOUNT, region=_FLEET_RE
         assert status == 200
 
 
-async def _fleet_client(client_id, templates=(), account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+async def _fleet_client(
+    client_id, templates=(), account=_FLEET_ACCOUNT, region=_FLEET_REGION, certificate_id=None
+):
     """A session subscribed to the replies of CreateKeysAndCertificate and of each template."""
     send, sent = _mock_send()
-    session = _IoTWSSession(send, account, region)
+    session = _IoTWSSession(send, account, region, certificate_id)
     await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
     filters = [f"{_FLEET_CREATE}/+"] + [
         f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
@@ -2493,6 +2588,240 @@ def test_fleet_provisioning_existing_thing_follows_override_settings():
     try:
         asyncio.run(_run())
     finally:
+        iot_module.reset()
+        reset()
+
+
+_FLEET_HOOK_ARN = f"arn:aws:lambda:{_FLEET_REGION}:{_FLEET_ACCOUNT}:function:fleet-hook"
+_FLEET_CLAIM_ID = "c1" * 32
+
+
+def _fleet_hook(monkeypatch, answers: dict) -> list:
+    """A hook function answering ``answers[Mode]`` for the request's Mode parameter; the events it gets."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    events = []
+
+    def _execute(_func, event):
+        events.append(event)
+        answer = answers[event["parameters"].get("Mode")]
+        return answer() if callable(answer) else answer
+
+    monkeypatch.setattr(lambda_svc, "_execute_function_with_config_scope", _execute)
+    lambda_svc._functions.clear()
+    with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+        lambda_svc._functions["fleet-hook"] = {
+            "config": {"FunctionName": "fleet-hook", "FunctionArn": _FLEET_HOOK_ARN},
+            "aliases": {}, "versions": {},
+            "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        }
+        lambda_svc._add_permission("fleet-hook", {
+            "StatementId": "iot", "Action": "lambda:InvokeFunction", "Principal": "iot.amazonaws.com",
+        })
+    return events
+
+
+async def _fleet_hook_templates(*names):
+    for name in names:
+        status, _ = await _fleet_request(
+            "PATCH", f"/provisioning-templates/{name}",
+            {"preProvisioningHook": {"targetArn": _FLEET_HOOK_ARN}},
+        )
+        assert status == 200
+
+
+def test_fleet_provisioning_hook_gets_the_request_and_overrides_its_parameters(monkeypatch):
+    """The hook gets the device's parameters before the template is resolved, and its overrides win."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    events = _fleet_hook(monkeypatch, {
+        "override": {"body": {"allowProvisioning": True, "parameterOverrides": {
+            "ThingName": "fleet-o", "ThingTypeName": "fleet-type"}}},
+        "supply": {"body": {"allowProvisioning": True, "parameterOverrides": {
+            "SerialNumber": 7, "Color": True}}},
+    })
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template(), "fleet-cdk": _fleet_cdk_template(
+            {"AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+             "ThingTypeName": "DO_NOTHING"})})
+        await _fleet_request("POST", "/thing-types/fleet-type", {})
+        await _fleet_request("POST", "/thing-groups/fleet-group", {})
+        await _fleet_hook_templates("fleet", "fleet-cdk")
+        session, sent = await _fleet_client(
+            "fleet-claim", ["fleet", "fleet-cdk"], certificate_id=_FLEET_CLAIM_ID
+        )
+        created = await _fleet_certificate(session, sent)
+        token = created["certificateOwnershipToken"]
+
+        parameters = {"ThingName": "fleet-x", "ThingTypeName": "fleet-other",
+                      "ThingGroup": "fleet-group", "Mode": "override"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"), _fleet_register(token, **parameters)
+        )
+        assert reply == (
+            f"{_fleet_provision_topic('fleet-cdk')}/accepted",
+            {"deviceConfiguration": {}, "thingName": "fleet-o"},
+        )
+        assert events == [{
+            "claimCertificateId": _FLEET_CLAIM_ID,
+            "clientId": "fleet-claim",
+            "certificateId": created["certificateId"],
+            "certificatePem": created["certificatePem"],
+            "templateArn": f"arn:aws:iot:{_FLEET_REGION}:{_FLEET_ACCOUNT}:provisioningtemplate/fleet-cdk",
+            "parameters": parameters,
+        }]
+        assert await _fleet_thing("fleet-o") == ({}, "fleet-type", ["fleet-group"])
+        assert await _fleet_thing("fleet-x") is None
+
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"), _fleet_register(token, Mode="supply")
+        )
+        assert reply[1]["thingName"] == "fleet-7"
+        assert events[-1]["parameters"] == {"Mode": "supply"}
+        assert await _fleet_thing("fleet-7") == ({"serial": "7", "color": "true"}, None, [])
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_hook_answers(monkeypatch):
+    """Each hook answer gets its reply; a rejected request creates nothing, and the token is checked first."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    invalid = (400, "InvalidResult", "Provisioning hook result is in an invalid format.")
+    denied = (403, "AccessDenied", "Access Denied")
+    cases = {
+        "deny": ({"allowProvisioning": False}, denied),
+        "string-false": ({"allowProvisioning": "false"}, denied),
+        "zero": ({"allowProvisioning": 0}, denied),
+        "no-allow": ({"parameterOverrides": {"Color": "blue"}}, invalid),
+        "yes": ({"allowProvisioning": "yes"}, invalid),
+        "http": ({"statusCode": 400, "body": "{}"}, invalid),
+        "string": ("allow", invalid),
+        "overrides-string": ({"allowProvisioning": True, "parameterOverrides": "Color=blue"}, invalid),
+        "overrides-nested": (
+            {"allowProvisioning": True, "parameterOverrides": {"Color": {"a": "b"}}}, invalid),
+        "null": (None, (400, "InvalidResult", "The provisioning hook did not return a response.")),
+        "null-override": ({"allowProvisioning": True, "parameterOverrides": {"Color": None}},
+                          (400, "InvalidParameters", "Cannot resolve reference value: Color")),
+    }
+    answers = {mode: {"body": answer} for mode, (answer, _reply) in cases.items()}
+    answers["raise"] = {"body": {"errorMessage": "boom", "errorType": "RuntimeError"}, "error": True}
+    answers["raw"] = {"body": b'"allow"'}
+    for mode, answer in (("true", "true"), ("upper", "TRUE"), ("one", 1)):
+        answers[mode] = {"body": {"allowProvisioning": answer}}
+    answers["extra"] = {"body": {"allowProvisioning": True, "extra": 1}}
+    events = _fleet_hook(monkeypatch, answers)
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_hook_templates("fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        created = await _fleet_certificate(session, sent)
+        token, provision = created["certificateOwnershipToken"], _fleet_provision_topic("fleet")
+
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register("made-up", SerialNumber="SN0", Mode="deny"))
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        assert events == []
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, Mode="deny"))
+        assert reply == (f"{provision}/rejected",
+                         {"statusCode": 403, "errorCode": "AccessDenied", "errorMessage": "Access Denied"})
+        expected = {
+            **{mode: reply for mode, (_answer, reply) in cases.items()},
+            "raise": (400, "InvocationError", "The provisioning hook was not executed successfully."),
+            "raw": invalid,
+        }
+        for mode, (status, code, message) in expected.items():
+            reply = await _fleet_publish(
+                session, sent, provision, _fleet_register(token, SerialNumber=f"SN-{mode}", Mode=mode))
+            assert reply == (f"{provision}/rejected",
+                             {"statusCode": status, "errorCode": code, "errorMessage": message}), mode
+            assert await _fleet_thing(f"fleet-SN-{mode}") is None
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+        for mode in ("true", "upper", "one", "extra"):
+            reply = await _fleet_publish(
+                session, sent, provision, _fleet_register(token, SerialNumber=f"SN-{mode}", Mode=mode))
+            assert reply == (f"{provision}/accepted",
+                             {"deviceConfiguration": {"greeting": "hello"}, "thingName": f"fleet-SN-{mode}"})
+        assert len(events) == len(expected) + 5
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_hook_time_limit_and_permission(monkeypatch):
+    """A slow hook fails the request without holding up the broker; one that may not be invoked is not."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    monkeypatch.setattr(iot_module, "_PROVISIONING_HOOK_SECONDS", 0.2)
+
+    def _slow():
+        time.sleep(0.6)
+        return {"body": {"allowProvisioning": True}}
+
+    events = _fleet_hook(monkeypatch, {"slow": _slow})
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_hook_templates("fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        token = (await _fleet_certificate(session, sent))["certificateOwnershipToken"]
+        provision = _fleet_provision_topic("fleet")
+
+        started = time.monotonic()
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN1", Mode="slow"))
+        assert time.monotonic() - started < 0.5
+        assert reply == (f"{provision}/rejected", {
+            "statusCode": 400, "errorCode": "InvocationError",
+            "errorMessage": "A failure occurred while invoking the provisioning hook.",
+        })
+        assert await _fleet_thing("fleet-SN1") is None
+
+        refused = (f"{provision}/rejected", {
+            "statusCode": 400, "errorCode": "InvocationError",
+            "errorMessage": "Access denied while invoking Lambda function",
+        })
+        with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+            lambda_svc._remove_permission("fleet-hook", "iot", {})
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN2", Mode="slow"))
+        assert reply == refused
+        lambda_svc._functions.clear()
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN3", Mode="slow"))
+        assert reply == refused
+        assert len(events) == 1
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
         iot_module.reset()
         reset()
 

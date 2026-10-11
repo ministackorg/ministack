@@ -1504,6 +1504,55 @@ def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
         iot_client.describe_provisioning_template(templateName=name)
 
 
+def test_cfn_iot_provisioning_template_pre_provisioning_hook(cfn, iot_client):
+    """A hook needs the invoke permission for iot.amazonaws.com; without it the stack rolls back."""
+
+    def template(name, permission):
+        resources = {
+            "Fn": {"Type": "AWS::Lambda::Function", "Properties": {
+                "FunctionName": name, "Runtime": "python3.12", "Handler": "index.handler",
+                "Role": "arn:aws:iam::000000000000:role/hook",
+                "Code": {"ZipFile": "def handler(e, c):\n    return {'allowProvisioning': True}\n"}}},
+            "PT": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+                "TemplateName": name,
+                "Enabled": True,
+                "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+                "TemplateBody": _cfn_provisioning_template_body(),
+                "PreProvisioningHook": {"TargetArn": {"Fn::GetAtt": ["Fn", "Arn"]}}}},
+        }
+        if permission:
+            resources["Perm"] = {"Type": "AWS::Lambda::Permission", "Properties": {
+                "FunctionName": {"Ref": "Fn"}, "Action": "lambda:InvokeFunction",
+                "Principal": "iot.amazonaws.com"}}
+            resources["PT"]["DependsOn"] = "Perm"
+        return json.dumps({"Resources": resources,
+                           "Outputs": {"Hook": {"Value": {"Fn::GetAtt": ["Fn", "Arn"]}}}})
+
+    try:
+        cfn.create_stack(StackName="cfn-iot-provhook",
+                         TemplateBody=template("cfn-provhook", True))
+        stack = _wait_stack(cfn, "cfn-iot-provhook")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert iot_client.describe_provisioning_template(
+            templateName="cfn-provhook"
+        )["preProvisioningHook"] == {
+            "payloadVersion": "2020-04-01", "targetArn": stack["Outputs"][0]["OutputValue"],
+        }
+
+        cfn.create_stack(StackName="cfn-iot-provhook-denied",
+                         TemplateBody=template("cfn-provhook-denied", False))
+        assert _wait_stack(cfn, "cfn-iot-provhook-denied")["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [
+            e.get("ResourceStatusReason", "")
+            for e in cfn.describe_stack_events(StackName="cfn-iot-provhook-denied")["StackEvents"]
+            if e["LogicalResourceId"] == "PT" and e["ResourceStatus"] == "CREATE_FAILED"
+        ]
+        assert reasons and "Access denied during lambda validation" in reasons[0]
+    finally:
+        for stack_name in ("cfn-iot-provhook", "cfn-iot-provhook-denied"):
+            _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _cfn_job_template(template_id, **overrides):
     props = {
         "JobTemplateId": template_id,

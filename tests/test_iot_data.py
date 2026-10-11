@@ -4238,6 +4238,78 @@ def test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics(tmp_path):
         _terminate(proc)
 
 
+# Names the thing after its certificate and keeps the device's thing type.
+_PROVISIONING_HOOK_HANDLER = (
+    "def handler(event, context):\n"
+    "    return {'allowProvisioning': True, 'parameterOverrides': {\n"
+    "        'ThingName': 'dev-' + event['certificateId'][:12],\n"
+    "        'ThingTypeName': event['parameters']['ThingTypeName']}}\n"
+)
+
+
+def test_mtls_provisioning_hook_names_the_thing(broker, tmp_path):
+    """A pre-provisioning hook Lambda names the thing that the device did not name."""
+    iot, lam = broker.client("iot"), broker.client("lambda")
+    name = _unique("fleet")
+    iot.create_thing_type(thingTypeName=f"{name}-type")
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", _PROVISIONING_HOOK_HANDLER)
+    role = broker.client("iam").create_role(RoleName=f"{name}-hook", AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+    hook = lam.create_function(
+        FunctionName=f"{name}-hook", Runtime="python3.12", Handler="index.handler",
+        Role=role["Role"]["Arn"], Code={"ZipFile": buf.getvalue()},
+    )["FunctionArn"]
+    lam.add_permission(
+        FunctionName=f"{name}-hook", StatementId="iot", Action="lambda:InvokeFunction",
+        Principal="iot.amazonaws.com",
+    )
+    iot.create_provisioning_template(
+        templateName=name,
+        templateBody=json.dumps({
+            "Parameters": {"ThingName": {"Type": "String"}, "ThingTypeName": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing", "OverrideSettings": {
+                    "AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+                    "ThingTypeName": "DO_NOTHING"}, "Properties": {
+                    "ThingName": {"Ref": "ThingName"}, "ThingTypeName": {"Ref": "ThingTypeName"},
+                    "AttributePayload": {}, "ThingGroups": []}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "Active"}},
+            },
+        }),
+        enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+        preProvisioningHook={"targetArn": hook},
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        created = json.loads(payload)
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": created["certificateOwnershipToken"],
+            "parameters": {"ThingTypeName": f"{name}-type"},
+        }).encode(), qos=1, packet_id=4))
+        thing = "dev-" + created["certificateId"][:12]
+        assert peer.next_publish(timeout=10) == (
+            f"{provision}/accepted",
+            json.dumps({"deviceConfiguration": {}, "thingName": thing}).encode(),
+        )
+    finally:
+        peer.close()
+    assert iot.describe_thing(thingName=thing)["thingTypeName"] == f"{name}-type"
+
+
 def test_mtls_jitr_certificate_is_listed_by_its_ca(broker, tmp_path):
     """As measured on AWS, ListCertificatesByCA lists the certificate that
     just-in-time registration created, while it is still PENDING_ACTIVATION."""

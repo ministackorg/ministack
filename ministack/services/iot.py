@@ -23,7 +23,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate``,
     ``CreateProvisioningClaim``, and fleet provisioning over MQTT
     (``$aws/certificates/create/json`` and
-    ``$aws/provisioning-templates/{name}/provision/json``);
+    ``$aws/provisioning-templates/{name}/provision/json``, after the
+    template's pre-provisioning hook allows it);
     ``provisioningRoleArn`` is presence-checked but not resolved
     (MiniStack does not validate IAM role ARNs elsewhere either)
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
@@ -93,6 +94,7 @@ from typing import Awaitable, Callable
 from urllib.parse import parse_qs, parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.iam_evaluator import EvalContext, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -1877,8 +1879,8 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 # Provisioning templates
 #
 # CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
-# topics) that applies a template to a certificate created over MQTT. The
-# pre-provisioning hook is stored but not invoked, and provisioningRoleArn is
+# topics) that applies a template to a certificate created over MQTT, once the
+# template's pre-provisioning hook allows it. provisioningRoleArn is
 # presence-checked but never resolved — MiniStack does
 # not validate IAM role ARNs elsewhere either. Template versions are not
 # modeled: a template always carries defaultVersionId 1. Wire shapes and
@@ -1929,6 +1931,76 @@ def _validate_provisioning_template_body(body) -> tuple | None:
     return None
 
 
+_PROVISIONING_HOOK_PAYLOAD_VERSION = "2020-04-01"
+_LAMBDA_FUNCTION_ARN_RE = re.compile(
+    r"^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:[A-Za-z0-9_-]+(:[A-Za-z0-9$_-]+)?$"
+)
+
+
+def _validate_provisioning_hook(hook, template_type: str, template_arn: str) -> tuple | None:
+    """The live service's checks of a ``preProvisioningHook``, the function's policy last."""
+    hook = hook if isinstance(hook, dict) else {}
+    version, target = hook.get("payloadVersion"), hook.get("targetArn")
+    if version is not None and not re.fullmatch(r"[0-9-]+", str(version)):
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'preProvisioningHook.payloadVersion' failed "
+            "to satisfy constraint: Member must satisfy regular expression pattern: ^[0-9-]+$",
+            400,
+        )
+    if template_type == "JITP":
+        return error_response_json(
+            "InvalidRequestException",
+            "Provisioning hook is not supported for template type: JITP",
+            400,
+        )
+    if not isinstance(target, str) or not _LAMBDA_FUNCTION_ARN_RE.match(target):
+        return error_response_json("InvalidRequestException", "Invalid arguments in the call", 400)
+    if version not in (None, _PROVISIONING_HOOK_PAYLOAD_VERSION):
+        return error_response_json(
+            "InvalidRequestException",
+            "The hook version cannot be supported by AWS Iot, the supported versions are: "
+            f"[{_PROVISIONING_HOOK_PAYLOAD_VERSION}]",
+            400,
+        )
+    if _provisioning_hook_function(target, template_arn) is None:
+        return error_response_json(
+            "InvalidRequestException", f"Access denied during lambda validation: {target}", 400
+        )
+    return None
+
+
+def _provisioning_hook(hook: dict) -> dict:
+    """A validated hook as the live service stores it, with its default payloadVersion."""
+    return {
+        "payloadVersion": hook.get("payloadVersion") or _PROVISIONING_HOOK_PAYLOAD_VERSION,
+        "targetArn": hook["targetArn"],
+    }
+
+
+def _provisioning_hook_function(target_arn: str, template_arn: str) -> dict | None:
+    """The hook function's execution record, if its policy lets iot.amazonaws.com invoke it for the template."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+    from ministack.services import lambda_svc
+
+    base, _config, _name = lambda_svc._get_base_func_record_for_ref(target_arn)
+    func, config, _name = lambda_svc._get_func_record_for_ref(target_arn)
+    if base is None or func is None or config is None:
+        return None
+    ctx = EvalContext(
+        principal_arn="*",
+        principal_type="Service",
+        principal_account="",
+        action="lambda:InvokeFunction",
+        resource_arn=target_arn,
+        region=get_region(),
+        service_context={"aws:sourcearn": template_arn, "aws:sourceaccount": get_account_id()},
+    )
+    if evaluate_resource_policy(base.get("policy"), ctx, service="iot.amazonaws.com").decision != "Allow":
+        return None
+    return lambda_svc._execution_record_for_config(func, config)
+
+
 def _provisioning_template_not_found(name: str) -> tuple:
     return error_response_json(
         "ResourceNotFoundException", f"Unable to find template named {name}", 404
@@ -1972,6 +2044,13 @@ def _create_provisioning_template(payload: dict) -> tuple:
            or _tags_error(payload.get("tags"), required=False))
     if err:
         return err
+    hook = payload.get("preProvisioningHook")
+    if hook:
+        err = _validate_provisioning_hook(
+            hook, payload.get("type", "FLEET_PROVISIONING"), _provisioning_template_arn(name)
+        )
+        if err:
+            return err
     if name in _provisioning_templates:
         return error_response_json(
             "ResourceAlreadyExistsException",
@@ -1994,8 +2073,8 @@ def _create_provisioning_template(payload: dict) -> tuple:
     # absent, not empty — so an unset one is not stored at all.
     if payload.get("description"):
         record["description"] = payload["description"]
-    if payload.get("preProvisioningHook"):
-        record["preProvisioningHook"] = payload["preProvisioningHook"]
+    if hook:
+        record["preProvisioningHook"] = _provisioning_hook(hook)
     _provisioning_templates[name] = record
     _set_created_tags(record["templateArn"], payload.get("tags"))
     logger.info("IoT provisioning template created: %s", name)
@@ -2042,6 +2121,11 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
             f"ProvisioningTemplate {name!r} has no version {version}",
             400,
         )
+    hook = None if payload.get("removePreProvisioningHook") else payload.get("preProvisioningHook")
+    if hook:
+        err = _validate_provisioning_hook(hook, t["type"], t["templateArn"])
+        if err:
+            return err
     if "description" in payload:
         # Same absent-not-empty rule as create: clearing removes the key.
         if payload["description"]:
@@ -2053,8 +2137,8 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
             t[field] = payload[field]
     if payload.get("removePreProvisioningHook"):
         t.pop("preProvisioningHook", None)
-    elif payload.get("preProvisioningHook"):
-        t["preProvisioningHook"] = payload["preProvisioningHook"]
+    elif hook:
+        t["preProvisioningHook"] = _provisioning_hook(hook)
     t["lastModifiedDate"] = _now_epoch()
     _provisioning_templates[name] = t
     # The live service answers 200 with an empty body — not an empty JSON
@@ -2145,9 +2229,9 @@ def _fleet_rejected(code: str, message: str, status: int = 400) -> tuple[str, di
 class _ProvisioningRejected(Exception):
     """A RegisterThing request the template cannot be applied to."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, status: int = 400):
         super().__init__(message)
-        self.reply = _fleet_rejected(code, message)
+        self.reply = _fleet_rejected(code, message, status)
 
 
 def _provisioning_failed(message: str) -> _ProvisioningRejected:
@@ -2160,13 +2244,14 @@ def _provisioning_failed(message: str) -> _ProvisioningRejected:
 
 
 async def _fleet_provisioning_reply(
-    account_id: str, region: str, operation: str, template_name: str | None, payload: bytes
+    account_id: str, region: str, operation: str, template_name: str | None, payload: bytes,
+    connection: dict,
 ) -> tuple[str, dict]:
     """The reply suffix (``accepted`` or ``rejected``) and document for one request."""
     if operation == "create":
         return await _fleet_create_keys_and_certificate(account_id, region)
     try:
-        return await _fleet_register_thing(account_id, region, template_name, payload)
+        return await _fleet_register_thing(account_id, region, template_name, payload, connection)
     except _ProvisioningRejected as e:
         return e.reply
 
@@ -2201,7 +2286,7 @@ async def _fleet_create_keys_and_certificate(account_id: str, region: str) -> tu
 
 
 async def _fleet_register_thing(
-    account_id: str, region: str, template_name: str, payload: bytes
+    account_id: str, region: str, template_name: str, payload: bytes, connection: dict
 ) -> tuple[str, dict]:
     """``RegisterThing``: apply the template to the certificate the ownership token stands for."""
     try:
@@ -2231,12 +2316,89 @@ async def _fleet_register_thing(
             )
         parameters = request.get("parameters")
         parameters = parameters if isinstance(parameters, dict) else {}
+        if template.get("preProvisioningHook"):
+            parameters = await _run_provisioning_hook(template, {
+                **connection,
+                "certificateId": cert["certificateId"],
+                "certificatePem": cert["certificatePem"],
+                "templateArn": template["templateArn"],
+                "parameters": parameters,
+            })
+            cert = _certificates.get(cert["certificateId"])
+            if cert is None:
+                return _fleet_rejected(
+                    "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+                )
         plan = _provisioning_plan(template, parameters, cert["certificateId"])
         thing_name = await _apply_provisioning_plan(plan, cert)
     reply = {"deviceConfiguration": plan["deviceConfiguration"]}
     if thing_name is not None:
         reply["thingName"] = thing_name
     return "accepted", reply
+
+
+# A hook that has not answered six seconds after it was invoked fails the request.
+_PROVISIONING_HOOK_SECONDS = 6
+_HOOK_INVALID_RESULT = ("InvalidResult", "Provisioning hook result is in an invalid format.")
+
+
+async def _run_provisioning_hook(template: dict, event: dict) -> dict:
+    """Invoke the template's pre-provisioning hook: the parameters with its overrides, or a rejection."""
+    from ministack.services import lambda_svc
+
+    exec_record = _provisioning_hook_function(
+        template["preProvisioningHook"]["targetArn"], template["templateArn"]
+    )
+    if exec_record is None:
+        raise _ProvisioningRejected("InvocationError", "Access denied while invoking Lambda function")
+    invocation = run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-iot-provisioning-hook",
+    )
+    try:
+        # Past the limit the function keeps running; only its answer is dropped.
+        result = await asyncio.wait_for(asyncio.shield(invocation), _PROVISIONING_HOOK_SECONDS)
+    except Exception:
+        result = None
+    if not isinstance(result, dict) or result.get("throttle"):
+        raise _ProvisioningRejected(
+            "InvocationError", "A failure occurred while invoking the provisioning hook."
+        )
+    if result.get("error"):
+        raise _ProvisioningRejected(
+            "InvocationError", "The provisioning hook was not executed successfully."
+        )
+    return {**event["parameters"], **_provisioning_hook_overrides(result)}
+
+
+def _provisioning_hook_overrides(result: dict) -> dict:
+    """The ``parameterOverrides`` of an answer that allows provisioning, or a rejection."""
+    answer = result.get("body")
+    if isinstance(answer, bytes) or (isinstance(answer, str) and result.get("raw_payload")):
+        try:
+            answer = json.loads(answer)
+        except ValueError:
+            raise _ProvisioningRejected(*_HOOK_INVALID_RESULT) from None
+    if answer is None:
+        raise _ProvisioningRejected("InvalidResult", "The provisioning hook did not return a response.")
+    answer = answer if isinstance(answer, dict) else {}
+    allow, overrides = answer.get("allowProvisioning"), answer.get("parameterOverrides")
+    # Read the way a Java boolean field reads JSON: "true", "TRUE" and 1 allow.
+    if isinstance(allow, str):
+        allow = {"true": True, "false": False}.get(allow.lower())
+    elif not isinstance(allow, (bool, int, float)):
+        allow = None
+    if allow is None or not isinstance(overrides, (dict, type(None))) or any(
+        isinstance(value, (dict, list)) for value in (overrides or {}).values()
+    ):
+        raise _ProvisioningRejected(*_HOOK_INVALID_RESULT)
+    if not allow:
+        raise _ProvisioningRejected("AccessDenied", "Access Denied", 403)
+    # Numbers and booleans become strings; null leaves the parameter unresolved.
+    return {
+        name: value if value is None or isinstance(value, str) else json.dumps(value)
+        for name, value in (overrides or {}).items()
+    }
 
 
 def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
@@ -2260,7 +2422,7 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         if len(value) == 1:
             function, argument = next(iter(value.items()))
             if function == "Ref":
-                if argument not in values:
+                if values.get(argument) is None:
                     raise _ProvisioningRejected(
                         "InvalidParameters", f"Cannot resolve reference value: {argument}"
                     )
@@ -9995,10 +10157,14 @@ class _WSSession:
         self, topic: str, operation: str, template_name: str | None, payload: bytes
     ) -> None:
         """Answer a fleet provisioning request on this connection only, if it subscribed to the reply."""
+        # What a pre-provisioning hook learns about the requester.
+        connection = {"clientId": self._client_id}
+        if self._principal != self.account_id:
+            connection["claimCertificateId"] = self._principal
         try:
             async with publishing_events():
                 kind, doc = await _fleet_provisioning_reply(
-                    self.account_id, self.region, operation, template_name, payload
+                    self.account_id, self.region, operation, template_name, payload, connection
                 )
         except Exception:
             _broker_logger.warning("IoT fleet provisioning failed for %r", topic, exc_info=True)
