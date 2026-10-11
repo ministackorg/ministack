@@ -6318,22 +6318,28 @@ def _appsync_api_delete(physical_id, props):
     _appsync._delete_graphql_api(physical_id)
 
 
+# The DataSource properties and the CreateDataSource members they become.
+_APPSYNC_DS_MEMBERS = {
+    "Description": "description", "ServiceRoleArn": "serviceRoleArn",
+    "DynamoDBConfig": "dynamodbConfig", "LambdaConfig": "lambdaConfig",
+    "ElasticsearchConfig": "elasticsearchConfig", "OpenSearchServiceConfig": "openSearchServiceConfig",
+    "HttpConfig": "httpConfig", "RelationalDatabaseConfig": "relationalDatabaseConfig",
+    "EventBridgeConfig": "eventBridgeConfig", "MetricsConfig": "metricsConfig",
+}
+
+
 def _appsync_ds_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     name = props.get("Name") or logical_id
-    ds_type = props.get("Type", "NONE")
-    body = {"name": name, "type": ds_type}
-    if props.get("DynamoDBConfig"):
-        body["dynamodbConfig"] = props["DynamoDBConfig"]
-    if props.get("LambdaConfig"):
-        body["lambdaConfig"] = props["LambdaConfig"]
-    if props.get("ServiceRoleArn"):
-        body["serviceRoleArn"] = props["ServiceRoleArn"]
-    _appsync._data_sources.setdefault(api_id, {})[name] = {
-        "name": name, "type": ds_type, **body,
-        "dataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}",
-    }
-    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}"}
+    body = {"name": name, "type": props.get("Type", "NONE")}
+    for prop, member in _APPSYNC_DS_MEMBERS.items():
+        if props.get(prop) not in (None, ""):
+            body[member] = _pascal_to_camel(props[prop])
+    resp = _appsync._create_data_source(api_id, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DataSource create failed: {resp[2]!r}")
+    arn = _appsync._data_sources[api_id][name]["dataSourceArn"]
+    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": arn}
 
 
 def _appsync_ds_delete(physical_id, props):
@@ -6376,22 +6382,29 @@ def _appsync_function_delete(physical_id, props):
     pass
 
 
+# The Resolver properties that become CreateResolver members.
+_APPSYNC_RESOLVER_MEMBERS = (
+    "DataSourceName", "RequestMappingTemplate", "ResponseMappingTemplate", "Kind",
+    "PipelineConfig", "CachingConfig", "SyncConfig", "MaxBatchSize", "Runtime", "Code",
+    "MetricsConfig",
+)
+
+
 def _appsync_resolver_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     type_name = props.get("TypeName", "Query")
     field_name = props.get("FieldName", logical_id)
-    ds_name = props.get("DataSourceName", "")
-    resolver = {
-        "typeName": type_name, "fieldName": field_name,
-        "dataSourceName": ds_name,
-        "resolverArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
-    }
-    if props.get("RequestMappingTemplate"):
-        resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
-    if props.get("ResponseMappingTemplate"):
-        resolver["responseMappingTemplate"] = props["ResponseMappingTemplate"]
-    _appsync._resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = resolver
-    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": resolver["resolverArn"]}
+    body = {"fieldName": field_name}
+    for prop in _APPSYNC_RESOLVER_MEMBERS:
+        if props.get(prop) not in (None, ""):
+            body[prop[:1].lower() + prop[1:]] = _pascal_to_camel(props[prop])
+    if "maxBatchSize" in body:
+        body["maxBatchSize"] = int(body["maxBatchSize"])
+    resp = _appsync._create_resolver(api_id, type_name, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::Resolver create failed: {resp[2]!r}")
+    arn = _appsync._resolvers[api_id][type_name][field_name]["resolverArn"]
+    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": arn}
 
 
 def _appsync_resolver_delete(physical_id, props):
@@ -14181,6 +14194,9 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DocDB::DBClusterParameterGroup": ("Description", "Family", "Name"),
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
+    "AWS::AppSync::DataSource": ("ApiId", "Name"),
+    "AWS::AppSync::Resolver": ("ApiId", "TypeName", "FieldName"),
+    "AWS::AppSync::GraphQLSchema": ("ApiId",),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
