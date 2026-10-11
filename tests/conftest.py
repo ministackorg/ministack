@@ -812,6 +812,11 @@ def budgets():
 
 
 @pytest.fixture(scope="session")
+def kinesisanalyticsv2():
+    return make_client("kinesisanalyticsv2")
+
+
+@pytest.fixture(scope="session")
 def inspector2():
     return make_client("inspector2")
 

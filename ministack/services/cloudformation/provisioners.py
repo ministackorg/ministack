@@ -45,6 +45,7 @@ import ministack.services.glue as _glue
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
+import ministack.services.kinesisanalyticsv2 as _kda
 import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
 import ministack.services.opensearch as _opensearch
@@ -1139,6 +1140,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::IAM::User": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
+    "AWS::KinesisAnalyticsV2::Application": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
     "AWS::Location::Tracker": ("Tags", "list"),
     "AWS::Logs::LogGroup": ("Tags", "list"),
@@ -3379,6 +3381,111 @@ def _cwlogs_import(identifier):
 def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
 
+
+# --- Managed Service for Apache Flink (kinesisanalyticsv2) ---
+
+def _kda_call(fn, data, resource_type):
+    """Run a kinesisanalyticsv2 operation and raise its error message."""
+    status, _, body = fn(data)
+    payload = json.loads(body) if body else {}
+    if status >= 400:
+        raise ValueError(f"{resource_type}: {payload.get('message') or payload.get('Message') or payload}")
+    return payload
+
+
+def _kda_application_create(logical_id, props, stack_name):
+    name = props.get("ApplicationName") or _physical_name(stack_name, logical_id)
+    data = {key: props[key] for key in (
+        "RuntimeEnvironment", "ServiceExecutionRole", "ApplicationConfiguration",
+        "ApplicationDescription", "ApplicationMode", "Tags") if props.get(key) is not None}
+    data["ApplicationName"] = name
+    _kda_call(_kda.create_application, data, "AWS::KinesisAnalyticsV2::Application")
+    if props.get("RunConfiguration"):
+        # Stored for the next StartApplication; CloudFormation does not start the application.
+        _kda._applications[name]["_RunConfiguration"] = copy.deepcopy(props["RunConfiguration"])
+    # Ref returns the application name (aws-resource-kinesisanalyticsv2-application).
+    return name, {}
+
+
+def _kda_application_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """ApplicationName replaces; the rest updates in place."""
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ApplicationName") or physical_id,
+        physical_id if physical_id in _kda._applications else None,
+        _kda_application_create, _kda_application_delete,
+    )
+    if replaced is not None:
+        return replaced
+    _kda.replace_from_template(physical_id, new_props)
+    arn = _kda._applications[physical_id]["ApplicationARN"]
+    tags = _tag_map(new_props.get("Tags"))
+    if tags:
+        _kda._tags[arn] = tags
+    else:
+        _kda._tags.pop(arn, None)
+    return physical_id, {}
+
+
+def _kda_application_delete(physical_id, props):
+    if physical_id in _kda._applications:
+        _kda_call(lambda data: _kda.delete_application(data, check_timestamp=False),
+                  {"ApplicationName": physical_id}, "AWS::KinesisAnalyticsV2::Application")
+
+
+def _kda_logging_option_create(logical_id, props, stack_name):
+    option = props.get("CloudWatchLoggingOption") or {}
+    payload = _kda_call(_kda.add_logging_option, {
+        "ApplicationName": props.get("ApplicationName"), "CloudWatchLoggingOption": option,
+    }, "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption")
+    option_id = next(o["CloudWatchLoggingOptionId"] for o in payload["CloudWatchLoggingOptionDescriptions"]
+                     if o["LogStreamARN"] == option.get("LogStreamARN"))
+    # The physical id is the logging option id the service assigns.
+    return option_id, {}
+
+
+def _kda_logging_option_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Both properties are create-only, so any change replaces the option."""
+    if old_props == new_props:
+        return physical_id, {}
+    _kda_logging_option_delete(physical_id, old_props)
+    return _kda_logging_option_create(logical_id or physical_id, new_props, stack_name)
+
+
+def _kda_logging_option_delete(physical_id, props):
+    name = props.get("ApplicationName")
+    if name in _kda._applications:
+        _kda.delete_logging_option({"ApplicationName": name, "CloudWatchLoggingOptionId": physical_id})
+
+
+# --- CloudWatch Logs LogStream ---
+
+def _cwlogs_stream_create(logical_id, props, stack_name):
+    group = props.get("LogGroupName")
+    if not group:
+        raise ValueError("AWS::Logs::LogStream requires LogGroupName")
+    name = props.get("LogStreamName") or _physical_name(stack_name, logical_id, max_len=512)
+    status, _, body = _cw_logs._create_log_stream({"logGroupName": group, "logStreamName": name})
+    if status >= 400:
+        raise ValueError(f"AWS::Logs::LogStream: {json.loads(body).get('message')}")
+    # Ref returns the log stream name (aws-resource-logs-logstream).
+    return name, {}
+
+
+def _cwlogs_stream_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """LogGroupName and LogStreamName are create-only: a change replaces the stream."""
+    if (old_props.get("LogGroupName") == new_props.get("LogGroupName")
+            and (new_props.get("LogStreamName") or physical_id) == physical_id):
+        return physical_id, {}
+    created = _cwlogs_stream_create(logical_id or physical_id, new_props, stack_name)
+    _delete_predecessor(_cwlogs_stream_delete, physical_id, old_props)
+    return created
+
+
+def _cwlogs_stream_delete(physical_id, props):
+    group = _cw_logs._log_groups.get(props.get("LogGroupName"))
+    if group:
+        group["streams"].pop(physical_id, None)
 
 # --- CloudWatch Logs ResourcePolicy ---
 
@@ -14483,6 +14590,24 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cwlogs_delete,
         "import": _cwlogs_import,
+    },
+    "AWS::Logs::LogStream": {
+        "create": _cwlogs_stream_create,
+        "update": _cwlogs_stream_update,
+        "update_with_logical_id": True,
+        "delete": _cwlogs_stream_delete,
+    },
+    "AWS::KinesisAnalyticsV2::Application": {
+        "create": _kda_application_create,
+        "update": _kda_application_update,
+        "update_with_logical_id": True,
+        "delete": _kda_application_delete,
+    },
+    "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption": {
+        "create": _kda_logging_option_create,
+        "update": _kda_logging_option_update,
+        "update_with_logical_id": True,
+        "delete": _kda_logging_option_delete,
     },
     "AWS::Logs::ResourcePolicy": {
         "create": _cwlogs_resource_policy_create,
