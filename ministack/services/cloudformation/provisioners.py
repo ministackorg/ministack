@@ -685,6 +685,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "Identifier",
         "requires_replacement": _requires_replacement_cognito_resource_server,
     },
+    # Domain is required, so a pool move under the same Domain fails on the
+    # name, as the replacement's CreateUserPoolDomain does.
+    "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -7129,25 +7132,50 @@ def _cognito_identity_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolDomain ---
 
+def _cognito_user_pool_domain_request(props):
+    """The CreateUserPoolDomain / UpdateUserPoolDomain request a template declares."""
+    request = {"UserPoolId": props.get("UserPoolId", ""), "Domain": props.get("Domain", "")}
+    for key in ("CustomDomainConfig", "Routing"):
+        if key in props:
+            request[key] = props[key]
+    if "ManagedLoginVersion" in props:
+        request["ManagedLoginVersion"] = int(props["ManagedLoginVersion"])
+    return request
+
+
+def _cognito_user_pool_domain_attributes(domain):
+    _, _, body = _cognito._describe_user_pool_domain({"Domain": domain})
+    description = json.loads(body)["DomainDescription"]
+    return {"CloudFrontDistribution": description.get("CloudFrontDistribution", "")}
+
+
 def _cognito_user_pool_domain_create(logical_id, props, stack_name):
     pid = props.get("UserPoolId", "")
     domain = props.get("Domain", "")
     pool = _cognito._user_pools.get(pid)
     if not pool:
         raise ValueError(f"UserPool {pid} not found for UserPoolDomain")
-    pool["Domain"] = domain
-    _cognito._pool_domain_map[domain] = pid
-    phys_id = f"{pid}-domain-{domain}"
-    return phys_id, {}
+    status, _, body = _cognito._create_user_pool_domain(_cognito_user_pool_domain_request(props))
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain create failed: {body!r}")
+    # Ref returns the domain name.
+    return domain, _cognito_user_pool_domain_attributes(domain)
+
+
+def _cognito_user_pool_domain_update(physical_id, old_props, new_props, stack_name):
+    """Apply CustomDomainConfig and ManagedLoginVersion through UpdateUserPoolDomain, which refuses Routing."""
+    request = _cognito_user_pool_domain_request(new_props)
+    status, _, body = _cognito._update_user_pool_domain(request)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain update failed: {body!r}")
+    return physical_id, _cognito_user_pool_domain_attributes(request["Domain"])
 
 
 def _cognito_user_pool_domain_delete(physical_id, props):
     domain = props.get("Domain", "")
-    pid = _cognito._pool_domain_map.pop(domain, None)
-    if pid:
-        pool = _cognito._user_pools.get(pid)
-        if pool:
-            pool["Domain"] = None
+    pid = props.get("UserPoolId", "")
+    if _cognito._pool_domain_map.get(domain) == pid:
+        _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
 # ===========================================================================
@@ -14183,6 +14211,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -14760,7 +14789,11 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
         "import": _cognito_identity_pool_import,
     },
-    "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolDomain": {
+        "create": _cognito_user_pool_domain_create,
+        "update": _cognito_user_pool_domain_update,
+        "delete": _cognito_user_pool_domain_delete,
+    },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
         "update": _ecr_repo_update,

@@ -23094,6 +23094,175 @@ def test_cfn_cognito_resource_server_move_under_custom_name_fails_loudly(cfn, co
             cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
+def _cfn_user_pool_domain_template(pool_id, domain, version=None, fail=False, **props):
+    props = {"UserPoolId": pool_id, "Domain": domain, **props}
+    if version is not None:
+        props["ManagedLoginVersion"] = version
+    body = json.dumps({
+        "Resources": {"Dom": {"Type": "AWS::Cognito::UserPoolDomain", "Properties": props}},
+        "Outputs": {"DomRef": {"Value": {"Ref": "Dom"}}},
+    })
+    return _cfn_with_failing_resource(body, "Dom") if fail else body
+
+
+def _cfn_user_pool_domain(cognito_idp, domain):
+    return cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+
+
+def test_cfn_cognito_user_pool_domain_update_in_place(cfn, cognito_idp):
+    """ManagedLoginVersion changes in place, survives a rollback and stays when the template drops it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-dom-upd-{uid}"
+    domain = f"cfn-dom-upd-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-dom-upd-{uid}")["UserPool"]["Id"]
+
+    def update(template, status="UPDATE_COMPLETE"):
+        cfn.update_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == status, stack.get("StackStatusReason")
+        assert _output(stack, "DomRef") == domain
+        return _cfn_user_pool_domain(cognito_idp, domain)["ManagedLoginVersion"]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_user_pool_domain_template(pool_id, domain))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DomRef") == domain
+        assert _cfn_user_pool_domain(cognito_idp, domain)["ManagedLoginVersion"] == 1
+
+        assert update(_cfn_user_pool_domain_template(pool_id, domain, 2)) == 2
+        assert update(_cfn_user_pool_domain_template(pool_id, domain, 1, fail=True),
+                      "UPDATE_ROLLBACK_COMPLETE") == 2
+        assert update(_cfn_user_pool_domain_template(pool_id, domain)) == 2
+        assert update(_cfn_user_pool_domain_template(pool_id, domain, 1)) == 1
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["Domain"] == domain
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert _cfn_user_pool_domain(cognito_idp, domain) == {}
+        assert not cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"].get("Domain")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_user_pool_domain_custom_domain_certificate_update(cfn, cognito_idp):
+    """CustomDomainConfig makes a custom domain whose certificate changes in place; GetAtt is its CloudFront target."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-dom-cert-{uid}"
+    domain = f"auth.{uid}.example.com"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-dom-cert-{uid}")["UserPool"]["Id"]
+    cert = "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-{}"
+
+    def template(serial):
+        body = json.loads(_cfn_user_pool_domain_template(
+            pool_id, domain, CustomDomainConfig={"CertificateArn": cert.format(serial)}))
+        body["Outputs"]["CloudFront"] = {"Value": {"Fn::GetAtt": ["Dom", "CloudFrontDistribution"]}}
+        return json.dumps(body)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("555555555555"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cloudfront = _output(stack, "CloudFront")
+        assert cloudfront.endswith(".cloudfront.net")
+        described = _cfn_user_pool_domain(cognito_idp, domain)
+        assert described["CloudFrontDistribution"] == cloudfront
+        assert described["CustomDomainConfig"] == {"CertificateArn": cert.format("555555555555")}
+        pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        assert pool.get("CustomDomain") == domain
+        assert not pool.get("Domain")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("666666666666"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DomRef") == domain
+        assert _output(stack, "CloudFront") == cloudfront
+        assert _cfn_user_pool_domain(cognito_idp, domain)["CustomDomainConfig"] == {
+            "CertificateArn": cert.format("666666666666")}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("pool", "Domain already exists"),
+    ("domain", "User pool already has a domain configured."),
+], ids=["pool-move-same-domain", "rename-same-pool"])
+def test_cfn_cognito_user_pool_domain_replacement_refused(cfn, cognito_idp, change, reason):
+    """A replacement's create fails on the kept Domain or on the pool's prefix domain, and the stack rolls back."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-dom-refuse-{uid}"
+    domain = f"cfn-dom-refuse-{uid}"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-dom-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-dom-b-{uid}")["UserPool"]["Id"]
+    changed = {"pool": (pool_b, domain), "domain": (pool_a, f"{domain}-new")}[change]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_user_pool_domain_template(pool_a, domain, 2))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_user_pool_domain_template(*changed, 2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert reason in _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "DomRef") == domain
+
+        kept = _cfn_user_pool_domain(cognito_idp, domain)
+        assert kept["UserPoolId"] == pool_a
+        assert kept["ManagedLoginVersion"] == 2
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_a)["UserPool"]["Domain"] == domain
+        assert not cognito_idp.describe_user_pool(UserPoolId=pool_b)["UserPool"].get("Domain")
+        assert _cfn_user_pool_domain(cognito_idp, f"{domain}-new") == {}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["replaced", "rolled-back"])
+def test_cfn_cognito_user_pool_domain_move_and_rename_replaces(cfn, cognito_idp, fail):
+    """A new Domain in another pool replaces the domain; a rollback keeps the old one and deletes the new one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-dom-move-{uid}"
+    old, new = f"cfn-dom-move-{uid}", f"cfn-dom-move-{uid}-new"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-dom-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-dom-b-{uid}")["UserPool"]["Id"]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_user_pool_domain_template(pool_a, old))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_user_pool_domain_template(pool_b, new, 2, fail=fail))
+        stack = _wait_stack(cfn, stack_name)
+        pools = {pool_a: cognito_idp.describe_user_pool(UserPoolId=pool_a)["UserPool"].get("Domain"),
+                 pool_b: cognito_idp.describe_user_pool(UserPoolId=pool_b)["UserPool"].get("Domain")}
+        if fail:
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            assert _output(stack, "DomRef") == old
+            assert _cfn_user_pool_domain(cognito_idp, old)["UserPoolId"] == pool_a
+            assert _cfn_user_pool_domain(cognito_idp, new) == {}
+            assert pools == {pool_a: old, pool_b: None}
+        else:
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _output(stack, "DomRef") == new
+            created = _cfn_user_pool_domain(cognito_idp, new)
+            assert (created["UserPoolId"], created["ManagedLoginVersion"]) == (pool_b, 2)
+            assert _cfn_user_pool_domain(cognito_idp, old) == {}
+            assert pools == {pool_a: None, pool_b: new}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 def test_cfn_secret_update_publishes_a_new_version(cfn, sm):
     """A changed SecretString publishes a new AWSCURRENT version of the same
     secret: same ARN, the first value still there as AWSPREVIOUS, and the
@@ -29153,6 +29322,22 @@ def test_cognito_change_set_reports_mfa_configuration_in_place(cfn, stack):
     change = _change(cfn, stack(old), new)
     assert _requirements(change) == {"MfaConfiguration": "Never"}
     assert change["Replacement"] == "False"
+
+
+@pytest.mark.parametrize("prop,value,recreation,replacement", [
+    ("ManagedLoginVersion", 2, "Never", "False"),
+    ("Domain", None, "Always", "True"),
+])
+def test_cognito_change_set_reports_user_pool_domain_replacement(cfn, cognito_idp, stack, prop, value,
+                                                                 recreation, replacement):
+    name = f"repl-{_uuid_mod.uuid4().hex[:10]}"
+    pool_id = cognito_idp.create_user_pool(PoolName=name)["UserPool"]["Id"]
+    props = {"UserPoolId": pool_id, "Domain": name}
+    old = _template("AWS::Cognito::UserPoolDomain", props)
+    new = _template("AWS::Cognito::UserPoolDomain", {**props, prop: value or name + "-new"})
+    change = _change(cfn, stack(old), new)
+    assert _requirements(change) == {prop: recreation}
+    assert change["Replacement"] == replacement
 
 
 _PASS = json.dumps({"StartAt": "A", "States": {"A": {"Type": "Pass", "End": True}}})

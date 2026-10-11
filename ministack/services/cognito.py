@@ -25,6 +25,7 @@ User Pools operations:
   AdminResetUserPassword, AdminUserGlobalSignOut,
   GlobalSignOut, RevokeToken,
   CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain,
+  UpdateUserPoolDomain,
   CreateIdentityProvider, DescribeIdentityProvider, UpdateIdentityProvider,
   DeleteIdentityProvider, ListIdentityProviders, GetIdentityProviderByIdentifier,
   AdminLinkProviderForUser, AdminDisableProviderForUser,
@@ -2513,6 +2514,7 @@ async def _dispatch_idp(action: str, data: dict):
         "CreateUserPoolDomain": _create_user_pool_domain,
         "DeleteUserPoolDomain": _delete_user_pool_domain,
         "DescribeUserPoolDomain": _describe_user_pool_domain,
+        "UpdateUserPoolDomain": _update_user_pool_domain,
         # Identity Providers
         "CreateIdentityProvider": _create_identity_provider,
         "DescribeIdentityProvider": _describe_identity_provider,
@@ -4968,6 +4970,11 @@ def _cloudfront_domain(domain: str) -> str:
     return f"d{hashlib.sha256(domain.encode()).hexdigest()[:13]}.cloudfront.net"
 
 
+def _managed_login_version(requested, current):
+    """The domain's managed login version: a value other than 1 or 2 keeps the current one."""
+    return requested if requested in (1, 2) else current
+
+
 def _create_user_pool_domain(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -4983,6 +4990,9 @@ def _create_user_pool_domain(data):
     # expands to {prefix}.auth.{region}.amazoncognito.com. A pool may hold one of
     # each, so they are stored in separate fields.
     custom_config = data.get("CustomDomainConfig")
+    if custom_config is None and pool.get("Domain"):
+        return error_response_json(
+            "InvalidParameterException", "User pool already has a domain configured.", 400)
     if custom_config is not None:
         if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
             return error_response_json(
@@ -4997,7 +5007,59 @@ def _create_user_pool_domain(data):
         # CNAME to, so AWS returns a null CloudFrontDomain for it — omit it.
         cloudfront = None
     _pool_domain_map[domain] = pid
-    return json_response({"CloudFrontDomain": cloudfront} if cloudfront else {})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), 1)
+    pool.setdefault("_managed_login_versions", {})[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if cloudfront:
+        resp["CloudFrontDomain"] = cloudfront
+    return json_response(resp)
+
+
+def _update_user_pool_domain(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    domain = data.get("Domain")
+    owner = _pool_domain_map.get(domain)
+    if owner is None:
+        return error_response_json("ResourceNotFoundException", "User pool domain was not found.", 400)
+    if owner != pid:
+        return error_response_json(
+            "InvalidParameterException", "The domain is not configured for this user pool.", 400)
+    is_custom = pool.get("CustomDomain") == domain
+    custom_config = data.get("CustomDomainConfig")
+    if custom_config is not None:
+        if not is_custom:
+            return error_response_json(
+                "InvalidParameterException", "Cannot convert prefix domain to custom domain.", 400)
+        if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
+            return error_response_json(
+                "InvalidParameterException",
+                "CustomDomainConfig must specify a CertificateArn.", 400)
+    versions = pool.setdefault("_managed_login_versions", {})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), versions.get(domain, 1))
+    routing = data.get("Routing")
+    if routing:
+        if version != 2:
+            return error_response_json(
+                "InvalidParameterException", "Routing field is not supported for Hosted UI (classic)", 400)
+        # Failover routes to a replica region, and no user pool here has one.
+        region = (routing.get("Failover") or {}).get("SecondaryRegion")
+        if region == _pool_region(pid):
+            return error_response_json(
+                "InvalidParameterException",
+                "Routing field can only be configured when replica status is one of: "
+                "ACTIVE, CREATING, INACTIVE. Current status: null", 400)
+        return error_response_json(
+            "InvalidParameterException", f"Region {region} is not active for the user pool", 400)
+    versions[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if is_custom:
+        if custom_config is not None:
+            pool["_custom_domain_config"] = custom_config
+        resp["CloudFrontDomain"] = _cloudfront_domain(domain)
+    return json_response(resp)
 
 
 def _delete_user_pool_domain(data):
@@ -5007,6 +5069,7 @@ def _delete_user_pool_domain(data):
         return err
     domain = data.get("Domain")
     _pool_domain_map.pop(domain, None)
+    pool.get("_managed_login_versions", {}).pop(domain, None)
     if domain and pool.get("CustomDomain") == domain:
         pool["CustomDomain"] = None
         pool.pop("_custom_domain_config", None)
@@ -5035,6 +5098,7 @@ def _describe_user_pool_domain(data):
             "Version": "1",
             "Status": "ACTIVE",
             "CustomDomainConfig": pool.get("_custom_domain_config", {}) if is_custom else {},
+            "ManagedLoginVersion": pool.get("_managed_login_versions", {}).get(domain, 1),
         }
     })
 
