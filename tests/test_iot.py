@@ -7923,6 +7923,63 @@ def test_iot_job_cancel_events():
     assert "forceCanceled" not in events[10][1]
 
 
+def test_iot_job_abort_events():
+    async def calls(call):
+        from ministack.services import iot as iot_module
+
+        for thing in ("ev-t1", "ev-t2", "ev-t3"):
+            await call("POST", f"/things/{thing}")
+        failed = {"failureType": "FAILED", "action": "CANCEL",
+                  "thresholdPercentage": 50.0, "minNumberOfExecutedThings": 2}
+        await _create_job(call, "ev-abort", ["ev-t1", "ev-t2", "ev-t3"],
+                          abortConfig={"criteriaList": [failed]})
+        await call("POST", "/things/ev-t1/jobs/ev-abort", {"status": "SUCCEEDED"}, device=True)
+        await iot_module.broker_publish(
+            _EVENTS_ACCOUNT, _TEST_REGION, "$aws/things/ev-t2/jobs/ev-abort/update",
+            json.dumps({"status": "FAILED"}).encode(),
+        )
+        timed_out = {**failed, "failureType": "TIMED_OUT", "minNumberOfExecutedThings": 1}
+        await _create_job(call, "ev-timeout", ["ev-t1", "ev-t2"],
+                          abortConfig={"criteriaList": [timed_out]},
+                          timeoutConfig={"inProgressTimeoutInMinutes": 1})
+        await call("POST", "/things/ev-t1/jobs/ev-timeout", {"status": "IN_PROGRESS"}, device=True)
+        iot_module._job_executions[("ev-t1", "ev-timeout")]["startedAt"] -= 61_000
+        await call("GET", "/things/ev-t1/jobs/ev-timeout", device=True)
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    assert [t for t, _e in events] == [
+        "$aws/events/jobExecution/ev-abort/succeeded",
+        "$aws/events/jobExecution/ev-abort/failed",
+        "$aws/events/job/ev-abort/cancellation_in_progress",
+        "$aws/events/jobExecution/ev-abort/canceled",
+        "$aws/events/job/ev-abort/canceled",
+        "$aws/events/jobExecution/ev-timeout/timed_out",
+        "$aws/events/job/ev-timeout/cancellation_in_progress",
+        "$aws/events/jobExecution/ev-timeout/canceled",
+        "$aws/events/job/ev-timeout/canceled",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    abort = {
+        "eventType": "JOB", "jobId": "ev-abort", "targetSelection": "SNAPSHOT",
+        "targets": [f"{_JOB_ARN}:thing/ev-t1", f"{_JOB_ARN}:thing/ev-t2", f"{_JOB_ARN}:thing/ev-t3"],
+        "forceCanceled": False, "reasonCode": "ABORT_CANCEL",
+        "comment": "Abort criteria for failure type FAILED with threshold 50.00% met. "
+                   "Total completed executions: 2, total FAILED executions: 1",
+    }
+    assert events[2][1] == {**abort, "operation": "cancellation_in_progress",
+                            "status": "CANCELLATION_IN_PROGRESS"}
+    assert events[3][1]["thingArn"] == f"{_JOB_ARN}:thing/ev-t3"
+    assert events[4][1] == {**abort, "operation": "canceled", "status": "CANCELED",
+                            "jobProcessDetails": _job_counts(Canceled=1, Failed=1, Succeeded=1)}
+    assert events[8][1]["comment"] == (
+        "Abort criteria for failure type TIMED_OUT with threshold 50.00% met. "
+        "Total completed executions: 1, total TIMED_OUT executions: 1"
+    )
+    assert events[8][1]["jobProcessDetails"] == _job_counts(Canceled=1, TimedOut=1)
+
+
 def test_iot_job_removed_timed_out_and_deleted_events():
     async def calls(call):
         from ministack.services import iot as iot_module

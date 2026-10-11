@@ -253,4 +253,5 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         await _iot_module.jobs_notify_thing(
             get_account_id(), get_region(), thing, prev_next
         )
+        await _iot_module.jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response(response)

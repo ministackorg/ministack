@@ -790,6 +790,272 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
         _cleanup(iot_client, jobs=[job_id], things=[first, second])
 
 
+def _abort_config(*criteria):
+    return {"criteriaList": [
+        {"failureType": failure_type, "action": "CANCEL",
+         "thresholdPercentage": threshold, "minNumberOfExecutedThings": minimum}
+        for failure_type, threshold, minimum in criteria
+    ]}
+
+
+def _abort_comment(failure_type, threshold, completed, failed):
+    return (
+        f"Abort criteria for failure type {failure_type} with threshold {threshold} met. "
+        f"Total completed executions: {completed}, total {failure_type} executions: {failed}"
+    )
+
+
+def test_iot_jobs_abort_config_cancels_the_job_and_its_queued_executions(
+    iot_client, iot_jobs_data
+):
+    """FAILED 30 % after 2: the second FAILED cancels the job and its QUEUED executions; IN_PROGRESS runs on."""
+    things = [_unique("jobs-thing") for _ in range(5)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 30, 2)))
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[0], status="IN_PROGRESS")
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[1], status="FAILED")
+        assert iot_client.describe_job(jobId=job_id)["job"]["status"] == "IN_PROGRESS"
+
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[2], status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["reasonCode"] == "ABORT_CANCEL"
+        assert job["comment"] == _abort_comment("FAILED", "30.00%", 2, 2)
+        assert job["forceCanceled"] is False
+        assert [
+            iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]["status"]
+            for thing in things
+        ] == ["IN_PROGRESS", "FAILED", "FAILED", "CANCELED", "CANCELED"]
+
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[0], status="SUCCEEDED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["jobProcessDetails"]["numberOfSucceededThings"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+@pytest.mark.parametrize("criteria, reports, comment", [
+    # A SUCCEEDED counts as completed, and its report runs the check.
+    ([("FAILED", 50, 3)], ["FAILED", "FAILED", "SUCCEEDED"], ("FAILED", "50.00%", 3, 2)),
+    # The threshold is a minimum.
+    ([("FAILED", 50, 2)], ["SUCCEEDED", "FAILED"], ("FAILED", "50.00%", 2, 1)),
+    # REJECTED counts REJECTED executions only.
+    ([("REJECTED", 33.33, 2)], ["FAILED", "SUCCEEDED", "REJECTED"], ("REJECTED", "33.33%", 3, 1)),
+    # ALL counts FAILED and REJECTED alike.
+    ([("ALL", 60, 3)], ["FAILED", "REJECTED", "SUCCEEDED"], ("ALL", "60.00%", 3, 2)),
+    # Of two criteria met at once, the first in the list cancels.
+    ([("ALL", 40, 1), ("FAILED", 50, 1)], ["FAILED"], ("ALL", "40.00%", 1, 1)),
+    ([("FAILED", 50, 1), ("ALL", 40, 1)], ["FAILED"], ("FAILED", "50.00%", 1, 1)),
+    # A canceled execution counts as completed, and CancelJobExecution runs the check.
+    ([("FAILED", 40, 2)], ["FAILED", "CANCEL"], ("FAILED", "40.00%", 2, 1)),
+])
+def test_iot_jobs_abort_config_counts_completed_executions(
+    iot_client, iot_jobs_data, criteria, reports, comment
+):
+    """Each report completes one more of four executions; only the last one meets a criterion."""
+    things = [_unique("jobs-thing") for _ in range(4)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(*criteria))
+        for thing, report in zip(things, reports):
+            assert iot_client.describe_job(jobId=job_id)["job"]["status"] == "IN_PROGRESS"
+            if report == "CANCEL":
+                iot_client.cancel_job_execution(jobId=job_id, thingName=thing)
+            else:
+                iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status=report)
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment(*comment)
+        execution = iot_client.describe_job_execution(jobId=job_id, thingName=things[-1])
+        assert execution["execution"]["status"] == "CANCELED"
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+def test_iot_jobs_abort_config_counts_removed_executions(iot_client, iot_jobs_data):
+    """A thing leaving a CONTINUOUS job's group completes its execution as REMOVED."""
+    things = [_unique("jobs-thing") for _ in range(3)]
+    group = _unique("jobs-group")
+    job_id = _unique("job")
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)["thingGroupArn"]
+        for thing in things:
+            _create_thing(iot_client, thing)
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        iot_client.create_job(jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+                              targetSelection="CONTINUOUS",
+                              abortConfig=_abort_config(("FAILED", 40, 2)))
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=things[0])
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[1], status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment("FAILED", "40.00%", 2, 1)
+        assert job["jobProcessDetails"]["numberOfRemovedThings"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things, groups=[group])
+
+
+def test_iot_jobs_abort_config_last_execution_completes_the_job(iot_client, iot_jobs_data):
+    """A report that finishes the job's last open execution completes the job, whatever the criteria."""
+    things = [_unique("jobs-thing") for _ in range(2)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 50, 2)))
+        for thing in things:
+            iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "COMPLETED"
+        assert "reasonCode" not in job
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+def test_iot_jobs_abort_config_ignores_deleted_executions(iot_client, iot_jobs_data):
+    """A deleted execution no longer counts, and DeleteJobExecution runs the check."""
+    things = [_unique("jobs-thing") for _ in range(4)]
+    kept, deleted = _unique("job"), _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=kept, targets=arns[:3], document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 50, 2)))
+        iot_jobs_data.update_job_execution(jobId=kept, thingName=things[0], status="FAILED")
+        iot_client.delete_job_execution(jobId=kept, thingName=things[0], executionNumber=1)
+        iot_jobs_data.update_job_execution(jobId=kept, thingName=things[1], status="SUCCEEDED")
+        assert iot_client.describe_job(jobId=kept)["job"]["status"] == "IN_PROGRESS"
+
+        iot_client.create_job(jobId=deleted, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 40, 2)))
+        for thing, status in zip(things, ["SUCCEEDED", "SUCCEEDED", "FAILED"]):
+            iot_jobs_data.update_job_execution(jobId=deleted, thingName=thing, status=status)
+        assert iot_client.describe_job(jobId=deleted)["job"]["status"] == "IN_PROGRESS"
+        iot_client.delete_job_execution(jobId=deleted, thingName=things[0], executionNumber=1)
+        job = iot_client.describe_job(jobId=deleted)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment("FAILED", "40.00%", 2, 1)
+        execution = iot_client.describe_job_execution(jobId=deleted, thingName=things[3])
+        assert execution["execution"]["status"] == "CANCELED"
+    finally:
+        _cleanup(iot_client, jobs=[kept, deleted], things=things)
+
+
+_TIMEOUT_0 = "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 0."
+
+
+def test_iot_jobs_abort_config_rejects_what_aws_rejects(iot_client):
+    """CreateJob, CreateJobTemplate and UpdateJob refuse the same abortConfig values."""
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    thing = _unique("jobs-thing")
+    job_id, other = _unique("job"), _unique("job")
+    template_id = _unique("tmpl")
+
+    def criterion(failure_type="FAILED", threshold=50, **over):
+        return {"failureType": failure_type, "action": "CANCEL",
+                "thresholdPercentage": threshold, "minNumberOfExecutedThings": 1, **over}
+
+    def without(member):
+        return {"criteriaList": [{k: v for k, v in criterion().items() if k != member}]}
+
+    def constraint(value, member, rule):
+        shown = "null" if value is None else f"'{value}'"
+        return (f"1 validation error detected: Value {shown} at "
+                f"'abortConfig.criteriaList{member}' failed to satisfy constraint: Member must {rule}")
+
+    duplicate = "Multiple AbortCriteria cannot have the same failure type"
+    decimals = "Abort thresholdPercentage must have two or less decimal digits"
+    positive = "ThresholdPercentage value 0.0 for AbortCriteria must have value greater than 0"
+    cases = [
+        *[(without(member), constraint(None, f".1.member.{member}", "not be null"))
+          for member in ("failureType", "action", "thresholdPercentage",
+                         "minNumberOfExecutedThings")],
+        ({}, constraint(None, "", "not be null")),
+        ({"criteriaList": [criterion(threshold=100.01)]},
+         constraint(100.01, ".1.member.thresholdPercentage", "have value less than or equal to 100")),
+        ({"criteriaList": [criterion(), criterion("ALL", action="BAD")]},
+         constraint("BAD", ".2.member.action", "satisfy enum value set: [CANCEL]")),
+        # The model constraints come first.
+        ({"criteriaList": [criterion("BAD", 0)]},
+         constraint("BAD", ".1.member.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]")),
+        ({"criteriaList": [criterion(threshold=0)]}, positive),
+        ({"criteriaList": [criterion(threshold=-0.001)]},
+         "ThresholdPercentage value -0.001 for AbortCriteria must have value greater than 0"),
+        ({"criteriaList": [criterion(threshold=10.999)]}, decimals),
+        ({"criteriaList": [criterion(), criterion(threshold=20)]}, duplicate),
+        # Criterion by criterion: a duplicate is refused before its own threshold.
+        ({"criteriaList": [criterion(threshold=10.999), criterion("ALL", 0)]}, decimals),
+        ({"criteriaList": [criterion(), criterion(threshold=0)]}, duplicate),
+        ({"criteriaList": [criterion(threshold=10.999), criterion(threshold=20)]}, decimals),
+    ]
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        for abort, message in cases:
+            for call in (
+                lambda: raw.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                                       abortConfig=abort),
+                lambda: raw.create_job_template(jobTemplateId=template_id, description="d",
+                                                document=_DOCUMENT, abortConfig=abort),
+                lambda: raw.update_job(jobId=job_id, abortConfig=abort),
+            ):
+                with pytest.raises(ClientError) as ei:
+                    call()
+                assert _error(ei) == (400, "InvalidRequestException", message), abort
+        assert "abortConfig" not in iot_client.describe_job(jobId=job_id)["job"]
+
+        # A bad timeout answers before the criteria checks, both before the id is looked up.
+        iot_client.create_job_template(jobTemplateId=template_id, description="d",
+                                       document=_DOCUMENT)
+        zero = {"criteriaList": [criterion(threshold=0)]}
+        timeout = {"timeoutConfig": {"inProgressTimeoutInMinutes": 0}}
+        for call, message in [
+            (lambda: raw.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT,
+                                    abortConfig=zero), positive),
+            (lambda: raw.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT,
+                                    **timeout), _TIMEOUT_0),
+            (lambda: raw.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                                    abortConfig=zero, **timeout), _TIMEOUT_0),
+            (lambda: raw.create_job_template(jobTemplateId=template_id, description="d",
+                                             document=_DOCUMENT, abortConfig=zero), positive),
+            (lambda: raw.create_job_template(jobTemplateId=other, description="d",
+                                             document=_DOCUMENT, abortConfig=zero, **timeout),
+             _TIMEOUT_0),
+            (lambda: raw.create_job_template(jobTemplateId=other, document=_DOCUMENT,
+                                             abortConfig={"criteriaList": [criterion("BAD")]}),
+             "2 validation errors detected: Value null at 'description' failed to satisfy "
+             "constraint: Member must not be null; Value 'BAD' at "
+             "'abortConfig.criteriaList.1.member.failureType' failed to satisfy constraint: "
+             "Member must satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]"),
+            (lambda: raw.update_job(jobId=other, abortConfig=zero), positive),
+            (lambda: raw.update_job(jobId=job_id, abortConfig=zero, **timeout), _TIMEOUT_0),
+        ]:
+            with pytest.raises(ClientError) as ei:
+                call()
+            assert _error(ei) == (400, "InvalidRequestException", message)
+
+        # Two decimals, and one criterion per failure type, are accepted.
+        accepted = {"criteriaList": [criterion(t, 10.99) for t in
+                                     ("FAILED", "REJECTED", "TIMED_OUT", "ALL")]}
+        iot_client.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                              abortConfig=accepted)
+        assert iot_client.describe_job(jobId=other)["job"]["abortConfig"] == accepted
+    finally:
+        try:
+            iot_client.delete_job_template(jobTemplateId=template_id)
+        except ClientError:
+            pass
+        _cleanup(iot_client, jobs=[job_id, other], things=[thing])
+
+
 # ---------------------------------------------------------------------------
 # Routing: the jobs routes must not shadow thing CRUD
 # ---------------------------------------------------------------------------
@@ -2020,6 +2286,7 @@ def test_iot_jobs_cancel_job_without_force_leaves_in_progress(
 
         job = iot_client.describe_job(jobId=job_id)["job"]
         assert job["status"] == "CANCELED"
+        assert job["forceCanceled"] is False
         execution = iot_client.describe_job_execution(
             jobId=job_id, thingName=thing
         )["execution"]
@@ -2776,6 +3043,30 @@ def test_jobs_mqtt_start_next_of_first_job_is_silent(iot_client, iot_data_client
     assert execution["versionNumber"] == 2
     _assert_epoch_seconds(doc["timestamp"])
     _assert_epoch_seconds(execution["startedAt"])
+
+
+def test_jobs_mqtt_abort_config_notifies_the_things_it_cancels(iot_client, iot_data_client):
+    """A FAILED over MQTT that meets abortConfig notifies the thing whose QUEUED execution it canceled."""
+    reporter, waiting = _unique("jobs-mqtt-ab"), _unique("jobs-mqtt-ab")
+    job_id = _unique("job")
+    arns = [_create_thing(iot_client, thing) for thing in (reporter, waiting)]
+    iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                          abortConfig=_abort_config(("FAILED", 50, 1)))
+    base = f"$aws/things/{waiting}/jobs"
+    received = _collect_shadow_frames(
+        f"{base}/#",
+        lambda: _mqtt_publish(
+            topic=f"$aws/things/{reporter}/jobs/{job_id}/update",
+            payload=json.dumps({"status": "FAILED"}).encode(),
+        ),
+        want=2,
+    )
+    frames = _frames_by_topic(received)
+    assert frames[f"{base}/notify"]["jobs"] == {}
+    assert set(frames[f"{base}/notify-next"]) == {"timestamp"}
+    job = iot_client.describe_job(jobId=job_id)["job"]
+    assert job["status"] == "CANCELED"
+    assert job["comment"] == _abort_comment("FAILED", "50.00%", 1, 1)
 
 
 def test_jobs_mqtt_update_include_flags_and_terminal_notify(

@@ -5516,6 +5516,8 @@ def _jobs_apply_timeout(execution: dict) -> dict:
     execution["versionNumber"] += 1
     _job_execution_event(execution)
     _jobs_maybe_complete(execution["jobId"])
+    # A read sends no jobs/notify, so the things an abort cancels here are not notified.
+    _jobs_abort(execution["jobId"])
     return execution
 
 
@@ -5541,6 +5543,43 @@ def _jobs_maybe_complete(job_id: str) -> None:
         job["completedAt"] = now
         job["lastUpdatedAt"] = now
         _job_event(job, "completed")
+
+
+# The execution statuses each abortConfig failureType counts.
+_JOB_ABORT_FAILURE_STATUSES = {
+    "FAILED": ("FAILED",), "REJECTED": ("REJECTED",), "TIMED_OUT": ("TIMED_OUT",),
+    "ALL": ("FAILED", "REJECTED", "TIMED_OUT"),
+}
+
+
+def _jobs_abort(job_id: str) -> dict:
+    """Cancel an IN_PROGRESS job once a criterion of its abortConfig is met; returns _jobs_cancel's mapping."""
+    job = _jobs.get(job_id)
+    criteria = ((job or {}).get("abortConfig") or {}).get("criteriaList") or []
+    if not criteria or job.get("status") != "IN_PROGRESS":
+        return {}
+    counts = _jobs_status_counts(job_id)
+    # Every terminal execution counts as completed, CANCELED and REMOVED ones included.
+    completed = sum(counts[status] for status in _JOB_EXECUTION_TERMINAL)
+    for criterion in criteria:
+        failure_type = criterion.get("failureType")
+        threshold = criterion.get("thresholdPercentage")
+        minimum = criterion.get("minNumberOfExecutedThings")
+        if (
+            criterion.get("action") != "CANCEL"
+            or failure_type not in _JOB_ABORT_FAILURE_STATUSES
+            or not isinstance(threshold, (int, float))
+            or not isinstance(minimum, int)
+        ):
+            continue
+        failed = sum(counts[status] for status in _JOB_ABORT_FAILURE_STATUSES[failure_type])
+        if completed >= max(minimum, 1) and failed * 100 >= threshold * completed:
+            comment = (
+                f"Abort criteria for failure type {failure_type} with threshold {threshold:.2f}% met. "
+                f"Total completed executions: {completed}, total {failure_type} executions: {failed}"
+            )
+            return _jobs_cancel(job_id, {"comment": comment, "reasonCode": "ABORT_CANCEL"}, False)
+    return {}
 
 
 def _jobs_check_expected_version(
@@ -5626,6 +5665,16 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "Invalid jobId: must match [a-zA-Z0-9_-]{1,64}",
             400,
         )
+    abort = payload.get("abortConfig")
+    if violations := _job_update_violations(job_id, {"abortConfig": abort}):
+        return _job_validation_error(violations)
+    timeout_cfg = payload.get("timeoutConfig") or {}
+    if timeout_cfg:
+        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
+    if err := _job_abort_criteria_error(abort):
+        return err
     if job_id in _jobs:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
@@ -5664,11 +5713,6 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
                 "follow the format YYYY-MM-DDThh:mm.",
                 400,
             )
-    timeout_cfg = payload.get("timeoutConfig") or {}
-    if timeout_cfg:
-        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
-        if err:
-            return err
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -5737,7 +5781,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
-        # Stored so DescribeJob echoes them. timeoutConfig is acted on; nothing aborts.
+        # Stored so DescribeJob echoes them. abortConfig and timeoutConfig are acted on.
         "abortConfig": payload.get("abortConfig"),
         "timeoutConfig": payload.get("timeoutConfig"),
         "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
@@ -5776,10 +5820,12 @@ _JOB_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+$")
 
 
 def _job_update_violations(job_id: str, payload: dict) -> list[str]:
-    """Model constraint failures of an UpdateJob request."""
+    """Model constraint failures of an UpdateJob request; CreateJob and CreateJobTemplate check abortConfig with it."""
     found: list[str] = []
 
-    def bound(value, member, low=None, high=None, double=False):
+    def bound(value, member, low=None, high=None, double=False, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return
         shown = float(value) if double else value
@@ -5790,7 +5836,9 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
             found.append(_job_validation_clause(
                 shown, member, f"Member must have value less than or equal to {high}"))
 
-    def enum(value, member, allowed):
+    def enum(value, member, allowed, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if value is not None and value not in allowed:
             found.append(_job_validation_clause(
                 value, member, f"Member must satisfy enum value set: {allowed}"))
@@ -5852,15 +5900,43 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
         at = f"jobExecutionsRetryConfig.criteriaList.{i}.member"
         bound(c.get("numberOfRetries"), f"{at}.numberOfRetries", low=0, high=10)
         enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED]")
-    for i, c in enumerate(criteria_list(payload.get("abortConfig"),
-                                        "abortConfig.criteriaList"), 1):
+    abort = payload.get("abortConfig")
+    if isinstance(abort, dict) and abort.get("criteriaList") is None:
+        found.append(_job_validation_clause(
+            None, "abortConfig.criteriaList", "Member must not be null"))
+    for i, c in enumerate(criteria_list(abort, "abortConfig.criteriaList"), 1):
         at = f"abortConfig.criteriaList.{i}.member"
-        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1)
-        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]")
-        enum(c.get("action"), f"{at}.action", "[CANCEL]")
+        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1,
+              required=True)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]",
+             required=True)
+        enum(c.get("action"), f"{at}.action", "[CANCEL]", required=True)
         bound(c.get("thresholdPercentage"), f"{at}.thresholdPercentage", high=100,
-              double=True)
+              double=True, required=True)
     return found
+
+
+def _job_abort_criteria_error(abort) -> tuple | None:
+    """The abortConfig checks that follow the model constraints, criterion by criterion."""
+    criteria = abort.get("criteriaList") if isinstance(abort, dict) else None
+    seen = set()
+    for c in criteria if isinstance(criteria, list) else []:
+        if not isinstance(c, dict):
+            continue
+        threshold = c.get("thresholdPercentage")
+        numeric = isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+        message = None
+        if c.get("failureType") in seen:
+            message = "Multiple AbortCriteria cannot have the same failure type"
+        elif numeric and threshold <= 0:
+            message = (f"ThresholdPercentage value {float(threshold)} for AbortCriteria "
+                       "must have value greater than 0")
+        elif numeric and round(threshold, 2) != threshold:
+            message = "Abort thresholdPercentage must have two or less decimal digits"
+        if message:
+            return error_response_json("InvalidRequestException", message, 400)
+        seen.add(c.get("failureType"))
+    return None
 
 
 def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
@@ -5878,6 +5954,8 @@ def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
             (payload["timeoutConfig"] or {}).get("inProgressTimeoutInMinutes"))
         if err:
             return err
+    if err := _job_abort_criteria_error(payload.get("abortConfig")):
+        return err
     rollout = payload.get("jobExecutionsRolloutConfig")
     if isinstance(rollout, dict):
         maximum, rate = rollout.get("maximumPerMinute"), rollout.get("exponentialRate")
@@ -6208,10 +6286,12 @@ def _handle_job_template(method: str, path: str, body: bytes) -> tuple:
 
 
 def _create_job_template(template_id: str, payload: dict) -> tuple:
+    abort = payload.get("abortConfig")
+    violations = _job_update_violations(template_id, {"abortConfig": abort})
     if payload.get("description") is None:
-        return _job_template_validation_error(
-            None, "description", "Member must not be null"
-        )
+        violations.insert(0, _job_validation_clause(None, "description", "Member must not be null"))
+    if violations:
+        return _job_validation_error(violations)
     document = payload.get("document")
     if isinstance(document, str) and len(document) > 32768:
         return _job_template_validation_error(
@@ -6219,6 +6299,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         )
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
     if minutes is not None and (err := _job_timeout_error(minutes)):
+        return err
+    if err := _job_abort_criteria_error(abort):
         return err
     source = payload.get("documentSource")
     if document and source:
@@ -6418,21 +6500,12 @@ def _job_payload_from_template(payload: dict) -> tuple[dict | None, tuple | None
     return merged, None
 
 
-async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
-    job = _jobs.get(job_id)
-    if job is None:
-        return _error_not_found("Job", job_id)
-    if job["status"] != "IN_PROGRESS":
-        return error_response_json(
-            "InvalidRequestException",
-            f"Job {job_id} is in status {job['status']} and cannot be canceled",
-            400,
-        )
-    force = _qp_bool(qp, "force")
+def _jobs_cancel(job_id: str, payload: dict, force: bool) -> dict:
+    """CancelJob's state change; maps each thing whose execution it canceled to its earlier queue front."""
+    job = _jobs[job_id]
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
-    if force:
-        job["forceCanceled"] = True
+    job["forceCanceled"] = force
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -6463,9 +6536,23 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             _job_execution_event(execution, force_canceled=force)
             canceled_things.add(execution["thingName"])
     _job_event(job, "canceled")
+    return {thing_name: prev_next[thing_name] for thing_name in canceled_things}
+
+
+async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} is in status {job['status']} and cannot be canceled",
+            400,
+        )
+    canceled = _jobs_cancel(job_id, payload, _qp_bool(qp, "force"))
     account_id, region = get_account_id(), get_region()
-    for thing_name in sorted(canceled_things):
-        await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
     response = {"jobArn": job["jobArn"], "jobId": job_id}
     if job.get("description") is not None:
         response["description"] = job["description"]
@@ -6658,6 +6745,7 @@ async def _cancel_job_execution(
     _job_execution_event(execution, force_canceled=force)
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response({})
 
 
@@ -6717,6 +6805,7 @@ async def _delete_job_execution(thing: str, job_id: str, number: str, qp: dict) 
     _jobs_maybe_complete(job_id)
     if pending:
         await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return 200, {}, b""
 
 
@@ -6897,6 +6986,14 @@ def jobs_update_execution(
         _job_execution_event(execution)
     _jobs_maybe_complete(job_id)
     return dict(execution), None
+
+
+async def jobs_abort_if_met(account_id: str, region: str, job_id: str) -> None:
+    """Apply the job's abortConfig after an execution finished, notifying the things whose execution it canceled."""
+    with request_scope(account_id, region):
+        canceled = _jobs_abort(job_id)
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
 
 
 def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
@@ -8234,6 +8331,7 @@ async def _handle_jobs_publish(
         # publishes update/accepted first, then notify + notify-next
         # (live-captured order) — which the _respond above just preserved.
         await jobs_notify_thing(account_id, region, thing, prev_next)
+        await jobs_abort_if_met(account_id, region, job_id)
 
 
 def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
