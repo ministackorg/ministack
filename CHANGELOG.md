@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — publishing on create or code update leaves `$LATEST` unpublished** — `CreateFunction` and `UpdateFunctionCode` with `Publish: true` overwrote `$LATEST`'s `Version` with the new version number. `ListVersionsByFunction` then listed that number twice and no `$LATEST`, `GetFunctionConfiguration` without a qualifier reported it, and invoking `$LATEST` set `AWS_LAMBDA_FUNCTION_VERSION` to it. `$LATEST` now stays `$LATEST`, as on AWS; the create and update responses are unchanged.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
