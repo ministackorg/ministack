@@ -4110,7 +4110,8 @@ def test_mtls_jitr_auto_registers_an_unknown_cert_without_connack(broker, tmp_pa
 
 def test_mtls_jitr_under_an_sni_only_ca_needs_sni(broker, tmp_path):
     """A CA in SNI_ONLY mode auto-registers a device only when its ClientHello
-    carries a server name. Without one the certificate stays unknown and is
+    carries a server name, and the certificate it creates is in SNI_ONLY mode
+    as on AWS. Without one the certificate stays unknown and is
     refused like any other unknown certificate (CONNACK 5)."""
     from ministack.core.x509_utils import generate_ca, get_certificate_id, sign_leaf_certificate
 
@@ -4139,6 +4140,7 @@ def test_mtls_jitr_under_an_sni_only_ca_needs_sni(broker, tmp_path):
         desc = iot.describe_certificate(certificateId=cert_id)["certificateDescription"]
         assert desc["status"] == "PENDING_ACTIVATION"
         assert desc["caCertificateId"] == ca_id
+        assert desc["certificateMode"] == "SNI_ONLY"
     finally:
         try:
             iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")

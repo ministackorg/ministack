@@ -8267,6 +8267,41 @@ def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client
         _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 
 
+def test_iot_register_certificate_takes_the_mode_of_its_ca(iot_client):
+    """A certificate registered under a CA reports the CA's mode; RegisterCertificateWithoutCA stays SNI_ONLY."""
+    modes, ca_ids, cert_ids = {}, [], []
+    try:
+        for ca_mode in ("SNI_ONLY", "DEFAULT"):
+            ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+                _registration_code(iot_client), count=3)
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, setAsActive=True, certificateMode=ca_mode,
+                **({"verificationCertificate": verification_pem} if ca_mode == "DEFAULT" else {}),
+            )["certificateId"])
+            with_ca_pem, no_ca_pem, without_ca = leaves
+            registered = {
+                "with-ca-pem": iot_client.register_certificate(
+                    certificatePem=with_ca_pem, caCertificatePem=ca_pem, status="ACTIVE"),
+                "no-ca-pem": iot_client.register_certificate(certificatePem=no_ca_pem, status="ACTIVE"),
+                "without-ca": iot_client.register_certificate_without_ca(
+                    certificatePem=without_ca, status="ACTIVE"),
+            }
+            for case, resp in registered.items():
+                cert_ids.append(resp["certificateId"])
+                modes[ca_mode, case] = iot_client.describe_certificate(
+                    certificateId=resp["certificateId"])["certificateDescription"]["certificateMode"]
+        assert modes == {
+            ("SNI_ONLY", "with-ca-pem"): "SNI_ONLY",
+            ("SNI_ONLY", "no-ca-pem"): "SNI_ONLY",
+            ("SNI_ONLY", "without-ca"): "SNI_ONLY",
+            ("DEFAULT", "with-ca-pem"): "DEFAULT",
+            ("DEFAULT", "no-ca-pem"): "DEFAULT",
+            ("DEFAULT", "without-ca"): "SNI_ONLY",
+        }
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
+
+
 def _assert_register_refused(iot_client, http_status, code, message, **kwargs):
     with pytest.raises(ClientError) as ei:
         iot_client.register_certificate(**kwargs)

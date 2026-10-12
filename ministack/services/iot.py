@@ -2063,12 +2063,14 @@ def _delete_provisioning_template(name: str) -> tuple:
 def _certificate_record(
     cert_id: str, cert_pem: str, status: str, ca_id: str | None = None
 ) -> dict:
-    """The registry record of a device certificate, owned by the current scope."""
+    """The registry record of a device certificate, owned by the current scope; it takes its CA's mode."""
+    ca = _ca_certificates.get(ca_id) if ca_id else None
     return {
         "certificateId": cert_id,
         "certificateArn": _cert_arn(cert_id),
         "certificatePem": cert_pem,  # verbatim
         "status": status,
+        "certificateMode": (ca or {}).get("certificateMode", "DEFAULT"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
         "caCertificateId": ca_id,
