@@ -1410,9 +1410,10 @@ def _update_thing(name: str, payload: dict) -> tuple:
 
 
 def _delete_thing(name: str) -> tuple:
+    """DeleteThing; an unknown name answers 200 like a completed delete."""
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return json_response({})
     if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
         return error_response_json(
             "InvalidRequestException",

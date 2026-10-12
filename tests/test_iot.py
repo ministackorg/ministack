@@ -1390,6 +1390,16 @@ def test_iot_delete_thing_refused_while_a_principal_is_attached(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_delete_thing_of_an_unknown_name_succeeds(iot_client):
+    """DeleteThing answers 200 for a name that does not exist, also with expectedVersion."""
+    name = _unique("thing")
+    for params in ({}, {"expectedVersion": 1}, {"expectedVersion": 7}):
+        resp = iot_client.delete_thing(thingName=name, **params)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+
+
 def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
     from ministack.core.responses import (
         get_account_id,
