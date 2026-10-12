@@ -21305,6 +21305,63 @@ def test_cfn_update_logs_log_group_in_place(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_logs_log_group_resource_policy_document(cfn, logs):
+    """ResourcePolicyDocument is the group's own resource policy through create, update and delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-rpd-{uid}"
+    group = f"/cfn/logs-rpd-{uid}"
+
+    def tpl(sid):
+        props = {"LogGroupName": group}
+        if sid:
+            props["ResourcePolicyDocument"] = {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Sid": sid, "Effect": "Allow",
+                    "Principal": {"Service": "route53.amazonaws.com"},
+                    "Action": "logs:PutLogEvents",
+                    "Resource": {"Fn::Sub": f"arn:aws:logs:${{AWS::Region}}:${{AWS::AccountId}}:log-group:{group}:*"},
+                }],
+            }
+        return json.dumps({"Resources": {"Group": {"Type": "AWS::Logs::LogGroup", "Properties": props}}})
+
+    def policy():
+        arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+        found = logs.describe_resource_policies(resourceArn=arn, policyScope="RESOURCE")["resourcePolicies"]
+        if not found:
+            return None
+        assert "policyName" not in found[0] and found[0]["resourceArn"] == arn
+        document = found[0]["policyDocument"]
+        assert document == json.dumps(json.loads(document), separators=(",", ":"))
+        return json.loads(document)["Statement"][0]["Sid"], found[0]["revisionId"]
+
+    def update(sid):
+        cfn.update_stack(StackName=stack_name, TemplateBody=tpl(sid))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=tpl("First"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert policy() == ("First", "1")
+        assert not any(group in (p.get("policyDocument") or "")
+                       for p in logs.describe_resource_policies()["resourcePolicies"])
+        update("Second")
+        assert policy() == ("Second", "2")
+        update(None)
+        assert policy() is None
+        update("Third")
+        assert policy() == ("Third", "1")
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        assert not any(group in (p.get("resourceArn") or "") for p in logs.describe_resource_policies(
+            policyScope="RESOURCE")["resourcePolicies"])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 @pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
 def test_cfn_logs_log_group_removal_drops_api_metric_filters(cfn, logs, rename):
     """A stack delete or a LogGroupName replacement drops the group's API metric filters."""

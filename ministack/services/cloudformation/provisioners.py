@@ -3366,7 +3366,32 @@ def _cwlogs_create(logical_id, props, stack_name):
         "streams": {},
         "subscriptionFilters": {},
     }
+    _cwlogs_sync_resource_policy(name, arn, props)
     return name, {"Arn": arn}
+
+
+def _cwlogs_policy_document(props):
+    document = props.get("ResourcePolicyDocument")
+    if document is None or isinstance(document, str):
+        return document
+    return json.dumps(document, separators=(",", ":"))
+
+
+def _cwlogs_sync_resource_policy(name, arn, props, old_props=None):
+    """Put or delete the group's own resource policy when ResourcePolicyDocument changes."""
+    document = _cwlogs_policy_document(props)
+    if document == (_cwlogs_policy_document(old_props) if old_props else None):
+        return
+    current = _cw_logs._log_group_policies.get(name)
+    request = {"resourceArn": arn.removesuffix(":*")}
+    if current:
+        request["expectedRevisionId"] = current["revisionId"]
+    if document is None:
+        _cw_logs._delete_resource_policy(request)
+        return
+    resp = _cw_logs._put_resource_policy({**request, "policyDocument": document})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::LogGroup ResourcePolicyDocument failed: {resp[2]!r}")
 
 
 def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -3389,6 +3414,7 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     # it was created with and only the key moves.
     group["kmsKeyId"] = new_props.get("KmsKeyId") or None
     _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
+    _cwlogs_sync_resource_policy(name, group["arn"], new_props, old_props)
     return name, {"Arn": group["arn"]}
 
 
