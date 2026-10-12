@@ -462,7 +462,7 @@ def _create_trail(body: dict):
         "HasCustomEventSelectors": False,
         "HasInsightSelectors": False,
         "IsOrganizationTrail": body.get("IsOrganizationTrail", False),
-        "IsLogging": True,
+        "IsLogging": False,
     }
     # CreateTrail must persist KmsKeyId so DescribeTrails/GetTrail echo it; otherwise a
     # CMK set at create is dropped and Terraform's aws_cloudtrail needs a second apply to
@@ -553,18 +553,12 @@ def _get_trail_status(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    now = int(time.time())
-    is_logging = bool(trail.get("IsLogging", True))
-    return _ok(
-        {
-            "IsLogging": is_logging,
-            "LatestDeliveryTime": now if is_logging else trail.get("_StoppedAt", now),
-            "StartLoggingTime": trail.get("_StartedAt", now - 3600),
-            "StopLoggingTime": trail.get("_StoppedAt") if not is_logging else None,
-            "LatestDeliveryError": "",
-            "LatestNotificationError": "",
-        }
-    )
+    status = {
+        "IsLogging": bool(trail.get("IsLogging", True)),
+        "StartLoggingTime": trail.get("_StartedAt"),
+        "StopLoggingTime": trail.get("_StoppedAt"),
+    }
+    return _ok({k: v for k, v in status.items() if v is not None})
 
 
 def _start_logging(body: dict):
@@ -576,7 +570,6 @@ def _start_logging(body: dict):
         return error
     trail["IsLogging"] = True
     trail["_StartedAt"] = int(time.time())
-    trail.pop("_StoppedAt", None)
     return _ok({})
 
 

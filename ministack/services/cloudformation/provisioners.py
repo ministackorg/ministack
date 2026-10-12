@@ -3377,7 +3377,8 @@ def _cwlogs_import(identifier):
 
 
 def _cwlogs_delete(physical_id, props):
-    _cw_logs._log_groups.pop(physical_id, None)
+    """Delete through DeleteLogGroup, which also drops the group's metric filters, policy and records."""
+    _cw_logs._delete_log_group({"logGroupName": physical_id})
 
 
 # --- CloudWatch Logs ResourcePolicy ---
@@ -13123,13 +13124,11 @@ def _iot_thing_import(identifier):
 
 
 def _iot_thing_delete(physical_id, props):
-    thing = _iot._things.get(physical_id)
-    if thing is None:
+    if physical_id not in _iot._things:
         return
-    if any(p.rsplit("/", 1)[-1] in _iot._certificates for p in thing.get("principals", [])):
-        raise ValueError(
-            f"Cannot delete. Thing {physical_id} is still attached to one or more principals")
-    _iot._delete_thing(physical_id)
+    resp = _iot._delete_thing(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_certificate_attrs(cert_id):
@@ -13206,16 +13205,9 @@ def _iot_certificate_delete(physical_id, props):
         return
     if cert["status"] == "ACTIVE":
         _iot_certificate_status(physical_id, "INACTIVE")
-    arn = cert["certificateArn"]
-    # The service refuses DeleteCertificate while things are attached, then
-    # while policies are, in that order.
-    if any(_iot._thing_name_from_arn(t) in _iot._things for t in cert.get("attachedThings", [])):
-        raise ValueError(f"Things must be detached before deletion (arn: {arn})")
-    if _iot._policies_attached_to(arn):
-        raise ValueError(f"Certificate policies must be detached before deletion (arn: {arn})")
     resp = _iot._handle_certificate("DELETE", f"/certificates/{physical_id}", b"", {})
     if resp[0] >= 400:
-        raise ValueError(f"AWS::IoT::Certificate delete failed: {resp[2]!r}")
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_thing_principal_attachment_call(method, thing, principal, thing_principal_type=None):
