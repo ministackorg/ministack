@@ -1472,6 +1472,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+            # Registered so request hooks such as CloudTrail recording see the module.
+            _loaded_modules.setdefault(mod_name, mod)
             if key in (
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",

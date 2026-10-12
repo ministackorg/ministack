@@ -46,6 +46,9 @@ _DEFAULT_EVENT_SELECTORS = [
     {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
 ]
 
+# Logging state kept on the trail record for GetTrailStatus; not part of the Trail shape.
+_TRAIL_STATE_KEYS = frozenset({"IsLogging", "_StartedAt", "_StoppedAt"})
+
 _SCRUB_KEYS = frozenset(
     {
         "secretaccesskey",
@@ -499,6 +502,11 @@ def _delete_trail(body: dict):
     return _ok({})
 
 
+def _trail_view(trail: dict) -> dict:
+    """The trail record as the Trail shape: no logging state and no unset members."""
+    return {k: v for k, v in trail.items() if k not in _TRAIL_STATE_KEYS and v != ""}
+
+
 def _get_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
@@ -511,7 +519,7 @@ def _get_trail(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    return _ok({"Trail": trail})
+    return _ok({"Trail": _trail_view(trail)})
 
 
 def _describe_trails(body: dict):
@@ -540,7 +548,7 @@ def _describe_trails(body: dict):
             ):
                 resolved.append(trail)
         all_trails = resolved
-    return _ok({"trailList": all_trails})
+    return _ok({"trailList": [_trail_view(trail) for trail in all_trails]})
 
 
 def _get_trail_status(body: dict):
@@ -558,7 +566,21 @@ def _get_trail_status(body: dict):
         "StartLoggingTime": trail.get("_StartedAt"),
         "StopLoggingTime": trail.get("_StoppedAt"),
     }
-    return _ok({k: v for k, v in status.items() if v is not None})
+    status = {k: v for k, v in status.items() if v is not None}
+    # The deprecated string members; nothing is delivered here, so the attempt times stay empty.
+    status.update(
+        LatestDeliveryAttemptSucceeded="",
+        LatestDeliveryAttemptTime="",
+        LatestNotificationAttemptSucceeded="",
+        LatestNotificationAttemptTime="",
+        TimeLoggingStarted=_iso_time(status.get("StartLoggingTime")),
+        TimeLoggingStopped=_iso_time(status.get("StopLoggingTime")),
+    )
+    return _ok(status)
+
+
+def _iso_time(epoch) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch)) if epoch is not None else ""
 
 
 def _start_logging(body: dict):
@@ -569,7 +591,7 @@ def _start_logging(body: dict):
     if error:
         return error
     trail["IsLogging"] = True
-    trail["_StartedAt"] = int(time.time())
+    trail["_StartedAt"] = round(time.time(), 3)
     return _ok({})
 
 
@@ -580,8 +602,10 @@ def _stop_logging(body: dict):
     _name, _home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
+    # Only a running trail records a stop; stopping a stopped trail keeps the last time.
+    if trail.get("IsLogging", True):
+        trail["_StoppedAt"] = round(time.time(), 3)
     trail["IsLogging"] = False
-    trail["_StoppedAt"] = int(time.time())
     return _ok({})
 
 
