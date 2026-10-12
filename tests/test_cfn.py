@@ -20804,6 +20804,80 @@ def test_cfn_update_iot_topic_rule_in_place(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_iot_republish_rule(rule_name, target):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+                    "Action": "sts:AssumeRole"}]}},
+            },
+            "Rule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule_name,
+                    "TopicRulePayload": {
+                        "Sql": "SELECT * FROM 'things/in/#'",
+                        "Actions": [{"Republish": {
+                            "Topic": target,
+                            "RoleArn": {"Fn::GetAtt": ["Role", "Arn"]},
+                        }}],
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_create(cfn, iot_client):
+    """The resource fails with IoT's refusal, the stack rolls back and no rule is stored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-self-{suffix}", f"cfn_rule_self_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "CREATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        with pytest.raises(ClientError) as ei:
+            iot_client.get_topic_rule(ruleName=rule_name)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_update(cfn, iot_client):
+    """An update that moves the republish topic inside the filter fails and rolls back to the old rule."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-selfup-{suffix}", f"cfn_rule_selfup_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "out/topic")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "UPDATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        rule = iot_client.get_topic_rule(ruleName=rule_name)["rule"]
+        assert rule["actions"][0]["republish"]["topic"] == "out/topic"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_sns_topic_in_place(cfn, sns):
     """A topic's DisplayName updates in place: the ARN — and a subscription
     created outside the stack — survive."""
@@ -21126,6 +21200,53 @@ def test_cfn_update_logs_log_group_in_place(cfn, logs):
         assert [s["logStreamName"] for s in streams] == ["ext-stream"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
+def test_cfn_logs_log_group_removal_drops_api_metric_filters(cfn, logs, rename):
+    """A stack delete or a LogGroupName replacement drops the group's API metric filters."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-gone-{uid}"
+    group = f"/cfn/logs-gone-{uid}"
+    namespace = f"CfnGone{uid}"
+
+    def tpl(name):
+        return json.dumps({"Resources": {
+            "Group": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": name}},
+        }})
+
+    def described():
+        return [g for g in logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+                if g["logGroupName"] == group]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=tpl(group))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        logs.put_metric_filter(
+            logGroupName=group, filterName="api", filterPattern='"ERROR"',
+            metricTransformations=[{"metricNamespace": namespace, "metricName": "Errors", "metricValue": "1"}])
+
+        if rename:
+            cfn.update_stack(StackName=stack_name, TemplateBody=tpl(f"{group}-new"))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        else:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        assert described() == []
+        assert logs.describe_metric_filters(
+            metricNamespace=namespace, metricName="Errors")["metricFilters"] == []
+
+        logs.create_log_group(logGroupName=group)
+        assert described()[0]["metricFilterCount"] == 0
+        assert logs.describe_metric_filters(logGroupName=group)["metricFilters"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            logs.delete_log_group(logGroupName=group)
+        except ClientError:
+            pass
 
 
 def test_cfn_update_s3_bucket_policy_in_place(cfn, s3):
@@ -26838,8 +26959,8 @@ def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1
 
 def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_accepted(cfn, iot_client):
     """A parent that does not exist fails the stack with the service's own
-    ResourceNotFoundException; QueryString (dynamic groups) and Tags, which
-    the service does not model, are accepted without effect."""
+    ResourceNotFoundException; QueryString (dynamic groups), which the service
+    does not model, is accepted without effect."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-thing-group-edge-{uid}"
     cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
@@ -26872,6 +26993,48 @@ def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_
         assert group["thingGroupProperties"]["thingGroupDescription"] == "dynamic on AWS, static here"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_tags_follow_the_template(cfn, iot_client):
+    """The Tags of AWS::IoT::ThingGroup, Policy and TopicRule reach
+    ListTagsForResource; an update applies changed and dropped tags in place,
+    and deleting the stack drops them."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-tags-{uid}"
+    group, policy, rule = f"cfn-tags-group-{uid}", f"cfn-tags-policy-{uid}", f"cfn_tags_rule_{uid}"
+
+    def template(tags):
+        extra = {} if tags is None else {"Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+        return json.dumps({"Resources": {
+            "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": group, **extra}},
+            "Policy": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": policy, **extra, "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Deny", "Action": "iot:Publish", "Resource": "*"}]}}},
+            "Rule": {"Type": "AWS::IoT::TopicRule", "Properties": {
+                "RuleName": rule, **extra,
+                "TopicRulePayload": {"Sql": "SELECT * FROM 't'", "Actions": [], "RuleDisabled": True}}},
+        }})
+
+    def listed():
+        return [{t["Key"]: t["Value"] for t in iot_client.list_tags_for_resource(resourceArn=arn)["tags"]}
+                for arn in arns]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"own": "1"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arns = [iot_client.describe_thing_group(thingGroupName=group)["thingGroupArn"],
+                iot_client.get_policy(policyName=policy)["policyArn"],
+                iot_client.get_topic_rule(ruleName=rule)["ruleArn"]]
+        assert listed() == [{"own": "1"}] * 3
+        for tags in ({"own": "2", "new": "x"}, None):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(tags))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert listed() == [tags or {}] * 3
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert listed() == [{}] * 3
 
 
 def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
