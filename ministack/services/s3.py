@@ -769,10 +769,13 @@ _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/Authenticated
 # The permissions that answer a read and a write, FULL_CONTROL covering both.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
 _ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
+_ACL_READ_ACP_PERMS = ("READ_ACP", "FULL_CONTROL")
+# Object reads an object ACL grants nothing for: READ covers the data, READ_ACP the ACL.
+_ACL_UNGRANTED_OBJECT_READS = ("uploadId", "annotation", "tagging", "retention", "legal-hold", "attributes")
 
 
-def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
-    """``(group URI, permission)`` for every Group grant in a stored ACL."""
+def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str, str]]:
+    """``(grantee, permission)`` for every grant in a stored ACL naming a group ``URI`` or a canonical ``ID``."""
     if not stored_xml:
         return []
     try:
@@ -783,14 +786,14 @@ def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
     for grant in root.iter():
         if not grant.tag.endswith("Grant"):
             continue
-        uri = permission = ""
+        value = permission = ""
         for child in grant.iter():
-            if child.tag.endswith("URI") and child.text:
-                uri = child.text.strip()
+            if child.tag.rsplit("}", 1)[-1] == grantee and child.text:
+                value = child.text.strip()
             elif child.tag.endswith("Permission") and child.text:
                 permission = child.text.strip()
-        if uri and permission:
-            grants.append((uri, permission))
+        if value and permission:
+            grants.append((value, permission))
     return grants
 
 
@@ -839,21 +842,26 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
     """Whether a caller who does not own the bucket may have this request.
 
     The owner's grants decide it: a Group grant on the bucket or the object
-    ACL, or an allow in the bucket policy. Nothing granted means the request
-    is denied, which is S3's default for a bucket nobody has opened up.
+    ACL, a grant to the caller's canonical ID on the object ACL, or an allow
+    in the bucket policy. Nothing granted means the request is denied, which
+    is S3's default for a bucket nobody has opened up.
     """
+    object_acl, object_wants = _foreign_object_acl(owner_account, bucket_name, key, method, query_params)
+    caller_id = _canonical_owner_id(caller) if caller else ""
+    if any(grantee == caller_id and permission in object_wants
+           for grantee, permission in _acl_grants(object_acl, "ID")):
+        # A grant to one account is not public, so Block Public Access leaves it alone.
+        return True
     if _public_access_blocked(owner_account, bucket_name):
         return False
     wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
     groups = [_ACL_GROUP_ALL_USERS] if not caller else [
         _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
 
-    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
-    if key:
-        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, "")))
-    for stored in acls:
-        for uri, permission in _acl_group_grants(stored):
-            if uri in groups and permission in wants:
+    for stored, granted in ((_bucket_acl.get_scoped(owner_account, None, bucket_name), wants),
+                            (object_acl, object_wants)):
+        for uri, permission in _acl_grants(stored):
+            if uri in groups and permission in granted:
                 return True
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
@@ -873,6 +881,20 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
         if evaluate_resource_policy(policy, ctx).decision == "Allow":
             return True
     return False
+
+
+def _foreign_object_acl(owner_account: str, bucket_name: str, key: str, method: str,
+                        query_params: dict) -> tuple[str | None, tuple[str, ...]]:
+    """The stored ACL of the object version a read addresses, and the permissions that grant the read."""
+    if not key or method not in ("GET", "HEAD") or any(q in query_params for q in _ACL_UNGRANTED_OBJECT_READS):
+        return None, ()
+    bucket = _buckets.get_scoped(owner_account, None, bucket_name)
+    if bucket is None or _bucket_owner_enforced(bucket):
+        # BucketOwnerEnforced disables ACLs: only policies grant access.
+        return None, ()
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    wants = _ACL_READ_ACP_PERMS if "acl" in query_params else _ACL_READ_PERMS
+    return _object_acl.get_scoped(owner_account, None, (bucket_name, key, version_id)), wants
 
 
 def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
@@ -2088,14 +2110,14 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
 # ---------------------------------------------------------------------------
 
 
-def _canonical_owner_id() -> str:
-    """The S3 canonical user ID for the current account.
+def _canonical_owner_id(account_id: str = "") -> str:
+    """The S3 canonical user ID for *account_id*, the current account by default.
 
     Real S3 reports an opaque 64-character hex canonical ID (not the account
     ID) and returns the same value from every Owner / CanonicalUser field
     (ListBuckets, GetBucketAcl, GetObjectAcl, object listings). MiniStack
     derives a stable one from the account so those fields agree (#1459)."""
-    return hashlib.sha256(get_account_id().encode()).hexdigest()
+    return hashlib.sha256((account_id or get_account_id()).encode()).hexdigest()
 
 
 def _list_buckets(query_params=None):
