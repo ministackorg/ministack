@@ -1072,7 +1072,7 @@ def _cancel_signing_profile(name):
     if profile.get("status") == "Active" and profile.get("policy"):
         profile["policy"] = dict(profile["policy"], revisionId=str(uuid.uuid4()))
     profile["status"] = "Canceled"
-    return json_response({})
+    return 204, {"Content-Type": REST_JSON_CONTENT_TYPE}, b""
 
 
 # ---------------------------------------------------------------------------

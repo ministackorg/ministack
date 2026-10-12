@@ -2,6 +2,8 @@ import json
 import os
 
 import pytest
+from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def test_acm_request_certificate(acm_client):
@@ -78,12 +80,60 @@ def test_acm_import_certificate(acm_client):
     desc = acm_client.describe_certificate(CertificateArn=arn)
     assert desc["Certificate"]["Type"] == "IMPORTED"
 
+def test_acm_import_certificate_requires_a_private_key(acm_client):
+    raw = make_client("acm", {"parameter_validation": False})
+    fake_cert = b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+    fake_key = b"-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----"
+    arn = acm_client.import_certificate(Certificate=fake_cert, PrivateKey=fake_key)["CertificateArn"]
+    for args, constraint in (
+        ({}, "Member must not be null"),
+        ({"PrivateKey": b""}, "Member must have length greater than or equal to 1"),
+        ({"CertificateArn": arn}, "Member must not be null"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.import_certificate(Certificate=fake_cert, **args)
+        assert exc.value.response["Error"] == {
+            "Code": "ValidationException",
+            "Message": f"1 validation error detected: Value at 'privateKey' failed to satisfy constraint: {constraint}",
+        }
+    acm_client.delete_certificate(CertificateArn=arn)
+
 def test_acm_delete_certificate(acm_client):
     arn = acm_client.request_certificate(DomainName="delete.example.com")["CertificateArn"]
     acm_client.delete_certificate(CertificateArn=arn)
     resp = acm_client.list_certificates()
     arns = [c["CertificateArn"] for c in resp["CertificateSummaryList"]]
     assert arn not in arns
+
+def test_acm_delete_certificate_refused_while_an_active_signing_profile_uses_it(acm_client, signer):
+    fake_cert = b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+    fake_key = b"-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----"
+    arn = acm_client.import_certificate(Certificate=fake_cert, PrivateKey=fake_key)["CertificateArn"]
+    account = arn.split(":")[4]
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["InUseBy"] == []
+    suffix = os.urandom(4).hex()
+    profiles = [
+        signer.put_signing_profile(
+            profileName=f"acm_in_use_{tag}_{suffix}",
+            platformId="AWSIoTDeviceManagement-SHA256-ECDSA",
+            signingMaterial={"certificateArn": arn},
+        )["arn"]
+        for tag in ("first", "second")
+    ]
+    signer.put_signing_profile(profileName=f"acm_in_use_lambda_{suffix}", platformId="AWSLambda-SHA384-ECDSA")
+
+    for in_use in (profiles, profiles[1:]):
+        assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["InUseBy"] == in_use
+        with pytest.raises(ClientError) as exc:
+            acm_client.delete_certificate(CertificateArn=arn)
+        assert exc.value.response["Error"] == {
+            "Code": "ResourceInUseException",
+            "Message": f"Certificate {arn} in account {account} is in use.",
+        }
+        signer.cancel_signing_profile(profileName=in_use[0].rsplit("/", 1)[-1])
+
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["InUseBy"] == []
+    acm_client.delete_certificate(CertificateArn=arn)
 
 def test_acm_update_certificate_options(acm_client):
     arn = acm_client.request_certificate(DomainName="options.example.com")["CertificateArn"]
