@@ -150,6 +150,64 @@ def test_appsync_signed_root_graphql_request_uses_current_region_fallback():
         west.delete_graphql_api(apiId=api["apiId"])
 
 
+def _graphql_host_post(host, headers=None, sign=False):
+    """POST { __typename } (no schema, so data is {}) with this Host header; return (status, body)."""
+    headers = {"Host": host, **(headers or {})}
+    if sign:
+        headers["Authorization"] = (
+            "AWS4-HMAC-SHA256 Credential=test/20261012/us-west-2/appsync/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=fake"
+        )
+    try:
+        return 200, _appsync_graphql_post(f"{_ENDPOINT}/graphql", "{ __typename }", headers=headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+_UNAUTHORIZED = {"errors": [{
+    "errorType": "UnauthorizedException", "message": "You are not authorized to make this call."}]}
+
+
+@pytest.mark.parametrize("host_shape", ["region", "uris", "no_region"])
+def test_appsync_graphql_host_reaches_the_api_it_names(host_shape):
+    west = _client("us-west-2")
+    key_api = west.create_graphql_api(name="host-key", authenticationType="API_KEY")["graphqlApi"]
+    iam_api = west.create_graphql_api(name="host-iam", authenticationType="AWS_IAM")["graphqlApi"]
+    key = west.create_api_key(apiId=key_api["apiId"])["apiKey"]["id"]
+
+    def host(api):
+        if host_shape == "uris":
+            return urlparse(api["uris"]["GRAPHQL"]).netloc
+        region = ".us-west-2" if host_shape == "region" else ""
+        return f"{api['apiId']}.appsync-api{region}.{_ENDPOINT_NETLOC}"
+
+    try:
+        assert _graphql_host_post(host(key_api), {"x-api-key": key}) == (200, {"data": {}})
+        assert _graphql_host_post(host(key_api)) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), sign=True) == (200, {"data": {}})
+        assert _graphql_host_post(host(iam_api)) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), {"x-api-key": key}) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), {"x-api-key": key}, sign=True) == (200, {"data": {}})
+    finally:
+        west.delete_graphql_api(apiId=key_api["apiId"])
+        west.delete_graphql_api(apiId=iam_api["apiId"])
+
+
+def test_appsync_graphql_on_an_event_api_host_is_not_found():
+    west = _client("us-west-2")
+    mode = [{"authType": "API_KEY"}]
+    api = west.create_api(name="host-events", eventConfig={
+        "authProviders": mode, "connectionAuthModes": mode,
+        "defaultPublishAuthModes": mode, "defaultSubscribeAuthModes": mode,
+    })["api"]
+    key = west.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+    try:
+        assert _graphql_host_post(f"{api['apiId']}.appsync-api.us-west-2.{_ENDPOINT_NETLOC}", {"x-api-key": key}) == (
+            404, {"errors": [{"errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}]})
+    finally:
+        west.delete_api(apiId=api["apiId"])
+
+
 def test_appsync_graphql_honors_dynamodb_data_source_region():
     east_ddb = boto3.client(
         "dynamodb",
