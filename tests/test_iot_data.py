@@ -1012,6 +1012,35 @@ def test_iot_disabled_rule_does_not_fire(iot_client, iot_data_client, lam, sqs):
     iot_client.delete_topic_rule(ruleName=rule)
 
 
+def test_iot_disable_topic_rule_stops_the_rule(iot_client, iot_data_client, sqs, iam):
+    """DisableTopicRule stops both the topic filter and Basic Ingest; EnableTopicRule restarts them."""
+    queue = sqs.create_queue(QueueName=_unique("toggled-sink"))["QueueUrl"]
+    rule = _unique("toggled").replace("-", "_")
+    role = _rule_role(iam)
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/toggled'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}],
+        },
+    )
+
+    def publish(n):
+        for topic in ("sensors/a1/toggled", f"$aws/rules/{rule}"):
+            iot_data_client.publish(topic=topic, payload=json.dumps({"n": n}).encode())
+
+    try:
+        iot_client.disable_topic_rule(ruleName=rule)
+        publish(1)
+        assert _poll_body(sqs, queue, timeout=2) is None
+        iot_client.enable_topic_rule(ruleName=rule)
+        publish(2)
+        assert _take_bodies(sqs, queue, 2) == [{"n": 2}, {"n": 2}]
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
+        iam.delete_role(RoleName=role["RoleName"])
+
+
 # Every byte value: not valid UTF-8, so it survives the rule path only if the
 # payload is never text-decoded.
 _BINARY_PAYLOAD = bytes(range(256))
