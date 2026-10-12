@@ -40,7 +40,7 @@ FROM python:3.13-alpine AS runtime
 # Upgrade base packages to pick up latest security patches.
 RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
     && rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/bin/pip* \
-              /usr/local/lib/python3.13/ensurepip /usr/local/lib/python3.13/idlelib \
+              /usr/local/lib/python3.13/idlelib \
               /usr/local/lib/python3.13/pydoc_data /usr/local/lib/python3.13/tkinter \
               /usr/local/lib/python3.13/turtledemo
 

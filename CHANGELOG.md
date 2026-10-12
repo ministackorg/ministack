@@ -10,6 +10,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Cognito Identity — `GetOpenIdToken` claims** — the token was a user-pool ID token with an empty audience; it is now issued by `https://cognito-identity.amazonaws.com` with the identity pool id as `aud`, the identity id as `sub`, an `amr` list naming the login providers and the user-pool sign-in, the pool ARN in `https://cognito-identity.amazonaws.com/identity-pool-arn` and a 10-minute lifetime. An identity id that no pool knows gets `ResourceNotFoundException` instead of a token. Contributed by @iot-rocket.
+- **CloudTrail — new trails start with logging off** — `CreateTrail` left a new trail logging, and `GetTrailStatus` reported a `StartLoggingTime` an hour back and a `LatestDeliveryTime` of now. A new trail now reports `IsLogging` false until `StartLogging`, and `GetTrailStatus` returns only the `StartLoggingTime` and `StopLoggingTime` of calls made (a restart keeps the last stop time), without `LatestDeliveryTime` or empty error strings. Contributed by @iot-rocket.
+## [1.5.26] — 2026-10-11
+
+### Fixed
+- **Docker image — `ensurepip` is back in the slim image** — 1.5.24 removed `ensurepip` from the Alpine image, so `python -m venv` could not install pip in images built on top of MiniStack. Reported by @jin-gizmo.
+- **ECS — `DescribeServices` on a missing cluster** — returned success with every service listed as `MISSING`; it now returns `ClusterNotFoundException`.
+- **Startup memory without Docker** — the Docker Hub pull fallback imported the Docker SDK at boot even when no Docker socket was available. It now loads only when a socket is present.
 
 ## [1.5.25] — 2026-10-10
 
