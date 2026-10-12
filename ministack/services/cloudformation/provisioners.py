@@ -1137,6 +1137,12 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Events::EventBus": ("Tags", "list"),
     "AWS::IAM::Role": ("Tags", "list"),
     "AWS::IAM::User": ("Tags", "list"),
+    "AWS::IoT::CACertificate": ("Tags", "list"),
+    "AWS::IoT::Policy": ("Tags", "list"),
+    "AWS::IoT::ProvisioningTemplate": ("Tags", "list"),
+    "AWS::IoT::ThingGroup": ("Tags", "list"),
+    "AWS::IoT::ThingType": ("Tags", "list"),
+    "AWS::IoT::TopicRule": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
@@ -1178,9 +1184,11 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
         return props
     prop, shape = spec
     extra = _tag_map(stack_tags)
-    extra["aws:cloudformation:stack-name"] = stack_name
-    extra["aws:cloudformation:stack-id"] = stack_id
-    extra["aws:cloudformation:logical-id"] = logical_id
+    # IoT refuses aws: tag keys and lists none of these on its resources.
+    if not resource_type.startswith("AWS::IoT::"):
+        extra["aws:cloudformation:stack-name"] = stack_name
+        extra["aws:cloudformation:stack-id"] = stack_id
+        extra["aws:cloudformation:logical-id"] = logical_id
     own = props.get(prop)
     if shape == "map":
         merged = {**extra, **(own if isinstance(own, dict) else _tag_map(own))}
@@ -13489,12 +13497,13 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
         created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_iot_policy_delete, physical_id, old_props)
         return created
-    _iot_policy_prune_versions(name)
-    resp = _iot._create_policy_version(
-        name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
-    )
-    if resp[0] >= 400:
-        raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
+    if _iot_policy_document(new_props) != _iot_policy_document(old_props):
+        _iot_policy_prune_versions(name)
+        resp = _iot._create_policy_version(
+            name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
     _iot_update_tags(_iot._policy_arn(name), old_props, new_props)
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
@@ -13526,7 +13535,7 @@ def _iot_provisioning_template_payload(name, props):
     if "Description" in props:
         payload["description"] = props["Description"]
     if "Enabled" in props:
-        payload["enabled"] = props["Enabled"]
+        payload["enabled"] = _cfn_bool(props["Enabled"])
     if "TemplateType" in props:
         payload["type"] = props["TemplateType"]
     if props.get("PreProvisioningHook"):

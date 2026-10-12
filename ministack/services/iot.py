@@ -1887,9 +1887,25 @@ def _validate_provisioning_template_name(name: str | None) -> tuple | None:
     return None
 
 
+def _provisioning_template_resource_error(resource, certificates: int) -> str | None:
+    """Why the service refuses one resource of a template body, or None."""
+    props = resource.get("Properties")
+    if props is None:
+        return "Properties of a resource cannot be null."
+    if resource.get("Type") != "AWS::IoT::Certificate":
+        return None
+    if certificates:
+        return "Only one certificate resource can be defined"
+    if not isinstance(props, dict) or props.get("CertificateId") != {"Ref": "AWS::IoT::Certificate::Id"}:
+        return "CertificateId must contain a reference to AWS::IoT::Certificate::Id"
+    status = props.get("Status")
+    if not isinstance(status, str) or status.lower() not in ("active", "inactive"):
+        return 'A certificate resource must specify a Status of either "Active" or "Inactive"'
+    return None
+
+
 def _validate_provisioning_template_body(body) -> tuple | None:
-    """The live service refuses a body without an AWS::IoT::Certificate
-    resource; its message is quoted verbatim below."""
+    """Refuse a body the live service refuses, with its messages verbatim."""
     doc = body
     if not isinstance(doc, dict):
         try:
@@ -1904,10 +1920,17 @@ def _validate_provisioning_template_body(body) -> tuple | None:
         )
     resources = doc.get("Resources")
     values = resources.values() if isinstance(resources, dict) else ()
-    if not any(
-        isinstance(r, dict) and r.get("Type") == "AWS::IoT::Certificate"
-        for r in values
-    ):
+    certificates = 0
+    for resource in values:
+        if not isinstance(resource, dict):
+            continue
+        reason = _provisioning_template_resource_error(resource, certificates)
+        if reason:
+            return error_response_json(
+                "InvalidRequestException", f"The template body is invalid: {reason}", 400
+            )
+        certificates += resource.get("Type") == "AWS::IoT::Certificate"
+    if not certificates:
         return error_response_json(
             "InvalidRequestException",
             "The template body is invalid: Template must have certificate resource.",

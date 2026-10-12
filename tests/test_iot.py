@@ -1633,7 +1633,8 @@ def _provisioning_template_body() -> str:
         "Resources": {
             "certificate": {
                 "Type": "AWS::IoT::Certificate",
-                "Properties": {"CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}},
+                "Properties": {"CertificateId": {"Ref": "AWS::IoT::Certificate::Id"},
+                               "Status": "ACTIVE"},
             },
             "thing": {
                 "Type": "AWS::IoT::Thing",
@@ -1736,6 +1737,56 @@ def test_iot_provisioning_template_body_must_carry_certificate_resource(iot_clie
 
     with pytest.raises(ClientError):
         iot_client.describe_provisioning_template(templateName=name)
+
+
+def test_iot_provisioning_template_body_checks_the_certificate_resource(iot_client):
+    """The template body's certificate resource needs a CertificateId reference and an Active or Inactive Status."""
+    role = "arn:aws:iam::000000000000:role/provisioning"
+    cert_id = {"CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}}
+    status_msg = 'A certificate resource must specify a Status of either "Active" or "Inactive"'
+    id_msg = "CertificateId must contain a reference to AWS::IoT::Certificate::Id"
+    thing = {"Type": "AWS::IoT::Thing", "Properties": {"ThingName": "t"}}
+
+    def cert(**props):
+        return {"Type": "AWS::IoT::Certificate", "Properties": props}
+
+    cases = [
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id)}, status_msg),
+        ("JITP", {"c": cert(**cert_id)}, status_msg),
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id, Status="PENDING_ACTIVATION")}, status_msg),
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id, Status="")}, status_msg),
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id, Status=None)}, status_msg),
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id, Status={"Ref": "S"})}, status_msg),
+        ("JITP", {"c": cert()}, id_msg),
+        ("FLEET_PROVISIONING", {"c": cert(CertificateId="abc", Status="ACTIVE")}, id_msg),
+        ("FLEET_PROVISIONING", {"c": cert(CertificateSigningRequest={"Ref": "Csr"}, Status="ACTIVE")}, id_msg),
+        ("FLEET_PROVISIONING", {"c": {"Type": "AWS::IoT::Certificate"}},
+         "Properties of a resource cannot be null."),
+        ("FLEET_PROVISIONING", {"c": cert(**cert_id, Status="ACTIVE"),
+                                "t": {"Type": "AWS::IoT::Thing", "Properties": None}},
+         "Properties of a resource cannot be null."),
+        ("FLEET_PROVISIONING", {"a": cert(**cert_id, Status="ACTIVE"), "b": cert(**cert_id)},
+         "Only one certificate resource can be defined"),
+        ("FLEET_PROVISIONING", {"a": cert(**cert_id), "b": cert(**cert_id, Status="ACTIVE")}, status_msg),
+    ]
+    for kind, resources, message in cases:
+        name = _unique("provtemplate")
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_template(
+                templateName=name, templateBody=json.dumps({"Resources": resources}),
+                provisioningRoleArn=role, type=kind)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == f"The template body is invalid: {message}", resources
+        with pytest.raises(ClientError):
+            iot_client.describe_provisioning_template(templateName=name)
+
+    for kind, status in (("FLEET_PROVISIONING", "active"), ("JITP", "Inactive"),
+                         ("FLEET_PROVISIONING", "AcTiVe")):
+        name = _unique("provtemplate")
+        iot_client.create_provisioning_template(
+            templateName=name, provisioningRoleArn=role, type=kind,
+            templateBody=json.dumps({"Resources": {"c": cert(**cert_id, Status=status), "t": thing}}))
+        iot_client.delete_provisioning_template(templateName=name)
 
 
 def test_iot_provisioning_template_name_validation(iot_client):

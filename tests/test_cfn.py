@@ -1342,7 +1342,8 @@ def _cfn_provisioning_template_body(marker="one"):
         "Resources": {
             "certificate": {"Type": "AWS::IoT::Certificate",
                             "Properties": {"CertificateId":
-                                           {"Ref": "AWS::IoT::Certificate::Id"}}},
+                                           {"Ref": "AWS::IoT::Certificate::Id"},
+                                           "Status": "ACTIVE"}},
             "thing": {"Type": "AWS::IoT::Thing",
                       "Properties": {"ThingName": {"Ref": "SerialNumber"},
                                      "AttributePayload": {"Attributes":
@@ -1402,6 +1403,60 @@ def test_cfn_iot_provisioning_template(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-provtmpl")
     with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
         iot_client.describe_provisioning_template(templateName="cfn-provtemplate")
+
+
+def test_cfn_iot_provisioning_template_enabled_from_a_string(cfn, iot_client):
+    """Enabled as the string 'false' disables the template; a parameter update to 'true' enables it in place."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, by_ref, literal = f"cfn-pt-enabled-{uid}", f"cfn-pt-ref-{uid}", f"cfn-pt-str-{uid}"
+
+    def template(name, enabled):
+        return {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+            "TemplateName": name, "Enabled": enabled,
+            "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+            "TemplateBody": _cfn_provisioning_template_body()}}
+
+    body = json.dumps({
+        "Parameters": {"EnabledParam": {"Type": "String", "Default": "false"}},
+        "Resources": {"ByRef": template(by_ref, {"Ref": "EnabledParam"}),
+                      "Literal": template(literal, "false")},
+    })
+
+    def enabled(name):
+        return iot_client.describe_provisioning_template(templateName=name)["enabled"]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=body)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert (enabled(by_ref), enabled(literal)) == (False, False)
+        cfn.update_stack(StackName=stack_name, TemplateBody=body, Parameters=[
+            {"ParameterKey": "EnabledParam", "ParameterValue": "true"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert (enabled(by_ref), enabled(literal)) == (True, False)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_provisioning_template_certificate_without_status_fails_the_stack(cfn, iot_client):
+    """A certificate resource without Status fails the create and rolls the stack back with no template left."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, name = f"cfn-pt-nostatus-{uid}", f"cfn-pt-nostatus-{uid}"
+    body = json.loads(_cfn_provisioning_template_body())
+    del body["Resources"]["certificate"]["Properties"]["Status"]
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"PT": {
+        "Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+            "TemplateName": name, "TemplateBody": json.dumps(body),
+            "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning"}}}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert ("The template body is invalid: A certificate resource must specify a Status"
+                in _stack_event_reasons(cfn, stack_name))
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_provisioning_template(templateName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_iot_provisioning_template_rename_replaces(cfn, iot_client):
@@ -27138,6 +27193,65 @@ def test_cfn_iot_tags_follow_the_template(cfn, iot_client):
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
     assert listed() == [{}] * 3
+
+
+def test_cfn_iot_stack_tags_reach_the_tagged_types(cfn, iot_client):
+    """Stack tags reach every tagged IoT type but JobTemplate, yield to a same-key template tag, and update in place."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-stacktags-{uid}"
+    ca_pem, _key = generate_ca(common_name=f"cfn-stacktags-{uid}")
+    own = [{"Key": "own", "Value": "1"}]
+    body = json.dumps({"Resources": {
+        "Type": {"Type": "AWS::IoT::ThingType", "Properties": {"ThingTypeName": f"cfn-st-type-{uid}", "Tags": own}},
+        "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+            "ThingGroupName": f"cfn-st-group-{uid}", "Tags": own + [{"Key": "shared", "Value": "own"}]}},
+        "Policy": {"Type": "AWS::IoT::Policy", "Properties": {
+            "PolicyName": f"cfn-st-policy-{uid}", "Tags": own, "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Deny", "Action": "iot:Publish", "Resource": "*"}]}}},
+        "Rule": {"Type": "AWS::IoT::TopicRule", "Properties": {
+            "RuleName": f"cfn_st_rule_{uid}", "Tags": own,
+            "TopicRulePayload": {"Sql": "SELECT * FROM 't'", "Actions": [], "RuleDisabled": True}}},
+        "Ca": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem, "CertificateMode": "SNI_ONLY", "Status": "INACTIVE", "Tags": own}},
+        "Pt": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+            "TemplateName": f"cfn-st-pt-{uid}", "TemplateBody": _cfn_provisioning_template_body(),
+            "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning"}},
+        "Jt": {"Type": "AWS::IoT::JobTemplate", "Properties": {
+            "JobTemplateId": f"cfn-st-jt-{uid}", "Description": "d", "Document": "{}", "Tags": own}},
+    }, "Outputs": {"Ca": {"Value": {"Ref": "Ca"}}}})
+
+    def tags_by_resource():
+        return [{t["Key"]: t["Value"] for t in iot_client.list_tags_for_resource(resourceArn=arn)["tags"]}
+                for arn in arns]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=body,
+                     Tags=[{"Key": "stacktag", "Value": "s"}, {"Key": "shared", "Value": "stack"}])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        prefix = "arn:aws:iot:us-east-1:000000000000:"
+        arns = [f"{prefix}thingtype/cfn-st-type-{uid}", f"{prefix}thinggroup/cfn-st-group-{uid}",
+                f"{prefix}policy/cfn-st-policy-{uid}", f"{prefix}rule/cfn_st_rule_{uid}",
+                f"{prefix}cacert/{_output(stack, 'Ca')}", f"{prefix}provisioningtemplate/cfn-st-pt-{uid}",
+                f"{prefix}jobtemplate/cfn-st-jt-{uid}"]
+        stacked = {"own": "1", "shared": "stack", "stacktag": "s"}
+        assert tags_by_resource() == [stacked, {**stacked, "shared": "own"}, stacked, stacked, stacked,
+                            {"shared": "stack", "stacktag": "s"}, {"own": "1"}]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=body,
+                         Tags=[{"Key": "stacktag", "Value": "t"}, {"Key": "added", "Value": "1"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        stacked = {"own": "1", "stacktag": "t", "added": "1"}
+        assert tags_by_resource() == [stacked, {**stacked, "shared": "own"}, stacked, stacked, stacked,
+                            {"stacktag": "t", "added": "1"}, {"own": "1"}]
+        assert len(iot_client.list_policy_versions(policyName=f"cfn-st-policy-{uid}")["policyVersions"]) == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
