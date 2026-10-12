@@ -1400,6 +1400,29 @@ def test_iot_delete_thing_of_an_unknown_name_succeeds(iot_client):
         iot_client.describe_thing(thingName=name)
 
 
+def test_iot_delete_thing_checks_expected_version(iot_client):
+    """A wrong expectedVersion is refused before the attached-principal check; the current one deletes."""
+    pytest.importorskip("cryptography")
+    name = _unique("thing")
+    iot_client.create_thing(thingName=name)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    iot_client.attach_thing_principal(thingName=name, principal=cert["certificateArn"])
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing(thingName=name, expectedVersion=2)
+    err = ei.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        409, "VersionConflictException", f"The version for thing {name} does not match the expected version.")
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing(thingName=name, expectedVersion=1)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    iot_client.detach_thing_principal(thingName=name, principal=cert["certificateArn"])
+    iot_client.delete_thing(thingName=name, expectedVersion=1)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
 def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
     from ministack.core.responses import (
         get_account_id,

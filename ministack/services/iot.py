@@ -1283,7 +1283,7 @@ def _handle_thing(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if method == "PATCH":
         return _update_thing(name, _parse_body(body))
     if method == "DELETE":
-        return _delete_thing(name)
+        return _delete_thing(name, qp.get("expectedVersion"))
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
     )
@@ -1409,11 +1409,17 @@ def _update_thing(name: str, payload: dict) -> tuple:
     return json_response({})
 
 
-def _delete_thing(name: str) -> tuple:
+def _delete_thing(name: str, expected_version=None) -> tuple:
     """DeleteThing; an unknown name answers 200 like a completed delete."""
     thing = _things.get(name)
     if thing is None:
         return json_response({})
+    if expected_version not in (None, "") and str(expected_version) != str(thing.get("version", 1)):
+        return error_response_json(
+            "VersionConflictException",
+            f"The version for thing {name} does not match the expected version.",
+            409,
+        )
     if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
         return error_response_json(
             "InvalidRequestException",
