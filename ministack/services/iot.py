@@ -37,8 +37,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateEventConfigurations``
   - Jobs (control plane): ``CreateJob``, ``UpdateJob``, ``DescribeJob``,
     ``ListJobs``, ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
-    ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
-    ``CancelJobExecution`` — execution state shared with the
+    ``ListJobExecutionsForThing``, ``ListJobExecutionsForJob``,
+    ``DescribeJobExecution``, ``CancelJobExecution``,
+    ``DeleteJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
   - Job templates: ``CreateJobTemplate``, ``DescribeJobTemplate``,
     ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
@@ -529,7 +530,8 @@ async def _route_request(
     # must come BEFORE the generic /things/{name} branch.
     if path.startswith("/things/") and path.endswith("/thing-groups") and method == "GET":
         return _list_thing_groups_for_thing(path)
-    # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] — like
+    # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] and
+    # /things/{name}/jobs/{jobId}/executionNumber/{n} — like
     # /principals, must come BEFORE the generic /things/{name} branch. The
     # `jobs` segment only counts when a thing name precedes it: `/things/jobs`
     # is thing CRUD for a thing that happens to be named `jobs`.
@@ -1399,6 +1401,9 @@ def _delete_thing(name: str) -> tuple:
     orphaned_jobs = [key[1] for key in _job_executions.keys() if key[0] == name]
     for job_id in orphaned_jobs:
         del _job_executions[(name, job_id)]
+    for job in _jobs.values():
+        if name in (job.get("executionsDeletedFor") or ()):
+            job["executionsDeletedFor"].remove(name)
     del _things[name]
     for job_id in orphaned_jobs:
         _jobs_maybe_complete(job_id)
@@ -1800,14 +1805,15 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
     if thing is None:
         return _error_not_found("Thing", tname or "")
     prev_next = jobs_first_pending_job_id(tname)
-    if tname in group.get("things", []):
+    left = tname in group.get("things", [])
+    if left:
         group["things"].remove(tname)
         _thing_groups[gname] = group
         _membership_event("REMOVED", group, thing)
     if gname in thing.get("thingGroupNames", []):
         thing["thingGroupNames"].remove(gname)
         _things[tname] = thing
-    if _jobs_thing_left_group(tname):
+    if _jobs_thing_left_group(tname, _thing_group_arn(gname) if left else None):
         await jobs_notify_thing(get_account_id(), get_region(), tname, prev_next)
     return json_response({})
 
@@ -4847,6 +4853,9 @@ def _list_topic_rules(qp: dict) -> tuple:
 # A thing leaving every target of a CONTINUOUS job moves its QUEUED execution
 # to REMOVED (see `_jobs_thing_left_group`). Deleting a thing DELETES its
 # executions (see `_delete_thing`) rather than marking them REMOVED.
+# DeleteJobExecution removes one execution; a CONTINUOUS job's thing that
+# lost all of them is listed under the job's `executionsDeletedFor`, so that
+# reads do not queue a new one until the thing joins a target group again.
 
 # Job ids are stricter than thing names, and identically so in both service
 # models (`iot` and `iot-jobs-data` declare JobId as [a-zA-Z0-9_-], max 64).
@@ -4962,9 +4971,10 @@ def _jobs_materialize_executions(job_id: str) -> None:
     if job.get("targetSelection") == "SNAPSHOT" and job.get("snapshotted"):
         return
     now = _jobs_now_ms()
+    deleted = job.get("executionsDeletedFor") or ()
     for thing in _job_target_things(job.get("targets")):
         key = (thing, job_id)
-        if key in _job_executions:
+        if key in _job_executions or thing in deleted:
             continue
         _jobs_queue_execution(thing, job_id, now)
     if job.get("targetSelection") == "SNAPSHOT":
@@ -4996,6 +5006,9 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
             *previous.get("history", []),
         ]
     _job_executions[(thing, job_id)] = execution
+    deleted = (_jobs.get(job_id) or {}).get("executionsDeletedFor")
+    if deleted and thing in deleted:
+        deleted.remove(thing)
 
 
 def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
@@ -5025,10 +5038,11 @@ def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
     return queued
 
 
-def _jobs_thing_left_group(thing: str) -> bool:
+def _jobs_thing_left_group(thing: str, group_arn: str | None) -> bool:
     """Retire a thing's QUEUED CONTINUOUS executions after it left a group.
 
-    Call after the membership change. For every CONTINUOUS job the thing no
+    Call after the membership change, with the ARN of the group the thing
+    left (None when it was not a member). For every CONTINUOUS job the thing no
     longer resolves into, a QUEUED execution becomes REMOVED with its
     `versionNumber` unchanged. IN_PROGRESS, SUCCEEDED and FAILED executions
     keep their status (measured eu-central-1 2026-10-05). Returns whether a
@@ -5038,6 +5052,17 @@ def _jobs_thing_left_group(thing: str) -> bool:
     removed = False
     for job_id, job in _jobs.items():
         execution = _job_executions.get((thing, job_id))
+        if (
+            execution is None
+            and thing in (job.get("executionsDeletedFor") or ())
+            and group_arn in (job.get("targets") or [])
+            and job.get("status") != "CANCELED"
+            and thing not in _job_target_things(job.get("targets"))
+        ):
+            # All its executions were deleted: it gets a REMOVED one, without an event.
+            _jobs_queue_execution(thing, job_id, now)
+            _job_executions[(thing, job_id)]["status"] = "REMOVED"
+            continue
         if (
             execution is None
             or execution["status"] != "QUEUED"
@@ -5276,6 +5301,8 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return await _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
     if suffix.endswith("/job-document") and method == "GET":
         return _get_job_document(suffix[:-len("/job-document")])
+    if suffix.endswith("/things") and method == "GET":
+        return _list_job_executions_for_job(suffix[:-len("/things")], qp)
     if "/" in suffix:
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -5792,7 +5819,7 @@ _JOB_TEMPLATE_CONFIG_MEMBERS = (
     "presignedUrlConfig", "jobExecutionsRolloutConfig", "abortConfig",
     "timeoutConfig", "jobExecutionsRetryConfig",
 )
-_JOB_TEMPLATE_PAGE_MAX = 250
+_JOB_PAGE_MAX = 250
 
 
 def _job_template_arn(template_id: str) -> str:
@@ -5978,43 +6005,51 @@ def _describe_job_template(template_id: str) -> tuple:
     })
 
 
-def _list_job_templates(qp: dict) -> tuple:
-    """``GET /job-templates``, newest first, paged by ``maxResults`` /
-    ``nextToken``; the token carries an offset into that order."""
+def _jobs_page(items: list, qp: dict, kind: str) -> tuple[list, str | None, tuple | None]:
+    """The ``maxResults`` / ``nextToken`` page of ``items`` as (page, token, error); a token is an offset."""
     raw = qp.get("maxResults")
     try:
-        limit = _JOB_TEMPLATE_PAGE_MAX if raw in (None, "") else int(raw)
+        limit = _JOB_PAGE_MAX if raw in (None, "") else int(raw)
     except (TypeError, ValueError):
         limit = 0
-    if not 1 <= limit <= _JOB_TEMPLATE_PAGE_MAX:
+    if not 1 <= limit <= _JOB_PAGE_MAX:
         bound = ("greater than or equal to 1" if limit < 1
-                 else f"less than or equal to {_JOB_TEMPLATE_PAGE_MAX}")
-        return _job_template_validation_error(
+                 else f"less than or equal to {_JOB_PAGE_MAX}")
+        return [], None, _job_validation_error([_job_validation_clause(
             raw, "maxResults", f"Member must have value {bound}"
-        )
+        )])
     start = 0
     token = qp.get("nextToken")
     if token:
         try:
             raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
             prefix, _, offset = raw_token.partition(":")
-            start = int(offset) if prefix == "jobtemplates" else -1
+            start = int(offset) if prefix == kind else -1
         except ValueError:  # binascii.Error and UnicodeDecodeError included
             start = -1
         if start < 0:
-            return error_response_json(
+            return [], None, error_response_json(
                 "InvalidRequestException", "Next token is invalid.", 400
             )
+    if start + limit >= len(items):
+        return items[start:], None, None
+    token = base64.urlsafe_b64encode(f"{kind}:{start + limit}".encode()).decode().rstrip("=")
+    return items[start:start + limit], token, None
+
+
+def _list_job_templates(qp: dict) -> tuple:
+    """``GET /job-templates``, newest first, paged by ``maxResults`` /
+    ``nextToken``; the token carries an offset into that order."""
     ordered = sorted(_job_templates.values(), key=lambda t: t["createdAt"], reverse=True)
-    page = ordered[start:start + limit]
+    page, token, error = _jobs_page(ordered, qp, "jobtemplates")
+    if error:
+        return error
     response = {"jobTemplates": [
         {k: t[k] for k in ("jobTemplateArn", "jobTemplateId", "description", "createdAt")}
         for t in page
     ]}
-    if start + limit < len(ordered):
-        response["nextToken"] = base64.urlsafe_b64encode(
-            f"jobtemplates:{start + limit}".encode()
-        ).decode().rstrip("=")
+    if token:
+        response["nextToken"] = token
     return json_response(response)
 
 
@@ -6135,7 +6170,8 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
 async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
     """Dispatch /things/{name}/jobs[...] control-plane routes.
 
-    Async because CancelJobExecution publishes jobs/notify(-next)."""
+    Async because CancelJobExecution and DeleteJobExecution publish
+    jobs/notify(-next)."""
     rest = path[len("/things/"):]
     thing, _, sub = rest.partition("/")
     err = _validate_name(thing, "thingName")
@@ -6158,6 +6194,9 @@ async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> t
         )
     if "/" not in tail and method == "GET":
         return _describe_job_execution(thing, tail, qp)
+    job_id, _, number = tail.partition("/executionNumber/")
+    if number and "/" not in job_id and method == "DELETE":
+        return await _delete_job_execution(thing, job_id, number, qp)
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
     )
@@ -6184,19 +6223,68 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
             continue
         if wanted_job and execution["jobId"] != wanted_job:
             continue
-        summary = {
-            "status": execution["status"],
-            "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
-            "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
-            "executionNumber": execution["executionNumber"],
-            "retryAttempt": execution.get("retryAttempt", 0),
-        }
-        if execution.get("startedAt") is not None:
-            summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
-        summaries.append(
-            {"jobId": execution["jobId"], "jobExecutionSummary": summary}
-        )
+        summaries.append({
+            "jobId": execution["jobId"],
+            "jobExecutionSummary": _job_execution_summary(execution),
+        })
     return json_response({"executionSummaries": summaries})
+
+
+def _job_execution_summary(execution: dict) -> dict:
+    """Control-plane JobExecutionSummary, as both execution lists nest it."""
+    summary = {
+        "status": execution["status"],
+        "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
+        "executionNumber": execution["executionNumber"],
+        "retryAttempt": execution.get("retryAttempt", 0),
+    }
+    if execution.get("startedAt") is not None:
+        summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
+    return summary
+
+
+def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
+    """``GET /jobs/{jobId}/things``, most recently updated first, paged like ``ListJobTemplates``."""
+    clauses = []
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", job_id):
+        clauses.append(_job_validation_clause(
+            job_id, "jobId", "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+"
+        ))
+    status = qp.get("status")
+    if status is not None and status not in _JOB_EXECUTION_STATUSES:
+        clauses.append(_job_validation_clause(
+            status, "status", "Member must satisfy enum value set: [REMOVED, SUCCEEDED, "
+            "TIMED_OUT, IN_PROGRESS, QUEUED, CANCELED, FAILED, REJECTED]"
+        ))
+    if clauses:
+        return _job_validation_error(clauses)
+    _, _, error = _jobs_page([], qp, "jobexecutions")
+    if error:
+        return error
+    if job_id not in _jobs:
+        return error_response_json(
+            "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+        )
+    _jobs_materialize_executions(job_id)
+    executions = [
+        execution
+        for latest in _job_executions.values()
+        if latest["jobId"] == job_id
+        for execution in _jobs_with_history(latest)
+        if status is None or execution["status"] == status
+    ]
+    executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
+    page, token, error = _jobs_page(executions, qp, "jobexecutions")
+    if error:
+        return error
+    response = {"executionSummaries": [
+        {"thingArn": _thing_arn(e["thingName"]), "jobExecutionSummary": _job_execution_summary(e)}
+        for e in page
+    ]}
+    if token:
+        response["nextToken"] = token
+    return json_response(response)
 
 
 def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
@@ -6266,6 +6354,65 @@ async def _cancel_job_execution(
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
     return json_response({})
+
+
+async def _delete_job_execution(thing: str, job_id: str, number: str, qp: dict) -> tuple:
+    """Delete one of a thing's executions of a job; an IN_PROGRESS one only with force."""
+    try:
+        number = int(number)
+    except ValueError:
+        return error_response_json(
+            "SerializationException", f"'{number}' can not be converted to Long", 400
+        )
+    if number < 1:
+        return error_response_json(
+            "InvalidRequestException", "Execution number is invalid.", 400
+        )
+    job = _jobs.get(job_id)
+    if job is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Job execution cannot be found as the Job {job_id} does not exist.",
+            404,
+        )
+    _jobs_materialize_executions(job_id)
+    latest = _job_executions.get((thing, job_id))
+    executions = _jobs_with_history(_jobs_apply_timeout(latest)) if latest else []
+    execution = next((e for e in executions if e["executionNumber"] == number), None)
+    if execution is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Job execution for thing {thing} cannot be found within job {job_id}.",
+            404,
+        )
+    if execution["status"] == "IN_PROGRESS" and not _qp_bool(qp, "force"):
+        return error_response_json(
+            "InvalidStateTransitionException",
+            f"Job execution for thing {thing} within job {job_id} in status "
+            "IN_PROGRESS cannot be deleted without force flag.",
+            409,
+        )
+    pending = execution["status"] in ("QUEUED", "IN_PROGRESS")
+    prev_next = jobs_first_pending_job_id(thing) if pending else None
+    # The next newest execution, if any, becomes the thing's current one.
+    rest = [
+        {k: v for k, v in e.items() if k != "history"}
+        for e in executions
+        if e is not execution
+    ]
+    if rest:
+        if len(rest) > 1:
+            rest[0]["history"] = rest[1:]
+        _job_executions[(thing, job_id)] = rest[0]
+    else:
+        del _job_executions[(thing, job_id)]
+        if job.get("targetSelection") == "CONTINUOUS":
+            job.setdefault("executionsDeletedFor", []).append(thing)
+    _job_execution_event(execution, "DELETED")
+    _jobs_maybe_complete(job_id)
+    if pending:
+        await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    return 200, {}, b""
 
 
 # ---------------------------------------------------------------------------
