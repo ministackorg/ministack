@@ -3377,7 +3377,8 @@ def _cwlogs_import(identifier):
 
 
 def _cwlogs_delete(physical_id, props):
-    _cw_logs._log_groups.pop(physical_id, None)
+    """Delete through DeleteLogGroup, which also drops the group's metric filters, policy and records."""
+    _cw_logs._delete_log_group({"logGroupName": physical_id})
 
 
 # --- CloudWatch Logs ResourcePolicy ---

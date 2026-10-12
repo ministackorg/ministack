@@ -754,6 +754,12 @@ def test_ecs_create_service_v2(ecs):
     assert svc["status"] == "ACTIVE"
     assert svc["desiredCount"] == 2
 
+def test_ecs_describe_services_missing_cluster(ecs):
+    with pytest.raises(ClientError) as exc:
+        ecs.describe_services(cluster=f"none-{_uuid_mod.uuid4().hex[:8]}", services=["svc"])
+    assert exc.value.response["Error"]["Code"] == "ClusterNotFoundException"
+
+
 def test_ecs_describe_services_v2(ecs):
     ecs.create_cluster(clusterName="ecs-ds-v2c")
     ecs.register_task_definition(
