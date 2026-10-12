@@ -13505,8 +13505,16 @@ def _iot_policy_import(identifier):
 
 
 def _iot_policy_delete(physical_id, props):
-    _iot._policies.pop(physical_id, None)
-    _iot._tags.pop(_iot._policy_arn(physical_id), None)
+    """Delete the non-default versions, then the policy; a policy still attached fails the delete."""
+    policy = _iot._policies.get(physical_id)
+    if policy is None:
+        return
+    for version_id, version in list(policy["versions"].items()):
+        if not version["isDefaultVersion"]:
+            _iot._delete_policy_version(physical_id, version_id)
+    resp = _iot._delete_policy(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_provisioning_template_body(props):

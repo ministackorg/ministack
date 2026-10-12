@@ -1333,6 +1333,53 @@ def test_cfn_iot_policy_rename_replaces_the_policy(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-pol-ren")
 
 
+def test_cfn_iot_policy_delete_removes_versions_and_keeps_an_attached_policy(cfn, iot_client):
+    """A stack delete removes non-default policy versions; a policy still attached fails its delete until detached."""
+    pytest.importorskip("cryptography")
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, attached, free = f"cfn-iot-pol-del-{uid}", f"cfn-pol-att-{uid}", f"cfn-pol-free-{uid}"
+
+    def template(action):
+        doc = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": action, "Resource": "*"}]}
+        return json.dumps({"Resources": {
+            "Attached": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": attached, "PolicyDocument": doc}},
+            "Free": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": free, "PolicyDocument": doc}},
+        }})
+
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    outside_doc = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Deny", "Action": "iot:Connect", "Resource": "*"}]})
+    cfn.create_stack(StackName=stack, TemplateBody=template("iot:Connect"))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack, TemplateBody=template("iot:Publish"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        for name in (attached, free):
+            iot_client.create_policy_version(policyName=name, policyDocument=outside_doc, setAsDefault=False)
+            assert len(iot_client.list_policy_versions(policyName=name)["policyVersions"]) == 3
+        iot_client.attach_policy(policyName=attached, target=cert["certificateArn"])
+
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_FAILED"
+        assert _cfn_iot_failure(cfn, stack, "Attached", "DELETE_FAILED") == (
+            "The policy cannot be deleted as the policy is attached to one or more principals "
+            f"(name={attached})")
+        versions = iot_client.list_policy_versions(policyName=attached)["policyVersions"]
+        assert [(v["versionId"], v["isDefaultVersion"]) for v in versions] == [("2", True)]
+        assert iot_client.list_targets_for_policy(policyName=attached)["targets"] == [cert["certificateArn"]]
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.get_policy(policyName=free)
+
+        iot_client.detach_policy(policyName=attached, target=cert["certificateArn"])
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.get_policy(policyName=attached)
+    finally:
+        iot_client.delete_certificate(certificateId=cert["certificateId"], forceDelete=True)
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def _cfn_provisioning_template_body(marker="one"):
     # The IoT control plane refuses a body without an AWS::IoT::Certificate
     # resource, so every stack body carries one; `marker` varies the body so a
