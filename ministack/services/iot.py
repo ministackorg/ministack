@@ -2845,6 +2845,8 @@ def _handle_policy(method: str, path: str, body: bytes, qp: dict) -> tuple:
             return _get_policy_version(name, version_id)
         if method == "DELETE":
             return _delete_policy_version(name, version_id)
+        if method == "PATCH":
+            return _set_default_policy_version(name, version_id)
 
     # /policies/{name}/version
     if len(parts) == 2 and parts[1] == "version":
@@ -3023,7 +3025,7 @@ def _list_policy_versions(name: str) -> tuple:
                 "isDefaultVersion": v["isDefaultVersion"],
                 "createDate": v.get("createDate"),
             }
-            for vid, v in p["versions"].items()
+            for vid, v in sorted(p["versions"].items(), key=lambda item: int(item[0]), reverse=True)
         ]
     })
 
@@ -3036,13 +3038,38 @@ def _delete_policy_version(name: str, version_id: str) -> tuple:
         return _error_not_found("PolicyVersion", version_id)
     if p["defaultVersionId"] == version_id:
         return error_response_json(
-            "InvalidRequestException",
-            "Cannot delete the default policy version",
-            400,
+            "DeleteConflictException",
+            f"Cannot delete a default policy version (name={name}, versionId={version_id})",
+            409,
         )
     del p["versions"][version_id]
     _policies[name] = p
     return json_response({})
+
+
+def _set_default_policy_version(name: str, version_id: str) -> tuple:
+    """SetDefaultPolicyVersion: 200 with an empty body, also for the current default."""
+    if not version_id.isdigit():
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'policyVersionId' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [0-9]+",
+            400,
+        )
+    p = _policies.get(name)
+    if p is None:
+        return _error_not_found("Policy", name)
+    if version_id not in p["versions"]:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Policy version does not exist (name={name}, versionId={version_id})",
+            404,
+        )
+    for vid, v in p["versions"].items():
+        v["isDefaultVersion"] = vid == version_id
+    p["defaultVersionId"] = version_id
+    _policies[name] = p
+    return 200, {}, b""
 
 
 # AttachPolicy / DetachPolicy via /target-policies/{policyName}
@@ -3069,12 +3096,13 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
     )
 
 
-def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tuple:
+def _change_policy_target(name: str, target: str | None, *, attach: bool, principal: bool = False) -> tuple:
     """``AttachPolicy`` / ``DetachPolicy`` over the policy and certificate stores.
 
     The data core behind both the modern ``/target-policies/{policyName}``
     route and the deprecated ``/principal-policies/{policyName}`` one, so
-    neither has to synthesize a request for the other.
+    neither has to synthesize a request for the other. ``principal`` selects
+    the deprecated call's refusals.
     """
     p = _policies.get(name)
     if p is None:
@@ -3083,6 +3111,10 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
         return error_response_json(
             "InvalidRequestException", "target is required", 400
         )
+    if attach:
+        err = _policy_target_error(target, principal=principal)
+        if err:
+            return err
     cert_id = target.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if attach:
@@ -3100,6 +3132,51 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
             cert["attachedPolicies"].remove(name)
             _certificates[cert_id] = cert
     return json_response({})
+
+
+# A Cognito identity id, the one target that is not an ARN.
+_COGNITO_IDENTITY_ID_RE = re.compile(r"[\w-]+:[0-9a-f-]+")
+
+
+def _policy_target_error(target: str, *, principal: bool) -> tuple | None:
+    """AttachPolicy's refusal of ``target`` (AttachPrincipalPolicy's with ``principal``), or ``None``."""
+    if _COGNITO_IDENTITY_ID_RE.fullmatch(target):
+        return None
+    try:
+        spec = parse_arn(target)
+    except ArnParseError:
+        spec = None
+    if spec is None:
+        if principal and target.startswith("arn:"):
+            return error_response_json("InvalidRequestException", "ARN not in proper syntax.", 400)
+        message = "Invalid principal type" if principal else "Invalid Target"
+        return error_response_json("InvalidRequestException", message, 400)
+    kind, _, resource_id = spec.resource.partition("/")
+    if spec.service != "iot" or kind not in (("cert",) if principal else ("cert", "thinggroup")):
+        message = "The given ARN does not represent a cert" if principal else f"Invalid Target: {target}"
+        return error_response_json("InvalidRequestException", message, 400)
+    if spec.account_id != get_account_id():
+        return error_response_json(
+            "AccessDeniedException",
+            "Cross account not allowed. Please check the account of the resource specified.",
+            403,
+        )
+    if spec.region != get_region() and not principal:
+        return error_response_json("InvalidRequestException", "Invalid Target", 400)
+    if kind == "thinggroup":
+        if resource_id in _thing_groups:
+            return None
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Cannot find requested thing group for accountId: {get_account_id()} and thing group name: "
+            f"{resource_id}",
+            404,
+        )
+    if resource_id in _certificates:
+        return None
+    return error_response_json(
+        "ResourceNotFoundException", "The certificate given in the principal does not exist.", 404
+    )
 
 
 def _policy_targets(name: str) -> list | None:
@@ -3160,7 +3237,7 @@ def _handle_principal_policy(method: str, path: str, headers: dict, qp: dict) ->
         return error_response_json(
             "InvalidRequestException", "x-amzn-iot-principal header is required", 400
         )
-    return _change_policy_target(name, principal, attach=method == "PUT")
+    return _change_policy_target(name, principal, attach=method == "PUT", principal=True)
 
 
 def _list_principal_policies(headers: dict, qp: dict) -> tuple:

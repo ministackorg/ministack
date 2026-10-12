@@ -1184,6 +1184,28 @@ def test_cfn_iot_principal_attachments(cfn, iot_client):
         iot_client.describe_thing(thingName=thing2)
 
 
+def test_cfn_iot_policy_principal_attachment_unknown_certificate(cfn, iot_client):
+    """A PolicyPrincipalAttachment to an unknown certificate fails the stack and rolls the policy back."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, policy = f"cfn-ppa-{uid}", f"cfn-ppa-{uid}"
+    document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+            "Pol": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": policy, "PolicyDocument": document}},
+            "Ppa": {"Type": "AWS::IoT::PolicyPrincipalAttachment", "Properties": {
+                "PolicyName": {"Ref": "Pol"},
+                "Principal": {"Fn::Sub": "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:cert/" + "ab" * 32}}},
+        }}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "The certificate given in the principal does not exist." in _cfn_iot_failure(
+            cfn, stack, "Ppa", "CREATE_FAILED")
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.get_policy(policyName=policy)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def test_cfn_iot_delete_keeps_what_is_attached_outside_the_stack(cfn, iot_client):
     """A certificate with a policy or a thing attached outside the stack is
     deactivated and then fails its delete, as is a thing with an outside
