@@ -11,6 +11,15 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **IoT — `ListJobExecutionsForJob`** — `GET /jobs/{jobId}/things` answered 400 `Unsupported IoT path`; it now lists every execution of the job, earlier ones of a rejoined thing included, most recently updated first, with the `status` filter and `maxResults` / `nextToken` paging. Contributed by @iot-rocket.
 - **IoT — `DeleteJobExecution`** — `DELETE /things/{thingName}/jobs/{jobId}/executionNumber/{executionNumber}` answered 400 `Unsupported IoT path`; it now deletes the execution (an `IN_PROGRESS` one only with `force`), drops it from the job's lists and counts, completes the job when only finished executions are left, and publishes the `deleted` job execution event and the thing's `jobs/notify` topics; a `CONTINUOUS` job's thing left with no execution gets none back until it leaves the group, which leaves a `REMOVED` execution 1. Contributed by @iot-rocket.
+### Fixed
+
+- **CloudTrail — new trails start with logging off** — `CreateTrail` left a new trail logging, and `GetTrailStatus` reported a `StartLoggingTime` an hour back and a `LatestDeliveryTime` of now. A new trail now reports `IsLogging` false until `StartLogging`, and `GetTrailStatus` returns only the `StartLoggingTime` and `StopLoggingTime` of calls made (a restart keeps the last stop time), without `LatestDeliveryTime` or empty error strings. Contributed by @iot-rocket.
+## [1.5.26] — 2026-10-11
+
+### Fixed
+- **Docker image — `ensurepip` is back in the slim image** — 1.5.24 removed `ensurepip` from the Alpine image, so `python -m venv` could not install pip in images built on top of MiniStack. Reported by @jin-gizmo.
+- **ECS — `DescribeServices` on a missing cluster** — returned success with every service listed as `MISSING`; it now returns `ClusterNotFoundException`.
+- **Startup memory without Docker** — the Docker Hub pull fallback imported the Docker SDK at boot even when no Docker socket was available. It now loads only when a socket is present.
 
 ## [1.5.25] — 2026-10-10
 

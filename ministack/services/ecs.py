@@ -1483,7 +1483,7 @@ def _delete_service(data):
 
 def _describe_services(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
-    if cluster_name is None:
+    if cluster_name is None or cluster_name not in _clusters:
         return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     refs = data.get("services", [])
     include = set(data.get("include", []))
