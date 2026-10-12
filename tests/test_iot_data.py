@@ -2424,6 +2424,9 @@ SUB_OPT_RETAIN_HANDLING_NEVER = 0x20
 PROP_PAYLOAD_FORMAT_INDICATOR = 0x01
 
 
+PROP_MESSAGE_EXPIRY_INTERVAL = 0x02
+
+
 PROP_CONTENT_TYPE = 0x03
 
 
@@ -2488,7 +2491,7 @@ def _enc_props(props: list[tuple[int, object]]) -> bytes:
             body.append(int(value))  # type: ignore[arg-type]
         elif ident in (PROP_TOPIC_ALIAS_MAXIMUM,):
             body += struct.pack("!H", int(value))  # type: ignore[arg-type]
-        elif ident in (PROP_SESSION_EXPIRY_INTERVAL,):
+        elif ident in (PROP_MESSAGE_EXPIRY_INTERVAL, PROP_SESSION_EXPIRY_INTERVAL):
             body += struct.pack("!I", int(value))  # type: ignore[arg-type]
         elif ident in (PROP_CORRELATION_DATA,):
             body += struct.pack("!H", len(value)) + value  # type: ignore[arg-type]
@@ -2876,7 +2879,7 @@ def test_http_publish_forwards_mqtt5_properties(iot_data_client):
     full, edges, none = _run(scenario())
     assert full == [
         (PROP_PAYLOAD_FORMAT_INDICATOR, 1),
-        (0x02, 60),
+        (0x02, 59),
         (PROP_RESPONSE_TOPIC, f"{topic}/reply"),
         (PROP_CORRELATION_DATA, b"\x00\x01req-7"),
         (PROP_CONTENT_TYPE, "application/json"),
@@ -2887,7 +2890,7 @@ def test_http_publish_forwards_mqtt5_properties(iot_data_client):
     ]
     assert edges == [
         (PROP_PAYLOAD_FORMAT_INDICATOR, 0),
-        (0x02, 604800),
+        (0x02, 604799),
         (PROP_CORRELATION_DATA, b"req-7"),
     ]
     assert none == []
@@ -3345,6 +3348,102 @@ def test_mqtt5_retain_handling_1_replays_only_for_a_new_subscription():
         "a message sent because a subscription was established carries RETAIN 1"
     )
     assert repeat_type == PKT_SUBACK, "the subscription already existed"
+
+
+def test_mqtt5_message_expiry_counts_down_on_delivery():
+    """A subscriber gets the expiry interval less the started second; 0 counts as 1, the cap is 604800."""
+    topic = _unique("v5/expiry/live")
+    intervals = [60, 1, 0, 604801, 0xFFFFFFFF]
+
+    async def scenario():
+        async with _connect(MQTT_5) as (sub, _c1):
+            await sub.send(_make_subscribe(1, topic, protocol_level=MQTT_5))
+            await sub.await_packet(PKT_SUBACK)
+            async with _connect(MQTT_5) as (pub, _c2):
+                delivered = []
+                for interval in intervals:
+                    await pub.send(
+                        _make_publish(topic, b"m", protocol_level=MQTT_5,
+                                      properties=[(PROP_MESSAGE_EXPIRY_INTERVAL, interval)])
+                    )
+                    _flags, body = await sub.await_packet(PKT_PUBLISH)
+                    delivered.append(_prop(_parse_publish(body, MQTT_5)[2], PROP_MESSAGE_EXPIRY_INTERVAL))
+                return delivered
+
+    assert _run(scenario()) == [59, 0, 0, 604799, 604799]
+
+
+def test_mqtt5_expired_retained_message_is_no_longer_served(iot_data_client):
+    """Once its expiry interval has passed, a retained message reaches neither a new subscriber nor iot-data."""
+    short, kept = _unique("v5/expiry/short"), _unique("v5/expiry/kept")
+
+    async def scenario():
+        async with _connect(MQTT_5) as (pub, _c1):
+            for packet_id, (topic, interval) in enumerate(((short, 1), (kept, 60)), start=1):
+                await pub.send(
+                    _make_publish(topic, b"stored", qos=1, packet_id=packet_id,
+                                  protocol_level=MQTT_5, retain=True,
+                                  properties=[(PROP_MESSAGE_EXPIRY_INTERVAL, interval)])
+                )
+                await pub.await_packet(PKT_PUBACK)
+        before = await asyncio.to_thread(iot_data_client.get_retained_message, topic=short)
+        await asyncio.sleep(1.2)
+        async with _connect(MQTT_5) as (sub, _c2):
+            await sub.send(_make_subscribe(1, short, protocol_level=MQTT_5))
+            first_type, _flags, _body = await sub.packet()
+            await sub.send(_make_subscribe(2, kept, protocol_level=MQTT_5))
+            flags, body = await sub.await_packet(PKT_PUBLISH)
+        return before, first_type, _parse_publish(body, MQTT_5, qos=(flags >> 1) & 0x03)[2]
+
+    before, first_type, kept_props = _run(scenario())
+    assert before["payload"] == b"stored"
+    assert first_type == PKT_SUBACK, "the expired message is not replayed"
+    assert 50 <= _prop(kept_props, PROP_MESSAGE_EXPIRY_INTERVAL) <= 58, "lowered by the time it waited"
+    with pytest.raises(ClientError) as exc:
+        iot_data_client.get_retained_message(topic=short)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    pages = iot_data_client.get_paginator("list_retained_messages").paginate()
+    listed = {t["topic"] for page in pages for t in page["retainedTopics"]}
+    assert kept in listed and short not in listed
+
+
+def test_mqtt5_queued_message_expires_while_the_session_is_offline():
+    """A resumed session gets only the queued messages still inside their interval, properties lowered."""
+    client_id, base = _unique("queue-expiry"), _unique("v5/expiry/queued")
+    session = {"clean_start": False, "properties": [(PROP_SESSION_EXPIRY_INTERVAL, 300)]}
+
+    async def scenario():
+        async with _connect(MQTT_5, client_id=client_id, **session) as (sub, _c1):
+            await sub.send(_make_subscribe(1, f"{base}/#", qos=1, protocol_level=MQTT_5))
+            await sub.await_packet(PKT_SUBACK)
+            await sub.send(_make_disconnect(MQTT_5))
+        await asyncio.sleep(0.5)
+        async with _connect(MQTT_5) as (pub, _c2):
+            for packet_id, (leaf, interval) in enumerate((("short", 1), ("long", 60), ("none", None)), start=1):
+                props = [] if interval is None else [(PROP_MESSAGE_EXPIRY_INTERVAL, interval)]
+                await pub.send(
+                    _make_publish(f"{base}/{leaf}", b"q", qos=1, packet_id=packet_id,
+                                  protocol_level=MQTT_5, properties=props)
+                )
+                await pub.await_packet(PKT_PUBACK)
+        await asyncio.sleep(1.2)
+        delivered = {}
+        async with _connect(MQTT_5, client_id=client_id, **session) as (back, connack):
+            try:
+                while True:
+                    flags, body = await back.await_packet(PKT_PUBLISH, timeout=1.0)
+                    topic, _payload, props = _parse_publish(body, MQTT_5, qos=(flags >> 1) & 0x03)
+                    delivered[topic.rsplit("/", 1)[1]] = _prop(props, PROP_MESSAGE_EXPIRY_INTERVAL, "absent")
+            except asyncio.TimeoutError:
+                pass
+            await back.send(_make_disconnect(MQTT_5))
+        return connack, delivered
+
+    connack, delivered = _run(scenario())
+    assert connack[0] & 0x01 == 1, "the session was resumed"
+    assert set(delivered) == {"long", "none"}
+    assert 50 <= delivered["long"] <= 58
+    assert delivered["none"] == "absent"
 
 
 def _make_connect_with_will(

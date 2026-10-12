@@ -53,8 +53,6 @@ _HTTP_RESTRICTED_TOPIC_RE = re.compile(
 
 # Publish's x-amz-mqtt5-payload-format-indicator values and the byte each one stands for.
 _PAYLOAD_FORMAT_INDICATORS = {"UNSPECIFIED_BYTES": 0, "UTF8_DATA": 1}
-# The broker's message expiry limit (seven days); longer intervals are capped.
-_MAX_MESSAGE_EXPIRY = 604800
 
 
 def _validate_topic(topic: str) -> tuple | None:
@@ -279,7 +277,7 @@ def _publish_properties(headers: dict, qp: dict) -> tuple[bytes, tuple | None]:
         seconds = int(expiry) if expiry.isascii() and expiry.isdigit() else -1
         if not 0 <= seconds < 2**32:
             return invalid("Message expiry interval must be an unsigned 4-byte integer")
-        props.append((_iot_module.PROP_MESSAGE_EXPIRY_INTERVAL, min(seconds, _MAX_MESSAGE_EXPIRY)))
+        props.append((_iot_module.PROP_MESSAGE_EXPIRY_INTERVAL, seconds))
     response_topic = qp.get("responseTopic")
     if response_topic:
         if "+" in response_topic or "#" in response_topic:

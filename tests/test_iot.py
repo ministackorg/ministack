@@ -3298,7 +3298,7 @@ def test_iot_broker_persistent_sessions_are_region_isolated():
         west_state = _persistent_sessions[
             (account_id, "us-west-2", client_id)
         ]
-        assert east_state.queued_messages == [
+        assert [m[:3] for m in east_state.queued_messages] == [
             ("events/one", b"east-only", 1)
         ]
         assert west_state.queued_messages == []
@@ -4095,7 +4095,7 @@ def test_queue_bounded_to_1000_messages():
         assert len(ps.queued_messages) == 1000
 
         # Verify oldest messages were dropped (first 50 should be gone)
-        first_topic, first_payload, first_qos = ps.queued_messages[0]
+        first_topic, first_payload, first_qos = ps.queued_messages[0][:3]
         assert first_payload == b"msg50"
 
     asyncio.run(_run())

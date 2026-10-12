@@ -76,6 +76,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -210,7 +211,7 @@ _retained: dict[str, "_RetainedMessage"] = {}
 
 
 class _RetainedMessage:
-    __slots__ = ("payload", "properties", "qos", "topic", "ts")
+    __slots__ = ("expires_at", "payload", "properties", "qos", "topic", "ts")
 
     def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b"",
                  ts: float | None = None):
@@ -221,6 +222,11 @@ class _RetainedMessage:
         # a message published by a 3.1.1 client.
         self.properties = properties
         self.ts = time.time() if ts is None else ts
+        self.expires_at = _message_expires_at(properties, self.ts)
+
+    def expired(self, now: float) -> bool:
+        """Whether the message's MQTT 5 expiry interval has run out."""
+        return self.expires_at is not None and now >= self.expires_at
 
 
 def _broker_get_state() -> dict:
@@ -7210,10 +7216,10 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 # property blocks on every packet that carries one, all four fields of the
 # subscription-options byte (QoS, No Local, Retain As Published, Retain
 # Handling), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
-# assigned client identifier, and pass-through of the PUBLISH properties a
-# subscriber may echo back. Out of scope, and advertised as unavailable in
-# CONNACK where the protocol has a flag for it: shared subscriptions, topic
-# aliases, message expiry, flow control (receive maximum), subscription
+# assigned client identifier, message expiry, and pass-through of the
+# PUBLISH properties a subscriber may echo back. Out of scope, and advertised
+# as unavailable in CONNACK where the protocol has a flag for it: shared
+# subscriptions, topic aliases, flow control (receive maximum), subscription
 # identifiers, and request/response semantics beyond forwarding the
 # properties untouched. Properties this broker does not model are parsed and
 # ignored, never echoed back.
@@ -7265,7 +7271,8 @@ class _PersistentSessionState:
         session_identifier: str | None = None,
     ):
         self.subscriptions: list[str] = subscriptions
-        self.queued_messages: list[tuple[str, bytes, int]] = []
+        # (topic, payload, qos, PUBLISH properties, time the broker received it)
+        self.queued_messages: list[tuple[str, bytes, int, bytes, float]] = []
         self.created_at: float = created_at
         # Seconds this session outlives its connection, as the client asked
         # for it in the MQTT 5 Session Expiry Interval. None means the client
@@ -8462,17 +8469,18 @@ async def broker_publish(
         return delivered
 
     scoped = _scoped_topic(account_id, region, topic)
+    received_at = time.time()
 
     if retain:
         if not payload:
             _retained.pop(scoped, None)
         else:
-            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties)
+            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties, received_at)
 
     async with _broker_lock:
         subs = [s for sset in _subscriptions.values() for s in sset]
 
-    token = _delivery_properties.set(properties)
+    token = _delivery_properties.set(_aged_properties(properties, received_at, received_at) or b"")
     try:
         for sub in subs:
             if sub.account_id != account_id or sub.region != region:
@@ -8514,7 +8522,7 @@ async def broker_publish(
                 continue
             for filt in ps.subscriptions:
                 if _subscription_matches(filt, topic):
-                    ps.queued_messages.append((topic, payload, qos))
+                    ps.queued_messages.append((topic, payload, qos, properties, received_at))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     delivered += 1
@@ -8609,7 +8617,10 @@ async def broker_subscribe(
             retained_to_send = []
 
     for r in retained_to_send:
-        token = _delivery_properties.set(r.properties)
+        properties = _aged_properties(r.properties, r.ts)
+        if properties is None:
+            continue
+        token = _delivery_properties.set(properties)
         # §3.3.1.3: a message sent because a subscription was established
         # carries RETAIN 1 whatever the subscription's Retain As Published
         # says — that flag is how the client tells this apart from live
@@ -8639,13 +8650,21 @@ async def broker_unsubscribe(subscription_id: str) -> None:
 
 
 def broker_get_retained(account_id: str, region: str, topic: str) -> "_RetainedMessage | None":
-    """The retained message stored for ``topic``, or None."""
-    return _retained.get(_scoped_topic(account_id, region, topic))
+    """The retained message stored for ``topic``, or None; an expired one is dropped here."""
+    scoped = _scoped_topic(account_id, region, topic)
+    msg = _retained.get(scoped)
+    if msg is not None and msg.expired(time.time()):
+        _retained.pop(scoped, None)
+        return None
+    return msg
 
 
 def broker_list_retained(account_id: str, region: str) -> list[tuple[str, "_RetainedMessage"]]:
     """``(topic, message)`` for every retained message here, most recently stored first."""
     prefix = f"{account_id}/{region}/"
+    now = time.time()
+    for key in [k for k, m in _retained.items() if k.startswith(prefix) and m.expired(now)]:
+        del _retained[key]
     found = [(k[len(prefix):], m) for k, m in _retained.items() if k.startswith(prefix)]
     found.sort(key=lambda item: item[1].ts, reverse=True)
     return found
@@ -8866,7 +8885,8 @@ _PROPERTY_TYPES: dict[int, str] = {
     PROP_SHARED_SUBSCRIPTION_AVAILABLE: "byte",
 }
 
-# PUBLISH properties handed on to subscribers unchanged. §3.3.2.3 requires a
+# PUBLISH properties handed on to subscribers unchanged, except the expiry
+# interval, which loses the time the message waited. §3.3.2.3 requires a
 # server to forward these, and a request/response client depends on getting
 # its own response topic and correlation data back. Everything else a
 # publisher sends (topic alias, subscription identifier, anything this broker
@@ -8879,6 +8899,9 @@ _FORWARDED_PUBLISH_PROPERTIES = frozenset({
     PROP_CORRELATION_DATA,
     PROP_USER_PROPERTY,
 })
+
+# AWS IoT Core counts a Message Expiry Interval of 0 as 1 and caps it at seven days.
+_MESSAGE_EXPIRY_MAX = 604800
 
 # MQTT 5 PUBLISH properties ride a contextvar rather than the subscriber
 # callback signature. ``deliver(topic, payload, qos)`` is the broker's
@@ -9091,6 +9114,40 @@ def _forwardable_publish_properties(props: list[tuple[int, object]]) -> bytes:
     if not kept:
         return b""
     return _encode_properties(kept)
+
+
+def _expiry_interval(props: list[tuple[int, object]]) -> int | None:
+    """The Message Expiry Interval among decoded PUBLISH properties, as AWS IoT Core bounds it."""
+    interval = _property_value(props, PROP_MESSAGE_EXPIRY_INTERVAL, None)
+    if interval is None:
+        return None
+    return min(max(int(interval), 1), _MESSAGE_EXPIRY_MAX)  # type: ignore[arg-type]
+
+
+def _message_expires_at(properties: bytes, received_at: float) -> float | None:
+    """When a message with this PUBLISH property block expires, or None if it never does."""
+    if not properties:
+        return None
+    interval = _expiry_interval(_decode_properties(properties, 0)[0])
+    return None if interval is None else received_at + interval
+
+
+def _aged_properties(properties: bytes, received_at: float, now: float | None = None) -> bytes | None:
+    """``properties`` with the expiry interval lowered to the whole seconds left, None once expired."""
+    if not properties:
+        return properties
+    props, _ = _decode_properties(properties, 0)
+    interval = _expiry_interval(props)
+    if interval is None:
+        return properties
+    left = received_at + interval - (time.time() if now is None else now)
+    if left <= 0:
+        return None
+    # A started second counts as spent: 60 goes out as 59, and 999 ms left as 0.
+    seconds = math.ceil(left) - 1
+    return _encode_properties(
+        [(i, seconds if i == PROP_MESSAGE_EXPIRY_INTERVAL else v) for i, v in props]
+    )
 
 
 def _make_connack(
@@ -9642,8 +9699,15 @@ class _WSSession:
                     )
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
-                    for q_topic, q_payload, q_qos in queued:
-                        await self.deliver_to_client(q_topic, q_payload, q_qos)
+                    for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
+                        properties = _aged_properties(q_properties, q_received_at)
+                        if properties is None:
+                            continue
+                        token = _delivery_properties.set(properties)
+                        try:
+                            await self.deliver_to_client(q_topic, q_payload, q_qos)
+                        finally:
+                            _delivery_properties.reset(token)
                     await self._publish_connected()
                     return True
                 else:
