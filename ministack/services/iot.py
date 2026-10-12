@@ -4869,6 +4869,9 @@ def delete_topic_rule(name: str) -> None:
 
 def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tuple:
     name = path[len("/rules/"):]
+    if method == "POST" and name.endswith(("/enable", "/disable")):
+        name, _, verb = name.rpartition("/")
+        return _set_topic_rule_disabled(name, verb == "disable")
     if method == "POST":
         return _create_topic_rule(name, _parse_body(body), headers.get("x-amz-tagging"))
     if method == "GET":
@@ -4934,6 +4937,22 @@ def _get_topic_rule(name: str) -> tuple:
     if rule is None:
         return _error_not_found("Rule", name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
+
+
+def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
+    """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
+    if not _RULE_NAME_RE.match(name):
+        return error_response_json(
+            "InvalidRequestException",
+            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+            400,
+        )
+    rule = _topic_rules.get(name)
+    if rule is None:
+        return _error_not_found("Rule", name)
+    rule["ruleDisabled"] = disabled
+    return 200, {}, b""
 
 
 def _delete_topic_rule(name: str) -> tuple:

@@ -2394,6 +2394,81 @@ def test_iot_replace_topic_rule(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def test_iot_enable_disable_topic_rule(iot_client):
+    name = _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+    )
+    created_at = iot_client.get_topic_rule(ruleName=name)["rule"]["createdAt"]
+    try:
+        for call, disabled in (
+            (iot_client.disable_topic_rule, True),
+            (iot_client.enable_topic_rule, False),
+        ):
+            # Repeating the call changes nothing and still answers 200.
+            for _ in range(2):
+                assert call(ruleName=name)["ResponseMetadata"]["HTTPStatusCode"] == 200
+            rule = iot_client.get_topic_rule(ruleName=name)["rule"]
+            assert rule["ruleDisabled"] is disabled
+            assert rule["createdAt"] == created_at
+            listed = [r for r in iot_client.list_topic_rules()["rules"] if r["ruleName"] == name]
+            assert [r["ruleDisabled"] for r in listed] == [disabled]
+        # ReplaceTopicRule without ruleDisabled enables a disabled rule.
+        iot_client.disable_topic_rule(ruleName=name)
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        )
+        assert iot_client.get_topic_rule(ruleName=name)["rule"]["ruleDisabled"] is False
+    finally:
+        iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_enable_disable_topic_rule_refusals(iot_client):
+    missing = _rule_name("missing")
+    pattern = (
+        "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    )
+    for call in (iot_client.enable_topic_rule, iot_client.disable_topic_rule):
+        with pytest.raises(ClientError) as ei:
+            call(ruleName=missing)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as ei:
+            call(ruleName="bad-name")
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == pattern
+
+
+def test_iot_disabled_topic_rule_persists():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _rule_name()
+
+    async def _call(method, path, body=b""):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        return await iot_module.handle_request(method, path, {}, body, {})
+
+    async def _disabled():
+        _status, _headers, body = await _call("GET", f"/rules/{name}")
+        return json.loads(body)["rule"]["ruleDisabled"]
+
+    async def _run():
+        body = json.dumps({"sql": "SELECT * FROM 'a'", "actions": []}).encode()
+        assert (await _call("POST", f"/rules/{name}", body))[0] == 200
+        status, _headers, answer = await _call("POST", f"/rules/{name}/disable")
+        assert (status, answer) == (200, b"")
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        assert await _disabled() is True
+
+    asyncio.run(_run())
+
+
 def test_iot_create_topic_rule_garbage_sql_rejected(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.create_topic_rule(
