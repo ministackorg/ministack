@@ -1871,22 +1871,23 @@ class TestResourceArn:
             service, "POST", path, headers, b"", {}, "eu-central-1", "123"
         ) == "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
 
-    def test_publish_resolves_the_same_topic_however_the_sdk_sent_it(self):
-        """Publish's URI label is non-greedy, so botocore percent-encodes the
-        separators and the ASGI server hands them back decoded. Both spellings
-        have to name one resource, or the grant matches on one path only."""
+    def test_publish_topic_arn_keeps_a_literal_percent_sequence(self):
+        """A %41 or %2F left in the decoded Publish path is part of the topic name and stays in the ARN."""
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
         from ministack.core.router import detect_service
 
         headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
-        expected = "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
-        for path in ("/topics/sensors/rack-1/temperature",
-                     "/topics/sensors%2Frack-1%2Ftemperature"):
-            service = detect_service("POST", path, headers, {})
-            assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+        for method, path, action, topic in (
+            ("POST", "/topics/sensors/p%41q", "iot:Publish", "sensors/p%41q"),
+            ("POST", "/topics/sensors/p%2Fq", "iot:Publish", "sensors/p%2Fq"),
+            ("GET", "/retainedMessage/sensors/p%25q", "iot:GetRetainedMessage", "sensors/p%25q"),
+        ):
+            service = detect_service(method, path, headers, {})
+            assert service == "iot-data"
+            assert extract_iam_action(service, method, path, headers, b"", {}) == action
             assert extract_resource_arn(
-                service, "POST", path, headers, b"", {}, "eu-central-1", "123"
-            ) == expected
+                service, method, path, headers, b"", {}, "eu-central-1", "123"
+            ) == f"arn:aws:iot:eu-central-1:123:topic/{topic}"
 
     def test_create_job_resolves_through_the_router(self):
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn

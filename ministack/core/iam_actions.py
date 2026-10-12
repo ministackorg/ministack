@@ -1523,11 +1523,10 @@ def extract_resource_arn(service: str, method: str, path: str,
         parts = [p for p in path.split("/") if p]
         # Publish and the retained-message calls take everything after the
         # prefix as the topic, and a topic is multi-level: the ARN is
-        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
-        # percent-encoded from the SDK, which is why iot_data._publish unquotes
-        # as well.
+        # topic/sensors/a/temperature, not topic/sensors. The path is already
+        # decoded, so a %41 left in it is part of the topic name.
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
-            topic = unquote("/".join(parts[1:]))
+            topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",

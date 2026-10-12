@@ -201,13 +201,8 @@ async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
     return json_response(doc)
 
 
-async def _publish(raw_topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
-    """``POST /topics/{topic}`` — forward body to the broker.
-
-    ``raw_topic`` is what came after ``/topics/`` in the URL. The SDK URL-
-    encodes ``/`` separators so we decode here and validate before relaying.
-    """
-    topic = unquote(raw_topic or "")
+async def _publish(topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
+    """``POST /topics/{topic}``: forward the body to the broker; the path arrives decoded, so ``%41`` stays literal."""
     err = _validate_topic(topic)
     if err is not None:
         return err
@@ -265,9 +260,8 @@ def _user_properties(properties: bytes) -> bytes:
     return json.dumps(pairs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _get_retained_message(raw_topic: str) -> tuple:
+def _get_retained_message(topic: str) -> tuple:
     """``GET /retainedMessage/{topic}``: the retained message stored for the topic."""
-    topic = unquote(raw_topic)
     if not topic:
         return error_response_json("InvalidRequestException", "unknown", 400)
     if "+" in topic or "#" in topic:

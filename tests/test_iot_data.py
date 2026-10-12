@@ -86,6 +86,23 @@ def test_get_retained_message_returns_the_retained_publish():
         assert "userProperties" not in resp
 
 
+def test_retained_topic_keeps_a_literal_percent_sequence():
+    """A topic holding %41, %25 or %2F is stored and read back as written, not decoded a second time."""
+    client = _own_account_iot_data()
+    topics = ("pct/p%41q", "pct/p%25q", "pct/p%2Fq")
+    for topic in topics:
+        client.publish(topic=topic, retain=True, payload=topic.encode())
+    for topic in topics:
+        resp = client.get_retained_message(topic=topic)
+        assert (resp["topic"], resp["payload"]) == (topic, topic.encode())
+    for decoded in ("pct/pAq", "pct/p%q", "pct/p/q"):
+        with pytest.raises(ClientError) as ei:
+            client.get_retained_message(topic=decoded)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    listed = {e["topic"] for e in client.list_retained_messages()["retainedTopics"]}
+    assert listed == set(topics)
+
+
 def test_get_retained_message_errors():
     client = _own_account_iot_data(parameter_validation=False)
     with pytest.raises(ClientError) as ei:
