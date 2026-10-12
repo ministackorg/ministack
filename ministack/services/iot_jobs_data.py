@@ -179,7 +179,7 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
     if execution is None:
         return error_response_json(
             "ResourceNotFoundException",
-            f"No job execution found for thing {thing} and job {job_id}",
+            f"Job {job_id} not found for {thing}",
             404,
         )
     execution_number = qp.get("executionNumber")
@@ -195,8 +195,7 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
         if execution_number != execution["executionNumber"]:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"No job execution {execution_number} found for thing {thing} "
-                f"and job {job_id}",
+                f"Job {job_id} not found for {thing}",
                 404,
             )
     include_document = str(qp.get("includeJobDocument", "true")).lower() != "false"
@@ -220,8 +219,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         if current is not None and execution_number != current["executionNumber"]:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"No job execution {execution_number} found for thing {thing} "
-                f"and job {job_id}", 404,
+                f"Job {job_id} not found for {thing}", 404,
             )
     prev_next = _iot_module.jobs_first_pending_job_id(thing)
     execution, error = _iot_module.jobs_update_execution(

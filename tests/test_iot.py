@@ -512,6 +512,99 @@ def test_iot_describe_unknown_thing_404(iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+_NO_PRINCIPAL = "because the principal does not exist in your account"
+
+
+@pytest.mark.parametrize("operation, kwargs, message", [
+    ("describe_thing", {"thingName": "{nothing}"}, "Thing {account}:{nothing} not found."),
+    ("update_thing", {"thingName": "{nothing}"}, "Thing {nothing} not found."),
+    ("list_thing_principals", {"thingName": "{nothing}"},
+     "Failed to list principals for thing{nothing} because the thing does not exist in your account"),
+    ("attach_thing_principal", {"thingName": "{nothing}", "principal": "{cert}"},
+     "Failed to attach the principal {cert} to thing {nothing} because the thing does not exist in your account"),
+    ("detach_thing_principal", {"thingName": "{nothing}", "principal": "{cert}"},
+     "Failed to detach the principal {cert} from thing {nothing} because the thing does not exist in your account"),
+    ("attach_thing_principal", {"thingName": "{thing}", "principal": "{nocert}"},
+     "Can't attach the principal {nocert} to thing {thing} " + _NO_PRINCIPAL),
+    ("detach_thing_principal", {"thingName": "{thing}", "principal": "{nocert}"},
+     "Can't detach the principal {nocert} from thing {thing} " + _NO_PRINCIPAL),
+    ("list_principal_things", {"principal": "{nocert}"},
+     "Can't list things for the principal {nocert} " + _NO_PRINCIPAL),
+    ("list_thing_groups_for_thing", {"thingName": "{nothing}"}, "thing does not exist"),
+    ("create_thing", {"thingName": "{nothing}", "thingTypeName": "{notype}"},
+     "Thing Type {account}:{notype} not found."),
+    ("update_thing", {"thingName": "{thing}", "thingTypeName": "{notype}"},
+     "Thing Type {account}:{notype} not found."),
+    ("describe_thing_type", {"thingTypeName": "{notype}"}, "Thing Type {account}:{notype} not found."),
+    ("deprecate_thing_type", {"thingTypeName": "{notype}"}, "Thing Type {account}:{notype} not found."),
+    ("describe_thing_group", {"thingGroupName": "{nogroup}"}, "ThingGroup {account}:{nogroup} not found."),
+    ("update_thing_group", {"thingGroupName": "{nogroup}", "thingGroupProperties": {}},
+     "Group {nogroup} does not exist"),
+    ("create_thing_group", {"thingGroupName": "{nothing}", "parentGroupName": "{nogroup}"},
+     "Cannot create group using non-existing group as parent : {nogroup}"),
+    ("list_things_in_thing_group", {"thingGroupName": "{nogroup}"},
+     "Cannot find requested thing group for accountId: {account} and thing group name: {nogroup}"),
+    ("add_thing_to_thing_group", {"thingGroupName": "{nogroup}", "thingName": "{thing}"},
+     "Cannot find requested thing group for accountId: {account} and thing group name: {nogroup}"),
+    ("add_thing_to_thing_group", {"thingGroupName": "{group}", "thingName": "{nothing}"},
+     "Thing {nothing} not found."),
+    ("remove_thing_from_thing_group", {"thingGroupName": "{group}", "thingName": "{nothing}"},
+     "Thing {nothing} not found."),
+    ("describe_certificate", {"certificateId": "{nocert_id}"}, "CertificateId {nocert_id} does not exist"),
+    ("update_certificate", {"certificateId": "{nocert_id}", "newStatus": "INACTIVE"},
+     "CertificateId {nocert_id} does not exist"),
+    ("delete_certificate", {"certificateId": "{nocert_id}"}, "CertificateId {nocert_id} does not exist"),
+    ("describe_ca_certificate", {"certificateId": "{nocert_id}"},
+     "Requested CA Certificate does not exist."),
+    ("update_ca_certificate", {"certificateId": "{nocert_id}", "newStatus": "INACTIVE"},
+     "Requested CA Certificate does not exist."),
+    ("delete_ca_certificate", {"certificateId": "{nocert_id}"}, "Requested CA Certificate does not exist."),
+    ("get_policy", {"policyName": "{nopolicy}"}, "Policy default version not found"),
+    ("delete_policy", {"policyName": "{nopolicy}"}, "Policy not found"),
+    ("create_policy_version", {"policyName": "{nopolicy}", "policyDocument": "{document}"},
+     "Policy not found"),
+    ("get_policy_version", {"policyName": "{nopolicy}", "policyVersionId": "1"}, "Policy not found"),
+    ("list_policy_versions", {"policyName": "{nopolicy}"}, "Policy not found"),
+    ("delete_policy_version", {"policyName": "{nopolicy}", "policyVersionId": "1"}, "Policy not found"),
+    ("attach_policy", {"policyName": "{nopolicy}", "target": "{cert}"}, "Policy not found"),
+    ("list_targets_for_policy", {"policyName": "{nopolicy}"}, "Policy not found"),
+    ("get_policy_version", {"policyName": "{policy}", "policyVersionId": "9"},
+     "Policy version does not exist (name={policy}, versionId=9)"),
+    ("delete_policy_version", {"policyName": "{policy}", "policyVersionId": "9"},
+     "Policy version does not exist (name={policy}, versionId=9)"),
+    ("delete_provisioning_template", {"templateName": "{nothing}"},
+     "Unable to delete template, template not found"),
+])
+def test_iot_not_found_messages(iot_client, operation, kwargs, message):
+    """A call naming a registry resource that does not exist answers in AWS's words."""
+    thing, group, policy = _unique("thing"), _unique("group"), _unique("policy")
+    document = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]})
+    arn = iot_client.create_thing(thingName=thing)["thingArn"]
+    iot_client.create_thing_group(thingGroupName=group)
+    iot_client.create_policy(policyName=policy, policyDocument=document)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    head, account = arn.rsplit(":", 1)[0], arn.split(":")[4]
+    names = {
+        "thing": thing, "group": group, "policy": policy, "cert": cert["certificateArn"],
+        "nothing": _unique("nothing"), "nogroup": _unique("nogroup"), "notype": _unique("notype"),
+        "nopolicy": _unique("nopolicy"), "nocert_id": "ab" * 32, "nocert": f"{head}:cert/{'ab' * 32}",
+        "account": account, "document": document,
+    }
+    try:
+        with pytest.raises(ClientError) as ei:
+            getattr(iot_client, operation)(**{
+                key: value.format(**names) if isinstance(value, str) else value for key, value in kwargs.items()})
+        error = ei.value.response["Error"]
+        status = ei.value.response["ResponseMetadata"]["HTTPStatusCode"]
+        assert (status, error["Code"], error["Message"]) == (404, "ResourceNotFoundException", message.format(**names))
+    finally:
+        iot_client.delete_certificate(certificateId=cert["certificateId"])
+        iot_client.delete_policy(policyName=policy)
+        iot_client.delete_thing_group(thingGroupName=group)
+        iot_client.delete_thing(thingName=thing)
+
+
 def test_iot_update_thing_increments_version(iot_client):
     name = _unique("thing")
     iot_client.create_thing(thingName=name)

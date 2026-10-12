@@ -480,10 +480,42 @@ def _parse_body(body: bytes) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _error_not_found(resource: str, name: str) -> tuple:
-    return error_response_json(
-        "ResourceNotFoundException", f"{resource} {name!r} not found", 404
-    )
+# AWS's ResourceNotFoundException wording per resource, or per operation where it differs.
+_NOT_FOUND_MESSAGES = {
+    "Thing": "Thing {name} not found.",
+    "DescribeThing": "Thing {account}:{name} not found.",
+    "ListThingGroupsForThing": "thing does not exist",
+    "ListThingPrincipals": "Failed to list principals for thing{name} because the thing does not exist in your account",
+    "AttachThingPrincipal": "Failed to attach the principal {principal} to thing {name} because the thing does not "
+    "exist in your account",
+    "DetachThingPrincipal": "Failed to detach the principal {principal} from thing {name} because the thing does not "
+    "exist in your account",
+    "AttachThingPrincipal:principal": "Can't attach the principal {principal} to thing {name} because the principal "
+    "does not exist in your account",
+    "DetachThingPrincipal:principal": "Can't detach the principal {principal} from thing {name} because the principal "
+    "does not exist in your account",
+    "ListPrincipalThings": "Can't list things for the principal {name} because the principal does not exist in your "
+    "account",
+    "ThingType": "Thing Type {account}:{name} not found.",
+    "ThingGroup": "ThingGroup {account}:{name} not found.",
+    "UpdateThingGroup": "Group {name} does not exist",
+    "CreateThingGroup": "Cannot create group using non-existing group as parent : {name}",
+    "ThingGroupMember": "Cannot find requested thing group for accountId: {account} and thing group name: {name}",
+    "Certificate": "CertificateId {name} does not exist",
+    "CACertificate": "Requested CA Certificate does not exist.",
+    "Policy": "Policy not found",
+    "GetPolicy": "Policy default version not found",
+    "PolicyVersion": "Policy version does not exist (name={policy}, versionId={name})",
+    "Job": "Job {name} cannot be found.",
+    "JobExecution": "Job execution for thing {thing} cannot be found within job {name}.",
+    "JobExecution:job": "Job execution cannot be found as the Job {name} does not exist.",
+}
+
+
+def _error_not_found(resource: str, name: str, **fields) -> tuple:
+    template = _NOT_FOUND_MESSAGES.get(resource, "{resource} {name!r} not found")
+    message = template.format(resource=resource, name=name, account=get_account_id(), **fields)
+    return error_response_json("ResourceNotFoundException", message, 404)
 
 
 def _qp_bool(qp: dict, name: str, default: bool = False) -> bool:
@@ -1339,7 +1371,7 @@ def _create_thing(name: str, payload: dict) -> tuple:
 def _describe_thing(name: str) -> tuple:
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found("DescribeThing", name)
     body = {
         "thingName": thing["thingName"],
         "thingId": thing["thingId"],
@@ -1675,7 +1707,7 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
     if parent and parent not in _thing_groups:
-        return _error_not_found("ThingGroup", parent)
+        return _error_not_found("CreateThingGroup", parent)
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -1728,7 +1760,7 @@ def _list_things_in_thing_group(path: str) -> tuple:
     middle = path[len("/thing-groups/"):-len("/things")]
     g = _thing_groups.get(middle)
     if g is None:
-        return _error_not_found("ThingGroup", middle)
+        return _error_not_found("ThingGroupMember", middle)
     return json_response({"things": list(g.get("things", []))})
 
 
@@ -1750,7 +1782,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
         )
     thing = _things.get(middle)
     if thing is None:
-        return _error_not_found("Thing", middle)
+        return _error_not_found("ListThingGroupsForThing", middle)
     return json_response({
         "thingGroups": [
             {"groupName": g, "groupArn": _thing_group_arn(g)}
@@ -1765,7 +1797,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
 def _update_thing_group(name: str, payload: dict) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return _error_not_found("UpdateThingGroup", name)
     props = payload.get("thingGroupProperties") or {}
     if props:
         g["thingGroupProperties"].update({
@@ -1818,7 +1850,7 @@ async def _add_thing_to_group(payload: dict) -> tuple:
         )
     group = _thing_groups.get(gname)
     if group is None:
-        return _error_not_found("ThingGroup", gname)
+        return _error_not_found("ThingGroupMember", gname)
     thing = _things.get(tname)
     if thing is None:
         return _error_not_found("Thing", tname)
@@ -2049,7 +2081,7 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
 
 def _delete_provisioning_template(name: str) -> tuple:
     if _provisioning_templates.get(name) is None:
-        return _provisioning_template_not_found(name)
+        return error_response_json("ResourceNotFoundException", "Unable to delete template, template not found", 404)
     _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
     return json_response({})
@@ -2767,8 +2799,9 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
         )
     name = middle
     thing = _things.get(name)
+    operation = {"PUT": "AttachThingPrincipal", "DELETE": "DetachThingPrincipal"}.get(method, "ListThingPrincipals")
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found(operation, name, principal=headers.get("x-amzn-principal") or qp.get("principal"))
 
     if method == "GET":
         return json_response({"principals": list(thing.get("principals", []))})
@@ -2782,7 +2815,7 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found(f"{operation}:principal", name, principal=principal)
 
     if method == "PUT":
         if principal not in thing.setdefault("principals", []):
@@ -2815,7 +2848,7 @@ def _list_principal_things(headers: dict, qp: dict) -> tuple:
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found("ListPrincipalThings", principal)
     things = []
     for arn in cert.get("attachedThings", []):
         tname = _thing_name_from_arn(arn)
@@ -2915,7 +2948,7 @@ def _create_policy(name: str, payload: dict) -> tuple:
 def _get_policy(name: str) -> tuple:
     p = _policies.get(name)
     if p is None:
-        return _error_not_found("Policy", name)
+        return _error_not_found("GetPolicy", name)
     default_id = p["defaultVersionId"]
     return json_response({
         "policyName": name,
@@ -3002,7 +3035,7 @@ def _get_policy_version(name: str, version_id: str) -> tuple:
         return _error_not_found("Policy", name)
     v = p["versions"].get(version_id)
     if v is None:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     return json_response({
         "policyArn": p["policyArn"],
         "policyDocument": v["document"],
@@ -3033,7 +3066,7 @@ def _delete_policy_version(name: str, version_id: str) -> tuple:
     if p is None:
         return _error_not_found("Policy", name)
     if version_id not in p["versions"]:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     if p["defaultVersionId"] == version_id:
         return error_response_json(
             "InvalidRequestException",
@@ -5213,6 +5246,12 @@ def _job_arn(job_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:job/{job_id}"
 
 
+def _job_target_not_found(arn: str) -> str:
+    """AWS's message for a job target thing or thing group that does not exist."""
+    kind, _, name = arn.rpartition(":")[2].partition("/")
+    return f"{'Thing Group' if kind == 'thinggroup' else 'Thing'} {name} cannot be found."
+
+
 def _job_target_resolve(arn: str) -> list[str] | None:
     """Thing names one job target ARN resolves to, under the caller's scope.
 
@@ -5688,7 +5727,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         resolved = _job_target_resolve(arn)
         if resolved is None:
             return error_response_json(
-                "ResourceNotFoundException", f"Job target {arn} not found", 404
+                "ResourceNotFoundException", _job_target_not_found(arn), 404
             )
         target_things.update(resolved)
     document = payload.get("document")
@@ -6609,7 +6648,7 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
             None,
         )
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     view = {
         "jobId": execution["jobId"],
         "status": execution["status"],
@@ -6633,7 +6672,7 @@ async def _cancel_job_execution(
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     error = _jobs_check_expected_version(
         execution, payload.get("expectedVersion"), "VersionConflictException"
     )
@@ -6849,7 +6888,7 @@ def jobs_update_execution(
     if execution is None:
         return None, error_response_json(
             "ResourceNotFoundException",
-            f"No job execution found for thing {thing_name} and job {job_id}",
+            f"Job {job_id} not found for {thing_name}",
             404,
         )
     error = _jobs_check_expected_version(
@@ -8187,7 +8226,7 @@ async def _handle_jobs_publish(
                 "rejected",
                 _jobs_rejected(
                     "ResourceNotFound",
-                    f"No job execution found for thing {thing} and job {job_id}",
+                    f"Job {job_id} not found for {thing}",
                     client_token,
                 ),
             )

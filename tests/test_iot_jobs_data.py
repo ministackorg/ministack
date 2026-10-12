@@ -2363,6 +2363,49 @@ def test_iot_jobs_unknown_job_is_not_found_on_every_path(
         _cleanup(iot_client, things=[thing])
 
 
+@pytest.mark.parametrize("operation, kwargs, message", [
+    ("describe_job", {"jobId": "{nojob}"}, "Job {nojob} cannot be found."),
+    ("get_job_document", {"jobId": "{nojob}"}, "Job {nojob} cannot be found."),
+    ("cancel_job", {"jobId": "{nojob}"}, "Job {nojob} cannot be found."),
+    ("delete_job", {"jobId": "{nojob}"}, "Job {nojob} cannot be found."),
+    ("describe_job_execution", {"jobId": "{nojob}", "thingName": "{thing}"},
+     "Job execution cannot be found as the Job {nojob} does not exist."),
+    ("cancel_job_execution", {"jobId": "{nojob}", "thingName": "{thing}"},
+     "Job execution cannot be found as the Job {nojob} does not exist."),
+    ("describe_job_execution", {"jobId": "{job}", "thingName": "{nothing}"},
+     "Job execution for thing {nothing} cannot be found within job {job}."),
+    ("cancel_job_execution", {"jobId": "{job}", "thingName": "{nothing}"},
+     "Job execution for thing {nothing} cannot be found within job {job}."),
+    ("describe_job_execution", {"jobId": "{job}", "thingName": "{thing}", "executionNumber": 9},
+     "Job execution for thing {thing} cannot be found within job {job}."),
+    ("create_job", {"jobId": "{nojob}", "targets": ["{head}:thing/{nothing}"], "document": "{{}}"},
+     "Thing {nothing} cannot be found."),
+    ("create_job", {"jobId": "{nojob}", "targets": ["{head}:thinggroup/{nothing}"], "document": "{{}}"},
+     "Thing Group {nothing} cannot be found."),
+])
+def test_iot_jobs_not_found_messages(iot_client, operation, kwargs, message):
+    """Control-plane job calls on a job, thing or execution that does not exist answer in AWS's words."""
+    thing, job = _unique("jobs-thing"), _unique("job")
+    try:
+        arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job, targets=[arn], document=_DOCUMENT)
+        names = {"thing": thing, "job": job, "nothing": _unique("nothing"), "nojob": _unique("nojob"),
+                 "head": arn.rsplit(":", 1)[0]}
+
+        def fill(value):
+            if isinstance(value, list):
+                return [fill(v) for v in value]
+            return value.format(**names) if isinstance(value, str) else value
+
+        with pytest.raises(ClientError) as ei:
+            getattr(iot_client, operation)(**{key: fill(value) for key, value in kwargs.items()})
+        response = ei.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+                response["Error"]["Message"]) == (404, "ResourceNotFoundException", message.format(**names))
+    finally:
+        _cleanup(iot_client, jobs=[job], things=[thing])
+
+
 def test_iot_jobs_list_executions_for_thing_filters(iot_client, iot_jobs_data):
     """ListJobExecutionsForThing narrows by `status` (modeled) and by `jobId`
     (a MiniStack convenience the `iot` model does not declare, so only raw HTTP
@@ -3025,6 +3068,47 @@ def test_jobs_mqtt_update_unknown_job_rejected(iot_client, iot_data_client):
     doc = _frames_by_topic(received)[f"{base}/no-such-job/update/rejected"]
     assert doc["code"] == "ResourceNotFound"
     assert doc["clientToken"] == "tok-x"
+
+
+@pytest.mark.parametrize("transport, verb, thing, job, number", [
+    ("http", "describe", "{thing}", "{nojob}", None),
+    ("http", "describe", "{nothing}", "{job}", None),
+    ("http", "describe", "{thing}", "{job}", 9),
+    ("http", "update", "{thing}", "{nojob}", None),
+    ("http", "update", "{nothing}", "{job}", None),
+    ("http", "update", "{thing}", "{job}", 9),
+    ("mqtt", "get", "{thing}", "{nojob}", None),
+    ("mqtt", "get", "{nothing}", "{job}", None),
+    ("mqtt", "update", "{thing}", "{nojob}", None),
+    ("mqtt", "update", "{nothing}", "{job}", None),
+])
+def test_iot_jobs_data_not_found_messages(iot_client, iot_jobs_data, transport, verb, thing, job, number):
+    """The device plane words an unknown job, thing or execution number as AWS does, on HTTP and MQTT."""
+    names = {"thing": _unique("jobs-thing"), "job": _unique("job"), "nothing": _unique("nothing"),
+             "nojob": _unique("nojob")}
+    thing, job = thing.format(**names), job.format(**names)
+    try:
+        arn = _create_thing(iot_client, names["thing"])
+        iot_client.create_job(jobId=names["job"], targets=[arn], document=_DOCUMENT)
+        extra = {} if number is None else {"executionNumber": number}
+        if transport == "http":
+            if verb == "update":
+                extra["status"] = "IN_PROGRESS"
+            with pytest.raises(ClientError) as ei:
+                getattr(iot_jobs_data, f"{verb}_job_execution")(thingName=thing, jobId=job, **extra)
+            response = ei.value.response
+            got = (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+                   response["Error"]["Message"])
+            assert got == (404, "ResourceNotFoundException", f"Job {job} not found for {thing}")
+        else:
+            topic = f"$aws/things/{thing}/jobs/{job}/{verb}"
+            payload = {"clientToken": "tok"} if verb == "get" else {"clientToken": "tok", "status": "IN_PROGRESS"}
+            received = _collect_shadow_frames(
+                f"{topic}/rejected", lambda: _mqtt_publish(topic=topic, payload=json.dumps(payload).encode()), want=1)
+            doc = _frames_by_topic(received)[f"{topic}/rejected"]
+            assert (doc["code"], doc["message"]) == ("ResourceNotFound", f"Job {job} not found for {thing}")
+    finally:
+        _cleanup(iot_client, jobs=[names["job"]], things=[names["thing"]])
 
 
 def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
