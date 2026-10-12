@@ -5576,15 +5576,21 @@ def _jobs_check_expected_version(
     return None
 
 
-def _jobs_reject_if_terminal(execution: dict, verb: str) -> tuple | None:
+def _jobs_reject_if_terminal(execution: dict, message: str) -> tuple | None:
     """Terminal executions are frozen — no update, no cancel."""
     if execution["status"] not in _JOB_EXECUTION_TERMINAL:
         return None
+    return error_response_json("InvalidStateTransitionException", message, 409)
+
+
+def jobs_reject_terminal_describe(execution: dict) -> tuple | None:
+    """The device plane describes only QUEUED and IN_PROGRESS executions."""
+    if execution["status"] not in _JOB_EXECUTION_TERMINAL:
+        return None
     return error_response_json(
-        "InvalidStateTransitionException",
-        f"Job execution is in terminal status {execution['status']} and "
-        f"cannot be {verb}",
-        409,
+        "TerminalStateException",
+        "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED",
+        410,
     )
 
 
@@ -6639,7 +6645,9 @@ async def _cancel_job_execution(
     )
     if error:
         return error
-    error = _jobs_reject_if_terminal(execution, "canceled")
+    error = _jobs_reject_if_terminal(
+        execution, f"Job execution for thing {thing} within job {job_id} cannot be canceled."
+    )
     if error:
         return error
     force = _qp_bool(qp, "force")
@@ -6857,20 +6865,11 @@ def jobs_update_execution(
     )
     if error:
         return None, error
-    error = _jobs_reject_if_terminal(execution, "updated")
-    if error:
-        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
             f"Invalid job execution status: {status!r}",
             400,
-        )
-    if status == "QUEUED":
-        return None, error_response_json(
-            "InvalidStateTransitionException",
-            "A device cannot move a job execution back to QUEUED",
-            409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
         # InvalidStateTransitionException, not InvalidRequestException
@@ -6880,11 +6879,18 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    error = _jobs_reject_if_terminal(
+        execution,
+        f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",
+    )
+    if error:
+        return None, error
     now = _jobs_now_ms()
     execution["status"] = status
     if status_details:
         execution["statusDetails"] = dict(status_details)
-    if status == "IN_PROGRESS" and execution.get("startedAt") is None:
+    # The first report starts the execution, unless the device rejects the job.
+    if status != "REJECTED" and execution.get("startedAt") is None:
         execution["startedAt"] = now
     if status == "IN_PROGRESS" and step_timeout_minutes is not None:
         # The device's own step timeout, reset every time it re-reports
@@ -8062,14 +8068,16 @@ def _jobs_error_tuple_to_rejected(
         code = "ResourceNotFound"
     elif status == 400:
         code = "InvalidRequest"
+    elif status == 410:
+        code = "TerminalStateReached"
     elif message.startswith("Expected version"):
         code = "VersionMismatch"
-    elif "terminal status" in message:
-        code = "TerminalStateReached"
     else:
         code = "InvalidStateTransition"
     execution_state = None
-    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None:
+    # A refused status carries no executionState.
+    refused_status = message.startswith("The status of job execution cannot be changed")
+    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
         execution_state = {
             "status": execution["status"],
             "versionNumber": execution["versionNumber"],
@@ -8191,6 +8199,10 @@ async def _handle_jobs_publish(
                     client_token,
                 ),
             )
+            return
+        error = jobs_reject_terminal_describe(execution) if execution is not None else None
+        if error:
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
             return
         # An idle thing's "$next" mirrors the HTTP plane's empty structure.
         doc = {"timestamp": ts}

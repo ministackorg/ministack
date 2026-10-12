@@ -7943,7 +7943,7 @@ def test_iot_job_removed_timed_out_and_deleted_events():
         await call("POST", "/things/ev-t4/jobs/ev-timeout",
                    {"status": "IN_PROGRESS", "statusDetails": {"d": "1"}}, device=True)
         iot_module._job_executions[("ev-t4", "ev-timeout")]["startedAt"] -= 61_000
-        await call("GET", "/things/ev-t4/jobs/ev-timeout", device=True)
+        await call("GET", "/things/ev-t4/jobs", device=True)
         await call("DELETE", "/jobs/ev-timeout")
         await call("DELETE", "/jobs/ev-cont", query={"force": "true"})
 

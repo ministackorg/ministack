@@ -649,6 +649,31 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
+def test_iot_jobs_first_report_stamps_started_at(iot_client, iot_jobs_data):
+    """QUEUED straight to SUCCEEDED or FAILED sets startedAt; REJECTED does not."""
+    thing = _unique("jobs-thing")
+    job_ids = {status: _unique("job") for status in ("SUCCEEDED", "FAILED", "REJECTED")}
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        for status, job_id in job_ids.items():
+            iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+            iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status=status)
+        listed = {
+            s["jobId"]: s["jobExecutionSummary"]
+            for s in iot_client.list_job_executions_for_thing(thingName=thing)["executionSummaries"]
+        }
+        for status, job_id in job_ids.items():
+            execution = iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+            if status == "REJECTED":
+                assert "startedAt" not in execution
+                assert "startedAt" not in listed[job_id]
+            else:
+                assert execution["startedAt"] == execution["lastUpdatedAt"]
+                assert listed[job_id]["startedAt"] == execution["startedAt"]
+    finally:
+        _cleanup(iot_client, jobs=list(job_ids.values()), things=[thing])
+
+
 def test_iot_jobs_update_rejects_service_side_statuses(
     iot_client, iot_jobs_data
 ):
@@ -742,6 +767,9 @@ def test_iot_jobs_device_cannot_move_execution_back_to_queued(
                 jobId=job_id, thingName=thing, status="QUEUED"
             )
         assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        assert ei.value.response["Error"]["Message"] == (
+            "The status of job execution cannot be changed to be QUEUED"
+        )
 
         execution = iot_jobs_data.describe_job_execution(
             jobId=job_id, thingName=thing
@@ -750,6 +778,114 @@ def test_iot_jobs_device_cannot_move_execution_back_to_queued(
         assert execution["versionNumber"] == 2  # the refusal changed nothing
     finally:
         _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def _terminal_executions(iot_client, iot_jobs_data, things, jobs, groups):
+    """One execution per terminal status a test can reach at once: {status: (thing, jobId)}."""
+    executions = {}
+    for status in ("SUCCEEDED", "FAILED", "REJECTED", "CANCELED"):
+        thing, job_id = _unique("jobs-thing"), _unique("job")
+        things.append(thing)
+        jobs.append(job_id)
+        arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[arn], document=_DOCUMENT)
+        if status == "CANCELED":
+            iot_client.cancel_job_execution(jobId=job_id, thingName=thing)
+        else:
+            iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status=status)
+        executions[status] = (thing, job_id)
+    group, thing, job_id = _unique("jobs-group"), _unique("jobs-thing"), _unique("job")
+    groups.append(group)
+    things.append(thing)
+    jobs.append(job_id)
+    group_arn = iot_client.create_thing_group(thingGroupName=group)["thingGroupArn"]
+    _create_thing(iot_client, thing)
+    iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+    iot_client.create_job(jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+                          targetSelection="CONTINUOUS")
+    iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=thing)
+    executions["REMOVED"] = (thing, job_id)
+    for status, (thing, job_id) in executions.items():
+        execution = iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+        assert execution["status"] == status
+    return executions
+
+
+def test_iot_jobs_device_cannot_describe_a_terminal_execution(iot_client, iot_jobs_data):
+    """AWS answers the device 410 TerminalStateException for every terminal status."""
+    things, jobs, groups = [], [], []
+    try:
+        executions = _terminal_executions(iot_client, iot_jobs_data, things, jobs, groups)
+        for status, (thing, job_id) in executions.items():
+            for extra in ({}, {"executionNumber": 1}, {"includeJobDocument": False}):
+                with pytest.raises(iot_jobs_data.exceptions.TerminalStateException) as ei:
+                    iot_jobs_data.describe_job_execution(jobId=job_id, thingName=thing, **extra)
+                assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 410, status
+                assert ei.value.response["Error"]["Message"] == (
+                    "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED"
+                ), status
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=things, groups=groups)
+
+
+def test_iot_jobs_device_cannot_describe_a_timed_out_execution():
+    """The timeout flips the execution on the device's read, which then answers 410."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+    from ministack.services import iot_jobs_data as jobs_data_module
+
+    iot_module.reset()
+    try:
+        with request_scope("123456789012", "us-east-1"):
+            started = iot_module._jobs_now_ms() - 120_000
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "targets": [], "targetSelection": "SNAPSHOT",
+                "status": "IN_PROGRESS", "document": "{}", "snapshotted": True,
+                "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+            }
+            iot_module._job_executions[("t1", "j1")] = {
+                "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+                "statusDetails": {}, "queuedAt": started, "startedAt": started,
+                "lastUpdatedAt": started, "executionNumber": 1, "versionNumber": 2,
+            }
+            status, _, body = jobs_data_module._describe_execution("t1", "j1", {})
+            assert status == 410
+            assert json.loads(body)["__type"] == "TerminalStateException"
+            assert iot_module._job_executions[("t1", "j1")]["status"] == "TIMED_OUT"
+    finally:
+        iot_module.reset()
+
+
+def test_iot_jobs_terminal_execution_refuses_update_and_cancel(iot_client, iot_jobs_data):
+    """The refusals name the job, the thing and the final status; a refused status is checked first."""
+    things, jobs, groups = [], [], []
+    try:
+        executions = _terminal_executions(iot_client, iot_jobs_data, things, jobs, groups)
+        for status, (thing, job_id) in executions.items():
+            for reported in ("IN_PROGRESS", "SUCCEEDED", "FAILED", "REJECTED"):
+                with pytest.raises(iot_jobs_data.exceptions.InvalidStateTransitionException) as ei:
+                    iot_jobs_data.update_job_execution(
+                        jobId=job_id, thingName=thing, status=reported
+                    )
+                assert ei.value.response["Error"]["Message"] == (
+                    f"Job {job_id} for {thing} has already finished with status {status}"
+                )
+            for reported in ("QUEUED", "CANCELED"):
+                with pytest.raises(iot_jobs_data.exceptions.InvalidStateTransitionException) as ei:
+                    iot_jobs_data.update_job_execution(
+                        jobId=job_id, thingName=thing, status=reported
+                    )
+                assert ei.value.response["Error"]["Message"] == (
+                    f"The status of job execution cannot be changed to be {reported}"
+                )
+            for force in (False, True):
+                with pytest.raises(iot_client.exceptions.InvalidStateTransitionException) as ei:
+                    iot_client.cancel_job_execution(jobId=job_id, thingName=thing, force=force)
+                assert ei.value.response["Error"]["Message"] == (
+                    f"Job execution for thing {thing} within job {job_id} cannot be canceled."
+                )
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=things, groups=groups)
 
 
 def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
@@ -2306,10 +2442,9 @@ def test_iot_jobs_status_details_are_nested_on_the_control_plane_only(
         )["execution"]
         assert control["status"] == "CANCELED"
         assert control["statusDetails"] == {"detailsMap": cancel_details}
-        device = iot_jobs_data.describe_job_execution(
-            jobId=job_id, thingName=thing
-        )["execution"]
-        assert device["statusDetails"] == cancel_details
+        # The device plane does not describe a terminal execution.
+        with pytest.raises(iot_jobs_data.exceptions.TerminalStateException):
+            iot_jobs_data.describe_job_execution(jobId=job_id, thingName=thing)
     finally:
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
@@ -3098,7 +3233,7 @@ def test_jobs_mqtt_malformed_json_is_rejected_invalidjson(iot_client, iot_data_c
     assert isinstance(doc["timestamp"], int)
 
 
-def test_jobs_mqtt_terminal_update_rejected_terminalstatereached(iot_client, iot_data_client):
+def test_jobs_mqtt_terminal_update_rejected_invalidstatetransition(iot_client, iot_data_client):
     thing = _unique("qa-terminal")
     job_id = _unique("job")
     arn = _create_thing(iot_client, thing)
@@ -3116,7 +3251,23 @@ def test_jobs_mqtt_terminal_update_rejected_terminalstatereached(iot_client, iot
                             json.dumps({"status": "FAILED"}).encode()),
         want=1,
     )
-    assert json.loads(received[0][1])["code"] == "TerminalStateReached"
+    doc = json.loads(received[0][1])
+    assert doc["code"] == "InvalidStateTransition"
+    assert doc["message"] == f"Job {job_id} for {thing} has already finished with status SUCCEEDED"
+    assert doc["executionState"] == {"status": "SUCCEEDED", "versionNumber": 2}
+    received = _collect_shadow_frames(
+        f"{base}/{job_id}/get/rejected",
+        lambda: _qa_publish(iot_data_client, f"{base}/{job_id}/get",
+                            json.dumps({"clientToken": "g"}).encode()),
+        want=1,
+    )
+    doc = json.loads(received[0][1])
+    assert doc["code"] == "TerminalStateReached"
+    assert doc["message"] == (
+        "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED"
+    )
+    assert doc["clientToken"] == "g"
+    assert "executionState" not in doc
 
 
 def test_jobs_mqtt_wrong_version_carries_execution_state(iot_client, iot_data_client):
@@ -3137,6 +3288,24 @@ def test_jobs_mqtt_wrong_version_carries_execution_state(iot_client, iot_data_cl
     assert doc["code"] == "VersionMismatch"
     assert doc["clientToken"] == "qa-1"
     assert set(doc["executionState"]) == {"status", "versionNumber"}
+
+
+def test_jobs_mqtt_refused_status_carries_no_execution_state(iot_client, iot_data_client):
+    thing = _unique("qa-queued")
+    job_id = _unique("job")
+    arn = _create_thing(iot_client, thing)
+    iot_client.create_job(jobId=job_id, targets=[arn], document=_DOCUMENT)
+    base = f"$aws/things/{thing}/jobs"
+    received = _collect_shadow_frames(
+        f"{base}/{job_id}/update/rejected",
+        lambda: _qa_publish(iot_data_client, f"{base}/{job_id}/update",
+                            json.dumps({"status": "QUEUED", "clientToken": "q"}).encode()),
+        want=1,
+    )
+    doc = json.loads(received[0][1])
+    assert doc["code"] == "InvalidStateTransition"
+    assert doc["message"] == "The status of job execution cannot be changed to be QUEUED"
+    assert "executionState" not in doc
 
 
 def test_jobs_mqtt_job_named_get_does_not_break_thing_level_get(iot_client, iot_data_client):

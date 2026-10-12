@@ -199,6 +199,9 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
                 f"and job {job_id}",
                 404,
             )
+    error = _iot_module.jobs_reject_terminal_describe(execution)
+    if error:
+        return error
     include_document = str(qp.get("includeJobDocument", "true")).lower() != "false"
     document = _iot_module.jobs_job_document(job_id) if include_document else None
     return json_response({"execution": _execution_view(execution, document)})
