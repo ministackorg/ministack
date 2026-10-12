@@ -2991,9 +2991,10 @@ async def _handle_lifespan(scope, receive, send):
                 )
             )
             logger.info("Worker thread pool: %d threads", _max_workers)
-            from ministack.core.responses import install_docker_hub_fallback
+            if _docker_socket_present():
+                from ministack.core.responses import install_docker_hub_fallback
 
-            install_docker_hub_fallback()
+                install_docker_hub_fallback()
             _run_init_scripts()
             # Reap any container that survived a hard kill of the previous
             # process. Persistence strips container ids from snapshots, so any
@@ -3132,10 +3133,16 @@ _DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
+def _docker_socket_present() -> bool:
+    """False when DOCKER_HOST (or the default) names a unix socket that does not
+    exist, so the docker SDK is never imported on a host without a daemon."""
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    return not (sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]))
+
+
 def _reaper_docker_client():
     """Docker client for the periodic reaper, or None when there is no daemon."""
-    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
-    if sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]):
+    if not _docker_socket_present():
         return None
     try:
         import docker
