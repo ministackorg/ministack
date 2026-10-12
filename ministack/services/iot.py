@@ -372,6 +372,8 @@ def reset() -> None:
     _job_executions.clear()
     _job_templates.clear()
     _tags.clear()
+    # Retained messages are part of the state get_state() saves.
+    _retained.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None

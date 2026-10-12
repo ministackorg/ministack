@@ -240,6 +240,20 @@ def test_retained_user_properties_and_time_survive_persistence():
         iot_module.broker_reset()
 
 
+def test_iot_reset_clears_retained_messages():
+    """The iot module saves retained messages, so its reset drops them even when iot_data was never loaded."""
+    import asyncio
+
+    from ministack.services import iot as iot_module
+
+    account = "123456789012"
+    asyncio.run(iot_module.broker_publish(account, "eu-west-1", "dev/kept", b"x", retain=True))
+    assert iot_module.broker_get_retained(account, "eu-west-1", "dev/kept") is not None
+    iot_module.reset()
+    assert iot_module.broker_get_retained(account, "eu-west-1", "dev/kept") is None
+    assert iot_module.get_state()["mqtt_broker"]["retained"] == []
+
+
 def test_iot_data_publish_rejects_wildcard_topic():
     """Wildcard characters in publish topics must produce a 400."""
     import urllib.request
