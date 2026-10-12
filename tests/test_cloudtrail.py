@@ -161,7 +161,7 @@ def test_read_trail_by_arn_from_different_request_region(ct):
     assert get_resp["Trail"]["Name"] == name
 
     status_resp = west_ct.get_trail_status(Name=arn)
-    assert status_resp["IsLogging"] is True
+    assert status_resp["IsLogging"] is False
 
     desc_resp = west_ct.describe_trails(trailNameList=[arn])
     assert [trail["TrailARN"] for trail in desc_resp["trailList"]] == [arn]
@@ -196,7 +196,7 @@ def test_multi_region_trail_is_shadow_visible_from_peer_region(ct):
     west_ct = _client("cloudtrail", region=WEST_REGION)
 
     assert west_ct.get_trail(Name=name)["Trail"]["HomeRegion"] == REGION
-    assert west_ct.get_trail_status(Name=name)["IsLogging"] is True
+    assert west_ct.get_trail_status(Name=name)["IsLogging"] is False
     assert west_ct.describe_trails(trailNameList=[name])["trailList"][0]["TrailARN"] == arn
     assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
     assert any(t["TrailARN"] == arn for t in west_ct.list_trails()["Trails"])
@@ -344,7 +344,21 @@ def test_get_trail_status(ct):
     name = f"trail-status-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
     resp = ct.get_trail_status(Name=name)
-    assert resp["IsLogging"] is True
+    assert resp["IsLogging"] is False
+
+
+def test_new_trail_is_not_logging_until_started(ct):
+    name = f"trail-new-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status == {"IsLogging": False}
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status.keys() == {"IsLogging", "StartLoggingTime"}
+    assert status["IsLogging"] is True
 
 
 def test_get_trail_status_not_found(ct):
@@ -365,6 +379,7 @@ def test_start_stop_logging_flips_is_logging_state(ct):
     aws_cloudtrail data source asserts on this."""
     name = f"trail-state-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
 
     ct.stop_logging(Name=name)
@@ -374,6 +389,20 @@ def test_start_stop_logging_flips_is_logging_state(ct):
 
     ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
+
+
+def test_restarted_trail_keeps_stop_logging_time(ct):
+    name = f"trail-restart-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    stopped = ct.get_trail_status(Name=name)
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert status["IsLogging"] is True
+    assert status["StopLoggingTime"] == stopped["StopLoggingTime"]
+    assert status["StartLoggingTime"] >= stopped["StartLoggingTime"]
 
 
 def test_list_trails_returns_summaries(ct):
