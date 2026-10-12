@@ -8654,6 +8654,38 @@ def test_cfn_iot_thing_type_rename_replaces_it(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_iot_thing_type_delete_deprecates_and_keeps_a_type_in_use(cfn, iot_client):
+    """A stack delete deprecates then deletes a thing type; one a thing still uses fails and stays deprecated."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, used, free, thing = (f"cfn-iot-tt-del-{uid}", f"cfn-tt-used-{uid}",
+                                f"cfn-tt-free-{uid}", f"cfn-tt-thing-{uid}")
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+        "Used": {"Type": "AWS::IoT::ThingType", "Properties": {"ThingTypeName": used}},
+        "Free": {"Type": "AWS::IoT::ThingType", "Properties": {"ThingTypeName": free}},
+    }}))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        iot_client.create_thing(thingName=thing, thingTypeName=used)
+
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_FAILED"
+        assert _cfn_iot_failure(cfn, stack, "Used", "DELETE_FAILED") == (
+            f"Can not delete thing type {used} with things associated with it")
+        assert iot_client.describe_thing_type(thingTypeName=used)["thingTypeMetadata"]["deprecated"] is True
+        assert iot_client.describe_thing(thingName=thing)["thingTypeName"] == used
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_thing_type(thingTypeName=free)
+
+        iot_client.update_thing(thingName=thing, removeThingType=True)
+        cfn.delete_stack(StackName=stack)
+        assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.describe_thing_type(thingTypeName=used)
+    finally:
+        iot_client.delete_thing(thingName=thing)
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def test_cfn_apigateway_account_update_removes_a_dropped_role():
     """CloudWatchRoleArn is No interruption. The create handler only ever
     wrote a declared role, so a template that dropped the property left the

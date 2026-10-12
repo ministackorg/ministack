@@ -13318,9 +13318,22 @@ def _iot_thing_type_import(identifier):
     return identifier["ThingTypeName"], _iot_thing_type_attrs(identifier["ThingTypeName"])
 
 
-def _iot_thing_type_delete(physical_id, props):
+def _iot_thing_type_remove(physical_id, props):
+    """Drop the record without the delete checks, for a replacement that reuses the generated name."""
     _iot._thing_types.pop(physical_id, None)
     _iot._tags.pop(_iot._thing_type_arn(physical_id), None)
+
+
+def _iot_thing_type_delete(physical_id, props):
+    """Deprecate the thing type, then delete it; a type a thing still uses fails the delete and stays deprecated."""
+    record = _iot._thing_types.get(physical_id)
+    if record is None:
+        return
+    if not record["thingTypeMetadata"].get("deprecated"):
+        _iot._deprecate_thing_type(physical_id, {"undoDeprecate": False})
+    resp = _iot._delete_thing_type(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
@@ -13349,7 +13362,7 @@ def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::IoT::ThingType", old_props, new_props):
-        _iot_thing_type_delete(physical_id, old_props)
+        _iot_thing_type_remove(physical_id, old_props)
         return _iot_thing_type_create(logical_id or physical_id, new_props, stack_name)
 
     stored = record.setdefault("thingTypeProperties", {})
