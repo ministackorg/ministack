@@ -684,6 +684,24 @@ def test_iot_delete_thing_type_active_rejected(iot_client):
     iot_client.delete_thing_type(thingTypeName=name)
 
 
+def test_iot_delete_thing_type_refused_while_a_thing_uses_it(iot_client):
+    """A deprecated thing type that a thing still uses is refused."""
+    type_name, thing = _unique("type"), _unique("thing")
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(thingName=thing, thingTypeName=type_name)
+    iot_client.deprecate_thing_type(thingTypeName=type_name)
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing_type(thingTypeName=type_name)
+    err = ei.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        400, "InvalidRequestException", f"Can not delete thing type {type_name} with things associated with it")
+    assert iot_client.describe_thing_type(thingTypeName=type_name)["thingTypeName"] == type_name
+
+    iot_client.update_thing(thingName=thing, removeThingType=True)
+    iot_client.delete_thing_type(thingTypeName=type_name)
+    iot_client.delete_thing(thingName=thing)
+
+
 # ---------------------------------------------------------------------------
 # ThingGroup CRUD + membership
 # ---------------------------------------------------------------------------
@@ -778,6 +796,20 @@ def test_iot_create_thing_group_repeat_compares_tags(iot_client):
     iot_client.delete_thing_group(thingGroupName=tagged)
 
 
+def test_iot_create_thing_group_repeat_compares_current_tags(iot_client):
+    name = _unique("group")
+    created = [{"Key": "team", "Value": "a"}]
+    arn = iot_client.create_thing_group(thingGroupName=name, tags=created)["thingGroupArn"]
+    iot_client.tag_resource(resourceArn=arn, tags=[{"Key": "added", "Value": "1"}])
+    for tags in (created, None):
+        kwargs = {} if tags is None else {"tags": tags}
+        assert _iot_error(iot_client.create_thing_group, thingGroupName=name, **kwargs) == (
+            409, f"Resource {arn} already exists in current account with different properties")
+    current = [{"Key": "added", "Value": "1"}, {"Key": "team", "Value": "a"}]
+    for tags in (current, current[::-1]):
+        assert iot_client.create_thing_group(thingGroupName=name, tags=tags)["thingGroupArn"] == arn
+
+
 def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     parent, child = _unique("parent"), _unique("child")
     iot_client.create_thing_group(thingGroupName=parent)
@@ -841,6 +873,309 @@ def test_iot_list_thing_groups_for_thing(iot_client):
     iot_client.delete_thing(thingName=tname)
     iot_client.delete_thing_group(thingGroupName=g1)
     iot_client.delete_thing_group(thingGroupName=g2)
+
+
+# ---------------------------------------------------------------------------
+# Tags (TagResource / UntagResource / ListTagsForResource)
+# ---------------------------------------------------------------------------
+
+
+def _iot_tags(iot_client, arn):
+    return {t["Key"]: t["Value"] for t in iot_client.list_tags_for_resource(resourceArn=arn)["tags"]}
+
+
+def _iot_error(call, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        call(**kwargs)
+    response = ei.value.response
+    return response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Message"]
+
+
+def test_iot_create_time_tags_are_listed(iot_client):
+    tags = [{"Key": "team", "Value": "a"}, {"Key": "env", "Value": "dev"}]
+    thing_arn = iot_client.create_thing(thingName=_unique("thing"))["thingArn"]
+    rule = _unique("rule").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule, topicRulePayload={"sql": "SELECT * FROM 't'", "actions": []},
+        tags="team=a&env=dev")
+    template_arn = iot_client.create_job_template(
+        jobTemplateId=_unique("jt"), description="d", document="{}", tags=tags)["jobTemplateArn"]
+    arns = [
+        iot_client.create_thing_type(thingTypeName=_unique("type"), tags=tags)["thingTypeArn"],
+        iot_client.create_thing_group(thingGroupName=_unique("group"), tags=tags)["thingGroupArn"],
+        iot_client.create_policy(policyName=_unique("policy"), policyDocument="{}", tags=tags)["policyArn"],
+        iot_client.get_topic_rule(ruleName=rule)["ruleArn"],
+        template_arn,
+        iot_client.create_job(jobId=_unique("job"), targets=[thing_arn], document="{}", tags=tags)["jobArn"],
+        iot_client.register_ca_certificate(
+            caCertificate=iot_test_ca("unused")[0], certificateMode="SNI_ONLY", tags=tags)["certificateArn"],
+        iot_client.create_provisioning_template(
+            templateName=_unique("prov"), templateBody=_provisioning_template_body(),
+            provisioningRoleArn="arn:aws:iam::000000000000:role/p", tags=tags)["templateArn"],
+        iot_client.create_domain_configuration(
+            domainConfigurationName=_unique("dc-tags"), tags=tags)["domainConfigurationArn"],
+    ]
+    for arn in arns:
+        assert _iot_tags(iot_client, arn) == {"team": "a", "env": "dev"}, arn
+    # A job created from a tagged template does not take the template's tags.
+    job_arn = iot_client.create_job(
+        jobId=_unique("job"), targets=[thing_arn], jobTemplateArn=template_arn)["jobArn"]
+    assert _iot_tags(iot_client, job_arn) == {}
+    # The generated id after a domain configuration's name is part of its ARN.
+    assert _iot_error(iot_client.tag_resource, resourceArn=arns[-1].rsplit("/", 1)[0] + "/other",
+                      tags=tags)[0] == 404
+
+
+def test_iot_create_calls_refuse_bad_tags(iot_client):
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    thing_arn = iot_client.create_thing(thingName=_unique("thing"))["thingArn"]
+    type_name, policy_name = _unique("type"), _unique("policy")
+    generic = "Invalid request exception. Please check the input."
+    job_tag = "Invalid tag parameter exception. Please check the input."
+    for create, missing_value in (
+        (lambda tags: raw.create_thing_type(thingTypeName=type_name, tags=tags),
+         "All tags in request should have keys and values."),
+        (lambda tags: raw.create_thing_group(thingGroupName=_unique("group"), tags=tags),
+         "All tags in request should have keys and values."),
+        (lambda tags: raw.create_policy(policyName=policy_name, policyDocument="{}", tags=tags), generic),
+        (lambda tags: raw.create_job_template(
+            jobTemplateId=_unique("jt"), description="d", document="{}", tags=tags), job_tag),
+        (lambda tags: raw.create_job(
+            jobId=_unique("job"), targets=[thing_arn], document="{}", tags=tags), job_tag),
+        (lambda tags: raw.create_provisioning_template(
+            templateName=_unique("prov"), templateBody=_provisioning_template_body(),
+            provisioningRoleArn="arn:aws:iam::000000000000:role/p", tags=tags), generic),
+        (lambda tags: raw.register_ca_certificate(
+            caCertificate=iot_test_ca("unused")[0], certificateMode="SNI_ONLY", tags=tags), generic),
+    ):
+        assert _iot_error(create, tags=[{"Key": "aws:x", "Value": "v"}]) == (
+            400, 'Tags cannot begin with "aws:", offending tag: aws:x')
+        assert _iot_error(create, tags=[{"Key": "k"}]) == (400, missing_value)
+    assert _iot_error(iot_client.describe_thing_type, thingTypeName=type_name)[0] == 404
+    assert _iot_error(iot_client.get_policy, policyName=policy_name)[0] == 404
+
+    rule = _unique("rule").replace("-", "_")
+    for tagging, message in (
+        ("aws:x=v", 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ("k", "Invalid tag parameters, please make sure the tags are in correct format with tagKeys "
+              "not exceeding 128 characters and tagValues not exceeding 256 characters"),
+    ):
+        assert _iot_error(iot_client.create_topic_rule, ruleName=rule, tags=tagging,
+                          topicRulePayload={"sql": "SELECT * FROM 't'", "actions": []}) == (400, message)
+    assert rule not in [r["ruleName"] for r in iot_client.list_topic_rules()["rules"]]
+
+
+def test_iot_tag_untag_and_delete(iot_client):
+    raw = iot_client.list_tags_for_resource
+    name = _unique("group")
+    arn = iot_client.create_thing_group(thingGroupName=name)["thingGroupArn"]
+    listed = raw(resourceArn=arn)
+    assert listed["tags"] == [] and "nextToken" not in listed
+    out = iot_client.tag_resource(resourceArn=arn, tags=[
+        {"Key": "a", "Value": "1"}, {"Key": "b", "Value": ""},
+        {"Key": "dup", "Value": "1"}, {"Key": "dup", "Value": "2"}])
+    assert out["ResponseMetadata"]["HTTPStatusCode"] == 200
+    iot_client.tag_resource(resourceArn=arn, tags=[{"Key": "a", "Value": "new"}])
+    assert _iot_tags(iot_client, arn) == {"a": "new", "b": "", "dup": "2"}
+    iot_client.untag_resource(resourceArn=arn, tagKeys=["b", "missing"])
+    assert _iot_tags(iot_client, arn) == {"a": "new", "dup": "2"}
+
+    # Deleting a resource drops its tags; a namesake starts without them.
+    rule, payload = name.replace("-", "_"), {"sql": "SELECT * FROM 't'", "actions": []}
+
+    def create():
+        iot_client.create_thing_group(thingGroupName=name)
+        iot_client.create_policy(policyName=name, policyDocument="{}")
+        iot_client.create_topic_rule(ruleName=rule, topicRulePayload=payload)
+
+    def delete():
+        iot_client.delete_thing_group(thingGroupName=name)
+        iot_client.delete_policy(policyName=name)
+        iot_client.delete_topic_rule(ruleName=rule)
+
+    iot_client.create_policy(policyName=name, policyDocument="{}")
+    iot_client.create_topic_rule(ruleName=rule, topicRulePayload=payload)
+    resources = (arn, arn.replace(f"thinggroup/{name}", f"policy/{name}"),
+                 arn.replace(f"thinggroup/{name}", f"rule/{rule}"))
+    for resource in resources[1:]:
+        iot_client.tag_resource(resourceArn=resource, tags=[{"Key": "k", "Value": "v"}])
+    delete()
+    for resource in resources:
+        assert _iot_tags(iot_client, resource) == {}
+        assert _iot_error(iot_client.tag_resource, resourceArn=resource,
+                          tags=[{"Key": "k", "Value": "v"}])[0] == 404
+    create()
+    for resource in resources:
+        assert _iot_tags(iot_client, resource) == {}
+    delete()
+
+
+def test_iot_tagging_refuses_unknown_and_foreign_arns(iot_client):
+    arn = iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+    head, account = arn.rsplit(":", 1)[0], arn.split(":")[4]
+    tags, missing = [{"Key": "k", "Value": "v"}], _unique("missing").replace("-", "_")
+    for resource, message in (
+        (f"thinggroup/{missing}", f"Thing Group {missing} does not exist."),
+        (f"thingtype/{missing}", f"Thing Type {missing} does not exist."),
+        (f"policy/{missing}", "This resource is not found"),
+        (f"rule/{missing}", f"Rule {missing} not found. accountId: {account}, "
+                            f"resourceArn: {head}:rule/{missing}"),
+        (f"job/{missing}", f"Job {missing} cannot be found."),
+        (f"jobtemplate/{missing}", f"Job Template {missing} cannot be found."),
+        ("cacert/" + "0" * 64, f"CA Certificate {'0' * 64} not found"),
+        (f"provisioningtemplate/{missing}", "Unable to get template id, template not found"),
+    ):
+        target = f"{head}:{resource}"
+        assert _iot_error(iot_client.tag_resource, resourceArn=target, tags=tags) == (404, message)
+        assert _iot_error(iot_client.untag_resource, resourceArn=target, tagKeys=["k"]) == (404, message)
+        assert iot_client.list_tags_for_resource(resourceArn=target)["tags"] == []
+
+    other_region = arn.replace(":us-east-1:", ":eu-west-1:")
+    for call, kwargs in ((iot_client.tag_resource, {"tags": tags}),
+                         (iot_client.untag_resource, {"tagKeys": ["k"]})):
+        assert _iot_error(call, resourceArn=other_region, **kwargs) == (
+            400, "Invalid request exception. Please check the input.")
+    assert iot_client.list_tags_for_resource(resourceArn=other_region)["tags"] == []
+
+    for target, message in (
+        (f"{head}:thing/{missing}", "Invalid resource type in ARN: thing"),
+        (f"{head}:cert/{'0' * 64}", "Invalid resource type in ARN: cert"),
+        (f"{head}:widget/{missing}", "Invalid arn in request"),
+        (f"{head}:", "Invalid arn in request"),
+        ("not-an-arn", "Invalid arn in request"),
+        (f"arn:aws:sqs:us-east-1:{account}:{missing}", "Invalid arn in request"),
+        (arn.replace(f":{account}:", ":123456789012:"), "ResourceArn doesn't belong in requester's account"),
+    ):
+        assert _iot_error(iot_client.tag_resource, resourceArn=target, tags=tags) == (400, message)
+        assert _iot_error(iot_client.untag_resource, resourceArn=target, tagKeys=["k"]) == (400, message)
+        assert _iot_error(iot_client.list_tags_for_resource, resourceArn=target) == (400, message)
+
+
+def test_iot_tag_limits_and_validation(iot_client):
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    arn = iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+    too_many = "Too many tags provided in the request. Please check the input."
+    fifty = [{"Key": f"k{i:02d}", "Value": "v"} for i in range(50)]
+    assert _iot_error(raw.tag_resource, resourceArn=arn, tags=fifty + [{"Key": "k50", "Value": "v"}]) == (
+        400, too_many)
+    raw.tag_resource(resourceArn=arn, tags=fifty)
+    assert _iot_error(raw.tag_resource, resourceArn=arn, tags=[{"Key": "k50", "Value": "v"}]) == (
+        400, too_many)
+    raw.tag_resource(resourceArn=arn, tags=[{"Key": "k00", "Value": "new"}])
+    assert len(_iot_tags(iot_client, arn)) == 50
+    raw.untag_resource(resourceArn=arn, tagKeys=[t["Key"] for t in fifty])
+
+    pattern = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$"
+    for tags, message in (
+        ([{"Key": "b" * 129, "Value": "v"}], f"1 validation error detected: Value '{'b' * 129}' at "
+         "'tags.1.member.key' failed to satisfy constraint: Member must have length less than or equal to 128"),
+        ([{"Key": "v", "Value": "x" * 257}], f"1 validation error detected: Value '{'x' * 257}' at "
+         "'tags.1.member.value' failed to satisfy constraint: Member must have length less than or equal to 256"),
+        ([{"Key": "", "Value": "v"}], "1 validation error detected: Value '' at 'tags.1.member.key' failed "
+         "to satisfy constraint: Member must have length greater than or equal to 1"),
+        ([{"Key": "a#b", "Value": "v"}], "1 validation error detected: Value 'a#b' at 'tags.1.member.key' "
+         f"failed to satisfy constraint: Member must satisfy regular expression pattern: {pattern}"),
+        ([{"Key": "AWS:x", "Value": "v"}], 'Tags cannot begin with "aws:", offending tag: AWS:x'),
+        ([{"Key": "novalue"}], "Invalid request exception. Please check the input."),
+        ([], "The validated collection is empty"),
+        (None, "1 validation error detected: Value null at 'tags' failed to satisfy constraint: "
+         "Member must not be null"),
+    ):
+        kwargs = {} if tags is None else {"tags": tags}
+        assert _iot_error(raw.tag_resource, resourceArn=arn, **kwargs) == (400, message)
+    raw.tag_resource(resourceArn=arn, tags=[
+        {"Key": "a" * 128, "Value": "x" * 256}, {"Key": "a b+-=._:/@", "Value": "aws:x"},
+        {"Key": "awsx", "Value": ""}])
+    assert len(_iot_tags(iot_client, arn)) == 3
+
+    for keys, message in (
+        (["aws:x"], 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ([], "The validated collection is empty"),
+        (None, "1 validation error detected: Value null at 'tagKeys' failed to satisfy constraint: "
+         "Member must not be null"),
+        (["b" * 129], f"1 validation error detected: Value '[{'b' * 129}]' at 'tagKeys' failed to "
+         "satisfy constraint: Member must satisfy constraint: [Member must have length less than or "
+         "equal to 128, Member must have length greater than or equal to 1, Member must satisfy "
+         f"regular expression pattern: {pattern}]"),
+    ):
+        kwargs = {} if keys is None else {"tagKeys": keys}
+        assert _iot_error(raw.untag_resource, resourceArn=arn, **kwargs) == (400, message)
+
+    # A Create call refuses the same tags, and creates nothing.
+    for tags, message in (
+        ([{"Key": "aws:x", "Value": "v"}], 'Tags cannot begin with "aws:", offending tag: aws:x'),
+        ([{"Key": f"k{i:02d}", "Value": "v"} for i in range(51)], too_many),
+    ):
+        name = _unique("group")
+        assert _iot_error(raw.create_thing_group, thingGroupName=name, tags=tags) == (400, message)
+        assert _iot_error(iot_client.describe_thing_group, thingGroupName=name)[0] == 404
+
+
+def test_iot_tags_are_persisted_and_reset():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("group")
+    arn = f"arn:aws:iot:eu-west-1:123456789012:thinggroup/{name}"
+
+    async def _tags():
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        _status, _headers, body = await iot_module.handle_request(
+            "GET", "/tags", {}, b"", {"resourceArn": arn})
+        return json.loads(body)["tags"]
+
+    async def _run():
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        body = json.dumps({"tags": [{"Key": "k", "Value": "v"}]}).encode()
+        status, _headers, _body = await iot_module.handle_request(
+            "POST", f"/thing-groups/{name}", {}, body, {})
+        assert status == 200
+        assert await _tags() == [{"Key": "k", "Value": "v"}]
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert await _tags() == []
+        iot_module.load_persisted_state(saved)
+        assert await _tags() == [{"Key": "k", "Value": "v"}]
+
+    asyncio.run(_run())
+
+
+def test_iot_tags_on_records_of_older_state_move_to_the_store():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name, tags = _unique("group"), [{"Key": "k", "Value": "v"}]
+    arn = f"arn:aws:iot:eu-west-1:123456789012:thinggroup/{name}"
+
+    async def _call(method, path, body=b"", qp=None):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        return await iot_module.handle_request(method, path, {}, body, qp or {})
+
+    async def _run():
+        body = json.dumps({"tags": tags}).encode()
+        assert (await _call("POST", f"/thing-groups/{name}", body))[0] == 200
+        saved = iot_module.get_state()
+        # What older versions saved: the tags on the record and no tag store.
+        del saved["tags"]
+        saved["thing_groups"].get_scoped("123456789012", "eu-west-1", name)["tags"] = tags
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        _status, _headers, listed = await _call("GET", "/tags", qp={"resourceArn": arn})
+        assert json.loads(listed)["tags"] == tags
+        assert (await _call("POST", f"/thing-groups/{name}", body))[0] == 200
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1272,43 @@ def test_iot_delete_active_certificate_rejected(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_delete_certificate_refused_while_attached(iot_client):
+    """ACTIVE is refused first, then attached things even when forced, then policies unless forced."""
+    pytest.importorskip("cryptography")
+    thing, policy = _unique("thing"), _unique("policy")
+    iot_client.create_thing(thingName=thing)
+    iot_client.create_policy(policyName=policy, policyDocument=_POLICY_DOC)
+    cert = iot_client.create_keys_and_certificate(setAsActive=True)
+    cert_id, arn = cert["certificateId"], cert["certificateArn"]
+    iot_client.attach_thing_principal(thingName=thing, principal=arn)
+    iot_client.attach_policy(policyName=policy, target=arn)
+
+    def refusal(**kwargs):
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_certificate(certificateId=cert_id, **kwargs)
+        err = ei.value.response
+        return err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]
+
+    active = (406, "CertificateStateException",
+              f"Certificate must be deactivated (not ACTIVE) before deletion. Id: {cert_id}")
+    things = (409, "DeleteConflictException", f"Things must be detached before deletion (arn: {arn})")
+    policies = (409, "DeleteConflictException", f"Certificate policies must be detached before deletion (arn: {arn})")
+    assert refusal() == refusal(forceDelete=True) == active
+    for status in ("INACTIVE", "REVOKED"):
+        iot_client.update_certificate(certificateId=cert_id, newStatus=status)
+        assert refusal() == refusal(forceDelete=True) == things
+    iot_client.detach_thing_principal(thingName=thing, principal=arn)
+    assert refusal() == policies
+    assert iot_client.list_targets_for_policy(policyName=policy)["targets"] == [arn]
+
+    iot_client.delete_certificate(certificateId=cert_id, forceDelete=True)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_certificate(certificateId=cert_id)
+    assert iot_client.list_targets_for_policy(policyName=policy)["targets"] == []
+    iot_client.delete_policy(policyName=policy)
+    iot_client.delete_thing(thingName=thing)
+
+
 def test_iot_register_certificate_preserves_pem_verbatim(iot_client):
     pytest.importorskip("cryptography")
     # Issue a cert, capture its PEM, delete it, then re-register the SAME PEM.
@@ -991,6 +1363,31 @@ def test_iot_attach_detach_thing_principal(iot_client):
     iot_client.update_certificate(certificateId=cert["certificateId"], newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert["certificateId"])
     iot_client.delete_thing(thingName=name)
+
+
+def test_iot_delete_thing_refused_while_a_principal_is_attached(iot_client):
+    """A thing with a certificate attached is refused whatever the certificate's status."""
+    pytest.importorskip("cryptography")
+    name = _unique("thing")
+    iot_client.create_thing(thingName=name)
+    cert = iot_client.create_keys_and_certificate(setAsActive=True)
+    cert_id, arn = cert["certificateId"], cert["certificateArn"]
+    iot_client.attach_thing_principal(thingName=name, principal=arn)
+    for status in ("ACTIVE", "INACTIVE", "REVOKED"):
+        iot_client.update_certificate(certificateId=cert_id, newStatus=status)
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_thing(thingName=name)
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException", f"Cannot delete. Thing {name} is still attached to one or more principals")
+    assert iot_client.list_thing_principals(thingName=name)["principals"] == [arn]
+    assert iot_client.list_principal_things(principal=arn)["things"] == [name]
+
+    iot_client.detach_thing_principal(thingName=name, principal=arn)
+    iot_client.delete_thing(thingName=name)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+    iot_client.delete_certificate(certificateId=cert_id)
 
 
 def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
@@ -1105,6 +1502,37 @@ def test_iot_attach_detach_policy(iot_client):
     assert arn not in targets2
 
     iot_client.delete_policy(policyName=name)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+def test_iot_delete_policy_refused_while_versioned_or_attached(iot_client):
+    """A non-default version is refused before an attachment."""
+    pytest.importorskip("cryptography")
+    name = _unique("policy")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    iot_client.create_policy_version(policyName=name, policyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Subscribe", "Resource": "*"}]}))
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    iot_client.attach_policy(policyName=name, target=cert["certificateArn"])
+
+    def refusal():
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_policy(policyName=name)
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"]) == (409, "DeleteConflictException")
+        return err["Error"]["Message"]
+
+    assert refusal() == (
+        f"The policy cannot be deleted as multiple versions of the policy exist (name={name}). "
+        "Use DeletePolicyVersion action to delete all non-default versions of the policy and retry.")
+    iot_client.delete_policy_version(policyName=name, policyVersionId="2")
+    assert refusal() == (
+        f"The policy cannot be deleted as the policy is attached to one or more principals (name={name})")
+
+    iot_client.detach_policy(policyName=name, target=cert["certificateArn"])
+    iot_client.delete_policy(policyName=name)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.get_policy(policyName=name)
     iot_client.delete_certificate(certificateId=cert["certificateId"])
 
 
@@ -2106,6 +2534,84 @@ def test_iot_create_topic_rule_accepts_full_where_grammar(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def _republish_role(iam) -> str:
+    """A role the republish actions can name, so the rules also resolve it under AUTH=true."""
+    trust = {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    try:
+        iam.create_role(RoleName="iot-republish-role", AssumeRolePolicyDocument=json.dumps(trust))
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "EntityAlreadyExists":
+            raise
+    return iam.get_role(RoleName="iot-republish-role")["Role"]["Arn"]
+
+
+def _republish(role_arn: str, topic: str) -> dict:
+    return {"republish": {"roleArn": role_arn, "topic": topic}}
+
+
+@pytest.mark.parametrize(
+    "topic_filter, targets, disabled",
+    [
+        ("loop/#", ["loop/x"], False),
+        ("loop/exact", ["loop/exact"], False),
+        ("loop/+/c", ["loop/b/c"], False),
+        ("loop/par/#", ["loop/par"], False),
+        ("loop/#", ["loop/${clientid()}"], False),
+        ("loop/#", ["loop/x"], True),
+        ("loop/#", ["elsewhere", "loop/x"], False),
+        ("$aws/things/t/shadow/update", ["$$aws/things/t/shadow/update"], False),
+    ],
+    ids=[
+        "hash", "exact", "plus", "hash-parent-level", "template-suffix", "disabled", "second-action",
+        "escaped-dollar",
+    ],
+)
+def test_iot_create_topic_rule_republish_inside_own_filter_rejected(
+    iot_client, iam, topic_filter, targets, disabled
+):
+    """A republish topic the rule's own FROM filter matches is refused, and nothing is stored."""
+    role_arn, name = _republish_role(iam), _rule_name()
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(ruleName=name, topicRulePayload={
+            "sql": f"SELECT * FROM '{topic_filter}'",
+            "ruleDisabled": disabled,
+            "actions": [_republish(role_arn, target) for target in targets],
+        })
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Republish topic cannot be within topic space of rule's topic pattern '{topic_filter}'"
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.get_topic_rule(ruleName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.parametrize(
+    "topic_filter, target, error_target",
+    [
+        ("loop/#", "elsewhere", None),
+        ("loop/+", "loop/a/b", None),
+        ("loop/#", "elsewhere", "loop/x"),
+        ("loop/#", "${topic()}", None),
+        ("+/b/c", "$$a/b/c", None),
+    ],
+    ids=["outside", "plus-one-level", "error-action-inside", "template-only", "dollar-under-leading-wildcard"],
+)
+def test_iot_create_topic_rule_republish_outside_own_filter_accepted(
+    iot_client, iam, topic_filter, target, error_target
+):
+    """Only the actions' topics as written are checked, so these rules are stored."""
+    role_arn, name = _republish_role(iam), _rule_name()
+    payload = {"sql": f"SELECT * FROM '{topic_filter}'", "actions": [_republish(role_arn, target)]}
+    if error_target:
+        payload["errorAction"] = _republish(role_arn, error_target)
+    iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["actions"] == [_republish(role_arn, target)]
+    iot_client.delete_topic_rule(ruleName=name)
+
+
 def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
     name = _rule_name()
     iot_client.create_topic_rule(
@@ -2118,6 +2624,24 @@ def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
     assert ei.value.response["Error"]["Code"] == "SqlParseException"
     # The stored rule is untouched.
     assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'a'"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_topic_rule_republish_inside_own_filter_rejected(iot_client, iam):
+    role_arn, name = _republish_role(iam), _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": [_republish(role_arn, "b")]}
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": [_republish(role_arn, "a")]}
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        "Republish topic cannot be within topic space of rule's topic pattern 'a'"
+    )
+    # The stored rule is untouched.
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["actions"] == [_republish(role_arn, "b")]
     iot_client.delete_topic_rule(ruleName=name)
 
 
@@ -4690,8 +5214,8 @@ def test_rule_event_from_less_basic_ingest_projects():
 
 
 # ----------------------------------------------------------------------
-# Rule SQL functions: newuuid(), replace(), clientid() (and the accepted
-# but unresolvable principal() / traceid()).
+# Rule SQL functions: newuuid(), replace(), clientid(), principal(),
+# traceid().
 # ----------------------------------------------------------------------
 
 
@@ -4757,22 +5281,23 @@ def test_rule_event_replace_handles_escaped_quotes():
     assert event == {"n": "it is on"}
 
 
-def test_rule_event_principal_and_traceid_accepted_but_unresolved(caplog):
-    """Both are real AWS functions, so a rule using them is stored rather than
-    failing a stack that deploys on AWS — but this publish path carries no
-    certificate identity or trace id, so they warn like any other function the
-    evaluator does not implement."""
+def test_rule_event_principal_and_traceid_read_the_message_identity(caplog):
+    """Both read the message under evaluation, without a warning, and are Undefined outside one."""
     from ministack.services import iot as iot_module
-    from ministack.services.iot import _rule_event, _validate_rule_sql
+    from ministack.services.iot import _rule_event, _unimplemented_sql_functions, _validate_rule_sql
 
     sql = "SELECT principal() AS p, traceid() AS t, temp FROM 't'"
     assert _validate_rule_sql(sql) is None
-    # The evaluator warns once per function name for the life of the process.
+    assert _unimplemented_sql_functions(sql) == []
     iot_module._warned_sql_funcs.clear()
     with caplog.at_level(logging.WARNING, logger="iot"):
         assert _rule_event(sql, "t", b'{"temp": 1}') == {"temp": 1}
-    warned = " ".join(r.message for r in caplog.records)
-    assert "principal()" in warned and "traceid()" in warned
+        token = iot_module._rule_message_identity.set(("c0ffee", "trace-1"))
+        try:
+            assert _rule_event(sql, "t", b'{"temp": 1}') == {"p": "c0ffee", "t": "trace-1", "temp": 1}
+        finally:
+            iot_module._rule_message_identity.reset(token)
+    assert not caplog.records
 
 
 def test_eval_where_clientid_reaches_every_leaf_form():
@@ -4801,6 +5326,31 @@ def test_eval_where_clientid_reaches_every_leaf_form():
     # ...but "n/a" is a value, so the function is never Undefined.
     assert _eval_where("isUndefined(clientid())", "t", raw, message) is False
     assert _eval_where("clientid() = 'n/a'", "t", raw, message) is True
+
+
+def test_eval_where_principal_and_traceid_are_operands():
+    """A rule can gate on who published (`WHERE principal() = '<certificate id>'`)."""
+    from ministack.services import iot as iot_module
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"temp": 1}'
+    message = _rule_message(raw)
+    token = iot_module._rule_message_identity.set(("c0ffee", "trace-1"))
+    try:
+        for pred, expected in (
+            ("principal() = 'c0ffee'", True),
+            ("principal() IN ('beef', 'c0ffee')", True),
+            ("principal() LIKE 'c0%'", True),
+            ("principal() = 'beef'", False),
+            ("traceid() = 'trace-1'", True),
+            ("isUndefined(traceid())", False),
+        ):
+            assert _eval_where(pred, "t", raw, message) is expected
+    finally:
+        iot_module._rule_message_identity.reset(token)
+    # With no message identity both are Undefined, so a comparison fails closed.
+    assert _eval_where("principal() = 'c0ffee'", "t", raw, message) is False
+    assert _eval_where("isUndefined(traceid())", "t", raw, message) is True
 
 
 def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
@@ -4843,6 +5393,56 @@ def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
     try:
         asyncio.run(_run())
         assert dispatched == [{"cid": "sensor-7"}, {"cid": "n/a"}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_broker_publish_threads_principal_and_trace_id_into_rules(monkeypatch):
+    """principal() is the publisher's; traceid() is one id per message, shared by every rule it reaches."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    for name in ("pt_a", "pt_b"):
+        iot_module._topic_rules.set_scoped(
+            account_id,
+            _TEST_REGION,
+            name,
+            {
+                "ruleName": name,
+                "sql": "SELECT principal() AS p, traceid() AS t FROM 'sensors/#'",
+                "ruleDisabled": False,
+                "actions": [{"lambda": {"functionArn": f"arn:aws:lambda:us-east-1:123456789012:function:{name}"}}],
+            },
+        )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append((arn.rsplit(":", 1)[-1], event)),
+    )
+
+    async def _run():
+        send, _sent = _mock_send()
+        session = _IoTWSSession(send, account_id, _TEST_REGION, "c0ffee")
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("sensor-7"))
+        for _ in range(2):
+            await session.handle_packet(PKT_PUBLISH, 0, _encode_string("sensors/door") + b"{}")
+        await session.cleanup()
+        # An in-process publish names no principal; it still gets a trace id.
+        await publish(account_id, "sensors/door", b"{}")
+
+    try:
+        asyncio.run(_run())
+        assert [rule for rule, _event in dispatched] == ["pt_a", "pt_b"] * 3
+        events = [event for _rule, event in dispatched]
+        assert [event.get("p") for event in events] == ["c0ffee"] * 4 + [None] * 2
+        trace_ids = [event["t"] for event in events]
+        assert all(str(uuid.UUID(t)) == t for t in trace_ids)
+        assert trace_ids[0] == trace_ids[1] and trace_ids[2] == trace_ids[3] and trace_ids[4] == trace_ids[5]
+        assert len(set(trace_ids)) == 3
     finally:
         iot_module._topic_rules.clear()
         reset()
@@ -5405,9 +6005,56 @@ def test_rule_republish_action_delivers_projected_event():
         reset()
 
 
+def test_rule_republish_is_a_new_message_from_the_rule_role_session():
+    """A republished message comes from the rule role's session and gets its own trace id."""
+    from ministack.services import iam as iam_module
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iam_module._roles.set_scoped(
+        account_id, None, "rule-role", {"RoleName": "rule-role", "RoleId": "AROAEXAMPLEROLEID0001"}
+    )
+    role_arn = f"arn:aws:iam::{account_id}:role/rule-role"
+    _put_rule(
+        account_id,
+        "chain_first",
+        "SELECT traceid() AS t FROM 'chain/in'",
+        [{"republish": {"topic": "chain/mid", "roleArn": role_arn}}],
+    )
+    _put_rule(
+        account_id,
+        "chain_second",
+        "SELECT principal() AS p, traceid() AS t, t AS original FROM 'chain/mid'",
+        [{"republish": {"topic": "chain/out", "roleArn": role_arn}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "chain/out", _collect)
+        await publish(account_id, "chain/in", b"{}", principal="c0ffee")
+
+    try:
+        asyncio.run(_run())
+        [event] = received
+        assert re.fullmatch(r"AROAEXAMPLEROLEID0001:[A-Za-z0-9]{8}", event["p"])
+        assert str(uuid.UUID(event["t"])) == event["t"]
+        assert event["t"] != event["original"]
+        # A role the account does not have names no session.
+        assert iot_module._rule_role_principal(account_id, f"arn:aws:iam::{account_id}:role/absent") is None
+        assert iot_module._rule_role_principal("210987654321", role_arn) is None
+    finally:
+        iam_module._roles.pop_scoped(account_id, None, "rule-role", None)
+        iot_module._topic_rules.clear()
+        reset()
+
+
 def test_rule_republish_onto_own_topic_terminates():
-    """A rule republishing onto its own topic filter is user error, but the
-    broker must cut the chain instead of recursing forever."""
+    """A rule restored from saved state can still republish onto its own filter; the broker cuts the chain."""
     from ministack.services import iot as iot_module
 
     reset()
@@ -5611,6 +6258,56 @@ def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
             {"failedAction": "DynamoDBv2Action", "failedResource": "absent",
              "errorMessage": "RuntimeError: dispatch blew up"}
         ]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_reports_the_message_trace_id(monkeypatch):
+    """The errorAction document's cloudwatchTraceId is the message's traceid()."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "err_rule",
+        {
+            "ruleName": "err_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+    _put_rule(
+        account_id,
+        "trace_rule",
+        "SELECT traceid() AS t FROM 'err/topic'",
+        [{"republish": {"topic": "err/trace"}}],
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+    received = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received[topic] = json.loads(payload)
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await subscribe(account_id, "err/trace", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        trace_id = received["err/trace"]["t"]
+        assert str(uuid.UUID(trace_id)) == trace_id
+        assert received["err/dlq"]["cloudwatchTraceId"] == trace_id
     finally:
         iot_module._topic_rules.clear()
         reset()
@@ -7284,6 +7981,34 @@ def test_iot_job_removed_timed_out_and_deleted_events():
     assert events[8][1]["targetSelection"] == "CONTINUOUS"
 
 
+def test_iot_job_execution_deleted_events():
+    async def calls(call):
+        for thing in ("ev-t1", "ev-t2"):
+            await call("POST", f"/things/{thing}")
+        await _create_job(call, "ev-del", ["ev-t1", "ev-t2"])
+        await call("POST", "/things/ev-t2/jobs/ev-del",
+                   {"status": "IN_PROGRESS", "statusDetails": {"p": "2"}}, device=True)
+        await call("DELETE", "/things/ev-t1/jobs/ev-del/executionNumber/1")
+        await call("DELETE", "/things/ev-t2/jobs/ev-del/executionNumber/1",
+                   query={"force": "true"})
+
+    events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
+    assert [t for t, _e in events] == [
+        "$aws/events/jobExecution/ev-del/deleted",
+        "$aws/events/jobExecution/ev-del/deleted",
+        "$aws/events/job/ev-del/completed",
+    ]
+    for _t, e in events:
+        e.pop("eventId")
+        _job_stamps(e)
+    deleted = {"eventType": "JOB_EXECUTION", "operation": "deleted", "jobId": "ev-del",
+               "status": "DELETED", "executionNumber": 1}
+    assert events[0][1] == {**deleted, "thingArn": f"{_JOB_ARN}:thing/ev-t1"}
+    assert events[1][1] == {**deleted, "thingArn": f"{_JOB_ARN}:thing/ev-t2",
+                            "statusDetails": {"p": "2"}}
+    assert events[2][1]["jobProcessDetails"] == _job_counts()
+
+
 @pytest.mark.parametrize("enable", [("JOB",), ("JOB_EXECUTION",), ()])
 def test_iot_job_events_follow_the_event_configuration(enable):
     async def calls(call):
@@ -7542,24 +8267,36 @@ def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client
         _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 
 
+def _assert_register_refused(iot_client, http_status, code, message, **kwargs):
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate(**kwargs)
+    assert ei.value.response["Error"]["Code"] == code
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == http_status
+
+
 def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
-    """``caCertificatePem`` naming a CA that was never registered is a
-    ``CertificateValidationException``, and nothing is stored — otherwise the
-    CA id is whatever the caller sent and DescribeCertificate points at a CA
-    that does not exist."""
+    """``caCertificatePem`` naming a CA that was never registered, or was
+    deleted, is a ``CertificateStateException``, and nothing is stored —
+    otherwise the CA id is whatever the caller sent and DescribeCertificate
+    points at a CA that does not exist."""
     from ministack.core.x509_utils import get_certificate_id
 
     ca_pem, _verification, leaf_pem = _generate_ca_and_leaf("never-registered")
-    with pytest.raises(ClientError) as ei:
-        iot_client.register_certificate(
-            certificatePem=leaf_pem, caCertificatePem=ca_pem
+    deleted_pem, _verification, deleted_leaf_pem = _generate_ca_and_leaf("deleted")
+    deleted_id = iot_client.register_ca_certificate(
+        caCertificate=deleted_pem, certificateMode="SNI_ONLY"
+    )["certificateId"]
+    iot_client.delete_ca_certificate(certificateId=deleted_id)
+    for ca, leaf in ((ca_pem, leaf_pem), (deleted_pem, deleted_leaf_pem)):
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "No CA certificate exists for the given certificate",
+            certificatePem=leaf, caCertificatePem=ca,
         )
-    assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
-    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-
-    with pytest.raises(ClientError) as ei:
-        iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaf))
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
@@ -7604,6 +8341,110 @@ def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
         for ca_id in (ca_x_id, ca_y_id):
             iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
             iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_certificate_refuses_a_ca_that_is_not_active(iot_client):
+    """A CA set INACTIVE refuses its leaves with or without
+    ``caCertificatePem``, whatever status they ask for and ahead of the
+    duplicate check. A leaf registered before keeps its status,
+    RegisterCertificateWithoutCA still takes the CA's leaves, and the CA set
+    ACTIVE again accepts them."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+        _registration_code(iot_client), count=4
+    )
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, verificationCertificate=verification_pem, setAsActive=True,
+    )["certificateId"]
+    cert_ids = [iot_client.register_certificate(
+        certificatePem=leaves[0], caCertificatePem=ca_pem, setAsActive=True
+    )["certificateId"]]
+    try:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        flags = [{}, {"setAsActive": True}, {"status": "ACTIVE"}, {"status": "INACTIVE"},
+                 {"status": "REVOKED"}]
+        for leaf in leaves[:2]:
+            for kwargs in [{"caCertificatePem": ca_pem, **f} for f in flags] + [{"status": "ACTIVE"}]:
+                _assert_register_refused(
+                    iot_client, 406, "CertificateStateException", "The CA certificate is not active",
+                    certificatePem=leaf, **kwargs,
+                )
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "Not allowed to register certificate with PENDING_ACTIVATION status",
+            certificatePem=leaves[1], caCertificatePem=ca_pem, status="PENDING_ACTIVATION",
+        )
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaves[1]))
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        desc = iot_client.describe_certificate(certificateId=cert_ids[0])["certificateDescription"]
+        assert (desc["status"], desc["caCertificateId"]) == ("ACTIVE", ca_id)
+
+        cert_ids.append(iot_client.register_certificate_without_ca(
+            certificatePem=leaves[2], status="ACTIVE"
+        )["certificateId"])
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="ACTIVE")
+        cert_ids.append(iot_client.register_certificate(
+            certificatePem=leaves[3], caCertificatePem=ca_pem
+        )["certificateId"])
+        desc = iot_client.describe_certificate(certificateId=cert_ids[-1])["certificateDescription"]
+        assert (desc["status"], desc["caCertificateId"]) == ("INACTIVE", ca_id)
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, [ca_id])
+
+
+def test_iot_register_certificate_checks_the_issuer_before_the_ca_status(iot_client):
+    """An unregistered CA is refused first, then a CA that did not issue the
+    leaf (issuer name, then signature), then a CA that is not ACTIVE. Without
+    ``caCertificatePem`` the signature picks the CA, so of two CAs with one
+    subject only the INACTIVE one's leaf is refused."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    subject = _unique("twin-ca")
+    (a_pem, a_key), (b_pem, b_key) = twins = [generate_ca(common_name=subject) for _ in range(2)]
+    other_pem, other_key = generate_ca(common_name=_unique("other-ca"))
+    unregistered_pem, _key = generate_ca(common_name=_unique("unregistered-ca"))
+
+    def leaf(ca_pem, ca_key):
+        return sign_leaf_certificate(
+            ca_cert_pem=ca_pem, ca_key_pem=ca_key, common_name=_unique("device")
+        )[0]
+
+    ca_ids, cert_ids = [], []
+    try:
+        for ca_pem in (*(pem for pem, _key in twins), other_pem):
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, certificateMode="SNI_ONLY", setAsActive=True,
+            )["certificateId"])
+        iot_client.update_ca_certificate(certificateId=ca_ids[1], newStatus="INACTIVE")
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException",
+            "No CA certificate exists for the given certificate",
+            certificatePem=leaf(other_pem, other_key), caCertificatePem=unregistered_pem,
+        )
+        _assert_register_refused(
+            iot_client, 400, "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the provided CA certificate.",
+            certificatePem=leaf(other_pem, other_key), caCertificatePem=b_pem,
+        )
+        _assert_register_refused(
+            iot_client, 400, "CertificateValidationException",
+            "The signature of the certificate failed verification against the provided CA certificate.",
+            certificatePem=leaf(a_pem, a_key), caCertificatePem=b_pem,
+        )
+        _assert_register_refused(
+            iot_client, 406, "CertificateStateException", "The CA certificate is not active",
+            certificatePem=leaf(b_pem, b_key), status="ACTIVE",
+        )
+        cert_ids.append(iot_client.register_certificate(
+            certificatePem=leaf(a_pem, a_key), status="ACTIVE"
+        )["certificateId"])
+        desc = iot_client.describe_certificate(certificateId=cert_ids[0])["certificateDescription"]
+        assert desc["caCertificateId"] == ca_ids[0]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 
 
 def _delete_certificates_and_cas(iot_client, cert_ids, ca_ids):
