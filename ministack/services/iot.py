@@ -326,6 +326,12 @@ def _restore_state(data: dict | None) -> None:
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
+    # Older state kept a template's body on the record, as its only version.
+    for record in _provisioning_templates.all_values():
+        if "versions" not in record:
+            body = record.pop("templateBody")
+            record["versions"] = {"1": _provisioning_template_version(1, body, record["creationDate"])}
+            record["lastVersionId"] = 1
     _provisioning_claims.update(data.get("provisioning_claims", {}))
     _ownership_tokens.update(data.get("ownership_tokens", {}))
     _jobs.update(data.get("jobs", {}))
@@ -603,7 +609,7 @@ async def _route_request(
     if path == "/provisioning-templates" and method == "GET":
         return _list_provisioning_templates(qp)
     if path.startswith("/provisioning-templates/"):
-        return _handle_provisioning_template(method, path, body)
+        return _handle_provisioning_template(method, path, body, qp)
 
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
@@ -1882,8 +1888,8 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 # topics) that applies a template to a certificate created over MQTT, once the
 # template's pre-provisioning hook allows it. provisioningRoleArn is
 # presence-checked but never resolved — MiniStack does
-# not validate IAM role ARNs elsewhere either. Template versions are not
-# modeled: a template always carries defaultVersionId 1. Wire shapes and
+# not validate IAM role ARNs elsewhere either. A template keeps up to five
+# body versions; Describe and RegisterThing use the default one. Wire shapes and
 # error messages mirror a live probe of the real service (2026-08-26).
 # ---------------------------------------------------------------------------
 
@@ -1914,7 +1920,7 @@ def _validate_provisioning_template_body(body) -> tuple | None:
     if not isinstance(doc, dict):
         return error_response_json(
             "InvalidRequestException",
-            "The template body is invalid: Template body is not valid JSON.",
+            "The template body is invalid",
             400,
         )
     resources = doc.get("Resources")
@@ -2007,18 +2013,30 @@ def _provisioning_template_not_found(name: str) -> tuple:
     )
 
 
-def _handle_provisioning_template(method: str, path: str, body: bytes) -> tuple:
+def _handle_provisioning_template(method: str, path: str, body: bytes, qp: dict) -> tuple:
     suffix = path[len("/provisioning-templates/"):]
     name, _, sub = suffix.partition("/")
-    if sub and (method, sub) != ("POST", "provisioning-claim"):
+    version = sub[len("versions/"):] if sub.startswith("versions/") else None
+    routes = {("POST", "provisioning-claim"), ("POST", "versions"), ("GET", "versions")}
+    if sub and (method, sub) not in routes and not (
+        version and "/" not in version and method in ("GET", "DELETE")
+    ):
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
         )
     err = _validate_provisioning_template_name(name)
     if err:
         return err
-    if sub:
+    if sub == "provisioning-claim":
         return _create_provisioning_claim(name)
+    if sub == "versions" and method == "POST":
+        return _create_provisioning_template_version(name, _parse_body(body), qp)
+    if sub == "versions":
+        return _list_provisioning_template_versions(name)
+    if version is not None and method == "GET":
+        return _describe_provisioning_template_version(name, version)
+    if version is not None:
+        return _delete_provisioning_template_version(name, version)
     if method == "GET":
         return _describe_provisioning_template(name)
     if method == "PATCH":
@@ -2061,13 +2079,14 @@ def _create_provisioning_template(payload: dict) -> tuple:
     record = {
         "templateName": name,
         "templateArn": _provisioning_template_arn(name),
-        "templateBody": payload["templateBody"],
         "enabled": bool(payload.get("enabled", False)),
         "provisioningRoleArn": payload["provisioningRoleArn"],
         "type": payload.get("type", "FLEET_PROVISIONING"),
         "defaultVersionId": 1,
         "creationDate": now,
         "lastModifiedDate": now,
+        "versions": {"1": _provisioning_template_version(1, payload["templateBody"], now)},
+        "lastVersionId": 1,
     }
     # The live service omits description from Describe when it was never set —
     # absent, not empty — so an unset one is not stored at all.
@@ -2085,11 +2104,21 @@ def _create_provisioning_template(payload: dict) -> tuple:
     })
 
 
+def _provisioning_template_version(version_id: int, body, created: float) -> dict:
+    return {"versionId": version_id, "creationDate": created, "templateBody": body}
+
+
+def _provisioning_template_body(t: dict):
+    """The body of the template's default version."""
+    return t["versions"][str(t["defaultVersionId"])]["templateBody"]
+
+
 def _describe_provisioning_template(name: str) -> tuple:
     t = _provisioning_templates.get(name)
     if t is None:
         return _provisioning_template_not_found(name)
-    return json_response(t)
+    out = {k: v for k, v in t.items() if k not in ("versions", "lastVersionId")}
+    return json_response({**out, "templateBody": _provisioning_template_body(t)})
 
 
 def _list_provisioning_templates(qp: dict) -> tuple:
@@ -2115,10 +2144,10 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
     if t is None:
         return _provisioning_template_not_found(name)
     version = payload.get("defaultVersionId")
-    if version is not None and version != t["defaultVersionId"]:
+    if version is not None and str(version) not in t["versions"]:
         return error_response_json(
             "InvalidRequestException",
-            f"ProvisioningTemplate {name!r} has no version {version}",
+            f"Unable to set version {version} as the default, version does not exist",
             400,
         )
     hook = None if payload.get("removePreProvisioningHook") else payload.get("preProvisioningHook")
@@ -2139,10 +2168,12 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
         t.pop("preProvisioningHook", None)
     elif hook:
         t["preProvisioningHook"] = _provisioning_hook(hook)
+    if version is not None:
+        t["defaultVersionId"] = int(version)
     t["lastModifiedDate"] = _now_epoch()
     _provisioning_templates[name] = t
     # The live service answers 200 with an empty body — not an empty JSON
-    # object — and does not bump defaultVersionId.
+    # object.
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
 
 
@@ -2151,6 +2182,94 @@ def _delete_provisioning_template(name: str) -> tuple:
         return _provisioning_template_not_found(name)
     _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
+    return json_response({})
+
+
+_PROVISIONING_TEMPLATE_VERSIONS_MAX = 5
+
+
+def _create_provisioning_template_version(name: str, payload: dict, qp: dict) -> tuple:
+    """``CreateProvisioningTemplateVersion``: version ids count up and are never reused."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    body = payload.get("templateBody")
+    if not body:
+        return error_response_json("InvalidRequestException", "templateBody is required", 400)
+    err = _validate_provisioning_template_body(body)
+    if err:
+        return err
+    if len(t["versions"]) >= _PROVISIONING_TEMPLATE_VERSIONS_MAX:
+        return error_response_json(
+            "VersionsLimitExceededException",
+            f"Can't create a template version for the template {name}, "
+            "the maximum number of template versions has been reached",
+            409,
+        )
+    version_id = t["lastVersionId"] + 1
+    now = _now_epoch()
+    t["versions"][str(version_id)] = _provisioning_template_version(version_id, body, now)
+    t["lastVersionId"] = version_id
+    is_default = str(qp.get("setAsDefault", "")).lower() == "true"
+    if is_default:
+        t["defaultVersionId"] = version_id
+    t["lastModifiedDate"] = now
+    _provisioning_templates[name] = t
+    return json_response({
+        "templateArn": t["templateArn"],
+        "templateName": name,
+        "versionId": version_id,
+        "isDefaultVersion": is_default,
+    })
+
+
+def _list_provisioning_template_versions(name: str) -> tuple:
+    """``ListProvisioningTemplateVersions``: all versions in one page, whatever maxResults asks for."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Template named {name} not found", 404)
+    return json_response({"versions": [
+        {
+            "versionId": v["versionId"],
+            "creationDate": v["creationDate"],
+            "isDefaultVersion": v["versionId"] == t["defaultVersionId"],
+        }
+        for v in t["versions"].values()
+    ]})
+
+
+def _describe_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Unable to find a template named {name}", 404)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Unable to find a template version with ID {version_id} for template {name}",
+            404,
+        )
+    return json_response({**v, "isDefaultVersion": v["versionId"] == t["defaultVersionId"]})
+
+
+def _delete_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException", f"Unable to find template version {version_id}", 404
+        )
+    if v["versionId"] == t["defaultVersionId"]:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Unable to delete template version {version_id}, it is the default version",
+            400,
+        )
+    del t["versions"][version_id]
+    t["lastModifiedDate"] = _now_epoch()
+    _provisioning_templates[name] = t
     return json_response({})
 
 
@@ -2403,7 +2522,7 @@ def _provisioning_hook_overrides(result: dict) -> dict:
 
 def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
     """The template's resources with ``Ref`` and ``Fn::Join`` resolved against the parameters."""
-    body = template["templateBody"]
+    body = _provisioning_template_body(template)
     body = json.loads(body) if isinstance(body, str) else body
     declared = body.get("Parameters")
     values = {

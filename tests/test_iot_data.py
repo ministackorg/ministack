@@ -4310,6 +4310,76 @@ def test_mtls_provisioning_hook_names_the_thing(broker, tmp_path):
     assert iot.describe_thing(thingName=thing)["thingTypeName"] == f"{name}-type"
 
 
+@pytest.mark.parametrize("hook", [False, True], ids=["plain", "hook"])
+def test_mtls_provisioning_applies_the_default_template_version(broker, tmp_path, hook):
+    """RegisterThing applies the default version of the template, after its hook if it has one."""
+    iot = broker.client("iot")
+    name = _unique("fleet")
+    extra = {}
+    if hook:
+        buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", "def handler(event, context):\n    return {'allowProvisioning': True}\n")
+        role = broker.client("iam").create_role(RoleName=f"{name}-hook", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                    "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+        lam = broker.client("lambda")
+        extra["preProvisioningHook"] = {"targetArn": lam.create_function(
+            FunctionName=f"{name}-hook", Runtime="python3.12", Handler="index.handler",
+            Role=role["Role"]["Arn"], Code={"ZipFile": buf.getvalue()},
+        )["FunctionArn"]}
+        lam.add_permission(
+            FunctionName=f"{name}-hook", StatementId="iot", Action="lambda:InvokeFunction",
+            Principal="iot.amazonaws.com",
+        )
+
+    def body(version):
+        return json.dumps({
+            "Parameters": {"SerialNumber": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing", "Properties": {
+                    "ThingName": {"Fn::Join": ["", [f"{name}-{version}-", {"Ref": "SerialNumber"}]]}}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}},
+            },
+            "DeviceConfiguration": {"version": version},
+        })
+
+    iot.create_provisioning_template(
+        templateName=name, templateBody=body("v1"), enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning", **extra,
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    packet_ids = iter(range(3, 100))
+
+    def register(serial, version):
+        peer.send(_make_publish(create, b"", qos=1, packet_id=next(packet_ids)))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": json.loads(payload)["certificateOwnershipToken"],
+            "parameters": {"SerialNumber": serial},
+        }).encode(), qos=1, packet_id=next(packet_ids)))
+        assert peer.next_publish(timeout=10) == (f"{provision}/accepted", json.dumps({
+            "deviceConfiguration": {"version": version}, "thingName": f"{name}-{version}-{serial}",
+        }).encode())
+
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        iot.create_provisioning_template_version(templateName=name, templateBody=body("v2"))
+        register("a", "v1")
+        iot.update_provisioning_template(templateName=name, defaultVersionId=2)
+        register("b", "v2")
+        iot.create_provisioning_template_version(templateName=name, templateBody=body("v3"), setAsDefault=True)
+        register("c", "v3")
+    finally:
+        peer.close()
+
+
 def test_mtls_jitr_certificate_is_listed_by_its_ca(broker, tmp_path):
     """As measured on AWS, ListCertificatesByCA lists the certificate that
     just-in-time registration created, while it is still PENDING_ACTIVATION."""
