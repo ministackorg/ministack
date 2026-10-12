@@ -86,6 +86,18 @@ def test_get_retained_message_returns_the_retained_publish():
         assert "userProperties" not in resp
 
 
+def test_get_retained_message_returns_http_publish_user_properties():
+    """The user properties of a retained HTTP Publish come back as AWS's compact JSON array."""
+    client = _own_account_iot_data()
+    client.publish(
+        topic="sensors/props", retain=True, payload=b"{}",
+        userProperties=[{"app": "demo"}, {"k": "v1"}, {"k": "v2"}, {"u": "ü"}],
+        contentType="application/json",
+    )
+    resp = client.get_retained_message(topic="sensors/props")
+    assert resp["userProperties"] == '[{"app":"demo"},{"k":"v1"},{"k":"v2"},{"u":"ü"}]'.encode()
+
+
 def test_retained_topic_keeps_a_literal_percent_sequence():
     """A topic holding %41, %25 or %2F is stored and read back as written, not decoded a second time."""
     client = _own_account_iot_data()
@@ -351,6 +363,45 @@ def test_iot_data_publish_reserved_topics(iot_data_client, topic, message):
         return
     with pytest.raises(ClientError) as ei:
         iot_data_client.publish(topic=topic, payload=b"{}")
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+_BAD_EXPIRY = "Message expiry interval must be an unsigned 4-byte integer"
+_BAD_RESPONSE_TOPIC = (
+    "This response topic isn't valid. Response topics must not contain MQTT wildcard characters (+ or #)"
+)
+_BAD_USER_PROPERTIES = "Invalid JSON string for User Properties"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "user_properties_header", "message"),
+    [
+        ({"payloadFormatIndicator": "BOGUS"}, None, "Invalid Payload Format Indicator"),
+        ({"messageExpiry": -1}, None, _BAD_EXPIRY),
+        ({"messageExpiry": 2**32}, None, _BAD_EXPIRY),
+        ({"responseTopic": "reply/+/x"}, None, _BAD_RESPONSE_TOPIC),
+        ({"responseTopic": "reply/#"}, None, _BAD_RESPONSE_TOPIC),
+        ({"correlationData": "not base64!"}, None, "Invalid Base64 string"),
+        ({"userProperties": [{"a": "1", "b": "2"}]}, None,
+         "Only one User Property is allowed in single JSONObject"),
+        ({"userProperties": [{"a": 1}]}, None, _BAD_USER_PROPERTIES),
+        ({"userProperties": {"a": "1"}}, None, _BAD_USER_PROPERTIES),
+        ({}, base64.b64encode(b'["a"]').decode(), _BAD_USER_PROPERTIES),
+        ({}, base64.b64encode(b"not json").decode(), _BAD_USER_PROPERTIES),
+        ({}, '[{"a":"1"}]', "Invalid Base64 string"),
+    ],
+)
+def test_iot_data_publish_refuses_invalid_mqtt5_properties(kwargs, user_properties_header, message):
+    """The MQTT 5 headers and query parameters of Publish are refused with AWS's messages."""
+    client = _own_account_iot_data(parameter_validation=False)
+    if user_properties_header is not None:
+        def _header(request, **_kw):
+            request.headers["x-amz-mqtt5-user-properties"] = user_properties_header
+        client.meta.events.register("before-sign.iot-data.Publish", _header)
+    with pytest.raises(ClientError) as ei:
+        client.publish(topic="props/refused", payload=b"x", **kwargs)
     assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
     assert ei.value.response["Error"]["Message"] == message
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
@@ -2784,6 +2835,62 @@ def test_mqtt5_publish_round_trip_forwards_properties():
     assert _prop(props, PROP_RESPONSE_TOPIC) == f"{topic}/reply"
     assert _prop(props, PROP_CORRELATION_DATA) == b"\x01\x02\x03"
     assert _prop(props, PROP_USER_PROPERTY) == ("tenant", "acme")
+
+
+def test_http_publish_forwards_mqtt5_properties(iot_data_client):
+    """HTTP Publish hands its MQTT 5 headers and query parameters to a 5.0 subscriber as properties."""
+    topic = _unique("v5/http")
+    publishes = [
+        {
+            "userProperties": [{"app": "demo"}, {"k": "v1"}, {"k": "v2"}, {"u": "ü"}],
+            "payloadFormatIndicator": "UTF8_DATA",
+            "contentType": "application/json",
+            "responseTopic": f"{topic}/reply",
+            "correlationData": base64.b64encode(b"\x00\x01req-7").decode(),
+            "messageExpiry": 60,
+        },
+        # Unpadded base64, an empty object, empty strings and an interval above
+        # the broker's seven-day limit.
+        {
+            "payloadFormatIndicator": "UNSPECIFIED_BYTES",
+            "correlationData": "cmVxLTc",
+            "userProperties": [{}],
+            "contentType": "",
+            "responseTopic": "",
+            "messageExpiry": 604801,
+        },
+        {},
+    ]
+
+    async def scenario():
+        async with _connect(MQTT_5) as (sub, _c1):
+            await sub.send(_make_subscribe(1, topic, protocol_level=MQTT_5, options=0x00))
+            await sub.await_packet(PKT_SUBACK)
+            delivered = []
+            for kwargs in publishes:
+                await asyncio.to_thread(iot_data_client.publish, topic=topic, payload=b"{}", **kwargs)
+                _flags, body = await sub.await_packet(PKT_PUBLISH)
+                delivered.append(_parse_publish(body, MQTT_5)[2])
+            return delivered
+
+    full, edges, none = _run(scenario())
+    assert full == [
+        (PROP_PAYLOAD_FORMAT_INDICATOR, 1),
+        (0x02, 60),
+        (PROP_RESPONSE_TOPIC, f"{topic}/reply"),
+        (PROP_CORRELATION_DATA, b"\x00\x01req-7"),
+        (PROP_CONTENT_TYPE, "application/json"),
+        (PROP_USER_PROPERTY, ("app", "demo")),
+        (PROP_USER_PROPERTY, ("k", "v1")),
+        (PROP_USER_PROPERTY, ("k", "v2")),
+        (PROP_USER_PROPERTY, ("u", "ü")),
+    ]
+    assert edges == [
+        (PROP_PAYLOAD_FORMAT_INDICATOR, 0),
+        (0x02, 604800),
+        (PROP_CORRELATION_DATA, b"req-7"),
+    ]
+    assert none == []
 
 
 def test_mqtt311_publisher_reaches_mqtt5_subscriber():

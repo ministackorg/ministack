@@ -51,6 +51,11 @@ _HTTP_RESTRICTED_TOPIC_RE = re.compile(
     r"^\$aws/(things/[^/]+/(jobs|defender)/|commands/)"
 )
 
+# Publish's x-amz-mqtt5-payload-format-indicator values and the byte each one stands for.
+_PAYLOAD_FORMAT_INDICATORS = {"UNSPECIFIED_BYTES": 0, "UTF8_DATA": 1}
+# The broker's message expiry limit (seven days); longer intervals are capped.
+_MAX_MESSAGE_EXPIRY = 604800
+
 
 def _validate_topic(topic: str) -> tuple | None:
     """Return an error response if ``topic`` is invalid, else None."""
@@ -122,7 +127,7 @@ async def handle_request(
 
     if method == "POST" and path.startswith("/topics/"):
         access_key = extract_access_key_id(headers, query_params)
-        return await _publish(path[len("/topics/"):], body, qp, access_key)
+        return await _publish(path[len("/topics/"):], body, qp, headers, access_key)
 
     # Device Shadow: /things/{thingName}/shadow[?name={shadowName}]
     if path.startswith("/things/") and path.endswith("/shadow"):
@@ -201,7 +206,7 @@ async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
     return json_response(doc)
 
 
-async def _publish(topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
+async def _publish(topic: str, body: bytes, qp: dict, headers: dict, access_key: str) -> tuple:
     """``POST /topics/{topic}``: forward the body to the broker; the path arrives decoded, so ``%41`` stays literal."""
     err = _validate_topic(topic)
     if err is not None:
@@ -218,6 +223,9 @@ async def _publish(topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
             "InvalidRequestException", "qos must be 0 or 1", 400
         )
     retain = str(qp.get("retain", "")).lower() in ("1", "true", "yes")
+    properties, err = _publish_properties(headers, qp)
+    if err is not None:
+        return err
 
     if not _iot_module.broker_is_available():
         return error_response_json(
@@ -234,6 +242,7 @@ async def _publish(topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
             body or b"",
             qos=qos,
             retain=retain,
+            properties=properties,
             principal=_iot_module._caller_principal(access_key),
         )
     except Exception as e:
@@ -243,6 +252,68 @@ async def _publish(topic: str, body: bytes, qp: dict, access_key: str) -> tuple:
         )
     # AWS returns 200 with empty body for Publish.
     return 200, {"Content-Type": "application/json"}, b""
+
+
+def _b64decode(value: str) -> bytes | None:
+    """Base64 with or without its padding, or None when the value is not base64."""
+    try:
+        return base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+    except ValueError:
+        return None
+
+
+def _publish_properties(headers: dict, qp: dict) -> tuple[bytes, tuple | None]:
+    """The MQTT 5 property block a Publish request asks for, or the error response refusing it."""
+
+    def invalid(message: str) -> tuple[bytes, tuple]:
+        return b"", error_response_json("InvalidRequestException", message, 400)
+
+    props: list[tuple[int, object]] = []
+    indicator = headers.get("x-amz-mqtt5-payload-format-indicator")
+    if indicator:
+        if indicator not in _PAYLOAD_FORMAT_INDICATORS:
+            return invalid("Invalid Payload Format Indicator")
+        props.append((_iot_module.PROP_PAYLOAD_FORMAT_INDICATOR, _PAYLOAD_FORMAT_INDICATORS[indicator]))
+    expiry = qp.get("messageExpiry")
+    if expiry is not None:
+        seconds = int(expiry) if expiry.isascii() and expiry.isdigit() else -1
+        if not 0 <= seconds < 2**32:
+            return invalid("Message expiry interval must be an unsigned 4-byte integer")
+        props.append((_iot_module.PROP_MESSAGE_EXPIRY_INTERVAL, min(seconds, _MAX_MESSAGE_EXPIRY)))
+    response_topic = qp.get("responseTopic")
+    if response_topic:
+        if "+" in response_topic or "#" in response_topic:
+            return invalid(
+                "This response topic isn't valid. Response topics must not contain"
+                " MQTT wildcard characters (+ or #)"
+            )
+        props.append((_iot_module.PROP_RESPONSE_TOPIC, response_topic))
+    correlation = headers.get("x-amz-mqtt5-correlation-data")
+    if correlation:
+        data = _b64decode(correlation)
+        if data is None:
+            return invalid("Invalid Base64 string")
+        props.append((_iot_module.PROP_CORRELATION_DATA, data))
+    if qp.get("contentType"):
+        props.append((_iot_module.PROP_CONTENT_TYPE, qp["contentType"]))
+    encoded = headers.get("x-amz-mqtt5-user-properties")
+    if encoded:
+        raw = _b64decode(encoded)
+        if raw is None:
+            return invalid("Invalid Base64 string")
+        try:
+            pairs = json.loads(raw)
+        except ValueError:
+            pairs = None
+        if not isinstance(pairs, list) or not all(
+            isinstance(pair, dict) and all(isinstance(v, str) for v in pair.values())
+            for pair in pairs
+        ):
+            return invalid("Invalid JSON string for User Properties")
+        if any(len(pair) > 1 for pair in pairs):
+            return invalid("Only one User Property is allowed in single JSONObject")
+        props += [(_iot_module.PROP_USER_PROPERTY, item) for pair in pairs for item in pair.items()]
+    return (_iot_module._encode_properties(props) if props else b""), None
 
 
 def _user_properties(properties: bytes) -> bytes:
