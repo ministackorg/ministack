@@ -340,3 +340,11 @@ def get_certificate_id(cert_pem: str) -> str:
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     der = cert.public_bytes(serialization.Encoding.DER)
     return hashlib.sha256(der).hexdigest()
+
+
+def certificate_common_name(cert_pem: str) -> str | None:
+    """Return the subject common name of ``cert_pem``, or None when it has none."""
+    _require_crypto()
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    return str(names[0].value) if names else None

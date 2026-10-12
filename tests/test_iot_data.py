@@ -59,6 +59,187 @@ def test_iot_data_publish_accepts_qos_and_retain(iot_data_client):
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
+def _own_account_iot_data(**config):
+    """An iot-data client in a fresh account, so other tests' retained messages stay out of its listings."""
+    return boto3.client(
+        "iot-data",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=f"{uuid.uuid4().int % 10**12:012d}",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}, **config),
+    )
+
+
+def test_get_retained_message_returns_the_retained_publish():
+    client = _own_account_iot_data()
+    payload = bytes(range(256))
+    for topic in ("sensors/bin", "sensors/a b%c/ü"):
+        before = int(time.time() * 1000)
+        client.publish(topic=topic, qos=1, retain=True, payload=payload)
+        after = int(time.time() * 1000)
+        resp = client.get_retained_message(topic=topic)
+        assert resp["topic"] == topic
+        assert resp["payload"] == payload
+        assert resp["qos"] == 1
+        assert before <= resp["lastModifiedTime"] <= after
+        assert "userProperties" not in resp
+
+
+def test_get_retained_message_errors():
+    client = _own_account_iot_data(parameter_validation=False)
+    with pytest.raises(ClientError) as ei:
+        client.get_retained_message(topic="sensors/never")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Message"] == "Retained message not found"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    for topic, message in (
+        ("sensors/+", "Invalid topic filter"),
+        ("sensors/#", "Invalid topic filter"),
+        ("sensors/a+b", "Invalid topic filter"),
+        ("", "unknown"),
+    ):
+        with pytest.raises(ClientError) as ei:
+            client.get_retained_message(topic=topic)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == message
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_retained_message_is_replaced_kept_and_cleared():
+    """A live publish keeps the retained message, a retained one replaces it, an empty one clears it."""
+    client = _own_account_iot_data()
+    client.publish(topic="t", qos=0, retain=True, payload=b"hello")
+    first = client.get_retained_message(topic="t")
+    client.publish(topic="t", qos=1, payload=b"live")
+    client.publish(topic="t", qos=0, payload=b"")
+    kept = client.get_retained_message(topic="t")
+    assert (kept["payload"], kept["qos"]) == (b"hello", 0)
+    assert kept["lastModifiedTime"] == first["lastModifiedTime"]
+
+    time.sleep(0.01)
+    client.publish(topic="t", qos=1, retain=True, payload=b"second")
+    replaced = client.get_retained_message(topic="t")
+    assert (replaced["payload"], replaced["qos"]) == (b"second", 1)
+    assert replaced["lastModifiedTime"] > first["lastModifiedTime"]
+
+    client.publish(topic="t", qos=0, retain=True, payload=b"")
+    with pytest.raises(ClientError) as ei:
+        client.get_retained_message(topic="t")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert client.list_retained_messages()["retainedTopics"] == []
+
+
+def test_list_retained_messages_newest_first_in_pages():
+    client = _own_account_iot_data()
+    for name in ("c", "a", "d", "b"):
+        client.publish(topic=f"order/{name}", qos=1, retain=True, payload=name.encode() * 3)
+        time.sleep(0.01)
+    client.publish(topic="order/a", qos=0, payload=b"live")
+
+    resp = client.list_retained_messages()
+    assert resp["nextToken"] == ""
+    assert [e["topic"] for e in resp["retainedTopics"]] == [
+        "order/b", "order/d", "order/a", "order/c"
+    ]
+    entry = resp["retainedTopics"][0]
+    assert set(entry) == {"topic", "payloadSize", "qos", "lastModifiedTime"}
+    assert (entry["payloadSize"], entry["qos"]) == (3, 1)
+    assert entry["lastModifiedTime"] == client.get_retained_message(
+        topic="order/b")["lastModifiedTime"]
+
+    seen, kwargs = [], {"maxResults": 3}
+    while True:
+        page = client.list_retained_messages(**kwargs)
+        seen.append([e["topic"] for e in page["retainedTopics"]])
+        if not page["nextToken"]:
+            break
+        kwargs["nextToken"] = page["nextToken"]
+    assert seen == [["order/b", "order/d", "order/a"], ["order/c"]]
+
+
+def test_list_retained_messages_pages_by_twenty_without_max_results():
+    client = _own_account_iot_data()
+    for i in range(21):
+        client.publish(topic=f"page/{i:02d}", retain=True, payload=b"p")
+    first = client.list_retained_messages()
+    assert len(first["retainedTopics"]) == 20
+    rest = client.list_retained_messages(nextToken=first["nextToken"])
+    assert [e["topic"] for e in rest["retainedTopics"]] == ["page/00"]
+    assert rest["nextToken"] == ""
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"maxResults": 0}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": 201}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": -1}, "Invalid maxResults value: Invalid max results parameter"),
+        ({"maxResults": "abc"}, "Invalid maxResults value: abc"),
+        ({"nextToken": "not-a-token"}, "unknown"),
+    ],
+)
+def test_list_retained_messages_rejects_bad_paging(kwargs, message):
+    client = _own_account_iot_data(parameter_validation=False)
+    with pytest.raises(ClientError) as ei:
+        client.list_retained_messages(**kwargs)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == message
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_retained_user_properties_and_time_survive_persistence():
+    """User properties come back as AWS's JSON array and survive a restore with lastModifiedTime, per region."""
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+    from ministack.services import iot_data
+
+    account = "123456789012"
+    user_props = iot_module._encode_properties([
+        (iot_module.PROP_CONTENT_TYPE, "text/plain"),
+        (iot_module.PROP_USER_PROPERTY, ("app", "demo")),
+        (iot_module.PROP_USER_PROPERTY, ("k", "v1")),
+        (iot_module.PROP_USER_PROPERTY, ("k", "v2")),
+        (iot_module.PROP_USER_PROPERTY, ("u", "ü")),
+    ])
+    content_type_only = iot_module._encode_properties([(iot_module.PROP_CONTENT_TYPE, "text/plain")])
+
+    async def _get(region, path):
+        set_request_account_id(account)
+        set_request_region(region)
+        status, _headers, body = await iot_data.handle_request("GET", path, {}, b"", {})
+        return status, json.loads(body)
+
+    async def _run():
+        await iot_module.broker_publish(
+            account, "eu-west-1", "dev/props", b"{}", qos=1, retain=True, properties=user_props)
+        await iot_module.broker_publish(
+            account, "eu-west-1", "dev/plain", b"x", retain=True, properties=content_type_only)
+        status, before = await _get("eu-west-1", "/retainedMessage/dev/props")
+        assert status == 200
+        assert base64.b64decode(before["userProperties"]) == (
+            '[{"app":"demo"},{"k":"v1"},{"k":"v2"},{"u":"ü"}]'.encode())
+        assert "userProperties" not in (await _get("eu-west-1", "/retainedMessage/dev/plain"))[1]
+        assert (await _get("eu-west-3", "/retainedMessage"))[1]["retainedTopics"] == []
+
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.broker_reset()
+        assert (await _get("eu-west-1", "/retainedMessage/dev/props"))[0] == 404
+        await asyncio.sleep(0.01)
+        iot_module.load_persisted_state(saved)
+        assert await _get("eu-west-1", "/retainedMessage/dev/props") == (200, before)
+
+    iot_module.broker_reset()
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
 def test_iot_data_publish_rejects_wildcard_topic():
     """Wildcard characters in publish topics must produce a 400."""
     import urllib.request
@@ -1496,6 +1677,141 @@ def test_iot_rule_sqs_action_applies_select_projection(iot_client, iot_data_clie
     assert json.loads(_poll_body(sqs, queue)) == {"id": "d1", "device": "a1"}
 
     iot_client.delete_topic_rule(ruleName=rule)
+
+
+def _take_bodies(sqs, url, count, timeout=10):
+    """The JSON bodies of the next ``count`` messages, deleted as they are read."""
+    bodies = []
+    deadline = time.time() + timeout
+    while len(bodies) < count and time.time() < deadline:
+        msg = _poll_message(sqs, url, timeout=max(0.0, deadline - time.time()))
+        if msg:
+            sqs.delete_message(QueueUrl=url, ReceiptHandle=msg["ReceiptHandle"])
+            bodies.append(json.loads(msg["Body"]))
+    return bodies
+
+
+def _rule_role(iam):
+    """A role the rules engine can assume, so the rule also creates under AUTH=true."""
+    name = _unique("rule-role")
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"}, "Action": "sts:AssumeRole"}
+        ],
+    }
+    return iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust))["Role"]
+
+
+def _iam_user_key(iam):
+    """A fresh IAM user allowed to publish, its access key, and its GetCallerIdentity UserId."""
+    user = _unique("publisher")
+    iam.create_user(UserName=user)
+    iam.put_user_policy(
+        UserName=user,
+        PolicyName="publish",
+        PolicyDocument=json.dumps(
+            {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:*", "Resource": "*"}]}
+        ),
+    )
+    key = iam.create_access_key(UserName=user)["AccessKey"]
+    caller = boto3.client(
+        "sts",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=key["AccessKeyId"],
+        aws_secret_access_key=key["SecretAccessKey"],
+        region_name="us-east-1",
+    ).get_caller_identity()
+    return user, key, caller["UserId"]
+
+
+def _drop_iam_user(iam, user, key):
+    iam.delete_access_key(UserName=user, AccessKeyId=key["AccessKeyId"])
+    iam.delete_user_policy(UserName=user, PolicyName="publish")
+    iam.delete_user(UserName=user)
+
+
+def test_iot_rule_principal_is_the_http_callers_user_id(iot_client, iam, sqs, sts):
+    """principal() of an HTTP Publish is the caller's UserId; every message gets its own trace id."""
+    queue = sqs.create_queue(QueueName=_unique("rule-principal"))["QueueUrl"]
+    topic = _unique("principal/http")
+    rule = _unique("principal").replace("-", "_")
+    user, key, user_id = _iam_user_key(iam)
+    role = _rule_role(iam)
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT principal() AS p, traceid() AS t FROM '{topic}'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}],
+        },
+    )
+    try:
+        callers = (
+            (key["AccessKeyId"], key["SecretAccessKey"], user_id),
+            ("test", "test", sts.get_caller_identity()["UserId"]),
+        )
+        trace_ids = []
+        for access_key, secret, expected in callers:
+            boto3.client(
+                "iot-data",
+                endpoint_url=ENDPOINT,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret,
+                region_name="us-east-1",
+            ).publish(topic=topic, payload=b"{}")
+            [event] = _take_bodies(sqs, queue, 1)
+            assert event["p"] == expected
+            assert str(uuid.UUID(event["t"])) == event["t"]
+            trace_ids.append(event["t"])
+        assert trace_ids[0] != trace_ids[1]
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
+        iam.delete_role(RoleName=role["RoleName"])
+        _drop_iam_user(iam, user, key)
+
+
+def test_iot_rule_principal_is_the_websocket_signers_user_id(iot_client, iam, sqs):
+    """principal() and the connected event's principalIdentifier are the WebSocket signer's UserId."""
+    queue = sqs.create_queue(QueueName=_unique("rule-ws-principal"))["QueueUrl"]
+    topic = _unique("principal/ws")
+    client_id = _unique("ws-signed")
+    user, key, user_id = _iam_user_key(iam)
+    role = _rule_role(iam)
+    rules = {
+        _unique("wspub").replace("-", "_"): f"SELECT 'publish' AS kind, principal() AS p FROM '{topic}'",
+        _unique("wscon").replace("-", "_"): (
+            "SELECT 'connected' AS kind, principalIdentifier AS p "
+            f"FROM '$aws/events/presence/connected/{client_id}'"
+        ),
+    }
+    for name, sql in rules.items():
+        iot_client.create_topic_rule(
+            ruleName=name,
+            topicRulePayload={"sql": sql, "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}]},
+        )
+    parsed = urlparse(ENDPOINT)
+    cred = quote(f"{key['AccessKeyId']}/20240101/us-east-1/iotdevicegateway/aws4_request")
+    url = (
+        f"ws://prefix-ats.iot.us-east-1.{parsed.hostname or 'localhost'}:{parsed.port or 4566}/mqtt"
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred}"
+    )
+
+    async def _run():
+        ws = await _mqtt_connect(client_id, url)
+        await ws.send(_make_publish(topic, b"{}"))
+        await asyncio.sleep(0.5)
+        await _mqtt_disconnect(ws)
+
+    try:
+        with patch_endpoint_dns():
+            asyncio.run(_run())
+        events = {event["kind"]: event["p"] for event in _take_bodies(sqs, queue, 2)}
+        assert events == {"publish": user_id, "connected": user_id}
+    finally:
+        for name in rules:
+            iot_client.delete_topic_rule(ruleName=name)
+        iam.delete_role(RoleName=role["RoleName"])
+        _drop_iam_user(iam, user, key)
 
 
 def test_iot_rule_sqs_action_missing_queue_does_not_stop_the_rule(
@@ -3390,6 +3706,37 @@ def test_mtls_publish_is_brokered(broker, tmp_path):
         subscriber.close()
 
 
+def test_mtls_publish_principal_is_the_certificate_id(broker, tmp_path):
+    """principal() of an mTLS publish is the id of the client certificate."""
+    cert_id, cert_pem, key_pem = _new_cert(broker)
+    topic = _unique("mtls/principal")
+    rule = _unique("mtlsprincipal").replace("-", "_")
+    role = _rule_role(broker.client("iam"))
+    broker.client("iot").create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT principal() AS p, traceid() AS t FROM '{topic}'",
+            "actions": [{"republish": {"topic": f"{topic}/out", "roleArn": role["Arn"]}}],
+        },
+    )
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("device")))
+        peer.subscribe(f"{topic}/out")
+        peer.send(_make_publish(topic, b"{}"))
+        received = peer.next_publish()
+        assert received is not None, "the rule's republish did not arrive"
+        out_topic, payload = received
+        event = json.loads(payload)
+        assert out_topic == f"{topic}/out"
+        assert event["p"] == cert_id
+        assert str(uuid.UUID(event["t"])) == event["t"]
+    finally:
+        peer.close()
+        broker.client("iot").delete_topic_rule(ruleName=rule)
+        broker.client("iam").delete_role(RoleName=role["RoleName"])
+
+
 def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):
     """No client certificate connects fine, exactly like the WebSocket path,
     and the session runs under the default account."""
@@ -3537,6 +3884,40 @@ def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
         _assert_connack(peer.connect(_unique("uncontested-again")))
     finally:
         peer.close()
+
+
+def test_mtls_auth_evaluates_iot_connect(tmp_path):
+    """With AUTH=true a device certificate connects only under a policy that
+    allows iot:Connect on its client id; otherwise the 3.1.1 CONNECT is closed
+    without a CONNACK. A private instance, because AUTH is read at startup."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    proc = _spawn({"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port)
+        iot = private.client("iot")
+        cert_id, cert_pem, key_pem = _new_cert(private)
+        client_id = _unique("device")
+        assert _refused_below_mqtt(private, cert_pem, key_pem, tmp_path, client_id)
+
+        policy = _unique("connect")
+        iot.create_policy(policyName=policy, policyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{client_id}"}
+            ],
+        }))
+        arn = iot.describe_certificate(certificateId=cert_id)["certificateDescription"]["certificateArn"]
+        iot.attach_policy(policyName=policy, target=arn)
+        peer = _Peer(_mtls_connect(private, cert_pem, key_pem, tmp_path))
+        try:
+            _assert_connack(peer.connect(client_id))
+        finally:
+            peer.close()
+        assert _refused_below_mqtt(private, cert_pem, key_pem, tmp_path, _unique("other"))
+    finally:
+        _terminate(proc)
 
 
 def test_mtls_registered_cert_connects_whatever_its_ca(broker, tmp_path):
