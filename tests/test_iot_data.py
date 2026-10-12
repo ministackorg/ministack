@@ -419,7 +419,8 @@ async def _ws_subscribe_and_collect(
     ws_url: str, topic: str, ready_event: threading.Event, received: list, stop: threading.Event
 ):
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
-        await ws.send(_make_connect("test-client"))
+        # Unique: a parallel worker connecting with the same client id would take this session over.
+        await ws.send(_make_connect(_unique("test-client")))
         # Wait for CONNACK
         await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
         # Subscribe

@@ -78,6 +78,15 @@ _LAMBDA_CODE_V2 = 'def handler(event, context):\n    return {"statusCode": 200, 
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
+
+@pytest.fixture(autouse=True)
+def _lambda_role(iam):
+    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server: AUTH=true needs it to exist."""
+    with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
+        iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument=json.dumps({"Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+
+
 _NODE_CODE = (
     "exports.handler = async (event, context) => {"
     " return { statusCode: 200, body: JSON.stringify({ hello: event.name || 'world' }) }; };"

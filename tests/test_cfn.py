@@ -1108,7 +1108,7 @@ def test_cfn_iot_certificate_refuses_property_combinations(cfn, iot_client, prop
     """Each certificate mode takes one exact set of sources; anything else
     fails the resource with AWS's message and creates no certificate."""
     pytest.importorskip("cryptography")
-    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+    from ministack.core.x509_utils import certificate_common_name, generate_ca, sign_leaf_certificate
 
     uid = _uuid_mod.uuid4().hex[:8]
     stack = f"cfn-cert-bad-{uid}"
@@ -1117,12 +1117,28 @@ def test_cfn_iot_certificate_refuses_property_combinations(cfn, iot_client, prop
               "csr": _cfn_iot_csr(uid)[0]}
     props = {k: values.get(v, v) for k, v in props.items()}
     before = {c["certificateId"] for c in iot_client.list_certificates()["certificates"]}
+
+    def created():
+        """New certificates whose subject carries this test's uid; other workers add and delete theirs meanwhile."""
+        ids = []
+        for cert in iot_client.list_certificates()["certificates"]:
+            if cert["certificateId"] in before:
+                continue
+            try:
+                pem = iot_client.describe_certificate(
+                    certificateId=cert["certificateId"])["certificateDescription"]["certificatePem"]
+            except iot_client.exceptions.ResourceNotFoundException:
+                continue
+            if uid in (certificate_common_name(pem) or ""):
+                ids.append(cert["certificateId"])
+        return ids
+
     try:
         cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"Cert": {
             "Type": "AWS::IoT::Certificate", "Properties": {**props, "Status": "ACTIVE"}}}}))
         assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
         assert _cfn_iot_failure(cfn, stack, "Cert", "CREATE_FAILED") == reason
-        assert {c["certificateId"] for c in iot_client.list_certificates()["certificates"]} == before
+        assert created() == []
     finally:
         _delete_cfn_test_stack(cfn, stack)
 
