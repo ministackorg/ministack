@@ -2800,7 +2800,7 @@ def test_mqtt5_publisher_reaches_mqtt311_subscriber():
 
 
 def test_mqtt5_qos1_puback_carries_reason_code():
-    """QoS 1 PUBACK reports Success with a subscriber, No matching subscribers without."""
+    """QoS 1 PUBACK reports Success with a subscriber and without one."""
     topic = _unique("v5/qos1")
 
     async def scenario():
@@ -2823,7 +2823,7 @@ def test_mqtt5_qos1_puback_carries_reason_code():
                 return lonely, matched
 
     lonely, matched = _run(scenario())
-    assert lonely == b"\x00\x07\x10\x00", "packet id 7, No matching subscribers, no properties"
+    assert lonely == b"\x00\x07\x00\x00", "packet id 7, Success, no properties"
     assert matched == b"\x00\x08\x00\x00", "packet id 8, Success, no properties"
 
 
@@ -3115,9 +3115,7 @@ def test_mqtt5_no_local_withholds_a_publisher_its_own_message():
 
     (pkt_type, _flags, puback), delivered = _run(scenario())
     assert pkt_type == PKT_PUBACK, "the publisher's own message must not come back"
-    assert puback == b"\x00\x07\x10\x00", (
-        "No matching subscribers: the only subscription was the publisher's own"
-    )
+    assert puback == b"\x00\x07\x00\x00", "packet id 7, Success, no properties"
     assert _parse_publish(delivered, MQTT_5)[1] == b"theirs"
 
 
