@@ -1659,6 +1659,30 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
+_PRESIGN_MAX_EXPIRES = 604800
+
+
+def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
+    """Under AUTH=true, refuse a presign with a malformed time, a lifetime over a week or a date in the future."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    try:
+        signed_at = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"", 400, path)
+    if expires and not expires.isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires should be a number", 400, path)
+    if expires and int(expires) > _PRESIGN_MAX_EXPIRES:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires "
+                      f"must be less than {_PRESIGN_MAX_EXPIRES} seconds", 400, path)
+    if signed_at > _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=15):
+        return _error("AccessDenied", "Request is not yet valid", 403, path)
+    return None
+
+
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
@@ -1695,6 +1719,9 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     # Expiry: a presigned URL past X-Amz-Date + X-Amz-Expires is rejected by S3
     # with 403 AccessDenied "Request has expired", independent of the signature.
     expires = _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", "")
+    time_error = _presign_time_error(amz_date, expires, path)
+    if time_error:
+        return time_error
     if expires:
         try:
             if presigned_request_is_expired(amz_date, expires):

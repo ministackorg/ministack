@@ -3582,9 +3582,19 @@ def _cwlogs_metric_filter_delete(physical_id, props):
 
 # --- EventBridge Rule ---
 
+
+def _eb_rule_bus_name(props):
+    # CloudFormation accepts a name or ARN, while the service stores names.
+    bus, error = _eb._event_bus_name_from_ref(props.get("EventBusName", "default"))
+    if error:
+        code, message = error
+        raise ValueError(f"AWS::Events::Rule EventBusName: {code}: {message}")
+    return bus
+
+
 def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
@@ -3638,8 +3648,8 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
-    old_bus = old_props.get("EventBusName", "default")
-    new_bus = new_props.get("EventBusName", "default")
+    old_bus = _eb_rule_bus_name(old_props)
+    new_bus = _eb_rule_bus_name(new_props)
     old_key = _eb._rule_key(physical_id, old_bus)
     rule = _eb._rules.get(old_key)
     replaced = _rename_replacement(
@@ -3693,7 +3703,7 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
 
 
 def _eb_rule_delete(physical_id, props):
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(physical_id, bus)
     rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)

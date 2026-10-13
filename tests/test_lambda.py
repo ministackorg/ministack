@@ -4906,6 +4906,12 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
 def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):
     """Through the app with AUTH=true as an IAM user of the consuming account: the
     layer policy decides, and a denial names that user the way AWS does."""
+    from urllib.parse import quote
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     import ministack.app as app_mod
     from ministack.services import iam as iam_svc
 
@@ -4932,13 +4938,15 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
         for granted_to in ("*", None):
             sent.clear()
             arn = _foreign_arn("auth-layer")
+            query = f"find=LayerVersion&Arn={quote(arn, safe='')}"
+            request = AWSRequest(method="GET", url=f"http://lambda.localhost/2018-10-31/layers?{query}")
+            SigV4Auth(Credentials(key, "s"), "lambda", _FOREIGN_REGION).add_auth(request)
             with _foreign_layer("auth-layer", granted_to=granted_to):
                 asyncio.run(app_mod.app({
                     "type": "http", "method": "GET", "path": "/2018-10-31/layers",
-                    "query_string": f"find=LayerVersion&Arn={arn}".encode(),
-                    "headers": [(b"host", b"lambda.localhost"), (b"authorization", (
-                        f"AWS4-HMAC-SHA256 Credential={key}/20260915/{_FOREIGN_REGION}/lambda/aws4_request, "
-                        "SignedHeaders=host, Signature=0").encode())],
+                    "query_string": query.encode(),
+                    "headers": [(b"host", b"lambda.localhost")] + [
+                        (name.lower().encode(), value.encode()) for name, value in request.headers.items()],
                 }, receive, send))
             status, body = sent[0]["status"], json.loads(sent[1]["body"])
             if granted_to:
