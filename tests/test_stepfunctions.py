@@ -4698,6 +4698,62 @@ def test_sfn_list_executions_filter(sfn):
     succeeded = sfn.list_executions(stateMachineArn=arn, statusFilter="SUCCEEDED")["executions"]
     assert all(e["status"] == "SUCCEEDED" for e in succeeded)
 
+
+_WAIT_AN_HOUR = {"Wait": {"Type": "Wait", "Seconds": 3600, "End": True}}
+
+
+def test_sfn_list_executions_most_recent_first(sfn):
+    """Running executions sort by startDate and the rest by stopDate, in one
+    ordering, most recent first. The timeline and answers are what AWS gave."""
+    with _machine(sfn, "Wait", _WAIT_AN_HOUR) as arn:
+        prefix = arn.replace(":stateMachine:", ":execution:")
+
+        def listed(**kwargs):
+            executions = sfn.list_executions(stateMachineArn=arn, **kwargs)["executions"]
+            return [e["name"] for e in executions]
+
+        for name in ("x", "y", "w"):
+            sfn.start_execution(stateMachineArn=arn, name=name)
+            time.sleep(0.01)
+        assert listed(statusFilter="RUNNING") == ["w", "y", "x"]
+
+        sfn.stop_execution(executionArn=f"{prefix}:y")
+        time.sleep(0.01)
+        sfn.start_execution(stateMachineArn=arn, name="z")
+        time.sleep(0.01)
+        sfn.stop_execution(executionArn=f"{prefix}:x")
+
+        assert listed(statusFilter="ABORTED") == ["x", "y"]
+        assert listed() == ["x", "z", "y", "w"]
+
+
+def test_sfn_list_executions_token_resumes_after_last_execution(sfn):
+    """The token resumes after the last execution returned, so one started
+    between pages is not repeated."""
+    with _machine(sfn, "Wait", _WAIT_AN_HOUR) as arn:
+        for name in ("a", "b", "c"):
+            sfn.start_execution(stateMachineArn=arn, name=name)
+            time.sleep(0.01)
+
+        first = sfn.list_executions(stateMachineArn=arn, maxResults=1)
+        assert [e["name"] for e in first["executions"]] == ["c"]
+        sfn.start_execution(stateMachineArn=arn, name="d")
+        second = sfn.list_executions(
+            stateMachineArn=arn, maxResults=1, nextToken=first["nextToken"])
+        assert [e["name"] for e in second["executions"]] == ["b"]
+        third = sfn.list_executions(
+            stateMachineArn=arn, maxResults=1, nextToken=second["nextToken"])
+        assert [e["name"] for e in third["executions"]] == ["a"]
+        assert "nextToken" not in third
+
+        everything = sfn.list_executions(stateMachineArn=arn, maxResults=0)
+        assert [e["name"] for e in everything["executions"]] == ["d", "c", "b", "a"]
+        assert "nextToken" not in everything
+
+        with pytest.raises(ClientError) as exc:
+            sfn.list_executions(stateMachineArn=arn, nextToken="not-a-token")
+        assert exc.value.response["Error"]["Code"] == "InvalidToken"
+
 def test_sfn_timestamp_fields_are_sdk_compatible(sfn, sfn_sync):
     """SFN timestamp fields must deserialize as datetimes, not fail as strings."""
     import datetime

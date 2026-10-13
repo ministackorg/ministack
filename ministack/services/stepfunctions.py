@@ -749,7 +749,35 @@ def _describe_execution(data):
     return json_response(result)
 
 
+def _execution_sort_key(execution):
+    """AWS lists the most recent execution first: a running one by its
+    startDate, the rest by stopDate. The ARN breaks ties, so the order is
+    total and a token can resume it."""
+    return (execution["stopDate"] or execution["startDate"], execution["executionArn"])
+
+
+def _encode_execution_token(execution):
+    """Tokens carry the sort position of the last execution returned, not an
+    index, as AWS's do: with an offset, an execution started between pages
+    would repeat one."""
+    raw = json.dumps(list(_execution_sort_key(execution))).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_execution_token(token):
+    try:
+        moment, arn = json.loads(base64.urlsafe_b64decode(token.encode("ascii")))
+        return (str(moment), str(arn))
+    except Exception:
+        return None
+
+
 def _list_executions(data):
+    cursor = None
+    if data.get("nextToken"):
+        cursor = _decode_execution_token(data["nextToken"])
+        if cursor is None:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
     status_filter = data.get("statusFilter")
     all_execs = []
@@ -766,18 +794,14 @@ def _list_executions(data):
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
         })
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
-    start = 0
-    if next_token:
-        try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_execs[start:start + max_results]
+    all_execs.sort(key=_execution_sort_key, reverse=True)
+    if cursor is not None:
+        all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
+    max_results = int(data.get("maxResults") or 1000)
+    page = all_execs[:max_results]
     resp = {"executions": page}
-    if start + max_results < len(all_execs):
-        resp["nextToken"] = str(start + max_results)
+    if len(all_execs) > max_results:
+        resp["nextToken"] = _encode_execution_token(page[-1])
     return json_response(resp)
 
 
