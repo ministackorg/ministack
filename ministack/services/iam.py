@@ -420,6 +420,9 @@ def _create_user(p):
     if name in _users:
         return _error(409, "EntityAlreadyExists",
                       f"User with name {name} already exists.", ns="iam")
+    tags = _extract_tags(p)
+    if _identity_tags_have_duplicate_keys(tags):
+        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
     path = _p(p, "Path") or "/"
     _users[name] = {
         "UserName": name,
@@ -429,7 +432,7 @@ def _create_user(p):
         "Path": path,
         "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
-        "Tags": _extract_tags(p),
+        "Tags": tags,
     }
     return _xml(200, "CreateUserResponse",
                 f"<CreateUserResult><User>{_user_xml(name)}</User></CreateUserResult>",
@@ -546,6 +549,9 @@ def _create_role(p):
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
+    tags = _extract_tags(p)
+    if _identity_tags_have_duplicate_keys(tags):
+        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
     path = _p(p, "Path") or "/"
     _roles[name] = {
         "RoleName": name,
@@ -559,7 +565,7 @@ def _create_role(p):
         "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
         "InlinePolicies": {},
-        "Tags": _extract_tags(p),
+        "Tags": tags,
     }
     return _xml(200, "CreateRoleResponse",
                 f"<CreateRoleResult><Role>{_role_xml(name)}</Role></CreateRoleResult>",
@@ -1439,9 +1445,11 @@ def _tag_role(p):
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
     new_tags = _extract_tags(p)
-    existing = {t["Key"]: t for t in role["Tags"]}
+    if _identity_tags_have_duplicate_keys(new_tags):
+        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+    existing = {_identity_tag_key(t["Key"]): t for t in role["Tags"]}
     for t in new_tags:
-        existing[t["Key"]] = t
+        existing[_identity_tag_key(t["Key"])] = t
     role["Tags"] = list(existing.values())
     return _xml(200, "TagRoleResponse", "", ns="iam")
 
@@ -1452,8 +1460,8 @@ def _untag_role(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    keys_to_remove = _extract_tag_keys(p)
-    role["Tags"] = [t for t in role["Tags"] if t["Key"] not in keys_to_remove]
+    keys_to_remove = {_identity_tag_key(key) for key in _extract_tag_keys(p)}
+    role["Tags"] = [t for t in role["Tags"] if _identity_tag_key(t["Key"]) not in keys_to_remove]
     return _xml(200, "UntagRoleResponse", "", ns="iam")
 
 
@@ -1475,6 +1483,20 @@ def _list_role_tags(p):
 
 # -------------------- Tags: users --------------------
 
+def _identity_tag_key(key):
+    """Compare IAM user/role keys without case, retaining the stored spelling.
+
+    Evidence: the IAM tagging guide, not a real AWS run. Other IAM resources
+    keep their case-sensitive tag handling.
+    """
+    return key.lower()
+
+
+def _identity_tags_have_duplicate_keys(tags):
+    keys = [_identity_tag_key(t["Key"]) for t in tags]
+    return len(keys) != len(set(keys))
+
+
 def _tag_user(p):
     user_name = _p(p, "UserName")
     user = _users.get(user_name)
@@ -1482,9 +1504,11 @@ def _tag_user(p):
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
     new_tags = _extract_tags(p)
-    existing = {t["Key"]: t for t in user["Tags"]}
+    if _identity_tags_have_duplicate_keys(new_tags):
+        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+    existing = {_identity_tag_key(t["Key"]): t for t in user["Tags"]}
     for t in new_tags:
-        existing[t["Key"]] = t
+        existing[_identity_tag_key(t["Key"])] = t
     user["Tags"] = list(existing.values())
     return _xml(200, "TagUserResponse", "", ns="iam")
 
@@ -1495,8 +1519,8 @@ def _untag_user(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    keys_to_remove = _extract_tag_keys(p)
-    user["Tags"] = [t for t in user["Tags"] if t["Key"] not in keys_to_remove]
+    keys_to_remove = {_identity_tag_key(key) for key in _extract_tag_keys(p)}
+    user["Tags"] = [t for t in user["Tags"] if _identity_tag_key(t["Key"]) not in keys_to_remove]
     return _xml(200, "UntagUserResponse", "", ns="iam")
 
 
