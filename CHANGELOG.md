@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.27] — 2026-10-13
+
 ### Added
 - **API Gateway — failed SigV4 authentication answers through the gateway responses** — under `AUTH=true` a REST API invoke that failed authentication got the generic JSON error and ignored the API's gateway responses; a wrong secret, a skewed clock or a credential date other than the request date now answers `INVALID_SIGNATURE` (`InvalidSignatureException`), an expired session `EXPIRED_TOKEN` (`ExpiredTokenException`), and an unknown key or a malformed `Authorization` header `DEFAULT_4XX` with the matching `x-amzn-ErrorType`, 403 with `{"message": ...}`. Contributed by @iot-rocket.
 - **Auth — the request time of a header-signed request is checked** — under `AUTH=true` a request signed with an IAM user or STS session key was served whatever its time; one signed more than 15 minutes (STS, IAM, SNS, SQS, DynamoDB, S3, ECR, RDS, ElastiCache) or 5 minutes (the default for other services) from the server clock answers `SignatureDoesNotMatch` / `InvalidSignatureException` with AWS's `Signature expired` or `Signature not yet current` message, `RequestTimeTooSkewed` from S3 and `AuthFailure` from EC2. Contributed by @iot-rocket.
