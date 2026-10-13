@@ -2571,6 +2571,80 @@ def test_sfn_aws_sdk_ec2_irregular_set_members_use_sdk_names(sfn_sync, ec2):
         ec2.delete_key_pair(KeyName=f"sdk-key-{suffix}")
 
 
+_SDK_TIMESTAMP = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$"
+
+
+def test_sfn_aws_sdk_sfn_list_executions_nested_shape(sfn_sync):
+    """Nested members of a JSON-protocol result take the SDK's names, timestamps
+    are ISO 8601 and an absent stopDate is left out, as on AWS."""
+    import re
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    with _machine(sfn_sync, "Wait", {"Wait": {"Type": "Wait", "Seconds": 3600, "End": True}}) as target:
+        sfn_sync.start_execution(stateMachineArn=target, name="single-1")
+        result = _run_sdk_task(sfn_sync, f"sdk-list-{suffix}", "sfn:listExecutions",
+                               {"StateMachineArn": target, "StatusFilter": "RUNNING"})
+
+    [execution] = result["Executions"]
+    assert sorted(execution) == ["ExecutionArn", "Name", "StartDate", "StateMachineArn", "Status"]
+    assert execution["Name"] == "single-1"
+    assert execution["Status"] == "RUNNING"
+    assert re.match(_SDK_TIMESTAMP, execution["StartDate"]), execution["StartDate"]
+
+
+def test_sfn_aws_sdk_dynamodb_get_item_keeps_attribute_names(sfn_sync, ddb):
+    """Attribute names are map keys and stay as written at every depth, while the
+    AttributeValue members take the SDK's names. The expected item is what AWS
+    returned for the same put."""
+    table = f"sdk-item-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"BOOL": True}, "nothing": {"NULL": True},
+            "set": {"SS": ["a", "b"]}, "nums": {"NS": ["1"]},
+            "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+            "list": {"L": [{"S": "x"}]},
+        })
+        result = _run_sdk_task(sfn_sync, f"{table}-get", "dynamodb:getItem",
+                               {"TableName": table, "Key": {"pk": {"S": "k"}}})
+    finally:
+        ddb.delete_table(TableName=table)
+
+    assert result["Item"] == {
+        "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"Bool": True}, "nothing": {"Nul": True},
+        "set": {"Ss": ["a", "b"]}, "nums": {"Ns": ["1"]},
+        "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+        "list": {"L": [{"S": "x"}]},
+    }
+
+
+def test_sfn_aws_sdk_json_results_rename_nested_members(sfn_sync, sm):
+    """An ARN member nested in a list becomes Arn, map keys such as version ids
+    stay as sent, and tag lists keep their Key/Value members."""
+    import re
+
+    name = f"sdk-secret-{_uuid_mod.uuid4().hex[:8]}"
+    version = sm.create_secret(Name=name, SecretString="x",
+                               Tags=[{"Key": "owner", "Value": "probe"}])["VersionId"]
+    try:
+        result = _run_sdk_task(sfn_sync, f"{name}-list", "secretsmanager:listSecrets",
+                               {"Filters": [{"Key": "name", "Values": [name]}]})
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    [secret] = result["SecretList"]
+    assert secret["Arn"].startswith(f"arn:aws:secretsmanager:us-east-1:000000000000:secret:{name}")
+    assert "ARN" not in secret
+    assert re.match(_SDK_TIMESTAMP, secret["CreatedDate"]), secret["CreatedDate"]
+    assert secret["Tags"] == [{"Key": "owner", "Value": "probe"}]
+    assert secret["SecretVersionsToStages"] == {version: ["AWSCURRENT"]}
+
+
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
     """aws-sdk:rds CreateDBInstance + DescribeDBInstances via query-protocol dispatch."""
     import uuid as _uuid

@@ -52,6 +52,7 @@ from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _service_model,
     error_response_json,
     get_account_id,
     get_region,
@@ -3752,11 +3753,45 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             and isinstance(result, dict) and "SecretBinary" in result):
         result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
-    # For JSON-protocol services, only convert top-level keys to avoid
-    # mangling user-defined data (e.g. DynamoDB attribute names).
-    if isinstance(result, dict):
-        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
-    return result
+    return _sdk_json_result(service_key, pascal_action, result)
+
+
+# The AWS SDK for Java v2 renames a member it cannot use as named, and Step
+# Functions returns that name: DynamoDB's NULL attribute value is Nul.
+_SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
+
+
+def _sdk_json_result(service_key, action, result):
+    """A JSON-protocol aws-sdk result as Step Functions returns it. Step
+    Functions parses the response with the AWS SDK for Java v2, so the
+    operation's output model decides the shape: structure members take the
+    SDK's names, map keys are data and stay as sent (DynamoDB attribute names,
+    tag keys), timestamps become ISO 8601 and absent members are left out."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).output_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if isinstance(result, dict):
+            return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+        return result
+    return _sdk_json_value(result, shape)
+
+
+def _sdk_json_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {
+            _SDK_MEMBER_NAME_OVERRIDES.get((shape.name, key), _api_name_to_sfn_key(key)):
+                _sdk_json_value(item, shape.members[key]) if key in shape.members else item
+            for key, item in value.items() if item is not None
+        }
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_value(item, shape.value) for key, item in value.items()}
+    if shape.type_name == "timestamp" and _is_num(value):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
 
 
 def _flatten_query_params(data, prefix=""):
@@ -4090,17 +4125,14 @@ def _api_name_to_sfn_key(name):
     SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
     (acronyms) are lowered except the last one when followed by a lowercase char.
     Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
-              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled,
+              SS -> Ss
     """
     if not name:
         return name
     result = []
     i = 0
     while i < len(name):
-        if i == 0:
-            result.append(name[i].upper())
-            i += 1
-            continue
         if name[i].isupper():
             j = i
             while j < len(name) and name[j].isupper():
@@ -4119,7 +4151,8 @@ def _api_name_to_sfn_key(name):
         else:
             result.append(name[i])
             i += 1
-    return "".join(result)
+    key = "".join(result)
+    return key[0].upper() + key[1:]
 
 
 def _convert_keys_to_sfn_convention(obj):
