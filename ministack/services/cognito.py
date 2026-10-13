@@ -794,6 +794,11 @@ def _granted_scopes(client: dict | None, requested: str | None, grant: str = "au
     return " ".join(dict.fromkeys(wanted))
 
 
+def _id_token_granted(scope: str | None) -> bool:
+    """Whether a grant gets an ID token: API sign-ins always, OAuth grants only with openid."""
+    return scope is None or "openid" in scope.split()
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
@@ -6834,6 +6839,8 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         "token_type": "Bearer",
         "expires_in": 3600,
     }
+    if not _id_token_granted(claims.get("scope")):
+        del resp["id_token"]
     return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
 
@@ -6905,9 +6912,9 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if not user:
                 return _oauth2_error("server_error", "User not found.")
 
+            scope = _granted_scopes(client, entry.get("scope"))
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
-                                         trigger_source="TokenGeneration_HostedAuth",
-                                         scope=_granted_scopes(client, entry.get("scope")))
+                                         trigger_source="TokenGeneration_HostedAuth", scope=scope)
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -6923,6 +6930,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "token_type": "Bearer",
                 "expires_in": result["ExpiresIn"],
             }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
             return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
         # Try SAML/OIDC federation auth codes
@@ -6961,13 +6970,16 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti,
                                         scope=scope)
 
-            return json_response({
+            resp = {
                 "id_token": id_token,
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
                 "expires_in": _token_validity(pool_id, effective_client_id, "access"),
-            })
+            }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
+            return json_response(resp)
 
         return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
@@ -7008,6 +7020,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             "token_type": "Bearer",
             "expires_in": _token_validity(pool_id, client_id, "access"),
         }
+        if not _id_token_granted(scope):
+            del resp["id_token"]
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
     # ── client_credentials ──

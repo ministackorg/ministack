@@ -4537,6 +4537,21 @@ def test_oauth2_refreshed_tokens_keep_the_granted_scopes():
     assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == 'aws.cognito.signin.user.admin'
 
 
+def test_oauth2_token_issues_no_id_token_without_openid():
+    """The token endpoint returns no id_token when openid was not granted."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    tokens = _code_grant_tokens(cognito_idp, client['ClientId'], 'api/read')
+    assert sorted(tokens) == ['access_token', 'expires_in', 'refresh_token', 'token_type']
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token'], 'client_id': client['ClientId'],
+    })
+
+    assert status == 200, body
+    assert sorted(json.loads(body)) == ['access_token', 'expires_in', 'token_type']
+
+
 def test_oauth2_token_client_credentials():
     cognito_idp = make_client('cognito-idp')
     pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
