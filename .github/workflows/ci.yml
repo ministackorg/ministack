@@ -73,14 +73,6 @@ jobs:
       # Control-plane tests must not contact the Docker daemon.
       DOCKER_HOST: unix:///no-existent/docker.sock
 
-    services:
-      redis:
-        image: public.ecr.aws/docker/library/redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
-
     steps:
       - uses: actions/checkout@v6
 
@@ -97,6 +89,19 @@ jobs:
 
       - name: Install dependencies
         run: uv pip install --system -e ".[test]" -r requirements.txt
+
+      - name: Start Redis
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          IMAGE=redis:7-alpine
+          docker pull "$IMAGE" || { IMAGE=public.ecr.aws/docker/library/redis:7-alpine; docker pull "$IMAGE"; }
+          docker run -d --name redis -p 6379:6379 "$IMAGE"
+          for i in $(seq 1 15); do
+            docker exec redis redis-cli ping && break
+            sleep 1
+          done
+          docker exec redis redis-cli ping
 
       - name: Start MiniStack
         run: |
@@ -160,13 +165,6 @@ jobs:
       OPENSEARCH_DATAPLANE: "1"
       DSQL_STRICT: "1"
       MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
-    services:
-      redis:
-        image: public.ecr.aws/docker/library/redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
       - uses: actions/checkout@v6
 
@@ -189,6 +187,19 @@ jobs:
           docker info
           docker network create "$DOCKER_NETWORK"
           docker network inspect "$DOCKER_NETWORK"
+
+      - name: Start Redis
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          IMAGE=redis:7-alpine
+          docker pull "$IMAGE" || { IMAGE=public.ecr.aws/docker/library/redis:7-alpine; docker pull "$IMAGE"; }
+          docker run -d --name redis -p 6379:6379 "$IMAGE"
+          for i in $(seq 1 15); do
+            docker exec redis redis-cli ping && break
+            sleep 1
+          done
+          docker exec redis redis-cli ping
 
       - name: Start MiniStack
         run: |
