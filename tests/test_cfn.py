@@ -35075,3 +35075,93 @@ def test_cfn_iam_user_generated_name(cfn, iam):
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("custom_bus", [True, False])
+def test_cfn_events_rule_bus_arn_delivery_and_lifecycle(cfn, eb, sqs, custom_bus):
+    """ARN/name aliases share a rule on create, update, delivery, drift and delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-bus-arn-{uid}"
+    rule_name = f"cfn-rule-bus-arn-{uid}"
+    bus_name = f"cfn-rule-bus-arn-{uid}" if custom_bus else "default"
+    url = sqs.create_queue(QueueName=f"cfn-rule-bus-arn-{uid}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def template(use_arn, description):
+        resources = {}
+        if custom_bus:
+            resources["Bus"] = {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}}
+        bus_ref = {"Fn::GetAtt": ["Bus", "Arn"]} if custom_bus else {
+            "Fn::Sub": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"}
+        resources["Rule"] = {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": rule_name, "EventBusName": bus_ref if use_arn else bus_name,
+            "Description": description, "EventPattern": {"source": [f"cfn.test.{uid}"]},
+            "Targets": [{"Id": "Q", "Arn": queue_arn}], "Tags": [{"Key": "team", "Value": "test"}]}}
+        return json.dumps({"Resources": resources, "Outputs": {
+            "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}}})
+
+    def delivered(marker, use_arn):
+        bus_ref = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}" if use_arn else bus_name
+        response = eb.put_events(Entries=[{
+            "EventBusName": bus_ref, "Source": f"cfn.test.{uid}", "DetailType": "demo",
+            "Detail": json.dumps({"marker": marker})}])
+        assert response["FailedEntryCount"] == 0
+        messages = sqs.receive_message(QueueUrl=url, WaitTimeSeconds=2).get("Messages", [])
+        assert len(messages) == 1
+        assert json.loads(messages[0]["Body"])["detail"] == {"marker": marker}
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=messages[0]["ReceiptHandle"])
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True, "first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        rule = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+        suffix = f"rule/{bus_name}/{rule_name}" if custom_bus else f"rule/{rule_name}"
+        assert rule["Arn"] == f"arn:aws:events:us-east-1:000000000000:{suffix}"
+        assert _output(stack, "RuleArn") == rule["Arn"]
+        assert rule["EventBusName"] == bus_name
+        assert eb.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"][0]["Arn"] == queue_arn
+        delivered("create", False)
+        delivered("arn-publish", True)
+        drift = cfn.detect_stack_resource_drift(StackName=stack_name, LogicalResourceId="Rule")
+        assert drift["StackResourceDrift"]["StackResourceDriftStatus"] == "IN_SYNC"
+        eb.tag_resource(ResourceARN=rule["Arn"], Tags=[{"Key": "outside", "Value": "kept"}])
+
+        # Switching aliases must not move/delete the rule or lose its targets/tags.
+        for use_arn, description in [(False, "by-name"), (True, "by-arn")]:
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(use_arn, description))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+            updated = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+            assert updated["Arn"] == rule["Arn"]
+            assert updated["Description"] == description
+            assert {"Key": "outside", "Value": "kept"} in eb.list_tags_for_resource(ResourceARN=rule["Arn"])["Tags"]
+            delivered(description, False)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+
+
+@pytest.mark.parametrize("bus_ref", [
+    "arn:aws:events:us-west-2:000000000000:event-bus/default",
+    "arn:aws:events:us-east-1:111111111111:event-bus/default",
+    "arn:aws:sqs:us-east-1:000000000000:default",
+    "arn:broken",
+])
+def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
+    """Reuse EventBridge's ARN checks rather than accepting foreign tenants."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-rule-bad-arn-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps({"Resources": {
+        "Rule": {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": name, "EventBusName": bus_ref, "EventPattern": {"source": ["cfn.test"]}}}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "AWS::Events::Rule EventBusName:" in _stack_event_reasons(cfn, name)
+        assert not any(rule["Name"] == name for rule in eb.list_rules(EventBusName="default")["Rules"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
