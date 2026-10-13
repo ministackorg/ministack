@@ -7436,14 +7436,20 @@ RETENTION = "Access Denied because object protected by object lock retention."
 LEGAL_HOLD = "Access Denied because object protected by object lock legal hold."
 
 
+_ROOT_AUTHORIZATION = (
+    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake"
+)
+
+
 def _lock_call(method, path, headers=None, body=b"", query=None):
     import asyncio
 
     from ministack.core.responses import request_scope
     from ministack.services import s3 as s3mod
 
+    headers = {"authorization": _ROOT_AUTHORIZATION, **(headers or {})}
     with request_scope("000000000000", "us-east-1"):
-        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, query or {}))
+        return asyncio.run(s3mod.handle_request(method, path, headers, body, query or {}))
 
 
 def _locked_in_process(**lock_headers):
@@ -8023,3 +8029,95 @@ def test_s3_create_owned_bucket_again(s3):
     finally:
         s3.delete_bucket(Bucket=east)
         s3.delete_bucket(Bucket=west)
+
+
+# Under AUTH=true a request without credentials is anonymous. S3 answers it only
+# through the bucket owner's public grants (AllUsers ACL grants or a bucket policy
+# for Principal "*", unless Public Access Block shuts them off); otherwise 403
+# AccessDenied. Source: the S3 User Guide on anonymous requests and Block Public
+# Access; not measured against AWS here.
+
+def _anonymous_bucket(monkeypatch, auth=True, **bucket_headers):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    bucket = f"anon-{uuid.uuid4().hex[:10]}"
+    assert _lock_call("PUT", f"/{bucket}", bucket_headers)[0] == 200
+    assert _lock_call("PUT", f"/{bucket}/k", {}, b"secret")[0] == 200
+    return bucket
+
+
+def _anonymous_call(method, path, headers=None, body=b"", internal=False):
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    with request_scope("000000000000", "us-east-1"):
+        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, {}, internal=internal))
+
+
+def _public_read_policy(bucket):
+    return json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*",
+    }]}).encode()
+
+
+def test_anonymous_request_to_a_private_bucket_is_denied_under_auth(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    for method, path, body in [("GET", f"/{bucket}/k", b""), ("HEAD", f"/{bucket}/k", b""),
+                               ("GET", f"/{bucket}/missing", b""), ("GET", f"/{bucket}", b""),
+                               ("PUT", f"/{bucket}/new", b"x"), ("DELETE", f"/{bucket}/k", b"")]:
+        status, _, resp = _anonymous_call(method, path, body=body)
+        assert status == 403, (method, path)
+        if method != "HEAD":
+            assert b"<Code>AccessDenied</Code>" in resp
+    # The owner still reads it, and the object is still there.
+    status, _, resp = _lock_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+
+
+def test_anonymous_request_reads_a_public_object_under_auth(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    assert _lock_call("PUT", f"/{bucket}/pub", {"x-amz-acl": "public-read"}, b"open")[0] == 200
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/pub")
+    assert (status, resp) == (200, b"open")
+    assert _anonymous_call("GET", f"/{bucket}/k")[0] == 403
+
+
+def test_anonymous_request_follows_a_public_bucket_policy_and_public_access_block(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    with request_scope("000000000000", "us-east-1"):
+        status, _, _ = asyncio.run(s3mod.handle_request(
+            "PUT", f"/{bucket}", {"authorization": _ROOT_AUTHORIZATION}, _public_read_policy(bucket),
+            {"policy": [""]}))
+    assert status == 204
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+    # The policy allows only s3:GetObject.
+    assert _anonymous_call("PUT", f"/{bucket}/k", body=b"overwrite")[0] == 403
+
+    block = (b"<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets>"
+             b"</PublicAccessBlockConfiguration>")
+    with request_scope("000000000000", "us-east-1"):
+        status, _, _ = asyncio.run(s3mod.handle_request(
+            "PUT", f"/{bucket}", {"authorization": _ROOT_AUTHORIZATION}, block, {"publicAccessBlock": [""]}))
+    assert status == 200
+    assert _anonymous_call("GET", f"/{bucket}/k")[0] == 403
+
+
+def test_anonymous_request_is_served_without_auth(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch, auth=False)
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+
+
+def test_internal_call_without_credentials_is_not_anonymous(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    assert _anonymous_call("PUT", f"/{bucket}/delivered", body=b"x", internal=True)[0] == 200
