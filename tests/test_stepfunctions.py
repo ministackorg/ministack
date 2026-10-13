@@ -2645,6 +2645,42 @@ def test_sfn_aws_sdk_json_results_rename_nested_members(sfn_sync, sm):
     assert secret["SecretVersionsToStages"] == {version: ["AWSCURRENT"]}
 
 
+def test_sfn_aws_sdk_ecs_and_ecr_parameters_reach_the_service(sfn_sync, ecs, ecr):
+    """SDK member names in Parameters reach a camelCase-wire service under its wire names."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    cluster, repo_a, repo_b = f"sdk-cl-{suffix}", f"sdk-repo-a-{suffix}", f"sdk-repo-b-{suffix}"
+    ecs.create_cluster(clusterName=cluster)
+    ecr.create_repository(repositoryName=repo_a)
+    ecr.create_repository(repositoryName=repo_b)
+    try:
+        clusters = _run_sdk_task(sfn_sync, f"sdk-ecs-{suffix}", "ecs:describeClusters", {"Clusters": [cluster]})
+        assert [c["ClusterName"] for c in clusters["Clusters"]] == [cluster]
+        missing = _run_sdk_task(sfn_sync, f"sdk-ecs-miss-{suffix}", "ecs:describeClusters",
+                                {"Clusters": [f"{cluster}-missing"]})
+        [failure] = missing["Failures"]
+        assert failure["Arn"].endswith(f"cluster/{cluster}-missing")
+        repos = _run_sdk_task(sfn_sync, f"sdk-ecr-{suffix}", "ecr:describeRepositories",
+                              {"RepositoryNames": [repo_a]})
+        assert [r["RepositoryName"] for r in repos["Repositories"]] == [repo_a]
+    finally:
+        ecs.delete_cluster(cluster=cluster)
+        ecr.delete_repository(repositoryName=repo_a)
+        ecr.delete_repository(repositoryName=repo_b)
+
+
+def test_sfn_aws_sdk_cloudwatchlogs_tag_keys_keep_their_case(sfn_sync, logs):
+    """Map keys in Parameters are data: tag keys reach the service as written."""
+    group = f"/sdk/tags-{_uuid_mod.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    try:
+        arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"].removesuffix(":*")
+        _run_sdk_task(sfn_sync, f"sdk-logs-tag-{group[-8:]}", "cloudwatchlogs:tagResource",
+                      {"ResourceArn": arn, "Tags": {"Team-Name": "data", "CostCentre": "42"}})
+        assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"Team-Name": "data", "CostCentre": "42"}
+    finally:
+        logs.delete_log_group(logGroupName=group)
+
+
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
     """aws-sdk:rds CreateDBInstance + DescribeDBInstances via query-protocol dispatch."""
     import uuid as _uuid

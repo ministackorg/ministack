@@ -3709,10 +3709,7 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    if service_info.get("param_case") == "lower-camel":
-        wire_data = _convert_keys_to_camel(input_data or {})
-    else:
-        wire_data = input_data
+    wire_data = _sdk_json_params(service_info, service_key, pascal_action, input_data)
     # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
     # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
     # without changing the state input or guessing whether the text is base64.
@@ -3762,11 +3759,7 @@ _SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
 
 
 def _sdk_json_result(service_key, action, result):
-    """A JSON-protocol aws-sdk result as Step Functions returns it. Step
-    Functions parses the response with the AWS SDK for Java v2, so the
-    operation's output model decides the shape: structure members take the
-    SDK's names, map keys are data and stay as sent (DynamoDB attribute names,
-    tag keys), timestamps become ISO 8601 and absent members are left out."""
+    """A JSON-protocol aws-sdk result shaped by the operation's output model, as Step Functions returns it."""
     model = _service_model(service_key)
     shape = (model.operation_model(action).output_shape
              if model is not None and action in model.operation_names else None)
@@ -3791,6 +3784,38 @@ def _sdk_json_value(value, shape):
     if shape.type_name == "timestamp" and _is_num(value):
         moment = datetime.fromtimestamp(value, timezone.utc)
         return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
+
+
+_SDK_PARAM_NAME_OVERRIDES = {(shape, sdk): wire for (shape, wire), sdk in _SDK_MEMBER_NAME_OVERRIDES.items()}
+
+
+def _sdk_json_params(service_info, service_key, action, input_data):
+    """aws-sdk Parameters on the wire, renamed by the operation's input model; map keys are data."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).input_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if service_info.get("param_case") == "lower-camel":
+            return _convert_keys_to_camel(input_data or {})
+        return input_data
+    return _sdk_json_param_value(input_data or {}, shape)
+
+
+def _sdk_json_param_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict) and not getattr(shape, "is_document_type", False):
+        by_sdk_name = {_api_name_to_sfn_key(name): name for name in shape.members}
+        renamed = {}
+        for key, item in value.items():
+            name = (key if key in shape.members
+                    else _SDK_PARAM_NAME_OVERRIDES.get((shape.name, key)) or by_sdk_name.get(key, key))
+            member = shape.members.get(name)
+            renamed[name] = _sdk_json_param_value(item, member) if member is not None else item
+        return renamed
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_param_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_param_value(item, shape.value) for key, item in value.items()}
     return value
 
 
