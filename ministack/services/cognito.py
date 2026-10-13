@@ -758,18 +758,57 @@ def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
     return int(value) * _VALIDITY_UNIT_SECONDS.get(unit, 3600)
 
 
+_API_TOKEN_SCOPE = "aws.cognito.signin.user.admin"
+
+
+def _aws_scope_order(scopes: list[str], presized: bool = True) -> list[str]:
+    """Scopes in the iteration order of a Java HashSet built from them, the order AWS lists them in."""
+    # The token's set is sized for the scopes up front, the trigger event's grows as they are added
+    limit = len(scopes) / 0.75
+    if presized:
+        limit = int(limit) + 1
+    size = 16
+    while size < limit:
+        size *= 2
+
+    def bucket(scope):
+        h = 0
+        for ch in scope:
+            h = (31 * h + ord(ch)) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (size - 1)
+
+    return sorted(scopes, key=bucket)
+
+
+def _granted_scopes(client: dict | None, requested: str | None, grant: str = "authorization_code") -> str | None:
+    """The scopes a token-endpoint grant carries: the requested ones the client allows, or all it allows."""
+    listed = (client or {}).get("AllowedOAuthScopes") or []
+    if not listed and not requested:
+        # Nothing to grant from: keep the API sign-in scope
+        return None
+    # client_credentials grants only resource-server scopes
+    allowed = sorted(s for s in listed if "/" in s or grant != "client_credentials")
+    wanted = requested.split() if requested else allowed
+    if listed:
+        wanted = [s for s in wanted if s in allowed]
+    return " ".join(dict.fromkeys(wanted))
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
-                 client_metadata: dict | None = None, origin_jti: str = "") -> str:
+                 client_metadata: dict | None = None, origin_jti: str = "",
+                 scope: str | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
-    Refresh tokens are opaque in AWS and skip the trigger.
+    Refresh tokens are opaque in AWS and skip the trigger. ``scope`` is the
+    grant's scopes; None for API sign-ins.
     """
+    granted = _API_TOKEN_SCOPE if scope is None else scope
     now = int(time.time())
     origin_jti = origin_jti or new_uuid()
     claims = {
@@ -816,7 +855,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
-        claims["scope"] = "aws.cognito.signin.user.admin"
+        claims["scope"] = " ".join(_aws_scope_order(granted.split()))
         if username:
             claims["username"] = username
         if groups:
@@ -825,6 +864,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
         claims["client_id"] = client_id
         claims["origin_jti"] = origin_jti
+        if scope is not None:
+            claims["scope"] = scope
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -837,6 +878,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             user_attrs=user_attrs or {},
             groups=groups or [],
             client_metadata=client_metadata,
+            scope=granted,
         )
     return _signed_jwt(claims)
 
@@ -864,7 +906,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
                              groups: list[str],
-                             client_metadata: dict | None = None) -> dict:
+                             client_metadata: dict | None = None,
+                             scope: str = _API_TOKEN_SCOPE) -> dict:
     """Invoke the user pool's PreTokenGeneration Lambda and apply its overrides.
 
     Honours both V1_0 (``LambdaConfig.PreTokenGeneration`` — id token only,
@@ -903,6 +946,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         trigger_source=trigger_source,
         version=v2_version if use_v2 else "V1_0",
         client_metadata=client_metadata,
+        scope=scope,
     )
 
     strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
@@ -970,7 +1014,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
 def _build_pretoken_event(pool_id: str, client_id: str, username: str,
                            user_attrs: dict, groups: list[str],
                            trigger_source: str, version: str,
-                           client_metadata: dict | None = None) -> dict:
+                           client_metadata: dict | None = None,
+                           scope: str = _API_TOKEN_SCOPE) -> dict:
     """Construct the event payload AWS sends to a PreTokenGeneration Lambda.
 
     Shape from the Cognito Developer Guide
@@ -987,7 +1032,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
         "clientMetadata": client_metadata or {},
     }
     if version.startswith("V2") or version.startswith("V3"):
-        request_block["scopes"] = ["aws.cognito.signin.user.admin"]
+        request_block["scopes"] = _aws_scope_order(scope.split(), presized=False)
 
     response_block = (
         {"claimsAndScopeOverrideDetails": None}
@@ -3858,7 +3903,8 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
-                        client_metadata: dict | None = None, origin_jti: str = "") -> dict:
+                        client_metadata: dict | None = None, origin_jti: str = "",
+                        scope: str | None = None) -> dict:
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -3870,12 +3916,12 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
                                     trigger_source=trigger_source,
-                                    client_metadata=client_metadata, origin_jti=origin_jti),
+                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
                                trigger_source=trigger_source,
-                               client_metadata=client_metadata, origin_jti=origin_jti),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti),
+                               client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope),
         "TokenType": "Bearer",
         "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
@@ -4267,8 +4313,10 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
     if err:
         return None, err
+    claims = _token_claims(refresh_token)
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
-                                origin_jti=_token_claims(refresh_token).get("origin_jti", ""))
+                                origin_jti=claims.get("origin_jti", ""),
+                                scope=claims.get("scope"))
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
@@ -6858,7 +6906,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 return _oauth2_error("server_error", "User not found.")
 
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
-                                         trigger_source="TokenGeneration_HostedAuth")
+                                         trigger_source="TokenGeneration_HostedAuth",
+                                         scope=_granted_scopes(client, entry.get("scope")))
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -6893,6 +6942,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user_attrs = {}
             groups = []
             origin_jti = new_uuid()
+            scope = _granted_scopes(_find_pool_by_client_id(effective_client_id)[2], code_data.get("scopes"))
             pool = _get_pool_unscoped(pool_id)
             if pool:
                 user = pool["_users"].get(username)
@@ -6903,11 +6953,13 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
             access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
                                         user_attrs=user_attrs, groups=groups,
-                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti)
+                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti,
+                                        scope=scope)
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
                                     groups=groups, trigger_source="TokenGeneration_HostedAuth",
-                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti)
-            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti)
+                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti, scope=scope)
+            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti,
+                                        scope=scope)
 
             return json_response({
                 "id_token": id_token,
@@ -6943,12 +6995,16 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         attrs = _attr_list_to_dict(user.get("Attributes", []))
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
-        origin_jti = _token_claims(refresh_val).get("origin_jti", "")
+        refresh_claims = _token_claims(refresh_val)
+        origin_jti = refresh_claims.get("origin_jti", "")
+        scope = refresh_claims.get("scope")
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
+                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                         scope=scope),
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
-                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
+                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                     scope=scope),
             "token_type": "Bearer",
             "expires_in": _token_validity(pool_id, client_id, "access"),
         }
@@ -6981,7 +7037,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
         access_token = _fake_token(cid, pool_id, cid, "access",
                                     trigger_source="TokenGeneration_ClientCredentials",
-                                    client_metadata=client_metadata)
+                                    client_metadata=client_metadata,
+                                    scope=_granted_scopes(client, form.get("scope"), "client_credentials"))
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",
