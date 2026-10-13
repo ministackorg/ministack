@@ -10220,8 +10220,9 @@ def _apigw_v2_stage_create(logical_id, props, stack_name):
         **_apigw_v2_stage_props(props),
     }
     _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
-    physical_id = f"{api_id}/{stage_name}"
-    return physical_id, {"StageName": stage_name}
+    # Ref uses the physical ID and AWS returns only the stage name. ApiId
+    # stays in the resolved properties for update and delete, as for v1 stages.
+    return stage_name, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -10235,13 +10236,15 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     through the service's own API. A property the template drops reverts to
     the create's default. ApiId and StageName require replacement: the new
     stage is created before the old one is removed."""
-    api_id, _, stage_name = physical_id.partition("/")
+    api_id = old_props.get("ApiId", "")
+    stage_name = old_props.get("StageName", "$default")
     stage = _apigw_v2._stages.get(api_id, {}).get(stage_name)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         (new_props.get("ApiId", ""), new_props.get("StageName", "$default")),
         (api_id, stage_name) if stage else None,
         _apigw_v2_stage_create, _apigw_v2_stage_delete,
+        delete_when_id_unchanged=True,
     )
     if replaced is not None:
         return replaced
@@ -10249,15 +10252,16 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Stage update failed: {resp[2]!r}")
     _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
+    # Keep legacy api/name physical IDs on in-place updates: changing the ID
+    # alone would make the engine delete the still-current stage as a predecessor.
     return physical_id, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_delete(physical_id, props):
-    parts = physical_id.split("/", 1)
-    if len(parts) == 2:
-        api_id, stage_name = parts
-        stages = _apigw_v2._stages.get(api_id, {})
-        stages.pop(stage_name, None)
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stages = _apigw_v2._stages.get(api_id, {})
+    stages.pop(stage_name, None)
 
 
 # ---------------------------------------------------------------------------
