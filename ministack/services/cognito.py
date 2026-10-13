@@ -770,9 +770,6 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
     Refresh tokens are opaque in AWS and skip the trigger.
     """
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
-    ).rstrip(b"=").decode()
     now = int(time.time())
     origin_jti = origin_jti or new_uuid()
     claims = {
@@ -841,7 +838,14 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             groups=groups or [],
             client_metadata=client_metadata,
         )
+    return _signed_jwt(claims)
 
+
+def _signed_jwt(claims: dict) -> str:
+    """A JWT over *claims*, signed with the RSA key when cryptography is available."""
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
+    ).rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
@@ -7202,6 +7206,32 @@ def _get_id(data):
     return json_response({"IdentityId": identity_id})
 
 
+def _identity_login_fields(logins: dict) -> tuple[list[str], list[str]]:
+    """The amr list and the API Gateway provider strings of an identity's logins."""
+    # The provider string is "<provider>,<provider>:CognitoSignIn:<sub>" per
+    # the mapping template reference, sub from the login's id token.
+    provider_parts = []
+    amr = ["authenticated"] if logins else ["unauthenticated"]
+    for provider_name, login_token in logins.items():
+        sub = ""
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(
+                login_token.split(".")[1] + "=="))
+            sub = payload.get("sub", "")
+        except Exception:
+            pass
+        # amr carries the bare provider name (what trust policies match with
+        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
+        # user-pool sign-in, the CognitoSignIn entry alongside it.
+        amr.append(provider_name)
+        if sub:
+            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
+            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
+        else:
+            provider_parts.append(provider_name)
+    return amr, provider_parts
+
+
 def _get_credentials_for_identity(data):
     """Vend identity-pool credentials AND register them as an STS session.
 
@@ -7235,28 +7265,8 @@ def _get_credentials_for_identity(data):
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
 
     # The cognito* identity fields API Gateway reports for IAM-authorized
-    # calls, precomputed here where the login tokens are at hand: the provider
-    # string is "<provider>,<provider>:CognitoSignIn:<sub>" per the mapping
-    # template reference, sub from the login's id token.
-    provider_parts = []
-    amr = ["authenticated"] if logins else ["unauthenticated"]
-    for provider_name, login_token in logins.items():
-        sub = ""
-        try:
-            payload = json.loads(base64.urlsafe_b64decode(
-                login_token.split(".")[1] + "=="))
-            sub = payload.get("sub", "")
-        except Exception:
-            pass
-        # amr carries the bare provider name (what trust policies match with
-        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
-        # user-pool sign-in, the CognitoSignIn entry alongside it.
-        amr.append(provider_name)
-        if sub:
-            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
-            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
-        else:
-            provider_parts.append(provider_name)
+    # calls, precomputed here where the login tokens are at hand.
+    amr, provider_parts = _identity_login_fields(logins)
 
     from ministack.services import sts as sts_svc
     sts_svc.register_session(access_key, {
@@ -7291,12 +7301,26 @@ def _get_open_id_token(data):
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
+    logins = data.get("Logins") or {}
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
-    token = _fake_token(identity_id, pool_id, "", "id")
-    return json_response({"IdentityId": identity_id, "Token": token})
+    if not pool_id:
+        return error_response_json("ResourceNotFoundException", f"Identity '{identity_id}' not found.", 400)
+    now = int(time.time())
+    claims = {
+        "sub": identity_id,
+        "aud": pool_id,
+        "amr": _identity_login_fields(logins)[0],
+        "iss": "https://cognito-identity.amazonaws.com",
+        "iat": now,
+        "exp": now + 600,
+        "https://cognito-identity.amazonaws.com/identity-pool-arn": (
+            f"arn:aws:cognito-identity:{get_region()}:{get_account_id()}:identitypool/{pool_id}"),
+    }
+    return json_response({"IdentityId": identity_id, "Token": _signed_jwt(claims)})
 
 
 def _set_identity_pool_roles(data):

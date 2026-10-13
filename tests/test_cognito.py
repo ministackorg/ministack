@@ -1182,6 +1182,50 @@ def test_cognito_get_open_id_token(cognito_identity):
     # Verify stub JWT structure: header.payload.sig
     parts = token.split(".")
     assert len(parts) == 3
+    claims = _decode_jwt_claims(token)
+    assert claims["iss"] == "https://cognito-identity.amazonaws.com"
+    assert claims["aud"] == iid
+    assert claims["sub"] == identity_id
+    assert claims["amr"] == ["unauthenticated"]
+    assert claims["exp"] - claims["iat"] == 600
+    assert claims["https://cognito-identity.amazonaws.com/identity-pool-arn"] == _identity_pool_arn(iid)
+
+
+def test_cognito_get_open_id_token_with_user_pool_login(cognito_idp, cognito_identity):
+    pool_id = cognito_idp.create_user_pool(PoolName="OidcLoginPool")["UserPool"]["Id"]
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="oidc-login", ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    user = cognito_idp.admin_create_user(UserPoolId=pool_id, Username="oidc-user", MessageAction="SUPPRESS")["User"]
+    sub = next(a["Value"] for a in user["Attributes"] if a["Name"] == "sub")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="oidc-user", Password="OidcPass1!", Permanent=True,
+    )
+    id_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "oidc-user", "PASSWORD": "OidcPass1!"},
+    )["AuthenticationResult"]["IdToken"]
+    provider = f"cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="OidcLoginIdentityPool", AllowUnauthenticatedIdentities=False,
+        CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": client_id}],
+    )["IdentityPoolId"]
+    identity_id = cognito_identity.get_id(IdentityPoolId=iid, Logins={provider: id_token})["IdentityId"]
+
+    token = cognito_identity.get_open_id_token(IdentityId=identity_id, Logins={provider: id_token})["Token"]
+    claims = _decode_jwt_claims(token)
+    assert claims["iss"] == "https://cognito-identity.amazonaws.com"
+    assert claims["aud"] == iid
+    assert claims["sub"] == identity_id
+    assert claims["amr"] == ["authenticated", provider, f"{provider}:CognitoSignIn:{sub}"]
+
+
+def test_cognito_get_open_id_token_unknown_identity(cognito_identity):
+    unknown = "us-east-1:00000000-0000-4000-8000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_open_id_token(IdentityId=unknown)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Message"] == f"Identity '{unknown}' not found."
 
 def test_cognito_signup_always_unconfirmed(cognito_idp):
     """SignUp always returns UNCONFIRMED regardless of AutoVerifiedAttributes."""
