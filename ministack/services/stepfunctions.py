@@ -1252,11 +1252,8 @@ def _test_state(data):
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
-            result = {
-                "status": "FAILED",
-                "error": state_def.get("Error", "States.Fail"),
-                "cause": state_def.get("Cause", ""),
-            }
+            error, cause = _fail_state_error(state_def, input_data, ctx)
+            result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
             effective = _apply_input_path(state_def, input_data, ctx)
@@ -1552,9 +1549,7 @@ def _run_execution(exec_arn):
                 continue
 
             if state_type == "Fail":
-                raise _ExecutionError(
-                    state_def.get("Error", "States.Fail"),
-                    state_def.get("Cause", ""))
+                raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
             handler_fn = {
                 "Pass": _execute_pass,
@@ -2157,6 +2152,17 @@ def _evaluate_rule(rule, data, ctx=None):
 # ---------------------------------------------------------------------------
 
 def _execute_wait(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Wait: Seconds and Timestamp may be expressions, and Output
+        # and Assign replace the JSONPath chain, as for Pass.
+        if "Seconds" in state_def:
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx))
+        elif "Timestamp" in state_def:
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx))
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        _apply_state_assign(state_def, raw_input, ctx)
+        return output, _next_or_end(state_def)
+
     effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
@@ -2176,6 +2182,29 @@ def _execute_wait(state_def, raw_input, ctx=None):
     return output, _next_or_end(state_def)
 
 
+def _jsonata_wait_seconds(state_def, raw_input, ctx):
+    seconds = _jsonata_state_field(state_def, "Seconds", "number", raw_input, ctx)
+    if not float(seconds).is_integer():
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The Seconds field cannot be parsed as an integer: {json.dumps(seconds)}")
+    if seconds < 0:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"Seconds cannot be negative but was: {json.dumps(seconds)}")
+    return seconds
+
+
+def _jsonata_wait_timestamp(state_def, raw_input, ctx):
+    timestamp = _jsonata_state_field(state_def, "Timestamp", "string", raw_input, ctx)
+    if _parse_ts(timestamp) is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "The Timestamp field cannot be parsed as an ISO-8601 extended offset "
+            f"date-time format string: {timestamp}")
+    return timestamp
+
+
 def _scaled_sleep(seconds):
     scaled = seconds * _SFN_WAIT_SCALE
     if scaled > 0:
@@ -2190,6 +2219,34 @@ def _sleep_until(iso_ts):
             _scaled_sleep(delta)
     except (ValueError, TypeError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Fail state
+# ---------------------------------------------------------------------------
+
+def _fail_state_error(state_def, raw_input, ctx=None):
+    """The error and cause a Fail state ends with. JSONata states may give
+    either as an expression; JSONPath states may select either from the
+    input with ErrorPath or CausePath. Both must be strings."""
+    return (_fail_state_field(state_def, "Error", "States.Fail", raw_input, ctx),
+            _fail_state_field(state_def, "Cause", "", raw_input, ctx))
+
+
+def _fail_state_field(state_def, field, default, raw_input, ctx):
+    if field in state_def and _state_query_language(state_def, ctx) == "JSONata":
+        return _jsonata_state_field(state_def, field, "string", raw_input, ctx)
+    path = state_def.get(f"{field}Path")
+    if path is None:
+        return state_def.get(field, default)
+    value = (_evaluate_intrinsic(path, raw_input, ctx) if path.startswith("States.")
+             else _resolve_path_or_ctx(path, raw_input, ctx))
+    if not isinstance(value, str):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The value referenced by {field}Path must be a string, "
+            f"but the value was: {json.dumps(value)}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -2361,9 +2418,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
             return _apply_output_path(state_def,
                                       _apply_input_path(state_def, current_input, ctx), ctx)
         if state_type == "Fail":
-            raise _ExecutionError(
-                state_def.get("Error", "States.Fail"),
-                state_def.get("Cause", ""))
+            raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
         handler_fn = {
             "Pass": _execute_pass,
@@ -2508,6 +2563,32 @@ def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_outpu
             for item in value
         ]
     return value
+
+
+def _jsonata_state_field(state_def, field, expected, raw_input, ctx):
+    """A state field that may be a JSONata expression, evaluated and held to
+    the JSON type AWS requires of it."""
+    value = _apply_jsonata_template(state_def[field], raw_input, ctx)
+    if _json_type(value) != expected:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The JSONata expression specified for the field '{field}' returned an "
+            f"unexpected result type. Expected '{expected}', but was "
+            f"'{_json_type(value)}' for value: {json.dumps(value)}")
+    return value
+
+
+def _json_type(value):
+    """The JSON type name AWS reports for a JSONata result."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if _is_num(value):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
 
 
 def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):

@@ -8437,6 +8437,130 @@ def test_sfn_jsonata_tomillis_still_parses_iso(sfn):
         sfn.delete_state_machine(stateMachineArn=sm)
 
 
+_JSONATA_FAIL = {
+    "Type": "Fail",
+    "QueryLanguage": "JSONata",
+    "Error": "{% $states.input.error %}",
+    "Cause": "{% 'value was: ' & $states.input.v %}",
+}
+
+
+def test_sfn_jsonata_fail_evaluates_error_and_cause(sfn_sync):
+    """A JSONata Fail state evaluates its Error and Cause, in a Parallel branch
+    and through TestState too, and refuses a result that is not a string."""
+    payload = json.dumps({"error": "Example.Error", "v": "abc"})
+    evaluated = ("FAILED", "Example.Error", "value was: abc")
+
+    with _machine(sfn_sync, "Stop", {"Stop": _JSONATA_FAIL}) as arn:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=arn, input=payload)
+        assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": 42, "v": "abc"}))
+        assert (resp["status"], resp["error"]) == ("FAILED", "States.QueryEvaluationError")
+        assert resp["cause"] == (
+            "The JSONata expression specified for the field 'Error' returned an unexpected "
+            "result type. Expected 'string', but was 'number' for value: 42")
+
+    branch = {"StartAt": "Stop", "States": {"Stop": _JSONATA_FAIL}}
+    with _machine(sfn_sync, "Fan", {
+        "Fan": {"Type": "Parallel", "Branches": [branch], "End": True},
+    }) as arn:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=arn, input=payload)
+        assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+    resp = sfn_sync.test_state(
+        definition=json.dumps(_JSONATA_FAIL),
+        input=payload,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+
+def test_sfn_fail_error_path_and_cause_path(sfn_sync):
+    """A JSONPath Fail state takes its error and cause from ErrorPath and
+    CausePath, a reference path or an intrinsic, which must yield a string."""
+    with _machine(sfn_sync, "Stop", {"Stop": {
+        "Type": "Fail",
+        "ErrorPath": "$.error",
+        "CausePath": "States.Format('cause: {}', $.cause)",
+    }}) as arn:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": "Path.Error", "cause": "y"}))
+        assert (resp["status"], resp["error"], resp["cause"]) == (
+            "FAILED", "Path.Error", "cause: y")
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": 42, "cause": "y"}))
+        assert (resp["status"], resp["error"], resp["cause"]) == (
+            "FAILED", "States.Runtime",
+            "The value referenced by ErrorPath must be a string, but the value was: 42")
+
+
+def test_sfn_jsonata_wait_evaluates_seconds(sfn_sync):
+    """A JSONata Wait evaluates a Seconds expression, which must be a
+    non-negative integer, and applies its Output and Assign."""
+    with _machine(sfn_sync, "Pause", {
+        "Pause": {
+            "Type": "Wait",
+            "QueryLanguage": "JSONata",
+            "Seconds": "{% $states.input.s %}",
+            "Output": "{% {'out': $states.input.s} %}",
+            "Assign": {"seen": "{% $states.input.s %}"},
+            "Next": "After",
+        },
+        "After": {
+            "Type": "Pass",
+            "QueryLanguage": "JSONata",
+            "Output": "{% {'input': $states.input, 'seen': $seen} %}",
+            "End": True,
+        },
+    }) as arn:
+        def run(seconds):
+            return sfn_sync.start_sync_execution(
+                stateMachineArn=arn, input=json.dumps({"s": seconds}))
+
+        resp = run(0)
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == {"input": {"out": 0}, "seen": 0}
+
+        for seconds, cause in (
+            (1.5, "The Seconds field cannot be parsed as an integer: 1.5"),
+            (-1, "Seconds cannot be negative but was: -1"),
+            ("1", "The JSONata expression specified for the field 'Seconds' returned an "
+                  "unexpected result type. Expected 'number', but was 'string' for value: \"1\""),
+        ):
+            resp = run(seconds)
+            assert (resp["status"], resp["error"], resp["cause"]) == (
+                "FAILED", "States.QueryEvaluationError", cause)
+
+
+def test_sfn_jsonata_wait_evaluates_timestamp(sfn_sync):
+    """A JSONata Wait evaluates a Timestamp expression, which must be a
+    parsable timestamp string."""
+    with _machine(sfn_sync, "Pause", {"Pause": {
+        "Type": "Wait",
+        "QueryLanguage": "JSONata",
+        "Timestamp": "{% $states.input.t %}",
+        "End": True,
+    }}) as arn:
+        def run(timestamp):
+            return sfn_sync.start_sync_execution(
+                stateMachineArn=arn, input=json.dumps({"t": timestamp}))
+
+        assert run("2020-01-01T00:00:00Z")["status"] == "SUCCEEDED"
+
+        for timestamp, cause in (
+            ("not a time", "The Timestamp field cannot be parsed as an ISO-8601 extended "
+                           "offset date-time format string: not a time"),
+            (5, "The JSONata expression specified for the field 'Timestamp' returned an "
+                "unexpected result type. Expected 'string', but was 'number' for value: 5"),
+        ):
+            resp = run(timestamp)
+            assert (resp["status"], resp["error"], resp["cause"]) == (
+                "FAILED", "States.QueryEvaluationError", cause)
+
+
 def test_sfn_choice_numeric_path_dynamic_batch_loop(sfn):
     """A dynamic batch loop guarded by NumericGreaterThanEqualsPath must exit once
     the cursor reaches the batch size. Before the *Path relational operators were
