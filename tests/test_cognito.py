@@ -1720,6 +1720,30 @@ def test_cognito_token_lifetimes_follow_client_validity(cognito_idp):
         assert refresh_claims["exp"] - refresh_claims["iat"] == 30 * 86400
 
 
+def test_cognito_restore_drops_the_old_default_token_validity():
+    """State saved before validities were honoured stored 60 for unset ones; a 60 with a unit stays."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    account, region, pid = "111111111111", "eu-central-1", "eu-central-1_old"
+    clients = {
+        "unset": {"AccessTokenValidity": 60, "IdTokenValidity": 60, "TokenValidityUnits": {}},
+        "minutes": {"AccessTokenValidity": 60, "IdTokenValidity": 60,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}},
+        "set": {"AccessTokenValidity": 2, "IdTokenValidity": 3, "TokenValidityUnits": {}},
+    }
+    saved = AccountRegionScopedDict()
+    saved.set_scoped(account, region, pid, {"Id": pid, "_clients": clients})
+    try:
+        mod.reset()
+        mod.load_persisted_state({"user_pools": saved})
+        restored = mod._user_pools.get_scoped(account, region, pid)["_clients"]
+        assert {cid: (c["AccessTokenValidity"], c["IdTokenValidity"]) for cid, c in restored.items()} == {
+            "unset": (None, None), "minutes": (60, 60), "set": (2, 3)}
+    finally:
+        mod.reset()
+
+
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="DescribeIdPool",
@@ -2552,6 +2576,27 @@ def test_cognito_oauth2_authorize_saml_metadata_file(cognito_idp):
         location = e.headers.get("Location", "")
         assert location.startswith("https://redirect.example.com/sso?")
         assert "SAMLRequest=" in location
+
+
+def test_cognito_oauth2_authorize_saml_metadata_file_without_redirect_binding(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="PostOnlySAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback&identity_provider=PostOnlySAML&scope=openid")
+    assert exc.value.code == 400
+    assert "HTTP-Redirect SingleSignOnService" in exc.value.read().decode()
 
 
 def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
@@ -10820,6 +10865,38 @@ def test_cognito_inbound_federation_trigger_missing_function_fails_sign_in(cogni
     assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
     with pytest.raises(ClientError):
         cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_missing-fn@example.com")
+
+
+def test_cognito_inbound_federation_trigger_map_replaces_idp_attributes(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['userName'] == 'TestSAML_replace-name-id', event['userName']\n"
+        "    event['response']['userAttributesToMap'] = {'given_name': 'Kept'}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-replace", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="replace-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Dropped"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_replace-name-id")["UserAttributes"]}
+    assert attrs["given_name"] == "Kept"
+    assert "family_name" not in attrs
+    assert attrs.get("email", "") != "raw@example.com"
+
+
+def test_cognito_inbound_federation_trigger_empty_map_keeps_idp_attributes(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    return event\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-noop", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="noop-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Kept"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_noop-name-id")["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"
+    assert attrs["family_name"] == "Kept"
 
 
 def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attributes(cognito_idp):

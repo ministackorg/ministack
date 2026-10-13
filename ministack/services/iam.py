@@ -422,7 +422,7 @@ def _create_user(p):
                       f"User with name {name} already exists.", ns="iam")
     tags = _extract_tags(p)
     if _identity_tags_have_duplicate_keys(tags):
-        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     path = _p(p, "Path") or "/"
     _users[name] = {
         "UserName": name,
@@ -551,7 +551,7 @@ def _create_role(p):
                       f"Role with name {name} already exists.", ns="iam")
     tags = _extract_tags(p)
     if _identity_tags_have_duplicate_keys(tags):
-        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     path = _p(p, "Path") or "/"
     _roles[name] = {
         "RoleName": name,
@@ -1446,7 +1446,7 @@ def _tag_role(p):
                       f"Role {role_name} not found.", ns="iam")
     new_tags = _extract_tags(p)
     if _identity_tags_have_duplicate_keys(new_tags):
-        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     existing = {_identity_tag_key(t["Key"]): t for t in role["Tags"]}
     for t in new_tags:
         existing[_identity_tag_key(t["Key"])] = t
@@ -1483,12 +1483,11 @@ def _list_role_tags(p):
 
 # -------------------- Tags: users --------------------
 
-def _identity_tag_key(key):
-    """Compare IAM user/role keys without case, retaining the stored spelling.
+DUPLICATE_IDENTITY_TAG_KEYS = "Duplicate tag keys found. Please note that Tag keys are case insensitive."
 
-    Evidence: the IAM tagging guide, not a real AWS run. Other IAM resources
-    keep their case-sensitive tag handling.
-    """
+
+def _identity_tag_key(key):
+    """User and role tag keys compare without case; the stored spelling is kept."""
     return key.lower()
 
 
@@ -1505,7 +1504,7 @@ def _tag_user(p):
                       f"The user with name {user_name} cannot be found.", ns="iam")
     new_tags = _extract_tags(p)
     if _identity_tags_have_duplicate_keys(new_tags):
-        return _error(400, "InvalidInput", "Duplicate tag keys found. Tag keys are case insensitive.", ns="iam")
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     existing = {_identity_tag_key(t["Key"]): t for t in user["Tags"]}
     for t in new_tags:
         existing[_identity_tag_key(t["Key"])] = t

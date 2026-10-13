@@ -599,6 +599,13 @@ def _restore_state(data):
             data.get("user_pools", {}),
             lambda pool_id, _pool: _region_from_pool_id(pool_id),
         )
+        # Older state stored 60 for an unset validity; 60 hours exceeds AWS's one-day cap.
+        for pool in _user_pools.all_values():
+            for client in (pool.get("_clients") or {}).values():
+                units = client.get("TokenValidityUnits") or {}
+                for kind in ("AccessToken", "IdToken"):
+                    if client.get(f"{kind}Validity") == 60 and not units.get(kind):
+                        client[f"{kind}Validity"] = None
 
         _restore_regional_store(
             _pool_domain_map,
@@ -1105,12 +1112,7 @@ _FEDERATION_RESERVED_CLAIMS = frozenset(
 
 
 def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
-    """Drop registered token claims from InboundFederation output unless mapped.
-
-    A Lambda that echoes the whole ``idToken`` back would otherwise land
-    ``iss`` / ``exp`` / ``iat`` in ``user_attrs``, and ``_fake_token`` copies
-    those over Cognito's own claims. Real Cognito only keeps mapped claims.
-    """
+    """Registered token claims from InboundFederation output count only when mapped."""
     mapped = set(attr_mapping.values())
     return {k: v for k, v in claims.items()
             if k not in _FEDERATION_RESERVED_CLAIMS or k in mapped}
@@ -1123,17 +1125,7 @@ class _InboundFederationRejected(Exception):
 def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: str,
                                        provider_name: str, provider_type: str,
                                        attributes: dict) -> dict:
-    """Invoke the pool's InboundFederation Lambda before AttributeMapping.
-
-    Emulates ``InboundFederation_ExternalProvider``: the Lambda receives the
-    raw IdP data (``samlResponse`` as a SAML Attribute name -> value map, or
-    ``idToken`` / ``userInfo`` claims) and returns
-    ``response.userAttributesToMap`` keyed by IdP claim name, which replaces
-    the IdP's own value for that claim as the AttributeMapping input.
-    Fail-closed like PreSignUp: a Lambda failure aborts the sign-in.
-
-    Returns ``{}`` when the pool has no ``LambdaConfig.InboundFederation``.
-    """
+    """The InboundFederation Lambda's userAttributesToMap, ``{}`` when unconfigured; a failure raises."""
     pool = _user_pools.get(pool_id)
     cfg = ((pool or {}).get("LambdaConfig") or {}).get("InboundFederation")
     arn = cfg.get("LambdaArn") if isinstance(cfg, dict) else None
@@ -2125,21 +2117,17 @@ def _oidc_callback_url(pool: dict) -> str:
 
 
 def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
-    """Return the IdP SingleSignOnService Location, preferring HTTP-Redirect; "" if unresolvable."""
+    """The IdP's HTTP-Redirect SingleSignOnService Location, the binding Cognito sends AuthnRequests on; "" if none."""
     if not metadata_xml:
         return ""
     try:
         root = safe_xml_parse(metadata_xml.strip())
     except Exception:
         return ""
-    services = [
-        el for el in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}SingleSignOnService")
-        if el.get("Location")
-    ]
-    for el in services:
-        if el.get("Binding") == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect":
+    for el in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}SingleSignOnService"):
+        if el.get("Binding") == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" and el.get("Location"):
             return el.get("Location")
-    return services[0].get("Location") if services else ""
+    return ""
 
 
 def _build_saml_authn_request(pool: dict, destination: str) -> str:
@@ -6078,7 +6066,7 @@ def _oauth2_authorize_federation(query_params):
         if not sso_url:
             return error_response_json(
                 "InvalidParameterException",
-                "SAML provider has no IDPSSOEndpoint, MetadataFile with SingleSignOnService, or MetadataURL.",
+                "SAML provider has no IDPSSOEndpoint, MetadataFile with an HTTP-Redirect SingleSignOnService, or MetadataURL.",
                 400)
         saml_request = _build_saml_authn_request(pool, sso_url)
         redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
@@ -6227,13 +6215,12 @@ def _saml2_idp_response(body: bytes, query_params):
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
-    idp_attrs = dict(saml_data.get("attributes", {}))
     try:
-        idp_attrs.update(_drop_unmapped_reserved_claims(
-            _apply_inbound_federation_trigger(
-                pool_id, client_id, name_id, provider_name, "SAML",
-                {"samlResponse": saml_data["attributes"]}),
-            attr_mapping))
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{name_id}", provider_name, "SAML",
+            {"samlResponse": saml_data["attributes"]})
+        idp_attrs = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                     else dict(saml_data.get("attributes", {})))
     except _InboundFederationRejected as e:
         logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
                     name_id, e)
@@ -6462,19 +6449,17 @@ def _oauth2_idp_response(method, body, query_params):
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
-    idp_claims = {k: str(v) for k, v in claims.items()
-                  if k not in _FEDERATION_RESERVED_CLAIMS
-                  and isinstance(v, (str, int, float, bool))}
     try:
-        idp_claims.update(_drop_unmapped_reserved_claims(
-            _apply_inbound_federation_trigger(
-                pool_id, client_id, str(claims.get("sub") or ""), provider_name, "OIDC",
-                {"idToken": claims}),
-            attr_mapping))
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{claims.get('sub') or claims.get('email') or ''}",
+            provider_name, "OIDC", {"idToken": claims})
     except _InboundFederationRejected as e:
         logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
                     claims.get("sub"), e)
         return error_response_json("UserLambdaValidationException", str(e), 400)
+    idp_claims = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                  else {k: str(v) for k, v in claims.items()
+                        if k not in _FEDERATION_RESERVED_CLAIMS and isinstance(v, (str, int, float, bool))})
     user_attrs = {}
     for idp_claim, value in idp_claims.items():
         user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value

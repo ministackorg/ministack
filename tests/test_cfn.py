@@ -21,6 +21,8 @@ from ministack.services.cloudformation.provisioners import (
     _CONDITIONALLY_REPLACING_PROPERTIES,
     _REPLACING_PROPERTIES,
     _RESOURCE_HANDLERS,
+    _reconcile_tag_list,
+    _with_stack_tags,
 )
 from ministack.services.cloudformation.stacks import _diff_resources
 
@@ -35165,3 +35167,135 @@ def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
         assert not any(rule["Name"] == name for rule in eb.list_rules(EventBusName="default")["Rules"])
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+_IDENTITY_TAG_TRUST = {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                 "Action": "sts:AssumeRole"}]}
+
+
+def _identity_tag_map(tags):
+    result = {t["Key"]: t["Value"] for t in tags}
+    assert len(result) == len(tags), f"Duplicate tag keys in response: {tags}"
+    return result
+
+
+def _identity_custom_tag_map(tags):
+    return _identity_tag_map([t for t in tags if not t["Key"].lower().startswith("aws:")])
+
+
+def _identity_template(resource, name, tags, after=False):
+    props = {f"{resource.title()}Name": name, "Tags": tags}
+    if resource == "role":
+        props.update(AssumeRolePolicyDocument=_IDENTITY_TAG_TRUST, Description="After" if after else "Before")
+    else:
+        props["Path"] = "/after/" if after else "/before/"
+    return json.dumps({"Resources": {"Identity": {"Type": f"AWS::IAM::{resource.title()}", "Properties": props}}})
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+@pytest.mark.parametrize("source", ["template", "stack"])
+def test_cfn_iam_identity_tag_case_update_and_removal(cfn, iam, resource, source):
+    name = f"cfn-{resource}-tag-case-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    original_tag = {"Key": "Department", "Value": "Finance"}
+    body = _identity_template(resource, name, [original_tag] if source == "template" else [])
+    cfn.create_stack(StackName=name, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     Tags=[original_tag] if source == "stack" else [])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert _identity_custom_tag_map(before["Tags"]) == {"Department": "Finance"}
+        # First change only the key's spelling, then change its value too.
+        for value in ["Finance", "HR"]:
+            desired_tags = [{"Key": "department", "Value": value}, {"Key": "Added", "Value": "New"}]
+            body = _identity_template(resource, name, desired_tags if source == "template" else [])
+            cfn.update_stack(StackName=name, TemplateBody=body,
+                             Tags=desired_tags if source == "stack" else [], Capabilities=["CAPABILITY_NAMED_IAM"])
+            assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+            identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+            assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+            assert _identity_custom_tag_map(identity["Tags"]) == {"department": value, "Added": "New"}
+        # Change a managed key's spelling externally; do not add unrelated external tags.
+        getattr(iam, f"tag_{resource}")(**params, Tags=[{"Key": "DEPARTMENT", "Value": "ExternalEdit"}])
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {
+            "DEPARTMENT": "ExternalEdit", "Added": "New"}
+        cfn.update_stack(StackName=name, TemplateBody=_identity_template(resource, name, []), Tags=[],
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+        identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_stack_tag_differing_only_in_case_fails_the_resource(cfn, iam, resource):
+    """Stack and resource tag keys merge case-sensitively, so IAM receives both spellings and refuses them."""
+    name = f"cfn-{resource}-tag-merge-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     TemplateBody=_identity_template(resource, name, [{"Key": "department", "Value": "Resource"}]),
+                     Tags=[{"Key": "Department", "Value": "Stack"}])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Identity" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any("Duplicate tag keys found. Please note that Tag keys are case insensitive." in r
+                   for r in reasons), reasons
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            getattr(iam, f"get_{resource}")(**{f"{resource.title()}Name": name})
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_duplicate_tag_keys_leave_state_unchanged(cfn, iam, operation, resource):
+    name = f"cfn-{resource}-tag-duplicate-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    before = None
+    if operation == "update":
+        cfn.create_stack(StackName=name, TemplateBody=_identity_template(resource, name, [{"Key": "Department", "Value": "Finance"}]),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+    try:
+        # Both duplicate forms use the predicate covered by the IAM API tests.
+        tags = [{"Key": "Department", "Value": "HR"}, {"Key": "department", "Value": "HR"}]
+        getattr(cfn, f"{operation}_stack")(StackName=name, TemplateBody=_identity_template(resource, name, tags, after=True),
+                                           Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == (
+            "UPDATE_ROLLBACK_COMPLETE" if operation == "update" else "ROLLBACK_COMPLETE")
+        if before is not None:
+            assert getattr(iam, f"get_{resource}")(**params)[resource.title()] == before
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                getattr(iam, f"get_{resource}")(**params)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource_type", ["AWS::SQS::Queue", "AWS::SSM::Parameter"])
+def test_cfn_other_resource_stack_tag_merge_remains_case_sensitive(resource_type):
+    # Protect the list/map branches of the shared merge without provisioning other services.
+    props = {"Tags": [{"Key": "department", "Value": "Resource"}]} if resource_type == "AWS::SQS::Queue" else {
+        "Tags": {"department": "Resource"}}
+    import copy
+
+    original = copy.deepcopy(props)
+    result = _with_stack_tags(resource_type, props, [{"Key": "Department", "Value": "Stack"}],
+                              "stack-name", "stack-id", "Resource")
+    tags = result["Tags"]
+    actual = tags if isinstance(tags, dict) else _identity_tag_map(tags)
+    assert {k: v for k, v in actual.items() if not k.lower().startswith("aws:")} == {
+        "Department": "Stack", "department": "Resource"}
+    assert props == original
+
+
+def test_cfn_other_resource_tag_reconciliation_remains_case_sensitive():
+    store = [{"Key": "Department", "Value": "External"}, {"Key": "department", "Value": "Before"}]
+    _reconcile_tag_list(store, {"Tags": [{"Key": "department", "Value": "Before"}]},
+                        {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]})
+    assert _identity_tag_map(store) == {"Department": "External", "DEPARTMENT": "After"}
+    _reconcile_tag_list(store, {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]}, {})
+    assert _identity_tag_map(store) == {"Department": "External"}

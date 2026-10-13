@@ -1189,18 +1189,10 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
             own = [{"Key": key, "Value": value} for key, value in own.items()]
         own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
         present = {t["Key"] for t in own_list}
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, own_list)
-            present = {_iam._identity_tag_key(k) for k in present}
-            extra = {k: v for k, v in extra.items() if _iam._identity_tag_key(k) not in present}
-        else:
-            extra = {k: v for k, v in extra.items() if k not in present}
         merged = own_list + [
             {"Key": key, "Value": value}
-            for key, value in extra.items()
+            for key, value in extra.items() if key not in present
         ]
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, merged)
     out = dict(props)
     out[prop] = merged
     return out
@@ -2394,9 +2386,9 @@ def _lambda_url_delete(physical_id, props):
 # --- IAM Role ---
 
 def _validate_iam_identity_tag_keys(resource_type, tags):
-    """Validate only user/role key uniqueness, before merging or changing state."""
+    """IAM's refusal of user/role tag keys that repeat without case, before any state changes."""
     if _iam._identity_tags_have_duplicate_keys([{"Key": t.get("Key", "")} for t in tags]):
-        raise ValueError(f"{resource_type} Tags contain duplicate keys (case insensitive)")
+        raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
 
 
 def _iam_role_create(logical_id, props, stack_name):

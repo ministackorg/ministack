@@ -4991,3 +4991,40 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
     assert bool(dispatched) == (expected == 200)
     if expected == 403:
         assert f"apigateway:{method}" in json.loads(body)["message"]
+
+
+@pytest.mark.parametrize("addressing", ["path", "virtual"])
+def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
+    """s3:prefix, s3:delimiter and s3:max-keys come from a ListBucket or ListBucketVersions request."""
+    from ministack import app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam, root_s3 = _local_client("iam"), _local_client("s3")
+    name = f"prefix-{time.time_ns()}"
+    bucket = name
+    root_s3.create_bucket(Bucket=bucket)
+    iam.create_user(UserName=name)
+    iam.put_user_policy(UserName=name, PolicyName="home", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
+            "Resource": f"arn:aws:s3:::{bucket}",
+            "Condition": {"StringLike": {"s3:prefix": ["home/alice/*"]}, "StringEquals": {"s3:delimiter": "/"},
+                          "NumericLessThanEquals": {"s3:max-keys": "100"}},
+        }]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        s3 = _local_client("s3", key["AccessKeyId"], key["SecretAccessKey"], addressing_style=addressing)
+        allowed = {"Prefix": "home/alice/", "Delimiter": "/", "MaxKeys": 100}
+        s3.list_objects_v2(Bucket=bucket, **allowed)
+        s3.list_objects(Bucket=bucket, **allowed)
+        s3.list_object_versions(Bucket=bucket, **allowed)
+        for refused in ({**allowed, "Prefix": "home/bob/"}, {**allowed, "Delimiter": "-"},
+                        {**allowed, "MaxKeys": 101}, {"Delimiter": "/", "MaxKeys": 100}):
+            assert _failure(lambda: s3.list_objects_v2(Bucket=bucket, **refused)) == ("AccessDenied", 403)
+        assert _failure(lambda: s3.list_object_versions(
+            Bucket=bucket, **{**allowed, "Prefix": "home/bob/"})) == ("AccessDenied", 403)
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="home")
+        iam.delete_user(UserName=name)
+        root_s3.delete_bucket(Bucket=bucket)

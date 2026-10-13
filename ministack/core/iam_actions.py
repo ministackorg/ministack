@@ -1788,6 +1788,20 @@ def dynamodb_transaction_checks(
     return checks
 
 
+def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
+    """The s3:prefix, s3:delimiter and s3:max-keys a ListBucket or ListBucketVersions request sends."""
+    if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
+        return {}
+    context = {}
+    for param in ("prefix", "delimiter", "max-keys"):
+        value = (query_params or {}).get(param)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if value is not None:
+            context[f"s3:{param}"] = value
+    return context
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
