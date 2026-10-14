@@ -854,22 +854,18 @@ def test_sts_get_caller_identity_json_protocol_resolves_iam_user(iam):
     """JSON protocol renders the resolved IAM-user identity, not root."""
     import urllib.request
 
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     with _iam_user_key(iam, "caller-identity-json-user") as (_, source):
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps({}).encode(),
-            method="POST",
-            headers={
-                "Content-Type": "application/x-amz-json-1.1",
-                "X-Amz-Target": "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
-                "Authorization": (
-                    "AWS4-HMAC-SHA256 "
-                    f"Credential={source['AccessKeyId']}/20240101/us-east-1/sts/aws4_request, "
-                    "SignedHeaders=host, Signature=fake"
-                ),
-            },
-        )
+        signed = AWSRequest(method="POST", url=endpoint, data=json.dumps({}).encode(), headers={
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+        })
+        SigV4Auth(Credentials(source["AccessKeyId"], source["SecretAccessKey"]), "sts", "us-east-1").add_auth(signed)
+        req = urllib.request.Request(endpoint, data=signed.body, method="POST", headers=dict(signed.headers))
         with urllib.request.urlopen(req) as r:
             assert r.status == 200
             data = json.loads(r.read())
