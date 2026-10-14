@@ -5028,7 +5028,9 @@ def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
         )
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return error_response_json(
+            "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+        )
     rule["ruleDisabled"] = disabled
     return 200, {}, b""
 
