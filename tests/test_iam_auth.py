@@ -12,6 +12,7 @@ the MiniStack server and work with AUTH=false.
 
 import asyncio
 import contextlib
+import contextvars
 import io
 import json
 import re
@@ -304,6 +305,16 @@ class TestEvaluate:
             {"Statement": [{"Effect": "Deny", "Action": "s3:Delete*", "Resource": "*"}]})
         assert evaluate(_ctx(action="s3:DeleteBucket"), [allow, deny]).decision == "Deny"
         assert evaluate(_ctx(action="s3:PutObject"), [allow, deny]).decision == "Allow"
+
+    def test_every_limit_must_allow(self):
+        identity = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "sqs:*"], "Resource": "*"}]})
+        boundary = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "ec2:*"], "Resource": "*"}]})
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], [boundary]).decision == "Allow"
+        assert evaluate(_ctx(action="sqs:SendMessage"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="ec2:RunInstances"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], []).decision == "ImplicitDeny"
 
 
 # ---------------------------------------------------------------------------
@@ -748,12 +759,11 @@ class TestTrustPolicy:
                                 "Action": "sts:AssumeRole"}]}
         assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:root")
 
-    def test_service_principal_allows_matching_service(self):
-        """Service principal matches callers containing the service name."""
+    def test_service_principal_denies_user_named_after_service(self):
         trust = {"Statement": [{"Effect": "Allow",
                                 "Principal": {"Service": "lambda.amazonaws.com"},
                                 "Action": "sts:AssumeRole"}]}
-        assert evaluate_trust_policy(trust, "arn:aws:lambda:us-east-1:123:function:test")
+        assert not evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/lambda-ops")
 
     def test_service_principal_denies_unrelated_user(self):
         """A service principal does NOT allow arbitrary IAM users."""
@@ -789,6 +799,20 @@ class TestTrustPolicy:
         trust = {"Statement": [{"Effect": "Deny", "Principal": "*",
                                 "Action": "sts:AssumeRole"}]}
         assert not evaluate_trust_policy(trust, "arn:aws:iam::123:user/a")
+
+    def test_federated_principal_matches_only_web_identity(self):
+        provider = "arn:aws:iam::123456789012:oidc-provider/issuer.example.com"
+        trust = {"Statement": [
+            {"Effect": "Allow", "Principal": {"Federated": provider},
+             "Action": "sts:AssumeRoleWithWebIdentity"},
+            {"Effect": "Allow", "Principal": {"AWS": "123456789012"},
+             "Action": "sts:AssumeRoleWithWebIdentity"}]}
+        other = "arn:aws:iam::123456789012:oidc-provider/other.example.com"
+        for arn, allowed in ((provider, True), (other, False)):
+            ctx = EvalContext(principal_arn=arn, principal_type="WebIdentityUser",
+                              principal_account="123456789012", action="sts:AssumeRoleWithWebIdentity",
+                              resource_arn="*", region="")
+            assert evaluate_trust_policy(trust, arn, ctx) is allowed
 
     def test_string_json_input(self):
         trust_str = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*",
@@ -1088,6 +1112,182 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+
+
+_PROBES = {"S": "sqs:ListQueues", "D": "dynamodb:ListTables",
+           "B": "s3:ListAllMyBuckets", "L": "logs:DescribeLogGroups"}
+_IDENTITY = {"Statement": [{"Effect": "Allow", "Resource": "*",
+                            "Action": ["sqs:ListQueues", "dynamodb:ListTables", "logs:DescribeLogGroups"]}]}
+_BOUNDARY = {"Statement": [
+    {"Effect": "Allow", "Resource": "*",
+     "Action": ["sqs:ListQueues", "dynamodb:ListTables", "s3:ListAllMyBuckets"]},
+    {"Effect": "Deny", "Action": "dynamodb:ListTables", "Resource": "*"},
+]}
+
+
+def _allowed(access_key):
+    """The probe actions ``enforce`` lets through, as letters."""
+    return "".join(letter for letter, action in _PROBES.items()
+                   if enforce(access_key, action, action.split(":")[0], "us-east-1") is None)
+
+
+def _iam_call(action, **params):
+    from ministack.services import iam as iam_svc
+    status, _headers, body = iam_svc._IAM_HANDLERS[action](
+        {"Action": [action], **{k: [v] for k, v in params.items()}})
+    assert status == 200, body
+    return body
+
+
+@pytest.fixture
+def boundary_principals():
+    """A user and a role session with the probe identity policy, and a boundary policy."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+    boundary = "arn:aws:iam::000000000000:policy/probe-boundary"
+    iam_svc.store_policy(boundary, "probe-boundary", "/", json.dumps(_BOUNDARY))
+    _iam_call("CreateUser", UserName="probe-user")
+    _iam_call("PutUserPolicy", UserName="probe-user", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    iam_svc._access_keys["AKIATESTBOUNDARY01"] = {
+        "UserName": "probe-user", "AccessKeyId": "AKIATESTBOUNDARY01",
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
+    _iam_call("PutRolePolicy", RoleName="probe-role", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    sts_svc._sessions["ASIATESTBOUNDARY01"] = {
+        "Arn": "arn:aws:sts::000000000000:assumed-role/probe-role/s",
+        "UserId": "AROA123:s", "SecretAccessKey": "s", "PrincipalType": "AssumedRole",
+        "AccountId": "000000000000", "Expiration": time.time() + 3600,
+    }
+    try:
+        yield {"user": "AKIATESTBOUNDARY01", "role": "ASIATESTBOUNDARY01", "boundary": boundary}
+    finally:
+        sts_svc._sessions.pop("ASIATESTBOUNDARY01", None)
+        iam_svc._access_keys.pop("AKIATESTBOUNDARY01", None)
+        iam_svc._user_inline_policies.pop("probe-user", None)
+        iam_svc._users.pop("probe-user", None)
+        iam_svc._roles.pop("probe-role", None)
+        iam_svc._policies.pop(boundary, None)
+
+
+class TestPermissionsBoundary:
+    """A boundary limits identity policies: only actions both allow pass, and its Deny denies."""
+
+    @pytest.mark.parametrize("kind", ["user", "role"])
+    def test_boundary_limits_identity_policies(self, boundary_principals, kind):
+        key, boundary = boundary_principals[kind], boundary_principals["boundary"]
+        name = {"UserName": "probe-user"} if kind == "user" else {"RoleName": "probe-role"}
+        entity = "User" if kind == "user" else "Role"
+        assert _allowed(key) == "SDL"
+        _iam_call(f"Put{entity}PermissionsBoundary", PermissionsBoundary=boundary, **name)
+        assert _allowed(key) == "S"
+        _iam_call(f"Delete{entity}PermissionsBoundary", **name)
+        assert _allowed(key) == "SDL"
+
+    def test_boundary_set_at_creation(self, boundary_principals):
+        from ministack.services import iam as iam_svc
+        _iam_call("CreateUser", UserName="probe-user-2", PermissionsBoundary=boundary_principals["boundary"])
+        _iam_call("PutUserPolicy", UserName="probe-user-2", PolicyName="identity",
+                  PolicyDocument=json.dumps(_IDENTITY))
+        iam_svc._access_keys["AKIATESTBOUNDARY02"] = {
+            "UserName": "probe-user-2", "AccessKeyId": "AKIATESTBOUNDARY02",
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        try:
+            assert _allowed("AKIATESTBOUNDARY02") == "S"
+            denied = enforce("AKIATESTBOUNDARY02", "dynamodb:ListTables", "dynamodb", "us-east-1")
+            assert denied.decision == "Deny"
+        finally:
+            iam_svc._access_keys.pop("AKIATESTBOUNDARY02", None)
+            iam_svc._user_inline_policies.pop("probe-user-2", None)
+            iam_svc._users.pop("probe-user-2", None)
+
+
+def _sts_key(access_key, **params):
+    """Call STS in-process as ``access_key`` and return the issued access key."""
+    import re
+    from urllib.parse import urlencode
+
+    from ministack.services import sts as sts_svc
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/20260930/us-east-1/sts/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    body = urlencode({"Version": "2011-06-15", **params}).encode()
+    status, _headers, payload = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+    assert status == 200, payload
+    return re.search(r"<AccessKeyId>(.*?)</AccessKeyId>", payload.decode()).group(1)
+
+
+def _allow(*actions, deny=None):
+    stmts = [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]
+    if deny:
+        stmts.append({"Effect": "Deny", "Action": deny, "Resource": "*"})
+    return json.dumps({"Version": "2012-10-17", "Statement": stmts})
+
+
+@pytest.fixture
+def issued_sessions():
+    from ministack.services import sts as sts_svc
+    before = set(sts_svc._sessions)
+    yield
+    for key in set(sts_svc._sessions) - before:
+        sts_svc._sessions.pop(key, None)
+
+
+class TestSessionPolicies:
+    """Session policies narrow a session to what both allow; a federated user without one gets nothing."""
+
+    def _assume(self, **params):
+        return _sts_key("test", Action="AssumeRole", RoleSessionName="s",
+                        RoleArn="arn:aws:iam::000000000000:role/probe-role", **params)
+
+    def test_session_policy_limits_the_role(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        logs = "arn:aws:iam::000000000000:policy/probe-logs"
+        iam_svc.store_policy(logs, "probe-logs", "/", _allow("logs:DescribeLogGroups"))
+        try:
+            assert _allowed(self._assume()) == "SDL"
+            assert _allowed(self._assume(Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))) == "S"
+            assert _allowed(self._assume(**{"PolicyArns.member.1.arn": logs})) == "L"
+            assert _allowed(self._assume(Policy=_allow("*", deny="dynamodb:ListTables"))) == "SL"
+        finally:
+            iam_svc._policies.pop(logs, None)
+
+    def test_session_policy_and_boundary_both_limit(self, boundary_principals, issued_sessions):
+        _iam_call("PutRolePermissionsBoundary", RoleName="probe-role",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(self._assume(Policy=_allow("dynamodb:ListTables", "logs:DescribeLogGroups"))) == ""
+        assert _allowed(self._assume(Policy=_allow("*"))) == "S"
+
+    def test_federated_user_is_limited_by_user_and_session_policies(self, boundary_principals, issued_sessions):
+        user = boundary_principals["user"]
+        fed = _sts_key(user, Action="GetFederationToken", Name="fed",
+                       Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))
+        assert _allowed(fed) == "S"
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed")) == ""
+        _iam_call("PutUserPermissionsBoundary", UserName="probe-user",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed", Policy=_allow("*"))) == "S"
+
+    def test_federated_user_principal_tags_are_the_session_tags(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        iam_svc._users["probe-user"]["Tags"] = [{"Key": "team", "Value": "blue"}, {"Key": "env", "Value": "dev"}]
+        fed = _sts_key(boundary_principals["user"], Action="GetFederationToken", Name="fed", Policy=_allow("*"),
+                       **{"Tags.member.1.Key": "TEAM", "Tags.member.1.Value": "green"})
+        keys = resolve_principal(fed, "000000000000").keys
+        assert keys["aws:principaltag/team"] == "green" and "aws:principaltag/env" not in keys
+        assert keys["aws:userid"] == "000000000000:fed" and "aws:username" not in keys
+
+    def test_root_federation_is_limited_by_the_session_policy(self, issued_sessions):
+        fed = _sts_key("test", Action="GetFederationToken", Name="fed", Policy=_allow("sqs:ListQueues"))
+        assert _allowed(fed) == "S"
+        assert resolve_principal(fed, "000000000000").arn == "arn:aws:sts::000000000000:federated-user/fed"
+
+
 class TestCustomerManagedPolicyResolution:
     """Customer policies belong to the explicit account and use full ARNs."""
 
@@ -1152,6 +1352,287 @@ class TestCustomerManagedPolicyResolution:
             policy["DefaultVersionId"] = "v1"
             assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Allow"
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
+
+
+@contextlib.contextmanager
+def _iam_user(name, tags=()):
+    """A stored IAM user with one access key; yields the key and a setter for its inline policy."""
+    from ministack.core.responses import get_account_id
+    from ministack.services import iam as iam_svc
+    key = "AKIATEST" + name.upper().replace("-", "")
+    iam_svc._access_keys[key] = {"UserName": name, "AccessKeyId": key, "SecretAccessKey": "s",
+                                 "Status": "Active", "CreateDate": "2024-01-01"}
+    iam_svc._users[name] = {"UserName": name, "Arn": f"arn:aws:iam::{get_account_id()}:user/{name}",
+                            "UserId": "AIDA" + name.upper().replace("-", ""), "Path": "/",
+                            "AttachedPolicies": [], "Tags": list(tags)}
+    try:
+        yield key, lambda doc: iam_svc._user_inline_policies.__setitem__(name, {"p": doc})
+    finally:
+        iam_svc._access_keys.pop(key, None)
+        iam_svc._users.pop(name, None)
+        iam_svc._user_inline_policies.pop(name, None)
+
+
+def _allows(access_key, put_policy, condition):
+    """Whether *access_key* may call sqs:ListQueues under a policy gated on *condition*."""
+    put_policy(json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*", "Condition": condition}]}))
+    return enforce(access_key, "sqs:ListQueues", "sqs", "us-east-1") is None
+
+
+class TestGlobalConditionKeys:
+    """The caller and transport condition keys."""
+
+    @pytest.fixture
+    def user(self):
+        with _iam_user("ck-user", [{"Key": "Team", "Value": "blue"}]) as user:
+            yield user
+
+    @pytest.fixture
+    def role_session(self):
+        from ministack.core.responses import get_account_id
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+        trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": get_account_id()},
+                                "Action": ["sts:AssumeRole", "sts:TagSession"]}]}
+        iam_svc._roles["ck-role"] = {"RoleName": "ck-role", "RoleId": "AROACKROLE", "AttachedPolicies": [],
+                                     "Arn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "InlinePolicies": {},
+                                     "AssumeRolePolicyDocument": json.dumps(trust),
+                                     "Tags": [{"Key": "team", "Value": "red"}, {"Key": "dept", "Value": "ops"}]}
+        body = (f"Action=AssumeRole&RoleArn=arn:aws:iam::{get_account_id()}:role/ck-role&RoleSessionName=s1"
+                "&Tags.member.1.Key=team&Tags.member.1.Value=green").encode()
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", {}, body, {}))
+        assert status == 200
+        key = re.search(r"<AccessKeyId>([^<]+)", out.decode()).group(1)
+        yield key, lambda doc: iam_svc._roles["ck-role"]["InlinePolicies"].__setitem__("p", doc)
+        sts_svc._sessions.pop(key, None)
+        iam_svc._roles.pop("ck-role", None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"StringEquals": {"aws:username": "ck-user"}}, True),
+        ({"StringEquals": {"aws:userid": "AIDACKUSER"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "blue"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/Team": "red"}}, False),
+        ({"Null": {"aws:MultiFactorAuthPresent": "false"}}, False),
+        ({"Null": {"aws:TokenIssueTime": "false"}}, False),
+    ])
+    def test_iam_user_keys(self, user, condition, allowed):
+        assert _allows(*user, condition) is allowed
+
+    def test_assumed_role_id_starts_with_the_role_id(self, role_session):
+        from ministack.services import sts as sts_svc
+        assert sts_svc._sessions[role_session[0]]["UserId"] == "AROACKROLE:s1"
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"Null": {"aws:username": "true"}}, True),
+        ({"StringEquals": {"aws:userid": "AROACKROLE:s1"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "green"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/dept": "ops"}}, True),
+        ({"Bool": {"aws:MultiFactorAuthPresent": "false"}}, True),
+        ({"DateGreaterThan": {"aws:TokenIssueTime": "2020-01-01T00:00:00Z"}}, True),
+    ])
+    def test_assumed_role_session_keys(self, role_session, condition, allowed):
+        assert _allows(*role_session, condition) is allowed
+
+    def test_assume_role_json_protocol_keeps_session_tags(self, role_session):
+        from ministack.core.responses import get_account_id
+        from ministack.services import sts as sts_svc
+        body = json.dumps({"RoleArn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "RoleSessionName": "s2",
+                           "Tags": [{"Key": "team", "Value": "white"}]}).encode()
+        headers = {"content-type": "application/x-amz-json-1.1",
+                   "x-amz-target": "AWSSecurityTokenServiceV20110615.AssumeRole"}
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+        key = json.loads(out)["Credentials"]["AccessKeyId"]
+        try:
+            assert _allows(key, role_session[1], {"StringEquals": {"aws:PrincipalTag/team": "white"}})
+        finally:
+            sts_svc._sessions.pop(key, None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"IpAddress": {"aws:SourceIp": "10.1.2.0/24"}}, True),
+        ({"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}}, False),
+        ({"Bool": {"aws:SecureTransport": "true"}}, True),
+    ])
+    def test_request_origin_keys(self, user, condition, allowed):
+        from ministack.core.iam_evaluator import pin_request_origin
+
+        def decide():
+            pin_request_origin("10.1.2.3", True)
+            return _allows(*user, condition)
+        assert contextvars.copy_context().run(decide) is allowed
+
+    def test_policy_simulation_ignores_the_request_origin(self):
+        from ministack.core.iam_evaluator import pin_request_origin
+        from ministack.services import iam as iam_svc
+        doc = json.dumps({"Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+            {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*",
+             "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]})
+        body = urlencode({"Action": "SimulateCustomPolicy", "PolicyInputList.member.1": doc,
+                          "ActionNames.member.1": "s3:GetObject"}).encode()
+
+        def simulate():
+            pin_request_origin("10.1.2.3", True)
+            return asyncio.run(iam_svc.handle_request("POST", "/", {}, body, {}))[2]
+        assert b"<EvalDecision>explicitDeny</EvalDecision>" in contextvars.copy_context().run(simulate)
+
+    @pytest.mark.parametrize("auth,scheme,headers,origin", [
+        (True, "https", [], ("10.9.8.7", True)),
+        (True, "http", [], ("10.9.8.7", False)),
+        (True, "http", [(b"x-forwarded-proto", b"https")], ("10.9.8.7", True)),
+        (False, "https", [], ("127.0.0.1", False)),
+    ])
+    def test_http_request_pins_the_client_address_and_scheme(self, monkeypatch, auth, scheme, headers, origin):
+        from ministack import app as app_mod
+        seen = []
+
+        async def capture(*args):
+            ctx = EvalContext("", "", "", "", "*", "us-east-1")
+            seen.append((ctx.source_ip, ctx.secure_transport))
+            return 200, {}, b"ok"
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        monkeypatch.setattr(app_mod, "_handle_pre_body_request", capture)
+        monkeypatch.setattr(app_mod, "AUTH", auth)
+        asyncio.run(app_mod.app({"type": "http", "method": "GET", "path": "/", "scheme": scheme,
+                                 "client": ("10.9.8.7", 50000), "headers": [(b"host", b"sts.localhost"), *headers],
+                                 "query_string": b""}, receive, send))
+        assert seen == [origin]
+
+
+class TestRequestTagContext:
+    """aws:RequestTag/* and aws:TagKeys of create, tag and untag calls."""
+
+    @pytest.mark.parametrize("service,action,body,params,context", [
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"env":"dev"}}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b"", {"Tag.1.Key": ["env"], "Tag.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("dynamodb", "dynamodb:TagResource", b'{"Tags":[{"Key":"env","Value":"dev"},{"Key":"t","Value":"1"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:requesttag/t": "1", "aws:TagKeys": ["env", "t"]}),
+        ("kms", "kms:CreateKey", b'{"Tags":[{"TagKey":"env","TagValue":"dev"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("iam", "iam:CreateUser", b"", {"Tags.member.1.Key": ["env"], "Tags.member.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"Env":"a","env":"b"}}', {},
+         {"aws:requesttag/env": ["a", "b"], "aws:TagKeys": ["Env", "env"]}),
+        ("sns", "sns:UntagResource", b"", {"TagKeys.member.1": ["env"]}, {"aws:TagKeys": ["env"]}),
+        ("ssm", "ssm:RemoveTagsFromResource", b'{"TagKeys":["env"]}', {}, {"aws:TagKeys": ["env"]}),
+        ("lambda", "lambda:UntagResource", b"", {"tagKeys": ["env", "temp"]}, {"aws:TagKeys": ["env", "temp"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q"}', {}, {}),
+        ("lambda", "lambda:InvokeFunction", b'{"Tags":{"env":"dev"}}', {}, {}),
+        ("sqs", "sqs:SendMessage", b'{"MessageBody":"x","tags":{"env":"dev"}}', {}, {}),
+    ])
+    def test_wire_shapes(self, service, action, body, params, context):
+        from ministack.core.iam_actions import request_tag_context
+        assert request_tag_context(service, action, body, params) == context
+
+    @pytest.mark.parametrize("tags,allowed", [
+        ({"env": "dev"}, True),
+        ({"env": "prod"}, False),
+        ({"env": "dev", "blocked": "1"}, False),
+        ({}, False),
+    ])
+    def test_create_is_decided_by_the_request_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-user") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"StringEquals": {"aws:RequestTag/env": "dev"}}},
+                {"Effect": "Deny", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "blocked"}}},
+            ]}))
+            denied = enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context)
+        assert (denied is None) is allowed
+
+    @pytest.mark.parametrize("tags,allowed", [({}, True), ({"env": "dev"}, False)])
+    def test_tag_keys_is_absent_without_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-null") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                                                  "Condition": {"Null": {"aws:TagKeys": "true"}}}]}))
+            assert (enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context) is None) is allowed
+
+    @pytest.mark.parametrize("method,grant,allowed", [
+        ("POST", "function:f", True), ("GET", "function:f*", True), ("DELETE", "function:g", False)])
+    def test_lambda_tag_calls_match_a_function_scoped_grant(self, method, grant, allowed):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        action = extract_iam_action("lambda", method, path, {}, b"", {})
+        arn = extract_resource_arn("lambda", method, path, {}, b"", {}, "us-east-1", "000000000000")
+        with _iam_user("rt-fn") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{
+                "Effect": "Allow", "Action": ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"],
+                "Resource": f"arn:aws:lambda:us-east-1:000000000000:{grant}"}]}))
+            denied = enforce(key, action, "lambda", "us-east-1", resource_arn=arn)
+        assert (denied is None) is allowed
+
+
+class TestResourceTagCondition:
+    """aws:ResourceTag/* from the tags of the resource a request names."""
+
+    def test_resource_tags_come_from_each_store(self):
+        from ministack.core.responses import get_account_id, get_region
+        from ministack.services import iam as iam_svc
+        from ministack.services import secretsmanager as sm
+        from ministack.services import sns, ssm
+        from ministack.services.tagging import resource_tags
+
+        acct, region = get_account_id(), get_region()
+        topic = f"arn:aws:sns:{region}:{acct}:rt-topic"
+        param = f"arn:aws:ssm:{region}:{acct}:parameter/rt-param"
+        sns._topics[topic] = {"tags": {"env": "dev"}}
+        ssm._tags[param] = {"env": "dev"}
+        secret = sm.create_secret_in_process("rt-secret", "v")
+        sm._secrets["rt-secret"]["Tags"] = [{"Key": "env", "Value": "dev"}]
+        iam_svc._roles["rt-role"] = {"RoleName": "rt-role", "Arn": f"arn:aws:iam::{acct}:role/rt-role",
+                                     "Tags": [{"Key": "env", "Value": "dev"}]}
+        try:
+            for arn in (topic, param, secret, f"arn:aws:iam::{acct}:role/rt-role"):
+                assert resource_tags(arn) == {"env": "dev"}, arn
+            assert resource_tags(f"arn:aws:sns:{region}:{acct}:missing") is None
+            assert resource_tags("arn:aws:s3:::bucket") is None
+            assert resource_tags("*") is None
+        finally:
+            sns._topics.pop(topic, None)
+            ssm._tags.pop(param, None)
+            sm._secrets.pop("rt-secret", None)
+            iam_svc._roles.pop("rt-role", None)
+
+    @pytest.mark.parametrize("condition,resource,allowed", [
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/ENV": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-prod", False),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-missing", False),
+        ({"Null": {"aws:ResourceTag/env": "true"}}, "rt-missing", True),
+    ])
+    def test_read_is_decided_by_the_resource_tags(self, condition, resource, allowed):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-reader") as (key, put_policy), _iam_user("rt-dev", [{"Key": "env", "Value": "dev"}]), \
+                _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*", "Condition": condition}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1",
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/{resource}")
+        assert (denied is None) is allowed
+
+    def test_tags_a_service_supplies_keep_precedence(self):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-ctx") as (key, put_policy), _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*",
+                                                  "Condition": {"StringEquals": {"aws:ResourceTag/env": "dev"}}}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1", service_context={"aws:ResourceTag/env": "dev"},
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/rt-prod")
+        assert denied is None
 
 
 class TestSeededAwsManagedPolicies:
@@ -1472,6 +1953,14 @@ class TestResourceArn:
     def test_lambda_invoke(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
+
+    @pytest.mark.parametrize("arn", [
+        "arn:aws:lambda:us-east-1:123:function:f", "arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Af"])
+    @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+    def test_lambda_tags(self, method, arn):
+        from ministack.core.iam_actions import extract_resource_arn
+        resolved = extract_resource_arn("lambda", method, f"/2017-03-31/tags/{arn}", {}, b"", {}, "us-east-1", "123")
+        assert resolved == "arn:aws:lambda:us-east-1:123:function:f"
 
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2387,6 +2876,13 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions", {}, b"", {}) == "lambda:CreateFunction"
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions/f/invocations", {}, b"", {}) == "lambda:InvokeFunction"
+
+    def test_lambda_tags_rest(self):
+        from ministack.core.iam_actions import extract_iam_action
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
+        assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
+        assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
@@ -4863,6 +5359,50 @@ def test_trust_not_action_denies(trust_api, operation, deny_first, excluded, con
     statements = [deny, ALLOW] if deny_first else [ALLOW, deny]
     _install_policy(trust_api, operation, _document(*statements))
     _assume(trust_api, expected, ExternalId="deployment-id", RoleSessionName="deploy-123")
+
+
+def _tags(protocol, **tags):
+    if protocol == "json":
+        return {"Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
+    return {f"Tags.member.{n}.{field}": text for n, (key, value) in enumerate(tags.items(), 1)
+            for field, text in (("Key", key), ("Value", value))}
+
+
+def test_trust_conditions_see_the_caller_principal_tags(trust_api):
+    call, _, _ = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(
+        ALLOW, Condition={"StringEquals": {"aws:PrincipalTag/team": "blue"}})))
+    _assume(trust_api, 403, RoleSessionName="untagged")
+    assert call("iam", "TagUser", UserName="trust-deployer", **_tags("query", team="blue"))[0] == 200
+    _assume(trust_api, 200, RoleSessionName="tagged")
+
+
+@pytest.mark.parametrize("actions, tagged, expected", [
+    ("sts:AssumeRole", False, 200),
+    ("sts:AssumeRole", True, 403),
+    (["sts:AssumeRole", "sts:TagSession"], True, 200),
+])
+def test_trust_session_tags_need_tag_session(trust_api, actions, tagged, expected):
+    call, sessions, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(ALLOW, Action=actions)))
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **(_tags(protocol, team="blue") if tagged else {}))
+    assert status == expected, body
+    if expected == 403:
+        assert f"{CALLER} is not authorized to perform: sts:TagSession on resource: {ROLE_ARN}".encode() in body
+    elif tagged:
+        assert [s["SessionTags"] for s in sessions.values()] == [[{"Key": "team", "Value": "blue"}]]
+
+
+@pytest.mark.parametrize("key, expected", [("team", 200), ("dept", 403)])
+def test_trust_conditions_see_session_tags_as_request_tags(trust_api, key, expected):
+    _, _, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(ALLOW, dict(
+        ALLOW, Action="sts:TagSession", Condition={"StringLike": {"aws:RequestTag/team": "*"}})))
+    call, _, _ = trust_api
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **_tags(protocol, **{key: "blue"}))
+    assert status == expected, body
 
 
 @pytest.mark.parametrize("operation", ["CreateRole", "UpdateAssumeRolePolicy"])
