@@ -10421,6 +10421,11 @@ _mtls_lock = asyncio.Lock()
 # Every live connection's writer, so that stopping the listener can close them
 # deliberately and in bounded time (see ``mtls_stop``).
 _mtls_sessions: set[asyncio.StreamWriter] = set()
+# Built on the first connection, not at boot, and dropped when the listener stops.
+_mtls_ssl_context: ssl.SSLContext | None = None
+_mtls_context_lock = asyncio.Lock()
+# TLS upgrades in flight, held so the loop keeps a reference to each task.
+_mtls_upgrades: set[asyncio.Task] = set()
 # Digests of the trust anchors already loaded into the live TLS context;
 # emptied whenever a context is built, since a fresh one starts with none.
 _mtls_loaded_anchors: set[str] = set()
@@ -10683,17 +10688,10 @@ async def _mtls_start_locked() -> None:
     if port is None:
         return
     try:
-        # Building the context can mint the server certificate — and, on first
-        # boot, the CA — which is RSA keygen, so keep it off the event loop.
-        ctx = await asyncio.to_thread(_mtls_build_ssl_context)
-    except Exception as e:
-        _mtls_logger.warning(
-            "IoT mTLS: could not build the TLS context (%s); listener unavailable", e
-        )
-        return
-    try:
-        _mtls_server = await asyncio.start_server(
-            _mtls_handle_conn, host="0.0.0.0", port=port, ssl=ctx
+        # Bound without TLS: the context imports `cryptography` and mints the
+        # server certificate (and the CA), which waits for the first device.
+        _mtls_server = await asyncio.get_running_loop().create_server(
+            _MtlsAcceptor, host="0.0.0.0", port=port
         )
     except OSError as e:
         _mtls_logger.warning(
@@ -10708,7 +10706,8 @@ async def _mtls_start_locked() -> None:
 
 
 async def _mtls_stop_locked() -> None:
-    global _mtls_server
+    global _mtls_server, _mtls_ssl_context
+    _mtls_ssl_context = None
     if _mtls_server is None and not _mtls_sessions:
         return
     if _mtls_server is not None:
@@ -10993,6 +10992,55 @@ async def _mtls_close(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except (OSError, ssl.SSLError):
         pass
+
+
+async def _mtls_context() -> ssl.SSLContext | None:
+    """The listener's TLS context, built once on first use; None refuses the connection and a later one retries."""
+    global _mtls_ssl_context
+    async with _mtls_context_lock:
+        if _mtls_ssl_context is None:
+            try:
+                # RSA keygen on first use, so keep it off the event loop.
+                _mtls_ssl_context = await asyncio.to_thread(_mtls_build_ssl_context)
+            except Exception as e:
+                _mtls_logger.warning(
+                    "IoT mTLS: could not build the TLS context (%s); connection refused", e
+                )
+                return None
+        return _mtls_ssl_context
+
+
+class _MtlsAcceptor(asyncio.Protocol):
+    """Accepts plaintext, upgrades it to TLS, then serves the stream session.
+
+    Reading is paused before anything arrives, so the ClientHello stays in the
+    kernel buffer until ``loop.start_tls`` takes over the transport.
+    """
+
+    def connection_made(self, transport):
+        transport.pause_reading()
+        task = asyncio.get_running_loop().create_task(self._upgrade(transport))
+        _mtls_upgrades.add(task)
+        task.add_done_callback(_mtls_upgrades.discard)
+
+    async def _upgrade(self, transport):
+        loop = asyncio.get_running_loop()
+        ctx = await _mtls_context()
+        if ctx is None or transport.is_closing():
+            transport.abort()
+            return
+        reader = asyncio.StreamReader(loop=loop)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+        try:
+            tls_transport = await loop.start_tls(transport, protocol, ctx, server_side=True)
+        except Exception as e:
+            _mtls_logger.debug("IoT mTLS: TLS handshake failed: %s", e)
+            transport.abort()
+            return
+        # start_tls does not call connection_made on the new protocol.
+        protocol.connection_made(tls_transport)
+        writer = asyncio.StreamWriter(tls_transport, protocol, reader, loop)
+        await _mtls_handle_conn(reader, writer)
 
 
 async def _mtls_handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

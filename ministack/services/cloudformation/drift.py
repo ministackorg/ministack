@@ -33,7 +33,7 @@ import ministack.services.sqs as _sqs
 import ministack.services.ssm as _ssm
 import ministack.services.stepfunctions as _sfn
 
-from .provisioners import _STACK_TAG_PROPERTY, _tag_map
+from .provisioners import _STACK_TAG_PROPERTY, _eb_rule_bus_name, _tag_map
 
 logger = logging.getLogger("cloudformation")
 
@@ -207,7 +207,7 @@ def _exists_in(store_getter):
 
 
 def _read_events_rule(physical_id, props):
-    key = _eb._rule_key(physical_id, props.get("EventBusName", "default"))
+    key = _eb._rule_key(physical_id, _eb_rule_bus_name(props))
     return {} if key in _eb._rules else None
 
 
