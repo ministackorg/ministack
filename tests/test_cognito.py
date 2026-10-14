@@ -1720,6 +1720,30 @@ def test_cognito_token_lifetimes_follow_client_validity(cognito_idp):
         assert refresh_claims["exp"] - refresh_claims["iat"] == 30 * 86400
 
 
+def test_cognito_restore_drops_the_old_default_token_validity():
+    """State saved before validities were honoured stored 60 for unset ones; a 60 with a unit stays."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    account, region, pid = "111111111111", "eu-central-1", "eu-central-1_old"
+    clients = {
+        "unset": {"AccessTokenValidity": 60, "IdTokenValidity": 60, "TokenValidityUnits": {}},
+        "minutes": {"AccessTokenValidity": 60, "IdTokenValidity": 60,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}},
+        "set": {"AccessTokenValidity": 2, "IdTokenValidity": 3, "TokenValidityUnits": {}},
+    }
+    saved = AccountRegionScopedDict()
+    saved.set_scoped(account, region, pid, {"Id": pid, "_clients": clients})
+    try:
+        mod.reset()
+        mod.load_persisted_state({"user_pools": saved})
+        restored = mod._user_pools.get_scoped(account, region, pid)["_clients"]
+        assert {cid: (c["AccessTokenValidity"], c["IdTokenValidity"]) for cid, c in restored.items()} == {
+            "unset": (None, None), "minutes": (60, 60), "set": (2, 3)}
+    finally:
+        mod.reset()
+
+
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="DescribeIdPool",
@@ -2521,6 +2545,60 @@ def test_cognito_oauth2_authorize_saml_redirect(cognito_idp):
         assert "RelayState=" in location
 
 
+def test_cognito_oauth2_authorize_saml_metadata_file(cognito_idp):
+    """MetadataFile only: SSO URL resolves from SingleSignOnService, preferring HTTP-Redirect."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<?xml version="1.0"?>'
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"'
+        ' Location="https://redirect.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="MetaSAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=MetaSAML&state=xyz123&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect, got 200"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"Expected 302, got {e.code}"
+        location = e.headers.get("Location", "")
+        assert location.startswith("https://redirect.example.com/sso?")
+        assert "SAMLRequest=" in location
+
+
+def test_cognito_oauth2_authorize_saml_metadata_file_without_redirect_binding(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="PostOnlySAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback&identity_provider=PostOnlySAML&scope=openid")
+    assert exc.value.code == 400
+    assert "HTTP-Redirect SingleSignOnService" in exc.value.read().decode()
+
+
 def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
     """GET /oauth2/authorize with unknown client_id returns 400."""
     url = f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id=nonexistent&redirect_uri=http://x&identity_provider=X"
@@ -2858,7 +2936,7 @@ def _start_fake_oidc_idp(claims):
     return token_url, recorded, stop
 
 
-def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None):
+def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mapping=None):
     pid = cognito_idp.create_user_pool(
         PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
@@ -2882,7 +2960,7 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None):
             "client_secret": "oidc-client-secret",
             "authorize_scopes": "openid email profile",
         },
-        AttributeMapping={"email": "email", "name": "name"},
+        AttributeMapping=attribute_mapping or {"email": "email", "name": "name"},
     )
     return pid, client["ClientId"]
 
@@ -10616,3 +10694,217 @@ def test_cognito_secret_hash_no_secret_refresh_ignores_supplied_hash(cognito_idp
     initiate = cognito_idp.admin_initiate_auth if admin else cognito_idp.initiate_auth
     result = initiate(**kwargs)["AuthenticationResult"]
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
+
+
+_INBOUND_EMAIL_CLAIM = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
+
+
+def _create_inbound_federation_lambda(lam, fn_name, handler):
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    return lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+
+def _saml_idpresponse(cid, saml_resp):
+    """Run the SAML authorize + idpresponse legs; return (status, Location or body)."""
+    try:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestSAML&state=s&scope=openid")
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["RelayState"][0]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=_urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect or 400"
+    except urllib.error.HTTPError as e:
+        return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
+
+
+def test_cognito_inbound_federation_trigger_feeds_attribute_mapping(cognito_idp, lam):
+    """userAttributesToMap supplies the AttributeMapping input the IdP did not send under that name."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['triggerSource'] == 'InboundFederation_ExternalProvider'\n"
+        "    assert event['request']['providerType'] == 'SAML'\n"
+        "    assert event['request']['providerName'] == 'TestSAML'\n"
+        f"    assert event['request']['attributes']['samlResponse'] == {{'{_INBOUND_EMAIL_CLAIM}': 'raw@example.com'}}\n"
+        f"    event['response']['userAttributesToMap'] = {{'{_INBOUND_EMAIL_CLAIM}': 'mapped@example.com'}}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-map", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["LambdaConfig"]["InboundFederation"]["LambdaArn"] == fn_arn
+
+    status, _ = _saml_idpresponse(
+        cid, _build_mock_saml_response(name_id="opaque-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com"}))
+    assert status == 302
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_opaque-name-id")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "mapped@example.com"
+
+
+def test_cognito_inbound_federation_trigger_failure_fails_saml_sign_in(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-reject", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+
+    status, body = _saml_idpresponse(cid, _build_mock_saml_response(name_id="blocked@example.com"))
+    assert status == 400
+    assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_blocked@example.com")
+
+
+def test_cognito_inbound_federation_trigger_feeds_oidc_attribute_mapping(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['request']['providerType'] == 'OIDC'\n"
+        "    assert event['request']['attributes']['idToken']['sub'] == 'oidc-sub'\n"
+        "    event['response']['userAttributesToMap'] = {'auth_time': '1700000000', 'email': 'oidc-mapped@example.com'}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "oidc-sub"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}},
+                                  attribute_mapping={"email": "email", "updated_at": "auth_time"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-sub")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["email"] == "oidc-mapped@example.com"
+        assert attrs["updated_at"] == "1700000000"
+        assert "auth_time" not in attrs
+    finally:
+        stop()
+
+
+def test_cognito_inbound_federation_trigger_registered_claims_do_not_override_id_token(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['userAttributesToMap'] = {\n"
+        "        k: str(v) for k, v in event['request']['attributes']['idToken'].items()}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reserved", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({
+        "sub": "oidc-sub", "email": "r@example.com", "iss": "https://idp.example.com",
+        "aud": "oidc-client-id", "exp": 1791852598, "iat": 1791852298, "jti": "idp-jti"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+        status, location = _oidc_idpresponse(cid)
+        assert status == 302
+        code = _parse_qs(urlparse(location).query)["code"][0]
+        req = urllib.request.Request(
+            f"{ENDPOINT}/oauth2/token",
+            data=(f"grant_type=authorization_code&code={code}&client_id={cid}"
+                  f"&redirect_uri=http://localhost:3000/callback").encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            claims = _decode_jwt_claims(json.loads(resp.read())["id_token"])
+        assert isinstance(claims["exp"], int) and isinstance(claims["iat"], int)
+        assert claims["iss"].startswith("https://cognito-idp.")
+        assert claims["aud"] == cid
+        assert claims["jti"] != "idp-jti"
+        assert claims["email"] == "r@example.com"
+    finally:
+        stop()
+
+
+def _oidc_idpresponse(cid):
+    """Run the OIDC authorize + idpresponse legs; return (status, Location or body)."""
+    try:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=s&scope=openid")
+        assert False, "Expected 302"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+    try:
+        _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+        assert False, "Expected redirect or 400"
+    except urllib.error.HTTPError as e:
+        return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
+
+
+def test_cognito_inbound_federation_trigger_failure_fails_oidc_sign_in(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reject", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "oidc-blocked"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+        status, body = _oidc_idpresponse(cid)
+        assert status == 400
+        assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+        with pytest.raises(ClientError):
+            cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-blocked")
+    finally:
+        stop()
+
+
+def test_cognito_inbound_federation_trigger_missing_function_fails_sign_in(cognito_idp):
+    missing_arn = "arn:aws:lambda:us-east-1:000000000000:function:ministack-inbound-fed-missing"
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": missing_arn}})
+
+    status, body = _saml_idpresponse(cid, _build_mock_saml_response(name_id="missing-fn@example.com"))
+    assert status == 400
+    assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_missing-fn@example.com")
+
+
+def test_cognito_inbound_federation_trigger_map_replaces_idp_attributes(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['userName'] == 'TestSAML_replace-name-id', event['userName']\n"
+        "    event['response']['userAttributesToMap'] = {'given_name': 'Kept'}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-replace", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="replace-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Dropped"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_replace-name-id")["UserAttributes"]}
+    assert attrs["given_name"] == "Kept"
+    assert "family_name" not in attrs
+    assert attrs.get("email", "") != "raw@example.com"
+
+
+def test_cognito_inbound_federation_trigger_empty_map_keeps_idp_attributes(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    return event\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-noop", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="noop-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Kept"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_noop-name-id")["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"
+    assert attrs["family_name"] == "Kept"
+
+
+def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attributes(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+
+    status, _ = _saml_idpresponse(
+        cid, _build_mock_saml_response(name_id="plain-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com"}))
+    assert status == 302
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_plain-name-id")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"

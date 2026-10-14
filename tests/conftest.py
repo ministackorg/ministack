@@ -5,6 +5,7 @@ Pytest fixtures for MiniStack integration tests.
 import concurrent.futures
 import contextlib
 import io
+import json
 import os
 import socket
 import statistics
@@ -13,7 +14,7 @@ import time
 import urllib.request
 import uuid
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import boto3
 import pytest
@@ -110,6 +111,60 @@ def iot_test_ca(registration_code, common_name="ministack-test-ca"):
     ca_pem, ca_key_pem = generate_ca(common_name=common_name)
     verification_pem = sign_leaf_certificate(ca_pem, ca_key_pem, common_name=registration_code)[0]
     return ca_pem, ca_key_pem, verification_pem
+
+
+def iam_user(identity_policy=None):
+    """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+
+    name = f"user-{uuid.uuid4().hex[:8]}"
+    key = ("AKIA" + uuid.uuid4().hex[:16].upper(), uuid.uuid4().hex)
+    arn = f"arn:aws:iam::{get_account_id()}:user/{name}"
+    with request_scope(get_account_id(), REGION):
+        iam_svc._users[name] = {"UserName": name, "Arn": arn, "UserId": "AIDA" + key[0][4:],
+                                "CreateDate": "2026-01-01", "Path": "/", "AttachedPolicies": [], "Tags": []}
+        iam_svc._access_keys[key[0]] = {"UserName": name, "AccessKeyId": key[0], "SecretAccessKey": key[1],
+                                        "Status": "Active", "CreateDate": "2026-01-01"}
+        if identity_policy:
+            iam_svc._user_inline_policies[name] = {"p": json.dumps(identity_policy)}
+    return key, arn
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    """AUTH=true for the in-process app."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+
+def routed_request(key, service, method, path, body=b"", headers=None, host="localhost:4566"):
+    """One in-process request through the whole app, SigV4-signed with *key* ``(key id, secret)`` unless it is None."""
+    import asyncio
+
+    from botocore.auth import S3SigV4Auth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    import ministack.app as app_mod
+
+    request = AWSRequest(method, f"http://{host}{path}", data=body, headers={"host": host, **(headers or {})})
+    if key:
+        (S3SigV4Auth if service == "s3" else SigV4Auth)(Credentials(*key), service, REGION).add_auth(request)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app({
+        "type": "http", "method": method, "path": unquote(path), "raw_path": path.encode(), "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]}, receive, send))
+    return (sent[0]["status"], {k.decode().lower(): v.decode() for k, v in sent[0].get("headers", [])},
+            b"".join(m.get("body", b"") for m in sent[1:]))
 
 
 _SERIAL_TESTS = {
